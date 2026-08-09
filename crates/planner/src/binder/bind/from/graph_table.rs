@@ -30,6 +30,7 @@ pub fn bind_graph_table(
     let graph_entry = schema.get_property_graph(&txn, &graph_name).map_err(|_| {
         paro_error::catalog(format!("Property graph \"{}\" does not exist", graph_name))
     })?;
+    let table_index = binder.bind_context.generate_table_index();
 
     let (bound_pattern, bound_columns, output_names, output_types, has_path_functions, path_length_col_idx) =
         binder.with_overlay_scope(|binder| -> Result<_> {
@@ -129,7 +130,7 @@ pub fn bind_graph_table(
                     let (expr, logical_type) = match func_name.as_str() {
                         "path_length" => {
                             let binding = ColumnBinding::new(
-                                usize::MAX,
+                                table_index,
                                 expand_chain_cols + PATH_LENGTH_OFFSET,
                             );
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
@@ -146,7 +147,7 @@ pub fn bind_graph_table(
                         "vertices" => {
                             let logical_type = path_element_list_type();
                             let binding = ColumnBinding::new(
-                                usize::MAX,
+                                table_index,
                                 expand_chain_cols + PATH_VERTICES_OFFSET,
                             );
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
@@ -158,7 +159,7 @@ pub fn bind_graph_table(
                         "edges" => {
                             let logical_type = path_element_list_type();
                             let binding = ColumnBinding::new(
-                                usize::MAX,
+                                table_index,
                                 expand_chain_cols + PATH_EDGES_OFFSET,
                             );
                             let expr = Expression::ColumnRef(ColumnRefExpression::new(
@@ -211,7 +212,6 @@ pub fn bind_graph_table(
             ))
         })?;
 
-    let table_index = binder.bind_context.generate_table_index();
     let binding_alias = alias
         .as_ref()
         .map(|a| a.name.name.clone())

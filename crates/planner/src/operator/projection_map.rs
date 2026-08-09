@@ -39,7 +39,13 @@ impl ProjectionMap {
     pub fn to_indices(&self, child_width: usize) -> Vec<usize> {
         match self {
             Self::All => (0..child_width).collect(),
-            Self::Columns(indices) => indices.clone(),
+            Self::Columns(indices) => {
+                debug_assert!(
+                    indices.iter().all(|index| *index < child_width),
+                    "projection index must be within the child layout"
+                );
+                indices.clone()
+            }
         }
     }
 
@@ -70,6 +76,10 @@ impl ProjectionMap {
         match self {
             Self::All => true,
             Self::Columns(indices) => {
+                debug_assert!(
+                    indices.iter().all(|index| *index < child_width),
+                    "projection index must be within the child layout"
+                );
                 indices.len() == child_width && indices.iter().copied().eq(0..child_width)
             }
         }

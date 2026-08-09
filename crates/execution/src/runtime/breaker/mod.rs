@@ -36,7 +36,7 @@ pub use join::{
     choose_hash_join_radix_bits, CompletionLatch, HashJoinBuildSpillReclaimer,
     HashJoinLocalBuildSpillReclaimer, JoinBuildHandle, JoinBuildId, JoinBuildMode,
     JoinBuildSpillBuffer, JoinBuildStats, JoinExternalModeConfig, JoinPartitionSet,
-    JoinProbeSpillBuffer, JoinRuntimeFilterSketch, JoinSpillState, JoinSpillStats, ProbeSpillSet,
+    JoinProbeSpillBuffer, JoinRuntimeFilterBuilder, JoinSpillState, JoinSpillStats, ProbeSpillSet,
 };
 pub use materialized::{FoundBits, MaterializedHandle, MaterializedReader};
 pub use recursive::{RecursiveDedupSet, RecursiveTableHandle};

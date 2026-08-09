@@ -85,6 +85,7 @@ impl GraphMatchDecompose {
             first_vertex.vertex_table_info.clone(),
             first_vertex.filter.clone(),
             first_vertex.table_index,
+            table_index,
             first_vertex.vertex_table_info.label.clone(),
             graph_name,
             schema_name,
@@ -136,6 +137,7 @@ impl GraphMatchDecompose {
                 source_table_index,
                 edge.table_index,
                 target_vertex.table_index,
+                table_index,
                 target_vertex.vertex_table_info.label.clone(),
                 source_vertex.vertex_table_info.table_oid,
                 target_vertex.vertex_table_info.table_oid,
@@ -379,6 +381,12 @@ mod tests {
         assert_eq!(result.op_type(), LogicalOperatorType::Projection);
         if let LogicalOperator::Projection(proj) = &result {
             assert_eq!(proj.expressions.len(), 3);
+            assert_eq!(proj.child.types().len(), 8);
+            let carrier_bindings = proj.child.get_column_bindings();
+            assert_eq!(carrier_bindings.len(), 8);
+            assert!(carrier_bindings
+                .iter()
+                .all(|binding| binding.table_index == 100));
             if let LogicalOperator::GraphExpand(ge2) = &proj.child.operator {
                 assert_eq!(ge2.edge_info.label, "Knows");
                 assert_eq!(ge2.target_table_index, 14);

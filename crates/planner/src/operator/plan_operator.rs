@@ -235,13 +235,22 @@ impl LogicalOperator {
             LogicalOperator::GraphScan(_gs) => {
                 vec!["local_vertex_id".to_string(), "rowid".to_string()]
             }
-            LogicalOperator::GraphExpand(_) => vec![
-                "src_local_id".to_string(),
-                "src_rowid".to_string(),
-                "edge_rowid".to_string(),
-                "dst_local_id".to_string(),
-                "dst_rowid".to_string(),
-            ],
+            LogicalOperator::GraphExpand(op) => {
+                let mut names = op.child.output_names();
+                names.extend([
+                    "edge_rowid".to_string(),
+                    "target_local_id".to_string(),
+                    "target_rowid".to_string(),
+                ]);
+                if op.has_path_functions {
+                    names.extend([
+                        "path_length".to_string(),
+                        "path_vertices".to_string(),
+                        "path_edges".to_string(),
+                    ]);
+                }
+                names
+            }
         }
     }
 
@@ -363,16 +372,7 @@ impl LogicalOperator {
             LogicalOperator::CopyTo(copy) => copy.types.clone(),
             LogicalOperator::GraphMatch(gm) => gm.output_types.clone(),
             LogicalOperator::GraphScan(gs) => gs.output_types.clone(),
-            LogicalOperator::GraphExpand(_) => {
-                // GraphExpand output: [src_local_id, src_rowid, edge_rowid, dst_local_id, dst_rowid]
-                vec![
-                    LogicalType::UBigInt,
-                    LogicalType::UBigInt,
-                    LogicalType::UBigInt,
-                    LogicalType::UBigInt,
-                    LogicalType::UBigInt,
-                ]
-            }
+            LogicalOperator::GraphExpand(op) => op.output_types(),
             LogicalOperator::DummyScan => vec![],
         }
     }
@@ -784,11 +784,10 @@ impl LogicalOperator {
                 Self::generate_column_bindings(gm.table_index, gm.output_types.len())
             }
             LogicalOperator::GraphScan(gs) => {
-                Self::generate_column_bindings(gs.table_index, gs.output_types.len())
+                Self::generate_column_bindings(gs.output_table_index, gs.output_types.len())
             }
             LogicalOperator::GraphExpand(ge) => {
-                // Expand produces 5 columns: src_local_id, src_rowid, edge_rowid, dst_local_id, dst_rowid
-                Self::generate_column_bindings(ge.edge_table_index, 5)
+                Self::generate_column_bindings(ge.output_table_index, ge.output_types().len())
             }
             LogicalOperator::Insert(_) => {
                 // Insert returns a single column (row count)
@@ -877,7 +876,9 @@ impl LogicalOperator {
             LogicalOperator::FullTextFilterScan(scan) => vec![scan.get.table_index],
             LogicalOperator::GraphMatch(gm) => vec![gm.table_index],
             LogicalOperator::GraphScan(gs) => vec![gs.table_index],
-            LogicalOperator::GraphExpand(ge) => vec![ge.edge_table_index],
+            LogicalOperator::GraphExpand(ge) => {
+                vec![ge.edge_table_index, ge.target_table_index]
+            }
             // Operators that don't introduce new table indices
             LogicalOperator::Filter(_)
             | LogicalOperator::Limit(_)
@@ -1313,6 +1314,7 @@ mod tests {
                         10,
                         11,
                         12,
+                        13,
                         "dst".to_string(),
                         100,
                         101,

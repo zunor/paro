@@ -996,8 +996,15 @@ impl ScanStructure {
             self.probe_matches_ready = true;
         }
 
-        let emit_count = (left.size() - self.probe_output_offset).min(result.capacity());
-        result.try_reset(result.allocator().clone())?;
+        let right_offset = left_projection_map.len();
+        result.try_reset_writable_suffix(right_offset, result.allocator().clone())?;
+        let output_capacity = result.capacity();
+        if output_capacity == 0 {
+            return Err(paro_common::error::internal(
+                "single join output requires non-zero capacity",
+            ));
+        }
+        let emit_count = (left.size() - self.probe_output_offset).min(output_capacity);
         self.scratch_sel.try_make_exclusive()?;
         self.scratch_sel.set_len(emit_count);
         for output_idx in 0..emit_count {
@@ -1018,7 +1025,6 @@ impl ScanStructure {
             )?);
         }
 
-        let right_offset = left_projection_map.len();
         for build_idx in 0..hash_table.build_types.len() {
             let vector = result.column_mut(right_offset + build_idx).ok_or_else(|| {
                 paro_common::error::internal(format!(

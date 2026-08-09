@@ -13,7 +13,7 @@ use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::{FullOuterScanState, JoinHashTable};
 use crate::memory_runtime::QueryMemoryPool;
 use crate::runtime::breaker::{
-    JoinBuildSpillBuffer, JoinProbeSpillBuffer, JoinRuntimeFilterSketch,
+    JoinBuildSpillBuffer, JoinProbeSpillBuffer, JoinRuntimeFilterBuilder,
 };
 
 #[derive(Debug, Default)]
@@ -189,7 +189,7 @@ pub struct HashJoinBuildSinkLocal {
     pub build_payload: Option<Chunk>,
     pub build_selection: Option<SelectionVector>,
     pub build_hashes: Vec<u64>,
-    pub runtime_filter_sketch: Option<JoinRuntimeFilterSketch>,
+    pub runtime_filter_builder: Option<JoinRuntimeFilterBuilder>,
     pub build_spill: Arc<Mutex<Option<JoinBuildSpillBuffer>>>,
     pub(crate) local_build_spill_reclaimer_name: Option<String>,
     pub(crate) query_memory: Option<Arc<QueryMemoryPool>>,

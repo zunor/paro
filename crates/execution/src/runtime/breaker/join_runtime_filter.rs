@@ -10,7 +10,6 @@
 //! than on every build row.
 
 use std::hash::Hash;
-use std::sync::Mutex;
 
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
@@ -61,17 +60,17 @@ impl Drop for RuntimeFilterReservation {
 
 #[derive(Debug)]
 enum ExactValues<T> {
-    Mutable {
-        // The breaker handle is shared before publication. Mutation still
-        // requires `&mut self`; the mutex makes the build-only value Sync.
-        values: Mutex<ExecutionHashSet<T>>,
+    Enabled {
+        values: ExecutionHashSet<T>,
         memory: MemoryAccountingContext,
     },
-    Frozen {
-        values: FixedMembership,
-        _reservation: RuntimeFilterReservation,
-    },
     Disabled,
+}
+
+#[derive(Debug)]
+struct FrozenExactValues {
+    values: Option<FixedMembership>,
+    _reservation: Option<RuntimeFilterReservation>,
 }
 
 impl<T> ExactValues<T>
@@ -82,22 +81,21 @@ where
         let Ok(grant) = memory.grant() else {
             return Self::Disabled;
         };
-        Self::Mutable {
-            values: Mutex::new(ExecutionHashSet::new_with_accounting_and_hasher(
+        Self::Enabled {
+            values: ExecutionHashSet::new_with_accounting_and_hasher(
                 grant,
                 memory.tag(),
                 memory.accounting_class(),
                 ExecutionHashBuilder,
-            )),
+            ),
             memory,
         }
     }
 
     fn insert(&mut self, value: T, max_values: usize) {
-        let Self::Mutable { values, .. } = self else {
+        let Self::Enabled { values, .. } = self else {
             return;
         };
-        let values = values.get_mut().unwrap_or_else(|error| error.into_inner());
         if values.len() == max_values && !values.contains(&value) {
             *self = Self::Disabled;
             return;
@@ -112,21 +110,13 @@ where
     fn merge(&mut self, incoming: Self, max_values: usize) {
         match incoming {
             Self::Disabled => *self = Self::Disabled,
-            Self::Frozen { .. } => {
-                debug_assert!(false, "published exact runtime filter cannot be merged");
-                *self = Self::Disabled;
-            }
-            Self::Mutable {
-                values: incoming,
+            Self::Enabled {
+                values: mut incoming,
                 memory: incoming_memory,
             } => {
-                let Self::Mutable { values, memory } = self else {
+                let Self::Enabled { values, memory } = self else {
                     return;
                 };
-                let values = values.get_mut().unwrap_or_else(|error| error.into_inner());
-                let mut incoming = incoming
-                    .into_inner()
-                    .unwrap_or_else(|error| error.into_inner());
                 if incoming.len() > values.len() {
                     // Adopt the larger table and its accounting context. This
                     // keeps combine linear in the smaller local domain and
@@ -149,40 +139,42 @@ where
         }
     }
 
-    fn freeze_with(&mut self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) {
-        let Self::Mutable { values, memory } = std::mem::replace(self, Self::Disabled) else {
-            return;
+    fn freeze_with(self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) -> FrozenExactValues {
+        let Self::Enabled { mut values, memory } = self else {
+            return FrozenExactValues {
+                values: None,
+                _reservation: None,
+            };
         };
-        let mut values = values
-            .into_inner()
-            .unwrap_or_else(|error| error.into_inner());
         let frozen = freeze(values.drain().collect());
+        if frozen.is_contiguous() {
+            return FrozenExactValues {
+                values: None,
+                _reservation: None,
+            };
+        }
         let Ok(reservation) = memory.retain(frozen.allocation_size()) else {
-            return;
+            return FrozenExactValues {
+                values: None,
+                _reservation: None,
+            };
         };
-        *self = Self::Frozen {
-            values: frozen,
-            _reservation: RuntimeFilterReservation(reservation),
-        };
-    }
-
-    fn frozen(&self) -> Option<&FixedMembership> {
-        match self {
-            Self::Frozen { values, .. } => Some(values),
-            Self::Mutable { .. } | Self::Disabled => None,
+        FrozenExactValues {
+            values: Some(frozen),
+            _reservation: Some(RuntimeFilterReservation(reservation)),
         }
     }
 }
 
 #[derive(Debug)]
-struct ExactDomain<T> {
+struct ExactDomainBuilder<T> {
     min: Option<T>,
     max: Option<T>,
     values: ExactValues<T>,
     policy: JoinRuntimeFilterPolicy,
 }
 
-impl<T> ExactDomain<T>
+impl<T> ExactDomainBuilder<T>
 where
     T: Copy + Eq + Hash + Ord,
 {
@@ -222,21 +214,23 @@ where
     }
 
     fn freeze_with(
-        &mut self,
+        self,
         freeze: impl FnOnce(Vec<T>, FixedMembershipBuildPolicy) -> FixedMembership,
-    ) {
+    ) -> FrozenExactDomain<T> {
         let membership = self.policy.membership;
-        self.values.freeze_with(|values| freeze(values, membership));
-        if self
-            .values
-            .frozen()
-            .is_some_and(FixedMembership::is_contiguous)
-        {
-            // A closed min/max range represents a contiguous domain exactly;
-            // release the redundant membership allocation immediately.
-            self.values = ExactValues::Disabled;
+        FrozenExactDomain {
+            min: self.min,
+            max: self.max,
+            values: self.values.freeze_with(|values| freeze(values, membership)),
         }
     }
+}
+
+#[derive(Debug)]
+struct FrozenExactDomain<T> {
+    min: Option<T>,
+    max: Option<T>,
+    values: FrozenExactValues,
 }
 
 #[derive(Debug)]
@@ -334,47 +328,62 @@ impl GenericDomain {
 }
 
 #[derive(Debug)]
-enum RuntimeFilterDomain {
-    I32(ExactDomain<i32>),
-    I64(ExactDomain<i64>),
-    I128(ExactDomain<i128>),
+enum RuntimeFilterDomainBuilder {
+    I32(ExactDomainBuilder<i32>),
+    I64(ExactDomainBuilder<i64>),
+    I128(ExactDomainBuilder<i128>),
     Generic(GenericDomain),
 }
 
-impl RuntimeFilterDomain {
+impl RuntimeFilterDomainBuilder {
     fn for_type(
         logical_type: &LogicalType,
         policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
         match logical_type {
-            LogicalType::Integer | LogicalType::Date => Self::I32(ExactDomain::new(policy, memory)),
+            LogicalType::Integer | LogicalType::Date => {
+                Self::I32(ExactDomainBuilder::new(policy, memory))
+            }
             LogicalType::BigInt
             | LogicalType::Decimal {
                 precision: 0..=18, ..
-            } => Self::I64(ExactDomain::new(policy, memory)),
-            LogicalType::Decimal { .. } => Self::I128(ExactDomain::new(policy, memory)),
+            } => Self::I64(ExactDomainBuilder::new(policy, memory)),
+            LogicalType::Decimal { .. } => Self::I128(ExactDomainBuilder::new(policy, memory)),
             _ => Self::Generic(GenericDomain::new()),
         }
     }
 
-    fn freeze(&mut self) {
+    fn freeze(self) -> RuntimeFilterDomain {
         match self {
-            Self::I32(domain) => domain.freeze_with(FixedMembership::i32_with_policy),
-            Self::I64(domain) => domain.freeze_with(FixedMembership::i64_with_policy),
-            Self::I128(domain) => domain.freeze_with(FixedMembership::i128_with_policy),
-            Self::Generic(_) => {}
+            Self::I32(domain) => {
+                RuntimeFilterDomain::I32(domain.freeze_with(FixedMembership::i32_with_policy))
+            }
+            Self::I64(domain) => {
+                RuntimeFilterDomain::I64(domain.freeze_with(FixedMembership::i64_with_policy))
+            }
+            Self::I128(domain) => {
+                RuntimeFilterDomain::I128(domain.freeze_with(FixedMembership::i128_with_policy))
+            }
+            Self::Generic(domain) => RuntimeFilterDomain::Generic(domain),
         }
     }
 }
 
 #[derive(Debug)]
-pub struct JoinRuntimeFilterSketch {
-    pub row_count: u64,
-    pub keys: Box<[JoinRuntimeFilterKeySketch]>,
+enum RuntimeFilterDomain {
+    I32(FrozenExactDomain<i32>),
+    I64(FrozenExactDomain<i64>),
+    I128(FrozenExactDomain<i128>),
+    Generic(GenericDomain),
 }
 
-impl JoinRuntimeFilterSketch {
+#[derive(Debug)]
+pub struct JoinRuntimeFilterBuilder {
+    keys: Box<[JoinRuntimeFilterKeyBuilder]>,
+}
+
+impl JoinRuntimeFilterBuilder {
     pub fn empty(key_types: &[LogicalType]) -> Self {
         Self::empty_with_policy(
             key_types,
@@ -399,12 +408,11 @@ impl JoinRuntimeFilterSketch {
         memory: MemoryAccountingContext,
     ) -> Self {
         Self {
-            row_count: 0,
             keys: key_types
                 .iter()
                 .cloned()
                 .map(|logical_type| {
-                    JoinRuntimeFilterKeySketch::new(logical_type, policy, memory.clone())
+                    JoinRuntimeFilterKeyBuilder::new(logical_type, policy, memory.clone())
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
@@ -448,7 +456,6 @@ impl JoinRuntimeFilterSketch {
                 selection.len()
             )));
         }
-        self.row_count += selected_count as u64;
         for (key_idx, key) in self.keys.iter_mut().enumerate() {
             let vector = keys.column(key_idx).ok_or_else(|| {
                 paro_error::internal("hash join runtime filter key column missing")
@@ -466,49 +473,42 @@ impl JoinRuntimeFilterSketch {
                 incoming.keys.len()
             )));
         }
-        self.row_count += incoming.row_count;
         for (left, right) in self.keys.iter_mut().zip(incoming.keys.into_vec()) {
             left.merge(right)?;
         }
         Ok(())
     }
 
-    pub(crate) fn freeze(&mut self) {
-        for key in &mut self.keys {
-            key.domain.freeze();
+    pub(crate) fn freeze(self) -> JoinRuntimeFilter {
+        JoinRuntimeFilter {
+            keys: self
+                .keys
+                .into_vec()
+                .into_iter()
+                .map(JoinRuntimeFilterKeyBuilder::freeze)
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         }
-    }
-
-    pub(crate) fn predicate_for_column(
-        &self,
-        build_key_index: usize,
-        probe_column_id: ColumnId,
-    ) -> Option<PredicateTree> {
-        self.keys
-            .get(build_key_index)
-            .and_then(|key| key.predicate_for_column(probe_column_id))
     }
 }
 
 #[derive(Debug)]
-pub struct JoinRuntimeFilterKeySketch {
-    pub logical_type: LogicalType,
-    pub non_null_count: u64,
-    pub has_null: bool,
-    domain: RuntimeFilterDomain,
+struct JoinRuntimeFilterKeyBuilder {
+    logical_type: LogicalType,
+    non_null_count: u64,
+    domain: RuntimeFilterDomainBuilder,
 }
 
-impl JoinRuntimeFilterKeySketch {
+impl JoinRuntimeFilterKeyBuilder {
     fn new(
         logical_type: LogicalType,
         policy: JoinRuntimeFilterPolicy,
         memory: MemoryAccountingContext,
     ) -> Self {
         Self {
-            domain: RuntimeFilterDomain::for_type(&logical_type, policy, memory),
+            domain: RuntimeFilterDomainBuilder::for_type(&logical_type, policy, memory),
             logical_type,
             non_null_count: 0,
-            has_null: false,
         }
     }
 
@@ -529,26 +529,25 @@ impl JoinRuntimeFilterKeySketch {
 
         let selected = &selection.as_slice()[..selected_count];
         match &mut self.domain {
-            RuntimeFilterDomain::I32(domain) => {
+            RuntimeFilterDomainBuilder::I32(domain) => {
                 visit_fixed(vector, logical_count, selected, Vector::get_i32, |value| {
-                    add_exact_value(domain, &mut self.non_null_count, &mut self.has_null, value)
+                    add_exact_value(domain, &mut self.non_null_count, value)
                 })
             }
-            RuntimeFilterDomain::I64(domain) => {
+            RuntimeFilterDomainBuilder::I64(domain) => {
                 visit_fixed(vector, logical_count, selected, Vector::get_i64, |value| {
-                    add_exact_value(domain, &mut self.non_null_count, &mut self.has_null, value)
+                    add_exact_value(domain, &mut self.non_null_count, value)
                 })
             }
-            RuntimeFilterDomain::I128(domain) => {
+            RuntimeFilterDomainBuilder::I128(domain) => {
                 visit_fixed(vector, logical_count, selected, Vector::get_i128, |value| {
-                    add_exact_value(domain, &mut self.non_null_count, &mut self.has_null, value)
+                    add_exact_value(domain, &mut self.non_null_count, value)
                 })
             }
-            RuntimeFilterDomain::Generic(domain) => {
+            RuntimeFilterDomainBuilder::Generic(domain) => {
                 for &row in selected {
                     let row_idx = row as usize;
                     if vector.is_null(row_idx) {
-                        self.has_null = true;
                         continue;
                     }
                     self.non_null_count += 1;
@@ -566,17 +565,21 @@ impl JoinRuntimeFilterKeySketch {
                 self.logical_type, incoming.logical_type
             )));
         }
-        self.has_null |= incoming.has_null;
         self.non_null_count += incoming.non_null_count;
         match (&mut self.domain, incoming.domain) {
-            (RuntimeFilterDomain::I32(left), RuntimeFilterDomain::I32(right)) => left.merge(right),
-            (RuntimeFilterDomain::I64(left), RuntimeFilterDomain::I64(right)) => left.merge(right),
-            (RuntimeFilterDomain::I128(left), RuntimeFilterDomain::I128(right)) => {
+            (RuntimeFilterDomainBuilder::I32(left), RuntimeFilterDomainBuilder::I32(right)) => {
                 left.merge(right)
             }
-            (RuntimeFilterDomain::Generic(left), RuntimeFilterDomain::Generic(right)) => {
+            (RuntimeFilterDomainBuilder::I64(left), RuntimeFilterDomainBuilder::I64(right)) => {
                 left.merge(right)
             }
+            (RuntimeFilterDomainBuilder::I128(left), RuntimeFilterDomainBuilder::I128(right)) => {
+                left.merge(right)
+            }
+            (
+                RuntimeFilterDomainBuilder::Generic(left),
+                RuntimeFilterDomainBuilder::Generic(right),
+            ) => left.merge(right),
             _ => {
                 return Err(paro_error::internal(
                     "hash join runtime filter physical domain changed during merge",
@@ -586,6 +589,40 @@ impl JoinRuntimeFilterKeySketch {
         Ok(())
     }
 
+    fn freeze(self) -> JoinRuntimeFilterKey {
+        JoinRuntimeFilterKey {
+            logical_type: self.logical_type,
+            non_null_count: self.non_null_count,
+            domain: self.domain.freeze(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct JoinRuntimeFilter {
+    keys: Box<[JoinRuntimeFilterKey]>,
+}
+
+impl JoinRuntimeFilter {
+    pub(crate) fn predicate_for_column(
+        &self,
+        build_key_index: usize,
+        probe_column_id: ColumnId,
+    ) -> Option<PredicateTree> {
+        self.keys
+            .get(build_key_index)
+            .and_then(|key| key.predicate_for_column(probe_column_id))
+    }
+}
+
+#[derive(Debug)]
+struct JoinRuntimeFilterKey {
+    logical_type: LogicalType,
+    non_null_count: u64,
+    domain: RuntimeFilterDomain,
+}
+
+impl JoinRuntimeFilterKey {
     fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
         if self.non_null_count == 0 {
             return None;
@@ -679,15 +716,13 @@ fn visit_fixed<T: Copy>(
 
 #[inline]
 fn add_exact_value<T>(
-    domain: &mut ExactDomain<T>,
+    domain: &mut ExactDomainBuilder<T>,
     non_null_count: &mut u64,
-    has_null: &mut bool,
     value: Option<T>,
 ) where
     T: Copy + Eq + Hash + Ord,
 {
     let Some(value) = value else {
-        *has_null = true;
         return;
     };
     *non_null_count += 1;
@@ -696,25 +731,18 @@ fn add_exact_value<T>(
 
 fn exact_or_range_predicate<T: Copy + Eq + Hash + Ord>(
     column_id: ColumnId,
-    domain: &ExactDomain<T>,
+    domain: &FrozenExactDomain<T>,
     to_value: impl Fn(T) -> Value,
 ) -> Option<Predicate> {
     let min = domain.min?;
     let max = domain.max?;
-    if let Some(values) = domain.values.frozen() {
-        if min == max {
-            return Some(Predicate::Eq {
-                column_id,
-                value: to_value(min),
-            });
-        }
-        if values.is_contiguous() {
-            return Some(Predicate::Range {
-                column_id,
-                lower: to_value(min),
-                upper: to_value(max),
-            });
-        }
+    if min == max {
+        return Some(Predicate::Eq {
+            column_id,
+            value: to_value(min),
+        });
+    }
+    if let Some(values) = domain.values.values.as_ref() {
         return Some(Predicate::FixedIn {
             column_id,
             values: values.clone(),
@@ -783,15 +811,33 @@ mod tests {
         let vector = test_i64_vector_with_allocator(&[30, 10, 20, 10], allocator.clone());
         let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
         let selection = SelectionVector::try_incremental(4, allocator).unwrap();
-        let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::BigInt]);
+        let mut sketch = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
         sketch.add_key_chunk(&keys, &selection, 4).unwrap();
-        sketch.freeze();
+        let filter = sketch.freeze();
 
         assert_eq!(
-            sketch.predicate_for_column(0, 9),
+            filter.predicate_for_column(0, 9),
             Some(PredicateTree::leaf(Predicate::FixedIn {
                 column_id: 9,
                 values: FixedMembership::i64(vec![10, 20, 30]),
+            }))
+        );
+    }
+
+    #[test]
+    fn singleton_exact_domain_publishes_equality() {
+        let allocator = test_allocator();
+        let vector = test_i64_vector_with_allocator(&[42, 42], allocator.clone());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(2, allocator).unwrap();
+        let mut builder = JoinRuntimeFilterBuilder::empty(&[LogicalType::BigInt]);
+        builder.add_key_chunk(&keys, &selection, 2).unwrap();
+
+        assert_eq!(
+            builder.freeze().predicate_for_column(0, 9),
+            Some(PredicateTree::leaf(Predicate::Eq {
+                column_id: 9,
+                value: Value::BigInt(42),
             }))
         );
     }
@@ -818,14 +864,14 @@ mod tests {
             MemoryAccountingClass::Metadata,
         );
         let mut sketch =
-            JoinRuntimeFilterSketch::empty_with_memory(&[LogicalType::Integer], memory);
+            JoinRuntimeFilterBuilder::empty_with_memory(&[LogicalType::Integer], memory);
         sketch
             .add_key_chunk(&keys, &selection, values.len())
             .unwrap();
-        sketch.freeze();
+        let filter = sketch.freeze();
 
         assert_eq!(
-            sketch.predicate_for_column(0, 7),
+            filter.predicate_for_column(0, 7),
             Some(PredicateTree::leaf(Predicate::Range {
                 column_id: 7,
                 lower: Value::Integer(0),

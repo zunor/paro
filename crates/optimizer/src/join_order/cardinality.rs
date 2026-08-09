@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_common::logging::targets;
-use paro_planner::expression::Expression;
+use paro_planner::expression::{ConjunctionType, Expression};
 use paro_planner::operator::{ColumnBinding, JoinType};
 use tracing::trace;
 
@@ -157,6 +157,29 @@ struct DistinctDomainEstimate {
     has_hll: bool,
 }
 
+#[derive(Debug, Default)]
+struct EqualityDenominatorScratch {
+    parents: Vec<usize>,
+    sizes: Vec<usize>,
+    active: Vec<bool>,
+    components: Vec<Vec<DistinctDomainEstimate>>,
+}
+
+impl EqualityDenominatorScratch {
+    fn prepare(&mut self, vertices: usize) {
+        self.parents.clear();
+        self.parents.extend(0..vertices);
+        self.sizes.clear();
+        self.sizes.resize(vertices, 1);
+        self.active.clear();
+        self.active.resize(vertices, false);
+        self.components.resize_with(vertices, Vec::new);
+        for component in &mut self.components {
+            component.clear();
+        }
+    }
+}
+
 impl DistinctDomainEstimate {
     fn observed(value: usize) -> Self {
         Self {
@@ -211,6 +234,8 @@ pub struct CardinalityEstimator {
     /// Statistics initialization can reorder equality classes. Recompile the
     /// compact topology lazily after the last mutation.
     equality_graphs_dirty: bool,
+    /// Reusable union-find and component storage for DP subset estimates.
+    equality_scratch: EqualityDenominatorScratch,
     /// Distinct-count estimates before equivalence classes merge their domains.
     ///
     /// A semi join needs the two sides independently: the fraction of preserved
@@ -529,15 +554,24 @@ impl CardinalityEstimator {
     /// class instead contributes `NDV^(vertices-components)`, the rank of its
     /// induced equality graph. Extra transitive predicates add cycles but no
     /// additional selectivity.
-    fn equality_denominator(&self, requested_set: &JoinRelationSet) -> (f64, HashSet<usize>) {
+    fn equality_denominator(&mut self, requested_set: &JoinRelationSet) -> (f64, HashSet<usize>) {
+        debug_assert!(
+            !self.equality_graphs_dirty,
+            "equality topology must be compiled before cardinality lookup"
+        );
         let mut denominator = 1.0;
         let mut consumed_filters = HashSet::new();
+        let Self {
+            relation_set_stats,
+            equality_graphs,
+            binding_stats,
+            equality_scratch,
+            ..
+        } = self;
 
-        for graph in &self.equality_graphs {
-            let stats = &self.relation_set_stats[graph.stats_index];
-            let mut parents = (0..graph.vertices.len()).collect::<Vec<_>>();
-            let mut sizes = vec![1usize; graph.vertices.len()];
-            let mut active = vec![false; graph.vertices.len()];
+        for graph in equality_graphs {
+            let stats = &relation_set_stats[graph.stats_index];
+            equality_scratch.prepare(graph.vertices.len());
             for edge in &graph.edges {
                 let left_relation = graph.vertices[edge.left].relation;
                 let right_relation = graph.vertices[edge.right].relation;
@@ -545,12 +579,23 @@ impl CardinalityEstimator {
                 {
                     continue;
                 }
-                active[edge.left] = true;
-                active[edge.right] = true;
-                union_components(&mut parents, &mut sizes, edge.left, edge.right);
+                equality_scratch.active[edge.left] = true;
+                equality_scratch.active[edge.right] = true;
+                union_components(
+                    &mut equality_scratch.parents,
+                    &mut equality_scratch.sizes,
+                    edge.left,
+                    edge.right,
+                );
                 consumed_filters.insert(edge.filter_index);
             }
-            if active.iter().filter(|active| **active).count() < 2 {
+            if equality_scratch
+                .active
+                .iter()
+                .filter(|active| **active)
+                .count()
+                < 2
+            {
                 continue;
             }
 
@@ -559,14 +604,13 @@ impl CardinalityEstimator {
             } else {
                 DistinctDomainEstimate::upper_bound(stats.distinct_count_no_hll)
             };
-            let mut components = vec![Vec::<DistinctDomainEstimate>::new(); graph.vertices.len()];
             for (index, vertex) in graph.vertices.iter().enumerate() {
-                if !active[index] {
+                if !equality_scratch.active[index] {
                     continue;
                 }
                 let mut distinct: Option<DistinctDomainEstimate> = None;
                 for binding in &vertex.bindings {
-                    let Some(binding) = self.binding_stats.get(binding) else {
+                    let Some(binding) = binding_stats.get(binding) else {
                         continue;
                     };
                     let binding_distinct = if binding.from_hll {
@@ -580,11 +624,12 @@ impl CardinalityEstimator {
                         distinct = Some(binding_distinct);
                     }
                 }
-                let root = find_component(&mut parents, index);
-                components[root].push(distinct.unwrap_or(fallback_distinct));
+                let root = find_component(&mut equality_scratch.parents, index);
+                equality_scratch.components[root].push(distinct.unwrap_or(fallback_distinct));
             }
-            for mut distincts in components
-                .into_iter()
+            for distincts in equality_scratch
+                .components
+                .iter_mut()
                 .filter(|component| !component.is_empty())
             {
                 let vertices = distincts.len();
@@ -812,6 +857,9 @@ impl CardinalityEstimator {
                 }
             }
             Expression::Conjunction(conj) => {
+                if conj.conjunction_type == ConjunctionType::Or {
+                    return None;
+                }
                 // Check children for comparison
                 for child in &conj.children {
                     if let Some(kind) = Self::get_comparison_type(child) {
@@ -1038,7 +1086,8 @@ mod tests {
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{
-        ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression,
+        ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionExpression,
+        ConjunctionType, ConstantExpression,
     };
 
     fn create_column_ref(table_index: usize, column_index: usize) -> Expression {
@@ -1494,5 +1543,14 @@ mod tests {
         // Constant (no comparison)
         let const_expr = create_constant(42);
         assert_eq!(CardinalityEstimator::get_comparison_type(&const_expr), None);
+
+        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![eq_expr, create_constant(7)],
+        ));
+        assert_eq!(
+            CardinalityEstimator::get_comparison_type(&disjunction),
+            None
+        );
     }
 }

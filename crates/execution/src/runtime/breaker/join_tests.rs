@@ -217,12 +217,12 @@ fn join_build_finalize_publishes_exact_runtime_filter() {
     );
     table.build(&keys, &payload).expect("build hash table");
     let selection = SelectionVector::try_incremental(3, allocator.clone()).expect("selection");
-    let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::Integer]);
+    let mut sketch = JoinRuntimeFilterBuilder::empty(&[LogicalType::Integer]);
     sketch
         .add_key_chunk(&keys, &selection, 3)
         .expect("update runtime filter sketch");
     handle
-        .merge_runtime_filter_sketch(Some(sketch))
+        .merge_runtime_filter_builder(Some(sketch))
         .expect("merge runtime filter sketch");
 
     handle.finalize_in_memory().expect("finalize build");
@@ -248,17 +248,17 @@ fn oversized_join_runtime_filter_falls_back_to_min_max() {
     values.set_count(value_count);
     let keys = Chunk::from_arc_vectors(vec![Arc::new(values)], allocator.clone());
     let selection = SelectionVector::try_incremental(value_count, allocator).unwrap();
-    let mut sketch = JoinRuntimeFilterSketch::empty_with_exact_value_limit(
+    let mut sketch = JoinRuntimeFilterBuilder::empty_with_exact_value_limit(
         &[LogicalType::Integer],
         exact_value_limit,
     );
     sketch
         .add_key_chunk(&keys, &selection, value_count)
         .expect("update oversized runtime filter sketch");
-    sketch.freeze();
+    let filter = sketch.freeze();
 
     assert_eq!(
-        sketch.predicate_for_column(0, 7).expect("predicate"),
+        filter.predicate_for_column(0, 7).expect("predicate"),
         PredicateTree::leaf(Predicate::Range {
             column_id: 7,
             lower: Value::Integer(0),

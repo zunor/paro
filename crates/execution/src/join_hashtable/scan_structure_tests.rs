@@ -449,6 +449,34 @@ fn test_next_single_join_drains_probe_larger_than_output_vector() {
 }
 
 #[test]
+fn test_next_single_join_uses_capacity_after_output_reset() {
+    let keys = [1, 2, 3, 4];
+    let ht = build_hash_table(JoinType::Single, &keys, &[10, 20, 30, 40]);
+    let (mut scan, probe_keys, left) = prepare_probe(&ht, &keys);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        2,
+    );
+    // A prior operator may advertise a transient capacity larger than the
+    // chunk's reset layout. SINGLE join must size its batch after restoring
+    // that layout.
+    result.set_capacity(4);
+
+    let first = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(first, 2);
+    assert!(!scan.finished);
+
+    let second = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(second, 2);
+    assert!(scan.finished);
+    assert_eq!(result.data[1].get_value(1), Value::Integer(40));
+}
+
+#[test]
 fn test_next_right_semi_or_anti_join_marks_build_rows() {
     let ht = build_hash_table(JoinType::RightSemi, &[1, 2], &[10, 20]);
     let (mut scan, keys, _left) = prepare_probe(&ht, &[1]);

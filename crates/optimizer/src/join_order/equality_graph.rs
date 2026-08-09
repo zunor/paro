@@ -109,7 +109,6 @@ fn is_equality(expression: &Expression) -> bool {
             comparison.comparison_type,
             ComparisonType::Equal | ComparisonType::NotDistinctFrom
         ),
-        Expression::Conjunction(conjunction) => conjunction.children.iter().any(is_equality),
         _ => false,
     }
 }
@@ -145,4 +144,44 @@ pub(super) fn union_components(
     }
     parents[right] = left;
     sizes[left] += sizes[right];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_equality;
+    use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::{
+        ComparisonExpression, ComparisonType, ConjunctionExpression, ConjunctionType,
+        ConstantExpression, Expression,
+    };
+
+    fn equality() -> Expression {
+        Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            )),
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(1),
+                LogicalType::Integer,
+            )),
+        ))
+    }
+
+    #[test]
+    fn only_atomic_equalities_enter_the_equality_graph() {
+        assert!(is_equality(&equality()));
+        let disjunction = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::Or,
+            vec![equality(), equality()],
+        ));
+        assert!(!is_equality(&disjunction));
+        let conjunction = Expression::Conjunction(ConjunctionExpression::new(
+            ConjunctionType::And,
+            vec![equality(), equality()],
+        ));
+        assert!(!is_equality(&conjunction));
+    }
 }

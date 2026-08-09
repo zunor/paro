@@ -25,7 +25,7 @@ use crate::physical::properties::MemoryClass;
 use crate::physical::properties::RequiredProperties;
 use crate::runtime::breaker::{
     HandleRef, HashJoinBuildSpillReclaimer, HashJoinLocalBuildSpillReclaimer, JoinBuildHandle,
-    JoinRuntimeFilterSketch,
+    JoinRuntimeFilterBuilder,
 };
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{
@@ -108,7 +108,7 @@ impl HashJoinBuildSinkExec {
             build_payload: None,
             build_selection: None,
             build_hashes: Vec::new(),
-            runtime_filter_sketch: Some(JoinRuntimeFilterSketch::empty_with_memory(
+            runtime_filter_builder: Some(JoinRuntimeFilterBuilder::empty_with_memory(
                 &build_key_types,
                 hash_join_memory_context(ctx.query)
                     .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
@@ -183,9 +183,9 @@ impl HashJoinBuildSinkExec {
         )?;
         if appended_count > 0 {
             local
-                .runtime_filter_sketch
+                .runtime_filter_builder
                 .as_mut()
-                .ok_or_else(|| paro_error::internal("hash join runtime filter sketch missing"))?
+                .ok_or_else(|| paro_error::internal("hash join runtime filter builder missing"))?
                 .add_key_chunk(key_chunk, build_selection, appended_count)?;
         }
         Ok(SinkPoll::NeedMoreInput)
@@ -216,7 +216,7 @@ impl HashJoinBuildSinkExec {
         }
         global
             .handle
-            .merge_runtime_filter_sketch(local.runtime_filter_sketch.take())?;
+            .merge_runtime_filter_builder(local.runtime_filter_builder.take())?;
         Ok(MergePoll::Done)
     }
 

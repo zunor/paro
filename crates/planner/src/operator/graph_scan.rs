@@ -23,6 +23,12 @@ pub struct GraphScan {
     pub filter: Option<Expression>,
     /// Table index for this vertex variable.
     pub table_index: usize,
+    /// Binding namespace for the graph chain's physical carrier columns.
+    ///
+    /// Property expressions keep using `table_index` and are materialized by
+    /// GraphProject. The carrier namespace describes the actual columns passed
+    /// between GraphScan/GraphExpand operators.
+    pub output_table_index: usize,
     /// Vertex label.
     pub label: String,
     /// Graph name (for index lookup at execution time).
@@ -38,6 +44,7 @@ impl GraphScan {
         vertex_info: VertexTableInfo,
         filter: Option<Expression>,
         table_index: usize,
+        output_table_index: usize,
         label: String,
         graph_name: String,
         schema_name: String,
@@ -47,6 +54,7 @@ impl GraphScan {
             vertex_info,
             filter,
             table_index,
+            output_table_index,
             label,
             graph_name,
             schema_name,

@@ -613,11 +613,14 @@ impl LogicalPlanDeepCopy {
             }
             LogicalOperator::GraphScan(gs) => {
                 let mut table_index = gs.table_index;
+                let mut output_table_index = gs.output_table_index;
                 self.remap_table_index(bind_shared, &mut table_index);
+                self.remap_table_index(bind_shared, &mut output_table_index);
                 LogicalOperator::GraphScan(GSNode {
                     vertex_info: gs.vertex_info.clone(),
                     filter: gs.filter.clone(),
                     table_index,
+                    output_table_index,
                     label: gs.label.clone(),
                     graph_name: gs.graph_name.clone(),
                     schema_name: gs.schema_name.clone(),
@@ -629,9 +632,11 @@ impl LogicalPlanDeepCopy {
                 let mut source_table_index = ge.source_table_index;
                 let mut edge_table_index = ge.edge_table_index;
                 let mut target_table_index = ge.target_table_index;
+                let mut output_table_index = ge.output_table_index;
                 self.remap_table_index(bind_shared, &mut source_table_index);
                 self.remap_table_index(bind_shared, &mut edge_table_index);
                 self.remap_table_index(bind_shared, &mut target_table_index);
+                self.remap_table_index(bind_shared, &mut output_table_index);
                 LogicalOperator::GraphExpand(GExpNode {
                     edge_info: ge.edge_info.clone(),
                     direction: ge.direction,
@@ -643,6 +648,7 @@ impl LogicalPlanDeepCopy {
                     source_table_index,
                     edge_table_index,
                     target_table_index,
+                    output_table_index,
                     target_label: ge.target_label.clone(),
                     source_table_oid: ge.source_table_oid,
                     target_table_oid: ge.target_table_oid,

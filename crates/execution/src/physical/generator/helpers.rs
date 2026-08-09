@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::operators::aggregate::perfect_hash_key::PerfectHashKeyDomain;
-use crate::operators::graph::state::graph_path_element_list_type;
+use paro_planner::operator::graph_expand::graph_path_element_list_type;
 
 pub(crate) fn extract_payload_expression(
     expr: Expression,
@@ -377,6 +377,7 @@ pub(crate) fn extract_schema_name_from_logical(plan: &LogicalPlan) -> Option<Str
 #[derive(Debug, Default, Clone)]
 pub(crate) struct GraphChainLayout {
     pub(crate) width: usize,
+    pub(crate) output_table_index: usize,
     pub(crate) local_id_cols: HashMap<usize, usize>,
     pub(crate) rowid_cols: HashMap<usize, usize>,
 }
@@ -386,6 +387,7 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
         LogicalOperator::GraphScan(scan) => {
             let mut layout = GraphChainLayout {
                 width: scan.output_types.len(),
+                output_table_index: scan.output_table_index,
                 ..GraphChainLayout::default()
             };
             layout.local_id_cols.insert(scan.table_index, 0);
@@ -394,6 +396,12 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
         }
         LogicalOperator::GraphExpand(expand) => {
             let mut layout = build_graph_chain_layout(expand.child.as_ref())?;
+            if layout.output_table_index != expand.output_table_index {
+                return Err(paro_error::internal(format!(
+                    "GraphExpand carrier namespace changed within a graph chain: child={}, expand={}",
+                    layout.output_table_index, expand.output_table_index
+                )));
+            }
             let base = layout.width;
             layout.rowid_cols.insert(expand.edge_table_index, base);
             layout
@@ -402,9 +410,11 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
             layout
                 .rowid_cols
                 .insert(expand.target_table_index, base + 2);
-            layout.width += 3;
-            if expand.has_path_functions {
-                layout.width += 3;
+            layout.width = expand.output_types().len();
+            if layout.width != base + 3 + usize::from(expand.has_path_functions) * 3 {
+                return Err(paro_error::internal(
+                    "GraphExpand logical carrier width is inconsistent with its child",
+                ));
             }
             Ok(layout)
         }

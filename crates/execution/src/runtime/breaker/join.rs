@@ -31,7 +31,8 @@ use super::registry::BreakerHandleMetadata;
 
 #[path = "join_runtime_filter.rs"]
 mod runtime_filter;
-pub use runtime_filter::JoinRuntimeFilterSketch;
+use runtime_filter::JoinRuntimeFilter;
+pub use runtime_filter::JoinRuntimeFilterBuilder;
 
 pub const HASH_JOIN_SPILL_MIN_RADIX_BITS: usize = 1;
 pub const HASH_JOIN_SPILL_MAX_RADIX_BITS: usize = 12;
@@ -52,8 +53,8 @@ pub struct JoinBuildHandle {
     pub stats: JoinBuildStats,
     table: Mutex<JoinHashTableState>,
     pending_consumers: Mutex<HashSet<PipelineId>>,
-    runtime_filter_builder: Mutex<Option<JoinRuntimeFilterSketch>>,
-    runtime_filter_sketch: OnceLock<JoinRuntimeFilterSketch>,
+    runtime_filter_builder: Mutex<Option<JoinRuntimeFilterBuilder>>,
+    runtime_filter: OnceLock<JoinRuntimeFilter>,
     mode: AtomicU8,
     reclaim_enabled: AtomicBool,
     spill_in_progress: AtomicBool,
@@ -74,7 +75,7 @@ impl JoinBuildHandle {
             table: Mutex::new(JoinHashTableState::Uninitialized),
             pending_consumers: Mutex::new(pending_consumers),
             runtime_filter_builder: Mutex::new(None),
-            runtime_filter_sketch: OnceLock::new(),
+            runtime_filter: OnceLock::new(),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
             reclaim_enabled: AtomicBool::new(false),
             spill_in_progress: AtomicBool::new(false),
@@ -201,39 +202,39 @@ impl JoinBuildHandle {
     ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
-            *builder = Some(JoinRuntimeFilterSketch::empty_with_memory(
+            *builder = Some(JoinRuntimeFilterBuilder::empty_with_memory(
                 key_types, memory,
             ));
         }
     }
 
-    pub fn merge_runtime_filter_sketch(
+    pub fn merge_runtime_filter_builder(
         &self,
-        sketch: Option<JoinRuntimeFilterSketch>,
+        incoming: Option<JoinRuntimeFilterBuilder>,
     ) -> Result<()> {
-        let Some(sketch) = sketch else {
+        let Some(incoming) = incoming else {
             return Ok(());
         };
         let mut builder = self.runtime_filter_builder.lock();
         match builder.as_mut() {
-            Some(existing) => existing.merge(sketch)?,
-            None => *builder = Some(sketch),
+            Some(existing) => existing.merge(incoming)?,
+            None => *builder = Some(incoming),
         }
         Ok(())
     }
 
     pub fn publish_runtime_filter_from_builder(&self) -> Result<()> {
         let mut builder = self.runtime_filter_builder.lock();
-        if self.runtime_filter_sketch.get().is_some() {
+        if self.runtime_filter.get().is_some() {
             return Ok(());
         }
-        let mut sketch = builder
+        let filter = builder
             .take()
-            .unwrap_or_else(|| JoinRuntimeFilterSketch::empty(&[]));
-        sketch.freeze();
+            .unwrap_or_else(|| JoinRuntimeFilterBuilder::empty(&[]))
+            .freeze();
         // The builder lock serializes concurrent finalize/reclaim publishers,
-        // so ownership can move into the immutable sketch without cloning it.
-        self.runtime_filter_sketch.set(sketch).map_err(|_| {
+        // so ownership can move into the immutable filter without cloning it.
+        self.runtime_filter.set(filter).map_err(|_| {
             paro_error::internal("hash join runtime filter was published concurrently")
         })?;
         Ok(())
@@ -244,13 +245,13 @@ impl JoinBuildHandle {
         build_key_index: usize,
         probe_column_id: ColumnId,
     ) -> Option<PredicateTree> {
-        self.runtime_filter_sketch
+        self.runtime_filter
             .get()
             .and_then(|filter| filter.predicate_for_column(build_key_index, probe_column_id))
     }
 
     pub fn runtime_filter_ready(&self) -> bool {
-        self.runtime_filter_sketch.get().is_some()
+        self.runtime_filter.get().is_some()
     }
 
     pub fn enable_build_reclaim(&self) {

@@ -209,7 +209,7 @@ fn build_graph_project_materialized_runtime(
 ) -> Result<GraphProjectMaterializedRuntime> {
     let mut required_cols: HashMap<usize, Vec<usize>> = HashMap::new();
     for expr in spec.expressions.iter().chain(spec.filters.iter()) {
-        collect_graph_project_table_refs(expr, &mut required_cols);
+        collect_graph_project_table_refs(expr, spec.path_table_index, &mut required_cols);
     }
     for cols in required_cols.values_mut() {
         cols.sort_unstable();
@@ -282,7 +282,7 @@ fn build_graph_project_materialized_runtime(
 
     let mut path_columns = Vec::new();
     for expr in spec.expressions.iter().chain(spec.filters.iter()) {
-        collect_graph_project_path_refs(expr, &mut path_columns);
+        collect_graph_project_path_refs(expr, spec.path_table_index, &mut path_columns);
     }
     let mut seen = HashSet::new();
     path_columns.retain(|column| seen.insert(*column));
@@ -296,12 +296,26 @@ fn build_graph_project_materialized_runtime(
     let remapped_filters = spec
         .filters
         .iter()
-        .map(|expr| remap_graph_project_expression(expr, &table_col_offsets, &path_column_map))
+        .map(|expr| {
+            remap_graph_project_expression(
+                expr,
+                spec.path_table_index,
+                &table_col_offsets,
+                &path_column_map,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let remapped_expressions = spec
         .expressions
         .iter()
-        .map(|expr| remap_graph_project_expression(expr, &table_col_offsets, &path_column_map))
+        .map(|expr| {
+            remap_graph_project_expression(
+                expr,
+                spec.path_table_index,
+                &table_col_offsets,
+                &path_column_map,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     Ok(GraphProjectMaterializedRuntime {
         table_fetches: table_fetches.into_boxed_slice(),
@@ -470,13 +484,14 @@ fn clone_chunk_refs(input: &Chunk) -> Chunk {
 
 fn remap_graph_project_expression(
     expr: &Expression,
+    path_table_index: usize,
     table_col_offsets: &HashMap<usize, usize>,
     path_column_map: &HashMap<usize, usize>,
 ) -> Result<Expression> {
     let mut missing = None;
     visit_column_refs(expr, &mut |col_ref| {
         let binding = col_ref.binding;
-        if binding.table_index == usize::MAX {
+        if binding.table_index == path_table_index {
             if !path_column_map.contains_key(&binding.column_index) {
                 missing = Some(format!("path column {}", binding.column_index));
             }
@@ -491,7 +506,7 @@ fn remap_graph_project_expression(
     }
     Ok(expr.clone().replace_column_ref(&|col_ref| {
         let binding = col_ref.binding;
-        let new_index = if binding.table_index == usize::MAX {
+        let new_index = if binding.table_index == path_table_index {
             path_column_map
                 .get(&binding.column_index)
                 .copied()
@@ -509,9 +524,13 @@ fn remap_graph_project_expression(
     }))
 }
 
-fn collect_graph_project_table_refs(expr: &Expression, out: &mut HashMap<usize, Vec<usize>>) {
+fn collect_graph_project_table_refs(
+    expr: &Expression,
+    path_table_index: usize,
+    out: &mut HashMap<usize, Vec<usize>>,
+) {
     visit_column_refs(expr, &mut |col_ref| {
-        if col_ref.binding.table_index != usize::MAX {
+        if col_ref.binding.table_index != path_table_index {
             out.entry(col_ref.binding.table_index)
                 .or_default()
                 .push(col_ref.binding.column_index);
@@ -519,9 +538,13 @@ fn collect_graph_project_table_refs(expr: &Expression, out: &mut HashMap<usize, 
     });
 }
 
-fn collect_graph_project_path_refs(expr: &Expression, out: &mut Vec<usize>) {
+fn collect_graph_project_path_refs(
+    expr: &Expression,
+    path_table_index: usize,
+    out: &mut Vec<usize>,
+) {
     visit_column_refs(expr, &mut |col_ref| {
-        if col_ref.binding.table_index == usize::MAX {
+        if col_ref.binding.table_index == path_table_index {
             out.push(col_ref.binding.column_index);
         }
     });

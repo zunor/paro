@@ -55,6 +55,7 @@ pub struct GraphRowidMapping {
 pub struct GraphProjectSpec {
     pub expressions: Box<[Expression]>,
     pub filters: Box<[Expression]>,
+    pub path_table_index: usize,
     pub rowid_mappings: Box<[GraphRowidMapping]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,

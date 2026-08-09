@@ -7,8 +7,8 @@ CREATE TABLE agg_phasee_spill(k1 INT, k2 INT, v INT);
 
 INSERT INTO agg_phasee_spill
 SELECT
-    (i % 4096)::INT AS k1,
-    ((i / 7) % 256)::INT AS k2,
+    i::INT AS k1,
+    (i % 257)::INT AS k2,
     1::INT AS v
 FROM generate_series(1, 200000) AS gs(i);
 

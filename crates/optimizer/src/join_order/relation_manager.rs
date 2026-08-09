@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use paro_common::logging::targets;
 use paro_planner::expression::{Expression, ExpressionIterator};
 use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
@@ -14,6 +15,7 @@ use paro_planner::operator::{
 use crate::expression::join_tree_has_evaluation_fence;
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::JoinRelationSetManager;
+use tracing::debug;
 
 /// A filter extracted from the logical plan together with the join semantics it came from.
 #[derive(Debug, Clone)]
@@ -295,6 +297,11 @@ impl RelationManager {
             // Extract bindings from the expression
             let mut bindings = HashSet::new();
             if !self.extract_bindings(&extracted_filter.expression, &mut bindings) {
+                debug!(
+                    target: targets::OPTIMIZER,
+                    expression = ?extracted_filter.expression,
+                    "Skipped join-region reordering because a predicate binding is external or unresolved"
+                );
                 return None;
             }
 
@@ -323,6 +330,11 @@ impl RelationManager {
 
             if !self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info)
             {
+                debug!(
+                    target: targets::OPTIMIZER,
+                    expression = ?extracted_filter.expression,
+                    "Skipped join-region reordering because a predicate binding is external or unresolved"
+                );
                 return None;
             }
             filters.push(Arc::new(filter_info));

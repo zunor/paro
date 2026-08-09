@@ -26,37 +26,38 @@ struct Verifier {
 
 #[derive(Debug)]
 struct GraphProjectionScope {
-    table_indices: HashSet<usize>,
-    path_columns: HashSet<usize>,
-    physical_width: usize,
+    materialized_table_indices: HashSet<usize>,
+    carrier_bindings: Vec<ColumnBinding>,
 }
 
 impl GraphProjectionScope {
     fn from_plan(plan: &LogicalPlan) -> Option<Self> {
         match &plan.operator {
             LogicalOperator::GraphScan(scan) => Some(Self {
-                table_indices: HashSet::from([scan.table_index]),
-                path_columns: HashSet::new(),
-                physical_width: scan.output_types.len(),
+                materialized_table_indices: HashSet::from([scan.table_index]),
+                carrier_bindings: plan.get_column_bindings(),
             }),
             LogicalOperator::GraphExpand(expand) => {
                 let mut scope = Self::from_plan(expand.child.as_ref())?;
-                scope.table_indices.insert(expand.edge_table_index);
-                scope.table_indices.insert(expand.target_table_index);
-
-                // Every expand appends edge rowid plus target local-id/rowid. A terminal
-                // path-producing expand appends the three path values after those columns.
-                scope.physical_width = scope.physical_width.checked_add(3)?;
-                if expand.has_path_functions {
-                    let path_start = scope.physical_width;
-                    let path_end = path_start.checked_add(3)?;
-                    scope.path_columns.extend(path_start..path_end);
-                    scope.physical_width = path_end;
-                }
+                scope
+                    .materialized_table_indices
+                    .insert(expand.edge_table_index);
+                scope
+                    .materialized_table_indices
+                    .insert(expand.target_table_index);
+                scope.carrier_bindings = plan.get_column_bindings();
                 Some(scope)
             }
-            LogicalOperator::Filter(filter) => Self::from_plan(filter.child.as_ref()),
-            LogicalOperator::EmptyResult(empty) => Self::from_plan(empty.child.as_ref()),
+            LogicalOperator::Filter(filter) => {
+                let mut scope = Self::from_plan(filter.child.as_ref())?;
+                scope.carrier_bindings = plan.get_column_bindings();
+                Some(scope)
+            }
+            LogicalOperator::EmptyResult(empty) => {
+                let mut scope = Self::from_plan(empty.child.as_ref())?;
+                scope.carrier_bindings = plan.get_column_bindings();
+                Some(scope)
+            }
             _ => None,
         }
     }
@@ -277,15 +278,14 @@ impl Verifier {
                 return Ok(());
             }
             let binding = column.binding;
-            let available = if binding.table_index == usize::MAX {
-                scope.path_columns.contains(&binding.column_index)
-            } else {
-                scope.table_indices.contains(&binding.table_index)
-            };
+            let available = scope.carrier_bindings.contains(&binding)
+                || scope
+                    .materialized_table_indices
+                    .contains(&binding.table_index);
             if !available {
                 return Err(paro_error::internal(format!(
-                    "Graph projection expression references unavailable binding {:?}; graph tables: {:?}, path columns: {:?}",
-                    binding, scope.table_indices, scope.path_columns
+                    "Graph projection expression references unavailable binding {:?}; materialized tables: {:?}, carrier bindings: {:?}",
+                    binding, scope.materialized_table_indices, scope.carrier_bindings
                 )));
             }
             return Ok(());

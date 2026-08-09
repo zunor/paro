@@ -9,6 +9,7 @@ use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
+use paro_planner::operator::graph_expand::graph_path_element_list_type;
 use paro_storage::index::graph::GraphReadSnapshot;
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::tablet::TabletReader;
@@ -67,29 +68,24 @@ pub(crate) fn graph_path_list_value(elements: &[GraphPathElement]) -> Value {
     )
 }
 
-pub(crate) fn graph_path_element_list_type() -> LogicalType {
-    LogicalType::List(Box::new(graph_path_element_type()))
-}
-
 fn graph_path_element_value(element: &GraphPathElement) -> Value {
+    let LogicalType::Struct(fields) = graph_path_element_type() else {
+        unreachable!("graph path element type is a struct")
+    };
     Value::Struct(
         vec![
             Value::UBigInt(element.table_oid),
             Value::UBigInt(element.rowid),
         ],
-        graph_path_element_fields(),
+        fields,
     )
 }
 
 fn graph_path_element_type() -> LogicalType {
-    LogicalType::Struct(graph_path_element_fields())
-}
-
-fn graph_path_element_fields() -> Vec<(String, LogicalType)> {
-    vec![
-        ("table_oid".to_string(), LogicalType::UBigInt),
-        ("rowid".to_string(), LogicalType::UBigInt),
-    ]
+    let LogicalType::List(element) = graph_path_element_list_type() else {
+        unreachable!("graph path payload type is a list")
+    };
+    *element
 }
 
 #[derive(Debug)]

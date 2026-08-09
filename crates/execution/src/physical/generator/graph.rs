@@ -133,6 +133,7 @@ impl PhysicalPlanGenerator {
             .unwrap_or_else(|| "public".to_string());
         let rowid_mappings =
             build_rowid_mappings_from_logical(project.child.as_ref(), &schema_name)?;
+        let path_table_index = build_graph_chain_layout(project.child.as_ref())?.output_table_index;
         let filters = collect_graph_filters_from_logical(project.child.as_ref());
         let output_names = align_output_names(
             project.output_names.clone(),
@@ -147,6 +148,7 @@ impl PhysicalPlanGenerator {
         let spec = GraphProjectSpec {
             expressions: project.expressions.clone().into_boxed_slice(),
             filters: filters.into_boxed_slice(),
+            path_table_index,
             rowid_mappings: rowid_mappings.into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
