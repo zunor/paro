@@ -223,8 +223,8 @@ mod tests {
         let mut filter = FilterInfo::new_inner(expr, set, filter_index);
         filter.set_left_set(left_set);
         filter.set_right_set(right_set);
-        filter.set_left_binding(ColumnBinding::new(left_table, left_col));
-        filter.set_right_binding(ColumnBinding::new(right_table, right_col));
+        filter.set_left_binding(ColumnBinding::new(left_table, left_col), left_table);
+        filter.set_right_binding(ColumnBinding::new(right_table, right_col), right_table);
 
         Arc::new(filter)
     }
@@ -491,7 +491,7 @@ mod tests {
                     0,
                     [
                         DistinctCount::new(150_000, false),
-                        DistinctCount::new(150_000, false),
+                        DistinctCount::new(25, false),
                     ],
                 ),
                 stats_initialized: true,
@@ -503,7 +503,7 @@ mod tests {
                     1,
                     [
                         DistinctCount::new(1_500_000, false),
-                        DistinctCount::new(1_500_000, false),
+                        DistinctCount::new(150_000, false),
                     ],
                 ),
                 stats_initialized: true,
@@ -514,8 +514,8 @@ mod tests {
                 column_distinct_count: column_distinct_counts(
                     2,
                     [
-                        DistinctCount::new(6_001_215, false),
-                        DistinctCount::new(6_001_215, false),
+                        DistinctCount::new(1_500_000, false),
+                        DistinctCount::new(10_000, false),
                     ],
                 ),
                 stats_initialized: true,
@@ -527,7 +527,7 @@ mod tests {
                     3,
                     [
                         DistinctCount::new(10_000, false),
-                        DistinctCount::new(10_000, false),
+                        DistinctCount::new(25, false),
                     ],
                 ),
                 stats_initialized: true,
@@ -557,18 +557,23 @@ mod tests {
 
         let customer_nation_region = sets.get_relation_from_vec(vec![0, 4, 5]);
         let customer_orders = sets.get_relation_from_vec(vec![0, 1]);
+        let customer_supplier = sets.get_relation_from_vec(vec![0, 3]);
         let filtered_orders = sets.get_relation_from_vec(vec![0, 1, 4, 5]);
         let customer_supplier_nation_region = sets.get_relation_from_vec(vec![0, 3, 4, 5]);
         let full_join = sets.get_relation_from_vec(vec![0, 1, 2, 3, 4, 5]);
 
         assert_eq!(model.get_cardinality(&customer_nation_region), 30_000.0);
         assert_eq!(model.get_cardinality(&customer_orders), 135_000.0);
+        // The nation equality class is bounded by the 25-row nation domain,
+        // even when nation itself is not yet part of this DP subset. Ignoring
+        // that class-wide bound makes this explosive join look selective.
+        assert_eq!(model.get_cardinality(&customer_supplier), 60_000_000.0);
         assert_eq!(model.get_cardinality(&filtered_orders), 27_000.0);
         assert_eq!(
             model.get_cardinality(&customer_supplier_nation_region),
             12_000_000.0
         );
-        assert!((model.get_cardinality(&full_join) - 4_320.8748).abs() < 1e-6);
+        assert!((model.get_cardinality(&full_join) - 4_320.874_8).abs() < 1e-6);
     }
 
     #[test]

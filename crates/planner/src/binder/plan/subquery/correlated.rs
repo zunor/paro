@@ -995,7 +995,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(output_types.len(), 2);
                 assert_eq!(output_names.len(), 2);
             }
@@ -1043,7 +1043,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0, 2]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0, 2][..]));
                 assert_eq!(output_types.len(), 3);
                 assert_eq!(output_names.len(), 3);
             }
@@ -1081,7 +1081,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(output_types.len(), 2);
             }
             other => panic!("expected comparison join, got {other:?}"),
@@ -1115,7 +1115,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(
                     extract_binding(&join.conditions[0].right),
                     Some(ColumnBinding::new(361, 1))
@@ -1176,7 +1176,7 @@ mod tests {
 
             match plan {
                 LogicalOperator::Join(Join::Comparison(join)) => {
-                    assert_eq!(join.right_projection_map, vec![0]);
+                    assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                     assert_eq!(
                         extract_binding(&join.conditions[0].right),
                         Some(ColumnBinding::new(setop_table, 1)),
@@ -1242,7 +1242,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0, 2]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0, 2][..]));
                 assert_eq!(output_types.len(), 3);
             }
             other => panic!("expected comparison join, got {other:?}"),

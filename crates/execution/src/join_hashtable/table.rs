@@ -170,6 +170,10 @@ pub struct JoinHashTable {
     /// Optional exact index owner for bounded unique integer equality keys.
     integer_index: Mutex<Option<Box<ExactIntegerJoinIndex>>>,
 
+    /// Build-time bounds accumulated from hot key vectors. Keeping this local
+    /// to each parallel table removes a full serialized-row pass at finalize.
+    integer_index_build_stats: Mutex<IntegerIndexBuildStats>,
+
     /// Lock-free read pointer published with `finalized`.
     probe_integer_index: AtomicPtr<ExactIntegerJoinIndex>,
 
@@ -205,6 +209,117 @@ pub struct JoinHashTable {
 
     /// Row count.
     count: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegerIndexBuildStats {
+    Ineligible,
+    Empty {
+        kind: IntegerKeyKind,
+    },
+    Bounded {
+        kind: IntegerKeyKind,
+        minimum: u128,
+        maximum: u128,
+        count: usize,
+    },
+}
+
+impl IntegerIndexBuildStats {
+    fn new(
+        join_type: JoinType,
+        equality_types: &[LogicalType],
+        comparisons: &[JoinComparisonType],
+    ) -> Self {
+        if join_type != JoinType::Inner
+            || equality_types.len() != 1
+            || comparisons
+                .iter()
+                .any(|comparison| *comparison != JoinComparisonType::Equal)
+        {
+            return Self::Ineligible;
+        }
+        IntegerKeyKind::from_logical_type(&equality_types[0])
+            .map_or(Self::Ineligible, |kind| Self::Empty { kind })
+    }
+
+    fn add_batch(&mut self, vector: &Vector, logical_count: usize, selected: &[u32]) -> Result<()> {
+        let kind = match *self {
+            Self::Empty { kind } | Self::Bounded { kind, .. } => kind,
+            Self::Ineligible => return Ok(()),
+        };
+        let Some((minimum, maximum)) = kind.selected_bounds(vector, logical_count, selected)?
+        else {
+            *self = Self::Ineligible;
+            return Ok(());
+        };
+        *self = match *self {
+            Self::Empty { .. } => Self::Bounded {
+                kind,
+                minimum,
+                maximum,
+                count: selected.len(),
+            },
+            Self::Bounded {
+                minimum: current_minimum,
+                maximum: current_maximum,
+                count,
+                ..
+            } => Self::Bounded {
+                kind,
+                minimum: current_minimum.min(minimum),
+                maximum: current_maximum.max(maximum),
+                count: count.saturating_add(selected.len()),
+            },
+            Self::Ineligible => unreachable!("ineligible stats returned above"),
+        };
+        Ok(())
+    }
+
+    fn merge(&mut self, incoming: Self) {
+        *self = match (*self, incoming) {
+            (Self::Ineligible, _) | (_, Self::Ineligible) => Self::Ineligible,
+            (
+                current @ Self::Empty { kind },
+                Self::Empty {
+                    kind: incoming_kind,
+                },
+            ) if kind == incoming_kind => current,
+            (
+                Self::Empty { kind },
+                bounded @ Self::Bounded {
+                    kind: incoming_kind,
+                    ..
+                },
+            ) if kind == incoming_kind => bounded,
+            (
+                bounded @ Self::Bounded { kind, .. },
+                Self::Empty {
+                    kind: incoming_kind,
+                },
+            ) if kind == incoming_kind => bounded,
+            (
+                Self::Bounded {
+                    kind,
+                    minimum,
+                    maximum,
+                    count,
+                },
+                Self::Bounded {
+                    kind: incoming_kind,
+                    minimum: incoming_minimum,
+                    maximum: incoming_maximum,
+                    count: incoming_count,
+                },
+            ) if kind == incoming_kind => Self::Bounded {
+                kind,
+                minimum: minimum.min(incoming_minimum),
+                maximum: maximum.max(incoming_maximum),
+                count: count.saturating_add(incoming_count),
+            },
+            _ => Self::Ineligible,
+        };
+    }
 }
 
 impl std::fmt::Debug for JoinHashTable {
@@ -302,6 +417,8 @@ impl JoinHashTable {
         let pointer_offset = build_row_layout.next_offset();
         let hash_offset = build_row_layout.hash_offset();
         let found_flag_offset = found_flag_column_index.map(|_| build_row_layout.found_offset());
+        let integer_index_build_stats =
+            IntegerIndexBuildStats::new(join_type, &equality_types, &equality_comparisons);
 
         Self {
             buffer_pool,
@@ -321,6 +438,7 @@ impl JoinHashTable {
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
             integer_index: Mutex::new(None),
+            integer_index_build_stats: Mutex::new(integer_index_build_stats),
             probe_integer_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
@@ -480,6 +598,11 @@ impl JoinHashTable {
             std::mem::replace(&mut *store, empty_store)
         };
         self.count.store(0, Ordering::Relaxed);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
         drained_store.drain_spill_chunks(visitor)
     }
 
@@ -510,6 +633,11 @@ impl JoinHashTable {
         let drained_store = std::mem::replace(&mut *store, empty_store);
         drop(store);
         self.count.store(0, Ordering::Relaxed);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
         drained_store.drain_spill_chunks(visitor)?;
         Ok(Some(drained_bytes))
     }
@@ -632,11 +760,20 @@ impl JoinHashTable {
         self.reset_runtime_state();
         self.build_store.lock().unwrap().reset();
         self.count.store(0, Ordering::Relaxed);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
     }
 
     pub fn refresh_count_from_data_collection(&self) {
         let count = self.build_store.lock().unwrap().count() as usize;
         self.count.store(count, Ordering::Relaxed);
+        // Callers that populate the row store directly bypass vector-domain
+        // collection. The optional exact index must decline rather than trust
+        // incomplete bounds.
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::Ineligible;
     }
 
     /// Build by appending keys and payload to the build store.
@@ -692,6 +829,14 @@ impl JoinHashTable {
             hashes,
             false,
         )?;
+
+        let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
+        if !matches!(*integer_stats, IntegerIndexBuildStats::Ineligible) {
+            let key = keys.column(0).ok_or_else(|| {
+                paro_error::internal("hash join build has no first equality-key column")
+            })?;
+            integer_stats.add_batch(key, keys.size(), &build_sel.as_slice()[..appended_count])?;
+        }
 
         // Update count
         self.count.fetch_add(appended_count, Ordering::Relaxed);
@@ -784,42 +929,20 @@ impl JoinHashTable {
     /// Build an exact compact index when the single equality key is a bounded
     /// integer and unique on the build side.
     fn try_build_integer_index(&self) -> Result<Option<ExactIntegerJoinIndex>> {
-        if self.join_type != JoinType::Inner
-            || self.equality_types.is_empty()
-            || self.equality_types.len() != 1
-            || self
-                .equality_comparisons
-                .iter()
-                .any(|comparison| *comparison != JoinComparisonType::Equal)
-        {
-            return Ok(None);
-        }
-        let Some(kind) = IntegerKeyKind::from_logical_type(&self.equality_types[0]) else {
+        let IntegerIndexBuildStats::Bounded {
+            kind,
+            minimum: min_ordinal,
+            maximum: max_ordinal,
+            count: measured_count,
+        } = *self.integer_index_build_stats.lock().unwrap()
+        else {
             return Ok(None);
         };
-
-        let store = self.build_store.lock().unwrap();
-        let mut min_ordinal = u128::MAX;
-        let mut max_ordinal = 0_u128;
-        let mut measured_count = 0usize;
-        store.visit_row_ptrs(|row_ptr| {
-            let ordinal = kind
-                .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
-                .ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "integer join build key does not match declared type {:?}",
-                        self.equality_types[0]
-                    ))
-                })?;
-            min_ordinal = min_ordinal.min(ordinal);
-            max_ordinal = max_ordinal.max(ordinal);
-            measured_count += 1;
-            Ok(())
-        })?;
-        if measured_count == 0 {
+        if measured_count == 0 || measured_count != self.count() {
             return Ok(None);
         }
 
+        let store = self.build_store.lock().unwrap();
         let mut index = match ExactIntegerJoinIndex::try_new(
             kind,
             min_ordinal,
@@ -904,6 +1027,11 @@ impl JoinHashTable {
         // Count is updated by combine
         let self_count = self_store.count() as usize;
         self.count.store(self_count, Ordering::Relaxed);
+        let incoming_stats = *other.integer_index_build_stats.lock().unwrap();
+        self.integer_index_build_stats
+            .lock()
+            .unwrap()
+            .merge(incoming_stats);
 
         Ok(())
     }

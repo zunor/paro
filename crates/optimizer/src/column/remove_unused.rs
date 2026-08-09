@@ -186,12 +186,18 @@ impl<'a> RemoveUnusedColumns<'a> {
         get.names = new_names;
     }
 
-    fn projected_bindings(plan: &LogicalPlan, projection: &[usize]) -> Vec<ColumnBinding> {
+    fn projected_bindings(
+        plan: &LogicalPlan,
+        projection: &paro_planner::operator::ProjectionMap,
+    ) -> Vec<ColumnBinding> {
         let bindings = plan.get_column_bindings();
-        projection
-            .iter()
-            .filter_map(|index| bindings.get(*index).copied())
-            .collect()
+        match projection.as_columns() {
+            None => bindings,
+            Some(indices) => indices
+                .iter()
+                .filter_map(|index| bindings.get(*index).copied())
+                .collect(),
+        }
     }
 
     fn remap_bindings(bindings: &mut [ColumnBinding], replacements: &[ReplacementBinding]) {
@@ -492,21 +498,25 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                         join.left_projection_map = Self::rebuild_projection_map(
                             join.left.as_ref(),
                             &projected_left_bindings,
-                        );
+                        )
+                        .into();
                         join.right_projection_map = Self::rebuild_projection_map(
                             join.right.as_ref(),
                             &projected_right_bindings,
-                        );
+                        )
+                        .into();
                     }
                     paro_planner::operator::Join::Any(join) => {
                         join.left_projection_map = Self::rebuild_projection_map(
                             join.left.as_ref(),
                             &projected_left_bindings,
-                        );
+                        )
+                        .into();
                         join.right_projection_map = Self::rebuild_projection_map(
                             join.right.as_ref(),
                             &projected_right_bindings,
-                        );
+                        )
+                        .into();
                     }
                     paro_planner::operator::Join::Cross(_) => {}
                 }
@@ -958,7 +968,7 @@ mod tests {
             )],
         );
         join.duplicate_eliminated_columns = vec![int_column(10, 1)];
-        join.right_projection_map = vec![0];
+        join.right_projection_map = vec![0].into();
         let joined = LogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)));
         let mut plan = LogicalPlan::new(
             ctx,

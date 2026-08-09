@@ -34,12 +34,6 @@ impl Sort {
         projection_map: Vec<usize>,
         is_index_sort: bool,
     ) -> Result<Self> {
-        let projection_map = if projection_map.is_empty() {
-            (0..input_types.len()).collect()
-        } else {
-            projection_map
-        };
-
         let sort_key_modifiers = orders
             .iter()
             .map(|order| OrderModifiers::new(order.ascending, order.nulls_first))

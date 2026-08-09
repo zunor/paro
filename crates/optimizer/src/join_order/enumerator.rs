@@ -553,8 +553,8 @@ mod tests {
         let mut filter = FilterInfo::new_inner(expr, set, filter_index);
         filter.set_left_set(left_set);
         filter.set_right_set(right_set);
-        filter.set_left_binding(ColumnBinding::new(left_table, left_col));
-        filter.set_right_binding(ColumnBinding::new(right_table, right_col));
+        filter.set_left_binding(ColumnBinding::new(left_table, left_col), left_table);
+        filter.set_right_binding(ColumnBinding::new(right_table, right_col), right_table);
 
         Arc::new(filter)
     }

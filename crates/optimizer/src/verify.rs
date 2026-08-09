@@ -24,6 +24,44 @@ struct Verifier {
     seen_table_indices: HashSet<usize>,
 }
 
+#[derive(Debug)]
+struct GraphProjectionScope {
+    table_indices: HashSet<usize>,
+    path_columns: HashSet<usize>,
+    physical_width: usize,
+}
+
+impl GraphProjectionScope {
+    fn from_plan(plan: &LogicalPlan) -> Option<Self> {
+        match &plan.operator {
+            LogicalOperator::GraphScan(scan) => Some(Self {
+                table_indices: HashSet::from([scan.table_index]),
+                path_columns: HashSet::new(),
+                physical_width: scan.output_types.len(),
+            }),
+            LogicalOperator::GraphExpand(expand) => {
+                let mut scope = Self::from_plan(expand.child.as_ref())?;
+                scope.table_indices.insert(expand.edge_table_index);
+                scope.table_indices.insert(expand.target_table_index);
+
+                // Every expand appends edge rowid plus target local-id/rowid. A terminal
+                // path-producing expand appends the three path values after those columns.
+                scope.physical_width = scope.physical_width.checked_add(3)?;
+                if expand.has_path_functions {
+                    let path_start = scope.physical_width;
+                    let path_end = path_start.checked_add(3)?;
+                    scope.path_columns.extend(path_start..path_end);
+                    scope.physical_width = path_end;
+                }
+                Some(scope)
+            }
+            LogicalOperator::Filter(filter) => Self::from_plan(filter.child.as_ref()),
+            LogicalOperator::EmptyResult(empty) => Self::from_plan(empty.child.as_ref()),
+            _ => None,
+        }
+    }
+}
+
 impl Verifier {
     fn verify_operator(&mut self, op: &LogicalOperator) -> Result<()> {
         for idx in op.get_table_index() {
@@ -113,16 +151,34 @@ impl Verifier {
                         )));
                     }
                 }
-                let child_bindings = proj.child.get_column_bindings();
-                for expression in &proj.expressions {
-                    self.verify_expression_bindings(expression, &child_bindings, "Projection")?;
+                if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
+                    for expression in &proj.expressions {
+                        self.verify_graph_projection_bindings(expression, &scope)?;
+                    }
+                } else {
+                    let child_bindings = proj.child.get_column_bindings();
+                    for expression in &proj.expressions {
+                        self.verify_expression_bindings(expression, &child_bindings, "Projection")?;
+                    }
                 }
             }
             LogicalOperator::Filter(filter) => {
                 let child_bindings = filter.child.get_column_bindings();
+                Self::verify_projection_map(
+                    "Filter",
+                    &filter.projection_map,
+                    child_bindings.len(),
+                )?;
                 for expression in &filter.expressions {
                     self.verify_expression_bindings(expression, &child_bindings, "Filter")?;
                 }
+            }
+            LogicalOperator::Order(order) => {
+                Self::verify_projection_map(
+                    "Order",
+                    &order.projection_map,
+                    order.child.types().len(),
+                )?;
             }
             LogicalOperator::Aggregate(agg) => {
                 let expected =
@@ -211,6 +267,39 @@ impl Verifier {
         result
     }
 
+    fn verify_graph_projection_bindings(
+        &self,
+        expression: &Expression,
+        scope: &GraphProjectionScope,
+    ) -> Result<()> {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth != 0 {
+                return Ok(());
+            }
+            let binding = column.binding;
+            let available = if binding.table_index == usize::MAX {
+                scope.path_columns.contains(&binding.column_index)
+            } else {
+                scope.table_indices.contains(&binding.table_index)
+            };
+            if !available {
+                return Err(paro_error::internal(format!(
+                    "Graph projection expression references unavailable binding {:?}; graph tables: {:?}, path columns: {:?}",
+                    binding, scope.table_indices, scope.path_columns
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expression, |child| {
+            if result.is_ok() {
+                result = self.verify_graph_projection_bindings(child, scope);
+            }
+        });
+        result
+    }
+
     fn verify_join_projection_maps(&self, join: &Join) -> Result<()> {
         match join {
             Join::Comparison(cj) => {
@@ -242,29 +331,35 @@ impl Verifier {
                         "comparison join build key",
                     )?;
                 }
-                for &idx in &cj.left_projection_map {
-                    if idx >= left_len {
-                        return Err(paro_error::internal(format!(
-                            "Join left_projection_map index {} out of range (left types={})",
-                            idx, left_len
-                        )));
-                    }
-                }
-                for &idx in &cj.right_projection_map {
-                    if idx >= right_len {
-                        return Err(paro_error::internal(format!(
-                            "Join right_projection_map index {} out of range (right types={})",
-                            idx, right_len
-                        )));
-                    }
+                Self::verify_projection_map(
+                    "Join left_projection_map",
+                    &cj.left_projection_map,
+                    left_len,
+                )?;
+                Self::verify_projection_map(
+                    "Join right_projection_map",
+                    &cj.right_projection_map,
+                    right_len,
+                )?;
+                if matches!(
+                    cj.join_type,
+                    paro_planner::operator::JoinType::Semi
+                        | paro_planner::operator::JoinType::Anti
+                        | paro_planner::operator::JoinType::Mark
+                ) && !cj.right_projection_map.is_none()
+                {
+                    return Err(paro_error::internal(
+                        "SEMI/ANTI/MARK join must not project right columns".to_string(),
+                    ));
                 }
                 if matches!(
                     cj.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                ) && !cj.right_projection_map.is_empty()
+                    paro_planner::operator::JoinType::RightSemi
+                        | paro_planner::operator::JoinType::RightAnti
+                ) && !cj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
-                        "SEMI/ANTI join must not project right columns".to_string(),
+                        "RIGHT SEMI/ANTI join must not project left columns".to_string(),
                     ));
                 }
             }
@@ -278,33 +373,63 @@ impl Verifier {
                     &input_bindings,
                     "ANY join condition",
                 )?;
-                for &idx in &aj.left_projection_map {
-                    if idx >= left_len {
-                        return Err(paro_error::internal(format!(
-                            "Join left_projection_map index {} out of range (left types={})",
-                            idx, left_len
-                        )));
-                    }
-                }
-                for &idx in &aj.right_projection_map {
-                    if idx >= right_len {
-                        return Err(paro_error::internal(format!(
-                            "Join right_projection_map index {} out of range (right types={})",
-                            idx, right_len
-                        )));
-                    }
+                Self::verify_projection_map(
+                    "Join left_projection_map",
+                    &aj.left_projection_map,
+                    left_len,
+                )?;
+                Self::verify_projection_map(
+                    "Join right_projection_map",
+                    &aj.right_projection_map,
+                    right_len,
+                )?;
+                if matches!(
+                    aj.join_type,
+                    paro_planner::operator::JoinType::Semi
+                        | paro_planner::operator::JoinType::Anti
+                        | paro_planner::operator::JoinType::Mark
+                ) && !aj.right_projection_map.is_none()
+                {
+                    return Err(paro_error::internal(
+                        "SEMI/ANTI/MARK join must not project right columns".to_string(),
+                    ));
                 }
                 if matches!(
                     aj.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                ) && !aj.right_projection_map.is_empty()
+                    paro_planner::operator::JoinType::RightSemi
+                        | paro_planner::operator::JoinType::RightAnti
+                ) && !aj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
-                        "SEMI/ANTI join must not project right columns".to_string(),
+                        "RIGHT SEMI/ANTI join must not project left columns".to_string(),
                     ));
                 }
             }
             Join::Cross(_) => {}
+        }
+        Ok(())
+    }
+
+    fn verify_projection_map(
+        label: &str,
+        projection_map: &paro_planner::operator::ProjectionMap,
+        child_width: usize,
+    ) -> Result<()> {
+        let Some(indices) = projection_map.as_columns() else {
+            return Ok(());
+        };
+        let mut seen = HashSet::with_capacity(indices.len());
+        for &index in indices {
+            if index >= child_width {
+                return Err(paro_error::internal(format!(
+                    "{label} index {index} out of range (child columns={child_width})"
+                )));
+            }
+            if !seen.insert(index) {
+                return Err(paro_error::internal(format!(
+                    "{label} contains duplicate child index {index}"
+                )));
+            }
         }
         Ok(())
     }

@@ -997,25 +997,35 @@ impl ScanStructure {
         }
 
         let emit_count = (left.size() - self.probe_output_offset).min(result.capacity());
-        let mut left_sel = SelectionVector::try_with_capacity(emit_count, self.allocator.clone())?;
-        left_sel.set_len(emit_count);
+        result.try_reset(result.allocator().clone())?;
+        self.scratch_sel.try_make_exclusive()?;
+        self.scratch_sel.set_len(emit_count);
         for output_idx in 0..emit_count {
-            left_sel.set(output_idx, self.probe_output_offset + output_idx);
+            self.scratch_sel
+                .set(output_idx, self.probe_output_offset + output_idx);
         }
-        let left_indices = left_projection_map.to_vec();
-
-        for (out_idx, left_idx) in left_indices.iter().enumerate() {
+        let left_sel = self.scratch_sel.clone();
+        for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
+            let left_column = left.data.get(*left_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "single join left projection index {left_idx} is out of range for {} columns",
+                    left.column_count()
+                ))
+            })?;
             result.data[out_idx] = Arc::new(Vector::try_dictionary(
-                Arc::clone(&left.data[*left_idx]),
+                Arc::clone(left_column),
                 left_sel.clone(),
             )?);
         }
 
-        let right_offset = left_indices.len();
+        let right_offset = left_projection_map.len();
         for build_idx in 0..hash_table.build_types.len() {
-            let vector = result
-                .column_mut(right_offset + build_idx)
-                .expect("single join output vector must exist");
+            let vector = result.column_mut(right_offset + build_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "single join output column {} is missing",
+                    right_offset + build_idx
+                ))
+            })?;
             let start = self.probe_output_offset;
             let row_ptrs = &self.single_match_pointers[start..start + emit_count];
             // SAFETY: match pointers are either zero for an unmatched probe row
@@ -1064,16 +1074,46 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
     ) -> Result<()> {
-        let left_indices = left_projection_map.to_vec();
-        let mut expected_types = left_indices
-            .iter()
-            .map(|left_idx| left.data[*left_idx].logical_type().clone())
-            .collect::<Vec<_>>();
-        expected_types.extend(hash_table.build_types.iter().cloned());
-        if result.column_count() != expected_types.len()
+        let expected_column_count = left_projection_map.len() + hash_table.build_types.len();
+        let left_layout_matches =
+            left_projection_map
+                .iter()
+                .enumerate()
+                .all(|(out_idx, &left_idx)| {
+                    left.data
+                        .get(left_idx)
+                        .zip(result.data.get(out_idx))
+                        .is_some_and(|(left_column, result_column)| {
+                            left_column.logical_type() == result_column.logical_type()
+                        })
+                });
+        let right_layout_matches =
+            hash_table
+                .build_types
+                .iter()
+                .enumerate()
+                .all(|(build_idx, build_type)| {
+                    result
+                        .data
+                        .get(left_projection_map.len() + build_idx)
+                        .is_some_and(|column| column.logical_type() == build_type)
+                });
+        if result.column_count() != expected_column_count
             || result.capacity() < count
-            || result.types() != expected_types
+            || !left_layout_matches
+            || !right_layout_matches
         {
+            let mut expected_types = Vec::with_capacity(expected_column_count);
+            for &left_idx in left_projection_map {
+                let left_column = left.data.get(left_idx).ok_or_else(|| {
+                    paro_common::error::internal(format!(
+                        "join left projection index {left_idx} is out of range for {} columns",
+                        left.column_count()
+                    ))
+                })?;
+                expected_types.push(left_column.logical_type().clone());
+            }
+            expected_types.extend(hash_table.build_types.iter().cloned());
             *result = paro_common::chunk::Chunk::try_initialize(
                 &expected_types,
                 VECTOR_SIZE.max(count),
@@ -1087,16 +1127,22 @@ impl ScanStructure {
         lhs_sel.set_len(count);
 
         // 1. Copy projected LHS columns
-        for (out_idx, left_idx) in left_indices.iter().enumerate() {
+        for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
+            let left_column = left.data.get(*left_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "join left projection index {left_idx} is out of range for {} columns",
+                    left.column_count()
+                ))
+            })?;
             // Reference the columns with selection vector
             result.data[out_idx] = Arc::new(Vector::try_dictionary(
-                left.data[*left_idx].clone(),
+                left_column.clone(),
                 lhs_sel.clone(),
             )?);
         }
 
         // 2. Gather projected RHS columns
-        let right_result_offset = left_indices.len();
+        let right_result_offset = left_projection_map.len();
         let unique_rhs_count = self.prepare_rhs_dictionary(count)?;
         for (build_idx, build_type) in hash_table.build_types.iter().enumerate() {
             let output_idx = right_result_offset + build_idx;
@@ -1107,9 +1153,9 @@ impl ScanStructure {
             } else {
                 &self.rhs_pointers[..count]
             };
-            let output = result
-                .column_mut(output_idx)
-                .expect("join output vector must exist");
+            let output = result.column_mut(output_idx).ok_or_else(|| {
+                paro_common::error::internal(format!("join output column {output_idx} is missing"))
+            })?;
             // SAFETY: these row pointers were obtained from `hash_table` while
             // resolving the current probe matches.
             unsafe { hash_table.gather_build_column(row_ptrs, build_idx, output)? };

@@ -89,6 +89,21 @@ pub(crate) fn query_hash_table_memory(
     )
 }
 
+/// Perfect-hash tables are fixed-size, planner-admitted direct-address arrays.
+/// They have no partial spill representation, so classify their bounded memory
+/// honestly instead of advertising it to the revocable-memory reclaimer.
+pub(crate) fn query_perfect_hash_memory(
+    query: &crate::runtime::context::QueryRuntimeContext,
+) -> MemoryAccountingContext {
+    let owner: Arc<dyn paro_common::memory::MemoryOwner> = query.memory.clone();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    )
+}
+
 /// Map aggregate inputs to Vec<Vec<usize>>.
 pub(crate) fn aggregate_inputs(spec: &AggregateSpec) -> Vec<Vec<usize>> {
     spec.aggregate_inputs

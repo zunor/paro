@@ -437,7 +437,11 @@ fn sort_range_column_stats_for_output(
     match &plan.operator {
         LogicalOperator::Get(get) => sort_range_get_column_stats(get, output_idx),
         LogicalOperator::Filter(filter) => {
-            let child_idx = projected_child_index(&filter.projection_map, output_idx)?;
+            let child_idx = projected_child_index(
+                &filter.projection_map,
+                filter.child.types().len(),
+                output_idx,
+            )?;
             sort_range_column_stats_for_output(filter.child.as_ref(), child_idx)
         }
         LogicalOperator::Projection(project) => {
@@ -448,7 +452,11 @@ fn sort_range_column_stats_for_output(
             sort_range_column_stats_for_output(limit.child.as_ref(), output_idx)
         }
         LogicalOperator::Order(order) => {
-            let child_idx = projected_child_index(&order.projection_map, output_idx)?;
+            let child_idx = projected_child_index(
+                &order.projection_map,
+                order.child.types().len(),
+                output_idx,
+            )?;
             sort_range_column_stats_for_output(order.child.as_ref(), child_idx)
         }
         LogicalOperator::TopN(topn) => {
@@ -458,11 +466,14 @@ fn sort_range_column_stats_for_output(
     }
 }
 
-fn projected_child_index(projection_map: &[usize], output_idx: usize) -> Option<usize> {
-    if projection_map.is_empty() {
-        Some(output_idx)
-    } else {
-        projection_map.get(output_idx).copied()
+fn projected_child_index(
+    projection_map: &paro_planner::operator::ProjectionMap,
+    child_width: usize,
+    output_idx: usize,
+) -> Option<usize> {
+    match projection_map.as_columns() {
+        None => (output_idx < child_width).then_some(output_idx),
+        Some(indices) => indices.get(output_idx).copied(),
     }
 }
 

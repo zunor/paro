@@ -321,7 +321,10 @@ impl RelationManager {
                 extracted_filter.anti_join_mode,
             );
 
-            self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info);
+            if !self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info)
+            {
+                return None;
+            }
             filters.push(Arc::new(filter_info));
         }
 
@@ -421,7 +424,7 @@ impl RelationManager {
         extracted_filter: &ExtractedFilter,
         set_manager: &mut JoinRelationSetManager,
         filter_info: &mut FilterInfo,
-    ) {
+    ) -> bool {
         match &extracted_filter.expression {
             Expression::Comparison(comp) => {
                 let mut left_bindings = HashSet::new();
@@ -429,7 +432,7 @@ impl RelationManager {
                 if !self.extract_bindings(&comp.left, &mut left_bindings)
                     || !self.extract_bindings(&comp.right, &mut right_bindings)
                 {
-                    return;
+                    return false;
                 }
 
                 if !left_bindings.is_empty() && !right_bindings.is_empty() {
@@ -438,10 +441,16 @@ impl RelationManager {
                 }
 
                 if let Some(binding) = Self::extract_column_binding(&comp.left) {
-                    filter_info.set_left_binding(binding);
+                    let Some(relation) = self.get_relation_id(binding.table_index) else {
+                        return false;
+                    };
+                    filter_info.set_left_binding(binding, relation);
                 }
                 if let Some(binding) = Self::extract_column_binding(&comp.right) {
-                    filter_info.set_right_binding(binding);
+                    let Some(relation) = self.get_relation_id(binding.table_index) else {
+                        return false;
+                    };
+                    filter_info.set_right_binding(binding, relation);
                 }
             }
             Expression::Conjunction(conj)
@@ -464,12 +473,18 @@ impl RelationManager {
 
                     if filter_info.left_binding.is_none() {
                         if let Some(binding) = Self::extract_column_binding(&comp.left) {
-                            filter_info.set_left_binding(binding);
+                            let Some(relation) = self.get_relation_id(binding.table_index) else {
+                                return false;
+                            };
+                            filter_info.set_left_binding(binding, relation);
                         }
                     }
                     if filter_info.right_binding.is_none() {
                         if let Some(binding) = Self::extract_column_binding(&comp.right) {
-                            filter_info.set_right_binding(binding);
+                            let Some(relation) = self.get_relation_id(binding.table_index) else {
+                                return false;
+                            };
+                            filter_info.set_right_binding(binding, relation);
                         }
                     }
                 }
@@ -481,6 +496,7 @@ impl RelationManager {
             }
             _ => {}
         }
+        true
     }
 
     fn extract_column_binding(expr: &Expression) -> Option<paro_planner::operator::ColumnBinding> {
@@ -779,8 +795,16 @@ mod tests {
         assert_eq!(filters.len(), 1);
         assert_eq!(filters[0].join_type, JoinType::Anti);
         assert_eq!(filters[0].anti_join_mode, AntiJoinMode::NullAware);
-        assert_eq!(filters[0].left_binding, Some(ColumnBinding::new(0, 0)));
-        assert_eq!(filters[0].right_binding, Some(ColumnBinding::new(1, 0)));
+        assert_eq!(
+            filters[0].left_binding.map(|key| key.column),
+            Some(ColumnBinding::new(0, 0))
+        );
+        assert_eq!(filters[0].left_binding.map(|key| key.relation), Some(0));
+        assert_eq!(
+            filters[0].right_binding.map(|key| key.column),
+            Some(ColumnBinding::new(1, 0))
+        );
+        assert_eq!(filters[0].right_binding.map(|key| key.relation), Some(1));
         assert!(filters[0].left_set.is_some());
         assert!(filters[0].right_set.is_some());
     }

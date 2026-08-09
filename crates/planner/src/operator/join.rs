@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use super::ColumnBinding;
+use super::{ColumnBinding, ProjectionMap};
 use crate::expression::Expression;
 use crate::plan::LogicalPlan;
 use paro_common::types::LogicalType;
@@ -104,38 +104,36 @@ impl std::fmt::Display for JoinType {
     }
 }
 
-fn project_types(child_types: &[LogicalType], projection_map: &[usize]) -> Vec<LogicalType> {
-    projection_map
-        .iter()
-        .filter_map(|&idx| child_types.get(idx).cloned())
-        .collect()
+fn project_types(child_types: &[LogicalType], projection_map: &ProjectionMap) -> Vec<LogicalType> {
+    match projection_map.as_columns() {
+        None => child_types.to_vec(),
+        Some(indices) => indices
+            .iter()
+            .filter_map(|&idx| child_types.get(idx).cloned())
+            .collect(),
+    }
 }
 
 fn project_bindings(
     child_bindings: &[ColumnBinding],
-    projection_map: &[usize],
+    projection_map: &ProjectionMap,
 ) -> Vec<ColumnBinding> {
-    projection_map
-        .iter()
-        .filter_map(|&idx| child_bindings.get(idx).copied())
-        .collect()
+    match projection_map.as_columns() {
+        None => child_bindings.to_vec(),
+        Some(indices) => indices
+            .iter()
+            .filter_map(|&idx| child_bindings.get(idx).copied())
+            .collect(),
+    }
 }
 
-fn full_projection(width: usize) -> Vec<usize> {
-    (0..width).collect()
-}
-
-fn default_join_projections(
-    join_type: JoinType,
-    left_width: usize,
-    right_width: usize,
-) -> (Vec<usize>, Vec<usize>) {
+fn default_join_projections(join_type: JoinType) -> (ProjectionMap, ProjectionMap) {
     match join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => {
-            (full_projection(left_width), Vec::new())
+            (ProjectionMap::all(), ProjectionMap::none())
         }
-        JoinType::RightSemi | JoinType::RightAnti => (Vec::new(), full_projection(right_width)),
-        _ => (full_projection(left_width), full_projection(right_width)),
+        JoinType::RightSemi | JoinType::RightAnti => (ProjectionMap::none(), ProjectionMap::all()),
+        _ => (ProjectionMap::all(), ProjectionMap::all()),
     }
 }
 
@@ -323,9 +321,9 @@ pub struct ComparisonJoin {
     /// Whether the delim join has been flipped to de-duplicating the RHS instead.
     pub delim_flipped: bool,
     /// Columns from left side to output.
-    pub left_projection_map: Vec<usize>,
+    pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
-    pub right_projection_map: Vec<usize>,
+    pub right_projection_map: ProjectionMap,
 }
 
 impl ComparisonJoin {
@@ -343,8 +341,7 @@ impl ComparisonJoin {
         right: LogicalPlan,
         conditions: Vec<JoinCondition>,
     ) -> Self {
-        let (left_projection_map, right_projection_map) =
-            default_join_projections(join_type, left.types().len(), right.types().len());
+        let (left_projection_map, right_projection_map) = default_join_projections(join_type);
         Self {
             join_type,
             anti_join_mode: AntiJoinMode::Regular,
@@ -421,9 +418,9 @@ pub struct AnyJoin {
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
     /// Columns from left side to output.
-    pub left_projection_map: Vec<usize>,
+    pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
-    pub right_projection_map: Vec<usize>,
+    pub right_projection_map: ProjectionMap,
 }
 
 impl AnyJoin {
@@ -434,8 +431,7 @@ impl AnyJoin {
         right: LogicalPlan,
         condition: Expression,
     ) -> Self {
-        let (left_projection_map, right_projection_map) =
-            default_join_projections(join_type, left.types().len(), right.types().len());
+        let (left_projection_map, right_projection_map) = default_join_projections(join_type);
         Self {
             join_type,
             left: Box::new(left),
@@ -775,7 +771,7 @@ mod tests {
             expression_get_plan(20, vec![LogicalType::Varchar]),
             vec![],
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
 
         assert_eq!(
             join.get_types(),
@@ -795,7 +791,7 @@ mod tests {
             expression_get_plan(20, right_types.clone()),
             vec![],
         );
-        right_semi.right_projection_map = vec![1];
+        right_semi.right_projection_map = vec![1].into();
         assert_eq!(right_semi.get_types(), vec![LogicalType::Boolean]);
 
         let right_anti = ComparisonJoin::new(
@@ -818,7 +814,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
 
         assert_eq!(
             join.get_types(),
@@ -839,7 +835,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        right_semi.right_projection_map = vec![1];
+        right_semi.right_projection_map = vec![1].into();
         assert_eq!(right_semi.get_types(), vec![LogicalType::Boolean]);
 
         let right_anti = AnyJoin::new(
@@ -866,8 +862,8 @@ mod tests {
             duplicate_plan_preserving_indices(&right, dup_ctx.shared().as_ref()),
             vec![],
         );
-        comparison.left_projection_map = vec![1];
-        comparison.right_projection_map = vec![0];
+        comparison.left_projection_map = vec![1].into();
+        comparison.right_projection_map = vec![0].into();
 
         let mut any = AnyJoin::new(
             JoinType::Inner,
@@ -878,8 +874,8 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        any.left_projection_map = vec![1];
-        any.right_projection_map = vec![0];
+        any.left_projection_map = vec![1].into();
+        any.right_projection_map = vec![0].into();
 
         assert_eq!(
             comparison.get_types(),

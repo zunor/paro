@@ -391,8 +391,8 @@ fn test_inner_hash_join_shape_survives_nested_filter_pushdown() {
             JoinComparisonType::Equal,
         )],
     );
-    join.left_projection_map = vec![0];
-    join.right_projection_map = vec![0];
+    join.left_projection_map = vec![0].into();
+    join.right_projection_map = vec![0].into();
     let filter = PlannerFilter::new(
         plan(&ctx, LogicalOperator::Join(Join::Comparison(join))),
         vec![make_comparison(
@@ -409,8 +409,8 @@ fn test_inner_hash_join_shape_survives_nested_filter_pushdown() {
     };
     assert_eq!(join.conditions.len(), 1);
     assert_eq!(join.conditions[0].comparison, JoinComparisonType::Equal);
-    assert_eq!(join.left_projection_map, vec![0]);
-    assert_eq!(join.right_projection_map, vec![0]);
+    assert_eq!(join.left_projection_map.as_columns(), Some(&[0][..]));
+    assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
     assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
 }
 
@@ -684,7 +684,7 @@ fn test_pushdown_through_order() {
     let order = paro_planner::operator::Order {
         child: Box::new(plan(&ctx, get)),
         orders: vec![],
-        projection_map: Vec::new(),
+        projection_map: paro_planner::operator::ProjectionMap::all(),
     };
 
     let filter_expr = make_comparison(

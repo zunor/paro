@@ -184,6 +184,17 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         self.len() == 0
     }
 
+    fn allocation_size(&self) -> usize {
+        match &self.representation {
+            FixedMembershipRepresentation::Sorted(values) => {
+                values.len().saturating_mul(std::mem::size_of::<T>())
+            }
+            FixedMembershipRepresentation::Dense { bits, .. } => {
+                bits.len().saturating_mul(std::mem::size_of::<u64>())
+            }
+        }
+    }
+
     pub(crate) fn is_contiguous(&self) -> bool {
         match &self.representation {
             FixedMembershipRepresentation::Sorted(values) => {
@@ -339,6 +350,15 @@ impl FixedMembership {
             FixedMembershipKind::I32(values) => values.len(),
             FixedMembershipKind::I64(values) => values.len(),
             FixedMembershipKind::I128(values) => values.len(),
+        }
+    }
+
+    /// Heap bytes retained by the immutable membership representation.
+    pub fn allocation_size(&self) -> usize {
+        match &self.kind {
+            FixedMembershipKind::I32(values) => values.allocation_size(),
+            FixedMembershipKind::I64(values) => values.allocation_size(),
+            FixedMembershipKind::I128(values) => values.allocation_size(),
         }
     }
 

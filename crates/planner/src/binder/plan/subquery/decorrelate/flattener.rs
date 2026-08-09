@@ -191,7 +191,7 @@ impl DependentJoinFlattener {
         // and replaced their bindings with aggregate-group bindings.
         let mut join = ComparisonJoin::new(JoinType::Single, left, right, conditions);
         join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
-        join.right_projection_map = right_visible_columns;
+        join.right_projection_map = right_visible_columns.into();
         Ok(LogicalOperator::Join(Join::Comparison(join)))
     }
 
@@ -235,7 +235,7 @@ impl DependentJoinFlattener {
 
         let mut join = ComparisonJoin::new(join_type, left, right, conditions);
         join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
-        join.right_projection_map = right_visible_columns;
+        join.right_projection_map = right_visible_columns.into();
         let plan = LogicalOperator::Join(Join::Comparison(join));
 
         if arbitrary_expressions.is_empty() {
@@ -582,19 +582,34 @@ impl DependentJoinFlattener {
 
     fn apply_projection_map_to_visible_columns(
         visible_columns: &[usize],
-        projection_map: &[usize],
+        projection_map: &crate::operator::ProjectionMap,
     ) -> Vec<usize> {
-        if projection_map.is_empty() {
+        let Some(indices) = projection_map.as_columns() else {
             return visible_columns.to_vec();
-        }
-
-        projection_map
+        };
+        indices
             .iter()
             .enumerate()
             .filter_map(|(output_idx, input_idx)| {
                 visible_columns.contains(input_idx).then_some(output_idx)
             })
             .collect()
+    }
+
+    /// Projection-bearing pass-through operators are planned before
+    /// decorrelation appends its internal keys. Preserve the operator's exact
+    /// user projection while explicitly carrying those keys to the dependent
+    /// join above it.
+    fn carry_correlation_keys(
+        &self,
+        child: &LogicalPlan,
+        base_binding: ColumnBinding,
+        projection_map: &mut crate::operator::ProjectionMap,
+    ) -> Result<()> {
+        for index in self.correlation_key_positions(child, base_binding)? {
+            projection_map.include(index);
+        }
+        Ok(())
     }
 
     fn internal_output_names(&self) -> Vec<String> {
@@ -830,7 +845,7 @@ impl DependentJoinFlattener {
             Expression::Conjunction(ConjunctionExpression::new(ConjunctionType::And, filters))
         };
         let mut filter = Filter::new(window_plan, vec![predicate]);
-        filter.projection_map = (0..child_column_count).collect();
+        filter.projection_map = Self::all_columns_visible(child_column_count).into();
 
         Ok(PushDownResult {
             plan: binder.wrap_plan(LogicalOperator::Filter(filter)),
@@ -877,8 +892,13 @@ impl DependentJoinFlattener {
                     .into_iter()
                     .map(|expr| rewriter.rewrite_expression(expr))
                     .collect();
-                filter.child = Box::new(child);
                 let projection_map = filter.projection_map.clone();
+                let projected_visible_columns = Self::apply_projection_map_to_visible_columns(
+                    &visible_columns,
+                    &projection_map,
+                );
+                self.carry_correlation_keys(&child, base_binding, &mut filter.projection_map)?;
+                filter.child = Box::new(child);
                 Ok(PushDownResult {
                     plan: LogicalPlan {
                         id,
@@ -886,10 +906,7 @@ impl DependentJoinFlattener {
                         operator: LogicalOperator::Filter(filter),
                     },
                     base_binding,
-                    visible_columns: Self::apply_projection_map_to_visible_columns(
-                        &visible_columns,
-                        &projection_map,
-                    ),
+                    visible_columns: projected_visible_columns,
                 })
             }
             LogicalOperator::Projection(mut proj) => {
@@ -1076,6 +1093,7 @@ impl DependentJoinFlattener {
                     &visible_columns,
                     &order.projection_map,
                 );
+                self.carry_correlation_keys(&child, base_binding, &mut order.projection_map)?;
                 order.child = Box::new(child);
                 Ok(PushDownResult {
                     plan: LogicalPlan {

@@ -122,7 +122,7 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                 sink: SinkSpec::SortBuild(SortBuildSinkSpec {
                     handle,
                     orders: vec![order_by_ref(0, LogicalType::Integer)].into_boxed_slice(),
-                    projection_map: Box::new([]),
+                    projection_map: Box::new([0]),
                     input_types: Box::new([LogicalType::Integer]),
                     output_names: Box::new(["v".to_string()]),
                     output_types: Box::new([LogicalType::Integer]),

@@ -677,6 +677,9 @@ impl AggregateRuntimeState {
     fn reclaimable_build_memory(&self) -> usize {
         match self {
             Self::Hash(state) => state.reclaimable_build_memory(),
+            // Ungrouped state is constant-sized. Perfect state is a bounded,
+            // planner-admitted direct-address table accounted as non-revocable;
+            // neither advertises bytes that its reclaimer cannot release.
             Self::Ungrouped(_) | Self::Perfect(_) => 0,
         }
     }

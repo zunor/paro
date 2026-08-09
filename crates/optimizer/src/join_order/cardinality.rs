@@ -11,6 +11,7 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{ColumnBinding, JoinType};
 use tracing::trace;
 
+use crate::join_order::equality_graph::{find_component, union_components, EqualityClassGraph};
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
@@ -188,16 +189,6 @@ impl DistinctDomainEstimate {
     }
 }
 
-fn find_component(parents: &mut [usize], index: usize) -> usize {
-    let parent = parents[index];
-    if parent == index {
-        return index;
-    }
-    let root = find_component(parents, parent);
-    parents[index] = root;
-    root
-}
-
 impl CardinalityHelper {
     pub fn new(cardinality_before_filters: f64) -> Self {
         Self {
@@ -215,6 +206,11 @@ impl CardinalityHelper {
 pub struct CardinalityEstimator {
     /// Statistics for equivalent relation sets.
     relation_set_stats: Vec<RelationsSetToStats>,
+    /// Equality-class topology compiled once before DP subset enumeration.
+    equality_graphs: Vec<EqualityClassGraph>,
+    /// Statistics initialization can reorder equality classes. Recompile the
+    /// compact topology lazily after the last mutation.
+    equality_graphs_dirty: bool,
     /// Distinct-count estimates before equivalence classes merge their domains.
     ///
     /// A semi join needs the two sides independently: the fraction of preserved
@@ -297,10 +293,16 @@ impl CardinalityEstimator {
             };
             b_count.cmp(&a_count)
         });
+        // Equality graphs refer to their owning statistics class by index.
+        // Progressive NDV initialization can reorder those classes; defer one
+        // rebuild until the first estimate after initialization, then reuse it
+        // throughout DP subset enumeration.
+        self.equality_graphs_dirty = true;
     }
 
     /// Estimate cardinality for a join relation set.
     pub fn estimate_cardinality(&mut self, new_set: &JoinRelationSet) -> f64 {
+        self.ensure_equality_graphs();
         let key = new_set.to_string();
         if let Some(helper) = self.relation_set_2_cardinality.get(&key) {
             return helper.cardinality_before_filters;
@@ -319,6 +321,14 @@ impl CardinalityEstimator {
     pub fn remove_empty_total_domains(&mut self) {
         self.relation_set_stats
             .retain(|r| !r.equivalent_relations.is_empty());
+        self.equality_graphs_dirty = true;
+    }
+
+    fn ensure_equality_graphs(&mut self) {
+        if self.equality_graphs_dirty {
+            self.equality_graphs = EqualityClassGraph::build_all(&self.relation_set_stats);
+            self.equality_graphs_dirty = false;
+        }
     }
 
     /// Update total domains with statistics from a relation.
@@ -362,6 +372,7 @@ impl CardinalityEstimator {
 
         // Check if we already have this binding in an equivalence set
         if let Some(left_binding) = filter_info.left_binding {
+            let left_binding = left_binding.column;
             for r2tdom in &self.relation_set_stats {
                 if r2tdom.equivalent_relations.contains(&left_binding) {
                     // Found an equivalent filter
@@ -401,13 +412,13 @@ impl CardinalityEstimator {
 
         for (i, r2tdom) in self.relation_set_stats.iter().enumerate() {
             if let Some(left_binding) = filter_info.left_binding {
-                if r2tdom.equivalent_relations.contains(&left_binding) {
+                if r2tdom.equivalent_relations.contains(&left_binding.column) {
                     matching_sets.push(i);
                     continue;
                 }
             }
             if let Some(right_binding) = filter_info.right_binding {
-                if r2tdom.equivalent_relations.contains(&right_binding) {
+                if r2tdom.equivalent_relations.contains(&right_binding.column) {
                     // Don't add both left and right to matching_sets
                     // since both get added to that index anyway
                     matching_sets.push(i);
@@ -452,22 +463,22 @@ impl CardinalityEstimator {
             if let Some(left_binding) = filter_info.left_binding {
                 self.relation_set_stats[idx]
                     .equivalent_relations
-                    .insert(left_binding);
+                    .insert(left_binding.column);
             }
             if let Some(right_binding) = filter_info.right_binding {
                 self.relation_set_stats[idx]
                     .equivalent_relations
-                    .insert(right_binding);
+                    .insert(right_binding.column);
             }
             self.relation_set_stats[idx].filters.push(filter_info);
         } else {
             // No matching sets, create a new one
             let mut bindings = HashSet::new();
             if let Some(left_binding) = filter_info.left_binding {
-                bindings.insert(left_binding);
+                bindings.insert(left_binding.column);
             }
             if let Some(right_binding) = filter_info.right_binding {
-                bindings.insert(right_binding);
+                bindings.insert(right_binding.column);
             }
             let mut new_stats = RelationsSetToStats::new(bindings);
             new_stats.filters.push(filter_info);
@@ -522,114 +533,76 @@ impl CardinalityEstimator {
         let mut denominator = 1.0;
         let mut consumed_filters = HashSet::new();
 
-        for stats in &self.relation_set_stats {
-            let mut edges = Vec::new();
-            let mut vertices = HashMap::<usize, DistinctDomainEstimate>::new();
-            for filter in &stats.filters {
-                if filter.join_type != JoinType::Inner
-                    || Self::get_comparison_type(&filter.filter) != Some(ComparisonKind::Equal)
-                    || !JoinRelationSet::is_subset(requested_set, &filter.set)
+        for graph in &self.equality_graphs {
+            let stats = &self.relation_set_stats[graph.stats_index];
+            let mut parents = (0..graph.vertices.len()).collect::<Vec<_>>();
+            let mut sizes = vec![1usize; graph.vertices.len()];
+            let mut active = vec![false; graph.vertices.len()];
+            for edge in &graph.edges {
+                let left_relation = graph.vertices[edge.left].relation;
+                let right_relation = graph.vertices[edge.right].relation;
+                if !requested_set.contains(left_relation) || !requested_set.contains(right_relation)
                 {
                     continue;
                 }
-                let (Some(left), Some(right)) = (&filter.left_set, &filter.right_set) else {
-                    continue;
-                };
-                if left.count() != 1 || right.count() != 1 {
-                    continue;
-                }
-                let left = left.relations()[0];
-                let right = right.relations()[0];
-                if left == right {
-                    continue;
-                }
-                let fallback_distinct = if stats.has_distinct_count_hll {
-                    DistinctDomainEstimate::observed(stats.distinct_count_hll)
-                } else {
-                    DistinctDomainEstimate::upper_bound(stats.distinct_count_no_hll)
-                };
-                let left_distinct = filter
-                    .left_binding
-                    .and_then(|binding| self.binding_stats.get(&binding))
-                    .map_or(fallback_distinct, |binding| {
-                        if binding.from_hll {
-                            DistinctDomainEstimate::observed(binding.distinct_count)
-                        } else {
-                            DistinctDomainEstimate::upper_bound(binding.distinct_count)
-                        }
-                    });
-                let right_distinct = filter
-                    .right_binding
-                    .and_then(|binding| self.binding_stats.get(&binding))
-                    .map_or(fallback_distinct, |binding| {
-                        if binding.from_hll {
-                            DistinctDomainEstimate::observed(binding.distinct_count)
-                        } else {
-                            DistinctDomainEstimate::upper_bound(binding.distinct_count)
-                        }
-                    });
-                vertices
-                    .entry(left)
-                    .and_modify(|distinct| distinct.merge(left_distinct))
-                    .or_insert(left_distinct);
-                vertices
-                    .entry(right)
-                    .and_modify(|distinct| distinct.merge(right_distinct))
-                    .or_insert(right_distinct);
-                edges.push((left, right));
-                consumed_filters.insert(filter.filter_index);
+                active[edge.left] = true;
+                active[edge.right] = true;
+                union_components(&mut parents, &mut sizes, edge.left, edge.right);
+                consumed_filters.insert(edge.filter_index);
             }
-            if vertices.len() < 2 {
+            if active.iter().filter(|active| **active).count() < 2 {
                 continue;
             }
 
-            let mut vertices = vertices.into_iter().collect::<Vec<_>>();
-            vertices.sort_unstable_by_key(|(relation, _)| *relation);
-            let vertex_index = vertices
-                .iter()
-                .enumerate()
-                .map(|(idx, (relation, _))| (*relation, idx))
-                .collect::<HashMap<_, _>>();
-            let mut parents = (0..vertices.len()).collect::<Vec<_>>();
-            for (left, right) in edges {
-                let left = find_component(&mut parents, vertex_index[&left]);
-                let right = find_component(&mut parents, vertex_index[&right]);
-                if left != right {
-                    parents[right] = left;
+            let fallback_distinct = if stats.has_distinct_count_hll {
+                DistinctDomainEstimate::observed(stats.distinct_count_hll)
+            } else {
+                DistinctDomainEstimate::upper_bound(stats.distinct_count_no_hll)
+            };
+            let mut components = vec![Vec::<DistinctDomainEstimate>::new(); graph.vertices.len()];
+            for (index, vertex) in graph.vertices.iter().enumerate() {
+                if !active[index] {
+                    continue;
                 }
-            }
-            let mut components = HashMap::<usize, Vec<DistinctDomainEstimate>>::new();
-            for (index, (_, distinct)) in vertices.iter().enumerate() {
+                let mut distinct: Option<DistinctDomainEstimate> = None;
+                for binding in &vertex.bindings {
+                    let Some(binding) = self.binding_stats.get(binding) else {
+                        continue;
+                    };
+                    let binding_distinct = if binding.from_hll {
+                        DistinctDomainEstimate::observed(binding.distinct_count)
+                    } else {
+                        DistinctDomainEstimate::upper_bound(binding.distinct_count)
+                    };
+                    if let Some(current) = distinct.as_mut() {
+                        current.merge(binding_distinct);
+                    } else {
+                        distinct = Some(binding_distinct);
+                    }
+                }
                 let root = find_component(&mut parents, index);
-                components.entry(root).or_default().push(*distinct);
+                components[root].push(distinct.unwrap_or(fallback_distinct));
             }
-            for mut distincts in components.into_values() {
+            for mut distincts in components
+                .into_iter()
+                .filter(|component| !component.is_empty())
+            {
                 let vertices = distincts.len();
                 let independent_edges = vertices.saturating_sub(1);
-                let component_denominator = if distincts.iter().all(|distinct| distinct.has_hll) {
-                    // Under uniformity and containment, equating N observed
-                    // domains contributes the product of the N-1 largest NDVs:
-                    // product(cardinality) * min(NDV) / product(NDV). This is
-                    // invariant to predicate order and does not over-select
-                    // heterogeneous domains by raising only the largest NDV to
-                    // the graph rank.
-                    distincts.sort_unstable_by_key(|distinct| distinct.value());
-                    distincts
-                        .iter()
-                        .skip(1)
-                        .fold(1.0, |product, distinct| product * distinct.value() as f64)
-                } else {
-                    // Cardinality-derived NDVs are upper bounds, not observed
-                    // domains. Preserve the equivalence-class estimate in that
-                    // case: an observed HLL wins when available, otherwise the
-                    // tightest upper bound is used for every independent edge.
-                    let mut class_distinct = distincts[0];
-                    for distinct in &distincts[1..] {
-                        class_distinct.merge(*distinct);
-                    }
-                    (class_distinct.value() as f64)
-                        .powi(independent_edges.min(i32::MAX as usize) as i32)
-                };
+                // Under uniformity and containment, equating N domains
+                // contributes the product of the N-1 largest NDVs:
+                // product(cardinality) * min(NDV) / product(NDV). Numeric
+                // min/max ranges provide useful per-column upper bounds when
+                // HLL is unavailable; a filtered relation's row count then
+                // caps that bound without pretending every join key has the
+                // same domain. This is invariant to predicate order and keeps
+                // a one-row filtered dimension from erasing the wider domain
+                // of the relation it filters.
+                distincts.sort_unstable_by_key(|distinct| distinct.value());
+                let component_denominator = distincts
+                    .iter()
+                    .skip(1)
+                    .fold(1.0, |product, distinct| product * distinct.value() as f64);
                 denominator *= component_denominator;
                 trace!(
                     target: targets::OPTIMIZER,
@@ -1118,8 +1091,8 @@ mod tests {
         let mut filter = FilterInfo::new_inner(expr, set, filter_index);
         filter.set_left_set(left_set);
         filter.set_right_set(right_set);
-        filter.set_left_binding(ColumnBinding::new(left_table, left_col));
-        filter.set_right_binding(ColumnBinding::new(right_table, right_col));
+        filter.set_left_binding(ColumnBinding::new(left_table, left_col), left_table);
+        filter.set_right_binding(ColumnBinding::new(right_table, right_col), right_table);
 
         Arc::new(filter)
     }
@@ -1145,8 +1118,8 @@ mod tests {
         );
         filter.set_left_set(left_set);
         filter.set_right_set(right_set);
-        filter.set_left_binding(ColumnBinding::new(0, 0));
-        filter.set_right_binding(ColumnBinding::new(1, 0));
+        filter.set_left_binding(ColumnBinding::new(0, 0), 0);
+        filter.set_right_binding(ColumnBinding::new(1, 0), 1);
         Arc::new(filter)
     }
 
@@ -1167,7 +1140,7 @@ mod tests {
 
         let mut filter = FilterInfo::new_inner(expr, set, filter_index);
         filter.set_left_set(left_set);
-        filter.set_left_binding(ColumnBinding::new(table, col));
+        filter.set_left_binding(ColumnBinding::new(table, col), table);
 
         Arc::new(filter)
     }

@@ -752,7 +752,7 @@ mod tests {
         let order = paro_planner::operator::Order {
             child: Box::new(plan(&ctx, LogicalOperator::Filter(filter))),
             orders: vec![],
-            projection_map: Vec::new(),
+            projection_map: paro_planner::operator::ProjectionMap::all(),
         };
         let op = LogicalOperator::Order(order);
 

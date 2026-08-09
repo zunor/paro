@@ -276,17 +276,17 @@ impl PhysicalPlanGenerator {
             aggregates.push(Expression::Aggregate(bound));
         }
 
-        let perfect_hash = if self.ctx.force_external {
-            None
-        } else {
+        // Perfect hash is a fixed-size, planner-admitted representation rather
+        // than a spillable hash table. `force_external` must not change the
+        // physical plan; memory admission below remains the single gate.
+        let perfect_hash =
             can_use_perfect_hash_aggregate(aggregate, &groups, &aggregates).map(|info| {
                 PerfectHashAggregatePlan {
                     group_minima: info.group_minima.into_boxed_slice(),
                     group_cardinalities: info.group_cardinalities.into_boxed_slice(),
                     max_local_tables: 1,
                 }
-            })
-        };
+            });
 
         let mut spec = AggregateSpec {
             grouping_key_count: groups.len(),

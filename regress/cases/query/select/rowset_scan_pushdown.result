@@ -145,10 +145,11 @@ PROJECTION  (rows=1)
     Output: aggr_0
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
-    ->  HASH_JOIN  (rows=64)
+    ->  HASH_JOIN  (rows=19)
       Join Type: INNER
       Join Condition: #0 = #0
-      Cardinality: [64, 64, 64]
+      Cardinality: [19, 19, 19]
+      Output Schema: (none)
       ->  ROWSET_SCAN on public.rowset_pushdown_case c
         Columns: k
         Pushed Predicate: col#1 >= 2 AND col#1 <= 8

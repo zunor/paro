@@ -126,7 +126,10 @@ impl JoinBuildHandle {
             .iter()
             .map(|condition| condition.right.return_type())
             .collect::<Vec<_>>();
-        self.initialize_runtime_filter_builder(&runtime_filter_key_types);
+        self.initialize_runtime_filter_builder(
+            &runtime_filter_key_types,
+            memory.with_class(MemoryAccountingClass::Metadata),
+        );
         let mut state = self.table.lock();
         match &*state {
             JoinHashTableState::Live(table) => return Ok(Arc::clone(table)),
@@ -191,10 +194,16 @@ impl JoinBuildHandle {
         Ok(())
     }
 
-    pub fn initialize_runtime_filter_builder(&self, key_types: &[LogicalType]) {
+    pub fn initialize_runtime_filter_builder(
+        &self,
+        key_types: &[LogicalType],
+        memory: MemoryAccountingContext,
+    ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
-            *builder = Some(JoinRuntimeFilterSketch::empty(key_types));
+            *builder = Some(JoinRuntimeFilterSketch::empty_with_memory(
+                key_types, memory,
+            ));
         }
     }
 

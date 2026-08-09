@@ -198,7 +198,11 @@ impl Optimizer {
             Box::new(StatisticsPropagationPass),
             // Projection maps are positional annotations over the final logical
             // layout. Derive them only after every structural rewrite (most
-            // notably build/probe-side flips) has settled that layout.
+            // notably build/probe-side flips) has settled that layout. This
+            // terminal pass may reduce output widths, but it must not reorder
+            // retained columns or invalidate operator/cardinality statistics:
+            // statistics propagated above are operator-level, never indexed by
+            // the pre-pruning output position.
             Box::new(ColumnLifetimePass),
         ]
     }

@@ -33,10 +33,19 @@ pub struct FilterInfo {
     pub left_set: Option<Arc<JoinRelationSet>>,
     /// The right side of the join (if applicable).
     pub right_set: Option<Arc<JoinRelationSet>>,
-    /// Column binding from the left side (for equality joins).
-    pub left_binding: Option<ColumnBinding>,
-    /// Column binding from the right side (for equality joins).
-    pub right_binding: Option<ColumnBinding>,
+    /// Direct equality key from the left expression, including its optimizer
+    /// relation ID. Table indexes and relation IDs are separate namespaces.
+    pub left_binding: Option<JoinKeyBinding>,
+    /// Direct equality key from the right expression, including its optimizer
+    /// relation ID. Table indexes and relation IDs are separate namespaces.
+    pub right_binding: Option<JoinKeyBinding>,
+}
+
+/// A direct equality key and the join-order relation that owns it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JoinKeyBinding {
+    pub column: ColumnBinding,
+    pub relation: usize,
 }
 
 /// Directional equality bindings for a reduction join.
@@ -95,13 +104,19 @@ impl FilterInfo {
     }
 
     /// Set the left column binding.
-    pub fn set_left_binding(&mut self, binding: ColumnBinding) {
-        self.left_binding = Some(binding);
+    pub fn set_left_binding(&mut self, binding: ColumnBinding, relation: usize) {
+        self.left_binding = Some(JoinKeyBinding {
+            column: binding,
+            relation,
+        });
     }
 
     /// Set the right column binding.
-    pub fn set_right_binding(&mut self, binding: ColumnBinding) {
-        self.right_binding = Some(binding);
+    pub fn set_right_binding(&mut self, binding: ColumnBinding, relation: usize) {
+        self.right_binding = Some(JoinKeyBinding {
+            column: binding,
+            relation,
+        });
     }
 
     /// Return equality-key bindings with reduction-join semantics attached.
@@ -113,20 +128,22 @@ impl FilterInfo {
         if !matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
             return None;
         }
+        let preserved = self.left_binding?;
+        let filtering = self.right_binding?;
         let bindings = ReductionJoinBindings {
-            preserved: self.left_binding?,
-            filtering: self.right_binding?,
+            preserved: preserved.column,
+            filtering: filtering.column,
         };
         debug_assert!(
             self.left_set
                 .as_ref()
-                .is_none_or(|set| set.contains(bindings.preserved.table_index)),
+                .is_none_or(|set| set.contains(preserved.relation)),
             "reduction-join preserved binding must belong to its left relation set"
         );
         debug_assert!(
             self.right_set
                 .as_ref()
-                .is_none_or(|set| set.contains(bindings.filtering.table_index)),
+                .is_none_or(|set| set.contains(filtering.relation)),
             "reduction-join filtering binding must belong to its right relation set"
         );
         Some(bindings)
@@ -434,8 +451,8 @@ mod tests {
         let mut filter = FilterInfo::new(expr, set, 0, JoinType::Left, AntiJoinMode::Regular);
         filter.set_left_set(left.clone());
         filter.set_right_set(right.clone());
-        filter.set_left_binding(ColumnBinding::new(0, 0));
-        filter.set_right_binding(ColumnBinding::new(1, 0));
+        filter.set_left_binding(ColumnBinding::new(0, 0), 0);
+        filter.set_right_binding(ColumnBinding::new(1, 0), 1);
 
         assert_eq!(filter.join_type, JoinType::Left);
         assert!(filter.left_set.is_some());
@@ -456,14 +473,15 @@ mod tests {
         let mut filter = FilterInfo::new(expr, set, 0, JoinType::Semi, AntiJoinMode::Regular);
         filter.set_left_set(manager.get_relation(0));
         filter.set_right_set(manager.get_relation(1));
-        filter.set_left_binding(ColumnBinding::new(0, 2));
-        filter.set_right_binding(ColumnBinding::new(1, 3));
+        // Logical table indexes deliberately differ from optimizer relation IDs.
+        filter.set_left_binding(ColumnBinding::new(6, 2), 0);
+        filter.set_right_binding(ColumnBinding::new(8, 3), 1);
 
         assert_eq!(
             filter.reduction_join_bindings(),
             Some(ReductionJoinBindings {
-                preserved: ColumnBinding::new(0, 2),
-                filtering: ColumnBinding::new(1, 3),
+                preserved: ColumnBinding::new(6, 2),
+                filtering: ColumnBinding::new(8, 3),
             })
         );
     }

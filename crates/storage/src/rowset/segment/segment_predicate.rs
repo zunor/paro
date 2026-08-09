@@ -790,6 +790,10 @@ impl PredicateEvaluator {
                     }
                 }
                 let mut compiled = Self::coalesce_constant_comparisons(compiled);
+                // Storage predicates are a pure, total IR: compilation has
+                // already rejected volatile expressions and represented cast
+                // failures before this point. Reordering AND children is
+                // therefore observable only through cost, not SQL semantics.
                 compiled.sort_by_key(Self::conjunction_priority);
                 Ok(CompiledPredicateTree::And(compiled))
             }

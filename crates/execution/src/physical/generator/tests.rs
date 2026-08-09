@@ -361,7 +361,7 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
             )),
         ],
     );
-    filter.projection_map = vec![0];
+    filter.projection_map = vec![0].into();
     let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());

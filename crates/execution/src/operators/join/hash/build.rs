@@ -108,7 +108,11 @@ impl HashJoinBuildSinkExec {
             build_payload: None,
             build_selection: None,
             build_hashes: Vec::new(),
-            runtime_filter_sketch: Some(JoinRuntimeFilterSketch::empty(&build_key_types)),
+            runtime_filter_sketch: Some(JoinRuntimeFilterSketch::empty_with_memory(
+                &build_key_types,
+                hash_join_memory_context(ctx.query)
+                    .with_class(paro_common::memory::MemoryAccountingClass::Metadata),
+            )),
             build_spill,
             local_build_spill_reclaimer_name,
             query_memory,

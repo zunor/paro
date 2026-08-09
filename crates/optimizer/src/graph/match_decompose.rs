@@ -174,6 +174,7 @@ mod tests {
     use paro_planner::binder::bind::graph::{
         BoundEdgeVariable, BoundPatternElement, BoundVertexVariable,
     };
+    use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::{BoundGraphColumn, BoundGraphPattern};
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::ColumnBinding;
@@ -273,6 +274,47 @@ mod tests {
 
     #[test]
     fn test_one_hop_decompose() {
+        let v_a = make_vertex("a", "Person", 10);
+        let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
+        let v_b = make_vertex("b", "Person", 12);
+
+        let elements = vec![
+            BoundPatternElement::Vertex(v_a),
+            BoundPatternElement::Edge(e_k),
+            BoundPatternElement::Vertex(v_b),
+        ];
+        let columns = vec![make_column(10, 1), make_column(12, 1)];
+        let plan = make_graph_match(elements, columns, 100);
+
+        let mut decompose = GraphMatchDecompose::new();
+        let result = decompose.optimize(plan);
+
+        crate::verify::verify_logical_plan(&BindContext::new(), &LogicalPlan::synthetic(result))
+            .expect("decomposed graph projection should satisfy logical invariants");
+    }
+
+    #[test]
+    fn test_graph_projection_verifier_rejects_unknown_relation() {
+        let v_a = make_vertex("a", "Person", 10);
+        let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
+        let v_b = make_vertex("b", "Person", 12);
+        let elements = vec![
+            BoundPatternElement::Vertex(v_a),
+            BoundPatternElement::Edge(e_k),
+            BoundPatternElement::Vertex(v_b),
+        ];
+        let plan = make_graph_match(elements, vec![make_column(99, 1)], 100);
+
+        let mut decompose = GraphMatchDecompose::new();
+        let result = LogicalPlan::synthetic(decompose.optimize(plan));
+        let error = crate::verify::verify_logical_plan(&BindContext::new(), &result)
+            .expect_err("unknown graph relation must not pass verification");
+
+        assert!(error.to_string().contains("unavailable binding"));
+    }
+
+    #[test]
+    fn test_one_hop_decompose_shape() {
         let v_a = make_vertex("a", "Person", 10);
         let e_k = make_edge("k", "Knows", 11, EdgeDirection::Right, "a", "b");
         let v_b = make_vertex("b", "Person", 12);

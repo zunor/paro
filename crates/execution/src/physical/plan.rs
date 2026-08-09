@@ -433,9 +433,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         _ => {}
     }
 
-    if let Some(output_schema) = format_output_schema(node) {
-        push_string_property(&mut properties, "Output Schema", output_schema);
-    }
+    push_string_property(&mut properties, "Output Schema", format_output_schema(node));
 
     properties
 }
@@ -693,19 +691,17 @@ fn format_hops(min_hops: u64, max_hops: u64) -> String {
     }
 }
 
-fn format_output_schema(node: &PhysicalPlanNode) -> Option<String> {
+fn format_output_schema(node: &PhysicalPlanNode) -> String {
     if node.output.column_count() == 0 {
-        return None;
+        return "(none)".to_string();
     }
-    Some(
-        node.output
-            .names
-            .iter()
-            .zip(node.output.types.iter())
-            .map(|(name, ty)| format!("{name} {ty}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+    node.output
+        .names
+        .iter()
+        .zip(node.output.types.iter())
+        .map(|(name, ty)| format!("{name} {ty}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_join_condition(condition: &JoinCondition) -> String {

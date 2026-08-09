@@ -1223,7 +1223,12 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 let page_span_end = u32::try_from(row_run.span_end - page_start).map_err(|_| {
                     paro_error::data_corrupted("BitShuffle page row offset overflow")
                 })?;
-                debug_assert!(page_span_end < decoder.count());
+                if page_span_end >= decoder.count() {
+                    return Err(paro_error::data_corrupted(format!(
+                        "BitShuffle row span exceeds page: end={page_span_end}, count={}",
+                        decoder.count()
+                    )));
+                }
                 decoder.gather_values_at(
                     run.iter()
                         .map(|&(orig_idx, rowid)| ((rowid - page_start) as u32, orig_idx)),

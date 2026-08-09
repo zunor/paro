@@ -17,8 +17,8 @@ use super::{
     DependentJoin, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain, ExpressionGet, Filter,
     FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert, Join, Limit,
     LogicalExternalProject, LogicalExternalTable, LogicalOperatorType, MaterializedCTE, Order,
-    Projection, RecursiveCTE, RefreshPropertyGraph, SearchScan, SetOpType, SetOperation,
-    TableFunctionGet, TopN, Update, Window,
+    Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph, SearchScan, SetOpType,
+    SetOperation, TableFunctionGet, TopN, Update, Window,
 };
 
 /// The LogicalOperator represents a node in the logical query plan.
@@ -112,18 +112,13 @@ pub enum LogicalOperator {
 
 impl LogicalOperator {
     pub fn output_names(&self) -> Vec<String> {
-        fn project_names(child_names: &[String], projection_map: &[usize]) -> Vec<String> {
-            projection_map
-                .iter()
-                .filter_map(|&idx| child_names.get(idx).cloned())
-                .collect()
-        }
-
-        fn project_or_all_names(child_names: &[String], projection_map: &[usize]) -> Vec<String> {
-            if projection_map.is_empty() {
-                child_names.to_vec()
-            } else {
-                project_names(child_names, projection_map)
+        fn project_names(child_names: &[String], projection_map: &ProjectionMap) -> Vec<String> {
+            match projection_map.as_columns() {
+                None => child_names.to_vec(),
+                Some(indices) => indices
+                    .iter()
+                    .filter_map(|&idx| child_names.get(idx).cloned())
+                    .collect(),
             }
         }
 
@@ -131,7 +126,7 @@ impl LogicalOperator {
             LogicalOperator::Get(op) => op.names.clone(),
             LogicalOperator::Filter(op) => {
                 let child_names = op.child.output_names();
-                project_or_all_names(&child_names, &op.projection_map)
+                project_names(&child_names, &op.projection_map)
             }
             LogicalOperator::Projection(op) => op.output_names.clone(),
             LogicalOperator::ExternalProject(op) => op.output_names.clone(),
@@ -139,7 +134,7 @@ impl LogicalOperator {
             LogicalOperator::Limit(op) => op.child.output_names(),
             LogicalOperator::Order(op) => {
                 let child_names = op.child.output_names();
-                project_or_all_names(&child_names, &op.projection_map)
+                project_names(&child_names, &op.projection_map)
             }
             LogicalOperator::TopN(op) => op.child.output_names(),
             LogicalOperator::CreateTable(_)
@@ -312,13 +307,12 @@ impl LogicalOperator {
             LogicalOperator::Get(op) => op.returned_types.clone(),
             LogicalOperator::Filter(op) => {
                 let child_types = op.child.types();
-                if op.projection_map.is_empty() {
-                    child_types
-                } else {
-                    op.projection_map
+                match op.projection_map.as_columns() {
+                    None => child_types,
+                    Some(indices) => indices
                         .iter()
                         .filter_map(|&idx| child_types.get(idx).cloned())
-                        .collect()
+                        .collect(),
                 }
             }
             LogicalOperator::Projection(op) => op.returned_types.clone(),
@@ -327,13 +321,12 @@ impl LogicalOperator {
             LogicalOperator::Limit(op) => op.child.types(),
             LogicalOperator::Order(op) => {
                 let child_types = op.child.types();
-                if op.projection_map.is_empty() {
-                    child_types
-                } else {
-                    op.projection_map
+                match op.projection_map.as_columns() {
+                    None => child_types,
+                    Some(indices) => indices
                         .iter()
                         .filter_map(|&idx| child_types.get(idx).cloned())
-                        .collect()
+                        .collect(),
                 }
             }
             LogicalOperator::TopN(op) => op.child.types(),
@@ -674,14 +667,12 @@ impl LogicalOperator {
             }
             LogicalOperator::Filter(filter) => {
                 let child_bindings = filter.child.get_column_bindings();
-                if filter.projection_map.is_empty() {
-                    child_bindings
-                } else {
-                    filter
-                        .projection_map
+                match filter.projection_map.as_columns() {
+                    None => child_bindings,
+                    Some(indices) => indices
                         .iter()
                         .filter_map(|&idx| child_bindings.get(idx).copied())
-                        .collect()
+                        .collect(),
                 }
             }
             LogicalOperator::Projection(proj) => {
@@ -703,8 +694,14 @@ impl LogicalOperator {
                 limit.child.get_column_bindings()
             }
             LogicalOperator::Order(order) => {
-                // Order passes through child's bindings unchanged
-                order.child.get_column_bindings()
+                let child_bindings = order.child.get_column_bindings();
+                match order.projection_map.as_columns() {
+                    None => child_bindings,
+                    Some(indices) => indices
+                        .iter()
+                        .filter_map(|&idx| child_bindings.get(idx).copied())
+                        .collect(),
+                }
             }
             LogicalOperator::TopN(topn) => {
                 // TopN passes through child's bindings unchanged
@@ -1338,7 +1335,7 @@ mod tests {
             lp(expression_get(20, vec![LogicalType::Varchar])),
             vec![],
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
         join.mark_index = Some(99);
 
         let bindings = LogicalOperator::Join(Join::Comparison(join)).get_column_bindings();
@@ -1359,7 +1356,7 @@ mod tests {
             )),
             vec![],
         );
-        join.right_projection_map = vec![1];
+        join.right_projection_map = vec![1].into();
 
         let bindings = LogicalOperator::Join(Join::Comparison(join)).get_column_bindings();
         assert_eq!(bindings, vec![ColumnBinding::new(20, 1)]);
@@ -1379,7 +1376,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
         join.mark_index = Some(99);
 
         let bindings = LogicalOperator::Join(Join::Any(Box::new(join))).get_column_bindings();
@@ -1403,7 +1400,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        join.right_projection_map = vec![1];
+        join.right_projection_map = vec![1].into();
 
         let bindings = LogicalOperator::Join(Join::Any(Box::new(join))).get_column_bindings();
         assert_eq!(bindings, vec![ColumnBinding::new(20, 1)]);
@@ -1423,8 +1420,8 @@ mod tests {
             )),
             vec![],
         );
-        comparison.left_projection_map = vec![1];
-        comparison.right_projection_map = vec![0];
+        comparison.left_projection_map = vec![1].into();
+        comparison.right_projection_map = vec![0].into();
 
         let mut any = AnyJoin::new(
             JoinType::Inner,
@@ -1441,8 +1438,8 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        any.left_projection_map = vec![1];
-        any.right_projection_map = vec![0];
+        any.left_projection_map = vec![1].into();
+        any.right_projection_map = vec![0].into();
 
         assert_eq!(
             LogicalOperator::Join(Join::Comparison(comparison)).get_column_bindings(),

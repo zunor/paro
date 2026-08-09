@@ -1070,7 +1070,7 @@ mod tests {
             transforms: vec![
                 TransformSpec::Filter(FilterSpec {
                     expressions: Box::new([]),
-                    projection_map: Box::new([]),
+                    projection_map: Box::new([0]),
                 }),
                 TransformSpec::Project(ProjectSpec {
                     table_index: 8,
@@ -1398,7 +1398,7 @@ mod tests {
                     sink: SinkSpec::SortBuild(super::super::graph::SortBuildSinkSpec {
                         handle: sort,
                         orders: vec![order_by_first_column()].into_boxed_slice(),
-                        projection_map: Box::new([]),
+                        projection_map: Box::new([0]),
                         input_types: Box::new([LogicalType::Integer]),
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),

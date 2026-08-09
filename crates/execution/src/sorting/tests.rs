@@ -34,7 +34,7 @@ fn build_int_sort() -> Sort {
             nulls_first: false,
         }],
         vec![LogicalType::Integer, LogicalType::Varchar],
-        vec![],
+        vec![0, 1],
         false,
     )
     .unwrap()
@@ -51,7 +51,7 @@ fn build_varchar_sort() -> Sort {
             nulls_first: false,
         }],
         vec![LogicalType::Varchar, LogicalType::Integer],
-        vec![],
+        vec![0, 1],
         false,
     )
     .unwrap()
@@ -309,7 +309,7 @@ fn lossy_float_key_encoding_retains_original_key_rows() {
             nulls_first: false,
         }],
         vec![LogicalType::Float],
-        vec![],
+        vec![0],
         false,
     )
     .unwrap();

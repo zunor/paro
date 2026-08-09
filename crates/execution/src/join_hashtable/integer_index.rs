@@ -123,6 +123,84 @@ impl IntegerKeyKind {
             Self::UHugeInt => read!(u128),
         })
     }
+
+    /// Compute one build batch's physical domain while its key vector is hot.
+    /// This moves min/max work out of the serial finalize phase.
+    pub(super) fn selected_bounds(
+        self,
+        vector: &Vector,
+        logical_count: usize,
+        selected: &[u32],
+    ) -> Result<Option<(u128, u128)>> {
+        if selected.is_empty() {
+            return Ok(None);
+        }
+        let view = vector.try_to_view(logical_count)?;
+        let mut minimum = u128::MAX;
+        let mut maximum = 0_u128;
+
+        macro_rules! bounds {
+            ($ty:ty, $ordinal:expr) => {{
+                let Some(data) = view.get_data::<$ty>() else {
+                    return self.selected_sequence_bounds(&view, selected);
+                };
+                let to_ordinal = $ordinal;
+                for &row in selected {
+                    let row = row as usize;
+                    if !view.is_valid(row) {
+                        return Ok(None);
+                    }
+                    // SAFETY: the vector view validates its physical storage
+                    // and selected rows are bounded by the build selection.
+                    let value = unsafe { *data.add(view.physical_index(row)) };
+                    let ordinal = to_ordinal(value);
+                    minimum = minimum.min(ordinal);
+                    maximum = maximum.max(ordinal);
+                }
+            }};
+        }
+
+        match self {
+            Self::TinyInt => bounds!(i8, |value| signed_ordinal(value as i128)),
+            Self::SmallInt => bounds!(i16, |value| signed_ordinal(value as i128)),
+            Self::Integer | Self::Date => bounds!(i32, |value| signed_ordinal(value as i128)),
+            Self::BigInt | Self::Timestamp | Self::TimestampTz | Self::Time => {
+                bounds!(i64, |value| signed_ordinal(value as i128))
+            }
+            Self::HugeInt => bounds!(i128, signed_ordinal),
+            Self::UTinyInt => bounds!(u8, u128::from),
+            Self::USmallInt => bounds!(u16, u128::from),
+            Self::UInteger => bounds!(u32, u128::from),
+            Self::UBigInt => bounds!(u64, u128::from),
+            Self::UHugeInt => bounds!(u128, |value| value),
+        }
+        Ok(Some((minimum, maximum)))
+    }
+
+    fn selected_sequence_bounds(
+        self,
+        view: &VectorView<'_>,
+        selected: &[u32],
+    ) -> Result<Option<(u128, u128)>> {
+        if matches!(
+            self,
+            Self::UTinyInt | Self::USmallInt | Self::UInteger | Self::UBigInt | Self::UHugeInt
+        ) {
+            return Ok(None);
+        }
+        let mut minimum = u128::MAX;
+        let mut maximum = 0_u128;
+        for &row in selected {
+            let row = row as usize;
+            if !view.is_valid(row) {
+                return Ok(None);
+            }
+            let ordinal = signed_ordinal(view.get_i64(row) as i128);
+            minimum = minimum.min(ordinal);
+            maximum = maximum.max(ordinal);
+        }
+        Ok(Some((minimum, maximum)))
+    }
 }
 
 /// Immutable after publication by [`super::table::JoinHashTable::finalize`].
@@ -199,12 +277,19 @@ impl ExactIntegerJoinIndex {
                 .checked_add(rank_bytes)
                 .and_then(|bytes| bytes.checked_add(pointer_bytes))
                 .ok_or_else(|| paro_error::internal("ranked join index size overflow"))?;
-            if final_bytes > MAX_RANKED_INDEX_BYTES {
-                return Ok(None);
-            }
             let offset_bytes = build_count
                 .checked_mul(std::mem::size_of::<u32>())
                 .ok_or_else(|| paro_error::internal("ranked join offset size overflow"))?;
+            // Finalization constructs ranks and the compact pointer array while
+            // the build-time offsets and input pointers are still live. Admit
+            // against that peak, not only the smaller published representation.
+            let peak_bytes = final_bytes
+                .checked_add(offset_bytes)
+                .and_then(|bytes| bytes.checked_add(pointer_bytes))
+                .ok_or_else(|| paro_error::internal("ranked join peak size overflow"))?;
+            if peak_bytes > MAX_RANKED_INDEX_BYTES {
+                return Ok(None);
+            }
             IntegerJoinStorage::RankedBuilding {
                 bits: memory.allocate_zeroed_buffer(allocator.clone(), bit_bytes)?,
                 offsets: memory.allocate_buffer(allocator.clone(), offset_bytes)?,
@@ -506,15 +591,16 @@ impl ExactIntegerJoinIndex {
         matched_rows: &mut [u32],
         lookup: impl Fn(u128) -> Option<usize>,
     ) -> Result<usize> {
-        if !matches!(
+        if matches!(
             self.kind,
-            IntegerKeyKind::BigInt
-                | IntegerKeyKind::Timestamp
-                | IntegerKeyKind::TimestampTz
-                | IntegerKeyKind::Time
+            IntegerKeyKind::UTinyInt
+                | IntegerKeyKind::USmallInt
+                | IntegerKeyKind::UInteger
+                | IntegerKeyKind::UBigInt
+                | IntegerKeyKind::UHugeInt
         ) {
             return Err(paro_error::internal(
-                "integer join vector has no fixed physical data",
+                "unsigned integer join sequence has no unsigned physical representation",
             ));
         }
         let mut matched_count = 0usize;

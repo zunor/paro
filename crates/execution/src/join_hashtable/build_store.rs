@@ -345,6 +345,10 @@ impl BuildBlock {
         row_width: usize,
     ) -> Result<Self> {
         let allocated_bytes = max_rows.saturating_mul(row_width);
+        // Append relies on every fresh slot starting at zero: validity bits,
+        // pointer metadata, and row padding are not cleared per row. Keep this
+        // allocation zeroed unless append is changed to initialize the complete
+        // physical row representation itself.
         let data = memory.allocate_zeroed_buffer(allocator, allocated_bytes)?;
         Ok(Self {
             data,
@@ -394,6 +398,13 @@ impl BuildBlock {
 
         let row_idx = self.row_count;
         let row_ptr = self.row_ptr_mut(row_idx);
+        debug_assert!(unsafe {
+            // SAFETY: row_idx is below max_rows and the allocation contains
+            // max_rows contiguous row_width-byte slots.
+            std::slice::from_raw_parts(row_ptr, self.row_width)
+                .iter()
+                .all(|byte| *byte == 0)
+        });
         // Build blocks are zero-initialized once and row slots are append-only.
         // PreparedRowScatter initializes every logical field and the code below
         // initializes all join metadata, so clearing the fresh slot again here

@@ -622,7 +622,7 @@ mod tests {
                     nulls_first: false,
                 }],
                 vec![LogicalType::Integer],
-                vec![],
+                vec![0],
                 false,
             )
             .expect("sort descriptor"),

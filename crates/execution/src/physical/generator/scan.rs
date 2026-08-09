@@ -127,7 +127,10 @@ impl PhysicalPlanGenerator {
         &mut self,
         filter: &LogicalFilter,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
-        if filter.projection_map.is_empty() {
+        if filter
+            .projection_map
+            .is_identity(filter.child.types().len())
+        {
             if let LogicalOperator::Aggregate(aggregate) = &filter.child.operator {
                 if let Some(having_filter) = rebase_aggregate_only_filter(
                     filter.expressions.clone(),
@@ -157,7 +160,10 @@ impl PhysicalPlanGenerator {
         };
         let spec = FilterSpec {
             expressions: expressions.into_boxed_slice(),
-            projection_map: filter.projection_map.clone().into_boxed_slice(),
+            projection_map: filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Filter(spec), vec![child]))
     }
@@ -178,7 +184,8 @@ impl PhysicalPlanGenerator {
         let mut scan_spec = self.rowset_scan_spec(get, predicate, residual.clone())?;
 
         if residual.is_empty() {
-            project_rowset_scan_spec(&mut scan_spec, get, &filter.projection_map)?;
+            let projection = filter.projection_map.to_indices(filter.child.types().len());
+            project_rowset_scan_spec(&mut scan_spec, get, &projection)?;
             return Ok((PhysicalNodeKind::RowsetScan(scan_spec), Vec::new()));
         }
 
@@ -195,7 +202,10 @@ impl PhysicalPlanGenerator {
         let expressions = normalize_filter_expressions(residual).into_boxed_slice();
         let spec = FilterSpec {
             expressions,
-            projection_map: filter.projection_map.clone().into_boxed_slice(),
+            projection_map: filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Filter(spec), vec![child_id]))
     }
@@ -316,13 +326,12 @@ impl PhysicalPlanGenerator {
             child_types.len(),
             "order child output",
         )?;
-        let output_names =
-            project_or_all_by_index(&child_names, &order.projection_map, "order output")?;
-        let output_types =
-            project_or_all_by_index(&child_types, &order.projection_map, "order output")?;
+        let projection = order.projection_map.to_indices(child_types.len());
+        let output_names = project_by_index(&child_names, &projection, "order output")?;
+        let output_types = project_by_index(&child_types, &projection, "order output")?;
         let spec = SortSpec {
             orders: order.orders.clone().into_boxed_slice(),
-            projection_map: order.projection_map.clone().into_boxed_slice(),
+            projection_map: projection.into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
         };
@@ -505,10 +514,6 @@ fn project_rowset_scan_spec(
     get: &Get,
     projection_map: &[usize],
 ) -> Result<()> {
-    if projection_map.is_empty() {
-        return Ok(());
-    }
-
     let table_column_count = spec.table.columns.len();
     let mut output_names = Vec::with_capacity(projection_map.len());
     let mut returned_types = Vec::with_capacity(projection_map.len());

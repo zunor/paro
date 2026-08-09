@@ -9,12 +9,16 @@
 //! keeps boxed [`Value`] conversion at the storage-predicate boundary rather
 //! than on every build row.
 
-use std::collections::HashSet;
 use std::hash::Hash;
+use std::sync::Mutex;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::hash::ExecutionHashBuilder;
+use paro_common::memory::{
+    AccountedHashSet, MemoryAccountingClass, MemoryAccountingContext, MemoryReleaseHandle,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, SelectionVector, Vector};
@@ -29,7 +33,7 @@ use paro_storage::index::{
 /// value, which covers fact-table key domains without allowing sparse endpoint
 /// ranges to dictate allocation size. Domains beyond the exact-value budget
 /// retain min/max only.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct JoinRuntimeFilterPolicy {
     max_exact_values: usize,
     membership: FixedMembershipBuildPolicy,
@@ -44,12 +48,29 @@ impl Default for JoinRuntimeFilterPolicy {
     }
 }
 
-type ExecutionHashSet<T> = HashSet<T, ExecutionHashBuilder>;
+type ExecutionHashSet<T> = AccountedHashSet<T, ExecutionHashBuilder>;
+
+#[derive(Debug)]
+struct RuntimeFilterReservation(MemoryReleaseHandle);
+
+impl Drop for RuntimeFilterReservation {
+    fn drop(&mut self) {
+        self.0.release();
+    }
+}
 
 #[derive(Debug)]
 enum ExactValues<T> {
-    Mutable(ExecutionHashSet<T>),
-    Frozen(FixedMembership),
+    Mutable {
+        // The breaker handle is shared before publication. Mutation still
+        // requires `&mut self`; the mutex makes the build-only value Sync.
+        values: Mutex<ExecutionHashSet<T>>,
+        memory: MemoryAccountingContext,
+    },
+    Frozen {
+        values: FixedMembership,
+        _reservation: RuntimeFilterReservation,
+    },
     Disabled,
 }
 
@@ -57,57 +78,98 @@ impl<T> ExactValues<T>
 where
     T: Copy + Eq + Hash + Ord,
 {
-    fn mutable() -> Self {
-        Self::Mutable(ExecutionHashSet::with_hasher(ExecutionHashBuilder))
+    fn mutable(memory: MemoryAccountingContext) -> Self {
+        let Ok(grant) = memory.grant() else {
+            return Self::Disabled;
+        };
+        Self::Mutable {
+            values: Mutex::new(ExecutionHashSet::new_with_accounting_and_hasher(
+                grant,
+                memory.tag(),
+                memory.accounting_class(),
+                ExecutionHashBuilder,
+            )),
+            memory,
+        }
     }
 
     fn insert(&mut self, value: T, max_values: usize) {
-        let Self::Mutable(values) = self else {
+        let Self::Mutable { values, .. } = self else {
             return;
         };
+        let values = values.get_mut().unwrap_or_else(|error| error.into_inner());
         if values.len() == max_values && !values.contains(&value) {
             *self = Self::Disabled;
             return;
         }
-        values.insert(value);
+        if values.try_insert(value).is_err() {
+            // Exact membership is optional. Query-memory pressure degrades to
+            // the min/max domain maintained alongside this set.
+            *self = Self::Disabled;
+        }
     }
 
     fn merge(&mut self, incoming: Self, max_values: usize) {
         match incoming {
             Self::Disabled => *self = Self::Disabled,
-            Self::Frozen(_) => {
+            Self::Frozen { .. } => {
                 debug_assert!(false, "published exact runtime filter cannot be merged");
                 *self = Self::Disabled;
             }
-            Self::Mutable(mut incoming) => {
-                let Self::Mutable(values) = self else {
+            Self::Mutable {
+                values: incoming,
+                memory: incoming_memory,
+            } => {
+                let Self::Mutable { values, memory } = self else {
                     return;
                 };
+                let values = values.get_mut().unwrap_or_else(|error| error.into_inner());
+                let mut incoming = incoming
+                    .into_inner()
+                    .unwrap_or_else(|error| error.into_inner());
                 if incoming.len() > values.len() {
+                    // Adopt the larger table and its accounting context. This
+                    // keeps combine linear in the smaller local domain and
+                    // avoids growing a second large allocation while both
+                    // tables are live.
                     std::mem::swap(values, &mut incoming);
+                    *memory = incoming_memory;
                 }
-                for value in incoming {
+                for value in incoming.drain() {
                     if values.len() == max_values && !values.contains(&value) {
                         *self = Self::Disabled;
                         return;
                     }
-                    values.insert(value);
+                    if values.try_insert(value).is_err() {
+                        *self = Self::Disabled;
+                        return;
+                    }
                 }
             }
         }
     }
 
     fn freeze_with(&mut self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) {
-        let Self::Mutable(values) = std::mem::replace(self, Self::Disabled) else {
+        let Self::Mutable { values, memory } = std::mem::replace(self, Self::Disabled) else {
             return;
         };
-        *self = Self::Frozen(freeze(values.into_iter().collect()));
+        let mut values = values
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner());
+        let frozen = freeze(values.drain().collect());
+        let Ok(reservation) = memory.retain(frozen.allocation_size()) else {
+            return;
+        };
+        *self = Self::Frozen {
+            values: frozen,
+            _reservation: RuntimeFilterReservation(reservation),
+        };
     }
 
     fn frozen(&self) -> Option<&FixedMembership> {
         match self {
-            Self::Frozen(values) => Some(values),
-            Self::Mutable(_) | Self::Disabled => None,
+            Self::Frozen { values, .. } => Some(values),
+            Self::Mutable { .. } | Self::Disabled => None,
         }
     }
 }
@@ -124,11 +186,11 @@ impl<T> ExactDomain<T>
 where
     T: Copy + Eq + Hash + Ord,
 {
-    fn new(policy: JoinRuntimeFilterPolicy) -> Self {
+    fn new(policy: JoinRuntimeFilterPolicy, memory: MemoryAccountingContext) -> Self {
         Self {
             min: None,
             max: None,
-            values: ExactValues::mutable(),
+            values: ExactValues::mutable(memory),
             policy,
         }
     }
@@ -147,10 +209,14 @@ where
         if let Some(value) = incoming.max {
             self.max = Some(self.max.map_or(value, |current| current.max(value)));
         }
-        debug_assert_eq!(
-            self.policy.max_exact_values, incoming.policy.max_exact_values,
-            "runtime filter policies must match across local sketches"
-        );
+        if self.policy != incoming.policy {
+            debug_assert_eq!(
+                self.policy, incoming.policy,
+                "runtime filter policies must match across local sketches"
+            );
+            self.values = ExactValues::Disabled;
+            return;
+        }
         self.values
             .merge(incoming.values, self.policy.max_exact_values);
     }
@@ -161,6 +227,15 @@ where
     ) {
         let membership = self.policy.membership;
         self.values.freeze_with(|values| freeze(values, membership));
+        if self
+            .values
+            .frozen()
+            .is_some_and(FixedMembership::is_contiguous)
+        {
+            // A closed min/max range represents a contiguous domain exactly;
+            // release the redundant membership allocation immediately.
+            self.values = ExactValues::Disabled;
+        }
     }
 }
 
@@ -267,14 +342,18 @@ enum RuntimeFilterDomain {
 }
 
 impl RuntimeFilterDomain {
-    fn for_type(logical_type: &LogicalType, policy: JoinRuntimeFilterPolicy) -> Self {
+    fn for_type(
+        logical_type: &LogicalType,
+        policy: JoinRuntimeFilterPolicy,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         match logical_type {
-            LogicalType::Integer | LogicalType::Date => Self::I32(ExactDomain::new(policy)),
+            LogicalType::Integer | LogicalType::Date => Self::I32(ExactDomain::new(policy, memory)),
             LogicalType::BigInt
             | LogicalType::Decimal {
                 precision: 0..=18, ..
-            } => Self::I64(ExactDomain::new(policy)),
-            LogicalType::Decimal { .. } => Self::I128(ExactDomain::new(policy)),
+            } => Self::I64(ExactDomain::new(policy, memory)),
+            LogicalType::Decimal { .. } => Self::I128(ExactDomain::new(policy, memory)),
             _ => Self::Generic(GenericDomain::new()),
         }
     }
@@ -297,16 +376,36 @@ pub struct JoinRuntimeFilterSketch {
 
 impl JoinRuntimeFilterSketch {
     pub fn empty(key_types: &[LogicalType]) -> Self {
-        Self::empty_with_policy(key_types, JoinRuntimeFilterPolicy::default())
+        Self::empty_with_policy(
+            key_types,
+            JoinRuntimeFilterPolicy::default(),
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Metadata,
+            ),
+        )
     }
 
-    fn empty_with_policy(key_types: &[LogicalType], policy: JoinRuntimeFilterPolicy) -> Self {
+    pub(crate) fn empty_with_memory(
+        key_types: &[LogicalType],
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        Self::empty_with_policy(key_types, JoinRuntimeFilterPolicy::default(), memory)
+    }
+
+    fn empty_with_policy(
+        key_types: &[LogicalType],
+        policy: JoinRuntimeFilterPolicy,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         Self {
             row_count: 0,
             keys: key_types
                 .iter()
                 .cloned()
-                .map(|logical_type| JoinRuntimeFilterKeySketch::new(logical_type, policy))
+                .map(|logical_type| {
+                    JoinRuntimeFilterKeySketch::new(logical_type, policy, memory.clone())
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
         }
@@ -323,6 +422,10 @@ impl JoinRuntimeFilterSketch {
                 max_exact_values,
                 ..JoinRuntimeFilterPolicy::default()
             },
+            MemoryAccountingContext::detached(
+                MemoryTag::HashTable,
+                MemoryAccountingClass::Metadata,
+            ),
         )
     }
 
@@ -396,9 +499,13 @@ pub struct JoinRuntimeFilterKeySketch {
 }
 
 impl JoinRuntimeFilterKeySketch {
-    fn new(logical_type: LogicalType, policy: JoinRuntimeFilterPolicy) -> Self {
+    fn new(
+        logical_type: LogicalType,
+        policy: JoinRuntimeFilterPolicy,
+        memory: MemoryAccountingContext,
+    ) -> Self {
         Self {
-            domain: RuntimeFilterDomain::for_type(&logical_type, policy),
+            domain: RuntimeFilterDomain::for_type(&logical_type, policy, memory),
             logical_type,
             non_null_count: 0,
             has_null: false,
@@ -667,6 +774,7 @@ fn required<T>(value: Option<T>) -> Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory_runtime::QueryMemoryPool;
     use paro_common::test_utils::{test_allocator, test_i64_vector_with_allocator};
 
     #[test]
@@ -684,6 +792,44 @@ mod tests {
             Some(PredicateTree::leaf(Predicate::FixedIn {
                 column_id: 9,
                 values: FixedMembership::i64(vec![10, 20, 30]),
+            }))
+        );
+    }
+
+    #[test]
+    fn exact_domain_degrades_under_query_memory_pressure() {
+        let allocator = test_allocator();
+        let values = (0_i32..256).map(|value| value * 2).collect::<Vec<_>>();
+        let mut vector =
+            Vector::try_new(LogicalType::Integer, values.len(), allocator.clone()).unwrap();
+        for (row, value) in values.iter().copied().enumerate() {
+            vector.set_i32(row, value);
+        }
+        vector.set_count(values.len());
+        let keys = Chunk::from_arc_vectors(vec![std::sync::Arc::new(vector)], allocator.clone());
+        let selection = SelectionVector::try_incremental(values.len(), allocator).unwrap();
+
+        let pool = std::sync::Arc::new(QueryMemoryPool::new(64));
+        let owner: std::sync::Arc<dyn paro_common::memory::MemoryOwner> = pool;
+        let memory = MemoryAccountingContext::from_owner(
+            owner,
+            paro_common::memory::MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        );
+        let mut sketch =
+            JoinRuntimeFilterSketch::empty_with_memory(&[LogicalType::Integer], memory);
+        sketch
+            .add_key_chunk(&keys, &selection, values.len())
+            .unwrap();
+        sketch.freeze();
+
+        assert_eq!(
+            sketch.predicate_for_column(0, 7),
+            Some(PredicateTree::leaf(Predicate::Range {
+                column_id: 7,
+                lower: Value::Integer(0),
+                upper: Value::Integer(510),
             }))
         );
     }

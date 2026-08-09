@@ -409,7 +409,7 @@ mod tests {
         let LogicalOperator::Filter(filter) = rewritten.operator else {
             panic!("expected filter");
         };
-        assert!(filter.projection_map.is_empty());
+        assert!(filter.projection_map.is_identity(1));
         let Expression::Operator(operator) = &filter.expressions[0] else {
             panic!("expected preserved IN operator");
         };

@@ -18,7 +18,7 @@ use paro_planner::operator::{
     JoinCondition, JoinType, LogicalOperator,
 };
 use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
-use paro_storage::statistics::ColumnStatistics;
+use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 use crate::cost_model::CostModel as LogicalCostModel;
 use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
@@ -28,6 +28,48 @@ use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
 };
+
+/// Tight integral-domain upper bound derived from correctness-safe min/max.
+///
+/// Join ordering uses this only as an NDV estimate. The paired bounds API
+/// prevents a partially known statistic from being promoted into a domain.
+fn integral_domain_cardinality(stats: &ColumnStatistics) -> Option<usize> {
+    let (minimum, maximum) = NumericStats::guaranteed_bounds(stats.statistics())?;
+    let minimum = integral_ordinal(&minimum)?;
+    let maximum = integral_ordinal(&maximum)?;
+    usize::try_from(maximum.checked_sub(minimum)?.checked_add(1)?).ok()
+}
+
+fn integral_ordinal(value: &paro_common::runtime_value::Value) -> Option<u128> {
+    use paro_common::runtime_value::Value;
+
+    match value {
+        Value::Boolean(value) => Some(u128::from(*value)),
+        Value::TinyInt(value) => Some(u128::from((*value as u8) ^ (1 << 7))),
+        Value::SmallInt(value) => Some(u128::from((*value as u16) ^ (1 << 15))),
+        Value::Integer(value) | Value::Date(value) => Some(u128::from((*value as u32) ^ (1 << 31))),
+        Value::BigInt(value)
+        | Value::Timestamp(value)
+        | Value::TimestampTz(value)
+        | Value::Time(value) => Some(u128::from((*value as u64) ^ (1 << 63))),
+        Value::HugeInt(value) | Value::Decimal(value, ..) => Some((*value as u128) ^ (1 << 127)),
+        Value::UTinyInt(value) => Some(u128::from(*value)),
+        Value::USmallInt(value) => Some(u128::from(*value)),
+        Value::UInteger(value) => Some(u128::from(*value)),
+        Value::UBigInt(value) => Some(u128::from(*value)),
+        Value::UHugeInt(value) => Some(*value),
+        Value::Null(_)
+        | Value::Float(_)
+        | Value::Double(_)
+        | Value::Varchar(_)
+        | Value::Blob(_)
+        | Value::Uuid(_)
+        | Value::Interval(_, _, _)
+        | Value::List(_, _)
+        | Value::Array(_, _, _)
+        | Value::Struct(_, _) => None,
+    }
+}
 
 /// The JoinOrderOptimizer performs cost-based join order optimization.
 ///
@@ -290,6 +332,11 @@ impl JoinOrderOptimizer {
     /// they can be reattached to the reconstructed tree. Without this step the
     /// enumerator still costs every filtered scan at its base-table cardinality,
     /// hiding selective date/range predicates from join ordering.
+    ///
+    /// These mutations are private to `RelationManager`, the DP estimator's
+    /// cost domain. They are never copied into the retained logical leaf plans:
+    /// reconstruction reattaches each predicate exactly once, and the later
+    /// statistics-propagation pass remains authoritative for plan annotations.
     fn apply_relation_local_selectivity(&mut self, filters: &[Arc<FilterInfo>]) {
         let mut filters_by_relation = HashMap::<usize, Vec<Expression>>::new();
         for filter in filters {
@@ -313,11 +360,12 @@ impl JoinOrderOptimizer {
             );
             relation.stats.cardinality = estimate.expected.max(1) as usize;
             for distinct in relation.stats.column_distinct_count.values_mut() {
-                if distinct.from_hll {
-                    distinct.distinct_count = distinct
-                        .distinct_count
-                        .min(relation.stats.cardinality.max(1));
-                }
+                // Both observed HLL values and synthetic NDV upper bounds are
+                // domains of the filtered relation. Neither can exceed its
+                // surviving row count.
+                distinct.distinct_count = distinct
+                    .distinct_count
+                    .min(relation.stats.cardinality.max(1));
             }
         }
     }
@@ -424,23 +472,25 @@ impl JoinOrderOptimizer {
             .get_column_bindings()
             .into_iter()
             .map(|binding| {
-                let distinct = self
-                    .column_stats
-                    .get(&binding)
+                let column_stats = self.column_stats.get(&binding);
+                let distinct = column_stats
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 let from_hll = distinct > 0;
+                let distinct = if from_hll {
+                    distinct
+                } else {
+                    column_stats
+                        .and_then(|stats| integral_domain_cardinality(stats))
+                        .unwrap_or(cardinality.max(1))
+                };
                 (
                     binding,
                     DistinctCount::new(
-                        if from_hll {
-                            // A filter can reduce the relation cardinality without
-                            // rewriting base-column HLL statistics. The filtered
-                            // domain cannot contain more distinct values than rows.
-                            distinct.min(cardinality.max(1))
-                        } else {
-                            cardinality.max(1)
-                        },
+                        // A filter can reduce the relation cardinality without
+                        // rewriting base-column HLL or min/max statistics. The
+                        // surviving domain cannot contain more values than rows.
+                        distinct.min(cardinality.max(1)),
                         from_hll,
                     ),
                 )
@@ -1009,6 +1059,75 @@ mod tests {
             .expect("projection column should retain its binding-keyed statistics");
         assert_eq!(distinct_count.distinct_count, 9);
         assert!(distinct_count.from_hll);
+    }
+
+    #[test]
+    fn filtered_relation_synthetic_domain_is_bounded_by_its_cardinality() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let plan = projection_relation(&bind_context, 100, 0, 100);
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer.add_relation_plan(&session, &bind_context, &plan);
+
+        let predicate =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::LessThan,
+                column_ref(0, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(10),
+                    LogicalType::Integer,
+                )),
+            ));
+        let filter = Arc::new(FilterInfo::new_inner(
+            predicate,
+            Arc::new(JoinRelationSet::single(0)),
+            0,
+        ));
+        optimizer.apply_relation_local_selectivity(&[filter]);
+
+        let stats = optimizer.relation_manager.get_relation_stats();
+        let distinct_count = stats[0]
+            .column_distinct_count
+            .get(&ColumnBinding::new(0, 0))
+            .expect("projection column should retain synthetic statistics");
+        assert!(!distinct_count.from_hll);
+        assert_eq!(distinct_count.distinct_count, stats[0].cardinality);
+        assert!(stats[0].cardinality < 100);
+    }
+
+    #[test]
+    fn integral_min_max_domain_is_used_without_hll() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let plan = projection_relation(&bind_context, 100, 0, 1_000);
+        let mut base = NumericStats::create_unknown(LogicalType::Integer);
+        NumericStats::set_guaranteed_min(&mut base, &Value::Integer(-12));
+        NumericStats::set_guaranteed_max(&mut base, &Value::Integer(12));
+
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer.column_stats.insert(
+            ColumnBinding::new(0, 0),
+            Arc::new(ColumnStatistics::new(base)),
+        );
+        optimizer.add_relation_plan(&session, &bind_context, &plan);
+
+        let stats = optimizer.relation_manager.get_relation_stats();
+        let distinct_count = stats[0]
+            .column_distinct_count
+            .get(&ColumnBinding::new(0, 0))
+            .expect("projection column should retain its min/max domain");
+        assert_eq!(distinct_count.distinct_count, 25);
+        assert!(!distinct_count.from_hll);
+    }
+
+    #[test]
+    fn integral_domain_cardinality_rejects_unrepresentable_full_u128_range() {
+        let mut base = NumericStats::create_unknown(LogicalType::UHugeInt);
+        NumericStats::set_guaranteed_min(&mut base, &Value::UHugeInt(0));
+        NumericStats::set_guaranteed_max(&mut base, &Value::UHugeInt(u128::MAX));
+        let stats = ColumnStatistics::new(base);
+
+        assert_eq!(integral_domain_cardinality(&stats), None);
     }
 
     #[test]

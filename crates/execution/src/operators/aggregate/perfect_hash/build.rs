@@ -15,7 +15,7 @@ use paro_function::scalar::FunctionExecContext;
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::aggregate::build_helpers::{
     create_perfect_aggregate_table, group_payload_refs, projected_payload_chunk,
-    query_hash_table_memory, update_perfect_aggregate_table,
+    query_perfect_hash_memory, update_perfect_aggregate_table,
 };
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
@@ -93,7 +93,7 @@ impl PerfectHashAggregateSinkExec {
                 table: Some(create_perfect_aggregate_table(
                     &self.spec,
                     ctx.query.allocator(MemoryTag::HashTable),
-                    query_hash_table_memory(ctx.query),
+                    query_perfect_hash_memory(ctx.query),
                 )?),
             },
         ))
@@ -220,7 +220,7 @@ impl PerfectHashAggregateSinkExec {
                 global.table = Some(create_perfect_aggregate_table(
                     &self.spec,
                     ctx.query.allocator(MemoryTag::HashTable),
-                    query_hash_table_memory(ctx.query),
+                    query_perfect_hash_memory(ctx.query),
                 )?);
             }
             Ok(())

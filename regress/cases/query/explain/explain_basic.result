@@ -10,6 +10,7 @@ PROJECTION
   Output: 1
   Output Schema: 1 INTEGER
   ->  DUMMY_SCAN
+    Output Schema: (none)
 
 -- @query json
 EXPLAIN SELECT 1 FORMAT JSON;
