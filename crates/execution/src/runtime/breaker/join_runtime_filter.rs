@@ -17,7 +17,7 @@ use paro_common::memory::{
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DataRef, SelectionVector, Vector};
+use paro_common::vector::{DataRef, SelectionVector, Vector, VECTOR_SIZE};
 use paro_storage::index::{
     ColumnId, FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateTree,
 };
@@ -34,6 +34,8 @@ struct JoinRuntimeFilterPolicy {
     max_exact_values: usize,
     membership: FixedMembershipBuildPolicy,
 }
+
+const MIN_EXACT_PENDING_VALUES: usize = VECTOR_SIZE;
 
 impl Default for JoinRuntimeFilterPolicy {
     fn default() -> Self {
@@ -57,7 +59,9 @@ impl Drop for RuntimeFilterReservation {
 enum ExactValues<T> {
     Enabled {
         values: AccountedVec<T>,
-        normalized: bool,
+        /// Length of the sorted, unique prefix. Values after this boundary are
+        /// an unsorted append buffer.
+        canonical_len: usize,
         memory: MemoryAccountingContext,
     },
     Disabled,
@@ -83,14 +87,16 @@ where
                 memory.tag(),
                 memory.accounting_class(),
             ),
-            normalized: true,
+            canonical_len: 0,
             memory,
         }
     }
 
     fn insert(&mut self, value: T, max_values: usize) {
         let Self::Enabled {
-            values, normalized, ..
+            values,
+            canonical_len,
+            ..
         } = self
         else {
             return;
@@ -100,17 +106,11 @@ where
             return;
         }
 
-        if !*normalized && values.len() >= max_values {
-            normalize_exact_values(values);
-            *normalized = true;
-        }
-
-        // Once the normalized domain reaches its distinct-value budget, a
-        // lookup decides whether the new value is a duplicate or requires a
-        // safe degradation to min/max. Below the budget, analytical keys are
-        // appended linearly and normalized in one batch instead of paying a
-        // hash-table insertion for every build row.
-        if *normalized && values.len() == max_values {
+        // A full canonical domain can decide immediately without growing the
+        // pending buffer. Below the budget, values append linearly and are
+        // normalized only after the suffix has accumulated enough work to pay
+        // for sorting the existing prefix.
+        if *canonical_len == values.len() && values.len() == max_values {
             if values.binary_search(&value).is_err() {
                 *self = Self::Disabled;
             }
@@ -122,31 +122,52 @@ where
             *self = Self::Disabled;
             return;
         }
-        *normalized = false;
-        if values.len() >= max_values {
-            normalize_exact_values(values);
-            *normalized = true;
+        let pending_len = values.len().saturating_sub(*canonical_len);
+        if pending_len >= exact_pending_limit(*canonical_len, max_values) {
+            normalize_exact_values(values, canonical_len);
             if values.len() > max_values {
                 *self = Self::Disabled;
             }
         }
     }
 
-    /// Reserve the largest exact-domain prefix that an input batch can add
-    /// before the next normalization boundary.
+    /// Geometrically reserve the portion of an input batch that fits before
+    /// the next normalization boundary.
     ///
     /// `AccountedVec` deliberately uses exact reservations so its query-memory
     /// charge matches the physical allocation. Growing it one value at a time
     /// would consequently put allocator and accounting work in the build-row
-    /// loop. Runtime filters consume vector batches, so reserve once at that
-    /// boundary instead. A failed reservation only disables optional exact
-    /// membership; min/max collection continues independently.
+    /// loop. The sorted-prefix/pending-suffix representation caps low-NDV
+    /// domains near one vector while allowing high-NDV domains to double up to
+    /// the 2M worst-case bound. A failed reservation only disables optional
+    /// exact membership; min/max collection continues independently.
     fn prepare_batch(&mut self, additional: usize, max_values: usize) {
-        let Self::Enabled { values, .. } = self else {
+        let Self::Enabled {
+            values,
+            canonical_len,
+            ..
+        } = self
+        else {
             return;
         };
-        let reservable = additional.min(max_values.saturating_sub(values.len()));
-        if reservable > 0 && values.try_reserve(reservable).is_err() {
+        if max_values == 0
+            || (*canonical_len == values.len() && values.len() == max_values)
+            || additional == 0
+        {
+            return;
+        }
+        let buffer_limit =
+            canonical_len.saturating_add(exact_pending_limit(*canonical_len, max_values));
+        let required = values.len().saturating_add(additional).min(buffer_limit);
+        if required <= values.capacity() {
+            return;
+        }
+        let geometric = values.capacity().max(1).saturating_mul(2);
+        let target_capacity = required.max(geometric).min(buffer_limit);
+        if values
+            .try_reserve(target_capacity.saturating_sub(values.len()))
+            .is_err()
+        {
             *self = Self::Disabled;
         }
     }
@@ -156,38 +177,49 @@ where
             Self::Disabled => *self = Self::Disabled,
             Self::Enabled {
                 values: mut incoming,
-                normalized: incoming_normalized,
+                canonical_len: mut incoming_canonical_len,
                 memory: incoming_memory,
             } => {
+                normalize_exact_values(&mut incoming, &mut incoming_canonical_len);
+                if incoming.len() > max_values {
+                    *self = Self::Disabled;
+                    return;
+                }
                 let Self::Enabled {
                     values,
-                    normalized,
+                    canonical_len,
                     memory,
                 } = self
                 else {
                     return;
                 };
+                normalize_exact_values(values, canonical_len);
+                if values.len() > max_values {
+                    *self = Self::Disabled;
+                    return;
+                }
                 if values.is_empty() {
                     // The global builder starts empty. Adopt the first local
                     // batch together with its accounting context without a
                     // copy or a second allocation.
                     std::mem::swap(values, &mut incoming);
-                    *normalized = incoming_normalized;
+                    *canonical_len = incoming_canonical_len;
                     *memory = incoming_memory;
                     return;
                 }
                 if incoming.is_empty() {
                     return;
                 }
-                normalize_exact_values(values);
-                normalize_exact_values(&mut incoming);
-                *normalized = true;
-
                 let normalized_len = values.len();
-                let reservable = incoming
-                    .len()
-                    .min(max_values.saturating_sub(normalized_len));
-                if reservable > 0 && values.try_reserve(reservable).is_err() {
+                let missing = incoming
+                    .iter()
+                    .filter(|value| values.binary_search(value).is_err())
+                    .count();
+                if missing > max_values.saturating_sub(normalized_len) {
+                    *self = Self::Disabled;
+                    return;
+                }
+                if missing > 0 && values.try_reserve(missing).is_err() {
                     *self = Self::Disabled;
                     return;
                 }
@@ -198,20 +230,26 @@ where
                     // `incoming` is normalized, so appended values cannot
                     // duplicate one another. Only the original sorted prefix
                     // needs a lookup while the suffix is appended.
-                    if values.len() == max_values || values.try_push(value).is_err() {
+                    if values.try_push(value).is_err() {
                         *self = Self::Disabled;
                         return;
                     }
                 }
-                *normalized = values.len() == normalized_len;
+                if values.len() != normalized_len {
+                    normalize_exact_values(values, canonical_len);
+                }
             }
         }
     }
 
-    fn freeze_with(mut self, freeze: impl FnOnce(Vec<T>) -> FixedMembership) -> FrozenExactValues {
+    fn freeze_with(
+        mut self,
+        max_values: usize,
+        freeze: impl FnOnce(Vec<T>) -> FixedMembership,
+    ) -> FrozenExactValues {
         let Self::Enabled {
             values,
-            normalized,
+            canonical_len,
             memory,
         } = &mut self
         else {
@@ -220,8 +258,12 @@ where
                 _reservation: None,
             };
         };
-        if !*normalized {
-            normalize_exact_values(values);
+        normalize_exact_values(values, canonical_len);
+        if values.len() > max_values {
+            return FrozenExactValues {
+                values: None,
+                _reservation: None,
+            };
         }
         let frozen = freeze(values.drain().collect());
         if frozen.is_contiguous() {
@@ -243,8 +285,21 @@ where
     }
 }
 
-fn normalize_exact_values<T: Copy + Eq + Ord>(values: &mut AccountedVec<T>) {
+fn exact_pending_limit(canonical_len: usize, max_values: usize) -> usize {
+    canonical_len
+        .max(MIN_EXACT_PENDING_VALUES)
+        .min(max_values.max(1))
+}
+
+fn normalize_exact_values<T: Copy + Eq + Ord>(
+    values: &mut AccountedVec<T>,
+    canonical_len: &mut usize,
+) {
+    if *canonical_len == values.len() {
+        return;
+    }
     if values.len() < 2 {
+        *canonical_len = values.len();
         return;
     }
     values.sort_unstable();
@@ -256,6 +311,7 @@ fn normalize_exact_values<T: Copy + Eq + Ord>(values: &mut AccountedVec<T>) {
         }
     }
     values.truncate(write);
+    *canonical_len = write;
 }
 
 #[derive(Debug)]
@@ -318,7 +374,11 @@ where
         FrozenExactDomain {
             min: self.min,
             max: self.max,
-            values: self.values.freeze_with(|values| freeze(values, membership)),
+            values: self
+                .values
+                .freeze_with(self.policy.max_exact_values, |values| {
+                    freeze(values, membership)
+                }),
         }
     }
 }
@@ -980,6 +1040,67 @@ mod tests {
                 upper: Value::BigInt(40),
             }))
         );
+    }
+
+    #[test]
+    fn exact_domain_low_ndv_buffer_stays_vector_sized() {
+        let memory = MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        );
+        let max_values = 512 * 1024;
+        let mut exact = ExactValues::mutable(memory);
+        for _ in 0..32 {
+            exact.prepare_batch(VECTOR_SIZE, max_values);
+            for row in 0..VECTOR_SIZE {
+                exact.insert((row % 10) as i64, max_values);
+            }
+        }
+
+        let ExactValues::Enabled {
+            values,
+            canonical_len,
+            ..
+        } = exact
+        else {
+            panic!("low-NDV exact domain unexpectedly disabled");
+        };
+        assert_eq!(canonical_len, 10);
+        assert_eq!(values.len(), 10);
+        assert!(values.capacity() <= VECTOR_SIZE + 10);
+    }
+
+    #[test]
+    fn exact_domain_near_budget_accumulates_a_pending_suffix() {
+        let memory = MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        );
+        let max_values = 64;
+        let mut exact = ExactValues::mutable(memory);
+        exact.prepare_batch(max_values, max_values);
+        for value in 0_i64..63 {
+            exact.insert(value, max_values);
+        }
+        // Reach the first normalization boundary with 63 distinct values.
+        exact.insert(0, max_values);
+        // A near-full canonical set must buy another O(M) suffix before the
+        // next sort instead of sorting the whole domain once per input row.
+        for _ in 0..62 {
+            exact.insert(0, max_values);
+        }
+
+        let ExactValues::Enabled {
+            values,
+            canonical_len,
+            ..
+        } = exact
+        else {
+            panic!("near-budget exact domain unexpectedly disabled");
+        };
+        assert_eq!(canonical_len, 63);
+        assert_eq!(values.len(), 125);
+        assert!(values.capacity() <= 126);
     }
 
     #[test]

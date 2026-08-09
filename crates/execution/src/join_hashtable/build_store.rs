@@ -24,12 +24,6 @@ use crate::operators::join::hash::row_format::HashJoinRowFormat;
 
 use super::ht_entry::{increment_and_wrap, HtEntry};
 
-#[derive(Clone, Copy)]
-pub(super) enum BuildHashInput<'a> {
-    Computed(&'a [u64]),
-    Deferred,
-}
-
 #[derive(Debug, Clone)]
 pub struct BuildRowLayout {
     base: Arc<RowLayout>,
@@ -635,19 +629,17 @@ impl HashBuildStore {
         payload: &Chunk,
         selection: &SelectionVector,
         selected_count: usize,
-        hashes: BuildHashInput<'_>,
+        hashes: &[u64],
         found: bool,
     ) -> Result<usize> {
         if selected_count == 0 {
             return Ok(0);
         }
-        if let BuildHashInput::Computed(hashes) = hashes {
-            if hashes.len() < selected_count {
-                return Err(paro_error::internal(format!(
-                    "HashBuildStore append hash count mismatch: selected={selected_count}, hashes={}",
-                    hashes.len()
-                )));
-            }
+        if hashes.len() < selected_count {
+            return Err(paro_error::internal(format!(
+                "HashBuildStore append hash count mismatch: selected={selected_count}, hashes={}",
+                hashes.len()
+            )));
         }
         if keys.column_count() != self.layout.key_count() {
             return Err(paro_error::internal(format!(
@@ -702,10 +694,7 @@ impl HashBuildStore {
             &source,
             selected_count,
             |output_idx| selection.get(output_idx),
-            |output_idx, _| match hashes {
-                BuildHashInput::Computed(hashes) => Ok(hashes[output_idx]),
-                BuildHashInput::Deferred => Ok(0),
-            },
+            |output_idx, _| Ok(hashes[output_idx]),
             |_, _| found,
         )
     }
