@@ -139,7 +139,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 storage,
                 CatalogObjectId::from_raw(payload.object_id),
                 0,
-            ),
+            )?,
         )));
         let table_collection = schema
             .collection(CatalogType::Table)

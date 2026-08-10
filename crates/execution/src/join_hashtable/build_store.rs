@@ -399,6 +399,12 @@ impl BuildBlock {
 
         let row_idx = self.row_count;
         let row_ptr = self.row_ptr_mut(row_idx);
+        #[cfg(debug_assertions)]
+        unsafe {
+            // Poison every byte so debug validation exercises the same
+            // uninitialized-slot contract as release builds.
+            ptr::write_bytes(row_ptr, 0xAA, self.row_width);
+        }
         write_row(row_ptr, heap)?;
 
         if let Some(heap_size_offset) = layout.base().heap_size_offset() {
@@ -406,6 +412,10 @@ impl BuildBlock {
                 .map_err(|_| paro_error::out_of_range("hash build row heap size exceeds u64"))?;
             unsafe {
                 ptr::write_unaligned(row_ptr.add(heap_size_offset) as *mut u64, heap_used);
+                debug_assert_eq!(
+                    ptr::read_unaligned(row_ptr.add(heap_size_offset) as *const u64),
+                    heap_used
+                );
             }
         }
 
@@ -782,9 +792,22 @@ impl HashBuildStore {
                                 )?;
                             }
                         }
-                        layout.set_hash(row_ptr, hash_at(output_idx, source_row_idx)?);
+                        let hash = hash_at(output_idx, source_row_idx)?;
+                        let found = found_at(output_idx, source_row_idx);
+                        layout.set_hash(row_ptr, hash);
                         layout.set_next(row_ptr, ptr::null());
-                        layout.set_found(row_ptr, found_at(output_idx, source_row_idx));
+                        layout.set_found(row_ptr, found);
+                        #[cfg(debug_assertions)]
+                        unsafe {
+                            source.debug_assert_row_initialized(
+                                layout.base().as_ref(),
+                                row_ptr,
+                                source_row_idx,
+                            );
+                            debug_assert_eq!(layout.hash(row_ptr), hash);
+                            debug_assert!(layout.next(row_ptr).is_null());
+                            debug_assert_eq!(layout.found(row_ptr), found);
+                        }
                         Ok(())
                     })?;
                 }

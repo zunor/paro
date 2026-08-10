@@ -87,6 +87,8 @@ impl RowHeapUsage {
 /// than recursively dispatching through `Vector` for every cell.
 pub struct PreparedRowScatter<'a> {
     columns: Vec<PreparedColumn<'a>>,
+    #[cfg(debug_assertions)]
+    source_columns: Vec<&'a Vector>,
     heap_columns: Vec<usize>,
     all_valid: bool,
     count: usize,
@@ -178,10 +180,31 @@ impl<'a> PreparedRowScatter<'a> {
         let all_valid = prepared.iter().all(PreparedColumn::all_valid);
         Ok(Self {
             columns: prepared,
+            #[cfg(debug_assertions)]
+            source_columns: columns.to_vec(),
             heap_columns,
             all_valid,
             count,
         })
+    }
+
+    /// Verify the complete logical row after an unchecked scatter.
+    ///
+    /// This is deliberately debug-only: it turns the uninitialized destination
+    /// contract into an executable assertion without adding release-build
+    /// clearing or materialization to the hot path.
+    #[cfg(debug_assertions)]
+    pub unsafe fn debug_assert_row_initialized(
+        &self,
+        layout: &RowLayout,
+        row_ptr: *const u8,
+        row_idx: usize,
+    ) {
+        for (column_idx, source) in self.source_columns.iter().enumerate() {
+            let expected = source.get_value(row_idx);
+            let actual = unsafe { unsafe_api::read_row_value(layout, row_ptr, column_idx) };
+            debug_assert_eq!(actual, expected, "row scatter missed column {column_idx}");
+        }
     }
 
     /// Compile the common all-valid fixed-width shape into a direct row

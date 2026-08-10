@@ -241,8 +241,22 @@ fn validate_constraint(
     };
     if !valid {
         return Err(paro_error::invalid_input(format!(
-            "invalid serialized {constraint_type:?} table constraint"
+            "invalid {constraint_type:?} table constraint"
         )));
+    }
+    Ok(())
+}
+
+fn validate_constraints(constraints: &[Constraint], column_count: usize) -> Result<()> {
+    for constraint in constraints {
+        validate_constraint(
+            constraint.constraint_type,
+            &constraint.columns,
+            constraint.expression.as_deref(),
+            constraint.referenced_table.as_deref(),
+            constraint.referenced_columns.as_deref(),
+            column_count,
+        )?;
     }
     Ok(())
 }
@@ -510,7 +524,7 @@ impl TableCatalogEntry {
         storage: Arc<TableHandle>,
         object_id: CatalogObjectId,
         timestamp: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         Self::from_info_with_object_id(info, storage, object_id, timestamp)
     }
 
@@ -520,8 +534,9 @@ impl TableCatalogEntry {
         storage: Arc<TableHandle>,
         object_id: CatalogObjectId,
         timestamp: u64,
-    ) -> Self {
+    ) -> Result<Self> {
         let column_count = info.columns.len();
+        validate_constraints(&info.constraints, column_count)?;
         let storage_descriptor = Self::descriptor_from_storage(&storage);
         let mut base = SchemaEntryMeta::new(
             CatalogType::Table,
@@ -535,7 +550,7 @@ impl TableCatalogEntry {
         base.base.temporary = info.temporary;
         base.set_dependencies(info.dependencies);
 
-        Self {
+        Ok(Self {
             base,
             table_type: info.table_type,
             columns: info.columns,
@@ -543,7 +558,7 @@ impl TableCatalogEntry {
             storage: Some(storage),
             storage_descriptor,
             statistics: Some(TableStatistics::new_empty(column_count)),
-        }
+        })
     }
 
     /// Create with a specific object identity (e.g. deserialization / replay).
@@ -1003,6 +1018,7 @@ impl TableCatalogEntry {
 
     /// Serialize the table entry
     pub fn serialize(&self) -> Result<Vec<u8>> {
+        validate_constraints(&self.constraints, self.columns.len())?;
         let mut buffer = Vec::new();
 
         buffer.write_all(&Self::SERIALIZATION_VERSION.to_le_bytes())?;
@@ -1014,24 +1030,18 @@ impl TableCatalogEntry {
         buffer.write_all(&self.base.base.timestamp().to_le_bytes())?;
 
         // 3. Name
-        let name_bytes = self.base.base.name.as_bytes();
-        buffer.write_all(&(name_bytes.len() as u32).to_le_bytes())?;
-        buffer.write_all(name_bytes)?;
+        write_string(&mut buffer, &self.base.base.name)?;
 
         // 4. Schema Name
-        let schema_bytes = self.base.schema_name.as_bytes();
-        buffer.write_all(&(schema_bytes.len() as u32).to_le_bytes())?;
-        buffer.write_all(schema_bytes)?;
+        write_string(&mut buffer, &self.base.schema_name)?;
 
         // 5. Table type
         buffer.write_all(&[self.table_type.to_byte()])?;
 
         // 6. Columns
-        buffer.write_all(&(self.columns.len() as u32).to_le_bytes())?;
+        write_usize_as_u32(&mut buffer, self.columns.len(), "column count")?;
         for col in &self.columns {
-            let col_name_bytes = col.name.as_bytes();
-            buffer.write_all(&(col_name_bytes.len() as u32).to_le_bytes())?;
-            buffer.write_all(col_name_bytes)?;
+            write_string(&mut buffer, &col.name)?;
             col.logical_type.serialize(&mut buffer)?;
             buffer.write_all(&[col.not_null as u8])?;
             write_optional_string(&mut buffer, col.default_value.as_deref())?;
@@ -1066,7 +1076,11 @@ impl TableCatalogEntry {
             ));
         };
         let descriptor_bytes = descriptor.serialize()?;
-        buffer.write_all(&(descriptor_bytes.len() as u32).to_le_bytes())?;
+        write_usize_as_u32(
+            &mut buffer,
+            descriptor_bytes.len(),
+            "storage descriptor length",
+        )?;
         buffer.write_all(&descriptor_bytes)?;
 
         // 9. Statistics (simplified)
@@ -1078,14 +1092,7 @@ impl TableCatalogEntry {
         }
 
         // 10. Optional table comment
-        if let Some(comment) = self.base.base.comment() {
-            let comment_bytes = comment.as_bytes();
-            buffer.write_all(&[1u8])?;
-            buffer.write_all(&(comment_bytes.len() as u32).to_le_bytes())?;
-            buffer.write_all(comment_bytes)?;
-        } else {
-            buffer.write_all(&[0u8])?;
-        }
+        write_optional_string(&mut buffer, self.base.base.comment().as_deref())?;
 
         Ok(buffer)
     }
@@ -1129,16 +1136,10 @@ impl TableCatalogEntry {
 
         // 6. Columns
         let col_count = read_u32(&mut cursor)? as usize;
-        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
-        // Every encoded column contains at least a name length, one logical-
-        // type tag, a nullability byte, and two optional-string markers.
-        if col_count > remaining / 8 {
-            return Err(paro_error::invalid_input(format!(
-                "catalog column count {col_count} exceeds remaining payload"
-            )));
-        }
-        let mut columns = Vec::with_capacity(col_count);
-        let mut column_types = Vec::with_capacity(col_count);
+        // Do not reserve from an untrusted count. Each decoder advances the
+        // bounded cursor and fails at the first incomplete element.
+        let mut columns = Vec::new();
+        let mut column_types = Vec::new();
 
         for _ in 0..col_count {
             let col_name = read_string(&mut cursor)?;
@@ -1160,15 +1161,7 @@ impl TableCatalogEntry {
 
         // 7. Constraints
         let constraint_count = read_u32(&mut cursor)? as usize;
-        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
-        // Type, local-column count, two optional strings, and referenced-
-        // column marker form an eight-byte minimum constraint payload.
-        if constraint_count > remaining / 8 {
-            return Err(paro_error::invalid_input(format!(
-                "catalog constraint count {constraint_count} exceeds remaining payload"
-            )));
-        }
-        let mut constraints = Vec::with_capacity(constraint_count);
+        let mut constraints = Vec::new();
         for _ in 0..constraint_count {
             cursor.read_exact(&mut byte_buf)?;
             let constraint_type = ConstraintType::from_byte(byte_buf[0])?;
@@ -1577,6 +1570,54 @@ mod tests {
     }
 
     #[test]
+    fn table_entry_rejects_invalid_constraints_before_publication() {
+        let info = CreateTableInfo::new(
+            "main".to_string(),
+            "public".to_string(),
+            "invalid".to_string(),
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+        )
+        .with_constraints(vec![Constraint::unique(Vec::new())]);
+        let storage = Arc::new(create_table(&[LogicalType::Integer]));
+
+        let error =
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_020), 100)
+                .expect_err("empty UNIQUE constraint must be rejected");
+
+        assert!(error.to_string().contains("invalid Unique"));
+    }
+
+    #[test]
+    fn serialization_revalidates_runtime_constraints() {
+        let mut entry = TableCatalogEntry::new(
+            "main".to_string(),
+            "public".to_string(),
+            "invalid".to_string(),
+            vec![ColumnDefinition::new(
+                "id".to_string(),
+                LogicalType::Integer,
+            )],
+            Arc::new(create_table(&[LogicalType::Integer])),
+            CatalogObjectId::from_raw(10_021),
+            100,
+        );
+        entry.constraints = vec![Constraint::foreign_key(
+            vec![0],
+            "parent".to_string(),
+            vec![0, 1],
+        )];
+
+        let error = entry
+            .serialize()
+            .expect_err("mismatched foreign key must not be persisted");
+
+        assert!(error.to_string().contains("invalid ForeignKey"));
+    }
+
+    #[test]
     fn test_to_sql() {
         let columns = vec![
             ColumnDefinition::new("id".to_string(), LogicalType::BigInt).with_not_null(),
@@ -1701,7 +1742,8 @@ mod tests {
             Constraint::check("item_id > 0".to_string()),
         ]);
         let entry =
-            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_005), 42);
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_005), 42)
+                .unwrap();
 
         let restored = TableCatalogEntry::deserialize(
             &entry.serialize().unwrap(),
@@ -1950,7 +1992,8 @@ mod tests {
 
         let storage = Arc::new(create_table(&[LogicalType::Integer, LogicalType::Varchar]));
         let entry =
-            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_010), 100);
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_010), 100)
+                .unwrap();
 
         assert_eq!(entry.constraints.len(), 3);
         assert_eq!(
@@ -1992,7 +2035,8 @@ mod tests {
             LogicalType::Varchar,
         ]));
         let entry =
-            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_011), 100);
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_011), 100)
+                .unwrap();
 
         // Remove middle column (email)
         let new_entry = entry.remove_column("email", 101).unwrap();

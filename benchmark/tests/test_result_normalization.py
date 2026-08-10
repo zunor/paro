@@ -2,10 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from decimal import Decimal
+from pathlib import Path
 import unittest
 
 from benchmark.harness.executor import _normalize_value
-from benchmark.harness.validator import STRONG_VALIDATE_MODES, ordered_rows_digest
+from benchmark.harness.loader import QueryDef
+from benchmark.harness.validator import (
+    STRONG_VALIDATE_MODES,
+    BenchmarkValidator,
+    ordered_rows_digest,
+)
 
 
 class ResultNormalizationTests(unittest.TestCase):
@@ -21,6 +27,22 @@ class ResultNormalizationTests(unittest.TestCase):
         )
         self.assertNotEqual(ordered_rows_digest(rows), ordered_rows_digest(list(reversed(rows))))
         self.assertIn("ordered_digest", STRONG_VALIDATE_MODES)
+
+    def test_ordered_digest_failure_reports_rows_and_preview(self) -> None:
+        query = QueryDef(
+            id="q",
+            file=Path("q.sql"),
+            sql="SELECT 1",
+            validate="ordered_digest",
+            expected="0" * 64,
+        )
+        outcome = BenchmarkValidator(lambda: None, 1).validate_query(
+            query, [[1, "first"], [2, "second"]]
+        )
+
+        self.assertEqual(outcome.status, "FAIL")
+        self.assertIn("row_count=2", outcome.detail or "")
+        self.assertIn("first_rows=[[1, 'first'], [2, 'second']]", outcome.detail or "")
 
 
 if __name__ == "__main__":

@@ -13,6 +13,7 @@ pub mod ids;
 pub mod node;
 pub mod plan;
 pub mod properties;
+mod rewrite;
 pub mod row_type;
 pub mod specs;
 

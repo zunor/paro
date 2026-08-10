@@ -162,8 +162,10 @@ struct EqualityDenominatorScratch {
     parents: Vec<usize>,
     sizes: Vec<usize>,
     active: Vec<bool>,
-    components: Vec<Vec<DistinctDomainEstimate>>,
+    components: Vec<Vec<usize>>,
     vertex_domains: Vec<Option<DistinctDomainEstimate>>,
+    tree_visited: Vec<bool>,
+    owned_edges: Vec<Option<usize>>,
 }
 
 impl EqualityDenominatorScratch {
@@ -180,6 +182,10 @@ impl EqualityDenominatorScratch {
         }
         self.vertex_domains.clear();
         self.vertex_domains.resize(vertices, None);
+        self.tree_visited.clear();
+        self.tree_visited.resize(vertices, false);
+        self.owned_edges.clear();
+        self.owned_edges.resize(vertices, None);
     }
 }
 
@@ -689,14 +695,14 @@ impl CardinalityEstimator {
                 let distinct = distinct.unwrap_or(fallback_distinct);
                 equality_scratch.vertex_domains[index] = Some(distinct);
                 let root = find_component(&mut equality_scratch.parents, index);
-                equality_scratch.components[root].push(distinct);
+                equality_scratch.components[root].push(index);
             }
-            for distincts in equality_scratch
+            for component_vertices in equality_scratch
                 .components
                 .iter_mut()
                 .filter(|component| !component.is_empty())
             {
-                let vertices = distincts.len();
+                let vertices = component_vertices.len();
                 let independent_edges = vertices.saturating_sub(1);
                 // Under uniformity and containment, equating N domains
                 // contributes the product of the N-1 largest NDVs:
@@ -707,11 +713,73 @@ impl CardinalityEstimator {
                 // same domain. This is invariant to predicate order and keeps
                 // a one-row filtered dimension from erasing the wider domain
                 // of the relation it filters.
-                distincts.sort_unstable_by_key(|distinct| distinct.value());
-                let component_denominator = distincts
+                let root = *component_vertices
                     .iter()
-                    .skip(1)
-                    .fold(1.0, |product, distinct| product * distinct.value() as f64);
+                    .min_by_key(|vertex| {
+                        (
+                            equality_scratch.vertex_domains[**vertex]
+                                .expect("active equality vertex must have a domain")
+                                .value(),
+                            graph.vertices[**vertex].relation,
+                        )
+                    })
+                    .expect("non-empty equality component must have a root");
+                equality_scratch.tree_visited[root] = true;
+
+                // Give every denominator factor a concrete owner edge. The
+                // root is the smallest domain, so multiplying every child
+                // domain still yields the N-1 largest domains. Ownership is
+                // later used to correlate parallel equality classes without
+                // ever dividing out a factor that was not multiplied here.
+                let mut remaining = vertices.saturating_sub(1);
+                while remaining > 0 {
+                    let mut candidate = None;
+                    for (edge_index, edge) in graph.edges.iter().enumerate() {
+                        if !equality_scratch.active[edge.left]
+                            || !equality_scratch.active[edge.right]
+                        {
+                            continue;
+                        }
+                        let (parent, child) = match (
+                            equality_scratch.tree_visited[edge.left],
+                            equality_scratch.tree_visited[edge.right],
+                        ) {
+                            (true, false) => (edge.left, edge.right),
+                            (false, true) => (edge.right, edge.left),
+                            _ => continue,
+                        };
+                        if find_component(&mut equality_scratch.parents, child)
+                            != find_component(&mut equality_scratch.parents, root)
+                        {
+                            continue;
+                        }
+                        let order = (
+                            graph.vertices[parent].relation,
+                            graph.vertices[child].relation,
+                            edge.filter_index,
+                        );
+                        if candidate.as_ref().is_none_or(|(best, _, _)| order < *best) {
+                            candidate = Some((order, child, edge_index));
+                        }
+                    }
+                    let Some((_, child, edge_index)) = candidate else {
+                        debug_assert!(false, "equality component must have a spanning tree");
+                        break;
+                    };
+                    equality_scratch.tree_visited[child] = true;
+                    equality_scratch.owned_edges[child] = Some(edge_index);
+                    remaining -= 1;
+                }
+
+                let component_denominator = component_vertices
+                    .iter()
+                    .filter(|vertex| **vertex != root)
+                    .fold(1.0, |product, vertex| {
+                        product
+                            * equality_scratch.vertex_domains[*vertex]
+                                .expect("active equality vertex must have a domain")
+                                .value() as f64
+                    });
                 denominator *= component_denominator;
                 trace!(
                     target: targets::OPTIMIZER,
@@ -724,30 +792,24 @@ impl CardinalityEstimator {
                 );
             }
 
-            // Multiple predicates in one equivalence class have already been
-            // reduced to graph rank above. Record at most one marginal domain
-            // per relation pair for this class, then correlate matching pairs
-            // across otherwise independent classes.
+            // Correlation is accounted against the exact spanning-tree edge
+            // that owns each factor, never reconstructed from endpoint maxima.
             let mut graph_pairs = HashMap::<(usize, usize), EqualityPairDomain>::new();
-            for edge in &graph.edges {
+            for (child, edge_index) in equality_scratch.owned_edges.iter().enumerate() {
+                let Some(edge_index) = edge_index else {
+                    continue;
+                };
+                let edge = &graph.edges[*edge_index];
                 let left_relation = graph.vertices[edge.left].relation;
                 let right_relation = graph.vertices[edge.right].relation;
-                if !requested_set.contains(left_relation) || !requested_set.contains(right_relation)
-                {
-                    continue;
-                }
-                let Some(left_domain) = equality_scratch.vertex_domains[edge.left] else {
-                    continue;
-                };
-                let Some(right_domain) = equality_scratch.vertex_domains[edge.right] else {
-                    continue;
-                };
                 let pair = if left_relation < right_relation {
                     (left_relation, right_relation)
                 } else {
                     (right_relation, left_relation)
                 };
-                let domain = left_domain.value().max(right_domain.value()) as f64;
+                let domain = equality_scratch.vertex_domains[child]
+                    .expect("owned equality vertex must have a domain")
+                    .value() as f64;
                 let pair_domain = graph_pairs
                     .entry(pair)
                     .or_insert_with(|| EqualityPairDomain {
@@ -807,7 +869,7 @@ impl CardinalityEstimator {
                 denominator *= unique_joint_domain / domains.strongest;
             }
         }
-        (denominator, consumed_filters)
+        (denominator.max(1.0), consumed_filters)
     }
 
     /// Check if an edge connects to a subgraph.
@@ -1601,6 +1663,40 @@ mod tests {
 
         let join = set_manager.get_relation_from_vec(vec![0, 1, 2]);
         assert_eq!(estimator.estimate_cardinality(&join), 18_003_645.0);
+    }
+
+    #[test]
+    fn star_correlation_only_removes_owned_denominator_factors() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut set_manager, 0, 0, 2, 0, 1),
+            create_equality_filter(&mut set_manager, 0, 1, 1, 1, 2),
+            create_equality_filter(&mut set_manager, 0, 1, 2, 1, 3),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        for (relation, cardinality, distinct) in [(0, 100, 100), (1, 10, 10), (2, 10, 10)] {
+            let set = set_manager.get_relation(relation);
+            let mut stats = RelationStats::with_cardinality(cardinality);
+            stats.column_distinct_count = column_distinct_counts(
+                relation,
+                [
+                    DistinctCount::new(distinct, true),
+                    DistinctCount::new(distinct, true),
+                ],
+            );
+            estimator.init_cardinality_estimator_props(&set, &stats);
+        }
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1, 2]);
+        estimator.ensure_equality_graphs();
+        let (denominator, _) = estimator.equality_denominator(&join);
+
+        // Each star contributes X(100) * one leaf(10). The second,
+        // correlated star removes exactly those two owned factors.
+        assert_eq!(denominator, 1_000.0);
     }
 
     #[test]

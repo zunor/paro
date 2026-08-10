@@ -259,7 +259,8 @@ mod tests {
                         before_cut_storage.clone(),
                         catalog.object_id_allocator().allocate(),
                         10,
-                    ),
+                    )
+                    .unwrap(),
                 ))),
                 InstallMode::RejectExisting,
             )
@@ -287,7 +288,8 @@ mod tests {
                         after_cut_storage,
                         catalog.object_id_allocator().allocate(),
                         11,
-                    ),
+                    )
+                    .unwrap(),
                 ))),
                 InstallMode::RejectExisting,
             )

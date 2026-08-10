@@ -12,6 +12,7 @@ use paro_common::vector::Vector;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use std::sync::Arc;
 
+use crate::join_hashtable::hash_kernel::PreparedProbeKeys;
 use crate::join_hashtable::JoinHashTable;
 use crate::operators::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
@@ -121,6 +122,7 @@ impl ScanStructure {
             return Ok(0);
         }
 
+        let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
 
         while base_count < paro_common::vector::VECTOR_SIZE {
@@ -157,7 +159,8 @@ impl ScanStructure {
                 break;
             }
 
-            let match_count = self.resolve_predicates_into_pending(keys, hash_table)?;
+            let match_count =
+                self.resolve_predicates_into_pending(prepared_keys.as_ref(), hash_table);
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -418,8 +421,9 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
-            let match_count = self.resolve_predicates(keys, hash_table, 0)?;
+            let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -472,8 +476,9 @@ impl ScanStructure {
     where
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
+        let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         while self.count > 0 {
-            let match_count = self.resolve_predicates(keys, hash_table, 0)?;
+            let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -597,15 +602,22 @@ impl ScanStructure {
     /// Resolve predicates for the current set of matching candidates.
     ///
     /// This compares the probe-side keys with the keys stored in the build-side rows.
-    pub fn resolve_predicates(
+    fn prepare_probe_keys<'a>(
+        &self,
+        keys: &'a paro_common::chunk::Chunk,
+        hash_table: &JoinHashTable,
+    ) -> Result<Option<PreparedProbeKeys<'a>>> {
+        (!self.exact_key_matches)
+            .then(|| hash_table.prepare_probe_keys(keys))
+            .transpose()
+    }
+
+    fn resolve_predicates(
         &mut self,
-        keys: &paro_common::chunk::Chunk,
+        prepared_keys: Option<&PreparedProbeKeys<'_>>,
         hash_table: &JoinHashTable,
         base_offset: usize,
-    ) -> Result<usize> {
-        let prepared_keys = (!self.exact_key_matches)
-            .then(|| hash_table.prepare_probe_keys(keys))
-            .transpose()?;
+    ) -> usize {
         let mut match_count = 0;
 
         for i in 0..self.count {
@@ -618,9 +630,7 @@ impl ScanStructure {
 
             if self.exact_key_matches
                 || hash_table.key_values_match_build_row(
-                    prepared_keys
-                        .as_ref()
-                        .expect("non-exact join probe must prepare its keys"),
+                    prepared_keys.expect("non-exact join probe must prepare its keys"),
                     idx,
                     row_ptr,
                 )
@@ -631,17 +641,14 @@ impl ScanStructure {
             }
         }
 
-        Ok(match_count)
+        match_count
     }
 
     fn resolve_predicates_into_pending(
         &mut self,
-        keys: &paro_common::chunk::Chunk,
+        prepared_keys: Option<&PreparedProbeKeys<'_>>,
         hash_table: &JoinHashTable,
-    ) -> Result<usize> {
-        let prepared_keys = (!self.exact_key_matches)
-            .then(|| hash_table.prepare_probe_keys(keys))
-            .transpose()?;
+    ) -> usize {
         let mut match_count = 0;
         for active_idx in 0..self.count {
             let probe_idx = self.sel_vector.get(active_idx);
@@ -649,9 +656,7 @@ impl ScanStructure {
             if row_ptr != 0
                 && (self.exact_key_matches
                     || hash_table.key_values_match_build_row(
-                        prepared_keys
-                            .as_ref()
-                            .expect("non-exact join probe must prepare its keys"),
+                        prepared_keys.expect("non-exact join probe must prepare its keys"),
                         probe_idx,
                         row_ptr,
                     ))
@@ -661,7 +666,7 @@ impl ScanStructure {
                 match_count += 1;
             }
         }
-        Ok(match_count)
+        match_count
     }
 
     /// Scan results for an inner join.
@@ -746,6 +751,7 @@ impl ScanStructure {
             return Ok(0);
         }
 
+        let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
         let mut base_count = 0;
 
         while self.count > 0 && base_count < VECTOR_SIZE {
@@ -754,7 +760,8 @@ impl ScanStructure {
             }
 
             let rhs_offset = base_count;
-            let match_count = self.resolve_predicates(keys, hash_table, rhs_offset)?;
+            let match_count =
+                self.resolve_predicates(prepared_keys.as_ref(), hash_table, rhs_offset);
             if match_count > 0 {
                 self.scratch_sel.set_len(match_count);
                 let accepted_count = residual_filter(
@@ -988,9 +995,10 @@ impl ScanStructure {
         }
 
         if !self.probe_matches_ready {
+            let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
             self.single_match_pointers[..left.size()].fill(0);
             while self.count > 0 {
-                let match_count = self.resolve_predicates(keys, hash_table, 0)?;
+                let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
                 self.scratch_sel.set_len(match_count);
                 let accepted_count = residual_filter(
                     &self.chain_match_sel,

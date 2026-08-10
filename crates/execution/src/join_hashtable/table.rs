@@ -412,7 +412,11 @@ impl JoinHashTable {
             build_types.clone(),
             found_flag_column_index.is_some(),
         );
-        let key_layout = JoinKeyLayout::new(&equality_types);
+        let key_layout = JoinKeyLayout::new(
+            &equality_types,
+            &equality_comparisons,
+            found_flag_column_index.is_some(),
+        );
         let spill_layout = Arc::new(RowLayout::from_types(
             build_row_layout.spill_types().to_vec(),
             paro_storage::row::RowValidityType::CanHaveNullValues,
@@ -1056,7 +1060,7 @@ impl JoinHashTable {
         if !unique || resource_declined {
             return Ok(None);
         }
-        let index = match index.finish(self.allocator.clone(), &self.pointer_memory) {
+        let index = match index.finish() {
             Ok(index) => index,
             // This index is an optional acceleration structure. A transient
             // allocation failure during ranked finalization must fall back to
@@ -1342,6 +1346,20 @@ mod tests {
         )
     }
 
+    fn bigint_equality_condition() -> JoinCondition {
+        JoinCondition::new(
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(1),
+                LogicalType::BigInt,
+            )),
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(1),
+                LogicalType::BigInt,
+            )),
+            JoinComparisonType::Equal,
+        )
+    }
+
     fn not_distinct_condition() -> JoinCondition {
         JoinCondition::new(
             Expression::Constant(ConstantExpression::new(
@@ -1370,6 +1388,47 @@ mod tests {
         }
         chunk.set_cardinality(values.len());
         chunk
+    }
+
+    fn chunk_from_optional_i64_columns(columns: &[&[Option<i64>]]) -> Chunk {
+        let row_count = columns.first().map_or(0, |values| values.len());
+        assert!(columns.iter().all(|values| values.len() == row_count));
+        let types = vec![LogicalType::BigInt; columns.len()];
+        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(&types, row_count.max(1));
+        for (column_idx, values) in columns.iter().enumerate() {
+            for (row_idx, value) in values.iter().enumerate() {
+                let value = value
+                    .map(Value::BigInt)
+                    .unwrap_or_else(|| Value::Null(LogicalType::BigInt));
+                chunk
+                    .column_mut(column_idx)
+                    .expect("column must exist")
+                    .set_value(row_idx, &value);
+            }
+        }
+        chunk.set_cardinality(row_count);
+        chunk
+    }
+
+    #[test]
+    fn nullable_i64_pair_fast_matcher_rejects_null_build_key() {
+        let table = JoinHashTable::new(
+            create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
+            vec![bigint_equality_condition(), bigint_equality_condition()],
+            vec![LogicalType::Integer],
+            JoinType::Right,
+            JoinHashTableConfig::default(),
+        );
+        let build_keys = chunk_from_optional_i64_columns(&[&[None], &[Some(0)]]);
+        let payload = chunk_from_optional_i32(&[Some(42)]);
+        table.build(&build_keys, &payload).unwrap();
+
+        let probe_keys = chunk_from_optional_i64_columns(&[&[Some(0)], &[Some(0)]]);
+        let prepared = table.prepare_probe_keys(&probe_keys).unwrap();
+        let build_row = table.all_build_row_ptrs()[0];
+
+        assert!(!table.key_values_match_build_row(&prepared, 0, build_row));
     }
 
     #[test]
@@ -1424,7 +1483,8 @@ mod tests {
     }
 
     fn find_linear_probe_collision_pair() -> (i32, i32) {
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
+        let layout =
+            JoinKeyLayout::new(&[LogicalType::Integer], &[JoinComparisonType::Equal], false);
         let values = (0..10_000).collect::<Vec<i32>>();
         let keys = Chunk::from_arc_vectors(
             vec![Arc::new(

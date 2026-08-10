@@ -122,7 +122,15 @@ impl BuildProbeSideOptimizer {
 /// This is shared by join-order enumeration and final build/probe orientation
 /// so both optimizers assign the same cost to wide and variable-length rows.
 pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
-    let mut width = 8;
+    8 + estimate_row_payload_width(types)
+}
+
+/// Estimate the schema-dependent bytes without a row-container header.
+/// Join-order costing combines multiple base relations into one intermediate,
+/// so the fixed header must be charged once for that intermediate rather than
+/// once per contributing relation.
+pub(crate) fn estimate_row_payload_width(types: &[LogicalType]) -> usize {
+    let mut width = 0;
     for ty in types {
         width += ty.type_size();
         width += type_penalty(ty);

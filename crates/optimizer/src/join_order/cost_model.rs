@@ -113,17 +113,18 @@ impl CostModel {
         }
         self.relation_widths = relation_stats
             .iter()
-            .map(|stats| stats.estimated_row_width.max(1))
+            .map(|stats| stats.estimated_payload_width)
             .collect();
     }
 
     /// Compute the cost of joining two nodes.
     ///
     /// The cost is computed as:
-    /// cost = cardinality(left ⋈ right) + cost(left) + cost(right)
+    /// cost = cardinality(left ⋈ right) * row_width + cost(left) + cost(right)
     ///
-    /// This simple cost model assumes that the cost of producing a join result
-    /// is proportional to the number of output tuples.
+    /// The row width is the combined projected payload plus one intermediate
+    /// row header, so wide retained values are charged without duplicating the
+    /// container overhead for every base relation.
     pub fn compute_cost(
         &mut self,
         left: &DPJoinNode,
@@ -143,12 +144,12 @@ impl CostModel {
         // a wide row with retained strings as identical, encouraging early
         // dimension joins whose payload is repeatedly serialized by later
         // breakers.
-        let row_width = combination
+        let payload_width = combination
             .relations()
             .iter()
-            .map(|relation| self.relation_widths.get(*relation).copied().unwrap_or(1))
-            .sum::<usize>()
-            .max(1);
+            .map(|relation| self.relation_widths.get(*relation).copied().unwrap_or(0))
+            .sum::<usize>();
+        let row_width = 8usize.saturating_add(payload_width).max(1);
         join_cardinality * row_width as f64 + left.cost + right.cost
     }
 

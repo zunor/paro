@@ -57,8 +57,8 @@ pub struct RelationStats {
     pub column_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
-    /// Estimated physical bytes carried by one row after projection pruning.
-    pub estimated_row_width: usize,
+    /// Estimated schema-dependent bytes carried by one row after projection pruning.
+    pub estimated_payload_width: usize,
     /// Declared unique keys that remain visible in this relation.
     pub unique_keys: Vec<Vec<ColumnBinding>>,
     /// Filter strength (selectivity factor).
@@ -73,7 +73,7 @@ impl RelationStats {
         Self {
             column_distinct_count: HashMap::new(),
             cardinality: 1,
-            estimated_row_width: 1,
+            estimated_payload_width: 1,
             unique_keys: Vec::new(),
             filter_strength: 1.0,
             stats_initialized: false,

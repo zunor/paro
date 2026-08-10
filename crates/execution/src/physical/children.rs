@@ -79,6 +79,14 @@ impl PlanChildren {
             Self::Many(id) => arena.get(*id),
         }
     }
+
+    pub(crate) fn replace_only(&mut self, child: PhysicalPlanNodeId) {
+        let Self::Inline(children) = self else {
+            panic!("unary physical node must store its child inline");
+        };
+        assert_eq!(children.len, 1, "physical node must have exactly one child");
+        children.ids[0] = child;
+    }
 }
 
 #[cfg(test)]

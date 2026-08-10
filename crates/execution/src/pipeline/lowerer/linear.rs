@@ -113,7 +113,7 @@ impl<'a> PipelineLowerer<'a> {
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Project(spec) => {
-                    push_project_transform(&mut transforms, spec);
+                    transforms.push(TransformSpec::Project(spec.clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::Limit(spec) => {

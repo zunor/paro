@@ -79,17 +79,25 @@ impl CostModel {
                 }
             },
             Expression::Operator(operator) => match operator.operator_type {
-                OperatorType::Like | OperatorType::ILike => {
-                    match like_pattern_shape(operator.children.get(1)) {
-                        LikePatternShape::MatchAll => 1.0,
-                        LikePatternShape::Exact => self.defaults.equality,
-                        LikePatternShape::Prefix => self.defaults.like_prefix,
-                        LikePatternShape::Contains | LikePatternShape::Suffix => {
-                            self.defaults.like_contains
-                        }
-                        LikePatternShape::Generic => self.defaults.predicate,
+                OperatorType::Like => match like_pattern_shape(operator.children.get(1)) {
+                    LikePatternShape::MatchAll => 1.0,
+                    LikePatternShape::Exact => self
+                        .estimate_exact_like_selectivity(operator.children.first(), column_stats),
+                    LikePatternShape::Prefix => self.defaults.like_prefix,
+                    LikePatternShape::Contains | LikePatternShape::Suffix => {
+                        self.defaults.like_contains
                     }
-                }
+                    LikePatternShape::Generic => self.defaults.predicate,
+                },
+                OperatorType::ILike => match like_pattern_shape(operator.children.get(1)) {
+                    LikePatternShape::MatchAll => 1.0,
+                    LikePatternShape::Exact => self.defaults.equality,
+                    LikePatternShape::Prefix => self.defaults.like_prefix,
+                    LikePatternShape::Contains | LikePatternShape::Suffix => {
+                        self.defaults.like_contains
+                    }
+                    LikePatternShape::Generic => self.defaults.predicate,
+                },
                 OperatorType::Not => operator
                     .children
                     .first()
@@ -229,6 +237,25 @@ impl CostModel {
             return clamp_selectivity(self.defaults.equality * probe_count);
         }
         clamp_selectivity((probe_count / distinct as f64).max(MIN_SELECTIVITY))
+    }
+
+    fn estimate_exact_like_selectivity(
+        &self,
+        candidate: Option<&Expression>,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) -> f64 {
+        let Some(Expression::ColumnRef(column_ref)) = candidate else {
+            return self.defaults.equality;
+        };
+        let distinct = column_stats
+            .get(&column_ref.binding)
+            .map(|stats| stats.get_distinct_count())
+            .unwrap_or(0);
+        if distinct == 0 {
+            self.defaults.equality
+        } else {
+            (1.0 / distinct as f64).max(MIN_SELECTIVITY)
+        }
     }
 }
 
@@ -376,5 +403,46 @@ mod tests {
             LogicalType::Boolean,
         ));
         assert_eq!(model.estimate_selectivity(&not_like, &HashMap::new()), 0.95);
+
+        let not_match_all = Expression::Operator(OperatorExpression::new_unary(
+            OperatorType::Not,
+            like("%"),
+            LogicalType::Boolean,
+        ));
+        assert_eq!(
+            model.estimate_selectivity(&not_match_all, &HashMap::new()),
+            0.0
+        );
+    }
+
+    #[test]
+    fn exact_like_uses_column_distinct_count() {
+        let model = CostModel::default();
+        let binding = ColumnBinding::new(1, 0);
+        let mut stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Varchar),
+        );
+        let hashes = (0..100)
+            .map(paro_common::hash::hash_u64)
+            .collect::<Vec<_>>();
+        stats.update_distinct_statistics(&hashes, hashes.len());
+        let distinct = stats.get_distinct_count();
+        let column_stats = HashMap::from([(binding, Arc::new(stats))]);
+        let expression = Expression::Operator(OperatorExpression::new(
+            OperatorType::Like,
+            vec![
+                Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Varchar)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("green".to_string()),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+
+        assert_eq!(
+            model.estimate_selectivity(&expression, &column_stats),
+            1.0 / distinct as f64
+        );
     }
 }

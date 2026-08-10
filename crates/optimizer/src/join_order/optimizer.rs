@@ -503,8 +503,8 @@ impl JoinOrderOptimizer {
     ) {
         let cardinality = self.estimate_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
-        stats.estimated_row_width =
-            crate::join::build_probe_side::estimate_row_width(&plan.types());
+        stats.estimated_payload_width =
+            crate::join::build_probe_side::estimate_row_payload_width(&plan.types());
         stats.unique_keys = declared_unique_keys(plan);
         stats.column_distinct_count = plan
             .get_column_bindings()

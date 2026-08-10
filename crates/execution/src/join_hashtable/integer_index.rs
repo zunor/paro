@@ -25,7 +25,7 @@ const MAX_SLOTS_PER_BUILD_ROW: usize = 256;
 
 const MAX_DIRECT_JOIN_SLOTS: usize = 1_048_576;
 const MAX_DIRECT_SLOTS_PER_BUILD_ROW: usize = 8;
-const MAX_RANKED_INDEX_BYTES: usize = 32 * 1024 * 1024;
+const MAX_RANKED_INDEX_PEAK_BYTES: usize = 32 * 1024 * 1024;
 
 const SIGNED_ORDINAL_MASK: u128 = 1_u128 << 127;
 
@@ -351,11 +351,16 @@ impl ExactIntegerJoinIndexBuilder {
             let build_pointer_bytes = build_count
                 .checked_mul(std::mem::size_of::<usize>())
                 .ok_or_else(|| paro_error::internal("ranked join build-pointer size overflow"))?;
-            let final_bytes = bit_bytes
+            let domain_index_bytes = build_count
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| paro_error::internal("ranked join domain-index size overflow"))?;
+            let peak_bytes = bit_bytes
                 .checked_add(rank_bytes)
                 .and_then(|bytes| bytes.checked_add(pointer_bytes))
+                .and_then(|bytes| bytes.checked_add(build_pointer_bytes))
+                .and_then(|bytes| bytes.checked_add(domain_index_bytes))
                 .ok_or_else(|| paro_error::internal("ranked join index size overflow"))?;
-            if final_bytes > MAX_RANKED_INDEX_BYTES {
+            if peak_bytes > MAX_RANKED_INDEX_PEAK_BYTES {
                 return Ok(None);
             }
             IntegerJoinBuildStorage::Ranked {
@@ -508,16 +513,12 @@ impl ExactIntegerJoinIndexBuilder {
     /// uniqueness. A monotonically increasing build stream is already in rank
     /// order and its pointer buffer can be published directly; arbitrary input
     /// order falls back to a rank scatter without revisiting the row store.
-    pub(super) fn finish(
-        self,
-        allocator: Arc<dyn Allocator>,
-        memory: &MemoryAccountingContext,
-    ) -> Result<ExactIntegerJoinIndex> {
+    pub(super) fn finish(self) -> Result<ExactIntegerJoinIndex> {
         let Self {
             domain,
             storage,
-            allocator: _,
-            memory: _,
+            allocator,
+            memory,
         } = self;
         let (bits, domain_indices, build_pointers, count, inserted, monotonic) = match storage {
             IntegerJoinBuildStorage::Direct {
@@ -907,7 +908,7 @@ mod tests {
         assert!(index.insert(min, 100).expect("insert first row"));
 
         let error = index
-            .finish(allocator, &memory)
+            .finish()
             .expect_err("incomplete direct index must not be published");
         assert!(error.to_string().contains("row count mismatch"));
     }
@@ -938,9 +939,7 @@ mod tests {
                 ..
             }
         ));
-        let index = index
-            .finish(allocator.clone(), &memory)
-            .expect("finish ranked index");
+        let index = index.finish().expect("finish ranked index");
 
         let vector = paro_common::test_utils::test_i32_vector_with_allocator(&[14, 15], allocator);
         let mut pointers = [0; 2];
@@ -979,9 +978,7 @@ mod tests {
                 ..
             }
         ));
-        let index = index
-            .finish(allocator.clone(), &memory)
-            .expect("finish ranked index");
+        let index = index.finish().expect("finish ranked index");
 
         let vector =
             paro_common::test_utils::test_i32_vector_with_allocator(&[12, 25, 13], allocator);
@@ -1013,9 +1010,7 @@ mod tests {
         assert!(index.insert(min, 120).expect("insert first key"));
         let second = kind.value_ordinal(&Value::BigInt(14)).expect("second key");
         assert!(index.insert(second, 140).expect("insert second key"));
-        let index = index
-            .finish(allocator.clone(), &memory)
-            .expect("finish direct index");
+        let index = index.finish().expect("finish direct index");
 
         let vector = paro_common::test_utils::test_sequence_with_allocator(12, 1, 4, allocator);
         let mut pointers = [0; 4];

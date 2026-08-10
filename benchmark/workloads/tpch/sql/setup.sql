@@ -14,6 +14,10 @@ SET threads = ${thread_count};
 SET memory_limit = '${memory_limit}';
 SET rowset_scan_pushdown = ${rowset_scan_pushdown};
 
+-- Keep every table uniformly heap-backed. In Paro a PRIMARY KEY also builds a
+-- physical unique index; declaring it on only selected tables changes both
+-- optimizer metadata and resident memory, while declaring every TPC-H key
+-- makes the 6M-row lineitem index dominate this analytical benchmark.
 CREATE TABLE region (
     r_regionkey INTEGER,
     r_name VARCHAR,
@@ -65,8 +69,7 @@ CREATE TABLE partsupp (
     ps_suppkey BIGINT,
     ps_availqty BIGINT,
     ps_supplycost DECIMAL(15, 2),
-    ps_comment VARCHAR,
-    PRIMARY KEY (ps_partkey, ps_suppkey)
+    ps_comment VARCHAR
 );
 
 CREATE TABLE orders (

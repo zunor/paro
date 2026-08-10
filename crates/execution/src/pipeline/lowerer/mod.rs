@@ -10,7 +10,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
 use paro_planner::binder::ir::OrderByNode;
-use paro_planner::expression::{Expression, ExpressionIterator, ReferenceExpression};
+use paro_planner::expression::{Expression, ReferenceExpression};
 use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
@@ -22,8 +22,8 @@ use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
     DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PhysicalNodeKind, ProjectSpec, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec,
-    SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
+    PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec,
+    SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
@@ -182,93 +182,6 @@ mod set_operation;
 
 pub(crate) use breaker_lowering::BreakerDispatch;
 use helpers::*;
-
-/// Add a projection while walking a physical chain from consumer to source.
-///
-/// Consecutive projections are composed here, after column bindings have become
-/// physical references. This keeps expression evaluation in a single vector
-/// program and avoids materializing an intermediate chunk. A computed inner
-/// expression must still be evaluated exactly once; passive values may be
-/// duplicated or removed.
-fn push_project_transform(transforms: &mut Vec<TransformSpec>, inner: &ProjectSpec) {
-    let Some(TransformSpec::Project(outer)) = transforms.last_mut() else {
-        transforms.push(TransformSpec::Project(inner.clone()));
-        return;
-    };
-    let Some(expressions) = compose_project_expressions(outer, inner) else {
-        transforms.push(TransformSpec::Project(inner.clone()));
-        return;
-    };
-    outer.expressions = expressions;
-}
-
-fn compose_project_expressions(
-    outer: &ProjectSpec,
-    inner: &ProjectSpec,
-) -> Option<Box<[Expression]>> {
-    if outer
-        .expressions
-        .iter()
-        .chain(inner.expressions.iter())
-        .any(|expression| expression.evaluation_properties().is_reorder_fence())
-    {
-        return None;
-    }
-
-    let mut references = vec![0usize; inner.expressions.len()];
-    for expression in &outer.expressions {
-        if !count_physical_references(expression, &inner.expressions, &mut references) {
-            return None;
-        }
-    }
-    if inner
-        .expressions
-        .iter()
-        .zip(&references)
-        .any(|(expression, &count)| !expression.is_passive_value() && count != 1)
-    {
-        return None;
-    }
-
-    let mut expressions = outer.expressions.to_vec();
-    for expression in &mut expressions {
-        substitute_physical_references(expression, &inner.expressions);
-    }
-    Some(expressions.into_boxed_slice())
-}
-
-fn count_physical_references(
-    expression: &Expression,
-    inner: &[Expression],
-    references: &mut [usize],
-) -> bool {
-    if let Expression::Reference(reference) = expression {
-        let Some(inner_expression) = inner.get(reference.index) else {
-            return false;
-        };
-        if reference.return_type != inner_expression.return_type() {
-            return false;
-        }
-        references[reference.index] += 1;
-        return true;
-    }
-
-    let mut valid = true;
-    ExpressionIterator::enumerate_children(expression, |child| {
-        valid &= count_physical_references(child, inner, references);
-    });
-    valid
-}
-
-fn substitute_physical_references(expression: &mut Expression, inner: &[Expression]) {
-    if let Expression::Reference(reference) = expression {
-        *expression = inner[reference.index].clone();
-        return;
-    }
-    ExpressionIterator::enumerate_children_mut(expression, |child| {
-        substitute_physical_references(child, inner);
-    });
-}
 
 #[cfg(test)]
 mod tests;

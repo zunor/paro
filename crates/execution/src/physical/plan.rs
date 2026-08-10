@@ -38,6 +38,10 @@ impl PhysicalPlanNodeArena {
         self.nodes.get(id.index())
     }
 
+    pub(crate) fn get_mut(&mut self, id: PhysicalPlanNodeId) -> Option<&mut PhysicalPlanNode> {
+        self.nodes.get_mut(id.index())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &PhysicalPlanNode> {
         self.nodes.iter()
     }

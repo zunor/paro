@@ -1458,7 +1458,8 @@ mod tests {
                 storage,
                 catalog.object_id_allocator().allocate(),
                 0,
-            ),
+            )
+            .unwrap(),
         )));
         let schema = catalog
             .get_schema(&CatalogSnapshot::read_only(u64::MAX), schema_name)

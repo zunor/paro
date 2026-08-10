@@ -32,6 +32,114 @@ use super::*;
 use crate::physical::specs::GroupKeyEncoding;
 
 #[test]
+fn physical_rewrite_composes_consecutive_projects() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![LogicalType::Integer; 3],
+        )),
+    );
+    let inner = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            1,
+            values,
+            vec![
+                Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            ],
+        )),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            2,
+            inner,
+            vec![
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            ],
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&outer)
+        .unwrap();
+    let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
+        panic!("expected project root");
+    };
+    let [child] = plan.node(plan.root).children.as_slice(&plan.children) else {
+        panic!("expected unary project");
+    };
+
+    assert!(matches!(
+        plan.node(*child).kind,
+        PhysicalNodeKind::Values(_)
+    ));
+    assert!(matches!(
+        &project.expressions[0],
+        Expression::Reference(reference) if reference.index == 0
+    ));
+    assert!(matches!(
+        &project.expressions[1],
+        Expression::Reference(reference) if reference.index == 2
+    ));
+}
+
+#[test]
+fn physical_rewrite_preserves_computed_expression_multiplicity() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".into()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let computed = Expression::Comparison(ComparisonExpression::new(
+        ComparisonType::Equal,
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(7),
+            LogicalType::Integer,
+        )),
+    ));
+    let inner = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(1, values, vec![computed])),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            2,
+            inner,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+            ],
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&outer)
+        .unwrap();
+    let [child] = plan.node(plan.root).children.as_slice(&plan.children) else {
+        panic!("expected unary project");
+    };
+
+    assert!(matches!(
+        plan.node(*child).kind,
+        PhysicalNodeKind::Project(_)
+    ));
+}
+
+#[test]
 fn arena_generator_builds_streaming_subset_without_runtime_objects() {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(

@@ -107,12 +107,14 @@ impl PhysicalPlanGenerator {
         self.arena = PhysicalPlanNodeArena::default();
         self.children = PlanChildrenArena::default();
         let root = self.generate_node(logical)?;
-        Ok(PhysicalPlan::new(
+        let mut plan = PhysicalPlan::new(
             root,
             mem::take(&mut self.arena),
             mem::take(&mut self.children),
             PlanPropertyMap::default(),
-        ))
+        );
+        super::rewrite::rewrite_projection_chains(&mut plan);
+        Ok(plan)
     }
 
     fn generate_node(&mut self, logical: &LogicalPlan) -> Result<PhysicalPlanNodeId> {

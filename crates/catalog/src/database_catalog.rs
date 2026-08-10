@@ -730,7 +730,7 @@ impl ParoCatalog {
             storage,
             self.object_id_allocator.allocate(),
             0,
-        ));
+        )?);
 
         schema.create_table(transaction, table_entry, on_conflict)?;
         Ok(())

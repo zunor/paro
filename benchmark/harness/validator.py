@@ -74,7 +74,12 @@ class BenchmarkValidator:
             actual = ordered_rows_digest(rows)
             if actual == expected.lower():
                 return ValidationOutcome("PASS")
-            return ValidationOutcome("FAIL", f"expected ordered digest {expected.lower()}, got {actual}")
+            preview = [_normalize_row(row) for row in rows[:5]]
+            return ValidationOutcome(
+                "FAIL",
+                f"expected ordered digest {expected.lower()}, got {actual}; "
+                f"row_count={len(rows)}, first_rows={preview!r}",
+            )
 
         if mode == "text_contains_all":
             haystack = _render_rows_text(rows)

@@ -96,6 +96,7 @@ impl JoinKeyColumn {
 #[derive(Debug, Clone)]
 pub(crate) struct JoinKeyLayout {
     columns: Box<[JoinKeyColumn]>,
+    matcher: JoinKeyMatcher,
 }
 
 /// Batch-local physical views of probe-side join keys.
@@ -107,7 +108,23 @@ pub(crate) struct JoinKeyLayout {
 /// comparison. The borrowed views also make the lifetime contract explicit:
 /// they cannot outlive the probe chunk whose buffers they reference.
 pub(crate) struct PreparedProbeKeys<'a> {
-    columns: Vec<PreparedProbeColumn<'a>>,
+    shape: PreparedProbeKeyShape<'a>,
+}
+
+enum PreparedProbeKeyShape<'a> {
+    I64Pair {
+        left: DecodedVectorRef<'a>,
+        right: DecodedVectorRef<'a>,
+    },
+    Generic {
+        columns: Vec<PreparedProbeColumn<'a>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JoinKeyMatcher {
+    I64PairEqual { build_keys_may_be_null: bool },
+    Generic,
 }
 
 enum PreparedProbeColumn<'a> {
@@ -120,14 +137,26 @@ enum PreparedProbeColumn<'a> {
 }
 
 impl JoinKeyLayout {
-    pub(crate) fn new(key_types: &[LogicalType]) -> Self {
-        Self {
-            columns: key_types
-                .iter()
-                .map(JoinKeyColumn::from_type)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
+    pub(crate) fn new(
+        key_types: &[LogicalType],
+        comparisons: &[JoinComparisonType],
+        build_keys_may_be_null: bool,
+    ) -> Self {
+        let columns = key_types
+            .iter()
+            .map(JoinKeyColumn::from_type)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let matcher = if columns.as_ref() == [JoinKeyColumn::I64, JoinKeyColumn::I64]
+            && comparisons == [JoinComparisonType::Equal, JoinComparisonType::Equal]
+        {
+            JoinKeyMatcher::I64PairEqual {
+                build_keys_may_be_null,
+            }
+        } else {
+            JoinKeyMatcher::Generic
+        };
+        Self { columns, matcher }
     }
 
     #[cfg(test)]
@@ -166,6 +195,20 @@ impl JoinKeyLayout {
     }
 
     pub(crate) fn prepare_probe_keys<'a>(&self, keys: &'a Chunk) -> Result<PreparedProbeKeys<'a>> {
+        if matches!(self.matcher, JoinKeyMatcher::I64PairEqual { .. }) {
+            let left = keys
+                .column(0)
+                .expect("hash join key column must exist")
+                .try_decode_ref(keys.size())?;
+            let right = keys
+                .column(1)
+                .expect("hash join key column must exist")
+                .try_decode_ref(keys.size())?;
+            return Ok(PreparedProbeKeys {
+                shape: PreparedProbeKeyShape::I64Pair { left, right },
+            });
+        }
+
         let mut columns = Vec::with_capacity(self.columns.len());
         for (col_idx, kind) in self.columns.iter().copied().enumerate() {
             let vector = keys
@@ -185,7 +228,9 @@ impl JoinKeyLayout {
             };
             columns.push(prepared);
         }
-        Ok(PreparedProbeKeys { columns })
+        Ok(PreparedProbeKeys {
+            shape: PreparedProbeKeyShape::Generic { columns },
+        })
     }
 
     fn hash_rows_into(
@@ -218,28 +263,33 @@ impl JoinKeyLayout {
         comparisons: &[JoinComparisonType],
     ) -> bool {
         let row_ptr = row_ptr as *const u8;
-        if comparisons == [JoinComparisonType::Equal, JoinComparisonType::Equal] {
-            if let [PreparedProbeColumn::Fixed {
-                kind: JoinKeyColumn::I64,
-                view: left,
-            }, PreparedProbeColumn::Fixed {
-                kind: JoinKeyColumn::I64,
-                view: right,
-            }] = keys.columns.as_slice()
-            {
-                // Ordinary equality filtering guarantees both probe and build
-                // keys are non-NULL before chain resolution. Composite BIGINT
-                // keys are common primary/foreign keys; compare the physical
-                // pair directly instead of repeating validity, comparison-mode
-                // and type dispatch for each component.
-                let layout = build_layout.base();
-                return unsafe { left.get_value::<i64>(probe_row_idx) }
-                    == read_row_i64(layout, row_ptr, 0)
-                    && unsafe { right.get_value::<i64>(probe_row_idx) }
-                        == read_row_i64(layout, row_ptr, 1);
+        if let (
+            JoinKeyMatcher::I64PairEqual {
+                build_keys_may_be_null,
+            },
+            PreparedProbeKeyShape::I64Pair { left, right },
+        ) = (self.matcher, &keys.shape)
+        {
+            if !left.is_valid(probe_row_idx) || !right.is_valid(probe_row_idx) {
+                return false;
             }
+            let layout = build_layout.base();
+            if build_keys_may_be_null
+                && (row_value_is_null(layout, row_ptr, 0) || row_value_is_null(layout, row_ptr, 1))
+            {
+                return false;
+            }
+            return unsafe { left.get_value::<i64>(probe_row_idx) }
+                == read_row_i64(layout, row_ptr, 0)
+                && unsafe { right.get_value::<i64>(probe_row_idx) }
+                    == read_row_i64(layout, row_ptr, 1);
         }
-        for (col_idx, column) in keys.columns.iter().enumerate() {
+
+        let PreparedProbeKeyShape::Generic { columns } = &keys.shape else {
+            debug_assert!(false, "join key matcher and prepared probe shape diverged");
+            return false;
+        };
+        for (col_idx, column) in columns.iter().enumerate() {
             let probe_null = !column.is_valid(probe_row_idx);
             let build_null = row_value_is_null(build_layout.base(), row_ptr, col_idx);
 
@@ -798,14 +848,19 @@ mod tests {
 
     #[test]
     fn join_key_layout_selects_typed_integer_kernel() {
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer, LogicalType::Varchar]);
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::Integer, LogicalType::Varchar],
+            &[JoinComparisonType::Equal, JoinComparisonType::Equal],
+            false,
+        );
         assert_eq!(layout.column_kinds_for_tests(), vec!["i32", "varchar"]);
     }
 
     #[test]
     fn typed_hash_kernel_hashes_equal_values_identically() {
         let allocator = test_allocator();
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
+        let layout =
+            JoinKeyLayout::new(&[LogicalType::Integer], &[JoinComparisonType::Equal], false);
         let left = Chunk::from_arc_vectors(
             vec![Arc::new(test_i32_vector_with_allocator(
                 &[42],
@@ -835,14 +890,19 @@ mod tests {
         );
         nested.set_count(1);
         let chunk = Chunk::from_arc_vectors(vec![Arc::new(nested)], test_allocator());
-        let layout = JoinKeyLayout::new(&[LogicalType::List(Box::new(LogicalType::Integer))]);
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::List(Box::new(LogicalType::Integer))],
+            &[JoinComparisonType::Equal],
+            false,
+        );
         assert_ne!(layout.hash_key_at(&chunk, 0), 0);
     }
 
     #[test]
     fn hash_kernel_hashes_selected_rows_column_major() {
         let allocator = test_allocator();
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
+        let layout =
+            JoinKeyLayout::new(&[LogicalType::Integer], &[JoinComparisonType::Equal], false);
         let chunk = Chunk::from_arc_vectors(
             vec![Arc::new(test_i32_vector_with_allocator(
                 &[7, 42, 99],

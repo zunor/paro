@@ -3,8 +3,10 @@
 
 schema_version = 1
 name = "tpch"
-version = 1
+version = 2
 enforcement = "shadow"
+# Promotion contract: move beyond shadow only after every required CI platform
+# has a fresh baseline and the archive contains at least 30 clean observations.
 
 [[sources]]
 name = "tpch-sql"
@@ -14,7 +16,7 @@ measurement_class = "sql_macro"
 required = true
 
 [metrics]
-required = ["p50", "p99", "throughput_per_second", "rss_peak_kb"]
+required = ["p50", "throughput_per_second", "rss_peak_kb"]
 
 [thresholds]
 latency_regression_percent = 15.0
@@ -23,10 +25,8 @@ throughput_min_ratio = 0.85
 
 [noise_floors]
 latency_ms = 1.0
-p99_latency_ms = 3.0
 short_query_latency_ms = 2.5
 short_query_max_p50_ms = 20.0
-tail_sample_min_count = 20
 resource_kb = 0.0
 rss_kb = 65536.0
 

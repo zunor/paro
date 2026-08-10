@@ -180,6 +180,8 @@ impl Optimizer {
             Box::new(CteInliningPass),
             Box::new(DelimJoinEliminationPass),
             Box::new(EmptyResultPullupPass),
+            // Planning statistics: collect base-column bounds and distinct
+            // counts before join ordering consumes them as cost inputs.
             Box::new(StatisticsGatheringPass),
             Box::new(ReorderFilterPass),
             Box::new(JoinEliminationPass),
@@ -195,10 +197,10 @@ impl Optimizer {
             Box::new(InClausePass),
             Box::new(SearchOptimizationPass),
             Box::new(SegmentPrunerPass),
-            // Join ordering and the later structural passes replace plan
-            // nodes while preserving the old parents. Recompute cardinality
-            // and output statistics over the settled tree so projections and
-            // aggregates cannot retain pre-rewrite estimates.
+            // Final annotations: structural planning above may replace nodes
+            // and preserve their old parents, so derive cardinality and output
+            // statistics again over the settled tree. This is a separate
+            // lifecycle phase from the cost inputs gathered before join order.
             Box::new(StatisticsGatheringPass),
             Box::new(StatisticsPropagationPass),
             // Projection maps are positional annotations over the final logical
