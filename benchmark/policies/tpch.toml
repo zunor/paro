@@ -1,0 +1,53 @@
+# Copyright 2024-2026 Zunor
+# SPDX-License-Identifier: Apache-2.0
+
+schema_version = 1
+name = "tpch"
+version = 1
+enforcement = "shadow"
+
+[[sources]]
+name = "tpch-sql"
+type = "sql_suite"
+suite = "tpch-baseline"
+measurement_class = "sql_macro"
+required = true
+
+[metrics]
+required = ["p50", "p99", "throughput_per_second", "rss_peak_kb"]
+
+[thresholds]
+latency_regression_percent = 15.0
+resource_regression_percent = 25.0
+throughput_min_ratio = 0.85
+
+[noise_floors]
+latency_ms = 1.0
+p99_latency_ms = 3.0
+short_query_latency_ms = 2.5
+short_query_max_p50_ms = 20.0
+tail_sample_min_count = 20
+resource_kb = 0.0
+rss_kb = 65536.0
+
+[absolute_max]
+
+[absolute_min]
+
+[statistics]
+model = "mann_whitney_rolling_p95_holm"
+family_alpha_first_run = 0.05
+family_alpha_confirmed = 0.01
+false_positive_target = 0.02
+true_positive_target = 0.95
+
+[calibration]
+source = "archive"
+min_clean_observations_sql_macro = 30
+min_clean_observations_rust_micro = 50
+rolling_window_sql_macro = 30
+rolling_window_rust_micro = 50
+noise_floor_formula = "directional_rolling_p95_delta"
+
+[coverage]
+new_query_staging_days = 14

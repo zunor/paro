@@ -65,7 +65,8 @@ CREATE TABLE partsupp (
     ps_suppkey BIGINT,
     ps_availqty BIGINT,
     ps_supplycost DECIMAL(15, 2),
-    ps_comment VARCHAR
+    ps_comment VARCHAR,
+    PRIMARY KEY (ps_partkey, ps_suppkey)
 );
 
 CREATE TABLE orders (

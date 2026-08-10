@@ -13,5 +13,5 @@ WHERE c_mktsegment = 'BUILDING'
   AND o_orderdate < DATE '1995-03-15'
   AND l_shipdate > DATE '1995-03-15'
 GROUP BY l_orderkey, o_orderdate, o_shippriority
-ORDER BY revenue DESC, o_orderdate
+ORDER BY revenue DESC, o_orderdate, l_orderkey
 LIMIT 10;

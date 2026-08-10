@@ -6,13 +6,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
+import json
 import threading
 from typing import Any, Callable
 
 from .loader import QueryDef
 
 
-STRONG_VALIDATE_MODES = {"scalar_equals", "ordered_rows"}
+STRONG_VALIDATE_MODES = {"scalar_equals", "ordered_rows", "ordered_digest"}
 
 
 @dataclass(frozen=True)
@@ -65,6 +67,14 @@ class BenchmarkValidator:
                 "FAIL",
                 f"ordered rows mismatch: expected {expected_rows!r}, got {actual_rows!r}",
             )
+
+        if mode == "ordered_digest":
+            if not isinstance(expected, str) or len(expected) != 64:
+                return ValidationOutcome("FAIL", "ordered_digest expected must be a SHA-256 hex digest")
+            actual = ordered_rows_digest(rows)
+            if actual == expected.lower():
+                return ValidationOutcome("PASS")
+            return ValidationOutcome("FAIL", f"expected ordered digest {expected.lower()}, got {actual}")
 
         if mode == "text_contains_all":
             haystack = _render_rows_text(rows)
@@ -143,6 +153,25 @@ def _normalize_expected_rows(expected: Any) -> list[list[Any]]:
         else:
             normalized.append([_normalize_value(row)])
     return normalized
+
+
+def ordered_rows_digest(rows: list[list[Any]]) -> str:
+    """Return a stable, type-preserving digest for an ordered SQL result.
+
+    Executor normalization has already converted exact DECIMAL and temporal
+    values to strings. JSON then supplies unambiguous row/value boundaries,
+    while sorted object keys keep nested values deterministic.
+    """
+
+    normalized = [_normalize_row(row) for row in rows]
+    payload = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _normalize_row(row: list[Any]) -> list[Any]:
