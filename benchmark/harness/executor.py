@@ -124,6 +124,7 @@ class BenchmarkExecutor:
         conn = None
         try:
             conn = self.connection_factory()
+            self._validate_workload_requirements(conn, workload)
             self._execute_script(conn, workload.setup_sql)
         except Exception as exc:
             result.setup_status = "FAIL"
@@ -177,6 +178,24 @@ class BenchmarkExecutor:
                 _safe_close(teardown_conn)
 
         return result
+
+    def _validate_workload_requirements(self, conn: Any, workload: WorkloadDef) -> None:
+        required = workload.minimum_server_memory_bytes
+        if required == 0:
+            return
+        rows = self._execute_sql(
+            conn,
+            "SELECT memory_limit FROM pragma_database_size() LIMIT 1",
+            fetch=True,
+        )
+        if not rows or len(rows[0]) != 1:
+            raise RuntimeError("server did not report its physical memory limit")
+        actual = int(rows[0][0])
+        if actual < required:
+            raise RuntimeError(
+                "server physical memory limit is below workload requirement: "
+                f"required={required} bytes, actual={actual} bytes"
+            )
 
     def _run_query(
         self,

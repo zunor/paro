@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from pathlib import Path
+import re
 from string import Template
 import tomllib
 from typing import Any, Mapping, Sequence
@@ -42,6 +43,7 @@ class WorkloadDef:
     name: str
     description: str
     run_order: int
+    minimum_server_memory_bytes: int
     root: Path
     params: dict[str, Any]
     setup_sql: str
@@ -148,6 +150,11 @@ def load_workload(
     name = str(meta.get("name") or workload_root.name)
     description = str(meta.get("description", ""))
     run_order = _optional_int(meta, "run_order", default=100, manifest_path=manifest_path)
+    minimum_server_memory_bytes = _parse_byte_size(
+        meta.get("minimum_server_memory", 0),
+        manifest_path=manifest_path,
+        field_name="meta.minimum_server_memory",
+    )
 
     setup_file = _require_str(setup, "file", table_name="setup")
     teardown_file = _require_str(setup, "teardown", table_name="setup")
@@ -228,6 +235,7 @@ def load_workload(
         name=name,
         description=description,
         run_order=run_order,
+        minimum_server_memory_bytes=minimum_server_memory_bytes,
         root=workload_root,
         params=params,
         setup_sql=setup_sql,
@@ -235,6 +243,38 @@ def load_workload(
         build_sql=build_sql,
         queries=tuple(queries),
     )
+
+
+_BYTE_SIZE_PATTERN = re.compile(r"^([0-9]+)\s*([kmgt]?i?b)?$", re.IGNORECASE)
+_BYTE_SIZE_MULTIPLIERS = {
+    "": 1,
+    "b": 1,
+    "kb": 1_000,
+    "mb": 1_000_000,
+    "gb": 1_000_000_000,
+    "tb": 1_000_000_000_000,
+    "kib": 1 << 10,
+    "mib": 1 << 20,
+    "gib": 1 << 30,
+    "tib": 1 << 40,
+}
+
+
+def _parse_byte_size(value: Any, *, manifest_path: Path, field_name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"{manifest_path}: {field_name} must be a byte size")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"{manifest_path}: {field_name} must not be negative")
+        return value
+    if not isinstance(value, str):
+        raise ValueError(f"{manifest_path}: {field_name} must be a byte size")
+    match = _BYTE_SIZE_PATTERN.fullmatch(value.strip())
+    if match is None:
+        raise ValueError(f"{manifest_path}: invalid {field_name} byte size {value!r}")
+    amount = int(match.group(1))
+    unit = (match.group(2) or "").lower()
+    return amount * _BYTE_SIZE_MULTIPLIERS[unit]
 
 
 def _load_sql(workload_root: Path, relative_path: str, params: Mapping[str, Any]) -> str:
