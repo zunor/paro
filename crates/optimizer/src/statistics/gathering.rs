@@ -9,8 +9,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::PathQuantifier;
 use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-    ExpressionIterator,
+    ComparisonExpression, ComparisonType, ConstantExpression, Expression,
 };
 use paro_planner::operator::{
     ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
@@ -212,15 +211,11 @@ impl StatisticsGathering {
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.stats.estimated_cardinality?;
         let child_bindings = filter.child.get_column_bindings();
-        let expressions = filter
-            .expressions
-            .iter()
-            .map(|expression| resolve_positional_references(expression, &child_bindings))
-            .collect::<Vec<_>>();
-        Some(ctx.cost_model.estimate_filter_cardinality(
+        Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,
-            &expressions,
+            &filter.expressions,
             &ctx.column_stats,
+            &child_bindings,
         ))
     }
 
@@ -492,33 +487,6 @@ impl StatisticsGathering {
             .map(|storage| storage.total_rows().max(1))
             .unwrap_or_else(|| default_table_cardinality(ctx))
     }
-}
-
-/// Convert execution-oriented positional references back to their logical
-/// column bindings for statistics lookup. This is an estimation-only copy;
-/// the executable expression retains its compact positional form.
-fn resolve_positional_references(
-    expression: &Expression,
-    input_bindings: &[ColumnBinding],
-) -> Expression {
-    fn resolve(expression: &mut Expression, input_bindings: &[ColumnBinding]) {
-        if let Expression::Reference(reference) = expression {
-            if let Some(binding) = input_bindings.get(reference.index).copied() {
-                *expression = Expression::ColumnRef(ColumnRefExpression::new(
-                    binding,
-                    reference.return_type.clone(),
-                ));
-            }
-            return;
-        }
-        ExpressionIterator::enumerate_children_mut(expression, |child| {
-            resolve(child, input_bindings)
-        });
-    }
-
-    let mut resolved = expression.clone();
-    resolve(&mut resolved, input_bindings);
-    resolved
 }
 
 fn collect_output_stats(

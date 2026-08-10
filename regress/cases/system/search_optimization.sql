@@ -18,6 +18,7 @@ INSERT INTO search_opt_docs VALUES
 CREATE INDEX idx_search_opt_docs_fts
 ON search_opt_docs USING GIN (to_tsvector('simple', content));
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM search_opt_docs
@@ -31,6 +32,7 @@ WHERE fulltext_match(content, 'graph database')
 ORDER BY bm25(content, 'graph database') DESC, id
 LIMIT 2;
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM search_opt_docs

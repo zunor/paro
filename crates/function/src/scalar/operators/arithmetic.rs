@@ -310,24 +310,10 @@ fn decimal_result_type(
         }
         DecimalArithmeticOp::Mul => {
             let scale = left_scale.saturating_add(right_scale).min(38);
-            let exact_precision = left_precision.saturating_add(right_precision);
-            // Keep multiplication inside the 64-bit DECIMAL domain when both
-            // operands already fit there. The exact product is computed in a
-            // wider intermediate and checked against DECIMAL(18, scale), so a
-            // value outside the declared result domain fails explicitly
-            // instead of forcing every row and downstream operator onto the
-            // substantially more expensive i128 representation. This also
-            // makes physical width stable under expression composition.
-            let precision = if exact_precision > 18
-                && left_precision <= 18
-                && right_precision <= 18
-                && scale < 18
-            {
-                18
-            } else {
-                exact_precision.min(38)
-            };
-            (precision, scale)
+            (
+                left_precision.saturating_add(right_precision).min(38),
+                scale,
+            )
         }
         DecimalArithmeticOp::Div => {
             let scale = left_scale.saturating_add(right_scale).max(6).min(18);
@@ -1057,19 +1043,26 @@ mod tests {
     }
 
     #[test]
-    fn decimal_multiplication_preserves_i64_physical_domain() {
+    fn decimal_multiplication_preserves_the_exact_logical_domain() {
         assert_eq!(
             decimal_result_type(DecimalArithmeticOp::Mul, 15, 2, 16, 2),
             LogicalType::Decimal {
-                precision: 18,
+                precision: 31,
                 scale: 4,
             }
         );
         assert_eq!(
             decimal_result_type(DecimalArithmeticOp::Mul, 18, 4, 16, 2),
             LogicalType::Decimal {
-                precision: 18,
+                precision: 34,
                 scale: 6,
+            }
+        );
+        assert_eq!(
+            decimal_result_type(DecimalArithmeticOp::Mul, 19, 2, 2, 0),
+            LogicalType::Decimal {
+                precision: 21,
+                scale: 2,
             }
         );
     }
@@ -1105,8 +1098,8 @@ mod tests {
         let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
         let mut result = paro_common::test_utils::test_vector(bound.return_type.clone());
         bound.execute(&chunk, &state, &mut result).unwrap();
-        assert_eq!(unsafe { result.get_fixed::<i64>(0) }, 117_277_500);
-        assert_eq!(unsafe { result.get_fixed::<i64>(1) }, 799_992_000);
+        assert_eq!(unsafe { result.get_fixed::<i128>(0) }, 117_277_500);
+        assert_eq!(unsafe { result.get_fixed::<i128>(1) }, 799_992_000);
 
         let mut left = paro_common::test_utils::test_vector(left_type);
         left.set_count(1);
@@ -1116,7 +1109,11 @@ mod tests {
         right.set_i64(0, 9_999_999_999_999_999);
         let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
         let mut result = paro_common::test_utils::test_vector(bound.return_type.clone());
-        assert!(bound.execute(&chunk, &state, &mut result).is_err());
+        bound.execute(&chunk, &state, &mut result).unwrap();
+        assert_eq!(
+            unsafe { result.get_fixed::<i128>(0) },
+            9_999_999_999_999_989_000_000_000_000_001_i128
+        );
     }
 
     #[test]

@@ -815,14 +815,20 @@ fn extract_internal_fulltext_query(
     let Some((column_id, tsv_config)) = extract_tsvector_source(&func.children[0], get)? else {
         return Ok(None);
     };
-    let Some((query_text, tsq_config, query_kind)) = extract_tsquery_source(&func.children[1])?
+    let Some((query_text, source_config, query_kind)) = extract_tsquery_source(&func.children[1])?
     else {
         return Ok(None);
     };
-    if !tsv_config.eq_ignore_ascii_case(&tsq_config) {
+    if source_config
+        .as_deref()
+        .is_some_and(|config| !tsv_config.eq_ignore_ascii_case(config))
+    {
         return Ok(None);
     }
-    let query_stats = build_fulltext_query_stats(&query_text, &tsq_config, query_kind)?;
+    // TSQUERY values are already normalized and carry no text-search config in
+    // their SQL type. A folded TSQUERY constant is therefore interpreted in
+    // the indexed TSVECTOR's domain and parsed as canonical tsquery syntax.
+    let query_stats = build_fulltext_query_stats(&query_text, &tsv_config, query_kind)?;
     Ok(Some(FullTextIntent {
         column_id: column_id as u32,
         query: query_text,
@@ -871,8 +877,16 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
 
 fn extract_tsquery_source(
     expr: &Expression,
-) -> Result<Option<(String, String, FullTextQueryKind)>> {
+) -> Result<Option<(String, Option<String>, FullTextQueryKind)>> {
     let expr = strip_casts(expr);
+    if let Expression::Constant(constant) = expr {
+        return Ok(match (&constant.return_type, &constant.value) {
+            (LogicalType::TsQuery, Value::Varchar(query)) => {
+                Some((query.clone(), None, FullTextQueryKind::SerializedTsQuery))
+            }
+            _ => None,
+        });
+    }
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
@@ -902,7 +916,7 @@ fn extract_tsquery_source(
         Some(BuiltinIntrinsicId::WebSearchToTsQuery) => FullTextQueryKind::WebSearch,
         _ => return Ok(None),
     };
-    Ok(Some((query_text, config, query_kind)))
+    Ok(Some((query_text, Some(config), query_kind)))
 }
 
 fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<u32> {
@@ -1047,6 +1061,52 @@ mod tests {
         assert_eq!(intent.score_mode, FullTextScoreMode::Bm25);
         assert_eq!(intent.query, "hello world");
         assert_eq!(intent.query_stats.term_count, 2);
+        assert_eq!(intent.query_stats.effective_query_terms(), 2);
+    }
+
+    #[test]
+    fn internal_fulltext_match_accepts_a_folded_tsquery_constant() {
+        let get = Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
+        let vector = Expression::Function(FunctionExpression::new(
+            scalar_function(
+                "to_tsvector",
+                vec![LogicalType::Varchar, LogicalType::Varchar],
+                LogicalType::TsVector,
+            ),
+            vec![
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("simple".to_string()),
+                    LogicalType::Varchar,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::TsVector,
+        ));
+        let expression = Expression::Function(FunctionExpression::new(
+            scalar_function(
+                "fulltext_match_internal",
+                vec![LogicalType::TsVector, LogicalType::TsQuery],
+                LogicalType::Boolean,
+            ),
+            vec![
+                vector,
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("vector & database".to_string()),
+                    LogicalType::TsQuery,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+
+        let intent = extract_fulltext_match_intent(&expression, &get)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.query, "vector & database");
+        assert_eq!(intent.query_kind, FullTextQueryKind::SerializedTsQuery);
+        assert_eq!(intent.config, "simple");
         assert_eq!(intent.query_stats.effective_query_terms(), 2);
     }
 

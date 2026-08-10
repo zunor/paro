@@ -644,10 +644,10 @@ impl BitShufflePageDecoder {
                 }
                 let source_start = source_idx as usize * self.type_size;
                 let output_start = output_idx * self.type_size;
-                // SAFETY: the index validation above proves both fixed-width
-                // ranges are in bounds. T is selected from the decoder's
-                // validated physical width and unaligned access is required
-                // because the byte buffers do not promise T's alignment.
+                // SAFETY: bounds come either from validation in this loop or
+                // from `gather_values_at_validated`'s caller contract. T is
+                // selected from the decoder's validated physical width and
+                // byte buffers do not promise T's alignment.
                 unsafe {
                     copy_fixed_unaligned::<T>(
                         decoded.as_ptr().add(source_start),
@@ -687,8 +687,9 @@ impl BitShufflePageDecoder {
             let source_start = (source_idx - group_start) * self.type_size;
             let output_start = output_idx * self.type_size;
             // SAFETY: decoded_group contains eight values at the validated
-            // physical width, and validate_gather_indices proves the output
-            // slot is in bounds. Both buffers may be unaligned for T.
+            // physical width. Output bounds come either from validation in
+            // this loop or `gather_values_at_validated`'s caller contract.
+            // Both buffers may be unaligned for T.
             unsafe {
                 copy_fixed_unaligned::<T>(
                     decoded_group.as_ptr().add(source_start),

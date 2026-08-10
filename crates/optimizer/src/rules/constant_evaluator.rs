@@ -6,6 +6,9 @@
 //! Scalar functions and casts are evaluated through their bound execution
 //! kernels. This keeps optimizer-time folding on the same semantic path as
 //! query execution instead of maintaining a second arithmetic implementation.
+//! Structural boolean nodes are evaluated locally only after their children
+//! have become typed `Value`s; they implement SQL three-valued control flow
+//! and do not duplicate scalar function or cast kernels.
 
 use paro_common::allocator::{default_allocator, Allocator, MemoryTag};
 use paro_common::chunk::Chunk;

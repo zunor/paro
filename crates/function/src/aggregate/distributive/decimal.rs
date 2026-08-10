@@ -10,7 +10,7 @@ use paro_common::vector::{Vector, VectorType};
 
 use crate::aggregate::{
     AggregateComparison, AggregateDirectUpdate, AggregateFunction, AggregateInputData,
-    AggregateStateInput, DirectAggregateStateCursor, FunctionData,
+    AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
 };
 use crate::decimal::{
     pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128, write_decimal,
@@ -57,7 +57,6 @@ pub(in crate::aggregate) struct DecimalNarrowState {
     value_words: [u64; 2],
     is_set: bool,
     overflowed: bool,
-    i64_mode: bool,
 }
 
 impl DecimalNarrowState {
@@ -68,12 +67,20 @@ impl DecimalNarrowState {
     fn set_value(&mut self, value: i128) {
         let value = value as u128;
         self.value_words = [value as u64, (value >> 64) as u64];
-        self.i64_mode = i64::try_from(value as i128).is_ok();
     }
 
     fn set_i64(&mut self, value: i64) {
         self.value_words = [value as u64, if value < 0 { u64::MAX } else { 0 }];
-        self.i64_mode = true;
+    }
+
+    #[inline]
+    fn value_is_i64(&self) -> bool {
+        self.value_words[1]
+            == if (self.value_words[0] as i64) < 0 {
+                u64::MAX
+            } else {
+                0
+            }
     }
 
     fn add(&mut self, value: i128) {
@@ -94,7 +101,7 @@ impl DecimalNarrowState {
             self.is_set = true;
             return;
         }
-        if self.i64_mode {
+        if self.value_is_i64() {
             if let Some(sum) = (self.value_words[0] as i64).checked_add(value) {
                 self.set_i64(sum);
                 return;
@@ -120,7 +127,7 @@ impl DecimalNarrowState {
 /// Two otherwise unreachable values at the bottom of the signed domain encode
 /// the empty and overflow states.
 #[repr(C)]
-struct DecimalSumState {
+pub(in crate::aggregate) struct DecimalSumState {
     value_words: [u64; 3],
 }
 
@@ -158,6 +165,31 @@ impl DecimalSumState {
             return;
         }
         self.add_words(source_words(value));
+    }
+
+    pub(in crate::aggregate) fn add_direct_i128(&mut self, value: i128) {
+        self.add_i128(value);
+    }
+
+    pub(in crate::aggregate) fn add_direct_i256(&mut self, value: i256) {
+        let (high, low) = value.into_words();
+        let high = high as u128;
+        let sign_extension = if (high as u64) >> 63 == 0 {
+            0
+        } else {
+            u64::MAX
+        };
+        if (high >> 64) as u64 != sign_extension {
+            self.value_words = Self::OVERFLOWED;
+            return;
+        }
+        let low = low as u128;
+        let words = [low as u64, (low >> 64) as u64, high as u64];
+        if !self.is_set() {
+            self.value_words = words;
+        } else if !self.overflowed() {
+            self.add_words(words);
+        }
     }
 
     fn add_state(&mut self, source: &Self) {
@@ -223,7 +255,6 @@ pub(in crate::aggregate) struct DecimalAverageState {
     is_set: bool,
     overflowed: bool,
     wide: bool,
-    i64_mode: bool,
 }
 
 impl DecimalAverageState {
@@ -246,14 +277,12 @@ impl DecimalAverageState {
         self.value_words[0] = value as u64;
         self.value_words[1] = (value >> 64) as u64;
         self.wide = false;
-        self.i64_mode = i64::try_from(value as i128).is_ok();
     }
 
     fn set_i64_value(&mut self, value: i64) {
         self.value_words[0] = value as u64;
         self.value_words[1] = if value < 0 { u64::MAX } else { 0 };
         self.wide = false;
-        self.i64_mode = true;
     }
 
     fn set_value(&mut self, value: i256) {
@@ -267,11 +296,21 @@ impl DecimalAverageState {
             (high >> 64) as u64,
         ];
         self.wide = value < i256::from(i128::MIN) || value > i256::from(i128::MAX);
-        self.i64_mode = !self.wide && i64::try_from(low as i128).is_ok();
+    }
+
+    #[inline]
+    fn value_is_i64(&self) -> bool {
+        !self.wide
+            && self.value_words[1]
+                == if (self.value_words[0] as i64) < 0 {
+                    u64::MAX
+                } else {
+                    0
+                }
     }
 
     fn add_i64(&mut self, value: i64) -> bool {
-        if !self.wide && self.i64_mode {
+        if self.value_is_i64() {
             if let Some(sum) = (self.value_words[0] as i64).checked_add(value) {
                 self.set_i64_value(sum);
                 return true;
@@ -316,6 +355,20 @@ impl DecimalAverageState {
         self.is_set = true;
     }
 
+    pub(in crate::aggregate) fn update_direct_i256(&mut self, value: i256, count: u64) {
+        let Some(total) = self.value().checked_add(value) else {
+            self.overflowed = true;
+            return;
+        };
+        self.set_value(total);
+        if let Some(total) = self.count.checked_add(count) {
+            self.count = total;
+        } else {
+            self.overflowed = true;
+        }
+        self.is_set = true;
+    }
+
     fn add_i128(&mut self, value: i128) -> bool {
         if !self.wide {
             if let Some(value) = self.narrow_value().checked_add(value) {
@@ -331,7 +384,7 @@ impl DecimalAverageState {
     }
 
     fn add_state(&mut self, source: &Self) -> bool {
-        if !self.wide && !source.wide && self.i64_mode && source.i64_mode {
+        if self.value_is_i64() && source.value_is_i64() {
             return self.add_i64(source.value_words[0] as i64);
         }
         if !self.wide && !source.wide {
@@ -449,13 +502,19 @@ fn bind(
         })?,
         wide_sum,
     });
-    function = match op {
-        DecimalAggregateOp::Sum if !wide_sum => {
-            function.with_direct_update(AggregateDirectUpdate::DecimalSumI64)
-        }
-        DecimalAggregateOp::Avg => {
-            function.with_direct_update(AggregateDirectUpdate::DecimalAverageI64)
-        }
+    function = match (op, *precision <= 18, wide_sum) {
+        (DecimalAggregateOp::Sum, true, false) => function.with_direct_update(
+            AggregateDirectUpdate::Decimal(DecimalDirectUpdate::NarrowSumI64),
+        ),
+        (DecimalAggregateOp::Sum, false, true) => function.with_direct_update(
+            AggregateDirectUpdate::Decimal(DecimalDirectUpdate::WideSumI128),
+        ),
+        (DecimalAggregateOp::Avg, true, _) => function.with_direct_update(
+            AggregateDirectUpdate::Decimal(DecimalDirectUpdate::AverageI64),
+        ),
+        (DecimalAggregateOp::Avg, false, _) => function.with_direct_update(
+            AggregateDirectUpdate::Decimal(DecimalDirectUpdate::AverageI128),
+        ),
         _ => function,
     };
     if op == DecimalAggregateOp::Sum {
@@ -473,7 +532,6 @@ unsafe fn initialize_narrow(state: *mut u8) {
     state.value_words = [0; 2];
     state.is_set = false;
     state.overflowed = false;
-    state.i64_mode = true;
 }
 
 unsafe fn initialize_sum(state: *mut u8) {
@@ -488,7 +546,6 @@ unsafe fn initialize_average(state: *mut u8) {
     state.is_set = false;
     state.overflowed = false;
     state.wide = false;
-    state.i64_mode = true;
 }
 
 unsafe fn update(
@@ -1130,357 +1187,5 @@ impl DecimalAggregateOp {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use paro_common::allocator::{default_allocator, ArenaAllocator};
-    use std::sync::Arc;
-
-    fn initialized_narrow_state() -> DecimalNarrowState {
-        DecimalNarrowState {
-            value_words: [0; 2],
-            is_set: false,
-            overflowed: false,
-            i64_mode: true,
-        }
-    }
-
-    fn initialized_sum_state() -> DecimalSumState {
-        DecimalSumState {
-            value_words: DecimalSumState::UNSET,
-        }
-    }
-
-    fn initialized_average_state() -> DecimalAverageState {
-        DecimalAverageState {
-            value_words: [0; 4],
-            count: 0,
-            is_set: false,
-            overflowed: false,
-            wide: false,
-            i64_mode: true,
-        }
-    }
-
-    #[test]
-    fn decimal_accumulators_promote_from_i64_without_losing_exactness() {
-        let mut sum = initialized_narrow_state();
-        sum.add_i64(i64::MAX);
-        assert!(sum.i64_mode);
-        sum.add_i64(1);
-        assert!(!sum.i64_mode);
-        assert_eq!(sum.value(), i128::from(i64::MAX) + 1);
-
-        let mut average = initialized_average_state();
-        assert!(average.add_i64(i64::MAX));
-        assert!(average.i64_mode);
-        assert!(average.add_i64(1));
-        assert!(!average.i64_mode);
-        assert_eq!(average.value(), i256::from(i128::from(i64::MAX) + 1));
-    }
-
-    #[test]
-    fn direct_decimal_program_fuses_shared_group_and_input_updates() {
-        let input_type = LogicalType::Decimal {
-            precision: 15,
-            scale: 2,
-        };
-        let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
-        let (average, _) = bind_avg(std::slice::from_ref(&input_type)).unwrap();
-        let sum_offset = 0;
-        let average_offset = std::mem::size_of::<DecimalNarrowState>();
-        let count_offset = average_offset + std::mem::size_of::<DecimalAverageState>();
-        let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(3);
-        assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0)));
-        assert!(program.try_add(1, average.direct_update, average_offset, Some(0),));
-        assert!(program.try_add(
-            2,
-            Some(AggregateDirectUpdate::CountStar),
-            count_offset,
-            None,
-        ));
-        assert!(program.is_worthwhile());
-
-        let state_bytes = count_offset + std::mem::size_of::<i64>();
-        let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
-        let base = storage.as_mut_ptr().cast::<u8>();
-        unsafe {
-            initialize_narrow(base.add(sum_offset));
-            initialize_average(base.add(average_offset));
-            *base.add(count_offset).cast::<i64>() = 0;
-        }
-        let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
-        addresses.set_count(2);
-        unsafe {
-            let values = addresses.flat_data_mut::<*mut u8>();
-            *values = base;
-            *values.add(1) = base;
-        }
-        let mut values = paro_common::test_utils::test_vector(input_type);
-        values.set_count(2);
-        values.set_i64(0, 100);
-        values.set_i64(1, 200);
-        let payload = paro_common::test_utils::test_chunk_from_vectors(vec![values]);
-        assert!(unsafe { program.execute(&payload, &addresses, 2) }.unwrap());
-        let sum = unsafe { &*base.add(sum_offset).cast::<DecimalNarrowState>() };
-        let average = unsafe { &*base.add(average_offset).cast::<DecimalAverageState>() };
-        assert_eq!(sum.value(), 300);
-        assert_eq!(average.value(), i256::from(300));
-        assert_eq!(average.count, 2);
-        assert_eq!(unsafe { *base.add(count_offset).cast::<i64>() }, 2);
-    }
-
-    unsafe fn finalize_single<T>(state: &mut T, data: &DecimalAggregateBindData) -> Result<Vector> {
-        let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
-        states.set_count(1);
-        *states.flat_data_mut::<*mut u8>() = state as *mut T as *mut u8;
-        let mut result = paro_common::test_utils::test_vector(LogicalType::Decimal {
-            precision: data.output_precision,
-            scale: data.output_scale,
-        });
-        result.set_count(1);
-        let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
-        let input_data = AggregateInputData::new(
-            Some(data),
-            &mut arena,
-            crate::aggregate::AggregateCombineType::PreserveInput,
-        );
-        finalize(&states, &input_data, &mut result, 1)?;
-        Ok(result)
-    }
-
-    #[test]
-    fn decimal_state_obeys_the_eight_byte_aggregate_alignment_contract() {
-        assert_eq!(std::mem::align_of::<DecimalNarrowState>(), 8);
-        assert_eq!(std::mem::align_of::<DecimalSumState>(), 8);
-        assert_eq!(std::mem::align_of::<DecimalAverageState>(), 8);
-        assert_eq!(
-            std::mem::size_of::<DecimalSumState>(),
-            std::mem::size_of::<DecimalNarrowState>()
-        );
-        assert!(
-            std::mem::size_of::<DecimalNarrowState>() < std::mem::size_of::<DecimalAverageState>()
-        );
-        let state_words = std::mem::size_of::<DecimalAverageState>().div_ceil(8);
-        let mut storage = vec![0_u64; state_words + 1];
-        let base = storage.as_mut_ptr() as *mut u8;
-        let offset = if (base as usize).is_multiple_of(16) {
-            8
-        } else {
-            0
-        };
-        let state_ptr = unsafe { base.add(offset) };
-        assert_eq!((state_ptr as usize) % 8, 0);
-        assert_ne!((state_ptr as usize) % 16, 0);
-
-        unsafe { initialize_average(state_ptr) };
-        let state = unsafe { &mut *(state_ptr as *mut DecimalAverageState) };
-        let expected = i256::from(-123_456_789_012_345_678_901_234_567_890_i128);
-        state.set_value(expected);
-        assert_eq!(state.value(), expected);
-    }
-
-    #[test]
-    fn decimal_aggregate_binding_preserves_exact_result_shapes() {
-        let input = LogicalType::Decimal {
-            precision: 15,
-            scale: 2,
-        };
-        let (sum, targets) = bind_sum(std::slice::from_ref(&input)).unwrap();
-        assert_eq!(targets, vec![input.clone()]);
-        assert_eq!(sum.state_size, std::mem::size_of::<DecimalNarrowState>());
-        assert_eq!(
-            sum.return_type,
-            LogicalType::Decimal {
-                precision: 38,
-                scale: 2
-            }
-        );
-
-        let (avg, _) = bind_avg(&[input]).unwrap();
-        assert_eq!(
-            avg.return_type,
-            LogicalType::Decimal {
-                precision: 38,
-                scale: 6
-            }
-        );
-
-        let (wide_sum, _) = bind_sum(&[LogicalType::Decimal {
-            precision: 38,
-            scale: 0,
-        }])
-        .unwrap();
-        assert_eq!(wide_sum.state_size, std::mem::size_of::<DecimalSumState>());
-
-        let (wide_avg, _) = bind_avg(&[LogicalType::Decimal {
-            precision: 38,
-            scale: 0,
-        }])
-        .unwrap();
-        assert_eq!(
-            wide_avg.return_type,
-            LogicalType::Decimal {
-                precision: 38,
-                scale: 0
-            }
-        );
-    }
-
-    #[test]
-    fn decimal_sum_set_prefers_dynamic_binding_over_double_coercion() {
-        let input = LogicalType::Decimal {
-            precision: 15,
-            scale: 2,
-        };
-        let (sum, targets) = crate::aggregate::distributive::sum::get_sum_function()
-            .bind(std::slice::from_ref(&input))
-            .unwrap();
-
-        assert_eq!(targets, vec![input]);
-        assert_eq!(
-            sum.return_type,
-            LogicalType::Decimal {
-                precision: 38,
-                scale: 2
-            }
-        );
-    }
-
-    #[test]
-    fn decimal_sum_reports_declared_precision_overflow() {
-        let data = DecimalAggregateBindData {
-            op: DecimalAggregateOp::Sum,
-            input_scale: 0,
-            output_precision: 38,
-            output_scale: 0,
-            output_limit: 10_i128.pow(38),
-            wide_sum: true,
-        };
-        let mut state = initialized_sum_state();
-        state.set_i128(10_i128.pow(38));
-
-        let error = unsafe { finalize_single(&mut state, &data) }.unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Decimal SUM result exceeds precision 38"));
-    }
-
-    #[test]
-    fn decimal_sum_is_exact_across_i128_intermediate_overflow() {
-        let max_decimal = 10_i128.pow(38) - 1;
-        let mut state = initialized_sum_state();
-        state.add_i128(max_decimal);
-        state.add_i128(max_decimal);
-        assert!(state.try_i128().is_none());
-        state.add_i128(-max_decimal);
-        assert_eq!(state.try_i128(), Some(max_decimal));
-        assert!(!state.overflowed());
-    }
-
-    #[test]
-    fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
-        let data = DecimalAggregateBindData {
-            op: DecimalAggregateOp::Sum,
-            input_scale: 2,
-            output_precision: 38,
-            output_scale: 2,
-            output_limit: 10_i128.pow(38),
-            wide_sum: false,
-        };
-        let mut states = [
-            initialized_narrow_state(),
-            initialized_narrow_state(),
-            initialized_narrow_state(),
-            initialized_narrow_state(),
-        ];
-        for (state, value) in states.iter_mut().zip([29_900, 30_000, 30_100]) {
-            state.set_value(value);
-            state.is_set = true;
-        }
-
-        let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);
-        addresses.set_count(states.len());
-        for (row, state) in states.iter_mut().enumerate() {
-            unsafe {
-                *addresses.flat_data_mut::<*mut u8>().add(row) = state as *mut _ as *mut u8;
-            }
-        }
-        let state_input = AggregateStateInput::try_new(&addresses, 0, None, states.len()).unwrap();
-        let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
-        let input_data = AggregateInputData::new(
-            Some(&data),
-            &mut arena,
-            crate::aggregate::AggregateCombineType::PreserveInput,
-        );
-        let mut selection = paro_common::vector::SelectionVector::try_with_capacity(
-            states.len(),
-            paro_common::test_utils::test_allocator(),
-        )
-        .unwrap();
-        let selected = unsafe {
-            filter_narrow_sum_state(
-                &state_input,
-                &input_data,
-                AggregateComparison::GreaterThan,
-                &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
-                &mut selection,
-                states.len(),
-            )
-        }
-        .unwrap();
-        assert_eq!(selected, 1);
-        assert_eq!(selection.as_slice(), &[2]);
-
-        let error = unsafe {
-            filter_narrow_sum_state(
-                &state_input,
-                &input_data,
-                AggregateComparison::GreaterThan,
-                &paro_common::runtime_value::Value::Decimal(300_000, 38, 3),
-                &mut selection,
-                states.len(),
-            )
-        }
-        .unwrap_err();
-        assert!(error.to_string().contains("constant type mismatch"));
-
-        states[0].set_value(10_i128.pow(38));
-        let error = unsafe {
-            filter_narrow_sum_state(
-                &state_input,
-                &input_data,
-                AggregateComparison::GreaterThan,
-                &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
-                &mut selection,
-                states.len(),
-            )
-        }
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("Decimal SUM result exceeds precision 38"));
-    }
-
-    #[test]
-    fn decimal_avg_uses_wide_accumulator_before_division() {
-        let data = DecimalAggregateBindData {
-            op: DecimalAggregateOp::Avg,
-            input_scale: 0,
-            output_precision: 38,
-            output_scale: 0,
-            output_limit: 10_i128.pow(38),
-            wide_sum: false,
-        };
-        let input = 99_999_999_999_999_999_999_999_999_999_999_999_999_i128;
-        let mut state = initialized_average_state();
-        update_average_state(&mut state, input);
-        assert!(!state.wide);
-        assert_eq!(state.narrow_value(), input);
-        update_average_state(&mut state, input);
-        assert!(state.wide);
-        assert!(state.value() > i256::from(i128::MAX));
-
-        let result = unsafe { finalize_single(&mut state, &data) }.unwrap();
-        assert_eq!(unsafe { result.get_fixed::<i128>(0) }, input);
-    }
-}
+#[path = "decimal_tests.rs"]
+mod tests;

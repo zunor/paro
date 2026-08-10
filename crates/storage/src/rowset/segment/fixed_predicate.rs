@@ -28,6 +28,17 @@ pub(super) struct FixedConjunction<T> {
     contradiction: bool,
 }
 
+enum FixedKernelShape<'a, T> {
+    Contradiction,
+    Equality(T),
+    Membership(FixedMembershipView<'a, T>),
+    Bounds {
+        lower: Option<FixedBound<T>>,
+        upper: Option<FixedBound<T>>,
+    },
+    General(&'a FixedConjunction<T>),
+}
+
 impl FixedPhysical for i32 {
     #[inline]
     fn from_le(value: Self) -> Self {
@@ -282,6 +293,34 @@ impl<T: FixedPhysical> FixedConjunction<T> {
             (false, false) => (7, 0),
         }
     }
+
+    /// Canonical execution shape shared by scalar and architecture-specific
+    /// kernels. The exhaustive field destructuring intentionally makes adding
+    /// new conjunction semantics a compile-time obligation here.
+    fn execution_shape(&self) -> FixedKernelShape<'_, T> {
+        let Self {
+            equality,
+            lower,
+            upper,
+            inclusions,
+            exclusions,
+            contradiction,
+        } = self;
+        if *contradiction {
+            FixedKernelShape::Contradiction
+        } else if let Some(value) = equality {
+            FixedKernelShape::Equality(*value)
+        } else if let Some(values) = inclusions {
+            FixedKernelShape::Membership(values.view())
+        } else if exclusions.is_empty() {
+            FixedKernelShape::Bounds {
+                lower: *lower,
+                upper: *upper,
+            }
+        } else {
+            FixedKernelShape::General(self)
+        }
+    }
 }
 
 pub(super) enum FixedComparisonValues {
@@ -351,7 +390,6 @@ impl FixedComparisonValues {
     }
 }
 
-#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
 fn try_filter_seed_i32_batch(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<i32>,
@@ -359,34 +397,71 @@ fn try_filter_seed_i32_batch(
     selection: &mut Vec<usize>,
     seed: bool,
 ) -> bool {
-    use core::arch::aarch64::{vcleq_s32, vdupq_n_s32, vld1q_s32, vst1q_u32};
-
     let PredicateColumnBatch::Raw(batch) = batch else {
         return false;
     };
-    let (None, Some(upper_bound)) = (kernel.lower, kernel.upper) else {
+    let FixedKernelShape::Bounds {
+        lower: None,
+        upper: Some(upper_bound),
+    } = kernel.execution_shape()
+    else {
         return false;
     };
-    if !seed
-        || batch.nulls.is_some()
-        || !upper_bound.inclusive
-        || kernel.contradiction
-        || kernel.equality.is_some()
-        || kernel.inclusions.is_some()
-        || !kernel.exclusions.is_empty()
-    {
+    if !seed || batch.nulls.is_some() || !upper_bound.inclusive {
         return false;
     }
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        unsafe {
+            filter_i32_upper_inclusive_neon(batch.data.as_ptr(), upper_bound.value, rows, selection)
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                filter_i32_upper_inclusive_avx2(
+                    batch.data.as_ptr(),
+                    upper_bound.value,
+                    rows,
+                    selection,
+                )
+            };
+        }
+        return false;
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "x86_64", target_endian = "little")
+    )))]
+    {
+        false
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn filter_i32_upper_inclusive_neon(
+    input: *const u8,
+    upper: i32,
+    rows: usize,
+    selection: &mut Vec<usize>,
+) -> bool {
+    use core::arch::aarch64::{vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vst1q_u32};
 
     selection.reserve(rows);
     let start = selection.len();
     let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
-    let input = batch.data.as_ptr().cast::<i32>();
-    let upper_vector = unsafe { vdupq_n_s32(upper_bound.value) };
+    let upper_vector = unsafe { vdupq_n_s32(upper) };
     let mut row = 0usize;
     let mut written = 0usize;
     while row + 4 <= rows {
-        let values = unsafe { vld1q_s32(input.add(row)) };
+        // NEON byte loads have no alignment precondition; reinterpretation is
+        // lane-local on the little-endian target selected by this function.
+        let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i32>())) };
+        let values = unsafe { vreinterpretq_s32_u8(bytes) };
         let matched = unsafe { vcleq_s32(values, upper_vector) };
         let mut lanes = [0u32; 4];
         unsafe { vst1q_u32(lanes.as_mut_ptr(), matched) };
@@ -409,8 +484,13 @@ fn try_filter_seed_i32_batch(
         row += 4;
     }
     while row < rows {
-        let value = i32::from_le(unsafe { input.add(row).read_unaligned() });
-        if value <= upper_bound.value {
+        let value = i32::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i32>())
+                .cast::<i32>()
+                .read_unaligned()
+        });
+        if value <= upper {
             unsafe { output.add(written).write(row) };
             written += 1;
         }
@@ -420,15 +500,69 @@ fn try_filter_seed_i32_batch(
     true
 }
 
-#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
-fn try_filter_seed_i32_batch(
-    _batch: &PredicateColumnBatch,
-    _kernel: &FixedConjunction<i32>,
-    _rows: usize,
-    _selection: &mut Vec<usize>,
-    _seed: bool,
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_i32_upper_inclusive_avx2(
+    input: *const u8,
+    upper: i32,
+    rows: usize,
+    selection: &mut Vec<usize>,
 ) -> bool {
-    false
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_set1_epi32,
+    };
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let upper_vector = unsafe { _mm256_set1_epi32(upper) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 8 <= rows {
+        let values = unsafe {
+            _mm256_loadu_si256(
+                input
+                    .add(row * std::mem::size_of::<i32>())
+                    .cast::<__m256i>(),
+            )
+        };
+        let rejected = unsafe {
+            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(
+                values,
+                upper_vector,
+            ))) as u32
+        };
+        if rejected == 0 {
+            for lane in 0..8 {
+                unsafe { output.add(written + lane).write(row + lane) };
+            }
+            written += 8;
+        } else {
+            for lane in 0..8 {
+                if rejected & (1 << lane) == 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 8;
+    }
+    while row < rows {
+        let value = i32::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i32>())
+                .cast::<i32>()
+                .read_unaligned()
+        });
+        if value <= upper {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
 }
 
 fn filter_fixed_batch<T: FixedPhysical>(
@@ -505,18 +639,14 @@ fn dispatch_fixed_kernel<T, L, V>(
     L: Fn(usize) -> T + Copy,
     V: Fn(usize) -> bool + Copy,
 {
-    if kernel.contradiction {
-        selection.clear();
-        return;
-    }
-    if let Some(expected) = kernel.equality {
-        filter_selection(rows, selection, seed, load, valid, |value| {
-            value == expected
-        });
-        return;
-    }
-    if let Some(inclusions) = &kernel.inclusions {
-        match inclusions.view() {
+    match kernel.execution_shape() {
+        FixedKernelShape::Contradiction => selection.clear(),
+        FixedKernelShape::Equality(expected) => {
+            filter_selection(rows, selection, seed, load, valid, |value| {
+                value == expected
+            });
+        }
+        FixedKernelShape::Membership(inclusions) => match inclusions {
             FixedMembershipView::Sorted(values) => {
                 filter_selection(rows, selection, seed, load, valid, |value| {
                     values.binary_search(&value).is_ok()
@@ -532,47 +662,44 @@ fn dispatch_fixed_kernel<T, L, V>(
                         != 0
                 });
             }
-        }
-        return;
-    }
-    if !kernel.exclusions.is_empty() {
-        filter_selection(rows, selection, seed, load, valid, |value| {
-            kernel.matches(value)
-        });
-        return;
-    }
-
-    match (kernel.lower, kernel.upper) {
-        (None, None) => filter_selection(rows, selection, seed, load, valid, |_| true),
-        (Some(lower), None) if lower.inclusive => {
+        },
+        FixedKernelShape::General(kernel) => {
             filter_selection(rows, selection, seed, load, valid, |value| {
-                value >= lower.value
-            })
+                kernel.matches(value)
+            });
         }
-        (Some(lower), None) => filter_selection(rows, selection, seed, load, valid, |value| {
-            value > lower.value
-        }),
-        (None, Some(upper)) if upper.inclusive => {
-            filter_selection(rows, selection, seed, load, valid, |value| {
-                value <= upper.value
-            })
-        }
-        (None, Some(upper)) => filter_selection(rows, selection, seed, load, valid, |value| {
-            value < upper.value
-        }),
-        (Some(lower), Some(upper)) => match (lower.inclusive, upper.inclusive) {
-            (true, true) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value >= lower.value && value <= upper.value
+        FixedKernelShape::Bounds { lower, upper } => match (lower, upper) {
+            (None, None) => filter_selection(rows, selection, seed, load, valid, |_| true),
+            (Some(lower), None) if lower.inclusive => {
+                filter_selection(rows, selection, seed, load, valid, |value| {
+                    value >= lower.value
+                })
+            }
+            (Some(lower), None) => filter_selection(rows, selection, seed, load, valid, |value| {
+                value > lower.value
             }),
-            (true, false) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value >= lower.value && value < upper.value
+            (None, Some(upper)) if upper.inclusive => {
+                filter_selection(rows, selection, seed, load, valid, |value| {
+                    value <= upper.value
+                })
+            }
+            (None, Some(upper)) => filter_selection(rows, selection, seed, load, valid, |value| {
+                value < upper.value
             }),
-            (false, true) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value > lower.value && value <= upper.value
-            }),
-            (false, false) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value > lower.value && value < upper.value
-            }),
+            (Some(lower), Some(upper)) => match (lower.inclusive, upper.inclusive) {
+                (true, true) => filter_selection(rows, selection, seed, load, valid, |value| {
+                    value >= lower.value && value <= upper.value
+                }),
+                (true, false) => filter_selection(rows, selection, seed, load, valid, |value| {
+                    value >= lower.value && value < upper.value
+                }),
+                (false, true) => filter_selection(rows, selection, seed, load, valid, |value| {
+                    value > lower.value && value <= upper.value
+                }),
+                (false, false) => filter_selection(rows, selection, seed, load, valid, |value| {
+                    value > lower.value && value < upper.value
+                }),
+            },
         },
     }
 }

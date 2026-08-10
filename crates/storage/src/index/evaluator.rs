@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::index::bound_index::BoundIndex;
+use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation};
 use crate::index::page_layout::PageLayout;
 use crate::index::predicate::{Predicate, PredicateTree};
 use crate::index::predicate_result::{
@@ -54,68 +54,48 @@ impl IndexEvaluator {
 
     /// Evaluate a predicate tree using available indexes.
     pub fn evaluate(&self, predicate_tree: &PredicateTree) -> PredicateResult {
+        self.evaluate_with_proof(predicate_tree).candidates
+    }
+
+    /// Evaluate candidates and guaranteed-true rows through one tree walk.
+    pub fn evaluate_with_proof(&self, predicate_tree: &PredicateTree) -> IndexPredicateEvaluation {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => self.evaluate_single(predicate),
             PredicateTree::And(children) => {
-                let mut result = PredicateResult::AllMatch;
+                let mut candidates = PredicateResult::AllMatch;
+                let mut guaranteed = PredicateResult::AllMatch;
                 for child in children {
-                    let child_result = self.evaluate(child);
-                    result = match &self.page_layout {
-                        Some(layout) => intersect_with_layout(&result, &child_result, layout),
-                        None => intersect(&result, &child_result),
+                    let child = self.evaluate_with_proof(child);
+                    candidates = match &self.page_layout {
+                        Some(layout) => {
+                            intersect_with_layout(&candidates, &child.candidates, layout)
+                        }
+                        None => intersect(&candidates, &child.candidates),
                     };
-                    if matches!(result, PredicateResult::NoneMatch) {
-                        return result;
-                    }
+                    guaranteed = match &self.page_layout {
+                        Some(layout) => {
+                            intersect_with_layout(&guaranteed, &child.guaranteed, layout)
+                        }
+                        None => intersect(&guaranteed, &child.guaranteed),
+                    };
                 }
-                result
+                IndexPredicateEvaluation::new(candidates, guaranteed)
             }
             PredicateTree::Or(children) => {
-                let mut result = PredicateResult::NoneMatch;
+                let mut candidates = PredicateResult::NoneMatch;
+                let mut guaranteed = PredicateResult::NoneMatch;
                 for child in children {
-                    let child_result = self.evaluate(child);
-                    result = match &self.page_layout {
-                        Some(layout) => union_with_layout(&result, &child_result, layout),
-                        None => union(&result, &child_result),
+                    let child = self.evaluate_with_proof(child);
+                    candidates = match &self.page_layout {
+                        Some(layout) => union_with_layout(&candidates, &child.candidates, layout),
+                        None => union(&candidates, &child.candidates),
                     };
-                    if matches!(result, PredicateResult::AllMatch) {
-                        return result;
-                    }
+                    guaranteed = match &self.page_layout {
+                        Some(layout) => union_with_layout(&guaranteed, &child.guaranteed, layout),
+                        None => union(&guaranteed, &child.guaranteed),
+                    };
                 }
-                result
-            }
-        }
-    }
-
-    /// Evaluate the subset of rows proven to satisfy a predicate tree.
-    ///
-    /// Candidate evaluation and proof evaluation deliberately remain
-    /// separate: a zone map page can be a candidate while only some pages are
-    /// strong enough to bypass row verification.
-    pub fn evaluate_guaranteed(&self, predicate_tree: &PredicateTree) -> PredicateResult {
-        match predicate_tree {
-            PredicateTree::Leaf(predicate) => self.evaluate_guaranteed_single(predicate),
-            PredicateTree::And(children) => {
-                children
-                    .iter()
-                    .fold(PredicateResult::AllMatch, |result, child| {
-                        let child = self.evaluate_guaranteed(child);
-                        match &self.page_layout {
-                            Some(layout) => intersect_with_layout(&result, &child, layout),
-                            None => intersect(&result, &child),
-                        }
-                    })
-            }
-            PredicateTree::Or(children) => {
-                children
-                    .iter()
-                    .fold(PredicateResult::NoneMatch, |result, child| {
-                        let child = self.evaluate_guaranteed(child);
-                        match &self.page_layout {
-                            Some(layout) => union_with_layout(&result, &child, layout),
-                            None => union(&result, &child),
-                        }
-                    })
+                IndexPredicateEvaluation::new(candidates, guaranteed)
             }
         }
     }
@@ -124,45 +104,29 @@ impl IndexEvaluator {
     ///
     /// Indexes are pre-filtered by column_id (stored in the HashMap)
     /// and sorted by priority (ART > Bitmap > Bloom > ZoneMap).
-    fn evaluate_single(&self, predicate: &Predicate) -> PredicateResult {
+    fn evaluate_single(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
         let Some(column_id) = predicate.index_column_id() else {
-            return PredicateResult::Unknown;
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
         let Some(indexes) = self.indexes.get(&column_id) else {
-            return PredicateResult::Unknown;
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
 
+        let mut candidates = PredicateResult::Unknown;
+        let mut guaranteed = PredicateResult::NoneMatch;
         for index in indexes {
-            let result = index.evaluate_predicate(predicate);
-            if !matches!(result, PredicateResult::Unknown) {
-                return result;
+            let result = index.evaluate_predicate_with_proof(predicate);
+            if matches!(candidates, PredicateResult::Unknown)
+                && !matches!(result.candidates, PredicateResult::Unknown)
+            {
+                candidates = result.candidates;
             }
+            guaranteed = match &self.page_layout {
+                Some(layout) => union_with_layout(&guaranteed, &result.guaranteed, layout),
+                None => union(&guaranteed, &result.guaranteed),
+            };
         }
-
-        PredicateResult::Unknown
-    }
-
-    fn evaluate_guaranteed_single(&self, predicate: &Predicate) -> PredicateResult {
-        let Some(column_id) = predicate.index_column_id() else {
-            return PredicateResult::NoneMatch;
-        };
-        let Some(indexes) = self.indexes.get(&column_id) else {
-            return PredicateResult::NoneMatch;
-        };
-        indexes
-            .iter()
-            .fold(PredicateResult::NoneMatch, |result, index| {
-                let proof = index.evaluate_guaranteed_predicate(predicate);
-                let proof = if matches!(proof, PredicateResult::Unknown) {
-                    PredicateResult::NoneMatch
-                } else {
-                    proof
-                };
-                match &self.page_layout {
-                    Some(layout) => union_with_layout(&result, &proof, layout),
-                    None => union(&result, &proof),
-                }
-            })
+        IndexPredicateEvaluation::new(candidates, guaranteed)
     }
 }
 

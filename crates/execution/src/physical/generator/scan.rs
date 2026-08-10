@@ -8,6 +8,7 @@ use std::sync::Arc;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
 use paro_storage::index::{collect_predicate_columns, PredicateTree};
+use paro_storage::rowset::scan_cost::ScanAccessCostModel;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_get(
@@ -61,13 +62,14 @@ impl PhysicalPlanGenerator {
             }
         }
 
-        let late_materialize = should_late_materialize(
-            &predicate,
-            &column_ids,
-            emit_row_id,
-            &table,
-            estimated_selectivity,
-        );
+        let late_materialize = self.ctx.rowset_scan_pushdown
+            && should_late_materialize(
+                &predicate,
+                &column_ids,
+                emit_row_id,
+                &table,
+                estimated_selectivity,
+            );
 
         Ok(RowsetScanSpec {
             table_index: get.table_index,
@@ -620,12 +622,10 @@ fn should_late_materialize(
     table: &TableCatalogEntry,
     estimated_selectivity: Option<f64>,
 ) -> bool {
-    const UNKNOWN_SELECTIVITY: f64 = 0.25;
-    const GATHER_ACCESS_PENALTY: f64 = 2.0;
-
     let Some(predicate) = predicate else {
         return false;
     };
+    let access_cost = ScanAccessCostModel::default();
     let predicate_columns = collect_predicate_columns(predicate);
     if predicate_columns.is_empty() {
         return false;
@@ -641,7 +641,7 @@ fn should_late_materialize(
         .iter()
         .filter(|column_id| !predicate_columns.contains(&(**column_id as u32)))
         .filter_map(|column_id| table.columns.get(*column_id))
-        .map(|column| column.logical_type.physical_size().max(1))
+        .map(|column| access_cost.estimated_width(&column.logical_type))
         .sum::<usize>();
     if deferred_width == 0 {
         return false;
@@ -650,7 +650,7 @@ fn should_late_materialize(
     let predicate_width = predicate_columns
         .iter()
         .filter_map(|column_id| table.columns.get(*column_id as usize))
-        .map(|column| column.logical_type.physical_size().max(1))
+        .map(|column| access_cost.estimated_width(&column.logical_type))
         .sum::<usize>();
     let predicate_column_ids = predicate_columns
         .iter()
@@ -659,12 +659,12 @@ fn should_late_materialize(
     let eager_width = output_columns
         .union(&predicate_column_ids)
         .filter_map(|column_id| table.columns.get(*column_id))
-        .map(|column| column.logical_type.physical_size().max(1))
+        .map(|column| access_cost.estimated_width(&column.logical_type))
         .sum::<usize>();
-    let selectivity = estimated_selectivity
-        .unwrap_or(UNKNOWN_SELECTIVITY)
-        .clamp(0.0, 1.0);
-    let late_cost =
-        predicate_width as f64 + selectivity * deferred_width as f64 * GATHER_ACCESS_PENALTY;
-    late_cost < eager_width as f64
+    access_cost.late_materialization_is_cheaper(
+        predicate_width,
+        deferred_width,
+        eager_width,
+        estimated_selectivity,
+    )
 }

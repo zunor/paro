@@ -33,6 +33,16 @@ impl DirectDecimalReader for DirectSelectedI64Reader<'_> {
 }
 
 #[derive(Clone, Copy)]
+struct DirectSelectedI128Reader<'a>(&'a DecodedVectorRef<'a>);
+
+impl DirectDecimalReader for DirectSelectedI128Reader<'_> {
+    #[inline(always)]
+    unsafe fn read(self, row: usize) -> i128 {
+        unsafe { self.0.get_value::<i128>(row) }
+    }
+}
+
+#[derive(Clone, Copy)]
 struct DirectI128Reader(*const i128);
 
 impl DirectDecimalReader for DirectI128Reader {
@@ -286,6 +296,11 @@ pub(super) fn execute_direct_decimal_rows(
     if matches!(op, DecimalArithmeticOp::Div | DecimalArithmeticOp::Mod) {
         return Ok(false);
     }
+    if let DecimalOutput::I128(output) = output {
+        if try_execute_speculative_narrow_i128_rows(left, right, output, native_plan, count) {
+            return Ok(true);
+        }
+    }
     if let DecimalOutput::I64(output) = output {
         if try_execute_direct_i64_rows(
             left,
@@ -371,6 +386,36 @@ pub(super) fn execute_direct_decimal_rows(
                 DirectSelectedI64Reader(right)
             );
         }
+        (DecimalInputAccess::SelectedI128(left), DecimalInputAccess::DirectI64(right)) => {
+            execute_pair!(DirectSelectedI128Reader(left), DirectI64Reader(*right));
+        }
+        (DecimalInputAccess::DirectI64(left), DecimalInputAccess::SelectedI128(right)) => {
+            execute_pair!(DirectI64Reader(*left), DirectSelectedI128Reader(right));
+        }
+        (DecimalInputAccess::SelectedI128(left), DecimalInputAccess::DirectI128(right)) => {
+            execute_pair!(DirectSelectedI128Reader(left), DirectI128Reader(*right));
+        }
+        (DecimalInputAccess::DirectI128(left), DecimalInputAccess::SelectedI128(right)) => {
+            execute_pair!(DirectI128Reader(*left), DirectSelectedI128Reader(right));
+        }
+        (DecimalInputAccess::SelectedI128(left), DecimalInputAccess::SelectedI64(right)) => {
+            execute_pair!(
+                DirectSelectedI128Reader(left),
+                DirectSelectedI64Reader(right)
+            );
+        }
+        (DecimalInputAccess::SelectedI64(left), DecimalInputAccess::SelectedI128(right)) => {
+            execute_pair!(
+                DirectSelectedI64Reader(left),
+                DirectSelectedI128Reader(right)
+            );
+        }
+        (DecimalInputAccess::SelectedI128(left), DecimalInputAccess::SelectedI128(right)) => {
+            execute_pair!(
+                DirectSelectedI128Reader(left),
+                DirectSelectedI128Reader(right)
+            );
+        }
         (DecimalInputAccess::Constant(left), DecimalInputAccess::DirectI64(right)) => {
             execute_pair!(DirectConstantReader(*left), DirectI64Reader(*right));
         }
@@ -389,11 +434,126 @@ pub(super) fn execute_direct_decimal_rows(
         (DecimalInputAccess::Constant(left), DecimalInputAccess::SelectedI64(right)) => {
             execute_pair!(DirectConstantReader(*left), DirectSelectedI64Reader(right));
         }
+        (DecimalInputAccess::SelectedI128(left), DecimalInputAccess::Constant(right)) => {
+            execute_pair!(DirectSelectedI128Reader(left), DirectConstantReader(*right));
+        }
+        (DecimalInputAccess::Constant(left), DecimalInputAccess::SelectedI128(right)) => {
+            execute_pair!(DirectConstantReader(*left), DirectSelectedI128Reader(right));
+        }
         (DecimalInputAccess::Constant(left), DecimalInputAccess::Constant(right)) => {
             execute_pair!(DirectConstantReader(*left), DirectConstantReader(*right));
         }
         _ => Ok(false),
     }
+}
+
+#[derive(Clone, Copy)]
+enum SpeculativeNarrowReader<'a> {
+    I64(*const i64),
+    I128(*const i128),
+    SelectedI64(&'a DecodedVectorRef<'a>),
+    SelectedI128(&'a DecodedVectorRef<'a>),
+    Constant(i128),
+}
+
+impl<'a> SpeculativeNarrowReader<'a> {
+    fn try_new(access: &'a DecimalInputAccess<'a>) -> Option<Self> {
+        match access {
+            DecimalInputAccess::DirectI64(values) => Some(Self::I64(*values)),
+            DecimalInputAccess::DirectI128(values) => Some(Self::I128(*values)),
+            DecimalInputAccess::SelectedI64(values) => Some(Self::SelectedI64(values)),
+            DecimalInputAccess::SelectedI128(values) => Some(Self::SelectedI128(values)),
+            DecimalInputAccess::Constant(value) => Some(Self::Constant(*value)),
+            DecimalInputAccess::Decoded(_) => None,
+        }
+    }
+
+    /// Return the low word and whether narrowing changed the exact value.
+    ///
+    /// # Safety
+    ///
+    /// `row` must identify a logical row in the prepared input batch.
+    #[inline(always)]
+    unsafe fn read_i64(self, row: usize) -> (i64, bool) {
+        let value = match self {
+            Self::I64(values) => return (unsafe { *values.add(row) }, false),
+            Self::I128(values) => unsafe { *values.add(row) },
+            Self::SelectedI64(values) => {
+                return (unsafe { values.get_value::<i64>(row) }, false);
+            }
+            Self::SelectedI128(values) => unsafe { values.get_value::<i128>(row) },
+            Self::Constant(value) => value,
+        };
+        let narrowed = value as i64;
+        (narrowed, i128::from(narrowed) != value)
+    }
+}
+
+fn try_execute_speculative_narrow_i128_rows(
+    left: &DecimalInputView<'_>,
+    right: &DecimalInputView<'_>,
+    output: *mut i128,
+    native_plan: NativeDecimalPlan,
+    count: usize,
+) -> bool {
+    let (Some(left), Some(right), Some(plan)) = (
+        SpeculativeNarrowReader::try_new(&left.access),
+        SpeculativeNarrowReader::try_new(&right.access),
+        I64NativeDecimalPlan::try_from_native(native_plan),
+    ) else {
+        return false;
+    };
+    match plan {
+        I64NativeDecimalPlan::Add { left: l, right: r } => {
+            let (Some(l), Some(r)) = (
+                SimpleI64Operand::try_from_native(l),
+                SimpleI64Operand::try_from_native(r),
+            ) else {
+                return false;
+            };
+            execute_speculative_narrow_i128_loop(left, right, output, count, |left, right| {
+                l.value(left).overflowing_add(r.value(right))
+            })
+        }
+        I64NativeDecimalPlan::Sub { left: l, right: r } => {
+            let (Some(l), Some(r)) = (
+                SimpleI64Operand::try_from_native(l),
+                SimpleI64Operand::try_from_native(r),
+            ) else {
+                return false;
+            };
+            execute_speculative_narrow_i128_loop(left, right, output, count, |left, right| {
+                l.value(left).overflowing_sub(r.value(right))
+            })
+        }
+        I64NativeDecimalPlan::Mul(I64ScaleTransform::Identity) => {
+            execute_speculative_narrow_i128_loop(left, right, output, count, i64::overflowing_mul)
+        }
+        I64NativeDecimalPlan::Mul(
+            I64ScaleTransform::Multiply(_) | I64ScaleTransform::Divide(_),
+        ) => false,
+    }
+}
+
+fn execute_speculative_narrow_i128_loop<F>(
+    left: SpeculativeNarrowReader<'_>,
+    right: SpeculativeNarrowReader<'_>,
+    output: *mut i128,
+    count: usize,
+    evaluate: F,
+) -> bool
+where
+    F: Fn(i64, i64) -> (i64, bool),
+{
+    let mut invalid = 0u64;
+    for row in 0..count {
+        let (left, left_wide) = unsafe { left.read_i64(row) };
+        let (right, right_wide) = unsafe { right.read_i64(row) };
+        let (value, overflowed) = evaluate(left, right);
+        invalid |= u64::from(left_wide | right_wide | overflowed);
+        unsafe { *output.add(row) = i128::from(value) };
+    }
+    invalid == 0
 }
 
 #[allow(clippy::too_many_arguments)]

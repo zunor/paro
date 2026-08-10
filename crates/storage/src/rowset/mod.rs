@@ -30,6 +30,7 @@ pub mod rowset;
 pub mod rowset_meta;
 pub mod rowset_statistics;
 pub mod rowset_writer;
+pub mod scan_cost;
 pub mod segment;
 pub mod segment_statistics;
 pub mod sparse_vector;

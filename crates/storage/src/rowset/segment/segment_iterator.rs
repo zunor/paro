@@ -8,6 +8,7 @@ use crate::buffer::{BufferPool, Prefetcher};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::column::{ColumnBatch, ColumnIterator, OrderedRowIds};
+use crate::rowset::scan_cost::ScanAccessCostModel;
 use crate::tablet::ColumnId;
 use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
@@ -126,7 +127,11 @@ fn predicate_proof_span(proof: &PredicateResult, start: u64, scan_end: u64) -> (
                 let range_start = range.start_row as u64;
                 let range_end = range.end_row as u64;
                 if start < range_start {
-                    return (false, scan_end.min(range_start));
+                    // A false span never needs to be split at the next proof
+                    // boundary: row-level evaluation remains correct across
+                    // both unproven and proven pages. Only an active proof
+                    // must stop where its truth value can change.
+                    return (false, scan_end);
                 }
                 if start < range_end {
                     return (true, scan_end.min(range_end));
@@ -516,8 +521,9 @@ impl SegmentIterator {
             let needs_row_level_eval =
                 PredicateEvaluator::predicate_tree_requires_row_verification(&tree)
                     || PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
-            self.predicate_guaranteed = evaluator.evaluate_guaranteed(&tree);
-            self.evaluated_selection = evaluator.evaluate(&tree);
+            let index_evaluation = evaluator.evaluate_with_proof(&tree);
+            self.predicate_guaranteed = index_evaluation.guaranteed;
+            self.evaluated_selection = index_evaluation.candidates;
             if needs_row_level_eval {
                 if !matches!(
                     self.evaluated_selection,
@@ -928,6 +934,43 @@ impl SegmentIterator {
             }
 
             let all_match = self.eager_predicate_matches.len() == rows_read;
+            let adapt_to_sparse = !materialize_sequential_rowids
+                && !ScanAccessCostModel::default().sequential_materialization_is_cheaper(
+                    self.eager_predicate_matches.len(),
+                    rows_read,
+                );
+            if adapt_to_sparse {
+                let evaluator = self
+                    .predicate_evaluator
+                    .as_ref()
+                    .expect("eager predicate mode requires an evaluator");
+                self.late_materialization = Some(LateMaterializationState::new(
+                    &self.column_iterators,
+                    evaluator,
+                ));
+                let rowids = self
+                    .eager_predicate_matches
+                    .iter()
+                    .map(|&row| (start_ordinal + row as u64) as u32)
+                    .collect::<Vec<_>>();
+                let ordered_rowids = OrderedRowIds::try_new(&rowids)?;
+                let mut compact_columns = Vec::with_capacity(self.column_iterators.len());
+                for (column_id, iterator) in &mut self.column_iterators {
+                    compact_columns.push((
+                        *column_id,
+                        iterator.read_by_ordered_rowids(&ordered_rowids)?,
+                    ));
+                }
+                self.seek_columns_to_ordinal(self.current_ordinal)?;
+                self.rowid_tracker.reset();
+                return Ok(SegmentBatch {
+                    rowids: Vec::new(),
+                    rows: rowids.len(),
+                    physical_rows: rowids.len(),
+                    selection: None,
+                    columns: compact_columns,
+                });
+            }
             let selection = (!all_match).then(|| {
                 self.eager_predicate_matches
                     .iter()
@@ -1067,12 +1110,8 @@ impl SegmentIterator {
                 && dense_materialization_is_cheaper(state.predicate_matches.len(), rows_read))
             .then(|| std::mem::take(&mut state.predicate_matches));
             if let Some(predicate_matches) = dense_matches {
-                let dense_batch = self.materialize_dense_selection(
-                    start_ordinal,
-                    rows_read,
-                    &predicate_matches,
-                    materialize_sequential_rowids,
-                )?;
+                let dense_batch =
+                    self.materialize_dense_selection(start_ordinal, rows_read, &predicate_matches)?;
                 self.current_ordinal += rows_read as u64;
                 return Ok(dense_batch);
             }
@@ -1096,7 +1135,6 @@ impl SegmentIterator {
         start_ordinal: u64,
         physical_rows: usize,
         predicate_matches: &[usize],
-        materialize_sequential_rowids: bool,
     ) -> Result<SegmentBatch> {
         let mut columns = Vec::with_capacity(self.column_iterators.len());
         for (column_id, iterator) in &mut self.column_iterators {
@@ -1112,20 +1150,7 @@ impl SegmentIterator {
             columns.push((*column_id, batch));
         }
 
-        let rowids = if materialize_sequential_rowids {
-            predicate_matches
-                .iter()
-                .map(|&row_idx| (start_ordinal + row_idx as u64) as u32)
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
-        if rowids.is_empty() {
-            self.rowid_tracker.reset();
-        } else {
-            self.rowid_tracker
-                .set(rowids.capacity() * std::mem::size_of::<u32>());
-        }
+        self.rowid_tracker.reset();
         let selection = (predicate_matches.len() != physical_rows).then(|| {
             predicate_matches
                 .iter()
@@ -1133,7 +1158,7 @@ impl SegmentIterator {
                 .collect::<Vec<_>>()
         });
         Ok(SegmentBatch {
-            rowids,
+            rowids: Vec::new(),
             rows: predicate_matches.len(),
             physical_rows,
             selection,
@@ -1215,7 +1240,8 @@ impl SegmentIterator {
 /// the threshold is the break-even point for the scan cost model's 2x gather
 /// access penalty.
 fn dense_materialization_is_cheaper(selected_rows: usize, physical_rows: usize) -> bool {
-    physical_rows != 0 && selected_rows.saturating_mul(2) >= physical_rows
+    ScanAccessCostModel::default()
+        .sequential_materialization_is_cheaper(selected_rows, physical_rows)
 }
 
 impl std::fmt::Debug for SegmentIterator {
@@ -1240,6 +1266,14 @@ mod tests {
     use crate::rowset::encoding::BinaryPlainPageBuilder;
     use crate::rowset::segment::predicate_column::{PredicateColumnAccess, PredicateColumnBatch};
     use crate::test_utils::{test_i32_vector, test_nullable_string_vector};
+
+    #[test]
+    fn unproven_spans_do_not_fragment_row_level_batches() {
+        let proof = PredicateResult::PageRanges(vec![crate::index::PageRange::new(10, 20)]);
+        assert_eq!(predicate_proof_span(&proof, 0, 30), (false, 30));
+        assert_eq!(predicate_proof_span(&proof, 10, 30), (true, 20));
+        assert_eq!(predicate_proof_span(&proof, 20, 30), (false, 30));
+    }
 
     #[test]
     fn decoded_predicate_batch_disables_column_reuse_for_readback() {

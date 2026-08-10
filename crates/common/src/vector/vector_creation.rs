@@ -566,9 +566,18 @@ impl Vector {
                 Ok(vec)
             }
             Value::Array(_, _, _) | Value::List(_, _) | Value::Struct(_, _) => {
-                // For Array, List, and Struct, we use reference_value to set up child vectors
+                // Nested constants use the same canonical flat representation as
+                // ordinary vectors. Only the outer row is constant; its child
+                // payload remains a one-row materialization that copy/gather can
+                // consume through the regular nested-vector paths.
                 let mut vec = Self::try_new(logical_type, 1, allocator)?;
-                vec.reference_value(&value);
+                vec.set_value(0, &value);
+                // Establish the single physical row before exposing an arbitrary
+                // logical constant cardinality. Array and struct children follow
+                // physical cardinality, while list children keep their payload
+                // length; try_set_count encodes those invariants centrally.
+                vec.try_set_count(1)?;
+                vec.vector_type = VectorType::Constant;
                 vec.count = count;
                 Ok(vec)
             }

@@ -31,7 +31,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{Vector, VECTOR_SIZE};
 
 use super::{
     GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
@@ -429,8 +429,8 @@ fn repeat_function(
     }
 
     // Fill output with the repeated value using constant vector
-    if let Some(col) = output.column_mut(0) {
-        col.reference_value(&bind_data.value);
+    if let Some(column) = output.column_mut(0) {
+        set_repeated_value(column, &bind_data.value, batch_size)?;
     }
     output.set_cardinality(batch_size);
 
@@ -496,13 +496,20 @@ fn repeat_row_function(
 
     // Fill each column with its repeated value using constant vector
     for (idx, value) in bind_data.values.iter().enumerate() {
-        if let Some(col) = output.column_mut(idx) {
-            col.reference_value(value);
+        if let Some(column) = output.column_mut(idx) {
+            set_repeated_value(column, value, batch_size)?;
         }
     }
     output.set_cardinality(batch_size);
 
     Ok(TableFunctionResult::HaveMoreOutput)
+}
+
+fn set_repeated_value(column: &mut Vector, value: &Value, count: usize) -> Result<()> {
+    let logical_type = column.logical_type().clone();
+    let allocator = column.allocator().clone();
+    *column = Vector::try_constant_from_value(logical_type, value.clone(), count, allocator)?;
+    Ok(())
 }
 
 // ============================================================================
@@ -938,5 +945,32 @@ mod tests {
         for i in 0..3 {
             assert!(col.is_null(i));
         }
+    }
+
+    #[test]
+    fn test_repeat_preserves_nested_values() {
+        let value = Value::List(
+            vec![Value::Integer(1), Value::Integer(2)],
+            LogicalType::Integer,
+        );
+        let bind_data = RepeatBindData::new(value.clone(), 3);
+        let gstate = RepeatGlobalState::new(bind_data.target_count);
+        let mut lstate = RepeatLocalState::new();
+        let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+        let mut chunk =
+            paro_common::test_utils::test_chunk_with_capacity(&[list_type], VECTOR_SIZE);
+        let mut input = TableFunctionInput {
+            bind_data: Some(&bind_data as &dyn TableFunctionBindData),
+            local_state: Some(&mut lstate as &mut dyn LocalTableFunctionState),
+            global_state: Some(&gstate as &dyn GlobalTableFunctionState),
+        };
+
+        let result = repeat_function(&mut input, &mut chunk).unwrap();
+
+        assert_eq!(result, TableFunctionResult::HaveMoreOutput);
+        assert_eq!(chunk.size(), 3);
+        let column = chunk.column(0).unwrap();
+        assert_eq!(column.get_value(0), value);
+        assert_eq!(column.get_value(2), value);
     }
 }

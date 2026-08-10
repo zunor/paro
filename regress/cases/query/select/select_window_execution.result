@@ -58,13 +58,7 @@ ORDER_BY  (rows=3)
   Sort Key: #0 ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: x
-    ->  PROJECTION  (rows=3)
-      Output: x
-      ->  PROJECTION  (rows=3)
-        Output: x
-        ->  PROJECTION  (rows=3)
-          Output: x
-          ->  VALUES  (rows=3)
+    ->  VALUES  (rows=3)
 
 SELECT
     category,

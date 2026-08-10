@@ -16,12 +16,14 @@ INSERT INTO ft_exec_mode_split VALUES
 CREATE INDEX idx_ft_exec_mode_split ON ft_exec_mode_split USING GIN (to_tsvector('simple', content));
 
 -- Filter mode should not expose usize::MAX as estimated rows.
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_exec_mode_split
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector database');
 
 -- TopK mode should retain LIMIT-based cardinality.
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_exec_mode_split

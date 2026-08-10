@@ -11,6 +11,7 @@ use paro_storage::index::fulltext::query_parser::{
     parse_websearch_to_tsquery, ParsedQuery,
 };
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
+use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
 use paro_storage::search::{
     CapabilityToken, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig, SearchRequestMode,
 };
@@ -266,6 +267,9 @@ fn parse_fulltext_query_with_tokenizer(
             FULLTEXT_MIN_TOKEN_LEN,
             FULLTEXT_MAX_TOKEN_LEN,
         ),
+        paro_storage::search::FullTextQueryKind::SerializedTsQuery => {
+            parse_serialized_tsquery(query)
+        }
         paro_storage::search::FullTextQueryKind::Plain => parse_plainto_tsquery(
             query,
             tokenizer,

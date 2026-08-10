@@ -59,7 +59,11 @@ impl Rule for ConstantFoldingRule {
         let Some(value) = evaluate_constant(expr) else {
             return RuleResult::NoChange;
         };
-        let return_type = value.logical_type();
+        // `Value` intentionally shares physical variants across logical
+        // string domains (VARCHAR/JSON/JSONB/TSVECTOR/TSQUERY). The bound
+        // expression remains the authoritative source of the logical type;
+        // deriving it from the materialized value would erase that domain.
+        let return_type = expr.return_type();
         RuleResult::Changed(Box::new(Expression::Constant(ConstantExpression {
             value,
             return_type,
@@ -127,6 +131,26 @@ mod tests {
             evaluate_constant(&null_comparison),
             Some(Value::Null(LogicalType::Boolean))
         ));
+    }
+
+    #[test]
+    fn folded_constant_preserves_the_bound_logical_domain() {
+        let rule = ConstantFoldingRule::new();
+        let expression = Expression::Operator(paro_planner::expression::OperatorExpression::new(
+            paro_planner::expression::OperatorType::Coalesce,
+            vec![Expression::Constant(ConstantExpression {
+                value: Value::Varchar("{}".to_string()),
+                return_type: LogicalType::Json,
+            })],
+            LogicalType::Json,
+        ));
+        let mut bindings = Vec::new();
+        assert!(rule.matcher().matches(&expression, &mut bindings));
+        let RuleResult::Changed(result) = rule.apply(&LogicalOperator::DummyScan, bindings, false)
+        else {
+            panic!("expected folded constant")
+        };
+        assert_eq!(result.return_type(), LogicalType::Json);
     }
 
     #[test]

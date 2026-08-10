@@ -23,6 +23,7 @@ FROM ft_t024_rank_cd
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'alpha beta')
 ORDER BY id;
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_t024_rank_cd

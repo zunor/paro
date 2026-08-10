@@ -6,11 +6,9 @@ ORDER_BY  (rows=1)
   Sort Key: #0 ASC NULLS LAST
   ->  PROJECTION  (rows=1)
     Output: v
-    ->  PROJECTION  (rows=1)
-      Output: expr_1
-      ->  FILTER  (rows=1)
-        Filter: #0 > 1
-        ->  VALUES  (rows=3)
+    ->  FILTER  (rows=1)
+      Filter: #0 > 1
+      ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))

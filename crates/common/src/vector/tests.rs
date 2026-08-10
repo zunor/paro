@@ -1383,6 +1383,79 @@ fn test_try_copy_list_range_handles_null_empty_and_dictionary_rows() {
 }
 
 #[test]
+fn constant_list_uses_the_canonical_nested_representation() {
+    let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+    let value = Value::List(
+        vec![Value::Integer(10), Value::Integer(20)],
+        LogicalType::Integer,
+    );
+    let constant = Vector::try_constant_from_value(
+        list_type.clone(),
+        value.clone(),
+        3,
+        crate::test_utils::test_allocator(),
+    )
+    .unwrap();
+
+    assert_eq!(constant.vector_type(), VectorType::Constant);
+    assert_eq!(constant.len(), 3);
+    assert_eq!(constant.get_value(0), value);
+    assert_eq!(constant.get_value(2), value);
+
+    let mut materialized = Vector::try_new(list_type, 3, constant.allocator().clone()).unwrap();
+    materialized.try_copy_range(0, &constant, 0, 3).unwrap();
+    assert_eq!(materialized.get_value(0), value);
+    assert_eq!(materialized.get_value(2), value);
+}
+
+#[test]
+fn constant_array_and_struct_children_have_one_physical_row() {
+    let allocator = crate::test_utils::test_allocator();
+    let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+    let array_value = Value::Array(
+        vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+        LogicalType::Float,
+        3,
+    );
+    let array = Vector::try_constant_from_value(
+        array_type.clone(),
+        array_value.clone(),
+        2,
+        allocator.clone(),
+    )
+    .unwrap();
+    assert_eq!(array.child().unwrap().len(), 3);
+    let mut arrays = Vector::try_new(array_type, 2, allocator.clone()).unwrap();
+    arrays.try_copy_range(0, &array, 0, 2).unwrap();
+    assert_eq!(arrays.get_value(1), array_value);
+
+    let fields = vec![
+        ("id".to_string(), LogicalType::Integer),
+        ("label".to_string(), LogicalType::Varchar),
+    ];
+    let struct_type = LogicalType::Struct(fields.clone());
+    let struct_value = Value::Struct(
+        vec![Value::Integer(7), Value::Varchar("seven".to_string())],
+        fields,
+    );
+    let structure = Vector::try_constant_from_value(
+        struct_type.clone(),
+        struct_value.clone(),
+        2,
+        allocator.clone(),
+    )
+    .unwrap();
+    assert!(structure
+        .children()
+        .unwrap()
+        .iter()
+        .all(|child| child.len() == 1));
+    let mut structures = Vector::try_new(struct_type, 2, allocator).unwrap();
+    structures.try_copy_range(0, &structure, 0, 2).unwrap();
+    assert_eq!(structures.get_value(1), struct_value);
+}
+
+#[test]
 fn test_try_copy_nested_list_range_recurses_in_child_payload() {
     let inner_type = LogicalType::List(Box::new(LogicalType::Integer));
     let nested_type = LogicalType::List(Box::new(inner_type.clone()));

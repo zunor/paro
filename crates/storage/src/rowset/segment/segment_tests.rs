@@ -153,6 +153,28 @@ fn segment_materialized_batch_api_forces_late_materialization() {
         value: Value::Integer(7),
     });
 
+    let mut eager = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
+        &segment,
+        vec![0, 1],
+        None,
+        Some(predicate.clone()),
+        None,
+    )
+    .unwrap();
+    let eager_batch = eager.next_batch_with_rowid_policy(10, false).unwrap();
+    assert_eq!(eager_batch.rows, 1);
+    assert_eq!(eager_batch.physical_rows, 1);
+    assert!(eager_batch.selection.is_none());
+    assert_eq!(
+        i32::from_le_bytes(eager_batch.columns[0].1.data[..4].try_into().unwrap()),
+        7
+    );
+    assert_eq!(
+        i32::from_le_bytes(eager_batch.columns[1].1.data[..4].try_into().unwrap()),
+        107
+    );
+    assert!(eager.uses_late_materialize());
+
     let mut iter = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
         &segment,
         vec![0, 1],

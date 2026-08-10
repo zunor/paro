@@ -137,9 +137,7 @@ fn build_comparison_predicate(
 
     let (col_idx, value, comparison) = match (left_col, right_col) {
         (Some(col), None) => {
-            let Some(value) =
-                extract_comparison_constant(&cmp.right, get, col, cmp.comparison_type)?
-            else {
+            let Some(value) = extract_comparison_constant(&cmp.right, get, col)? else {
                 return Ok(None);
             };
             (col.column_idx, value, cmp.comparison_type)
@@ -148,7 +146,7 @@ fn build_comparison_predicate(
             let Some(flipped) = flip_comparison(cmp.comparison_type) else {
                 return Ok(None);
             };
-            let Some(value) = extract_comparison_constant(&cmp.left, get, col, flipped)? else {
+            let Some(value) = extract_comparison_constant(&cmp.left, get, col)? else {
                 return Ok(None);
             };
             (col.column_idx, value, flipped)
@@ -216,7 +214,6 @@ fn extract_comparison_constant(
     expr: &Expression,
     get: &Get,
     operand: ScanColumnOperand,
-    _comparison: ComparisonType,
 ) -> Result<Option<Value>> {
     match operand.transform {
         ScanColumnTransform::Identity => extract_constant_value(expr, get, operand.column_idx),

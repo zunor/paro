@@ -9,12 +9,14 @@ INSERT INTO ft_coverage_guard VALUES
     (1, 'vector after index'),
     (2, 'noise');
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_coverage_guard
 WHERE to_tsvector('simple', content) @@ plainto_tsquery('simple', 'vector')
 ORDER BY id;
 
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_coverage_guard

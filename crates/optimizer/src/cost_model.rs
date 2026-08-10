@@ -7,8 +7,7 @@ use std::sync::Arc;
 use paro_common::runtime_value::Value;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
-    ColumnRefExpression, ComparisonExpression, ComparisonType, ConjunctionType, Expression,
-    OperatorType,
+    ComparisonExpression, ComparisonType, ConjunctionType, Expression, OperatorType,
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
@@ -117,20 +116,54 @@ impl Default for SelectivityDefaults {
     }
 }
 
+struct StatisticsResolver<'a> {
+    column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    positional_bindings: Option<&'a [ColumnBinding]>,
+}
+
+impl<'a> StatisticsResolver<'a> {
+    fn logical(column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>) -> Self {
+        Self {
+            column_stats,
+            positional_bindings: None,
+        }
+    }
+
+    fn with_positions(
+        column_stats: &'a HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        positional_bindings: &'a [ColumnBinding],
+    ) -> Self {
+        Self {
+            column_stats,
+            positional_bindings: Some(positional_bindings),
+        }
+    }
+
+    fn get(&self, expression: &Expression) -> Option<&'a Arc<ColumnStatistics>> {
+        let binding = match expression {
+            Expression::ColumnRef(column) => column.binding,
+            Expression::Reference(reference) => *self.positional_bindings?.get(reference.index)?,
+            _ => return None,
+        };
+        self.column_stats.get(&binding)
+    }
+}
+
 impl CostModel {
     pub fn estimate_selectivity(
         &self,
         expr: &Expression,
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     ) -> f64 {
-        self.estimate_selectivity_with_provenance(expr, column_stats)
+        let resolver = StatisticsResolver::logical(column_stats);
+        self.estimate_selectivity_with_provenance(expr, &resolver)
             .fraction
     }
 
     fn estimate_selectivity_with_provenance(
         &self,
         expr: &Expression,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        resolver: &StatisticsResolver<'_>,
     ) -> SelectivityEstimate {
         match expr {
             Expression::Constant(constant) => match &constant.value {
@@ -139,14 +172,14 @@ impl CostModel {
                 _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
             Expression::Comparison(comparison) => SelectivityEstimate::estimated(
-                self.estimate_comparison_selectivity(comparison, column_stats),
+                self.estimate_comparison_selectivity(comparison, resolver),
             ),
             Expression::Conjunction(conjunction) => {
                 let children = || {
                     conjunction
                         .children
                         .iter()
-                        .map(|child| self.estimate_selectivity_with_provenance(child, column_stats))
+                        .map(|child| self.estimate_selectivity_with_provenance(child, resolver))
                 };
                 match conjunction.conjunction_type {
                     ConjunctionType::And => conjunction_estimate(children()),
@@ -157,10 +190,8 @@ impl CostModel {
                 OperatorType::Like => SelectivityEstimate::estimated(
                     match like_pattern_shape(operator.children.get(1)) {
                         LikePatternShape::MatchAll => 1.0,
-                        LikePatternShape::Exact => self.estimate_exact_like_selectivity(
-                            operator.children.first(),
-                            column_stats,
-                        ),
+                        LikePatternShape::Exact => self
+                            .estimate_exact_like_selectivity(operator.children.first(), resolver),
                         LikePatternShape::Prefix => self.defaults.like_prefix,
                         LikePatternShape::Contains | LikePatternShape::Suffix => {
                             self.defaults.like_contains
@@ -185,7 +216,7 @@ impl CostModel {
                 OperatorType::Not => operator.children.first().map_or_else(
                     || SelectivityEstimate::estimated(self.defaults.predicate),
                     |child| {
-                        self.estimate_selectivity_with_provenance(child, column_stats)
+                        self.estimate_selectivity_with_provenance(child, resolver)
                             .complement()
                     },
                 ),
@@ -196,10 +227,10 @@ impl CostModel {
                     SelectivityEstimate::estimated(self.defaults.is_not_null)
                 }
                 OperatorType::In => SelectivityEstimate::estimated(
-                    self.estimate_in_selectivity(operator.children.as_slice(), column_stats),
+                    self.estimate_in_selectivity(operator.children.as_slice(), resolver),
                 ),
                 OperatorType::NotIn => SelectivityEstimate::estimated(
-                    1.0 - self.estimate_in_selectivity(operator.children.as_slice(), column_stats),
+                    1.0 - self.estimate_in_selectivity(operator.children.as_slice(), resolver),
                 ),
                 _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
@@ -238,6 +269,33 @@ impl CostModel {
         expressions: &[Expression],
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     ) -> CardinalityEstimate {
+        self.estimate_filter_cardinality_with_resolver(
+            base_cardinality,
+            expressions,
+            &StatisticsResolver::logical(column_stats),
+        )
+    }
+
+    pub fn estimate_filter_cardinality_with_positions(
+        &self,
+        base_cardinality: u64,
+        expressions: &[Expression],
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        positional_bindings: &[ColumnBinding],
+    ) -> CardinalityEstimate {
+        self.estimate_filter_cardinality_with_resolver(
+            base_cardinality,
+            expressions,
+            &StatisticsResolver::with_positions(column_stats, positional_bindings),
+        )
+    }
+
+    fn estimate_filter_cardinality_with_resolver(
+        &self,
+        base_cardinality: u64,
+        expressions: &[Expression],
+        resolver: &StatisticsResolver<'_>,
+    ) -> CardinalityEstimate {
         if base_cardinality == 0 {
             return CardinalityEstimate::exact(0);
         }
@@ -248,7 +306,7 @@ impl CostModel {
         let combined = conjunction_estimate(
             expressions
                 .iter()
-                .map(|expr| self.estimate_selectivity_with_provenance(expr, column_stats)),
+                .map(|expr| self.estimate_selectivity_with_provenance(expr, resolver)),
         );
         let combined_selectivity = combined.fraction;
 
@@ -273,7 +331,7 @@ impl CostModel {
     fn estimate_comparison_selectivity(
         &self,
         expr: &ComparisonExpression,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        resolver: &StatisticsResolver<'_>,
     ) -> f64 {
         let default = if matches!(
             expr.comparison_type,
@@ -287,11 +345,11 @@ impl CostModel {
             self.defaults.equality
         };
 
-        let Some((column_ref, constant, comparison_type)) = column_constant_comparison(expr) else {
+        let Some((column, constant, comparison_type)) = column_constant_comparison(expr) else {
             return default;
         };
 
-        let Some(stats) = column_stats.get(&column_ref.binding) else {
+        let Some(stats) = resolver.get(column) else {
             return default;
         };
 
@@ -323,14 +381,14 @@ impl CostModel {
     fn estimate_in_selectivity(
         &self,
         children: &[Expression],
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        resolver: &StatisticsResolver<'_>,
     ) -> f64 {
-        let Some(Expression::ColumnRef(column_ref)) = children.first() else {
+        let Some(column) = children.first() else {
             return self.defaults.predicate;
         };
 
         let probe_count = children.len().saturating_sub(1).max(1) as f64;
-        let Some(stats) = column_stats.get(&column_ref.binding) else {
+        let Some(stats) = resolver.get(column) else {
             return clamp_selectivity(self.defaults.equality * probe_count);
         };
         let distinct = stats.get_distinct_count();
@@ -343,13 +401,13 @@ impl CostModel {
     fn estimate_exact_like_selectivity(
         &self,
         candidate: Option<&Expression>,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        resolver: &StatisticsResolver<'_>,
     ) -> f64 {
-        let Some(Expression::ColumnRef(column_ref)) = candidate else {
+        let Some(candidate) = candidate else {
             return self.defaults.equality;
         };
-        let distinct = column_stats
-            .get(&column_ref.binding)
+        let distinct = resolver
+            .get(candidate)
             .map(|stats| stats.get_distinct_count())
             .unwrap_or(0);
         if distinct == 0 {
@@ -370,12 +428,16 @@ fn clamp_selectivity(value: f64) -> f64 {
 
 fn column_constant_comparison(
     expression: &ComparisonExpression,
-) -> Option<(&ColumnRefExpression, &Value, ComparisonType)> {
+) -> Option<(&Expression, &Value, ComparisonType)> {
     match (expression.left.as_ref(), expression.right.as_ref()) {
-        (Expression::ColumnRef(column), Expression::Constant(constant)) => {
-            Some((column, &constant.value, expression.comparison_type))
-        }
-        (Expression::Constant(constant), Expression::ColumnRef(column)) => Some((
+        (
+            column @ (Expression::ColumnRef(_) | Expression::Reference(_)),
+            Expression::Constant(constant),
+        ) => Some((column, &constant.value, expression.comparison_type)),
+        (
+            Expression::Constant(constant),
+            column @ (Expression::ColumnRef(_) | Expression::Reference(_)),
+        ) => Some((
             column,
             &constant.value,
             reverse_comparison(expression.comparison_type),
@@ -412,6 +474,11 @@ fn estimate_range_selectivity(
         ordered_integral_value(&maximum),
         ordered_integral_value(constant),
     ) {
+        if minimum.domain != maximum.domain || minimum.domain != constant.domain {
+            return None;
+        }
+        let (minimum, maximum, constant) =
+            (minimum.coordinate, maximum.coordinate, constant.coordinate);
         if minimum > maximum {
             return None;
         }
@@ -479,24 +546,79 @@ fn estimate_range_selectivity(
     })
 }
 
-fn ordered_integral_value(value: &Value) -> Option<u128> {
-    match value {
-        Value::Boolean(value) => Some(u128::from(*value)),
-        Value::TinyInt(value) => Some(u128::from((*value as u8) ^ (1 << 7))),
-        Value::SmallInt(value) => Some(u128::from((*value as u16) ^ (1 << 15))),
-        Value::Integer(value) | Value::Date(value) => Some(u128::from((*value as u32) ^ (1 << 31))),
-        Value::BigInt(value)
-        | Value::Timestamp(value)
-        | Value::TimestampTz(value)
-        | Value::Time(value) => Some(u128::from((*value as u64) ^ (1 << 63))),
-        Value::HugeInt(value) | Value::Decimal(value, ..) => Some((*value as u128) ^ (1 << 127)),
-        Value::UTinyInt(value) => Some(u128::from(*value)),
-        Value::USmallInt(value) => Some(u128::from(*value)),
-        Value::UInteger(value) => Some(u128::from(*value)),
-        Value::UBigInt(value) => Some(u128::from(*value)),
-        Value::UHugeInt(value) => Some(*value),
-        _ => None,
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntegralDomain {
+    Boolean,
+    TinyInt,
+    SmallInt,
+    Integer,
+    BigInt,
+    HugeInt,
+    UTinyInt,
+    USmallInt,
+    UInteger,
+    UBigInt,
+    UHugeInt,
+    Date,
+    Timestamp,
+    TimestampTz,
+    Time,
+    Decimal { scale: u8 },
+}
+
+struct OrderedIntegralValue {
+    domain: IntegralDomain,
+    coordinate: u128,
+}
+
+fn ordered_integral_value(value: &Value) -> Option<OrderedIntegralValue> {
+    let (domain, coordinate) = match value {
+        Value::Boolean(value) => (IntegralDomain::Boolean, u128::from(*value)),
+        Value::TinyInt(value) => (
+            IntegralDomain::TinyInt,
+            u128::from((*value as u8) ^ (1 << 7)),
+        ),
+        Value::SmallInt(value) => (
+            IntegralDomain::SmallInt,
+            u128::from((*value as u16) ^ (1 << 15)),
+        ),
+        Value::Integer(value) => (
+            IntegralDomain::Integer,
+            u128::from((*value as u32) ^ (1 << 31)),
+        ),
+        Value::BigInt(value) => (
+            IntegralDomain::BigInt,
+            u128::from((*value as u64) ^ (1 << 63)),
+        ),
+        Value::HugeInt(value) => (IntegralDomain::HugeInt, (*value as u128) ^ (1 << 127)),
+        Value::UTinyInt(value) => (IntegralDomain::UTinyInt, u128::from(*value)),
+        Value::USmallInt(value) => (IntegralDomain::USmallInt, u128::from(*value)),
+        Value::UInteger(value) => (IntegralDomain::UInteger, u128::from(*value)),
+        Value::UBigInt(value) => (IntegralDomain::UBigInt, u128::from(*value)),
+        Value::UHugeInt(value) => (IntegralDomain::UHugeInt, *value),
+        Value::Date(value) => (
+            IntegralDomain::Date,
+            u128::from((*value as u32) ^ (1 << 31)),
+        ),
+        Value::Timestamp(value) => (
+            IntegralDomain::Timestamp,
+            u128::from((*value as u64) ^ (1 << 63)),
+        ),
+        Value::TimestampTz(value) => (
+            IntegralDomain::TimestampTz,
+            u128::from((*value as u64) ^ (1 << 63)),
+        ),
+        Value::Time(value) => (
+            IntegralDomain::Time,
+            u128::from((*value as u64) ^ (1 << 63)),
+        ),
+        Value::Decimal(value, _, scale) => (
+            IntegralDomain::Decimal { scale: *scale },
+            (*value as u128) ^ (1 << 127),
+        ),
+        _ => return None,
+    };
+    Some(OrderedIntegralValue { domain, coordinate })
 }
 
 fn ordered_float_value(value: &Value) -> Option<f64> {
@@ -543,7 +665,9 @@ fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
 #[cfg(test)]
 mod tests {
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ComparisonExpression, ConstantExpression, OperatorExpression};
+    use paro_planner::expression::{
+        ColumnRefExpression, ComparisonExpression, ConstantExpression, OperatorExpression,
+    };
 
     use super::*;
 
@@ -647,6 +771,47 @@ mod tests {
                 ComparisonType::LessThanOrEqual,
             ),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn integral_range_selectivity_rejects_mixed_types_and_decimal_scales() {
+        let mut integer_stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+        );
+        NumericStats::set_guaranteed_min(integer_stats.statistics_mut(), &Value::Integer(10));
+        NumericStats::set_guaranteed_max(integer_stats.statistics_mut(), &Value::Integer(20));
+        assert_eq!(
+            estimate_range_selectivity(
+                &integer_stats,
+                &Value::BigInt(15),
+                ComparisonType::LessThanOrEqual,
+            ),
+            None
+        );
+
+        let decimal_type = LogicalType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        let mut decimal_stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(decimal_type),
+        );
+        NumericStats::set_guaranteed_min(
+            decimal_stats.statistics_mut(),
+            &Value::Decimal(1_000, 10, 2),
+        );
+        NumericStats::set_guaranteed_max(
+            decimal_stats.statistics_mut(),
+            &Value::Decimal(2_000, 10, 2),
+        );
+        assert_eq!(
+            estimate_range_selectivity(
+                &decimal_stats,
+                &Value::Decimal(1_500, 10, 3),
+                ComparisonType::LessThanOrEqual,
+            ),
+            None
         );
     }
 

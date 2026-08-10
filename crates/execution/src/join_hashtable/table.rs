@@ -1400,7 +1400,7 @@ mod tests {
             for (row_idx, value) in values.iter().enumerate() {
                 let value = value
                     .map(Value::BigInt)
-                    .unwrap_or_else(|| Value::Null(LogicalType::BigInt));
+                    .unwrap_or(Value::Null(LogicalType::BigInt));
                 chunk
                     .column_mut(column_idx)
                     .expect("column must exist")

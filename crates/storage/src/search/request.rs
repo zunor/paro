@@ -7,6 +7,7 @@ use crate::index::fulltext::query_parser::{
 };
 pub use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::tokenizer::{tokenizer_from_config, TokenizerKind};
+use crate::index::fulltext::ts_serde::parse_serialized_tsquery;
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::tablet::ColumnId;
@@ -42,6 +43,10 @@ pub struct SparseIntent {
 pub enum FullTextQueryKind {
     Legacy,
     TsQuery,
+    /// Canonical TSQUERY text produced by a SQL tsquery function. Terms have
+    /// already passed through the source text-search configuration and must
+    /// not be normalized a second time.
+    SerializedTsQuery,
     Plain,
     Phrase,
     WebSearch,
@@ -151,6 +156,7 @@ pub fn build_fulltext_query_stats(
     let parsed = match query_kind {
         FullTextQueryKind::Legacy => parse_query(query_text, tokenizer.as_ref(), 1, None)?,
         FullTextQueryKind::TsQuery => parse_to_tsquery(query_text, tokenizer.as_ref(), 1, None)?,
+        FullTextQueryKind::SerializedTsQuery => parse_serialized_tsquery(query_text)?,
         FullTextQueryKind::Plain => parse_plainto_tsquery(query_text, tokenizer.as_ref(), 1, None)?,
         FullTextQueryKind::Phrase => {
             parse_phraseto_tsquery(query_text, tokenizer.as_ref(), 1, None)?

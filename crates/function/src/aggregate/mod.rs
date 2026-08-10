@@ -23,7 +23,7 @@ pub mod distributive;
 
 pub use direct_update::{
     DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
-    PreparedDirectGroupedAggregateInput,
+    PreparedDirectGroupedAggregateInput, ValidatedDirectGroupSlots,
 };
 
 // Re-export FunctionData from scalar module
@@ -282,8 +282,15 @@ pub type AggregateDistinctRunUpdateFn = unsafe fn(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateDirectUpdate {
     CountStar,
-    DecimalSumI64,
-    DecimalAverageI64,
+    Decimal(DecimalDirectUpdate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalDirectUpdate {
+    NarrowSumI64,
+    WideSumI128,
+    AverageI64,
+    AverageI128,
 }
 
 // ============================================================================

@@ -49,10 +49,10 @@ SELECT
 FROM window_spill_test
 WHERE part IN (1, 2);
 QUERY PLAN
-PROJECTION  (rows=6)
+PROJECTION  (rows=8)
   Output: part, id, score, rn, rk, lead_score, lag_score
-  ->  WINDOW  (rows=6)
-    ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
+  ->  WINDOW  (rows=8)
+    ->  ROWSET_SCAN on public.window_spill_test  (rows=8)
       Columns: part, id, score
       Pushed Predicate: col#0 IN (1, 2)
       Late Materialize: auto

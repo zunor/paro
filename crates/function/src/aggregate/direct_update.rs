@@ -3,23 +3,31 @@
 
 //! Precompiled grouped aggregate update programs.
 
+use ethnum::i256;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef, Vector, VECTOR_SIZE};
 use smallvec::SmallVec;
 
-use super::distributive::decimal::{DecimalAverageState, DecimalNarrowState};
-use super::{AggregateDirectUpdate, AggregateStateInput};
-
-const DIRECT_SLOT_SCAN_LIMIT: usize = 64;
+use super::distributive::decimal::{DecimalAverageState, DecimalNarrowState, DecimalSumState};
+use super::{AggregateDirectUpdate, AggregateStateInput, DecimalDirectUpdate};
 
 #[derive(Debug, Clone)]
 struct DirectDecimalInputUpdates {
     input_index: usize,
-    sums: Vec<usize>,
+    width: DirectDecimalWidth,
+    narrow_sums: Vec<usize>,
+    wide_sums: Vec<usize>,
     averages: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectDecimalWidth {
+    I64,
+    I128,
 }
 
 /// Fused update program compiled from explicit aggregate capabilities.
@@ -47,9 +55,50 @@ pub struct DirectGroupedAggregateScratch {
     source_count: usize,
     totals: AccountedVec<i128>,
     narrow_totals: AccountedVec<i64>,
+    wide_totals: AccountedVec<i256>,
     row_counts: AccountedVec<usize>,
-    first_rows: AccountedVec<usize>,
     touched_slots: AccountedVec<usize>,
+}
+
+/// Perfect-hash slots whose domain membership has been validated once before
+/// entering unchecked aggregate reduction loops.
+pub struct ValidatedDirectGroupSlots<'a> {
+    slots: &'a [usize],
+    slot_count: usize,
+}
+
+impl<'a> ValidatedDirectGroupSlots<'a> {
+    pub fn try_new(slots: &'a [usize], count: usize, slot_count: usize) -> Result<Self> {
+        let slots = slots.get(..count).ok_or_else(|| {
+            paro_common::error::internal(format!(
+                "direct aggregate slot batch is too short: slots={}, rows={count}",
+                slots.len()
+            ))
+        })?;
+        if let Some(slot) = slots.iter().copied().find(|slot| *slot >= slot_count) {
+            return Err(paro_common::error::internal(format!(
+                "direct aggregate slot out of bounds: slot={slot}, slots={slot_count}"
+            )));
+        }
+        Ok(Self { slots, slot_count })
+    }
+
+    fn as_slice(&self) -> &'a [usize] {
+        self.slots
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReducedSlotTraversal {
+    DenseDomain,
+    SparseTouched,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReducedDecimalWidth {
+    I64,
+    I128,
+    I256,
 }
 
 impl DirectGroupedAggregateProgram {
@@ -79,44 +128,61 @@ impl DirectGroupedAggregateProgram {
             return false;
         }
         match update {
-            AggregateDirectUpdate::CountStar if input_index.is_none() => {
+            AggregateDirectUpdate::CountStar => {
+                if input_index.is_some() {
+                    return false;
+                }
                 self.count_star_offsets.push(state_offset);
             }
-            AggregateDirectUpdate::DecimalSumI64 | AggregateDirectUpdate::DecimalAverageI64 => {
+            AggregateDirectUpdate::Decimal(decimal_update) => {
                 let Some(input_index) = input_index else {
                     return false;
+                };
+                let width = match decimal_update {
+                    DecimalDirectUpdate::NarrowSumI64 | DecimalDirectUpdate::AverageI64 => {
+                        DirectDecimalWidth::I64
+                    }
+                    DecimalDirectUpdate::WideSumI128 | DecimalDirectUpdate::AverageI128 => {
+                        DirectDecimalWidth::I128
+                    }
                 };
                 let source = if let Some(source) = self
                     .decimal_inputs
                     .iter_mut()
                     .find(|source| source.input_index == input_index)
                 {
+                    if source.width != width {
+                        return false;
+                    }
                     source
                 } else {
                     self.decimal_inputs.push(DirectDecimalInputUpdates {
                         input_index,
-                        sums: Vec::new(),
+                        width,
+                        narrow_sums: Vec::new(),
+                        wide_sums: Vec::new(),
                         averages: Vec::new(),
                     });
                     self.decimal_inputs
                         .last_mut()
                         .expect("source was just inserted")
                 };
-                match update {
-                    AggregateDirectUpdate::DecimalSumI64 => source.sums.push(state_offset),
-                    AggregateDirectUpdate::DecimalAverageI64 => source.averages.push(state_offset),
-                    AggregateDirectUpdate::CountStar => return false,
+                match decimal_update {
+                    DecimalDirectUpdate::NarrowSumI64 => source.narrow_sums.push(state_offset),
+                    DecimalDirectUpdate::WideSumI128 => source.wide_sums.push(state_offset),
+                    DecimalDirectUpdate::AverageI64 | DecimalDirectUpdate::AverageI128 => {
+                        source.averages.push(state_offset)
+                    }
                 }
             }
-            AggregateDirectUpdate::CountStar => return false,
         }
         *handled = true;
         self.update_count += 1;
         true
     }
 
-    pub fn is_worthwhile(&self) -> bool {
-        self.update_count >= 2
+    pub fn has_updates(&self) -> bool {
+        self.update_count != 0
     }
 
     pub fn handles(&self, aggregate_index: usize) -> bool {
@@ -145,8 +211,12 @@ impl DirectGroupedAggregateProgram {
             return None;
         }
         let bytes_per_slot = aggregate_count
-            .checked_mul(std::mem::size_of::<i128>().checked_add(std::mem::size_of::<i64>())?)?
-            .checked_add(2 * std::mem::size_of::<usize>())?;
+            .checked_mul(
+                std::mem::size_of::<i128>()
+                    .checked_add(std::mem::size_of::<i64>())?
+                    .checked_add(std::mem::size_of::<i256>())?,
+            )?
+            .checked_add(std::mem::size_of::<usize>())?;
         bytes_per_slot
             .checked_mul(slot_count)?
             .checked_add(slot_count.checked_mul(std::mem::size_of::<usize>())?)
@@ -170,10 +240,10 @@ impl DirectGroupedAggregateProgram {
         totals.try_resize_with(total_count, || 0)?;
         let mut narrow_totals = accounted_scratch_vec::<i64>(memory)?;
         narrow_totals.try_resize_with(total_count, || 0)?;
+        let mut wide_totals = accounted_scratch_vec::<i256>(memory)?;
+        wide_totals.try_resize_with(total_count, || i256::ZERO)?;
         let mut row_counts = accounted_scratch_vec::<usize>(memory)?;
         row_counts.try_resize_with(slot_count, || 0)?;
-        let mut first_rows = accounted_scratch_vec::<usize>(memory)?;
-        first_rows.try_resize_with(slot_count, || 0)?;
         let mut touched_slots = accounted_scratch_vec::<usize>(memory)?;
         touched_slots.try_reserve(slot_count)?;
         Ok(Some(DirectGroupedAggregateScratch {
@@ -181,8 +251,8 @@ impl DirectGroupedAggregateProgram {
             source_count,
             totals,
             narrow_totals,
+            wide_totals,
             row_counts,
-            first_rows,
             touched_slots,
         }))
     }
@@ -217,57 +287,26 @@ impl DirectGroupedAggregateProgram {
                 unsafe { *base.add(state_offset).cast::<i64>() += 1 };
             }
             for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
-                let value = unsafe { inputs.value(source_idx, row, shared_physical_row) };
-                for &state_offset in &source.sums {
+                let value = unsafe { inputs.value_i128(source_idx, row, shared_physical_row) };
+                for &state_offset in &source.narrow_sums {
                     let state =
                         unsafe { &mut *base.add(state_offset).cast::<DecimalNarrowState>() };
-                    state.add_i64(value);
+                    state.add_i64(value as i64);
+                }
+                for &state_offset in &source.wide_sums {
+                    let state = unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                    state.add_direct_i128(value);
                 }
                 for &state_offset in &source.averages {
                     let state =
                         unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
-                    state.update_direct_i64(value);
+                    match source.width {
+                        DirectDecimalWidth::I64 => state.update_direct_i64(value as i64),
+                        DirectDecimalWidth::I128 => state.update_direct_i128(value, 1),
+                    }
                 }
             }
         }
-        Ok(true)
-    }
-
-    /// Collapse a batch by perfect-hash slot before touching aggregate state.
-    ///
-    /// This is profitable only for small direct-addressing domains: each
-    /// input value is accumulated in an i128 batch cell and each aggregate
-    /// state is updated once per touched slot.
-    ///
-    /// # Safety
-    ///
-    /// Every address must identify a live state row whose offsets match those
-    /// used to compile the program. Each slot must be within `scratch`.
-    pub unsafe fn execute_reduced(
-        &self,
-        payload: &Chunk,
-        addresses: &Vector,
-        slots: &[usize],
-        count: usize,
-        scratch: &mut DirectGroupedAggregateScratch,
-    ) -> Result<bool> {
-        if scratch.source_count != self.decimal_inputs.len() || slots.len() < count {
-            return Ok(false);
-        }
-        let Some(states) = AggregateStateInput::try_new(addresses, 0, None, count)?.direct_cursor()
-        else {
-            return Ok(false);
-        };
-        let Some(inputs) = self.prepare_inputs(payload) else {
-            return Ok(false);
-        };
-        let narrow = self.reduce_inputs::<true>(&inputs, slots, count, scratch)?;
-        for touched_idx in 0..scratch.touched_slots.len() {
-            let slot = scratch.touched_slots[touched_idx];
-            let base = unsafe { states.state_ptr(scratch.first_rows[slot]) };
-            self.apply_reduced_slot(base, slot, scratch, narrow);
-        }
-        scratch.touched_slots.clear();
         Ok(true)
     }
 
@@ -276,166 +315,126 @@ impl DirectGroupedAggregateProgram {
     /// # Safety
     ///
     /// `state_base + slot * state_stride` must identify initialized aggregate
-    /// state rows for every supplied slot. Every value in `slots[..count]`
-    /// must be smaller than `scratch.slot_count`.
+    /// state rows for every validated slot.
     pub unsafe fn execute_reduced_slots_prepared(
         &self,
         inputs: &PreparedDirectGroupedAggregateInput<'_>,
-        slots: &[usize],
-        count: usize,
+        slots: &ValidatedDirectGroupSlots<'_>,
         scratch: &mut DirectGroupedAggregateScratch,
         state_base: *mut u8,
         state_stride: usize,
     ) -> Result<bool> {
-        if scratch.source_count != self.decimal_inputs.len() || slots.len() < count {
+        if scratch.source_count != self.decimal_inputs.len()
+            || slots.slot_count != scratch.slot_count
+        {
             return Ok(false);
         }
-        let scan_direct_domain = scratch.slot_count <= DIRECT_SLOT_SCAN_LIMIT;
-        let narrow = if scan_direct_domain {
-            self.reduce_inputs::<false>(inputs, slots, count, scratch)?
+        let traversal = if scratch.slot_count <= slots.as_slice().len() {
+            ReducedSlotTraversal::DenseDomain
         } else {
-            self.reduce_inputs::<true>(inputs, slots, count, scratch)?
+            ReducedSlotTraversal::SparseTouched
         };
-        if scan_direct_domain {
-            for slot in 0..scratch.slot_count {
-                if scratch.row_counts[slot] != 0 {
+        let widths = self.reduce_inputs(inputs, slots, scratch, traversal)?;
+        match traversal {
+            ReducedSlotTraversal::DenseDomain => {
+                for slot in 0..scratch.slot_count {
+                    if scratch.row_counts[slot] == 0 {
+                        continue;
+                    }
                     let base = unsafe { state_base.add(slot * state_stride) };
-                    self.apply_reduced_slot(base, slot, scratch, narrow);
+                    self.apply_reduced_slot(base, slot, scratch, &widths);
                 }
             }
-        } else {
-            for touched_idx in 0..scratch.touched_slots.len() {
-                let slot = scratch.touched_slots[touched_idx];
-                let base = unsafe { state_base.add(slot * state_stride) };
-                self.apply_reduced_slot(base, slot, scratch, narrow);
+            ReducedSlotTraversal::SparseTouched => {
+                for touched_idx in 0..scratch.touched_slots.len() {
+                    let slot = scratch.touched_slots[touched_idx];
+                    let base = unsafe { state_base.add(slot * state_stride) };
+                    self.apply_reduced_slot(base, slot, scratch, &widths);
+                }
             }
         }
         scratch.touched_slots.clear();
         Ok(true)
     }
 
-    fn reduce_inputs<const TRACK_TOUCHED: bool>(
+    fn reduce_inputs(
         &self,
         inputs: &PreparedDirectGroupedAggregateInput<'_>,
-        slots: &[usize],
-        count: usize,
+        slots: &ValidatedDirectGroupSlots<'_>,
         scratch: &mut DirectGroupedAggregateScratch,
-    ) -> Result<bool> {
-        let mut overflowed = 0u64;
-        for (row, &slot) in slots.iter().take(count).enumerate() {
-            if TRACK_TOUCHED && slot >= scratch.slot_count {
-                return Err(paro_common::error::internal(format!(
-                    "direct aggregate slot out of bounds: slot={slot}, slots={}",
-                    scratch.slot_count
-                )));
-            }
-            if TRACK_TOUCHED && scratch.row_counts[slot] == 0 {
-                scratch.first_rows[slot] = row;
+        traversal: ReducedSlotTraversal,
+    ) -> Result<SmallVec<[ReducedDecimalWidth; 8]>> {
+        let slots = slots.as_slice();
+        let mut overflowed: SmallVec<[bool; 8]> =
+            std::iter::repeat_n(false, inputs.len()).collect();
+        for (row, &slot) in slots.iter().enumerate() {
+            if traversal == ReducedSlotTraversal::SparseTouched && scratch.row_counts[slot] == 0 {
                 scratch.touched_slots.try_push(slot)?;
             }
             scratch.row_counts[slot] += 1;
             let shared_physical_row = inputs.shared_physical_row(row);
-            match inputs.len() {
-                1 => unsafe {
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 0, row, shared_physical_row, slot, scratch)
-                },
-                2 => unsafe {
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 0, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 1, row, shared_physical_row, slot, scratch);
-                },
-                3 => unsafe {
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 0, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 1, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 2, row, shared_physical_row, slot, scratch);
-                },
-                4 => unsafe {
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 0, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 1, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 2, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 3, row, shared_physical_row, slot, scratch);
-                },
-                5 => unsafe {
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 0, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 1, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 2, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 3, row, shared_physical_row, slot, scratch);
-                    overflowed |=
-                        accumulate_narrow_input(inputs, 4, row, shared_physical_row, slot, scratch);
-                },
-                _ => {
-                    for source_idx in 0..inputs.len() {
-                        overflowed |= unsafe {
-                            accumulate_narrow_input(
-                                inputs,
-                                source_idx,
-                                row,
-                                shared_physical_row,
-                                slot,
-                                scratch,
-                            )
-                        };
-                    }
+            for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
+                let source_overflowed = match source.width {
+                    DirectDecimalWidth::I64 => unsafe {
+                        accumulate_i64_input(
+                            inputs,
+                            source_idx,
+                            row,
+                            shared_physical_row,
+                            slot,
+                            scratch,
+                        )
+                    },
+                    DirectDecimalWidth::I128 => unsafe {
+                        accumulate_i128_input(
+                            inputs,
+                            source_idx,
+                            row,
+                            shared_physical_row,
+                            slot,
+                            scratch,
+                        )
+                    },
+                };
+                if source_overflowed {
+                    overflowed[source_idx] = true;
                 }
             }
-        }
-        if overflowed == 0 {
-            return Ok(true);
         }
 
-        if TRACK_TOUCHED {
-            for &slot in scratch.touched_slots.iter() {
-                for source in 0..inputs.len() {
-                    scratch.narrow_totals[source * scratch.slot_count + slot] = 0;
-                }
+        let mut widths = SmallVec::with_capacity(inputs.len());
+        for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
+            if !overflowed[source_idx] {
+                widths.push(match source.width {
+                    DirectDecimalWidth::I64 => ReducedDecimalWidth::I64,
+                    DirectDecimalWidth::I128 => ReducedDecimalWidth::I128,
+                });
+                continue;
             }
-        } else {
-            for slot in 0..scratch.slot_count {
-                if scratch.row_counts[slot] != 0 {
-                    for source in 0..inputs.len() {
-                        scratch.narrow_totals[source * scratch.slot_count + slot] = 0;
+            clear_reduced_source(source_idx, scratch, traversal);
+            let width = match source.width {
+                DirectDecimalWidth::I64 => {
+                    for (row, &slot) in slots.iter().enumerate() {
+                        let physical_row = inputs.shared_physical_row(row);
+                        let total = source_idx * scratch.slot_count + slot;
+                        scratch.totals[total] +=
+                            i128::from(unsafe { inputs.value_i64(source_idx, row, physical_row) });
                     }
+                    ReducedDecimalWidth::I128
                 }
-            }
+                DirectDecimalWidth::I128 => {
+                    for (row, &slot) in slots.iter().enumerate() {
+                        let physical_row = inputs.shared_physical_row(row);
+                        let total = source_idx * scratch.slot_count + slot;
+                        scratch.wide_totals[total] +=
+                            i256::from(unsafe { inputs.value_i128(source_idx, row, physical_row) });
+                    }
+                    ReducedDecimalWidth::I256
+                }
+            };
+            widths.push(width);
         }
-        for (row, &slot) in slots.iter().take(count).enumerate() {
-            let shared_physical_row = inputs.shared_physical_row(row);
-            for source in 0..inputs.len() {
-                let total = source * scratch.slot_count + slot;
-                scratch.totals[total] +=
-                    i128::from(unsafe { inputs.value(source, row, shared_physical_row) });
-            }
-        }
-        Ok(false)
-    }
-
-    fn prepare_inputs<'a>(
-        &self,
-        payload: &'a Chunk,
-    ) -> Option<PreparedDirectGroupedAggregateInput<'a>> {
-        let mut decoded = SmallVec::<[DecodedVectorRef<'a>; 8]>::new();
-        for source in &self.decimal_inputs {
-            let vector = payload.column(source.input_index)?;
-            let input = vector.try_decode_ref(payload.size()).ok()?;
-            if !input.validity().all_valid() || !matches!(input.data(), DataRef::Ptr(_)) {
-                return None;
-            }
-            decoded.push(input);
-        }
-        Some(PreparedDirectGroupedAggregateInput::new(decoded))
+        Ok(widths)
     }
 
     fn apply_reduced_slot(
@@ -443,7 +442,7 @@ impl DirectGroupedAggregateProgram {
         base: *mut u8,
         slot: usize,
         scratch: &mut DirectGroupedAggregateScratch,
-        narrow: bool,
+        widths: &[ReducedDecimalWidth],
     ) {
         let row_count = scratch.row_counts[slot];
         for &state_offset in &self.count_star_offsets {
@@ -451,41 +450,95 @@ impl DirectGroupedAggregateProgram {
         }
         for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
             let total_idx = source_idx * scratch.slot_count + slot;
-            if narrow {
-                let value = scratch.narrow_totals[total_idx];
-                for &state_offset in &source.sums {
-                    let state =
-                        unsafe { &mut *base.add(state_offset).cast::<DecimalNarrowState>() };
-                    state.add_i64(value);
+            match widths[source_idx] {
+                ReducedDecimalWidth::I64 => {
+                    let value = scratch.narrow_totals[total_idx];
+                    for &state_offset in &source.narrow_sums {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalNarrowState>() };
+                        state.add_i64(value);
+                    }
+                    for &state_offset in &source.averages {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                        state.update_direct_i64_sum(value, row_count as u64);
+                    }
+                    scratch.narrow_totals[total_idx] = 0;
                 }
-                for &state_offset in &source.averages {
-                    let state =
-                        unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
-                    state.update_direct_i64_sum(value, row_count as u64);
+                ReducedDecimalWidth::I128 => {
+                    let value = scratch.totals[total_idx];
+                    for &state_offset in &source.narrow_sums {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalNarrowState>() };
+                        state.add_direct_i128(value);
+                    }
+                    for &state_offset in &source.wide_sums {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                        state.add_direct_i128(value);
+                    }
+                    for &state_offset in &source.averages {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                        state.update_direct_i128(value, row_count as u64);
+                    }
+                    scratch.totals[total_idx] = 0;
                 }
-                scratch.narrow_totals[total_idx] = 0;
-            } else {
-                let value = scratch.totals[total_idx];
-                for &state_offset in &source.sums {
-                    let state =
-                        unsafe { &mut *base.add(state_offset).cast::<DecimalNarrowState>() };
-                    state.add_direct_i128(value);
+                ReducedDecimalWidth::I256 => {
+                    let value = scratch.wide_totals[total_idx];
+                    for &state_offset in &source.wide_sums {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                        state.add_direct_i256(value);
+                    }
+                    for &state_offset in &source.averages {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                        state.update_direct_i256(value, row_count as u64);
+                    }
+                    scratch.wide_totals[total_idx] = i256::ZERO;
                 }
-                for &state_offset in &source.averages {
-                    let state =
-                        unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
-                    state.update_direct_i128(value, row_count as u64);
-                }
-                scratch.totals[total_idx] = 0;
             }
         }
         scratch.row_counts[slot] = 0;
     }
+
+    fn prepare_inputs<'a>(
+        &self,
+        payload: &'a Chunk,
+    ) -> Option<PreparedDirectGroupedAggregateInput<'a>> {
+        let mut decoded = SmallVec::<[(DecodedVectorRef<'a>, DirectDecimalWidth); 8]>::new();
+        for source in &self.decimal_inputs {
+            let vector = payload.column(source.input_index)?;
+            let width = match vector.logical_type() {
+                LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+                    DirectDecimalWidth::I64
+                }
+                LogicalType::Decimal { .. } => DirectDecimalWidth::I128,
+                _ => return None,
+            };
+            if width != source.width {
+                return None;
+            }
+            let input = vector.try_decode_ref(payload.size()).ok()?;
+            if !input.validity().all_valid() || !matches!(input.data(), DataRef::Ptr(_)) {
+                return None;
+            }
+            decoded.push((input, width));
+        }
+        Some(PreparedDirectGroupedAggregateInput::new(decoded))
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PreparedDecimalData {
+    I64(*const i64),
+    I128(*const i128),
 }
 
 struct PreparedDecimalInput<'a> {
     decoded: DecodedVectorRef<'a>,
-    data: *const i64,
+    data: PreparedDecimalData,
     direct: bool,
     uses_shared_selection: bool,
 }
@@ -497,19 +550,24 @@ pub struct PreparedDirectGroupedAggregateInput<'a> {
 }
 
 impl<'a> PreparedDirectGroupedAggregateInput<'a> {
-    fn new(decoded: SmallVec<[DecodedVectorRef<'a>; 8]>) -> Self {
+    fn new(decoded: SmallVec<[(DecodedVectorRef<'a>, DirectDecimalWidth); 8]>) -> Self {
         let shared_identity = decoded
             .iter()
-            .find_map(|input| input.sel().allocation_identity());
+            .find_map(|(input, _)| input.sel().allocation_identity());
         let shared_selection_input = shared_identity.and_then(|identity| {
             decoded
                 .iter()
-                .position(|input| input.sel().allocation_identity() == Some(identity))
+                .position(|(input, _)| input.sel().allocation_identity() == Some(identity))
         });
         let inputs: SmallVec<[PreparedDecimalInput<'a>; 8]> = decoded
             .into_iter()
-            .map(|decoded| PreparedDecimalInput {
-                data: decoded.get_data::<i64>(),
+            .map(|(decoded, width)| PreparedDecimalInput {
+                data: match width {
+                    DirectDecimalWidth::I64 => PreparedDecimalData::I64(decoded.get_data::<i64>()),
+                    DirectDecimalWidth::I128 => {
+                        PreparedDecimalData::I128(decoded.get_data::<i128>())
+                    }
+                },
                 direct: matches!(decoded.sel(), SelectionRef::Incremental { .. }),
                 uses_shared_selection: shared_identity
                     .is_some_and(|identity| decoded.sel().allocation_identity() == Some(identity)),
@@ -544,14 +602,46 @@ impl<'a> PreparedDirectGroupedAggregateInput<'a> {
     /// `source`, `row`, and `shared_physical_row` must identify rows within the
     /// prepared input batch.
     #[inline(always)]
-    unsafe fn value(&self, source: usize, row: usize, shared_physical_row: usize) -> i64 {
-        let input = unsafe { self.inputs.get_unchecked(source) };
+    unsafe fn physical_row(
+        &self,
+        input: &PreparedDecimalInput<'_>,
+        row: usize,
+        shared_physical_row: usize,
+    ) -> usize {
         if input.uses_shared_selection {
-            unsafe { *input.data.add(shared_physical_row) }
+            shared_physical_row
         } else if input.direct {
-            unsafe { *input.data.add(row) }
+            row
         } else {
-            unsafe { *input.data.add(input.decoded.physical_index(row)) }
+            input.decoded.physical_index(row)
+        }
+    }
+
+    /// # Safety
+    ///
+    /// The prepared source must be an i64 DECIMAL and all row indices must be
+    /// within the prepared input batch.
+    #[inline(always)]
+    unsafe fn value_i64(&self, source: usize, row: usize, shared_physical_row: usize) -> i64 {
+        let input = unsafe { self.inputs.get_unchecked(source) };
+        let physical_row = unsafe { self.physical_row(input, row, shared_physical_row) };
+        let PreparedDecimalData::I64(data) = input.data else {
+            unreachable!("validated direct i64 source has a non-i64 physical representation")
+        };
+        unsafe { *data.add(physical_row) }
+    }
+
+    /// # Safety
+    ///
+    /// `source`, `row`, and `shared_physical_row` must identify rows within the
+    /// prepared input batch.
+    #[inline(always)]
+    unsafe fn value_i128(&self, source: usize, row: usize, shared_physical_row: usize) -> i128 {
+        let input = unsafe { self.inputs.get_unchecked(source) };
+        let physical_row = unsafe { self.physical_row(input, row, shared_physical_row) };
+        match input.data {
+            PreparedDecimalData::I64(data) => i128::from(unsafe { *data.add(physical_row) }),
+            PreparedDecimalData::I128(data) => unsafe { *data.add(physical_row) },
         }
     }
 }
@@ -567,16 +657,16 @@ fn decoded_selection_data(decoded: &DecodedVectorRef<'_>) -> Option<*const u32> 
 /// The source, logical row, shared physical row, slot, and scratch dimensions
 /// must all have been validated by `reduce_inputs` and `prepare_inputs`.
 #[inline(always)]
-unsafe fn accumulate_narrow_input(
+unsafe fn accumulate_i64_input(
     inputs: &PreparedDirectGroupedAggregateInput<'_>,
     source: usize,
     row: usize,
     shared_physical_row: usize,
     slot: usize,
     scratch: &mut DirectGroupedAggregateScratch,
-) -> u64 {
+) -> bool {
     let total = source * scratch.slot_count + slot;
-    let value = unsafe { inputs.value(source, row, shared_physical_row) };
+    let value = unsafe { inputs.value_i64(source, row, shared_physical_row) };
     let target = unsafe {
         scratch
             .narrow_totals
@@ -585,7 +675,57 @@ unsafe fn accumulate_narrow_input(
     };
     let (sum, overflowed) = target.overflowing_add(value);
     *target = sum;
-    u64::from(overflowed)
+    overflowed
+}
+
+/// Accumulate one physical i128 input into its slot-local batch state.
+///
+/// # Safety
+///
+/// The source, logical row, shared physical row, slot, and scratch dimensions
+/// must all have been validated by `reduce_inputs` and `prepare_inputs`.
+#[inline(always)]
+unsafe fn accumulate_i128_input(
+    inputs: &PreparedDirectGroupedAggregateInput<'_>,
+    source: usize,
+    row: usize,
+    shared_physical_row: usize,
+    slot: usize,
+    scratch: &mut DirectGroupedAggregateScratch,
+) -> bool {
+    let total = source * scratch.slot_count + slot;
+    let value = unsafe { inputs.value_i128(source, row, shared_physical_row) };
+    let target = unsafe { scratch.totals.as_mut_slice().get_unchecked_mut(total) };
+    let (sum, overflowed) = target.overflowing_add(value);
+    *target = sum;
+    overflowed
+}
+
+fn clear_reduced_source(
+    source: usize,
+    scratch: &mut DirectGroupedAggregateScratch,
+    traversal: ReducedSlotTraversal,
+) {
+    let mut clear_slot = |slot: usize| {
+        let index = source * scratch.slot_count + slot;
+        scratch.narrow_totals[index] = 0;
+        scratch.totals[index] = 0;
+        scratch.wide_totals[index] = i256::ZERO;
+    };
+    match traversal {
+        ReducedSlotTraversal::DenseDomain => {
+            for slot in 0..scratch.slot_count {
+                if scratch.row_counts[slot] != 0 {
+                    clear_slot(slot);
+                }
+            }
+        }
+        ReducedSlotTraversal::SparseTouched => {
+            for touched_idx in 0..scratch.touched_slots.len() {
+                clear_slot(scratch.touched_slots[touched_idx]);
+            }
+        }
+    }
 }
 
 fn accounted_scratch_vec<T>(memory: &MemoryAccountingContext) -> Result<AccountedVec<T>> {

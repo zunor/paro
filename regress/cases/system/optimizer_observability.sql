@@ -35,6 +35,7 @@ FROM paro_optimizers()
 WHERE name IN ('search_optimization', 'statistics_gathering')
 ORDER BY name;
 
+-- @normalize explain_search_ids
 EXPLAIN (VERBOSE)
 SELECT id
 FROM obs_docs

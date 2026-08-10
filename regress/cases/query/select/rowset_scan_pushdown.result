@@ -58,10 +58,10 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Columns: k
       Pushed Predicate: col#1 = 3
+      Late Materialize: auto
       Cardinality: [3, 6, 10]
-      Output Schema: k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT payload FROM rowset_pushdown_case WHERE k = 3;
@@ -71,11 +71,11 @@ PROJECTION  (rows=6)
   Cardinality: [3, 6, 10]
   Output Schema: payload VARCHAR
   ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-    Columns: k, payload
+    Columns: payload
     Pushed Predicate: col#1 = 3
     Late Materialize: auto
     Cardinality: [3, 6, 10]
-    Output Schema: k INTEGER, payload VARCHAR
+    Output Schema: payload VARCHAR
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
@@ -89,11 +89,11 @@ PROJECTION  (rows=1)
     Output: aggr_0
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Columns: k
-      Pushed Predicate: col#1 >= 2 AND col#1 < 5
-      Cardinality: [2, 6, 9]
-      Output Schema: k INTEGER
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=26)
+      Pushed Predicate: col#1 < 5 AND col#1 >= 2
+      Late Materialize: auto
+      Cardinality: [12, 26, 39]
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);
@@ -108,10 +108,10 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
-      Columns: k
       Pushed Predicate: col#1 IN (1, 4, 9)
+      Late Materialize: auto
       Cardinality: [9, 19, 29]
-      Output Schema: k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE nullable_k IS NULL;
@@ -126,10 +126,10 @@ PROJECTION  (rows=1)
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
-      Columns: nullable_k
       Pushed Predicate: col#2 IS NULL
+      Late Materialize: auto
       Cardinality: [3, 6, 10]
-      Output Schema: nullable_k INTEGER
+      Output Schema: (none)
 
 EXPLAIN (VERBOSE)
 SELECT COUNT(*)
@@ -148,7 +148,7 @@ PROJECTION  (rows=1)
     ->  HASH_JOIN  (rows=19)
       Join Type: INNER
       Join Condition: #0 = #0
-      Cardinality: [19, 19, 19]
+      Cardinality: [10, 19, 29]
       Output Schema: (none)
       ->  ROWSET_SCAN on public.rowset_pushdown_case c
         Columns: k

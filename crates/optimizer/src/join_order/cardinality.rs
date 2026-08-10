@@ -158,6 +158,10 @@ struct DistinctDomainEstimate {
     has_hll: bool,
 }
 
+/// Deterministic Prim frontier ordered by parent relation, child relation,
+/// filter, edge, then child vertex.
+type EqualityTreeFrontierEntry = Reverse<(usize, usize, usize, usize, usize)>;
+
 #[derive(Debug, Default)]
 struct EqualityDenominatorScratch {
     parents: Vec<usize>,
@@ -167,7 +171,7 @@ struct EqualityDenominatorScratch {
     vertex_domains: Vec<Option<DistinctDomainEstimate>>,
     tree_visited: Vec<bool>,
     owned_edges: Vec<Option<usize>>,
-    tree_frontier: BinaryHeap<Reverse<(usize, usize, usize, usize, usize)>>,
+    tree_frontier: BinaryHeap<EqualityTreeFrontierEntry>,
 }
 
 impl EqualityDenominatorScratch {
@@ -243,7 +247,7 @@ fn push_tree_frontier(
     graph: &EqualityClassGraph,
     active: &[bool],
     tree_visited: &[bool],
-    tree_frontier: &mut BinaryHeap<Reverse<(usize, usize, usize, usize, usize)>>,
+    tree_frontier: &mut BinaryHeap<EqualityTreeFrontierEntry>,
     parent: usize,
 ) {
     for edge_index in &graph.adjacency[parent] {
