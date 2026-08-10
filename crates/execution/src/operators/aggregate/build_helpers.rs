@@ -247,14 +247,11 @@ pub(crate) fn projected_payload_chunk<'a>(
             query.allocator(MemoryTag::BaseTable),
         )?;
     }
-    executor.execute_all_kernel(
-        VectorKernelInput::from_eval_input(ExpressionEvalInput {
-            params: query.params.as_ref(),
-            columns: input,
-        }),
-        query,
-        payload,
-    )?;
+    let input = VectorKernelInput::from_eval_input(ExpressionEvalInput {
+        params: query.params.as_ref(),
+        columns: input,
+    });
+    executor.execute_all_kernel(input, query, payload)?;
     Ok(payload)
 }
 
@@ -661,6 +658,9 @@ pub(crate) fn update_perfect_aggregate_table(
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
     let groups = build_groups_chunk(payload, group_refs)?;
+    if !has_aggregate_filters(spec) && table.try_update_direct_groups(&groups, payload)? {
+        return Ok(());
+    }
     ensure_group_update_scratch(
         addresses,
         new_groups,

@@ -123,7 +123,9 @@ impl PhysicalPlanGenerator {
             LogicalOperator::DummyScan => (PhysicalNodeKind::DummyScan(DummyScanSpec), Vec::new()),
             LogicalOperator::ExpressionGet(values) => self.lower_values(values),
             LogicalOperator::EmptyResult(empty) => self.lower_empty_result(empty)?,
-            LogicalOperator::Filter(filter) => self.lower_filter(filter)?,
+            LogicalOperator::Filter(filter) => {
+                self.lower_filter(filter, logical.stats.estimated_cardinality)?
+            }
             LogicalOperator::Projection(project) if is_graph_chain(project.child.as_ref()) => {
                 self.lower_graph_project(project)?
             }

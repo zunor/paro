@@ -416,11 +416,19 @@ fn perfect_hash_max_local_tables(
     }
     let objects = aggregate_objects(spec).ok()?;
     let layout = AggregateStateLayout::new(&objects).ok()?;
-    let bytes_per_table = layout
+    let storage_bytes = layout
         .total_size()
         .max(1)
         .checked_add(1)
         .and_then(|bytes_per_slot| bytes_per_slot.checked_mul(slots))?;
+    let scratch_bytes =
+        paro_function::aggregate::DirectGroupedAggregateProgram::conservative_scratch_bytes(
+            objects.len(),
+            slots,
+        )
+        .unwrap_or(0)
+        .checked_add(paro_common::vector::VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>())?)?;
+    let bytes_per_table = storage_bytes.checked_add(scratch_bytes)?;
     let table_budget = max_memory / PERFECT_HASH_MEMORY_BUDGET_DIVISOR;
     let admitted_tables = table_budget / bytes_per_table;
     (admitted_tables > 0).then_some(admitted_tables.min(parallelism.max(1)))

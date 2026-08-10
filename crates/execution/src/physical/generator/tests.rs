@@ -491,6 +491,38 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
 }
 
 #[test]
+fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
+    let build_scan = |filtered_rows: u64| {
+        let ctx = BindContext::new();
+        let mut get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+        get.stats.estimated_cardinality =
+            Some(paro_planner::plan::CardinalityEstimate::exact(1_000_000));
+        let filter = Filter::new(
+            get,
+            vec![comparison(
+                ComparisonType::LessThanOrEqual,
+                ref_expr(0, LogicalType::Integer),
+                int_const(42),
+            )],
+        );
+        let mut plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+        plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(
+            filtered_rows,
+        ));
+        let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+            .generate(&plan)
+            .expect("filter should lower");
+        let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+            panic!("fully pushed filter should lower to rowset scan");
+        };
+        spec.late_materialize
+    };
+
+    assert!(!build_scan(990_000));
+    assert!(build_scan(10_000));
+}
+
+#[test]
 fn arena_generator_can_disable_rowset_scan_pushdown() {
     let ctx = BindContext::new();
     let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));

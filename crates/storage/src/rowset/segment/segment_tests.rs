@@ -117,7 +117,7 @@ fn segment_varlen_column_keeps_rows_across_pages_and_appends() {
 }
 
 #[test]
-fn segment_predicate_fallback_uses_late_materialize() {
+fn segment_materialized_batch_api_forces_late_materialization() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("predicate.seg");
     let schema = create_int_schema();
@@ -162,15 +162,94 @@ fn segment_predicate_fallback_uses_late_materialize() {
     )
     .unwrap();
 
-    assert!(iter.uses_late_materialize());
+    assert!(!iter.uses_late_materialize());
     assert!(matches!(iter.evaluated_selection, PredicateResult::Unknown));
 
     let (rowids, batch) = iter.next_batch(32).unwrap();
     assert_eq!(rowids, vec![7]);
+    assert!(iter.uses_late_materialize());
     let predicate_value = i32::from_le_bytes(batch[0].1.data[0..4].try_into().unwrap());
     let projected_value = i32::from_le_bytes(batch[1].1.data[0..4].try_into().unwrap());
     assert_eq!(predicate_value, 7);
     assert_eq!(projected_value, 107);
+}
+
+#[test]
+fn late_materialization_adapts_to_observed_batch_density() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("adaptive_predicate_density.seg");
+    let schema = create_int_schema();
+    let opts = SegmentWriterOptions::new(0).with_compression(CompressionType::None);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, opts).unwrap();
+    writer
+        .append_chunk(&[
+            ColumnData::new(
+                (0i32..20).flat_map(i32::to_le_bytes).collect::<Vec<_>>(),
+                20,
+            ),
+            ColumnData::new(
+                (100i32..120).flat_map(i32::to_le_bytes).collect::<Vec<_>>(),
+                20,
+            ),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+
+    let make_iter = |predicate| {
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![1],
+            vec![0],
+            None,
+            Some(predicate),
+            None,
+        )
+        .unwrap()
+    };
+
+    let mut dense = make_iter(PredicateTree::leaf(Predicate::Lt {
+        column_id: 0,
+        value: Value::Integer(18),
+    }));
+    let dense_batch = dense.next_batch_with_rowid_policy(20, false).unwrap();
+    assert_eq!(dense_batch.rows, 18);
+    assert_eq!(dense_batch.physical_rows, 20);
+    let expected_selection = (0u32..18).collect::<Vec<_>>();
+    assert_eq!(
+        dense_batch.selection.as_deref(),
+        Some(expected_selection.as_slice())
+    );
+    assert!(dense_batch.rowids.is_empty());
+    assert_eq!(
+        dense_batch.columns[0].1.data.len(),
+        20 * std::mem::size_of::<i32>()
+    );
+
+    let mut sparse = make_iter(PredicateTree::leaf(Predicate::Eq {
+        column_id: 0,
+        value: Value::Integer(7),
+    }));
+    let sparse_batch = sparse.next_batch_with_rowid_policy(20, false).unwrap();
+    assert_eq!(sparse_batch.rows, 1);
+    assert_eq!(sparse_batch.physical_rows, 1);
+    assert!(sparse_batch.selection.is_none());
+    assert!(sparse_batch.rowids.is_empty());
+    assert_eq!(
+        i32::from_le_bytes(sparse_batch.columns[0].1.data[..4].try_into().unwrap()),
+        107
+    );
 }
 
 #[test]

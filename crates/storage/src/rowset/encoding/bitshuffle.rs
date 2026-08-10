@@ -575,11 +575,11 @@ impl BitShufflePageDecoder {
         }
 
         match self.type_size {
-            1 => self.gather_fixed_values::<u8, _>(values, output),
-            2 => self.gather_fixed_values::<u16, _>(values, output),
-            4 => self.gather_fixed_values::<u32, _>(values, output),
-            8 => self.gather_fixed_values::<u64, _>(values, output),
-            16 => self.gather_fixed_values::<u128, _>(values, output),
+            1 => self.gather_fixed_values::<u8, _, true>(values, output),
+            2 => self.gather_fixed_values::<u16, _, true>(values, output),
+            4 => self.gather_fixed_values::<u32, _, true>(values, output),
+            8 => self.gather_fixed_values::<u64, _, true>(values, output),
+            16 => self.gather_fixed_values::<u128, _, true>(values, output),
             _ => Err(paro_common::error::internal(format!(
                 "initialized BitShuffle decoder has invalid type size {}",
                 self.type_size
@@ -587,7 +587,49 @@ impl BitShufflePageDecoder {
         }
     }
 
-    fn gather_fixed_values<T, I>(&self, values: I, output: &mut [u8]) -> Result<()>
+    /// Gather values whose source and destination indices were validated by
+    /// the page-run planner.
+    ///
+    /// # Safety
+    ///
+    /// Every source index must be below `self.count()` and every destination
+    /// index must identify an element-width slot in `output`.
+    pub(crate) unsafe fn gather_values_at_validated<I>(
+        &self,
+        values: I,
+        output: &mut [u8],
+    ) -> Result<()>
+    where
+        I: IntoIterator<Item = (u32, usize)>,
+    {
+        if !self.parsed {
+            return Err(paro_common::error::internal(
+                "BitShufflePageDecoder: not initialized",
+            ));
+        }
+        if output.len() % self.type_size != 0 {
+            return Err(paro_common::error::invalid_input(
+                "BitShuffle gather output is not aligned to the element width",
+            ));
+        }
+        match self.type_size {
+            1 => self.gather_fixed_values::<u8, _, false>(values, output),
+            2 => self.gather_fixed_values::<u16, _, false>(values, output),
+            4 => self.gather_fixed_values::<u32, _, false>(values, output),
+            8 => self.gather_fixed_values::<u64, _, false>(values, output),
+            16 => self.gather_fixed_values::<u128, _, false>(values, output),
+            _ => Err(paro_common::error::internal(format!(
+                "initialized BitShuffle decoder has invalid type size {}",
+                self.type_size
+            ))),
+        }
+    }
+
+    fn gather_fixed_values<T, I, const VALIDATE: bool>(
+        &self,
+        values: I,
+        output: &mut [u8],
+    ) -> Result<()>
     where
         T: Copy,
         I: IntoIterator<Item = (u32, usize)>,
@@ -597,7 +639,9 @@ impl BitShufflePageDecoder {
         let output_rows = output.len() / self.type_size;
         if let Some(decoded) = &self.decoded_data {
             for (source_idx, output_idx) in values {
-                self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+                if VALIDATE {
+                    self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+                }
                 let source_start = source_idx as usize * self.type_size;
                 let output_start = output_idx * self.type_size;
                 // SAFETY: the index validation above proves both fixed-width
@@ -621,7 +665,9 @@ impl BitShufflePageDecoder {
         let mut decoded_group = [0_u8; 16 * 8];
         let mut decoded_group_start = None;
         for (source_idx, output_idx) in values {
-            self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+            if VALIDATE {
+                self.validate_gather_indices(source_idx, output_idx, output_rows)?;
+            }
             let source_idx = source_idx as usize;
             let block_start = source_idx / self.block_elements * self.block_elements;
             let row_in_block = source_idx - block_start;

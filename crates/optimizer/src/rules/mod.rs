@@ -6,6 +6,7 @@
 pub mod arithmetic;
 pub mod comparison;
 pub mod conjunction;
+mod constant_evaluator;
 pub mod constant_folding;
 pub mod expression_matcher;
 pub mod function_matcher;

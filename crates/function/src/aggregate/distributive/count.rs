@@ -6,7 +6,8 @@
 //!
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateDirectUpdate, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -151,6 +152,7 @@ pub fn get_count_star_function() -> AggregateFunction {
         Some(CountFunction::simple_update_star),
         None,
     )
+    .with_direct_update(AggregateDirectUpdate::CountStar)
 }
 
 pub fn get_count_function() -> AggregateFunctionSet {

@@ -18,7 +18,13 @@ use paro_common::vector::{SelectionRef, SelectionVector, Vector};
 use std::fmt;
 use std::sync::Arc;
 
+mod direct_update;
 pub mod distributive;
+
+pub use direct_update::{
+    DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
+    PreparedDirectGroupedAggregateInput,
+};
 
 // Re-export FunctionData from scalar module
 pub use crate::scalar::FunctionData;
@@ -77,6 +83,28 @@ pub struct AggregateStateInput<'a> {
     state_offset: usize,
 }
 
+/// Fast cursor for the common case where group lookup produced a flat or
+/// contiguous-range address vector and the aggregate update has no secondary
+/// row selection. Constructing this once per aggregate batch keeps selection
+/// dispatch out of the row loop.
+#[derive(Clone, Copy)]
+pub struct DirectAggregateStateCursor {
+    address_data: *const *mut u8,
+    state_offset: usize,
+}
+
+impl DirectAggregateStateCursor {
+    /// # Safety
+    ///
+    /// `row` must be within the count used to construct the parent
+    /// [`AggregateStateInput`], and the pointed-to aggregate state must be
+    /// initialized and live.
+    #[inline(always)]
+    pub unsafe fn state_ptr(self, row: usize) -> *mut u8 {
+        unsafe { (*self.address_data.add(row)).add(self.state_offset) }
+    }
+}
+
 impl<'a> AggregateStateInput<'a> {
     pub fn try_new(
         addresses: &'a Vector,
@@ -123,6 +151,25 @@ impl<'a> AggregateStateInput<'a> {
             .map_or(row, |selection| selection.get(row));
         let physical_row = self.address_selection.get(address_row);
         (*self.address_data.add(physical_row)).add(self.state_offset)
+    }
+
+    /// Return a selection-free cursor when logical rows map to a contiguous
+    /// range of the address vector.
+    pub fn direct_cursor(&self) -> Option<DirectAggregateStateCursor> {
+        if self.update_selection.is_some() {
+            return None;
+        }
+        let address_data = match self.address_selection {
+            SelectionRef::Incremental { .. } => self.address_data,
+            SelectionRef::Range { offset, .. } => unsafe { self.address_data.add(offset) },
+            SelectionRef::Borrowed(_) | SelectionRef::Owned(_) | SelectionRef::Constant { .. } => {
+                return None
+            }
+        };
+        Some(DirectAggregateStateCursor {
+            address_data,
+            state_offset: self.state_offset,
+        })
     }
 }
 
@@ -228,6 +275,17 @@ pub type AggregateDistinctRunUpdateFn = unsafe fn(
     count: usize,
 );
 
+/// Engine-recognized grouped update semantics.
+///
+/// This explicit capability lets a physical aggregate compile compatible
+/// functions into one update loop without relying on function names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateDirectUpdate {
+    CountStar,
+    DecimalSumI64,
+    DecimalAverageI64,
+}
+
 // ============================================================================
 // AggregateFunction
 // ============================================================================
@@ -279,6 +337,9 @@ pub struct AggregateFunction {
 
     /// Optional reducer for pre-deduplicated, group-clustered input runs.
     pub distinct_run_update: Option<AggregateDistinctRunUpdateFn>,
+
+    /// Optional semantics for a fused grouped-update program.
+    pub direct_update: Option<AggregateDirectUpdate>,
 
     /// Destructor for the state (optional).
     pub destructor: Option<AggregateDestructorFn>,
@@ -336,6 +397,7 @@ impl AggregateFunction {
             state_filter: None,
             simple_update,
             distinct_run_update: None,
+            direct_update: None,
             destructor,
             state_serialize: None,
             state_deserialize: None,
@@ -352,6 +414,11 @@ impl AggregateFunction {
     /// Set the reducer used when DISTINCT finalization has contiguous group runs.
     pub fn with_distinct_run_update(mut self, update: AggregateDistinctRunUpdateFn) -> Self {
         self.distinct_run_update = Some(update);
+        self
+    }
+
+    pub fn with_direct_update(mut self, update: AggregateDirectUpdate) -> Self {
+        self.direct_update = Some(update);
         self
     }
 

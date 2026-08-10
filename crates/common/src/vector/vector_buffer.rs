@@ -5,6 +5,8 @@ use std::fmt;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
 
@@ -16,14 +18,26 @@ struct RawBuffer {
     ptr: NonNull<u8>,
     /// Total size in bytes
     size: usize,
-    /// Allocator used for this buffer
-    allocator: Arc<dyn Allocator>,
+    storage: RawBufferStorage,
+}
+
+enum RawBufferStorage {
+    Allocated(Arc<dyn Allocator>),
+    External { _owner: Bytes },
 }
 
 impl Drop for RawBuffer {
     fn drop(&mut self) {
-        // Use allocator to free memory
-        self.allocator.free(self.ptr.as_ptr(), self.size);
+        if let RawBufferStorage::Allocated(allocator) = &self.storage {
+            allocator.free(self.ptr.as_ptr(), self.size);
+        }
+    }
+}
+
+impl RawBuffer {
+    #[inline]
+    fn is_mutable(&self) -> bool {
+        matches!(self.storage, RawBufferStorage::Allocated(_))
     }
 }
 
@@ -85,7 +99,63 @@ impl VectorBuffer {
             inner: Some(Arc::new(RawBuffer {
                 ptr: NonNull::new(ptr).expect("out of memory or allocator bug: ptr is null"),
                 size,
-                allocator: allocator.clone(),
+                storage: RawBufferStorage::Allocated(allocator.clone()),
+            })),
+            element_size,
+            capacity,
+            allocator,
+        })
+    }
+
+    /// Adopt immutable, fixed-width vector storage without copying it.
+    ///
+    /// Mutation uses the normal vector copy-on-write path and therefore first
+    /// materializes an allocator-owned buffer. Misaligned byte storage is
+    /// copied eagerly because typed vector readers require physical alignment.
+    pub fn try_from_bytes(
+        element_size: usize,
+        capacity: usize,
+        bytes: Bytes,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let expected_size = element_size.checked_mul(capacity).ok_or_else(|| {
+            paro_error::out_of_memory(format!(
+                "external vector buffer size overflow: element_size={element_size}, capacity={capacity}"
+            ))
+        })?;
+        if bytes.len() != expected_size {
+            return Err(paro_error::invalid_input(format!(
+                "external vector buffer length mismatch: expected={expected_size}, actual={}",
+                bytes.len()
+            )));
+        }
+        if expected_size == 0 {
+            return Ok(Self {
+                inner: None,
+                element_size,
+                capacity: 0,
+                allocator,
+            });
+        }
+
+        let required_alignment = element_size.min(std::mem::align_of::<u128>()).max(1);
+        if !(bytes.as_ptr() as usize).is_multiple_of(required_alignment) {
+            let owned = Self::try_with_allocator(element_size, capacity, allocator)?;
+            // SAFETY: both buffers were validated to contain `expected_size`
+            // bytes and do not overlap because `owned` was freshly allocated.
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), owned.data(), expected_size);
+            }
+            return Ok(owned);
+        }
+
+        let ptr = NonNull::new(bytes.as_ptr() as *mut u8)
+            .expect("non-empty Bytes must expose a non-null pointer");
+        Ok(Self {
+            inner: Some(Arc::new(RawBuffer {
+                ptr,
+                size: expected_size,
+                storage: RawBufferStorage::External { _owner: bytes },
             })),
             element_size,
             capacity,
@@ -134,7 +204,7 @@ impl VectorBuffer {
     pub(crate) fn is_uniquely_owned(&self) -> bool {
         self.inner
             .as_ref()
-            .is_none_or(|inner| Arc::strong_count(inner) == 1)
+            .is_none_or(|inner| inner.is_mutable() && Arc::strong_count(inner) == 1)
     }
 
     pub(crate) fn collect_allocation_size(&self, allocations: &mut AllocationSet) -> usize {
@@ -183,11 +253,8 @@ impl VectorBuffer {
     /// Create a deep copy of this buffer.
     pub fn try_deep_copy(&self) -> Result<Self> {
         if let Some(inner) = &self.inner {
-            let new_buffer = Self::try_with_allocator(
-                self.element_size,
-                self.capacity,
-                Arc::clone(&inner.allocator),
-            )?;
+            let new_buffer =
+                Self::try_with_allocator(self.element_size, self.capacity, self.allocator.clone())?;
             if let Some(new_inner) = &new_buffer.inner {
                 unsafe {
                     std::ptr::copy_nonoverlapping(
@@ -206,7 +273,7 @@ impl VectorBuffer {
     /// Ensure the buffer is exclusively owned (Copy-on-Write).
     pub fn try_make_exclusive(&mut self) -> Result<()> {
         if let Some(inner) = &self.inner {
-            if Arc::strong_count(inner) > 1 {
+            if !inner.is_mutable() || Arc::strong_count(inner) > 1 {
                 *self = self.try_deep_copy()?;
             }
         }
@@ -214,9 +281,10 @@ impl VectorBuffer {
     }
 }
 
-// SAFETY: VectorBuffer owns its memory exclusively. The raw pointer is only accessed
-// through the owning VectorBuffer, and Clone creates a deep copy. No shared mutable
-// access occurs across threads. Allocator is Send+Sync.
+// SAFETY: allocated storage follows the existing COW protocol before mutable
+// vector access; external storage is retained by immutable `Bytes` and is also
+// copied before mutation. The raw pointer stays valid for the lifetime of the
+// `RawBuffer`, and the allocator is Send + Sync.
 unsafe impl Send for VectorBuffer {}
 unsafe impl Sync for VectorBuffer {}
 
@@ -324,5 +392,25 @@ mod tests {
             assert_eq!(cloned.as_slice::<i32>(10)[0], 1);
             assert_eq!(buf.as_slice::<i32>(10)[0], 2);
         }
+    }
+
+    #[test]
+    fn external_bytes_are_borrowed_until_mutation() {
+        let bytes = Bytes::from(vec![1_u8, 2, 3, 4]);
+        let source_ptr = bytes.as_ptr();
+        let mut buffer = VectorBuffer::try_from_bytes(
+            1,
+            bytes.len(),
+            bytes.clone(),
+            Arc::new(DefaultAllocator::new()),
+        )
+        .unwrap();
+
+        assert_eq!(buffer.data(), source_ptr as *mut u8);
+        assert!(!buffer.is_uniquely_owned());
+        buffer.try_make_exclusive().unwrap();
+        assert_ne!(buffer.data(), source_ptr as *mut u8);
+        unsafe { buffer.as_mut_slice::<u8>(4)[0] = 9 };
+        assert_eq!(bytes[0], 1);
     }
 }

@@ -221,6 +221,33 @@ fn decode_storage_dictionary_batch(
     }
 
     let null_index = dictionary_len as u32;
+    #[cfg(target_endian = "little")]
+    if nulls.is_none() {
+        for row_idx in 0..rows {
+            let code_offset = row_idx * std::mem::size_of::<u32>();
+            let code = u32::from_le_bytes(
+                batch.codes[code_offset..code_offset + std::mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("u32-aligned storage dictionary codes"),
+            );
+            if code as usize >= dictionary_len {
+                return Err(paro_error::data_corrupted(format!(
+                    "storage dictionary code {} out of range {}",
+                    code, dictionary_len
+                )));
+            }
+        }
+        return Vector::try_with_dictionary(
+            Arc::new(child),
+            SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?,
+            DictionaryInfo {
+                unique_len,
+                provenance_id,
+                source: DictionarySource::Storage,
+            },
+        );
+    }
+
     let mut selection = Vec::with_capacity(rows);
     for row_idx in 0..rows {
         let code_offset = row_idx * std::mem::size_of::<u32>();
@@ -380,26 +407,20 @@ where
             "Column data length does not match expected rows",
         ));
     }
-    let mut vector = Vector::try_new(logical_type, rows, allocator)?;
-    if rows > 0 {
-        #[cfg(target_endian = "little")]
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                vector.flat_data_mut::<T>().cast::<u8>(),
-                expected_bytes,
-            );
-        }
-        #[cfg(target_endian = "big")]
-        {
-            let values = parse_primitive::<T>(data, rows)?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
-            }
-        }
+    #[cfg(target_endian = "little")]
+    {
+        Vector::try_from_fixed_width_bytes(logical_type, rows, data.clone(), allocator)
     }
-    vector.try_set_count(rows)?;
-    Ok(vector)
+    #[cfg(target_endian = "big")]
+    {
+        let values = parse_primitive::<T>(data, rows)?;
+        let mut vector = Vector::try_new(logical_type, rows, allocator)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
+        }
+        vector.try_set_count(rows)?;
+        Ok(vector)
+    }
 }
 
 fn build_varlen_vector(

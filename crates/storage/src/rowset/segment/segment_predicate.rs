@@ -10,7 +10,6 @@ use crate::index::{
     collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
     PredicateTree,
 };
-#[cfg(test)]
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::column::ColumnIterator;
 use crate::tablet::ColumnId;
@@ -129,6 +128,17 @@ enum CompiledPredicate {
 }
 
 impl PredicateEvaluator {
+    pub(super) fn all_columns_projected(
+        &self,
+        columns: &[(ColumnId, Box<dyn ColumnIterator + Send + Sync>)],
+    ) -> bool {
+        self.predicate_columns.iter().all(|predicate_column| {
+            columns
+                .iter()
+                .any(|(column_id, _)| column_id == predicate_column)
+        })
+    }
+
     pub(super) fn reusable_column_info(
         &self,
         column_id: ColumnId,
@@ -352,6 +362,33 @@ impl PredicateEvaluator {
         }
 
         Ok((rows, filled))
+    }
+
+    /// Prepare predicate views over columns already read by an eager scan.
+    ///
+    /// Returning `None` means at least one predicate column is not present in
+    /// the projected batch, so the caller must retain the independent
+    /// predicate-column path.
+    pub(super) fn prepare_projected_batches(
+        &self,
+        columns: &[(ColumnId, ColumnBatch)],
+        rows: usize,
+    ) -> Result<Option<Vec<PredicateColumnBatch>>> {
+        let mut result = Vec::with_capacity(self.predicate_columns.len());
+        for (predicate_idx, column_id) in self.predicate_columns.iter().enumerate() {
+            let Some((_, batch)) = columns.iter().find(|(candidate, _)| candidate == column_id)
+            else {
+                return Ok(None);
+            };
+            result.push(PredicateColumnBatch::prepare(
+                &self.predicate_types[predicate_idx],
+                self.predicate_column_access[predicate_idx],
+                batch.clone(),
+                rows,
+                self.allocator.clone(),
+            )?);
+        }
+        Ok(Some(result))
     }
 
     pub(super) fn evaluate_batch(

@@ -4,10 +4,26 @@
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::Allocator;
 use crate::error::Result;
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 static SELECTION_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct OwnedNativeIndices(Vec<u32>);
+
+impl AsRef<[u8]> for OwnedNativeIndices {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: every byte of every u32 in the Vec is initialized, and the
+        // byte slice is tied to the immutable owner retained by `Bytes`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.0.as_ptr().cast::<u8>(),
+                self.0.len() * std::mem::size_of::<u32>(),
+            )
+        }
+    }
+}
 
 #[inline]
 pub fn selection_materialization_count() -> u64 {
@@ -111,6 +127,41 @@ impl SelectionVector {
             }
         }
         Ok(sv)
+    }
+
+    /// Adopt owned native-endian u32 indices without copying them.
+    /// Mutation follows the normal copy-on-write path.
+    pub fn try_from_owned_indices(
+        indices: Vec<u32>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let count = indices.len();
+        if count == 0 {
+            return Self::try_with_capacity(0, allocator);
+        }
+        Self::try_from_native_bytes(
+            Bytes::from_owner(OwnedNativeIndices(indices)),
+            count,
+            allocator,
+        )
+    }
+
+    /// Adopt an immutable native-endian u32 selection buffer without copying.
+    /// Mutation follows the normal copy-on-write path.
+    pub fn try_from_native_bytes(
+        bytes: Bytes,
+        count: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            buffer: VectorBuffer::try_from_bytes(
+                std::mem::size_of::<u32>(),
+                count,
+                bytes,
+                allocator,
+            )?,
+            count,
+        })
     }
 
     /// Get index at position.
@@ -438,5 +489,32 @@ impl From<SelectionVector> for VectorSelection {
 impl From<&SelectionVector> for VectorSelection {
     fn from(selection: &SelectionVector) -> Self {
         Self::Materialized(selection.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::default_allocator;
+
+    #[test]
+    fn owned_indices_are_adopted_and_mutate_with_copy_on_write() {
+        let indices = vec![3_u32, 1, 4, 1];
+        let original_address = indices.as_ptr() as usize;
+        let mut selection =
+            SelectionVector::try_from_owned_indices(indices, Arc::new(default_allocator()))
+                .unwrap();
+
+        assert_eq!(selection.buffer.data() as usize, original_address);
+        assert_eq!(
+            (0..selection.len())
+                .map(|idx| selection.get(idx))
+                .collect::<Vec<_>>(),
+            vec![3, 1, 4, 1]
+        );
+
+        selection.try_set(0, 9).unwrap();
+        assert_ne!(selection.buffer.data() as usize, original_address);
+        assert_eq!(selection.get(0), 9);
     }
 }

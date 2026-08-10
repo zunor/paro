@@ -9,7 +9,7 @@ use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::{SelectionVector, Vector};
 use std::sync::Arc;
 
 impl TabletReader {
@@ -61,6 +61,7 @@ impl TabletReader {
         Err(paro_error::internal("Column ID not found in schema"))
     }
 
+    #[cfg(test)]
     pub(super) fn build_chunk(
         &self,
         batch: &[(ColumnId, crate::rowset::column::ColumnBatch)],
@@ -69,12 +70,38 @@ impl TabletReader {
         rowset_id: u64,
         segment_id: u32,
     ) -> Result<Chunk> {
+        self.build_chunk_with_owned_selection(
+            batch, rows, rows, None, rowids, rowset_id, segment_id,
+        )
+    }
+
+    pub(super) fn build_chunk_with_owned_selection(
+        &self,
+        batch: &[(ColumnId, crate::rowset::column::ColumnBatch)],
+        rows: usize,
+        physical_rows: usize,
+        selection: Option<Vec<u32>>,
+        rowids: &[u32],
+        rowset_id: u64,
+        segment_id: u32,
+    ) -> Result<Chunk> {
         if rows == 0 {
             return Chunk::try_new(self.allocator.clone());
+        }
+        if selection
+            .as_ref()
+            .is_some_and(|selection| selection.len() != rows)
+        {
+            return Err(paro_error::data_corrupted(
+                "Column batch selection length does not match logical rows",
+            ));
         }
 
         let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
+        let selection = selection
+            .map(|indices| SelectionVector::try_from_owned_indices(indices, allocator.clone()))
+            .transpose()?;
         let mut batch_hint = 0usize;
 
         for (idx, col_id) in self.projection.iter().enumerate() {
@@ -86,14 +113,14 @@ impl TabletReader {
                 read_vectors.push(Arc::new(vector_decoder::decode_column_batch(
                     ty,
                     col_batch,
-                    rows,
+                    physical_rows,
                     allocator.clone(),
                     storage_provenance,
                 )?));
                 continue;
             }
 
-            if let Some(vector) = self.schema_fill_vector(rowset_id, idx, rows)? {
+            if let Some(vector) = self.schema_fill_vector(rowset_id, idx, physical_rows)? {
                 read_vectors.push(vector);
                 continue;
             }
@@ -107,9 +134,22 @@ impl TabletReader {
             } else {
                 read_vectors.push(Arc::new(Vector::try_constant_null(
                     ty.clone(),
-                    rows,
+                    physical_rows,
                     allocator.clone(),
                 )?));
+            }
+        }
+
+        if let Some(selection) = &selection {
+            for vector in &mut read_vectors {
+                if vector.len() == physical_rows {
+                    *vector = Arc::new(Vector::try_dictionary(vector.clone(), selection.clone())?);
+                } else if vector.len() != rows {
+                    return Err(paro_error::data_corrupted(format!(
+                        "Selected column vector has {} rows, expected {rows} logical or {physical_rows} physical rows",
+                        vector.len(),
+                    )));
+                }
             }
         }
 

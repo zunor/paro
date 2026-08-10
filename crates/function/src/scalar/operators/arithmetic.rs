@@ -9,6 +9,8 @@
 //! - Vector: ✅
 //! - Chunk: ✅
 
+mod direct_decimal;
+
 use crate::decimal::{
     pow10_checked, rescale_checked, round_divide_checked, to_i128, DecimalInteger,
     I128DecimalPrecision,
@@ -19,6 +21,7 @@ use crate::scalar::{
     BoundScalarFunction, ExpressionState, FunctionData, ScalarBindInput, ScalarFunction,
     ScalarFunctionSet,
 };
+use direct_decimal::execute_direct_decimal_rows;
 use ethnum::i256;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -307,10 +310,24 @@ fn decimal_result_type(
         }
         DecimalArithmeticOp::Mul => {
             let scale = left_scale.saturating_add(right_scale).min(38);
-            (
-                left_precision.saturating_add(right_precision).min(38),
-                scale,
-            )
+            let exact_precision = left_precision.saturating_add(right_precision);
+            // Keep multiplication inside the 64-bit DECIMAL domain when both
+            // operands already fit there. The exact product is computed in a
+            // wider intermediate and checked against DECIMAL(18, scale), so a
+            // value outside the declared result domain fails explicitly
+            // instead of forcing every row and downstream operator onto the
+            // substantially more expensive i128 representation. This also
+            // makes physical width stable under expression composition.
+            let precision = if exact_precision > 18
+                && left_precision <= 18
+                && right_precision <= 18
+                && scale < 18
+            {
+                18
+            } else {
+                exact_precision.min(38)
+            };
+            (precision, scale)
         }
         DecimalArithmeticOp::Div => {
             let scale = left_scale.saturating_add(right_scale).max(6).min(18);
@@ -371,6 +388,19 @@ fn execute_decimal_rows(
     let output = DecimalOutput::try_new(result)?;
     let precision_guard = I128DecimalPrecision::new(precision)?;
     let native_plan = NativeDecimalPlan::new(op, &left, &right, result_scale);
+    if execute_direct_decimal_rows(
+        &left,
+        &right,
+        output,
+        precision,
+        precision_guard,
+        result_scale,
+        op,
+        native_plan,
+        chunk.size(),
+    )? {
+        return Ok(());
+    }
     for row in 0..chunk.size() {
         if !left.is_valid(row) || !right.is_valid(row) {
             result.try_set_null(row, true)?;
@@ -1024,6 +1054,69 @@ mod tests {
             unsafe { result.get_fixed::<i128>(0) },
             4_000_000_000_000_000_000_000_000_000_000_000_000_i128
         );
+    }
+
+    #[test]
+    fn decimal_multiplication_preserves_i64_physical_domain() {
+        assert_eq!(
+            decimal_result_type(DecimalArithmeticOp::Mul, 15, 2, 16, 2),
+            LogicalType::Decimal {
+                precision: 18,
+                scale: 4,
+            }
+        );
+        assert_eq!(
+            decimal_result_type(DecimalArithmeticOp::Mul, 18, 4, 16, 2),
+            LogicalType::Decimal {
+                precision: 18,
+                scale: 6,
+            }
+        );
+    }
+
+    #[test]
+    fn decimal_i64_multiplication_is_exact_and_checks_declared_precision() {
+        let left_type = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let right_type = LogicalType::Decimal {
+            precision: 16,
+            scale: 2,
+        };
+        let mut set = ScalarFunctionSet::new("*".to_string());
+        register_arithmetic_functions(&mut set);
+        let (function, target_types) = set.bind(&[left_type.clone(), right_type.clone()]).unwrap();
+        let bound = function
+            .bind(&ScalarBindInput::new(target_types, vec![None, None]))
+            .unwrap();
+        let state = BindState {
+            bind_data: bound.bind_data.as_ref().unwrap().clone(),
+        };
+
+        let mut left = paro_common::test_utils::test_vector(left_type.clone());
+        left.set_count(2);
+        left.set_i64(0, 12_345);
+        left.set_i64(1, 99_999);
+        let mut right = paro_common::test_utils::test_vector(right_type.clone());
+        right.set_count(2);
+        right.set_i64(0, 9_500);
+        right.set_i64(1, 8_000);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
+        let mut result = paro_common::test_utils::test_vector(bound.return_type.clone());
+        bound.execute(&chunk, &state, &mut result).unwrap();
+        assert_eq!(unsafe { result.get_fixed::<i64>(0) }, 117_277_500);
+        assert_eq!(unsafe { result.get_fixed::<i64>(1) }, 799_992_000);
+
+        let mut left = paro_common::test_utils::test_vector(left_type);
+        left.set_count(1);
+        left.set_i64(0, 999_999_999_999_999);
+        let mut right = paro_common::test_utils::test_vector(right_type);
+        right.set_count(1);
+        right.set_i64(0, 9_999_999_999_999_999);
+        let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![left, right]);
+        let mut result = paro_common::test_utils::test_vector(bound.return_type.clone());
+        assert!(bound.execute(&chunk, &state, &mut result).is_err());
     }
 
     #[test]

@@ -124,7 +124,7 @@ impl PerfectHashAggregateSinkExec {
                 ctx.query,
             )?
         } else {
-            input
+            &*input
         };
         let table = local.table.as_mut().ok_or_else(|| {
             paro_error::internal("perfect aggregate local table was already merged")

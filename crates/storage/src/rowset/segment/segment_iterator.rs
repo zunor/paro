@@ -7,7 +7,7 @@ use super::segment_predicate::PredicateEvaluator;
 use crate::buffer::{BufferPool, Prefetcher};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
-use crate::rowset::column::{ColumnBatch, ColumnIterator};
+use crate::rowset::column::{ColumnBatch, ColumnIterator, OrderedRowIds};
 use crate::tablet::ColumnId;
 use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
@@ -67,8 +67,10 @@ pub struct SegmentIterator {
     options: SegmentOptions,
     delete_vector: Option<DeleteVector>,
     pub(super) evaluated_selection: PredicateResult,
+    predicate_guaranteed: PredicateResult,
     predicate_evaluator: Option<PredicateEvaluator>,
     late_materialization: Option<LateMaterializationState>,
+    eager_predicate_matches: Vec<usize>,
     selection_tracker: ColumnDataBytesTracker,
     rowid_tracker: ColumnDataBytesTracker,
     prefetcher: Option<Arc<Prefetcher>>,
@@ -77,6 +79,11 @@ pub struct SegmentIterator {
 pub struct SegmentBatch {
     pub rowids: Vec<u32>,
     pub rows: usize,
+    /// Number of physical rows represented by every returned column batch.
+    /// This differs from `rows` only when `selection` overlays an eager batch.
+    pub physical_rows: usize,
+    /// Shared logical-to-physical mapping for an eager predicate result.
+    pub selection: Option<Vec<u32>>,
     pub columns: Vec<(ColumnId, ColumnBatch)>,
 }
 
@@ -107,6 +114,30 @@ struct LateMaterializationState {
     rowids: Vec<u32>,
     predicate_matches: Vec<usize>,
     reused_predicate_columns: Vec<ReusedPredicateColumn>,
+}
+
+/// Return whether `start` belongs to a predicate-proof range and the next
+/// ordinal at which that answer can change. Proof ranges are segment-relative.
+fn predicate_proof_span(proof: &PredicateResult, start: u64, scan_end: u64) -> (bool, u64) {
+    match proof {
+        PredicateResult::AllMatch => (true, scan_end),
+        PredicateResult::PageRanges(ranges) => {
+            for range in ranges {
+                let range_start = range.start_row as u64;
+                let range_end = range.end_row as u64;
+                if start < range_start {
+                    return (false, scan_end.min(range_start));
+                }
+                if start < range_end {
+                    return (true, scan_end.min(range_end));
+                }
+            }
+            (false, scan_end)
+        }
+        PredicateResult::NoneMatch | PredicateResult::Bitmap(_) | PredicateResult::Unknown => {
+            (false, scan_end)
+        }
+    }
 }
 
 impl ReusedPredicateColumn {
@@ -375,6 +406,8 @@ impl SegmentBatch {
         Self {
             rowids: Vec::new(),
             rows: 0,
+            physical_rows: 0,
+            selection: None,
             columns: Vec::new(),
         }
     }
@@ -412,8 +445,10 @@ impl SegmentIterator {
             options: segment.options.clone(),
             delete_vector: None,
             evaluated_selection: PredicateResult::Unknown,
+            predicate_guaranteed: PredicateResult::NoneMatch,
             predicate_evaluator: None,
             late_materialization: None,
+            eager_predicate_matches: Vec::new(),
             selection_tracker: ColumnDataBytesTracker::new(buffer_pool.clone()),
             rowid_tracker: ColumnDataBytesTracker::new(buffer_pool),
             prefetcher,
@@ -476,10 +511,12 @@ impl SegmentIterator {
         explicit_predicate_columns: Option<Vec<ColumnId>>,
     ) -> Result<()> {
         if let Some(tree) = predicate_tree {
+            let use_late_materialization = explicit_predicate_columns.is_some();
             let evaluator = IndexEvaluator::new(segment.predicate_indexes());
             let needs_row_level_eval =
                 PredicateEvaluator::predicate_tree_requires_row_verification(&tree)
                     || PredicateEvaluator::requires_row_level_predicate_eval(&evaluator, &tree);
+            self.predicate_guaranteed = evaluator.evaluate_guaranteed(&tree);
             self.evaluated_selection = evaluator.evaluate(&tree);
             if needs_row_level_eval {
                 if !matches!(
@@ -497,10 +534,11 @@ impl SegmentIterator {
                 self.prefetcher.clone(),
                 explicit_predicate_columns,
             )?;
-            self.late_materialization = self
-                .predicate_evaluator
-                .as_ref()
-                .map(|evaluator| LateMaterializationState::new(&self.column_iterators, evaluator));
+            self.late_materialization = self.predicate_evaluator.as_ref().and_then(|evaluator| {
+                (use_late_materialization
+                    || !evaluator.all_columns_projected(&self.column_iterators))
+                .then(|| LateMaterializationState::new(&self.column_iterators, evaluator))
+            });
         }
         Ok(())
     }
@@ -514,7 +552,7 @@ impl SegmentIterator {
 
     #[cfg(test)]
     pub(crate) fn uses_late_materialize(&self) -> bool {
-        self.predicate_evaluator.is_some()
+        self.late_materialization.is_some()
     }
 
     pub fn segment_id(&self) -> u32 {
@@ -581,6 +619,19 @@ impl SegmentIterator {
         &mut self,
         batch_size: usize,
     ) -> Result<(Vec<u32>, Vec<(ColumnId, ColumnBatch)>)> {
+        // This compact API cannot represent a logical selection over physical
+        // column batches. Force the materialized path before reading so its
+        // row ids and column values always have identical cardinality.
+        if self.predicate_evaluator.is_some() && self.late_materialization.is_none() {
+            let evaluator = self
+                .predicate_evaluator
+                .as_ref()
+                .expect("predicate evaluator was checked");
+            self.late_materialization = Some(LateMaterializationState::new(
+                &self.column_iterators,
+                evaluator,
+            ));
+        }
         let batch = self.next_batch_with_rowid_policy(batch_size, true)?;
         Ok((batch.rowids, batch.columns))
     }
@@ -590,8 +641,11 @@ impl SegmentIterator {
         batch_size: usize,
         materialize_sequential_rowids: bool,
     ) -> Result<SegmentBatch> {
+        if self.predicate_evaluator.is_some() && self.late_materialization.is_some() {
+            return self.next_batch_late_materialize(batch_size, materialize_sequential_rowids);
+        }
         if self.predicate_evaluator.is_some() {
-            return self.next_batch_late_materialize(batch_size);
+            return self.next_batch_eager_predicate(batch_size, materialize_sequential_rowids);
         }
 
         loop {
@@ -671,15 +725,17 @@ impl SegmentIterator {
                         .set(rowids.capacity() * std::mem::size_of::<u32>());
                     return Ok(SegmentBatch {
                         rows: rowids.len(),
+                        physical_rows: rowids.len(),
+                        selection: None,
                         rowids,
                         columns: Vec::new(),
                     });
                 }
 
-                let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
+                let ordered_rowids = OrderedRowIds::try_new(&rowids)?;
                 let mut results = Vec::with_capacity(self.column_iterators.len());
                 for (col_id, iter) in &mut self.column_iterators {
-                    let batch = iter.read_by_rowids(&rowids_u64)?;
+                    let batch = iter.read_by_ordered_rowids(&ordered_rowids)?;
                     results.push((*col_id, batch));
                 }
 
@@ -687,6 +743,8 @@ impl SegmentIterator {
                     .set(rowids.capacity() * std::mem::size_of::<u32>());
                 return Ok(SegmentBatch {
                     rows: rowids.len(),
+                    physical_rows: rowids.len(),
+                    selection: None,
                     rowids,
                     columns: results,
                 });
@@ -724,6 +782,8 @@ impl SegmentIterator {
                 return Ok(SegmentBatch {
                     rowids,
                     rows: to_read,
+                    physical_rows: to_read,
+                    selection: None,
                     columns: Vec::new(),
                 });
             }
@@ -756,12 +816,153 @@ impl SegmentIterator {
             return Ok(SegmentBatch {
                 rowids,
                 rows: rows_read,
+                physical_rows: rows_read,
+                selection: None,
                 columns: results,
             });
         }
     }
 
-    fn next_batch_late_materialize(&mut self, batch_size: usize) -> Result<SegmentBatch> {
+    fn next_batch_eager_predicate(
+        &mut self,
+        batch_size: usize,
+        materialize_sequential_rowids: bool,
+    ) -> Result<SegmentBatch> {
+        if batch_size == 0 {
+            return Ok(SegmentBatch::empty());
+        }
+
+        loop {
+            if self.current_ordinal >= self.end_ordinal
+                || matches!(self.evaluated_selection, PredicateResult::NoneMatch)
+            {
+                return Ok(SegmentBatch::empty());
+            }
+
+            if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
+                let Some(range) = ranges
+                    .iter()
+                    .find(|range| self.current_ordinal < range.end_row as u64)
+                else {
+                    self.current_ordinal = self.end_ordinal;
+                    return Ok(SegmentBatch::empty());
+                };
+                if self.current_ordinal < range.start_row as u64 {
+                    self.seek_columns_to_ordinal(range.start_row as u64)?;
+                }
+            }
+
+            let start_ordinal = self.current_ordinal;
+            let mut to_read = batch_size.min((self.end_ordinal - start_ordinal) as usize);
+            if let PredicateResult::PageRanges(ranges) = &self.evaluated_selection {
+                if let Some(range) = ranges
+                    .iter()
+                    .find(|range| start_ordinal < range.end_row as u64)
+                {
+                    to_read = to_read.min((range.end_row as u64 - start_ordinal) as usize);
+                }
+            }
+            let (predicate_guaranteed, proof_end) =
+                predicate_proof_span(&self.predicate_guaranteed, start_ordinal, self.end_ordinal);
+            to_read = to_read.min((proof_end - start_ordinal) as usize);
+
+            let mut columns = Vec::with_capacity(self.column_iterators.len());
+            let mut rows_read = None;
+            for (column_id, iterator) in &mut self.column_iterators {
+                let (count, batch) = iterator.next_batch(to_read)?;
+                if rows_read.is_some_and(|expected| expected != count) {
+                    return Err(paro_error::data_corrupted(
+                        "Eager predicate column row count mismatch",
+                    ));
+                }
+                rows_read = Some(count);
+                columns.push((*column_id, batch));
+            }
+            let rows_read = rows_read.unwrap_or(0);
+            if rows_read == 0 {
+                self.current_ordinal = start_ordinal + to_read as u64;
+                continue;
+            }
+            self.current_ordinal = start_ordinal + rows_read as u64;
+
+            if predicate_guaranteed {
+                self.eager_predicate_matches.clear();
+                self.eager_predicate_matches.extend(0..rows_read);
+            } else {
+                let predicate_batches = self
+                    .predicate_evaluator
+                    .as_ref()
+                    .expect("eager predicate mode requires an evaluator")
+                    .prepare_projected_batches(&columns, rows_read)?
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "eager predicate mode is missing a projected predicate column",
+                        )
+                    })?;
+                self.predicate_evaluator
+                    .as_ref()
+                    .expect("eager predicate mode requires an evaluator")
+                    .evaluate_batch(
+                        &predicate_batches,
+                        rows_read,
+                        &mut self.eager_predicate_matches,
+                    )?;
+            }
+
+            let selection_bitmap = match &self.evaluated_selection {
+                PredicateResult::Bitmap(bitmap) => Some(bitmap),
+                _ => None,
+            };
+            if selection_bitmap.is_some() || self.delete_vector.is_some() {
+                self.eager_predicate_matches.retain(|&row_idx| {
+                    let ordinal = start_ordinal + row_idx as u64;
+                    selection_bitmap.is_none_or(|bitmap| bitmap.contains(ordinal as u32))
+                        && self
+                            .delete_vector
+                            .as_ref()
+                            .is_none_or(|deletes| !deletes.is_deleted(ordinal as u32))
+                });
+            }
+            if self.eager_predicate_matches.is_empty() {
+                continue;
+            }
+
+            let all_match = self.eager_predicate_matches.len() == rows_read;
+            let selection = (!all_match).then(|| {
+                self.eager_predicate_matches
+                    .iter()
+                    .map(|&row| row as u32)
+                    .collect::<Vec<_>>()
+            });
+            let rowids = if materialize_sequential_rowids {
+                self.eager_predicate_matches
+                    .iter()
+                    .map(|&row| (start_ordinal + row as u64) as u32)
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            if rowids.is_empty() {
+                self.rowid_tracker.reset();
+            } else {
+                self.rowid_tracker
+                    .set(rowids.capacity() * std::mem::size_of::<u32>());
+            }
+            return Ok(SegmentBatch {
+                rowids,
+                rows: self.eager_predicate_matches.len(),
+                physical_rows: rows_read,
+                selection,
+                columns,
+            });
+        }
+    }
+
+    fn next_batch_late_materialize(
+        &mut self,
+        batch_size: usize,
+        materialize_sequential_rowids: bool,
+    ) -> Result<SegmentBatch> {
         if batch_size == 0 {
             self.rowid_tracker.reset();
             return Ok(SegmentBatch::empty());
@@ -786,7 +987,8 @@ impl SegmentIterator {
             if staged_rows >= batch_size
                 || (self.current_ordinal >= self.end_ordinal && staged_rows > 0)
             {
-                return self.materialize_staged_selection(batch_size);
+                return self
+                    .materialize_staged_selection(batch_size, materialize_sequential_rowids);
             }
             if self.current_ordinal >= self.end_ordinal {
                 self.rowid_tracker.reset();
@@ -820,7 +1022,10 @@ impl SegmentIterator {
                 }
             }
 
-            let remaining = (max_rowid - self.current_ordinal) as usize;
+            let start_ordinal = self.current_ordinal;
+            let (predicate_guaranteed, proof_end) =
+                predicate_proof_span(&self.predicate_guaranteed, start_ordinal, max_rowid);
+            let remaining = (proof_end - start_ordinal) as usize;
             let to_read = batch_size.min(remaining);
             let (rows_read, predicate_batches) = self
                 .predicate_evaluator
@@ -836,11 +1041,15 @@ impl SegmentIterator {
                 .late_materialization
                 .as_mut()
                 .expect("late materialization requires selection state");
-            self.predicate_evaluator
-                .as_ref()
-                .expect("late materialization requires predicate evaluator")
-                .evaluate_batch(&predicate_batches, rows_read, &mut state.predicate_matches)?;
-
+            if predicate_guaranteed {
+                state.predicate_matches.clear();
+                state.predicate_matches.extend(0..rows_read);
+            } else {
+                self.predicate_evaluator
+                    .as_ref()
+                    .expect("late materialization requires predicate evaluator")
+                    .evaluate_batch(&predicate_batches, rows_read, &mut state.predicate_matches)?;
+            }
             let selection_bitmap = match &self.evaluated_selection {
                 PredicateResult::Bitmap(bitmap) => Some(bitmap),
                 _ => None,
@@ -853,6 +1062,20 @@ impl SegmentIterator {
                         .as_ref()
                         .is_some_and(|deletes| deletes.is_deleted(ordinal as u32)))
             });
+            let dense_matches = (!materialize_sequential_rowids
+                && state.rowids.is_empty()
+                && dense_materialization_is_cheaper(state.predicate_matches.len(), rows_read))
+            .then(|| std::mem::take(&mut state.predicate_matches));
+            if let Some(predicate_matches) = dense_matches {
+                let dense_batch = self.materialize_dense_selection(
+                    start_ordinal,
+                    rows_read,
+                    &predicate_matches,
+                    materialize_sequential_rowids,
+                )?;
+                self.current_ordinal += rows_read as u64;
+                return Ok(dense_batch);
+            }
             for reused in &mut state.reused_predicate_columns {
                 let batch = predicate_batches
                     .get(reused.predicate_idx)
@@ -868,7 +1091,61 @@ impl SegmentIterator {
         }
     }
 
-    fn materialize_staged_selection(&mut self, batch_size: usize) -> Result<SegmentBatch> {
+    fn materialize_dense_selection(
+        &mut self,
+        start_ordinal: u64,
+        physical_rows: usize,
+        predicate_matches: &[usize],
+        materialize_sequential_rowids: bool,
+    ) -> Result<SegmentBatch> {
+        let mut columns = Vec::with_capacity(self.column_iterators.len());
+        for (column_id, iterator) in &mut self.column_iterators {
+            if iterator.current_ordinal() != start_ordinal {
+                iterator.seek_to_ordinal(start_ordinal)?;
+            }
+            let (rows_read, batch) = iterator.next_batch(physical_rows)?;
+            if rows_read != physical_rows {
+                return Err(paro_error::data_corrupted(
+                    "Dense predicate column row count mismatch",
+                ));
+            }
+            columns.push((*column_id, batch));
+        }
+
+        let rowids = if materialize_sequential_rowids {
+            predicate_matches
+                .iter()
+                .map(|&row_idx| (start_ordinal + row_idx as u64) as u32)
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if rowids.is_empty() {
+            self.rowid_tracker.reset();
+        } else {
+            self.rowid_tracker
+                .set(rowids.capacity() * std::mem::size_of::<u32>());
+        }
+        let selection = (predicate_matches.len() != physical_rows).then(|| {
+            predicate_matches
+                .iter()
+                .map(|&row_idx| row_idx as u32)
+                .collect::<Vec<_>>()
+        });
+        Ok(SegmentBatch {
+            rowids,
+            rows: predicate_matches.len(),
+            physical_rows,
+            selection,
+            columns,
+        })
+    }
+
+    fn materialize_staged_selection(
+        &mut self,
+        batch_size: usize,
+        materialize_sequential_rowids: bool,
+    ) -> Result<SegmentBatch> {
         let state = self
             .late_materialization
             .as_mut()
@@ -879,14 +1156,22 @@ impl SegmentIterator {
             .set(rowids.capacity() * std::mem::size_of::<u32>());
 
         if self.column_iterators.is_empty() {
+            let returned_rowids = if materialize_sequential_rowids {
+                rowids
+            } else {
+                self.rowid_tracker.reset();
+                Vec::new()
+            };
             return Ok(SegmentBatch {
                 rows,
-                rowids,
+                physical_rows: rows,
+                selection: None,
+                rowids: returned_rowids,
                 columns: Vec::new(),
             });
         }
 
-        let rowids_u64: Vec<u64> = rowids.iter().map(|&id| id as u64).collect();
+        let ordered_rowids = OrderedRowIds::try_new(&rowids)?;
         let mut columns = Vec::with_capacity(self.column_iterators.len());
         for (column_id, iter) in &mut self.column_iterators {
             let reused_batch = state
@@ -898,14 +1183,24 @@ impl SegmentIterator {
                 .flatten();
             let batch = match reused_batch {
                 Some(batch) => batch,
-                None => iter.read_by_rowids(&rowids_u64)?,
+                None => iter.read_by_ordered_rowids(&ordered_rowids)?,
             };
             columns.push((*column_id, batch));
         }
 
+        let returned_rowids = if materialize_sequential_rowids {
+            rowids
+        } else {
+            Vec::new()
+        };
+        if returned_rowids.is_empty() {
+            self.rowid_tracker.reset();
+        }
         Ok(SegmentBatch {
             rows,
-            rowids,
+            physical_rows: rows,
+            selection: None,
+            rowids: returned_rowids,
             columns,
         })
     }
@@ -913,6 +1208,14 @@ impl SegmentIterator {
     pub fn num_columns(&self) -> usize {
         self.column_iterators.len()
     }
+}
+
+/// Ordered row-id gathering performs lookup and scatter work for every value.
+/// Sequential decoding wins once at least half of the physical batch survives;
+/// the threshold is the break-even point for the scan cost model's 2x gather
+/// access penalty.
+fn dense_materialization_is_cheaper(selected_rows: usize, physical_rows: usize) -> bool {
+    physical_rows != 0 && selected_rows.saturating_mul(2) >= physical_rows
 }
 
 impl std::fmt::Debug for SegmentIterator {

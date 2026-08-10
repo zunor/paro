@@ -129,6 +129,12 @@ pub trait BoundIndex: Index {
         PredicateResult::Unknown
     }
 
+    /// Rows for which this index proves the predicate true without row-level
+    /// verification. The default is an empty proof set.
+    fn evaluate_guaranteed_predicate(&self, _predicate: &Predicate) -> PredicateResult {
+        PredicateResult::NoneMatch
+    }
+
     // =========================================================================
     // Data Manipulation
     // =========================================================================

@@ -46,17 +46,23 @@ impl ColumnLifetimeAnalyzer {
                 LogicalOperator::Projection(proj)
             }
             LogicalOperator::Filter(mut filter) => {
+                let output_references = self.column_references.clone();
                 for expr in &filter.expressions {
                     self.visit_expression(expr);
                 }
 
-                // Keep full filter outputs here.
-                // Correlated-subquery plans can still contain stale column bindings before
-                // ColumnBindingResolver runs; filter-level projection pruning is unsafe there.
-                // We preserve correctness by deferring this optimization.
                 let child = *filter.child;
                 filter.child = Box::new(self.optimize_plan(child)?);
-                filter.projection_map = ProjectionMap::all();
+                let child_bindings = filter.child.get_column_bindings();
+                // Correlated-subquery flattening can temporarily leave stale
+                // bindings before physical reference resolution. Preserve the
+                // full carrier only for that explicit fallback; ordinary
+                // filters should not expose predicate-only columns upstream.
+                filter.projection_map = if self.has_unknown_references(&child_bindings) {
+                    ProjectionMap::all()
+                } else {
+                    self.generate_exact_projection_map(&child_bindings, &output_references)
+                };
                 LogicalOperator::Filter(filter)
             }
             LogicalOperator::Aggregate(mut agg) => {
@@ -395,12 +401,12 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::binder::ir::OrderByNode;
     use paro_planner::expression::{
-        ColumnRefExpression, Expression, WindowExpression, WindowFrame, WindowFrameBound,
-        WindowFrameType,
+        ColumnRefExpression, ComparisonExpression, ComparisonType, Expression, WindowExpression,
+        WindowFrame, WindowFrameBound, WindowFrameType,
     };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
-        JoinType, LogicalOperator, Order, Projection,
+        ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Join, JoinComparisonType,
+        JoinCondition, JoinType, LogicalOperator, Order, Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -616,5 +622,56 @@ mod tests {
             panic!("expected order");
         };
         assert_eq!(order.projection_map.as_columns(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn filter_key_is_an_execution_dependency_not_an_output_dependency() {
+        let ctx = BindContext::new();
+        let input = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["filter_key".into(), "payload".into()],
+                vec![LogicalType::Integer, LogicalType::BigInt],
+            )),
+        );
+        let filter = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Filter(Filter::new(
+                input,
+                vec![Expression::Comparison(ComparisonExpression::new(
+                    ComparisonType::GreaterThan,
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    )),
+                ))],
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                filter,
+                vec![Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(10, 1),
+                    LogicalType::BigInt,
+                ))],
+            )),
+        );
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Projection(projection) = optimized.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Filter(filter) = projection.child.operator else {
+            panic!("expected filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[1][..]));
     }
 }

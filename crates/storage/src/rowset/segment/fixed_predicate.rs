@@ -331,7 +331,12 @@ impl FixedComparisonValues {
         seed: bool,
     ) -> Result<()> {
         match self {
-            Self::I32(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
+            Self::I32(kernel) => {
+                if try_filter_seed_i32_batch(batch, kernel, rows, selection, seed) {
+                    return Ok(());
+                }
+                filter_fixed_batch(batch, kernel, rows, selection, seed)
+            }
             Self::I64(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
             Self::I128(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
         }
@@ -344,6 +349,86 @@ impl FixedComparisonValues {
             Self::I128(kernel) => kernel.evaluation_priority(),
         }
     }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+fn try_filter_seed_i32_batch(
+    batch: &PredicateColumnBatch,
+    kernel: &FixedConjunction<i32>,
+    rows: usize,
+    selection: &mut Vec<usize>,
+    seed: bool,
+) -> bool {
+    use core::arch::aarch64::{vcleq_s32, vdupq_n_s32, vld1q_s32, vst1q_u32};
+
+    let PredicateColumnBatch::Raw(batch) = batch else {
+        return false;
+    };
+    let (None, Some(upper_bound)) = (kernel.lower, kernel.upper) else {
+        return false;
+    };
+    if !seed
+        || batch.nulls.is_some()
+        || !upper_bound.inclusive
+        || kernel.contradiction
+        || kernel.equality.is_some()
+        || kernel.inclusions.is_some()
+        || !kernel.exclusions.is_empty()
+    {
+        return false;
+    }
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let input = batch.data.as_ptr().cast::<i32>();
+    let upper_vector = unsafe { vdupq_n_s32(upper_bound.value) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 4 <= rows {
+        let values = unsafe { vld1q_s32(input.add(row)) };
+        let matched = unsafe { vcleq_s32(values, upper_vector) };
+        let mut lanes = [0u32; 4];
+        unsafe { vst1q_u32(lanes.as_mut_ptr(), matched) };
+        if lanes == [u32::MAX; 4] {
+            unsafe {
+                output.add(written).write(row);
+                output.add(written + 1).write(row + 1);
+                output.add(written + 2).write(row + 2);
+                output.add(written + 3).write(row + 3);
+            }
+            written += 4;
+        } else {
+            for (lane, &matched) in lanes.iter().enumerate() {
+                if matched != 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 4;
+    }
+    while row < rows {
+        let value = i32::from_le(unsafe { input.add(row).read_unaligned() });
+        if value <= upper_bound.value {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
+}
+
+#[cfg(not(all(target_arch = "aarch64", target_endian = "little")))]
+fn try_filter_seed_i32_batch(
+    _batch: &PredicateColumnBatch,
+    _kernel: &FixedConjunction<i32>,
+    _rows: usize,
+    _selection: &mut Vec<usize>,
+    _seed: bool,
+) -> bool {
+    false
 }
 
 fn filter_fixed_batch<T: FixedPhysical>(
@@ -507,11 +592,19 @@ fn filter_selection<T, L, V, P>(
     P: Fn(T) -> bool,
 {
     if seed {
+        selection.reserve(rows);
+        let start = selection.len();
+        let spare = selection.spare_capacity_mut();
+        let mut written = 0usize;
         for row_idx in 0..rows {
             if valid(row_idx) && predicate(load(row_idx)) {
-                selection.push(row_idx);
+                spare[written].write(row_idx);
+                written += 1;
             }
         }
+        // SAFETY: exactly `written` consecutive entries in the spare capacity
+        // were initialized above, and reserve ensured room for `rows` entries.
+        unsafe { selection.set_len(start + written) };
         return;
     }
 

@@ -363,6 +363,7 @@ mod tests {
             state_filter: None,
             simple_update: None,
             distinct_run_update: None,
+            direct_update: None,
             destructor: None,
             state_serialize: None,
             state_deserialize: None,

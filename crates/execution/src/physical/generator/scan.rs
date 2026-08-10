@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
@@ -24,7 +25,7 @@ impl PhysicalPlanGenerator {
         } else {
             (None, Vec::new())
         };
-        let spec = self.rowset_scan_spec(get, runtime_predicate, runtime_residual)?;
+        let spec = self.rowset_scan_spec(get, runtime_predicate, runtime_residual, None)?;
         Ok((PhysicalNodeKind::RowsetScan(spec), Vec::new()))
     }
 
@@ -33,6 +34,7 @@ impl PhysicalPlanGenerator {
         get: &Get,
         predicate: Option<PredicateTree>,
         residual_predicates: Vec<Expression>,
+        estimated_selectivity: Option<f64>,
     ) -> Result<RowsetScanSpec> {
         let Some(table) = get.table.clone() else {
             return Err(paro_error::internal(
@@ -59,8 +61,13 @@ impl PhysicalPlanGenerator {
             }
         }
 
-        let late_materialize = self.ctx.rowset_scan_pushdown
-            && should_late_materialize(&predicate, &column_ids, emit_row_id, table_column_count);
+        let late_materialize = should_late_materialize(
+            &predicate,
+            &column_ids,
+            emit_row_id,
+            &table,
+            estimated_selectivity,
+        );
 
         Ok(RowsetScanSpec {
             table_index: get.table_index,
@@ -126,6 +133,7 @@ impl PhysicalPlanGenerator {
     pub(crate) fn lower_filter(
         &mut self,
         filter: &LogicalFilter,
+        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         if filter
             .projection_map
@@ -144,7 +152,7 @@ impl PhysicalPlanGenerator {
         if self.ctx.rowset_scan_pushdown {
             if let LogicalOperator::Get(get) = &filter.child.operator {
                 if get.table.is_some() {
-                    return self.lower_filter_over_get(filter, get);
+                    return self.lower_filter_over_get(filter, get, filter_cardinality);
                 }
             }
         }
@@ -172,6 +180,7 @@ impl PhysicalPlanGenerator {
         &mut self,
         filter: &LogicalFilter,
         get: &Get,
+        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let (filter_predicate, mut residual) =
             predicate_builder::build_predicate_tree(&filter.expressions, get)?;
@@ -181,11 +190,19 @@ impl PhysicalPlanGenerator {
 
         let predicate =
             predicate_builder::combine_predicate_trees(filter_predicate, runtime_predicate);
-        let mut scan_spec = self.rowset_scan_spec(get, predicate, residual.clone())?;
+        // A residual predicate is evaluated above the scan, so the filter's
+        // output cardinality is not a valid estimate of storage-predicate
+        // selectivity in that case.
+        let estimated_selectivity = residual
+            .is_empty()
+            .then(|| estimated_filter_selectivity(filter, filter_cardinality))
+            .flatten();
+        let mut scan_spec =
+            self.rowset_scan_spec(get, predicate, residual.clone(), estimated_selectivity)?;
 
         if residual.is_empty() {
             let projection = filter.projection_map.to_indices(filter.child.types().len());
-            project_rowset_scan_spec(&mut scan_spec, get, &projection)?;
+            project_rowset_scan_spec(&mut scan_spec, get, &projection, estimated_selectivity)?;
             return Ok((PhysicalNodeKind::RowsetScan(scan_spec), Vec::new()));
         }
 
@@ -513,6 +530,7 @@ fn project_rowset_scan_spec(
     spec: &mut RowsetScanSpec,
     get: &Get,
     projection_map: &[usize],
+    estimated_selectivity: Option<f64>,
 ) -> Result<()> {
     let table_column_count = spec.table.columns.len();
     let mut output_names = Vec::with_capacity(projection_map.len());
@@ -568,19 +586,43 @@ fn project_rowset_scan_spec(
     spec.emit_row_id = emit_row_id;
     spec.late_materialize = should_late_materialize(
         &spec.predicate,
-        spec.column_ids.as_ref(),
-        spec.emit_row_id,
-        table_column_count,
+        &spec.column_ids,
+        emit_row_id,
+        &spec.table,
+        estimated_selectivity,
     );
     Ok(())
 }
 
+fn estimated_filter_selectivity(
+    filter: &LogicalFilter,
+    filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+) -> Option<f64> {
+    let input = filter.child.stats.estimated_cardinality?.expected;
+    let output = filter_cardinality?.expected;
+    if input == 0 {
+        return Some(0.0);
+    }
+    Some((output as f64 / input as f64).clamp(0.0, 1.0))
+}
+
+/// Choose between eager sequential decoding and late row-id gathering.
+///
+/// The model compares bytes touched rather than query shapes. Sequential input
+/// costs one unit per byte, while sparse gathers carry an additional access
+/// penalty because every selected value performs row lookup and scatter work.
+/// Unknown selectivity deliberately favors late materialization, which bounds
+/// work for selective runtime filters without specializing for any workload.
 fn should_late_materialize(
     predicate: &Option<PredicateTree>,
     column_ids: &[usize],
     emit_row_id: bool,
-    table_column_count: usize,
+    table: &TableCatalogEntry,
+    estimated_selectivity: Option<f64>,
 ) -> bool {
+    const UNKNOWN_SELECTIVITY: f64 = 0.25;
+    const GATHER_ACCESS_PENALTY: f64 = 2.0;
+
     let Some(predicate) = predicate else {
         return false;
     };
@@ -590,11 +632,39 @@ fn should_late_materialize(
     }
 
     let output_columns = if column_ids.is_empty() && !emit_row_id {
-        (0..table_column_count).collect::<Vec<_>>()
+        (0..table.columns.len()).collect::<Vec<_>>()
     } else {
         column_ids.to_vec()
     };
-    output_columns
+    let output_columns = output_columns.into_iter().collect::<HashSet<_>>();
+    let deferred_width = output_columns
         .iter()
-        .any(|column_id| !predicate_columns.contains(&(*column_id as u32)))
+        .filter(|column_id| !predicate_columns.contains(&(**column_id as u32)))
+        .filter_map(|column_id| table.columns.get(*column_id))
+        .map(|column| column.logical_type.physical_size().max(1))
+        .sum::<usize>();
+    if deferred_width == 0 {
+        return false;
+    }
+
+    let predicate_width = predicate_columns
+        .iter()
+        .filter_map(|column_id| table.columns.get(*column_id as usize))
+        .map(|column| column.logical_type.physical_size().max(1))
+        .sum::<usize>();
+    let predicate_column_ids = predicate_columns
+        .iter()
+        .map(|column_id| *column_id as usize)
+        .collect::<HashSet<_>>();
+    let eager_width = output_columns
+        .union(&predicate_column_ids)
+        .filter_map(|column_id| table.columns.get(*column_id))
+        .map(|column| column.logical_type.physical_size().max(1))
+        .sum::<usize>();
+    let selectivity = estimated_selectivity
+        .unwrap_or(UNKNOWN_SELECTIVITY)
+        .clamp(0.0, 1.0);
+    let late_cost =
+        predicate_width as f64 + selectivity * deferred_width as f64 * GATHER_ACCESS_PENALTY;
+    late_cost < eager_width as f64
 }

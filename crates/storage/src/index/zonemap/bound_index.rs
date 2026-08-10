@@ -335,6 +335,71 @@ impl ZoneMapIndex {
         }
     }
 
+    fn guaranteed_pages(&self, predicate: &Predicate) -> PredicateResult {
+        let Some(logical_type) = self.logical_type() else {
+            return PredicateResult::NoneMatch;
+        };
+        let encoded = |value: &Value| value_to_bytes(value, logical_type).ok();
+        let cmp = |left: &[u8], right: &[u8]| compare_bytes(logical_type, left, right).ok();
+        let ranges = self.page_ranges_or_default();
+        let mut guaranteed = Vec::new();
+        for (page_idx, range) in ranges.iter().enumerate() {
+            if self.reader.page_has_null(page_idx) {
+                continue;
+            }
+            let Some((minimum, maximum)) = self.reader.page_min_max(page_idx) else {
+                continue;
+            };
+            let proven = match predicate {
+                Predicate::Eq { value, .. } => encoded(value).is_some_and(|value| {
+                    cmp(minimum, &value).is_some_and(|order| order.is_eq())
+                        && cmp(maximum, &value).is_some_and(|order| order.is_eq())
+                }),
+                Predicate::NotEq { value, .. } => encoded(value).is_some_and(|value| {
+                    cmp(&value, minimum).is_some_and(|order| order.is_lt())
+                        || cmp(&value, maximum).is_some_and(|order| order.is_gt())
+                }),
+                Predicate::Lt { value, .. } => encoded(value)
+                    .is_some_and(|value| cmp(maximum, &value).is_some_and(|order| order.is_lt())),
+                Predicate::Le { value, .. } => encoded(value)
+                    .is_some_and(|value| cmp(maximum, &value).is_some_and(|order| !order.is_gt())),
+                Predicate::Gt { value, .. } => encoded(value)
+                    .is_some_and(|value| cmp(minimum, &value).is_some_and(|order| order.is_gt())),
+                Predicate::Ge { value, .. } => encoded(value)
+                    .is_some_and(|value| cmp(minimum, &value).is_some_and(|order| !order.is_lt())),
+                Predicate::Range { lower, upper, .. } => encoded(lower)
+                    .zip(encoded(upper))
+                    .is_some_and(|(lower, upper)| {
+                        cmp(minimum, &lower).is_some_and(|order| !order.is_lt())
+                            && cmp(maximum, &upper).is_some_and(|order| !order.is_gt())
+                    }),
+                Predicate::In { values, .. } => {
+                    cmp(minimum, maximum).is_some_and(|order| order.is_eq())
+                        && values.iter().any(|value| {
+                            encoded(value).is_some_and(|value| {
+                                cmp(minimum, &value).is_some_and(|order| order.is_eq())
+                            })
+                        })
+                }
+                Predicate::IsNotNull { .. } => true,
+                Predicate::IsNull { .. }
+                | Predicate::FixedIn { .. }
+                | Predicate::StringPrefix { .. }
+                | Predicate::ColumnComparison { .. } => false,
+            };
+            if proven {
+                guaranteed.push(*range);
+            }
+        }
+        if guaranteed.is_empty() {
+            PredicateResult::NoneMatch
+        } else if guaranteed.len() == ranges.len() {
+            PredicateResult::AllMatch
+        } else {
+            PredicateResult::PageRanges(guaranteed)
+        }
+    }
+
     /// Load from IndexStorageInfo buffers/options.
     pub fn from_storage_info(
         input: &crate::index::CreateIndexInput,
@@ -470,6 +535,13 @@ impl BoundIndex for ZoneMapIndex {
             | Predicate::StringPrefix { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
+    }
+
+    fn evaluate_guaranteed_predicate(&self, predicate: &Predicate) -> PredicateResult {
+        if self.column_ids.len() != 1 || predicate.index_column_id() != Some(self.column_ids[0]) {
+            return PredicateResult::NoneMatch;
+        }
+        self.guaranteed_pages(predicate)
     }
 }
 

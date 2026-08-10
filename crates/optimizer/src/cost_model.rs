@@ -12,7 +12,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
-use paro_storage::statistics::ColumnStatistics;
+use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 const MIN_SELECTIVITY: f64 = 0.000_001;
 
@@ -287,9 +287,7 @@ impl CostModel {
             self.defaults.equality
         };
 
-        let Some(column_ref) = column_ref_with_constant(&expr.left, &expr.right)
-            .or_else(|| column_ref_with_constant(&expr.right, &expr.left))
-        else {
+        let Some((column_ref, constant, comparison_type)) = column_constant_comparison(expr) else {
             return default;
         };
 
@@ -297,22 +295,28 @@ impl CostModel {
             return default;
         };
 
-        let distinct = stats.get_distinct_count();
-        if distinct == 0 {
-            return default;
-        }
-
-        match expr.comparison_type {
+        match comparison_type {
             ComparisonType::Equal | ComparisonType::NotDistinctFrom => {
+                let distinct = stats.get_distinct_count();
+                if distinct == 0 {
+                    return default;
+                }
                 (1.0 / distinct as f64).max(MIN_SELECTIVITY)
             }
             ComparisonType::NotEqual | ComparisonType::DistinctFrom => {
+                let distinct = stats.get_distinct_count();
+                if distinct == 0 {
+                    return default;
+                }
                 (1.0 - (1.0 / distinct as f64)).clamp(MIN_SELECTIVITY, 1.0)
             }
             ComparisonType::LessThan
             | ComparisonType::LessThanOrEqual
             | ComparisonType::GreaterThan
-            | ComparisonType::GreaterThanOrEqual => self.defaults.range,
+            | ComparisonType::GreaterThanOrEqual => {
+                estimate_range_selectivity(stats, constant, comparison_type)
+                    .unwrap_or(self.defaults.range)
+            }
         }
     }
 
@@ -364,12 +368,141 @@ fn clamp_selectivity(value: f64) -> f64 {
     }
 }
 
-fn column_ref_with_constant<'a>(
-    candidate: &'a Expression,
-    other: &'a Expression,
-) -> Option<&'a ColumnRefExpression> {
-    match (candidate, other) {
-        (Expression::ColumnRef(column_ref), Expression::Constant(_)) => Some(column_ref),
+fn column_constant_comparison(
+    expression: &ComparisonExpression,
+) -> Option<(&ColumnRefExpression, &Value, ComparisonType)> {
+    match (expression.left.as_ref(), expression.right.as_ref()) {
+        (Expression::ColumnRef(column), Expression::Constant(constant)) => {
+            Some((column, &constant.value, expression.comparison_type))
+        }
+        (Expression::Constant(constant), Expression::ColumnRef(column)) => Some((
+            column,
+            &constant.value,
+            reverse_comparison(expression.comparison_type),
+        )),
+        _ => None,
+    }
+}
+
+fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
+    match comparison_type {
+        ComparisonType::LessThan => ComparisonType::GreaterThan,
+        ComparisonType::LessThanOrEqual => ComparisonType::GreaterThanOrEqual,
+        ComparisonType::GreaterThan => ComparisonType::LessThan,
+        ComparisonType::GreaterThanOrEqual => ComparisonType::LessThanOrEqual,
+        other => other,
+    }
+}
+
+/// Estimate an ordered comparison from complete-population numeric bounds.
+///
+/// Integral domains use their exact number of representable values so that
+/// inclusive and exclusive predicates differ at the endpoints. Floating-point
+/// domains use the conventional continuous uniform approximation.
+fn estimate_range_selectivity(
+    stats: &ColumnStatistics,
+    constant: &Value,
+    comparison_type: ComparisonType,
+) -> Option<f64> {
+    let minimum = NumericStats::min(stats.statistics())?;
+    let maximum = NumericStats::max(stats.statistics())?;
+
+    if let (Some(minimum), Some(maximum), Some(constant)) = (
+        ordered_integral_value(&minimum),
+        ordered_integral_value(&maximum),
+        ordered_integral_value(constant),
+    ) {
+        if minimum > maximum {
+            return None;
+        }
+        let domain = maximum.saturating_sub(minimum).saturating_add(1) as f64;
+        let matching = match comparison_type {
+            ComparisonType::LessThan if constant <= minimum => 0,
+            ComparisonType::LessThan => constant.saturating_sub(minimum),
+            ComparisonType::LessThanOrEqual if constant < minimum => 0,
+            ComparisonType::LessThanOrEqual => constant.saturating_sub(minimum).saturating_add(1),
+            ComparisonType::GreaterThan if constant >= maximum => 0,
+            ComparisonType::GreaterThan => maximum.saturating_sub(constant),
+            ComparisonType::GreaterThanOrEqual if constant > maximum => 0,
+            ComparisonType::GreaterThanOrEqual => {
+                maximum.saturating_sub(constant).saturating_add(1)
+            }
+            _ => return None,
+        };
+        return Some(clamp_selectivity((matching as f64).min(domain) / domain));
+    }
+
+    let minimum = ordered_float_value(&minimum)?;
+    let maximum = ordered_float_value(&maximum)?;
+    let constant = ordered_float_value(constant)?;
+    if !minimum.is_finite() || !maximum.is_finite() || !constant.is_finite() || minimum > maximum {
+        return None;
+    }
+    if minimum == maximum {
+        return Some(match comparison_type {
+            ComparisonType::LessThan => {
+                if minimum < constant {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ComparisonType::LessThanOrEqual => {
+                if minimum <= constant {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ComparisonType::GreaterThan => {
+                if minimum > constant {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            ComparisonType::GreaterThanOrEqual => {
+                if minimum >= constant {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            _ => return None,
+        });
+    }
+    let below = ((constant - minimum) / (maximum - minimum)).clamp(0.0, 1.0);
+    Some(match comparison_type {
+        ComparisonType::LessThan | ComparisonType::LessThanOrEqual => below,
+        ComparisonType::GreaterThan | ComparisonType::GreaterThanOrEqual => 1.0 - below,
+        _ => return None,
+    })
+}
+
+fn ordered_integral_value(value: &Value) -> Option<u128> {
+    match value {
+        Value::Boolean(value) => Some(u128::from(*value)),
+        Value::TinyInt(value) => Some(u128::from((*value as u8) ^ (1 << 7))),
+        Value::SmallInt(value) => Some(u128::from((*value as u16) ^ (1 << 15))),
+        Value::Integer(value) | Value::Date(value) => Some(u128::from((*value as u32) ^ (1 << 31))),
+        Value::BigInt(value)
+        | Value::Timestamp(value)
+        | Value::TimestampTz(value)
+        | Value::Time(value) => Some(u128::from((*value as u64) ^ (1 << 63))),
+        Value::HugeInt(value) | Value::Decimal(value, ..) => Some((*value as u128) ^ (1 << 127)),
+        Value::UTinyInt(value) => Some(u128::from(*value)),
+        Value::USmallInt(value) => Some(u128::from(*value)),
+        Value::UInteger(value) => Some(u128::from(*value)),
+        Value::UBigInt(value) => Some(u128::from(*value)),
+        Value::UHugeInt(value) => Some(*value),
+        _ => None,
+    }
+}
+
+fn ordered_float_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Float(value) => Some(*value as f64),
+        Value::Double(value) => Some(*value),
         _ => None,
     }
 }
@@ -449,6 +582,71 @@ mod tests {
         assert_eq!(
             model.estimate_selectivity(&expr, &HashMap::new()),
             model.defaults.equality
+        );
+    }
+
+    #[test]
+    fn integral_range_selectivity_uses_bounds_and_preserves_orientation() {
+        let model = CostModel::default();
+        let binding = ColumnBinding::new(1, 0);
+        let mut stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Date),
+        );
+        NumericStats::set_guaranteed_min(stats.statistics_mut(), &Value::Date(0));
+        NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Date(100));
+        let column_stats = HashMap::from([(binding, Arc::new(stats))]);
+        let column = || Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Date));
+        let constant =
+            || Expression::Constant(ConstantExpression::new(Value::Date(90), LogicalType::Date));
+        let upper_bound = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::LessThanOrEqual,
+            column(),
+            constant(),
+        ));
+        let reversed = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThanOrEqual,
+            constant(),
+            column(),
+        ));
+
+        let expected = 91.0 / 101.0;
+        assert_eq!(
+            model.estimate_selectivity(&upper_bound, &column_stats),
+            expected
+        );
+        assert_eq!(
+            model.estimate_selectivity(&reversed, &column_stats),
+            expected
+        );
+    }
+
+    #[test]
+    fn integral_range_selectivity_handles_domain_boundaries() {
+        let mut stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+        );
+        NumericStats::set_guaranteed_min(stats.statistics_mut(), &Value::Integer(10));
+        NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Integer(20));
+
+        assert_eq!(
+            estimate_range_selectivity(&stats, &Value::Integer(9), ComparisonType::LessThanOrEqual,),
+            Some(0.0)
+        );
+        assert_eq!(
+            estimate_range_selectivity(
+                &stats,
+                &Value::Integer(21),
+                ComparisonType::GreaterThanOrEqual,
+            ),
+            Some(0.0)
+        );
+        assert_eq!(
+            estimate_range_selectivity(
+                &stats,
+                &Value::Integer(20),
+                ComparisonType::LessThanOrEqual,
+            ),
+            Some(1.0)
         );
     }
 

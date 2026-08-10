@@ -70,6 +70,57 @@ struct RowIdPageRun {
     span_len: usize,
 }
 
+trait RowIdSequence {
+    fn len(&self) -> usize;
+    fn pair(&self, index: usize) -> (usize, u64);
+}
+
+impl RowIdSequence for [(usize, u64)] {
+    fn len(&self) -> usize {
+        <[(usize, u64)]>::len(self)
+    }
+
+    #[inline]
+    fn pair(&self, index: usize) -> (usize, u64) {
+        self[index]
+    }
+}
+
+/// Strictly increasing physical row IDs validated once for a multi-column
+/// gather. The private representation prevents callers from bypassing the
+/// ordering contract.
+pub struct OrderedRowIds<'a>(&'a [u32]);
+
+impl<'a> OrderedRowIds<'a> {
+    pub fn try_new(rowids: &'a [u32]) -> Result<Self> {
+        if rowids.windows(2).any(|window| window[0] >= window[1]) {
+            return Err(paro_error::invalid_input(
+                "ordered row IDs must be strictly increasing",
+            ));
+        }
+        Ok(Self(rowids))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl RowIdSequence for OrderedRowIds<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    fn pair(&self, index: usize) -> (usize, u64) {
+        (index, u64::from(self.0[index]))
+    }
+}
+
 impl ColumnBatch {
     pub fn new(data: Bytes, nulls: Option<Bytes>) -> Self {
         Self {
@@ -214,6 +265,13 @@ pub trait ColumnIterator: Send + Sync {
     /// # Returns
     /// Data for the requested rows
     fn read_by_rowids(&mut self, rowids: &[u64]) -> Result<ColumnBatch>;
+
+    /// Read row IDs already ordered by ascending physical ordinal.
+    ///
+    /// Scan selection builders establish this order once for the whole
+    /// projected batch, so column readers can avoid independently sorting the
+    /// same row IDs for every projected column.
+    fn read_by_ordered_rowids(&mut self, rowids: &OrderedRowIds<'_>) -> Result<ColumnBatch>;
 
     /// Get the current row ordinal.
     fn current_ordinal(&self) -> u64;
@@ -714,28 +772,21 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         Ok(page_idx)
     }
 
-    fn next_rowid_page_run(
+    fn next_rowid_page_run<S: RowIdSequence + ?Sized>(
         &self,
-        sorted_rowids: &[(usize, u64)],
+        rowids: &S,
         idx: &mut usize,
     ) -> Result<RowIdPageRun> {
-        let page_idx = self.page_index_for_rowid(sorted_rowids[*idx].1)?;
+        let page_idx = self.page_index_for_rowid(rowids.pair(*idx).1)?;
         let page_end = self.page_end_ordinal(page_idx);
         let run_start = *idx;
         *idx += 1;
-        while *idx < sorted_rowids.len() && sorted_rowids[*idx].1 < page_end {
+        while *idx < rowids.len() && rowids.pair(*idx).1 < page_end {
             *idx += 1;
         }
 
-        let run = &sorted_rowids[run_start..*idx];
-        let span_start = run
-            .first()
-            .map(|&(_, rowid)| rowid)
-            .expect("run should not be empty");
-        let span_end = run
-            .last()
-            .map(|&(_, rowid)| rowid)
-            .expect("run should not be empty");
+        let span_start = rowids.pair(run_start).1;
+        let span_end = rowids.pair(*idx - 1).1;
         let span_len = usize::try_from(span_end - span_start + 1)
             .map_err(|_| paro_error::data_corrupted("rowid span overflow"))?;
 
@@ -977,9 +1028,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         )))
     }
 
-    fn try_read_varlen_storage_dictionary_by_rowids(
+    fn try_read_varlen_storage_dictionary_by_rowids<S: RowIdSequence + ?Sized>(
         &mut self,
-        sorted_rowids: &[(usize, u64)],
+        rowids: &S,
         total_rows: usize,
     ) -> Result<Option<ColumnBatch>> {
         let Some(dictionary) = self.dict_data.clone() else {
@@ -996,9 +1047,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         let mut utf8_verified = true;
 
         let mut idx = 0usize;
-        while idx < sorted_rowids.len() {
-            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
-            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+        while idx < rowids.len() {
+            let row_run = self.next_rowid_page_run(rowids, &mut idx)?;
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
@@ -1047,7 +1097,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 None
             };
 
-            for &(orig_idx, rowid) in run {
+            for run_idx in row_run.run_start..row_run.run_end {
+                let (orig_idx, rowid) = rowids.pair(run_idx);
                 let row_idx = usize::try_from(rowid - row_run.span_start)
                     .map_err(|_| paro_error::data_corrupted("dictionary row offset overflow"))?;
                 let code_offset = row_idx
@@ -1103,9 +1154,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         }))
     }
 
-    fn read_plain_varlen_by_rowids(
+    fn read_plain_varlen_by_rowids<S: RowIdSequence + ?Sized>(
         &mut self,
-        sorted_rowids: &[(usize, u64)],
+        rowids: &S,
         total_rows: usize,
     ) -> Result<ColumnBatch> {
         let mut values: Vec<Vec<u8>> = vec![Vec::new(); total_rows];
@@ -1118,9 +1169,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         let mut idx = 0usize;
         let mut page_run_seeks = 0usize;
         let mut utf8_verified = true;
-        while idx < sorted_rowids.len() {
-            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
-            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+        while idx < rowids.len() {
+            let row_run = self.next_rowid_page_run(rowids, &mut idx)?;
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
@@ -1134,7 +1184,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             }
             let row_ranges = Self::plain_varlen_row_ranges(&batch, count)?;
 
-            for &(orig_idx, rowid) in run {
+            for run_idx in row_run.run_start..row_run.run_end {
+                let (orig_idx, rowid) = rowids.pair(run_idx);
                 let row_idx = usize::try_from(rowid - row_run.span_start)
                     .map_err(|_| paro_error::data_corrupted("varlen row offset overflow"))?;
                 let Some(&(row_start, row_end)) = row_ranges.get(row_idx) else {
@@ -1171,9 +1222,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         })
     }
 
-    fn read_fixed_width_by_rowids(
+    fn read_fixed_width_by_rowids<S: RowIdSequence + ?Sized>(
         &mut self,
-        sorted_rowids: &[(usize, u64)],
+        rowids: &S,
         total_rows: usize,
         type_size: usize,
     ) -> Result<ColumnBatch> {
@@ -1189,9 +1240,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
         let mut idx = 0usize;
         let mut page_run_seeks = 0usize;
-        while idx < sorted_rowids.len() {
-            let row_run = self.next_rowid_page_run(sorted_rowids, &mut idx)?;
-            let run = &sorted_rowids[row_run.run_start..row_run.run_end];
+        while idx < rowids.len() {
+            let row_run = self.next_rowid_page_run(rowids, &mut idx)?;
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
@@ -1229,14 +1279,24 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                         decoder.count()
                     )));
                 }
-                decoder.gather_values_at(
-                    run.iter()
-                        .map(|&(orig_idx, rowid)| ((rowid - page_start) as u32, orig_idx)),
-                    &mut result,
-                )?;
+                // SAFETY: `run` belongs to the page selected by
+                // `next_rowid_page_run`; `page_span_end < decoder.count()`
+                // proves every sorted source index is in range. `orig_idx`
+                // came from enumerating the `total_rows` request that sized
+                // `result`, so every destination slot is in range.
+                unsafe {
+                    decoder.gather_values_at_validated(
+                        (row_run.run_start..row_run.run_end).map(|run_idx| {
+                            let (orig_idx, rowid) = rowids.pair(run_idx);
+                            ((rowid - page_start) as u32, orig_idx)
+                        }),
+                        &mut result,
+                    )?;
+                }
 
                 if let Some(ref mut nulls_out) = result_nulls {
-                    for &(orig_idx, rowid) in run {
+                    for run_idx in row_run.run_start..row_run.run_end {
+                        let (orig_idx, rowid) = rowids.pair(run_idx);
                         let span_idx =
                             usize::try_from(rowid - row_run.span_start).map_err(|_| {
                                 paro_error::data_corrupted("fixed-width null offset overflow")
@@ -1267,7 +1327,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 )));
             }
 
-            for &(orig_idx, rowid) in run {
+            for run_idx in row_run.run_start..row_run.run_end {
+                let (orig_idx, rowid) = rowids.pair(run_idx);
                 let row_idx = usize::try_from(rowid - row_run.span_start)
                     .map_err(|_| paro_error::data_corrupted("fixed-width row offset overflow"))?;
                 let src_start = row_idx
@@ -1413,19 +1474,36 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
         if let Some(type_size) = self.meta.type_size {
             let mut sorted_rowids: Vec<(usize, u64)> = rowids.iter().copied().enumerate().collect();
             sorted_rowids.sort_by_key(|&(_, rowid)| rowid);
-            self.read_fixed_width_by_rowids(&sorted_rowids, rowids.len(), type_size)
+            self.read_fixed_width_by_rowids(sorted_rowids.as_slice(), rowids.len(), type_size)
         } else {
             // Variable-length types keep their length-prefixed bytes after page-local span reads.
             let mut sorted_rowids: Vec<(usize, u64)> = rowids.iter().copied().enumerate().collect();
             sorted_rowids.sort_by_key(|&(_, rowid)| rowid);
 
-            if let Some(batch) =
-                self.try_read_varlen_storage_dictionary_by_rowids(&sorted_rowids, rowids.len())?
-            {
+            if let Some(batch) = self.try_read_varlen_storage_dictionary_by_rowids(
+                sorted_rowids.as_slice(),
+                rowids.len(),
+            )? {
                 return Ok(batch);
             }
 
-            self.read_plain_varlen_by_rowids(&sorted_rowids, rowids.len())
+            self.read_plain_varlen_by_rowids(sorted_rowids.as_slice(), rowids.len())
+        }
+    }
+
+    fn read_by_ordered_rowids(&mut self, rowids: &OrderedRowIds<'_>) -> Result<ColumnBatch> {
+        if rowids.is_empty() {
+            return Ok(ColumnBatch::empty());
+        }
+        if let Some(type_size) = self.meta.type_size {
+            self.read_fixed_width_by_rowids(rowids, rowids.len(), type_size)
+        } else {
+            if let Some(batch) =
+                self.try_read_varlen_storage_dictionary_by_rowids(rowids, rowids.len())?
+            {
+                return Ok(batch);
+            }
+            self.read_plain_varlen_by_rowids(rowids, rowids.len())
         }
     }
 
@@ -1525,6 +1603,10 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for FilteredColumnIterator<R> 
         self.inner.read_by_rowids(rowids)
     }
 
+    fn read_by_ordered_rowids(&mut self, rowids: &OrderedRowIds<'_>) -> Result<ColumnBatch> {
+        self.inner.read_by_ordered_rowids(rowids)
+    }
+
     fn current_ordinal(&self) -> u64 {
         self.inner.current_ordinal()
     }
@@ -1560,6 +1642,14 @@ mod tests {
             None,
             PageReaderOptions::default(),
         )
+    }
+
+    #[test]
+    fn ordered_rowids_require_strict_order() {
+        assert!(OrderedRowIds::try_new(&[1, 2, 4]).is_ok());
+        assert!(OrderedRowIds::try_new(&[]).is_ok());
+        assert!(OrderedRowIds::try_new(&[1, 1]).is_err());
+        assert!(OrderedRowIds::try_new(&[2, 1]).is_err());
     }
 
     fn create_test_column() -> (Cursor<Vec<u8>>, ColumnReaderMeta, OrdinalIndexReader) {

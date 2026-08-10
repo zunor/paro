@@ -55,6 +55,15 @@ impl<'a> SelectionRef<'a> {
         }
     }
 
+    #[inline]
+    pub fn materialized_indices(&self) -> Option<&[u32]> {
+        match self {
+            Self::Borrowed(selection) => Some(selection.as_slice()),
+            Self::Owned(selection) => Some(selection.as_slice()),
+            Self::Range { .. } | Self::Constant { .. } | Self::Incremental { .. } => None,
+        }
+    }
+
     fn try_compose(self, selection: &'a VectorSelection, count: usize) -> Result<SelectionRef<'a>> {
         match (self, selection) {
             (SelectionRef::Borrowed(child_sel), VectorSelection::Materialized(sel)) => {
@@ -149,6 +158,7 @@ pub struct VectorView<'a> {
     sel: SelectionRef<'a>,
     validity: ValidityRef<'a>,
     data: DataRef,
+    physical_count: usize,
     _vector: PhantomData<&'a Vector>,
 }
 
@@ -171,6 +181,11 @@ impl<'a> VectorView<'a> {
     #[inline]
     pub fn data(&self) -> DataRef {
         self.data
+    }
+
+    #[inline]
+    pub fn physical_count(&self) -> usize {
+        self.physical_count
     }
 
     #[inline]
@@ -284,6 +299,7 @@ pub struct DecodedVectorRef<'a> {
     sel: SelectionRef<'a>,
     data: DataRef,
     validity: ValidityRef<'a>,
+    physical_count: usize,
 }
 
 impl<'a> DecodedVectorRef<'a> {
@@ -318,6 +334,11 @@ impl<'a> DecodedVectorRef<'a> {
     #[inline]
     pub fn validity(&self) -> &ValidityRef<'a> {
         &self.validity
+    }
+
+    #[inline]
+    pub fn physical_count(&self) -> usize {
+        self.physical_count
     }
 
     #[inline]
@@ -432,6 +453,7 @@ impl Vector {
                 sel: SelectionRef::Incremental { count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
+                physical_count: self.len(),
                 _vector: PhantomData,
             }),
             VectorType::Constant => Ok(VectorView {
@@ -439,6 +461,7 @@ impl Vector {
                 sel: SelectionRef::Constant { count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
+                physical_count: 1,
                 _vector: PhantomData,
             }),
             VectorType::Dictionary => {
@@ -450,6 +473,7 @@ impl Vector {
                     sel: child_view.sel.try_compose(&self.selection, count)?,
                     validity: child_view.validity,
                     data: child_view.data,
+                    physical_count: child_view.physical_count,
                     _vector: PhantomData,
                 })
             }
@@ -463,6 +487,7 @@ impl Vector {
                     sel: SelectionRef::Incremental { count },
                     validity: ValidityRef::Borrowed(&self.validity),
                     data: DataRef::SequenceI64 { start, increment },
+                    physical_count: count,
                     _vector: PhantomData,
                 })
             }
@@ -500,6 +525,7 @@ impl Vector {
             sel: view.sel,
             data: view.data,
             validity: view.validity,
+            physical_count: view.physical_count,
         })
     }
 

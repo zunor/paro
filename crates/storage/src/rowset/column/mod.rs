@@ -27,7 +27,7 @@ mod column_writer;
 pub use array_column_reader::{ArrayColumnIterator, ArrayColumnReaderMeta, ArrayValue};
 pub use array_column_writer::{ArrayColumnWriter, ArrayColumnWriterMeta};
 pub use column_iterator::{
-    ColumnBatch, ColumnIterator, FilteredColumnIterator, ScalarColumnIterator,
+    ColumnBatch, ColumnIterator, FilteredColumnIterator, OrderedRowIds, ScalarColumnIterator,
     StorageDictionaryBatch,
 };
 pub use column_reader::{

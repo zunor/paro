@@ -11,10 +11,11 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
-use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
+use paro_common::types::{InlineString, LogicalType};
+use paro_common::vector::{DecodedVectorRef, SelectionRef, SelectionVector, Vector};
 use paro_function::aggregate::{
-    AggregateCombineType, AggregateComparison, AggregateInputData, AggregateStateInput,
+    AggregateCombineType, AggregateComparison, AggregateDirectUpdate, AggregateInputData,
+    AggregateStateInput, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
 };
 
 use super::aggregate_kernel::{
@@ -51,6 +52,193 @@ struct PerfectHashSlotLayout {
     cardinalities: Vec<usize>,
     strides: Vec<usize>,
     slot_count: usize,
+}
+
+struct PreparedSingleByteVarcharPair<'a> {
+    left: *const InlineString,
+    left_selection: &'a SelectionRef<'a>,
+    right: *const InlineString,
+    right_selection: &'a SelectionRef<'a>,
+    left_selection_data: *const u32,
+    right_selection_data: *const u32,
+    shared_selection: bool,
+    minima: [i128; 2],
+    cardinalities: [usize; 2],
+    strides: [usize; 2],
+    left_codes: Option<[usize; 16]>,
+    right_codes: Option<[usize; 16]>,
+    pair_slots: Option<PreparedPairSlots>,
+}
+
+struct PreparedPairSlots {
+    slots: [usize; 16 * 16],
+    left_count: usize,
+    right_count: usize,
+}
+
+impl<'a> PreparedSingleByteVarcharPair<'a> {
+    fn try_new(
+        domains: &[PerfectHashKeyDomain],
+        minima: &[i128],
+        layout: &PerfectHashSlotLayout,
+        groups: &'a [DecodedVectorRef<'a>],
+    ) -> Result<Option<Self>> {
+        if domains.len() != 2
+            || domains
+                .iter()
+                .any(|domain| domain.logical_type() != &LogicalType::Varchar)
+            || minima.len() != 2
+            || groups.len() != 2
+            || !groups.iter().all(|group| group.validity().all_valid())
+        {
+            return Ok(None);
+        }
+        let left_codes = Self::precompute_codes(
+            groups[0].get_data::<InlineString>(),
+            groups[0].physical_count(),
+            minima[0],
+            layout.cardinalities[0],
+        )?;
+        let right_codes = Self::precompute_codes(
+            groups[1].get_data::<InlineString>(),
+            groups[1].physical_count(),
+            minima[1],
+            layout.cardinalities[1],
+        )?;
+        let pair_slots = left_codes
+            .as_ref()
+            .zip(right_codes.as_ref())
+            .map(|(left, right)| {
+                let left_count = groups[0].physical_count();
+                let right_count = groups[1].physical_count();
+                let mut slots = [0; 16 * 16];
+                for left_idx in 0..left_count {
+                    for right_idx in 0..right_count {
+                        slots[left_idx * right_count + right_idx] = left[left_idx]
+                            * layout.strides[0]
+                            + right[right_idx] * layout.strides[1];
+                    }
+                }
+                PreparedPairSlots {
+                    slots,
+                    left_count,
+                    right_count,
+                }
+            });
+        Ok(Some(Self {
+            left: groups[0].get_data::<InlineString>(),
+            left_selection: groups[0].sel(),
+            right: groups[1].get_data::<InlineString>(),
+            right_selection: groups[1].sel(),
+            left_selection_data: groups[0]
+                .sel()
+                .materialized_indices()
+                .map_or(std::ptr::null(), <[u32]>::as_ptr),
+            right_selection_data: groups[1]
+                .sel()
+                .materialized_indices()
+                .map_or(std::ptr::null(), <[u32]>::as_ptr),
+            shared_selection: groups[0]
+                .sel()
+                .allocation_identity()
+                .is_some_and(|identity| groups[1].sel().allocation_identity() == Some(identity)),
+            minima: [minima[0], minima[1]],
+            cardinalities: [layout.cardinalities[0], layout.cardinalities[1]],
+            strides: [layout.strides[0], layout.strides[1]],
+            left_codes,
+            right_codes,
+            pair_slots,
+        }))
+    }
+
+    #[inline(always)]
+    fn slot(&self, row: usize) -> Result<usize> {
+        let left_index = if self.left_selection_data.is_null() {
+            self.left_selection.get(row)
+        } else {
+            unsafe { *self.left_selection_data.add(row) as usize }
+        };
+        let right_index = if self.shared_selection {
+            left_index
+        } else if self.right_selection_data.is_null() {
+            self.right_selection.get(row)
+        } else {
+            unsafe { *self.right_selection_data.add(row) as usize }
+        };
+        if let Some(pair_slots) = &self.pair_slots {
+            if left_index >= pair_slots.left_count || right_index >= pair_slots.right_count {
+                return Err(paro_error::internal(
+                    "decoded perfect-hash pair index is out of bounds",
+                ));
+            }
+            return Ok(pair_slots.slots[left_index * pair_slots.right_count + right_index]);
+        }
+        let left = match &self.left_codes {
+            Some(codes) => *codes.get(left_index).ok_or_else(|| {
+                paro_error::internal("decoded left group key index is out of bounds")
+            })?,
+            None => self.adjust(unsafe { *self.left.add(left_index) }, 0)?,
+        };
+        let right = match &self.right_codes {
+            Some(codes) => *codes.get(right_index).ok_or_else(|| {
+                paro_error::internal("decoded right group key index is out of bounds")
+            })?,
+            None => self.adjust(unsafe { *self.right.add(right_index) }, 1)?,
+        };
+        Ok(left * self.strides[0] + right * self.strides[1])
+    }
+
+    #[inline(always)]
+    fn adjust(&self, value: InlineString, group_index: usize) -> Result<usize> {
+        Self::adjust_value(
+            value,
+            self.minima[group_index],
+            self.cardinalities[group_index],
+        )
+    }
+
+    fn adjust_value(value: InlineString, minimum: i128, cardinality: usize) -> Result<usize> {
+        let encoded = match value.as_bytes() {
+            [] => 0_i128,
+            [byte] => i128::from(*byte) + 1,
+            value => {
+                return Err(paro_error::internal(format!(
+                    "Single-byte perfect-hash key received VARCHAR length {}",
+                    value.len()
+                )))
+            }
+        };
+        let adjusted = encoded
+            .checked_sub(minimum)
+            .and_then(|value| value.checked_add(1))
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or_else(|| {
+                paro_error::internal("Perfect aggregate key is below the planned minimum")
+            })?;
+        if adjusted == 0 || adjusted >= cardinality {
+            return Err(paro_error::internal(format!(
+                "Perfect aggregate key exceeds planned range: adjusted={adjusted}, cardinality={}",
+                cardinality
+            )));
+        }
+        Ok(adjusted)
+    }
+
+    fn precompute_codes(
+        values: *const InlineString,
+        count: usize,
+        minimum: i128,
+        cardinality: usize,
+    ) -> Result<Option<[usize; 16]>> {
+        if count > 16 {
+            return Ok(None);
+        }
+        let mut codes = [0; 16];
+        for (index, code) in codes.iter_mut().take(count).enumerate() {
+            *code = Self::adjust_value(unsafe { *values.add(index) }, minimum, cardinality)?;
+        }
+        Ok(Some(codes))
+    }
 }
 
 impl PerfectHashSlotLayout {
@@ -130,6 +318,9 @@ pub struct PerfectAggregateHashTable {
     state_layout: AggregateStateLayout,
     aggregate_objects: Vec<AggregateObject>,
     aggregate_inputs: Vec<Vec<usize>>,
+    direct_update_program: Option<DirectGroupedAggregateProgram>,
+    direct_update_scratch: Option<DirectGroupedAggregateScratch>,
+    batch_slots: AccountedVec<usize>,
     // 0 = empty, 1 = occupied
     occupancy: AccountedVec<u8>,
     // Keep row storage 8-byte aligned so aggregate states can be safely cast to typed pointers.
@@ -204,6 +395,29 @@ impl PerfectAggregateHashTable {
         let total_groups = slot_layout.slot_count;
 
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
+        let mut direct_update_program = DirectGroupedAggregateProgram::new(aggregate_objects.len());
+        for (aggregate_index, object) in aggregate_objects.iter().enumerate() {
+            let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
+                continue;
+            };
+            if object.is_distinct() || object.filter.is_some() || !object.order_bys.is_empty() {
+                continue;
+            }
+            let input = direct_payload_input(object, inputs);
+            direct_update_program.try_add(
+                aggregate_index,
+                object.function.direct_update,
+                state_layout.state_offset(aggregate_index),
+                input,
+            );
+        }
+        let direct_update_program = direct_update_program
+            .is_worthwhile()
+            .then_some(direct_update_program);
+        let direct_update_scratch = match direct_update_program.as_ref() {
+            Some(program) => program.try_create_scratch(total_groups, &memory)?,
+            None => None,
+        };
         let row_width = state_layout.total_size().max(1);
         let total_bytes = row_width.checked_mul(total_groups).ok_or_else(|| {
             paro_error::internal(format!(
@@ -223,6 +437,12 @@ impl PerfectAggregateHashTable {
             MemoryAccountingClass::Metadata,
         )?;
         occupancy.try_resize_with(total_groups, || 0)?;
+        let mut batch_slots = accounted_vec_for_context(
+            &memory,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        )?;
+        batch_slots.try_reserve(paro_common::vector::VECTOR_SIZE)?;
         Ok(Self {
             group_domains,
             group_minima,
@@ -230,6 +450,9 @@ impl PerfectAggregateHashTable {
             state_layout,
             aggregate_objects,
             aggregate_inputs,
+            direct_update_program,
+            direct_update_scratch,
+            batch_slots,
             occupancy,
             data,
             row_width,
@@ -259,13 +482,80 @@ impl PerfectAggregateHashTable {
     ) -> Result<usize> {
         self.validate_group_chunk(groups)?;
         validate_addresses_vector(addresses, groups.size())?;
+        addresses.try_set_count(groups.size())?;
+        let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
+        if new_groups.capacity() < groups.size() {
+            *new_groups =
+                SelectionVector::try_with_capacity(groups.size(), groups.allocator().clone())?;
+        }
+        new_groups.set_len(groups.size());
+        let new_group_count =
+            self.find_or_create_groups_inner(groups, Some(address_data), Some(new_groups))?;
+        new_groups.set_len(new_group_count);
+        Ok(new_group_count)
+    }
 
+    /// Update a fully supported batch directly from perfect-hash slots.
+    ///
+    /// Returning `false` means no state was changed and the caller must use
+    /// the address-producing aggregate ABI.
+    pub fn try_update_direct_groups(&mut self, groups: &Chunk, payload: &Chunk) -> Result<bool> {
+        self.validate_group_chunk(groups)?;
+        if groups.size() != payload.size() {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate group/payload cardinality mismatch: groups={}, payload={}",
+                groups.size(),
+                payload.size()
+            )));
+        }
+        let Some(program) = self.direct_update_program.as_ref() else {
+            return Ok(false);
+        };
+        if !program.handles_all() || self.direct_update_scratch.is_none() {
+            return Ok(false);
+        }
+        let Some(prepared_input) = program.prepare_input(payload) else {
+            return Ok(false);
+        };
+
+        self.find_or_create_groups_inner(groups, None, None)?;
+        let state_base = self.data.as_mut_ptr().cast::<u8>();
+        let program = self
+            .direct_update_program
+            .as_ref()
+            .expect("direct program was validated");
+        let scratch = self
+            .direct_update_scratch
+            .as_mut()
+            .expect("direct scratch was validated");
+        let executed = unsafe {
+            program.execute_reduced_slots_prepared(
+                &prepared_input,
+                &self.batch_slots,
+                payload.size(),
+                scratch,
+                state_base,
+                self.row_width,
+            )?
+        };
+        if !executed {
+            return Err(paro_error::internal(
+                "validated direct perfect aggregate batch declined execution",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn find_or_create_groups_inner(
+        &mut self,
+        groups: &Chunk,
+        address_data: Option<*mut *mut u8>,
+        mut new_groups: Option<&mut SelectionVector>,
+    ) -> Result<usize> {
         if groups.size() == 0 {
-            addresses.try_set_count(0)?;
-            new_groups.set_len(0);
+            self.batch_slots.clear();
             return Ok(0);
         }
-
         let decoded_groups = (0..self.group_domains.len())
             .map(|group_idx| {
                 groups
@@ -278,37 +568,64 @@ impl PerfectAggregateHashTable {
                     .and_then(|column| column.try_decode_ref(groups.size()))
             })
             .collect::<Result<Vec<_>>>()?;
-
-        addresses.try_set_count(groups.size())?;
-        let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
-        if new_groups.capacity() < groups.size() {
-            *new_groups =
-                SelectionVector::try_with_capacity(groups.size(), groups.allocator().clone())?;
-        }
-        new_groups.set_len(groups.size());
+        self.batch_slots.clear();
         let mut new_group_count = 0usize;
-
-        for row_idx in 0..groups.size() {
-            let slot = self.compute_slot_from_decoded(&decoded_groups, row_idx)?;
-            let state_ptr = self.state_ptr(slot);
-            unsafe {
-                *address_data.add(row_idx) = state_ptr;
+        if let Some(keys) = PreparedSingleByteVarcharPair::try_new(
+            &self.group_domains,
+            &self.group_minima,
+            &self.slot_layout,
+            &decoded_groups,
+        )? {
+            for row_idx in 0..groups.size() {
+                let slot = keys.slot(row_idx)?;
+                self.batch_slots.try_push(slot)?;
+                let state_ptr = self.state_ptr(slot);
+                if let Some(address_data) = address_data {
+                    unsafe { *address_data.add(row_idx) = state_ptr };
+                }
+                if self.occupancy[slot] == 0 {
+                    self.initialize_state(state_ptr);
+                    self.occupancy[slot] = 1;
+                    self.count += 1;
+                    if let Some(new_groups) = new_groups.as_deref_mut() {
+                        new_groups.try_set(new_group_count, row_idx)?;
+                    }
+                    new_group_count += 1;
+                }
             }
-            if self.occupancy[slot] == 0 {
-                self.initialize_state(state_ptr);
-                self.occupancy[slot] = 1;
-                self.count += 1;
-                new_groups.try_set(new_group_count, row_idx)?;
-                new_group_count += 1;
+        } else {
+            for row_idx in 0..groups.size() {
+                let slot = self.compute_slot_from_decoded(&decoded_groups, row_idx)?;
+                self.batch_slots.try_push(slot)?;
+                let state_ptr = self.state_ptr(slot);
+                if let Some(address_data) = address_data {
+                    unsafe { *address_data.add(row_idx) = state_ptr };
+                }
+                if self.occupancy[slot] == 0 {
+                    self.initialize_state(state_ptr);
+                    self.occupancy[slot] = 1;
+                    self.count += 1;
+                    if let Some(new_groups) = new_groups.as_deref_mut() {
+                        new_groups.try_set(new_group_count, row_idx)?;
+                    }
+                    new_group_count += 1;
+                }
             }
         }
-
-        new_groups.set_len(new_group_count);
-        Ok(new_groups.len())
+        Ok(new_group_count)
     }
 
     /// Update aggregate states for a batch of input payload rows.
     pub fn update_aggregates(
+        &mut self,
+        payload: &Chunk,
+        addresses: &Vector,
+        filter: Option<&SelectionVector>,
+    ) -> Result<()> {
+        self.update_aggregates_inner(payload, addresses, filter)
+    }
+
+    fn update_aggregates_inner(
         &mut self,
         payload: &Chunk,
         addresses: &Vector,
@@ -328,16 +645,16 @@ impl PerfectAggregateHashTable {
             validate_filter(selection, payload.size())?;
         }
 
-        let payload_desc = AggregatePayload {
-            chunk: payload,
-            aggregate_inputs: &self.aggregate_inputs,
-        };
-        let mut input_data = AggregateInputData::new(
-            None,
-            &mut self.aggregate_allocator,
-            AggregateCombineType::PreserveInput,
-        );
         if let Some(selection) = filter {
+            let payload_desc = AggregatePayload {
+                chunk: payload,
+                aggregate_inputs: &self.aggregate_inputs,
+            };
+            let mut input_data = AggregateInputData::new(
+                None,
+                &mut self.aggregate_allocator,
+                AggregateCombineType::PreserveInput,
+            );
             update_filtered_states(
                 &self.aggregate_objects,
                 &mut input_data,
@@ -347,6 +664,60 @@ impl PerfectAggregateHashTable {
                 selection.len(),
             )?;
         } else {
+            if let Some(program) = self.direct_update_program.as_ref() {
+                let executed = match self.direct_update_scratch.as_mut() {
+                    Some(scratch) => unsafe {
+                        program.execute_reduced(
+                            payload,
+                            addresses,
+                            &self.batch_slots,
+                            payload.size(),
+                            scratch,
+                        )?
+                    },
+                    None => unsafe { program.execute(payload, addresses, payload.size())? },
+                };
+                if executed {
+                    let payload_desc = AggregatePayload {
+                        chunk: payload,
+                        aggregate_inputs: &self.aggregate_inputs,
+                    };
+                    let mut input_data = AggregateInputData::new(
+                        None,
+                        &mut self.aggregate_allocator,
+                        AggregateCombineType::PreserveInput,
+                    );
+                    let program = self
+                        .direct_update_program
+                        .as_ref()
+                        .expect("program was checked");
+                    for (agg_idx, object) in self.aggregate_objects.iter().enumerate() {
+                        if program.handles(agg_idx) {
+                            continue;
+                        }
+                        let inputs = input_vectors_for_aggregate(&payload_desc, agg_idx)?;
+                        let states = AggregateStateInput::try_new(
+                            addresses,
+                            self.state_layout.state_offset(agg_idx),
+                            None,
+                            payload.size(),
+                        )?;
+                        with_aggregate_input_data(object, &mut input_data, |aggr_input| unsafe {
+                            (object.function.update)(&inputs, &aggr_input, &states, payload.size());
+                        });
+                    }
+                    return Ok(());
+                }
+            }
+            let payload_desc = AggregatePayload {
+                chunk: payload,
+                aggregate_inputs: &self.aggregate_inputs,
+            };
+            let mut input_data = AggregateInputData::new(
+                None,
+                &mut self.aggregate_allocator,
+                AggregateCombineType::PreserveInput,
+            );
             update_states(
                 &self.aggregate_objects,
                 &mut input_data,
@@ -1017,6 +1388,13 @@ fn validate_aggregate_inputs(
         }
     }
     Ok(())
+}
+
+fn direct_payload_input(object: &AggregateObject, inputs: &[usize]) -> Option<usize> {
+    if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
+        return None;
+    }
+    inputs.first().copied()
 }
 
 fn validate_addresses_vector(addresses: &Vector, row_count: usize) -> Result<()> {

@@ -444,12 +444,21 @@ impl TabletReader {
             }
 
             // Fetch next batch from current rowset/segment
-            let (rowids, batch_v, batch_rows, segment_finished, rowset_id, segment_id) = {
+            let (
+                rowids,
+                batch_v,
+                batch_rows,
+                physical_rows,
+                selection,
+                segment_finished,
+                rowset_id,
+                segment_id,
+            ) = {
                 let cursor = self.current_cursor.as_mut().unwrap();
                 let rowset_id = cursor.rowset.rowset_id();
 
                 if cursor.is_finished() {
-                    (Vec::new(), Vec::new(), 0, true, rowset_id, 0)
+                    (Vec::new(), Vec::new(), 0, 0, None, true, rowset_id, 0)
                 } else {
                     let iter = cursor.next_iter().expect("segment iterator must exist");
                     let segment_id = iter.segment_id();
@@ -464,6 +473,8 @@ impl TabletReader {
                         segment_batch.rowids,
                         segment_batch.columns,
                         segment_batch.rows,
+                        segment_batch.physical_rows,
+                        segment_batch.selection,
                         finished,
                         rowset_id,
                         segment_id,
@@ -481,7 +492,13 @@ impl TabletReader {
             }
 
             // Infer row count (verifies against expected)
-            let rows = self.infer_row_count(&batch, batch_rows)?;
+            let inferred_physical_rows = self.infer_row_count(&batch, physical_rows)?;
+            if inferred_physical_rows != physical_rows {
+                return Err(paro_error::data_corrupted(
+                    "Segment batch physical row count mismatch",
+                ));
+            }
+            let rows = batch_rows;
 
             if rows == 0 {
                 // Empty batch – advance segment and continue
@@ -495,7 +512,15 @@ impl TabletReader {
                 continue;
             }
 
-            let chunk = self.build_chunk(&batch, rows, &rowids, rowset_id, segment_id)?;
+            let chunk = self.build_chunk_with_owned_selection(
+                &batch,
+                rows,
+                physical_rows,
+                selection,
+                &rowids,
+                rowset_id,
+                segment_id,
+            )?;
 
             self.state.rows_read += rows as u64;
 

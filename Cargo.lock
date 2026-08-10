@@ -1576,6 +1576,7 @@ name = "paro-common"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "bytes",
  "bytesize",
  "crc32c",
  "dirs",
@@ -1664,6 +1665,7 @@ dependencies = [
  "paro-storage",
  "regex",
  "serde_json",
+ "smallvec",
 ]
 
 [[package]]

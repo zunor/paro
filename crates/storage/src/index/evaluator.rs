@@ -87,6 +87,39 @@ impl IndexEvaluator {
         }
     }
 
+    /// Evaluate the subset of rows proven to satisfy a predicate tree.
+    ///
+    /// Candidate evaluation and proof evaluation deliberately remain
+    /// separate: a zone map page can be a candidate while only some pages are
+    /// strong enough to bypass row verification.
+    pub fn evaluate_guaranteed(&self, predicate_tree: &PredicateTree) -> PredicateResult {
+        match predicate_tree {
+            PredicateTree::Leaf(predicate) => self.evaluate_guaranteed_single(predicate),
+            PredicateTree::And(children) => {
+                children
+                    .iter()
+                    .fold(PredicateResult::AllMatch, |result, child| {
+                        let child = self.evaluate_guaranteed(child);
+                        match &self.page_layout {
+                            Some(layout) => intersect_with_layout(&result, &child, layout),
+                            None => intersect(&result, &child),
+                        }
+                    })
+            }
+            PredicateTree::Or(children) => {
+                children
+                    .iter()
+                    .fold(PredicateResult::NoneMatch, |result, child| {
+                        let child = self.evaluate_guaranteed(child);
+                        match &self.page_layout {
+                            Some(layout) => union_with_layout(&result, &child, layout),
+                            None => union(&result, &child),
+                        }
+                    })
+            }
+        }
+    }
+
     /// Evaluate a single predicate using the best available index.
     ///
     /// Indexes are pre-filtered by column_id (stored in the HashMap)
@@ -107,6 +140,29 @@ impl IndexEvaluator {
         }
 
         PredicateResult::Unknown
+    }
+
+    fn evaluate_guaranteed_single(&self, predicate: &Predicate) -> PredicateResult {
+        let Some(column_id) = predicate.index_column_id() else {
+            return PredicateResult::NoneMatch;
+        };
+        let Some(indexes) = self.indexes.get(&column_id) else {
+            return PredicateResult::NoneMatch;
+        };
+        indexes
+            .iter()
+            .fold(PredicateResult::NoneMatch, |result, index| {
+                let proof = index.evaluate_guaranteed_predicate(predicate);
+                let proof = if matches!(proof, PredicateResult::Unknown) {
+                    PredicateResult::NoneMatch
+                } else {
+                    proof
+                };
+                match &self.page_layout {
+                    Some(layout) => union_with_layout(&result, &proof, layout),
+                    None => union(&result, &proof),
+                }
+            })
     }
 }
 

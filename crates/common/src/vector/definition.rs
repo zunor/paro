@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
 use crate::memory::AllocationId;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{InlineString, LogicalType, PhysicalType};
 
 use super::{
     AllocationSet, SelectionVector, StringHeap, ValidityMask, VectorBuffer, VectorSelection,
@@ -145,6 +147,39 @@ impl Vector {
             _ => {}
         }
         Ok(vec)
+    }
+
+    /// Create an all-valid flat vector over immutable fixed-width bytes.
+    ///
+    /// The byte owner is retained by the vector. Any later mutable access
+    /// transparently materializes allocator-owned storage through COW.
+    pub fn try_from_fixed_width_bytes(
+        logical_type: LogicalType,
+        rows: usize,
+        bytes: Bytes,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        if matches!(
+            logical_type.physical_type(),
+            PhysicalType::Varchar | PhysicalType::List | PhysicalType::Struct | PhysicalType::Array
+        ) {
+            return Err(paro_error::invalid_input(format!(
+                "external fixed-width vector does not support {logical_type:?}"
+            )));
+        }
+        let element_size = logical_type.physical_size();
+        Ok(Self {
+            vector_type: VectorType::Flat,
+            buffer: VectorBuffer::try_from_bytes(element_size, rows, bytes, allocator.clone())?,
+            validity: ValidityMask::with_allocator(rows, allocator),
+            count: rows,
+            logical_type,
+            selection: VectorSelection::None,
+            child: None,
+            children: Vec::new(),
+            string_heap: None,
+            dictionary_info: None,
+        })
     }
 
     pub fn child(&self) -> Option<&Arc<Vector>> {

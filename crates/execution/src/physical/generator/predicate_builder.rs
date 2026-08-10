@@ -118,28 +118,40 @@ fn build_comparison_predicate(
     cmp: &paro_planner::expression::ComparisonExpression,
     get: &Get,
 ) -> Result<Option<PredicateTree>> {
-    let left_col = extract_scan_column_index(&cmp.left);
-    let right_col = extract_scan_column_index(&cmp.right);
+    let left_col = extract_scan_column_operand(&cmp.left);
+    let right_col = extract_scan_column_operand(&cmp.right);
 
     if let (Some(left_col), Some(right_col)) = (left_col, right_col) {
-        return build_column_comparison_predicate(cmp.comparison_type, get, left_col, right_col);
+        let (ScanColumnTransform::Identity, ScanColumnTransform::Identity) =
+            (left_col.transform, right_col.transform)
+        else {
+            return Ok(None);
+        };
+        return build_column_comparison_predicate(
+            cmp.comparison_type,
+            get,
+            left_col.column_idx,
+            right_col.column_idx,
+        );
     }
 
     let (col_idx, value, comparison) = match (left_col, right_col) {
         (Some(col), None) => {
-            let Some(value) = extract_constant_value(&cmp.right, get, col)? else {
+            let Some(value) =
+                extract_comparison_constant(&cmp.right, get, col, cmp.comparison_type)?
+            else {
                 return Ok(None);
             };
-            (col, value, cmp.comparison_type)
+            (col.column_idx, value, cmp.comparison_type)
         }
         (None, Some(col)) => {
-            let Some(value) = extract_constant_value(&cmp.left, get, col)? else {
-                return Ok(None);
-            };
             let Some(flipped) = flip_comparison(cmp.comparison_type) else {
                 return Ok(None);
             };
-            (col, value, flipped)
+            let Some(value) = extract_comparison_constant(&cmp.left, get, col, flipped)? else {
+                return Ok(None);
+            };
+            (col.column_idx, value, flipped)
         }
         _ => return Ok(None),
     };
@@ -160,6 +172,71 @@ fn build_comparison_predicate(
     };
 
     Ok(Some(PredicateTree::Leaf(predicate)))
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ScanColumnOperand {
+    column_idx: usize,
+    transform: ScanColumnTransform,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScanColumnTransform {
+    Identity,
+    /// SQL DATE values are represented by midnight timestamps under this
+    /// widening cast. A timestamp constant can be mapped back only when it is
+    /// exactly representable as a DATE; otherwise the comparison stays in the
+    /// execution layer.
+    DateToTimestamp,
+}
+
+fn extract_scan_column_operand(expr: &Expression) -> Option<ScanColumnOperand> {
+    if let Some(column_idx) = extract_scan_column_index(expr) {
+        return Some(ScanColumnOperand {
+            column_idx,
+            transform: ScanColumnTransform::Identity,
+        });
+    }
+    let Expression::Cast(cast) = expr else {
+        return None;
+    };
+    if cast.cast_info.context_dependency() != CastContextDependency::Independent
+        || cast.child.return_type() != LogicalType::Date
+        || cast.target_type != LogicalType::Timestamp
+    {
+        return None;
+    }
+    Some(ScanColumnOperand {
+        column_idx: extract_scan_column_index(cast.child.as_ref())?,
+        transform: ScanColumnTransform::DateToTimestamp,
+    })
+}
+
+fn extract_comparison_constant(
+    expr: &Expression,
+    get: &Get,
+    operand: ScanColumnOperand,
+    _comparison: ComparisonType,
+) -> Result<Option<Value>> {
+    match operand.transform {
+        ScanColumnTransform::Identity => extract_constant_value(expr, get, operand.column_idx),
+        ScanColumnTransform::DateToTimestamp => {
+            const MICROS_PER_DAY: i64 = 86_400_000_000;
+            if get.column_types.get(operand.column_idx) != Some(&LogicalType::Date) {
+                return Ok(None);
+            }
+            let Some(Value::Timestamp(timestamp)) = evaluate_bound_constant(expr)? else {
+                return Ok(None);
+            };
+            if timestamp.rem_euclid(MICROS_PER_DAY) != 0 {
+                return Ok(None);
+            }
+            let Ok(days) = i32::try_from(timestamp.div_euclid(MICROS_PER_DAY)) else {
+                return Ok(None);
+            };
+            Ok(Some(Value::Date(days)))
+        }
+    }
 }
 
 fn build_column_comparison_predicate(
@@ -432,7 +509,9 @@ pub fn extract_scan_column_index(expr: &Expression) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_function::scalar::cast::date_casts::{parse_date_text, varchar_to_date};
+    use paro_function::scalar::cast::date_casts::{
+        date_to_timestamp, parse_date_text, varchar_to_date,
+    };
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
     use paro_planner::expression::{
@@ -509,6 +588,41 @@ mod tests {
         assert_eq!(
             evaluate_bound_constant(&expr).unwrap(),
             Some(Value::Date(parse_date_text("1994-01-01").unwrap()))
+        );
+    }
+
+    #[test]
+    fn exactly_representable_date_timestamp_comparison_is_pushed() {
+        const MICROS_PER_DAY: i64 = 86_400_000_000;
+        let get = Get::new_without_table(7, vec!["shipdate".to_string()], vec![LogicalType::Date]);
+        let date_column = Expression::Reference(ReferenceExpression::new(0, LogicalType::Date));
+        let timestamp_column = Expression::Cast(CastExpression::new(
+            date_column,
+            LogicalType::Timestamp,
+            BoundCastInfo::fixed(date_to_timestamp),
+            false,
+        ));
+        let comparison = |timestamp| {
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::LessThanOrEqual,
+                timestamp_column.clone(),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Timestamp(timestamp),
+                    LogicalType::Timestamp,
+                )),
+            ))
+        };
+
+        assert_eq!(
+            build_predicate(&comparison(10_000 * MICROS_PER_DAY), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::Le {
+                column_id: 0,
+                value: Value::Date(10_000),
+            }))
+        );
+        assert_eq!(
+            build_predicate(&comparison(10_000 * MICROS_PER_DAY + 1), &get).unwrap(),
+            None,
         );
     }
 
