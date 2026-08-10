@@ -180,7 +180,7 @@ class BenchmarkExecutor:
         return result
 
     def _validate_workload_requirements(self, conn: Any, workload: WorkloadDef) -> None:
-        required = workload.minimum_server_memory_bytes
+        required = workload.minimum_server_buffer_pool_bytes
         if required == 0:
             return
         rows = self._execute_sql(
@@ -189,11 +189,11 @@ class BenchmarkExecutor:
             fetch=True,
         )
         if not rows or len(rows[0]) != 1:
-            raise RuntimeError("server did not report its physical memory limit")
+            raise RuntimeError("server did not report its buffer-pool memory limit")
         actual = int(rows[0][0])
         if actual < required:
             raise RuntimeError(
-                "server physical memory limit is below workload requirement: "
+                "server buffer-pool memory limit is below workload requirement: "
                 f"required={required} bytes, actual={actual} bytes"
             )
 

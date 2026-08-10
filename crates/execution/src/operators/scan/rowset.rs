@@ -8,6 +8,7 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
 
 use paro_storage::index::{collect_predicate_columns, PredicateTree};
@@ -30,7 +31,7 @@ use crate::runtime::state::{
 /// Large scans retain coarse morsels so reader construction stays amortized.
 /// Smaller scans are split just far enough to occupy the query's worker set;
 /// this matters for single-segment dimension tables feeding blocking joins.
-const MIN_ROWSET_MORSEL_ROWS: u64 = 32 * 1024;
+const MIN_ROWSET_MORSEL_ROWS: u64 = VECTOR_SIZE as u64;
 const MAX_ROWSET_MORSEL_ROWS: u64 = 256 * 1024;
 
 #[derive(Debug, Clone)]
@@ -289,7 +290,8 @@ mod tests {
 
     #[test]
     fn morsels_expose_workers_without_fragmenting_large_scans() {
-        assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
+        assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
+        assert_eq!(rowset_morsel_rows(10_000, 4), 2_500);
         assert_eq!(rowset_morsel_rows(200_000, 4), 50_000);
         assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
         assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);

@@ -52,7 +52,7 @@ fn declared_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
     };
 
     table
-        .constraints
+        .constraints()
         .iter()
         .filter(|constraint| {
             matches!(
@@ -896,8 +896,13 @@ impl Default for JoinOrderOptimizer {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::join_order::cardinality::CardinalityEstimator;
+    use paro_catalog::entry::{
+        CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
+    };
     use paro_common::{runtime_value::Value, types::LogicalType};
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_function::scalar::FunctionStability;
@@ -905,9 +910,11 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, ReferenceExpression,
     };
-    use paro_planner::operator::{AnyJoin, ColumnBinding, ExpressionGet, Projection};
+    use paro_planner::operator::{AnyJoin, ColumnBinding, ExpressionGet, Get, Projection};
     use paro_planner::plan::{CardinalityEstimate, NodeStats};
+    use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
+    use paro_storage::table::table_factory::TableFactory;
 
     fn make_test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
@@ -1166,6 +1173,130 @@ mod tests {
         let stats = ColumnStatistics::new(base);
 
         assert_eq!(integral_domain_cardinality(&stats), None);
+    }
+
+    #[test]
+    fn persisted_composite_key_reaches_joint_domain_estimation() {
+        static NEXT_META_ROOT: AtomicU64 = AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "paro_optimizer_unique_key_{}_{}",
+            std::process::id(),
+            NEXT_META_ROOT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let store: Arc<dyn MetadataStore> =
+            Arc::new(FileMetadataStore::new(root.join("meta")).unwrap());
+        let meta_manager = Arc::new(TabletMetaManager::with_store_and_data_root(store, &root));
+        let types = vec![LogicalType::Integer; 3];
+        let columns = (0..3)
+            .map(|index| ColumnDefinition::new(format!("c{index}"), LogicalType::Integer))
+            .collect::<Vec<_>>();
+        let info = CreateTableInfo::new(
+            "main".to_string(),
+            "public".to_string(),
+            "composite_key".to_string(),
+            columns,
+        )
+        .with_constraints(vec![Constraint::primary_key(vec![0, 2])]);
+        let entry = TableCatalogEntry::from_info(
+            info,
+            Arc::new(
+                TableFactory::new(Some(Arc::clone(&meta_manager)))
+                    .create_table(&types)
+                    .unwrap(),
+            ),
+            CatalogObjectId::from_raw(42),
+            0,
+        )
+        .unwrap();
+        let restored = Arc::new(
+            TableCatalogEntry::deserialize(
+                &entry.serialize().unwrap(),
+                "main".to_string(),
+                Some(meta_manager),
+            )
+            .unwrap(),
+        );
+
+        // Project columns in a different order to verify that catalog column
+        // IDs become output bindings before entering relation statistics.
+        let mut get = Get::new(
+            40,
+            vec!["c2".to_string(), "c0".to_string(), "c1".to_string()],
+            types.clone(),
+            restored,
+        );
+        get.column_ids = vec![2, 0, 1];
+        let bind_context = BindContext::new();
+        let plan = LogicalPlan {
+            id: bind_context.next_plan_id(),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(100)),
+            },
+            operator: LogicalOperator::Get(get),
+        };
+
+        let mut optimizer = JoinOrderOptimizer::new();
+        optimizer.add_relation_plan(&make_test_session(), &bind_context, &plan);
+        let mut left_stats = optimizer.relation_manager.get_relation_stats()[0].clone();
+        assert_eq!(
+            left_stats.unique_keys,
+            vec![vec![ColumnBinding::new(40, 1), ColumnBinding::new(40, 0)]]
+        );
+        left_stats.column_distinct_count = HashMap::from([
+            (ColumnBinding::new(40, 0), DistinctCount::new(10, true)),
+            (ColumnBinding::new(40, 1), DistinctCount::new(10, true)),
+        ]);
+
+        let mut set_manager = JoinRelationSetManager::new();
+        let filters = [(1, 0), (0, 1)]
+            .into_iter()
+            .enumerate()
+            .map(|(filter_index, (left_column, right_column))| {
+                let left_binding = ColumnBinding::new(40, left_column);
+                let right_binding = ColumnBinding::new(50, right_column);
+                let expression =
+                    Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                        ComparisonType::Equal,
+                        Expression::ColumnRef(ColumnRefExpression::new(
+                            left_binding,
+                            LogicalType::Integer,
+                        )),
+                        Expression::ColumnRef(ColumnRefExpression::new(
+                            right_binding,
+                            LogicalType::Integer,
+                        )),
+                    ));
+                let mut filter = FilterInfo::new_inner(
+                    expression,
+                    set_manager.get_relation_from_vec(vec![0, 1]),
+                    filter_index,
+                );
+                filter.set_left_set(set_manager.get_relation(0));
+                filter.set_right_set(set_manager.get_relation(1));
+                filter.set_left_binding(left_binding, 0);
+                filter.set_right_binding(right_binding, 1);
+                Arc::new(filter)
+            })
+            .collect::<Vec<_>>();
+        let mut right_stats = RelationStats::with_cardinality(100);
+        right_stats.column_distinct_count = HashMap::from([
+            (ColumnBinding::new(50, 0), DistinctCount::new(10, true)),
+            (ColumnBinding::new(50, 1), DistinctCount::new(10, true)),
+        ]);
+
+        let mut estimator = CardinalityEstimator::new();
+        estimator.init_equivalent_relations(&filters);
+        estimator.init_cardinality_estimator_props(&set_manager.get_relation(0), &left_stats);
+        estimator.init_cardinality_estimator_props(&set_manager.get_relation(1), &right_stats);
+
+        // Marginal statistics alone retain only one NDV=10 factor for the
+        // correlated pair. The persisted composite key supplies the exact
+        // joint domain of 100, yielding 100 * 100 / 100 rows.
+        assert_eq!(
+            estimator.estimate_cardinality(&set_manager.get_relation_from_vec(vec![0, 1])),
+            100.0
+        );
     }
 
     #[test]

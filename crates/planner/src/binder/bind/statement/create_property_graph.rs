@@ -226,7 +226,7 @@ fn resolve_key_column_ids(
 
 fn resolve_primary_key_column_ids(table: &TableCatalogEntry, context: &str) -> Result<Vec<u32>> {
     let pk_constraint = table
-        .constraints
+        .constraints()
         .iter()
         .find(|constraint| constraint.constraint_type == ConstraintType::PrimaryKey)
         .ok_or_else(|| {

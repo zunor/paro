@@ -33,7 +33,7 @@ class WorkloadRequirementTests(unittest.TestCase):
             name="analytical",
             description="",
             run_order=1,
-            minimum_server_memory_bytes=2_000_000_000,
+            minimum_server_buffer_pool_bytes=2 << 30,
             root=Path("."),
             params={},
             setup_sql="",
@@ -42,7 +42,7 @@ class WorkloadRequirementTests(unittest.TestCase):
             queries=(),
         )
 
-        with self.assertRaisesRegex(RuntimeError, "physical memory limit"):
+        with self.assertRaisesRegex(RuntimeError, "buffer-pool memory limit"):
             executor._validate_workload_requirements(object(), workload)
 
 

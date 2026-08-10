@@ -5,7 +5,7 @@
 name = "tpch"
 description = "TPC-H analytical query performance"
 run_order = 90
-minimum_server_memory = "2GB"
+minimum_server_buffer_pool = "2GiB"
 
 [params]
 data_dir = "/tmp/paro-tpch-data"

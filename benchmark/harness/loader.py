@@ -43,7 +43,7 @@ class WorkloadDef:
     name: str
     description: str
     run_order: int
-    minimum_server_memory_bytes: int
+    minimum_server_buffer_pool_bytes: int
     root: Path
     params: dict[str, Any]
     setup_sql: str
@@ -150,10 +150,10 @@ def load_workload(
     name = str(meta.get("name") or workload_root.name)
     description = str(meta.get("description", ""))
     run_order = _optional_int(meta, "run_order", default=100, manifest_path=manifest_path)
-    minimum_server_memory_bytes = _parse_byte_size(
-        meta.get("minimum_server_memory", 0),
+    minimum_server_buffer_pool_bytes = _parse_byte_size(
+        meta.get("minimum_server_buffer_pool", 0),
         manifest_path=manifest_path,
-        field_name="meta.minimum_server_memory",
+        field_name="meta.minimum_server_buffer_pool",
     )
 
     setup_file = _require_str(setup, "file", table_name="setup")
@@ -235,7 +235,7 @@ def load_workload(
         name=name,
         description=description,
         run_order=run_order,
-        minimum_server_memory_bytes=minimum_server_memory_bytes,
+        minimum_server_buffer_pool_bytes=minimum_server_buffer_pool_bytes,
         root=workload_root,
         params=params,
         setup_sql=setup_sql,

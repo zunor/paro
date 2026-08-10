@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use paro_catalog::entry::{
-    CatalogObjectId, CatalogType, ColumnDefinition, SchemaEntryMeta, TableCatalogEntry, TableType,
-};
+use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::RoutineCallIdentity;
@@ -31,6 +29,7 @@ use paro_planner::operator::{
     TopN as LogicalTopN, Window as LogicalWindow,
 };
 use paro_planner::plan::{LogicalPlan, PlanNodeId};
+use paro_storage::table::table_factory::TableFactory;
 
 use crate::operators::external::runtime_bridge::{
     ExternalRoutineDescriptor, ExternalRuntimeBridge,
@@ -1098,22 +1097,19 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
 }
 
 fn rowset_spec_for_test() -> RowsetScanSpec {
-    let table = Arc::new(TableCatalogEntry {
-        base: SchemaEntryMeta::new(
-            CatalogType::Table,
-            "test".to_string(),
-            "main".to_string(),
-            "t".to_string(),
-            CatalogObjectId::from_raw(10_001),
-            0,
+    let table = Arc::new(TableCatalogEntry::new(
+        "test".to_string(),
+        "main".to_string(),
+        "t".to_string(),
+        vec![ColumnDefinition::new("a".to_string(), LogicalType::Integer)],
+        Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer])
+                .unwrap(),
         ),
-        table_type: TableType::BaseTable,
-        columns: vec![ColumnDefinition::new("a".to_string(), LogicalType::Integer)],
-        constraints: Vec::new(),
-        storage: None,
-        storage_descriptor: None,
-        statistics: None,
-    });
+        CatalogObjectId::from_raw(10_001),
+        0,
+    ));
 
     RowsetScanSpec {
         table_index: 0,

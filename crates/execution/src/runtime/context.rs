@@ -710,7 +710,13 @@ impl QueryOutputPort {
     }
 
     pub fn close(&self) {
-        self.inner.closed.store(true, Ordering::Release);
+        // Output backpressure is scheduler-visible through `generation`, not
+        // through this condvar alone. Closing the port makes every pending
+        // write permanently ready to resume, so publish that state transition
+        // exactly once just like removing a buffered chunk.
+        if !self.inner.closed.swap(true, Ordering::AcqRel) {
+            self.inner.generation.fetch_add(1, Ordering::AcqRel);
+        }
         self.inner.cv.notify_all();
     }
 
@@ -1125,6 +1131,20 @@ mod tests {
 
         assert!(port.pop_front().is_some());
         assert_ne!(port.wake_generation(), initial_generation);
+    }
+
+    #[test]
+    fn closing_output_port_wakes_scheduler_backpressure_waiters() {
+        let port = QueryOutputPort::bounded(1);
+        let initial_generation = port.wake_generation();
+
+        port.close();
+
+        assert!(port.is_closed());
+        assert_ne!(port.wake_generation(), initial_generation);
+        let closed_generation = port.wake_generation();
+        port.close();
+        assert_eq!(port.wake_generation(), closed_generation);
     }
 
     #[test]

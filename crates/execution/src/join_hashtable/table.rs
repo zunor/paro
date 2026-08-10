@@ -402,7 +402,8 @@ impl JoinHashTable {
             }
         }
 
-        let found_flag_column_index = if Self::propagates_build_side(join_type) {
+        let build_keys_may_be_null = Self::propagates_build_side(join_type);
+        let found_flag_column_index = if build_keys_may_be_null {
             Some(equality_types.len() + build_types.len())
         } else {
             None
@@ -415,7 +416,7 @@ impl JoinHashTable {
         let key_layout = JoinKeyLayout::new(
             &equality_types,
             &equality_comparisons,
-            found_flag_column_index.is_some(),
+            build_keys_may_be_null,
         );
         let spill_layout = Arc::new(RowLayout::from_types(
             build_row_layout.spill_types().to_vec(),

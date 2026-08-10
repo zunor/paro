@@ -3,7 +3,8 @@
 
 //! Cardinality estimation helpers for join-order planning.
 
-use std::collections::{HashMap, HashSet};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_common::logging::targets;
@@ -166,6 +167,7 @@ struct EqualityDenominatorScratch {
     vertex_domains: Vec<Option<DistinctDomainEstimate>>,
     tree_visited: Vec<bool>,
     owned_edges: Vec<Option<usize>>,
+    tree_frontier: BinaryHeap<Reverse<(usize, usize, usize, usize, usize)>>,
 }
 
 impl EqualityDenominatorScratch {
@@ -186,6 +188,7 @@ impl EqualityDenominatorScratch {
         self.tree_visited.resize(vertices, false);
         self.owned_edges.clear();
         self.owned_edges.resize(vertices, None);
+        self.tree_frontier.clear();
     }
 }
 
@@ -227,6 +230,43 @@ struct EqualityPairDomain {
     relation_bindings: HashMap<usize, HashSet<ColumnBinding>>,
 }
 
+impl Default for EqualityPairDomain {
+    fn default() -> Self {
+        Self {
+            domain: 1.0,
+            relation_bindings: HashMap::new(),
+        }
+    }
+}
+
+fn push_tree_frontier(
+    graph: &EqualityClassGraph,
+    active: &[bool],
+    tree_visited: &[bool],
+    tree_frontier: &mut BinaryHeap<Reverse<(usize, usize, usize, usize, usize)>>,
+    parent: usize,
+) {
+    for edge_index in &graph.adjacency[parent] {
+        let edge = &graph.edges[*edge_index];
+        let child = if edge.left == parent {
+            edge.right
+        } else {
+            debug_assert_eq!(edge.right, parent);
+            edge.left
+        };
+        if !active[child] || tree_visited[child] {
+            continue;
+        }
+        tree_frontier.push(Reverse((
+            graph.vertices[parent].relation,
+            graph.vertices[child].relation,
+            edge.filter_index,
+            *edge_index,
+            child,
+        )));
+    }
+}
+
 impl DistinctDomainEstimate {
     fn observed(value: usize) -> Self {
         Self {
@@ -242,12 +282,6 @@ impl DistinctDomainEstimate {
             upper_bound_min: value.max(1),
             has_hll: false,
         }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.hll_max = self.hll_max.max(other.hll_max);
-        self.upper_bound_min = self.upper_bound_min.min(other.upper_bound_min);
-        self.has_hll |= other.has_hll;
     }
 
     fn value(self) -> usize {
@@ -676,22 +710,13 @@ impl CardinalityEstimator {
                 if !equality_scratch.active[index] {
                     continue;
                 }
-                let mut distinct: Option<DistinctDomainEstimate> = None;
-                for binding in &vertex.bindings {
-                    let Some(binding) = binding_stats.get(binding) else {
-                        continue;
-                    };
-                    let binding_distinct = if binding.from_hll {
+                let distinct = binding_stats.get(&vertex.binding).map(|binding| {
+                    if binding.from_hll {
                         DistinctDomainEstimate::observed(binding.distinct_count)
                     } else {
                         DistinctDomainEstimate::upper_bound(binding.distinct_count)
-                    };
-                    if let Some(current) = distinct.as_mut() {
-                        current.merge(binding_distinct);
-                    } else {
-                        distinct = Some(binding_distinct);
                     }
-                }
+                });
                 let distinct = distinct.unwrap_or(fallback_distinct);
                 equality_scratch.vertex_domains[index] = Some(distinct);
                 let root = find_component(&mut equality_scratch.parents, index);
@@ -721,6 +746,8 @@ impl CardinalityEstimator {
                                 .expect("active equality vertex must have a domain")
                                 .value(),
                             graph.vertices[**vertex].relation,
+                            graph.vertices[**vertex].binding.table_index,
+                            graph.vertices[**vertex].binding.column_index,
                         )
                     })
                     .expect("non-empty equality component must have a root");
@@ -731,43 +758,34 @@ impl CardinalityEstimator {
                 // domain still yields the N-1 largest domains. Ownership is
                 // later used to correlate parallel equality classes without
                 // ever dividing out a factor that was not multiplied here.
+                equality_scratch.tree_frontier.clear();
+                push_tree_frontier(
+                    graph,
+                    &equality_scratch.active,
+                    &equality_scratch.tree_visited,
+                    &mut equality_scratch.tree_frontier,
+                    root,
+                );
                 let mut remaining = vertices.saturating_sub(1);
                 while remaining > 0 {
-                    let mut candidate = None;
-                    for (edge_index, edge) in graph.edges.iter().enumerate() {
-                        if !equality_scratch.active[edge.left]
-                            || !equality_scratch.active[edge.right]
-                        {
-                            continue;
-                        }
-                        let (parent, child) = match (
-                            equality_scratch.tree_visited[edge.left],
-                            equality_scratch.tree_visited[edge.right],
-                        ) {
-                            (true, false) => (edge.left, edge.right),
-                            (false, true) => (edge.right, edge.left),
-                            _ => continue,
-                        };
-                        if find_component(&mut equality_scratch.parents, child)
-                            != find_component(&mut equality_scratch.parents, root)
-                        {
-                            continue;
-                        }
-                        let order = (
-                            graph.vertices[parent].relation,
-                            graph.vertices[child].relation,
-                            edge.filter_index,
-                        );
-                        if candidate.as_ref().is_none_or(|(best, _, _)| order < *best) {
-                            candidate = Some((order, child, edge_index));
-                        }
-                    }
-                    let Some((_, child, edge_index)) = candidate else {
+                    let Some(Reverse((_, _, _, edge_index, child))) =
+                        equality_scratch.tree_frontier.pop()
+                    else {
                         debug_assert!(false, "equality component must have a spanning tree");
                         break;
                     };
+                    if equality_scratch.tree_visited[child] {
+                        continue;
+                    }
                     equality_scratch.tree_visited[child] = true;
                     equality_scratch.owned_edges[child] = Some(edge_index);
+                    push_tree_frontier(
+                        graph,
+                        &equality_scratch.active,
+                        &equality_scratch.tree_visited,
+                        &mut equality_scratch.tree_frontier,
+                        child,
+                    );
                     remaining -= 1;
                 }
 
@@ -810,36 +828,32 @@ impl CardinalityEstimator {
                 let domain = equality_scratch.vertex_domains[child]
                     .expect("owned equality vertex must have a domain")
                     .value() as f64;
-                let pair_domain = graph_pairs
-                    .entry(pair)
-                    .or_insert_with(|| EqualityPairDomain {
-                        domain,
-                        relation_bindings: HashMap::new(),
-                    });
-                pair_domain.domain = pair_domain.domain.max(domain);
+                let pair_domain = graph_pairs.entry(pair).or_default();
+                pair_domain.domain *= domain;
                 pair_domain
                     .relation_bindings
                     .entry(left_relation)
                     .or_default()
-                    .extend(graph.vertices[edge.left].bindings.iter().copied());
+                    .insert(graph.vertices[edge.left].binding);
                 pair_domain
                     .relation_bindings
                     .entry(right_relation)
                     .or_default()
-                    .extend(graph.vertices[edge.right].bindings.iter().copied());
+                    .insert(graph.vertices[edge.right].binding);
             }
             for (pair, pair_domain) in graph_pairs {
-                correlated_pairs
-                    .entry(pair)
-                    .and_modify(|domains| {
-                        domains.add(pair_domain.domain, pair_domain.relation_bindings.clone())
-                    })
-                    .or_insert_with(|| {
-                        CorrelatedEqualityDomains::new(
+                use std::collections::hash_map::Entry;
+                match correlated_pairs.entry(pair) {
+                    Entry::Occupied(mut entry) => entry
+                        .get_mut()
+                        .add(pair_domain.domain, pair_domain.relation_bindings),
+                    Entry::Vacant(entry) => {
+                        entry.insert(CorrelatedEqualityDomains::new(
                             pair_domain.domain,
                             pair_domain.relation_bindings,
-                        )
-                    });
+                        ));
+                    }
+                }
             }
         }
 
@@ -1697,6 +1711,58 @@ mod tests {
         // Each star contributes X(100) * one leaf(10). The second,
         // correlated star removes exactly those two owned factors.
         assert_eq!(denominator, 1_000.0);
+    }
+
+    #[test]
+    fn parallel_self_join_edges_retain_every_owned_factor() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            // One equality class has three binding vertices but only two
+            // relation aliases. Both tree edges therefore belong to pair
+            // (0, 1), and both factors must survive pair-level correlation.
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut set_manager, 0, 1, 1, 0, 1),
+            // A second equality class connects the same relation pair.
+            create_equality_filter(&mut set_manager, 0, 2, 1, 1, 2),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let left = set_manager.get_relation(0);
+        let mut left_stats = RelationStats::with_cardinality(1_000);
+        left_stats.column_distinct_count = column_distinct_counts(
+            0,
+            [
+                DistinctCount::new(5, true),
+                DistinctCount::new(5, true),
+                DistinctCount::new(20, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&left, &left_stats);
+
+        let right = set_manager.get_relation(1);
+        let mut right_stats = RelationStats::with_cardinality(1_000);
+        right_stats.column_distinct_count = column_distinct_counts(
+            1,
+            [DistinctCount::new(1, true), DistinctCount::new(20, true)],
+        );
+        estimator.init_cardinality_estimator_props(&right, &right_stats);
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1]);
+        estimator.ensure_equality_graphs();
+        assert_eq!(
+            estimator
+                .equality_graphs
+                .iter()
+                .map(|graph| graph.vertices.len())
+                .max(),
+            Some(3)
+        );
+        let (denominator, _) = estimator.equality_denominator(&join);
+
+        // The first class owns 5 * 5 = 25 for pair (0, 1); the second owns
+        // 20. Correlation keeps the stronger whole-class domain, 25.
+        assert_eq!(denominator, 25.0);
     }
 
     #[test]

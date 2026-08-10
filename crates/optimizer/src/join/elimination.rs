@@ -428,7 +428,7 @@ impl JoinElimination {
             return false;
         }
 
-        table.constraints.iter().any(|constraint| {
+        table.constraints().iter().any(|constraint| {
             matches!(
                 constraint.constraint_type,
                 ConstraintType::Unique | ConstraintType::PrimaryKey
@@ -584,17 +584,22 @@ mod tests {
             .map(|idx| ColumnDefinition::new(format!("c{idx}"), LogicalType::Integer))
             .collect();
 
-        let mut table = TableCatalogEntry::new(
+        let info = paro_catalog::entry::CreateTableInfo::new(
             "paro".to_string(),
             "public".to_string(),
             name.to_string(),
             columns,
-            storage,
-            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
-            0,
-        );
-        table.constraints = constraints;
-        Arc::new(table)
+        )
+        .with_constraints(constraints);
+        Arc::new(
+            TableCatalogEntry::from_info(
+                info,
+                storage,
+                paro_catalog::entry::CatalogObjectId::from_raw(10_001),
+                0,
+            )
+            .unwrap(),
+        )
     }
 
     fn create_get(

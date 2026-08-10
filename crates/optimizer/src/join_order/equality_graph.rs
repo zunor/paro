@@ -13,7 +13,7 @@ use super::cardinality::RelationsSetToStats;
 #[derive(Debug, Clone)]
 pub(super) struct EqualityGraphVertex {
     pub(super) relation: usize,
-    pub(super) bindings: Vec<ColumnBinding>,
+    pub(super) binding: ColumnBinding,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -28,6 +28,10 @@ pub(super) struct EqualityClassGraph {
     pub(super) stats_index: usize,
     pub(super) vertices: Vec<EqualityGraphVertex>,
     pub(super) edges: Vec<EqualityGraphEdge>,
+    /// Edge indexes adjacent to each binding vertex. Cardinality estimation
+    /// enumerates many relation subsets, so compile topology once instead of
+    /// rescanning every edge for every step of every spanning tree.
+    pub(super) adjacency: Vec<Vec<usize>>,
 }
 
 impl EqualityClassGraph {
@@ -41,7 +45,7 @@ impl EqualityClassGraph {
 
     fn build(stats_index: usize, stats: &RelationsSetToStats) -> Option<Self> {
         let mut vertices = Vec::<EqualityGraphVertex>::new();
-        let mut vertex_index = HashMap::<usize, usize>::new();
+        let mut vertex_index = HashMap::<ColumnBinding, usize>::new();
         let mut edges = Vec::new();
 
         for filter in &stats.filters {
@@ -60,34 +64,34 @@ impl EqualityClassGraph {
                 continue;
             }
 
-            let left = *vertex_index.entry(left_relation).or_insert_with(|| {
+            let (Some(left_binding), Some(right_binding)) =
+                (filter.left_binding, filter.right_binding)
+            else {
+                continue;
+            };
+            debug_assert_eq!(left_binding.relation, left_relation);
+            debug_assert_eq!(right_binding.relation, right_relation);
+
+            // Vertices represent equality domains, not relations. A self-join
+            // can equate two columns from one relation alias with a column on
+            // the other alias; merging those columns into one vertex silently
+            // drops a rank factor from the equality graph.
+            let left = *vertex_index.entry(left_binding.column).or_insert_with(|| {
                 let index = vertices.len();
                 vertices.push(EqualityGraphVertex {
                     relation: left_relation,
-                    bindings: Vec::new(),
+                    binding: left_binding.column,
                 });
                 index
             });
-            let right = *vertex_index.entry(right_relation).or_insert_with(|| {
+            let right = *vertex_index.entry(right_binding.column).or_insert_with(|| {
                 let index = vertices.len();
                 vertices.push(EqualityGraphVertex {
                     relation: right_relation,
-                    bindings: Vec::new(),
+                    binding: right_binding.column,
                 });
                 index
             });
-            if let Some(binding) = filter.left_binding {
-                debug_assert_eq!(binding.relation, left_relation);
-                if !vertices[left].bindings.contains(&binding.column) {
-                    vertices[left].bindings.push(binding.column);
-                }
-            }
-            if let Some(binding) = filter.right_binding {
-                debug_assert_eq!(binding.relation, right_relation);
-                if !vertices[right].bindings.contains(&binding.column) {
-                    vertices[right].bindings.push(binding.column);
-                }
-            }
             edges.push(EqualityGraphEdge {
                 left,
                 right,
@@ -95,10 +99,19 @@ impl EqualityClassGraph {
             });
         }
 
-        (!edges.is_empty()).then_some(Self {
+        if edges.is_empty() {
+            return None;
+        }
+        let mut adjacency = vec![Vec::new(); vertices.len()];
+        for (edge_index, edge) in edges.iter().enumerate() {
+            adjacency[edge.left].push(edge_index);
+            adjacency[edge.right].push(edge_index);
+        }
+        Some(Self {
             stats_index,
             vertices,
             edges,
+            adjacency,
         })
     }
 }

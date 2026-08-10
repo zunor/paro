@@ -481,7 +481,7 @@ pub struct TableCatalogEntry {
     /// Column definitions
     pub columns: Vec<ColumnDefinition>,
     /// Table constraints
-    pub constraints: Vec<Constraint>,
+    constraints: Vec<Constraint>,
     /// Reference to the underlying storage
     pub storage: Option<Arc<TableHandle>>,
     /// Stable storage descriptor persisted by catalog
@@ -495,6 +495,14 @@ impl TableCatalogEntry {
 
     fn descriptor_from_storage(storage: &Arc<TableHandle>) -> Option<TableStorageDescriptor> {
         storage.to_descriptor().ok()
+    }
+
+    /// Validated constraints attached to this table.
+    ///
+    /// The collection is intentionally read-only outside the catalog entry:
+    /// construction, replay, and schema evolution are the validation boundary.
+    pub fn constraints(&self) -> &[Constraint] {
+        &self.constraints
     }
 
     /// Create a new table catalog entry.

@@ -16,6 +16,75 @@ use paro_storage::statistics::ColumnStatistics;
 
 const MIN_SELECTIVITY: f64 = 0.000_001;
 
+#[derive(Debug, Clone, Copy)]
+struct SelectivityEstimate {
+    fraction: f64,
+    proven: bool,
+}
+
+impl SelectivityEstimate {
+    fn proven(fraction: f64) -> Self {
+        Self {
+            fraction: clamp_selectivity(fraction),
+            proven: true,
+        }
+    }
+
+    fn estimated(fraction: f64) -> Self {
+        Self {
+            fraction: clamp_selectivity(fraction).max(MIN_SELECTIVITY),
+            proven: false,
+        }
+    }
+
+    fn complement(self) -> Self {
+        if self.proven {
+            Self::proven(1.0 - self.fraction)
+        } else {
+            Self::estimated(1.0 - self.fraction)
+        }
+    }
+}
+
+fn conjunction_estimate(
+    estimates: impl Iterator<Item = SelectivityEstimate>,
+) -> SelectivityEstimate {
+    let mut fraction = 1.0;
+    let mut proven = true;
+    for estimate in estimates {
+        if estimate.proven && estimate.fraction == 0.0 {
+            return SelectivityEstimate::proven(0.0);
+        }
+        fraction *= estimate.fraction;
+        proven &= estimate.proven;
+    }
+    if proven {
+        SelectivityEstimate::proven(fraction)
+    } else {
+        SelectivityEstimate::estimated(fraction)
+    }
+}
+
+fn disjunction_estimate(
+    estimates: impl Iterator<Item = SelectivityEstimate>,
+) -> SelectivityEstimate {
+    let mut miss_fraction = 1.0;
+    let mut proven = true;
+    for estimate in estimates {
+        if estimate.proven && estimate.fraction == 1.0 {
+            return SelectivityEstimate::proven(1.0);
+        }
+        miss_fraction *= 1.0 - estimate.fraction;
+        proven &= estimate.proven;
+    }
+    let fraction = 1.0 - miss_fraction;
+    if proven {
+        SelectivityEstimate::proven(fraction)
+    } else {
+        SelectivityEstimate::estimated(fraction)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CostModel {
     pub defaults: SelectivityDefaults,
@@ -54,91 +123,113 @@ impl CostModel {
         expr: &Expression,
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
     ) -> f64 {
-        let selectivity = match expr {
+        self.estimate_selectivity_with_provenance(expr, column_stats)
+            .fraction
+    }
+
+    fn estimate_selectivity_with_provenance(
+        &self,
+        expr: &Expression,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    ) -> SelectivityEstimate {
+        match expr {
             Expression::Constant(constant) => match &constant.value {
-                Value::Boolean(true) => 1.0,
-                Value::Boolean(false) => 0.0,
-                _ => self.defaults.predicate,
+                Value::Boolean(true) => SelectivityEstimate::proven(1.0),
+                Value::Boolean(false) => SelectivityEstimate::proven(0.0),
+                _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
-            Expression::Comparison(comparison) => {
-                self.estimate_comparison_selectivity(comparison, column_stats)
-            }
-            Expression::Conjunction(conjunction) => match conjunction.conjunction_type {
-                ConjunctionType::And => conjunction
-                    .children
-                    .iter()
-                    .map(|child| self.estimate_selectivity(child, column_stats))
-                    .product(),
-                ConjunctionType::Or => {
-                    let independent_miss = conjunction
+            Expression::Comparison(comparison) => SelectivityEstimate::estimated(
+                self.estimate_comparison_selectivity(comparison, column_stats),
+            ),
+            Expression::Conjunction(conjunction) => {
+                let children = || {
+                    conjunction
                         .children
                         .iter()
-                        .map(|child| 1.0 - self.estimate_selectivity(child, column_stats))
-                        .product::<f64>();
-                    1.0 - independent_miss
+                        .map(|child| self.estimate_selectivity_with_provenance(child, column_stats))
+                };
+                match conjunction.conjunction_type {
+                    ConjunctionType::And => conjunction_estimate(children()),
+                    ConjunctionType::Or => disjunction_estimate(children()),
                 }
-            },
+            }
             Expression::Operator(operator) => match operator.operator_type {
-                OperatorType::Like => match like_pattern_shape(operator.children.get(1)) {
-                    LikePatternShape::MatchAll => 1.0,
-                    LikePatternShape::Exact => self
-                        .estimate_exact_like_selectivity(operator.children.first(), column_stats),
-                    LikePatternShape::Prefix => self.defaults.like_prefix,
-                    LikePatternShape::Contains | LikePatternShape::Suffix => {
-                        self.defaults.like_contains
-                    }
-                    LikePatternShape::Generic => self.defaults.predicate,
-                },
-                OperatorType::ILike => match like_pattern_shape(operator.children.get(1)) {
-                    LikePatternShape::MatchAll => 1.0,
-                    LikePatternShape::Exact => self.defaults.equality,
-                    LikePatternShape::Prefix => self.defaults.like_prefix,
-                    LikePatternShape::Contains | LikePatternShape::Suffix => {
-                        self.defaults.like_contains
-                    }
-                    LikePatternShape::Generic => self.defaults.predicate,
-                },
-                OperatorType::Not => operator
-                    .children
-                    .first()
-                    .map(|child| 1.0 - self.estimate_selectivity(child, column_stats))
-                    .unwrap_or(self.defaults.predicate),
-                OperatorType::IsNull => 1.0 - self.defaults.is_not_null,
-                OperatorType::IsNotNull => self.defaults.is_not_null,
-                OperatorType::In => {
-                    self.estimate_in_selectivity(operator.children.as_slice(), column_stats)
+                OperatorType::Like => SelectivityEstimate::estimated(
+                    match like_pattern_shape(operator.children.get(1)) {
+                        LikePatternShape::MatchAll => 1.0,
+                        LikePatternShape::Exact => self.estimate_exact_like_selectivity(
+                            operator.children.first(),
+                            column_stats,
+                        ),
+                        LikePatternShape::Prefix => self.defaults.like_prefix,
+                        LikePatternShape::Contains | LikePatternShape::Suffix => {
+                            self.defaults.like_contains
+                        }
+                        LikePatternShape::Generic => self.defaults.predicate,
+                    },
+                ),
+                OperatorType::ILike => SelectivityEstimate::estimated(
+                    match like_pattern_shape(operator.children.get(1)) {
+                        LikePatternShape::MatchAll => 1.0,
+                        // Case folding can merge several stored values into one
+                        // comparison domain, so the raw column NDV is not a sound
+                        // denominator for an exact ILIKE pattern.
+                        LikePatternShape::Exact => self.defaults.equality,
+                        LikePatternShape::Prefix => self.defaults.like_prefix,
+                        LikePatternShape::Contains | LikePatternShape::Suffix => {
+                            self.defaults.like_contains
+                        }
+                        LikePatternShape::Generic => self.defaults.predicate,
+                    },
+                ),
+                OperatorType::Not => operator.children.first().map_or_else(
+                    || SelectivityEstimate::estimated(self.defaults.predicate),
+                    |child| {
+                        self.estimate_selectivity_with_provenance(child, column_stats)
+                            .complement()
+                    },
+                ),
+                OperatorType::IsNull => {
+                    SelectivityEstimate::estimated(1.0 - self.defaults.is_not_null)
                 }
-                OperatorType::NotIn => {
-                    1.0 - self.estimate_in_selectivity(operator.children.as_slice(), column_stats)
+                OperatorType::IsNotNull => {
+                    SelectivityEstimate::estimated(self.defaults.is_not_null)
                 }
-                _ => self.defaults.predicate,
+                OperatorType::In => SelectivityEstimate::estimated(
+                    self.estimate_in_selectivity(operator.children.as_slice(), column_stats),
+                ),
+                OperatorType::NotIn => SelectivityEstimate::estimated(
+                    1.0 - self.estimate_in_selectivity(operator.children.as_slice(), column_stats),
+                ),
+                _ => SelectivityEstimate::estimated(self.defaults.predicate),
             },
-            Expression::Function(function) => match function.builtin_intrinsic() {
-                Some(
-                    BuiltinIntrinsicId::FullTextMatch
-                    | BuiltinIntrinsicId::FullTextMatchInternal
-                    | BuiltinIntrinsicId::Bm25
-                    | BuiltinIntrinsicId::Bm25ScoreInternal
-                    | BuiltinIntrinsicId::TsRank
-                    | BuiltinIntrinsicId::TsRankCd
-                    | BuiltinIntrinsicId::ToTsVector
-                    | BuiltinIntrinsicId::PlainToTsQuery
-                    | BuiltinIntrinsicId::ToTsQuery
-                    | BuiltinIntrinsicId::PhraseToTsQuery
-                    | BuiltinIntrinsicId::WebSearchToTsQuery,
-                ) => self.defaults.fulltext_match,
-                Some(
-                    BuiltinIntrinsicId::L2Distance
-                    | BuiltinIntrinsicId::L1Distance
-                    | BuiltinIntrinsicId::CosineDistance
-                    | BuiltinIntrinsicId::NegativeInnerProduct
-                    | BuiltinIntrinsicId::SparseDistance,
-                ) => self.defaults.vector_topk_fraction,
-                _ => self.defaults.predicate,
-            },
-            _ => self.defaults.predicate,
-        };
-        clamp_selectivity(selectivity)
+            Expression::Function(function) => {
+                SelectivityEstimate::estimated(match function.builtin_intrinsic() {
+                    Some(
+                        BuiltinIntrinsicId::FullTextMatch
+                        | BuiltinIntrinsicId::FullTextMatchInternal
+                        | BuiltinIntrinsicId::Bm25
+                        | BuiltinIntrinsicId::Bm25ScoreInternal
+                        | BuiltinIntrinsicId::TsRank
+                        | BuiltinIntrinsicId::TsRankCd
+                        | BuiltinIntrinsicId::ToTsVector
+                        | BuiltinIntrinsicId::PlainToTsQuery
+                        | BuiltinIntrinsicId::ToTsQuery
+                        | BuiltinIntrinsicId::PhraseToTsQuery
+                        | BuiltinIntrinsicId::WebSearchToTsQuery,
+                    ) => self.defaults.fulltext_match,
+                    Some(
+                        BuiltinIntrinsicId::L2Distance
+                        | BuiltinIntrinsicId::L1Distance
+                        | BuiltinIntrinsicId::CosineDistance
+                        | BuiltinIntrinsicId::NegativeInnerProduct
+                        | BuiltinIntrinsicId::SparseDistance,
+                    ) => self.defaults.vector_topk_fraction,
+                    _ => self.defaults.predicate,
+                })
+            }
+            _ => SelectivityEstimate::estimated(self.defaults.predicate),
+        }
     }
 
     pub fn estimate_filter_cardinality(
@@ -154,13 +245,19 @@ impl CostModel {
             return CardinalityEstimate::exact(base_cardinality);
         }
 
-        let combined_selectivity = expressions
-            .iter()
-            .map(|expr| self.estimate_selectivity(expr, column_stats))
-            .product::<f64>()
-            .clamp(0.0, 1.0);
+        let combined = conjunction_estimate(
+            expressions
+                .iter()
+                .map(|expr| self.estimate_selectivity_with_provenance(expr, column_stats)),
+        );
+        let combined_selectivity = combined.fraction;
 
         let expected = ((base_cardinality as f64) * combined_selectivity).round() as u64;
+        let expected = if combined.proven && combined_selectivity == 0.0 {
+            0
+        } else {
+            expected.max(1)
+        };
         let min = ((base_cardinality as f64) * (combined_selectivity * 0.5).clamp(0.0, 1.0)).floor()
             as u64;
         let max = ((base_cardinality as f64) * (combined_selectivity * 1.5).clamp(0.0, 1.0)).ceil()
@@ -411,7 +508,67 @@ mod tests {
         ));
         assert_eq!(
             model.estimate_selectivity(&not_match_all, &HashMap::new()),
+            MIN_SELECTIVITY
+        );
+    }
+
+    #[test]
+    fn only_proven_false_predicates_receive_zero_selectivity() {
+        let model = CostModel::default();
+        let constant = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::Boolean(value),
+                LogicalType::Boolean,
+            ))
+        };
+        let estimated_zero =
+            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![
+                    Expression::Operator(OperatorExpression::new_unary(
+                        OperatorType::Not,
+                        Expression::Operator(OperatorExpression::new(
+                            OperatorType::Like,
+                            vec![
+                                Expression::ColumnRef(ColumnRefExpression::new(
+                                    ColumnBinding::new(1, 0),
+                                    LogicalType::Varchar,
+                                )),
+                                Expression::Constant(ConstantExpression::new(
+                                    Value::Varchar("%".to_string()),
+                                    LogicalType::Varchar,
+                                )),
+                            ],
+                            LogicalType::Boolean,
+                        )),
+                        LogicalType::Boolean,
+                    )),
+                    constant(true),
+                ],
+            ));
+        let proven_zero =
+            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![estimated_zero.clone(), constant(false)],
+            ));
+
+        assert_eq!(
+            model.estimate_selectivity(&estimated_zero, &HashMap::new()),
+            MIN_SELECTIVITY
+        );
+        assert_eq!(
+            model.estimate_selectivity(&proven_zero, &HashMap::new()),
             0.0
+        );
+        assert_eq!(
+            model
+                .estimate_filter_cardinality(42, &[estimated_zero], &HashMap::new())
+                .expected,
+            1
+        );
+        assert_eq!(
+            model.estimate_filter_cardinality(42, &[proven_zero], &HashMap::new()),
+            CardinalityEstimate::exact(0)
         );
     }
 
