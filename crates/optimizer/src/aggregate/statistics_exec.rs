@@ -255,8 +255,7 @@ impl AggregateStatisticsExecutor {
                     let column_id = *get.column_ids.get(current_binding.column_index)?;
                     let table = get.table.as_ref()?;
                     let storage = table.get_storage()?;
-                    let base = storage.column_statistics(column_id)?;
-                    return Some(Arc::new(ColumnStatistics::new(base)));
+                    return Some(Arc::new(storage.column_statistics(column_id)?));
                 }
                 _ => return None,
             }

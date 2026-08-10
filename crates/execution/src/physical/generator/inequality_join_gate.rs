@@ -484,7 +484,7 @@ fn sort_range_get_column_stats(get: &Get, output_idx: usize) -> Option<SortRange
         return None;
     }
     let storage = table.get_storage()?;
-    let base_stats = storage.column_statistics(column_id)?;
+    let column_stats = storage.column_statistics(column_id)?;
     let rows = storage
         .tablet()
         .statistics()
@@ -497,7 +497,8 @@ fn sort_range_get_column_stats(get: &Get, output_idx: usize) -> Option<SortRange
                 .map(|stats| stats.row_count)
                 .filter(|rows| *rows > 0)
         })?;
-    let histogram = SortRangeUniformHistogram::from_base_statistics(&base_stats, rows)?;
+    let histogram =
+        SortRangeUniformHistogram::from_base_statistics(column_stats.statistics(), rows)?;
     Some(SortRangeColumnStats { rows, histogram })
 }
 

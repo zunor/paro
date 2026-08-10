@@ -345,11 +345,12 @@ impl BuildBlock {
         row_width: usize,
     ) -> Result<Self> {
         let allocated_bytes = max_rows.saturating_mul(row_width);
-        // Append relies on every fresh slot starting at zero: validity bits,
-        // pointer metadata, and row padding are not cleared per row. Keep this
-        // allocation zeroed unless append is changed to initialize the complete
-        // physical row representation itself.
-        let data = memory.allocate_zeroed_buffer(allocator, allocated_bytes)?;
+        // Row slots have no implicit zero state. PreparedRowScatter initializes
+        // every validity flag and logical field, and append initializes all
+        // join metadata before publishing the row. Alignment padding is never
+        // observed. Keeping that contract here avoids clearing entire slabs
+        // whose bytes are immediately overwritten by the build path.
+        let data = memory.allocate_buffer(allocator, allocated_bytes)?;
         Ok(Self {
             data,
             row_width,
@@ -398,18 +399,6 @@ impl BuildBlock {
 
         let row_idx = self.row_count;
         let row_ptr = self.row_ptr_mut(row_idx);
-        debug_assert!(unsafe {
-            // SAFETY: row_idx is below max_rows and the allocation contains
-            // max_rows contiguous row_width-byte slots.
-            std::slice::from_raw_parts(row_ptr, self.row_width)
-                .iter()
-                .all(|byte| *byte == 0)
-        });
-        // Build blocks are zero-initialized once and row slots are append-only.
-        // PreparedRowScatter initializes every logical field and the code below
-        // initializes all join metadata, so clearing the fresh slot again here
-        // only duplicates an O(row_width) write for every build row.
-
         write_row(row_ptr, heap)?;
 
         if let Some(heap_size_offset) = layout.base().heap_size_offset() {
@@ -629,16 +618,16 @@ impl HashBuildStore {
         payload: &Chunk,
         selection: &SelectionVector,
         selected_count: usize,
-        hashes: &[u64],
+        hashes: Option<&[u64]>,
         found: bool,
     ) -> Result<usize> {
         if selected_count == 0 {
             return Ok(0);
         }
-        if hashes.len() < selected_count {
+        if hashes.is_some_and(|hashes| hashes.len() < selected_count) {
             return Err(paro_error::internal(format!(
                 "HashBuildStore append hash count mismatch: selected={selected_count}, hashes={}",
-                hashes.len()
+                hashes.map_or(0, <[u64]>::len)
             )));
         }
         if keys.column_count() != self.layout.key_count() {
@@ -694,9 +683,25 @@ impl HashBuildStore {
             &source,
             selected_count,
             |output_idx| selection.get(output_idx),
-            |output_idx, _| Ok(hashes[output_idx]),
+            |output_idx, _| Ok(hashes.map_or(0, |hashes| hashes[output_idx])),
             |_, _| found,
         )
+    }
+
+    /// Initialize hashes for rows appended through the adaptive integer-index
+    /// path. That path deliberately defers hashing while an exact index remains
+    /// viable; spill or generic hash-table fallback calls this before reading
+    /// the hash field.
+    pub(super) fn materialize_deferred_hashes(
+        &mut self,
+        mut hash_row: impl FnMut(*const u8) -> u64,
+    ) {
+        for block in self.blocks.iter_mut() {
+            for row_idx in 0..block.row_count() {
+                let row_ptr = block.row_ptr_mut(row_idx);
+                self.layout.set_hash(row_ptr, hash_row(row_ptr));
+            }
+        }
     }
 
     fn append_prepared_rows<S, H, F>(
@@ -745,6 +750,7 @@ impl HashBuildStore {
         };
         let mut batch_values = StableValueHeap::default();
         let layout = self.layout.clone();
+        let fixed_source = source.fixed_all_valid(layout.base());
 
         let write_result = {
             let mut heap = BatchRowHeap::new(byte_buffer.as_ref(), &mut batch_values);
@@ -762,13 +768,19 @@ impl HashBuildStore {
                         })?;
                     let block = self.ensure_current_block()?;
                     block.append_row(&layout, row_heap_bytes, &mut heap, |row_ptr, heap| {
-                        unsafe {
-                            source.scatter_row(
-                                layout.base().as_ref(),
-                                row_ptr,
-                                source_row_idx,
-                                heap,
-                            )?;
+                        if let Some(fixed_source) = &fixed_source {
+                            unsafe {
+                                fixed_source.scatter_row_unchecked(row_ptr, source_row_idx);
+                            }
+                        } else {
+                            unsafe {
+                                source.scatter_row_unchecked(
+                                    layout.base().as_ref(),
+                                    row_ptr,
+                                    source_row_idx,
+                                    heap,
+                                )?;
+                            }
                         }
                         layout.set_hash(row_ptr, hash_at(output_idx, source_row_idx)?);
                         layout.set_next(row_ptr, ptr::null());

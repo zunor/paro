@@ -163,6 +163,7 @@ struct EqualityDenominatorScratch {
     sizes: Vec<usize>,
     active: Vec<bool>,
     components: Vec<Vec<DistinctDomainEstimate>>,
+    vertex_domains: Vec<Option<DistinctDomainEstimate>>,
 }
 
 impl EqualityDenominatorScratch {
@@ -177,7 +178,47 @@ impl EqualityDenominatorScratch {
         for component in &mut self.components {
             component.clear();
         }
+        self.vertex_domains.clear();
+        self.vertex_domains.resize(vertices, None);
     }
+}
+
+#[derive(Debug, Clone)]
+struct CorrelatedEqualityDomains {
+    strongest: f64,
+    redundant_product: f64,
+    relation_bindings: HashMap<usize, HashSet<ColumnBinding>>,
+}
+
+impl CorrelatedEqualityDomains {
+    fn new(domain: f64, relation_bindings: HashMap<usize, HashSet<ColumnBinding>>) -> Self {
+        Self {
+            strongest: domain,
+            redundant_product: 1.0,
+            relation_bindings,
+        }
+    }
+
+    fn add(&mut self, domain: f64, relation_bindings: HashMap<usize, HashSet<ColumnBinding>>) {
+        if domain > self.strongest {
+            self.redundant_product *= self.strongest;
+            self.strongest = domain;
+        } else {
+            self.redundant_product *= domain;
+        }
+        for (relation, bindings) in relation_bindings {
+            self.relation_bindings
+                .entry(relation)
+                .or_default()
+                .extend(bindings);
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EqualityPairDomain {
+    domain: f64,
+    relation_bindings: HashMap<usize, HashSet<ColumnBinding>>,
 }
 
 impl DistinctDomainEstimate {
@@ -242,6 +283,11 @@ pub struct CardinalityEstimator {
     /// keys that can match is bounded by `right_ndv / left_ndv`. The merged
     /// equivalence-class domain deliberately loses that directionality.
     binding_stats: HashMap<ColumnBinding, BindingCardinalityStats>,
+    /// Unique keys are correctness guarantees, unlike marginal NDV estimates.
+    /// They allow parallel equality classes to use a joint domain without
+    /// assuming the key columns are statistically independent.
+    relation_unique_keys: HashMap<usize, Vec<Vec<ColumnBinding>>>,
+    relation_cardinalities: HashMap<usize, usize>,
     /// Cached cardinalities for relation sets.
     relation_set_2_cardinality: HashMap<String, CardinalityHelper>,
     /// Set manager for creating/looking up relation sets.
@@ -301,6 +347,11 @@ impl CardinalityEstimator {
                     },
                 )
             }));
+        let relation = set.relations()[0];
+        self.relation_unique_keys
+            .insert(relation, stats.unique_keys.clone());
+        self.relation_cardinalities
+            .insert(relation, stats.cardinality);
 
         self.update_total_domains(set, stats);
 
@@ -554,17 +605,28 @@ impl CardinalityEstimator {
     /// class instead contributes `NDV^(vertices-components)`, the rank of its
     /// induced equality graph. Extra transitive predicates add cycles but no
     /// additional selectivity.
+    ///
+    /// Different equality classes that connect the same relation pair are not
+    /// independent unless a joint-domain statistic says so. Multiplying their
+    /// single-column NDVs can underestimate a composite-key join by orders of
+    /// magnitude. Until such a joint statistic exists, keep the strongest
+    /// domain for parallel equality edges. This preserves independent
+    /// equality topology across the rest of each graph without manufacturing
+    /// independence between columns from marginal statistics alone.
     fn equality_denominator(&mut self, requested_set: &JoinRelationSet) -> (f64, HashSet<usize>) {
         debug_assert!(
             !self.equality_graphs_dirty,
             "equality topology must be compiled before cardinality lookup"
         );
         let mut denominator = 1.0;
+        let mut correlated_pairs = HashMap::<(usize, usize), CorrelatedEqualityDomains>::new();
         let mut consumed_filters = HashSet::new();
         let Self {
             relation_set_stats,
             equality_graphs,
             binding_stats,
+            relation_unique_keys,
+            relation_cardinalities,
             equality_scratch,
             ..
         } = self;
@@ -624,8 +686,10 @@ impl CardinalityEstimator {
                         distinct = Some(binding_distinct);
                     }
                 }
+                let distinct = distinct.unwrap_or(fallback_distinct);
+                equality_scratch.vertex_domains[index] = Some(distinct);
                 let root = find_component(&mut equality_scratch.parents, index);
-                equality_scratch.components[root].push(distinct.unwrap_or(fallback_distinct));
+                equality_scratch.components[root].push(distinct);
             }
             for distincts in equality_scratch
                 .components
@@ -659,8 +723,90 @@ impl CardinalityEstimator {
                     "Applied equality-class rank selectivity"
                 );
             }
+
+            // Multiple predicates in one equivalence class have already been
+            // reduced to graph rank above. Record at most one marginal domain
+            // per relation pair for this class, then correlate matching pairs
+            // across otherwise independent classes.
+            let mut graph_pairs = HashMap::<(usize, usize), EqualityPairDomain>::new();
+            for edge in &graph.edges {
+                let left_relation = graph.vertices[edge.left].relation;
+                let right_relation = graph.vertices[edge.right].relation;
+                if !requested_set.contains(left_relation) || !requested_set.contains(right_relation)
+                {
+                    continue;
+                }
+                let Some(left_domain) = equality_scratch.vertex_domains[edge.left] else {
+                    continue;
+                };
+                let Some(right_domain) = equality_scratch.vertex_domains[edge.right] else {
+                    continue;
+                };
+                let pair = if left_relation < right_relation {
+                    (left_relation, right_relation)
+                } else {
+                    (right_relation, left_relation)
+                };
+                let domain = left_domain.value().max(right_domain.value()) as f64;
+                let pair_domain = graph_pairs
+                    .entry(pair)
+                    .or_insert_with(|| EqualityPairDomain {
+                        domain,
+                        relation_bindings: HashMap::new(),
+                    });
+                pair_domain.domain = pair_domain.domain.max(domain);
+                pair_domain
+                    .relation_bindings
+                    .entry(left_relation)
+                    .or_default()
+                    .extend(graph.vertices[edge.left].bindings.iter().copied());
+                pair_domain
+                    .relation_bindings
+                    .entry(right_relation)
+                    .or_default()
+                    .extend(graph.vertices[edge.right].bindings.iter().copied());
+            }
+            for (pair, pair_domain) in graph_pairs {
+                correlated_pairs
+                    .entry(pair)
+                    .and_modify(|domains| {
+                        domains.add(pair_domain.domain, pair_domain.relation_bindings.clone())
+                    })
+                    .or_insert_with(|| {
+                        CorrelatedEqualityDomains::new(
+                            pair_domain.domain,
+                            pair_domain.relation_bindings,
+                        )
+                    });
+            }
         }
 
+        for domains in correlated_pairs.values() {
+            denominator /= domains.redundant_product;
+
+            let unique_joint_domain = domains
+                .relation_bindings
+                .iter()
+                .filter_map(|(relation, observed_bindings)| {
+                    let covers_unique_key =
+                        relation_unique_keys.get(relation).is_some_and(|keys| {
+                            keys.iter().any(|key| {
+                                !key.is_empty()
+                                    && key
+                                        .iter()
+                                        .all(|binding| observed_bindings.contains(binding))
+                            })
+                        });
+                    covers_unique_key
+                        .then(|| relation_cardinalities.get(relation).copied())
+                        .flatten()
+                })
+                .max()
+                .unwrap_or(0) as f64;
+            if unique_joint_domain > domains.strongest {
+                denominator *= unique_joint_domain / domains.strongest;
+            }
+        }
         (denominator, consumed_filters)
     }
 
@@ -1334,6 +1480,127 @@ mod tests {
 
         // Expected: (1000 * 500) / max(100, 50) = 500000 / 100 = 5000
         assert!(cardinality > 0.0);
+    }
+
+    #[test]
+    fn parallel_equality_classes_do_not_assume_composite_key_independence() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut set_manager, 0, 1, 1, 1, 1),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let left = set_manager.get_relation(0);
+        let mut left_stats = RelationStats::with_cardinality(6_001_215);
+        left_stats.column_distinct_count = column_distinct_counts(
+            0,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&left, &left_stats);
+
+        let right = set_manager.get_relation(1);
+        let mut right_stats = RelationStats::with_cardinality(800_000);
+        right_stats.column_distinct_count = column_distinct_counts(
+            1,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&right, &right_stats);
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1]);
+        // Marginal NDVs cannot establish that the two key columns are
+        // independent. Use the strongest known single-column selectivity
+        // instead of turning a 24M estimate into 2.4K.
+        assert_eq!(estimator.estimate_cardinality(&join), 24_004_860.0);
+    }
+
+    #[test]
+    fn declared_composite_key_provides_a_joint_equality_domain() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut set_manager, 0, 1, 1, 1, 1),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let probe = set_manager.get_relation(0);
+        let mut probe_stats = RelationStats::with_cardinality(6_001_215);
+        probe_stats.column_distinct_count = column_distinct_counts(
+            0,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&probe, &probe_stats);
+
+        let build = set_manager.get_relation(1);
+        let mut build_stats = RelationStats::with_cardinality(800_000);
+        build_stats.column_distinct_count = column_distinct_counts(
+            1,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        build_stats.unique_keys = vec![vec![ColumnBinding::new(1, 0), ColumnBinding::new(1, 1)]];
+        estimator.init_cardinality_estimator_props(&build, &build_stats);
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1]);
+        assert_eq!(estimator.estimate_cardinality(&join), 6_001_215.0);
+    }
+
+    #[test]
+    fn parallel_key_correlation_survives_a_larger_equivalence_scope() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            // part.partkey = lineitem.partkey = partsupp.partkey
+            create_equality_filter(&mut set_manager, 0, 0, 1, 0, 0),
+            create_equality_filter(&mut set_manager, 1, 0, 2, 0, 1),
+            // lineitem.suppkey = partsupp.suppkey
+            create_equality_filter(&mut set_manager, 1, 1, 2, 1, 2),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let part = set_manager.get_relation(0);
+        let mut part_stats = RelationStats::with_cardinality(150_000);
+        part_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(150_000, true)]);
+        estimator.init_cardinality_estimator_props(&part, &part_stats);
+
+        let lineitem = set_manager.get_relation(1);
+        let mut lineitem_stats = RelationStats::with_cardinality(6_001_215);
+        lineitem_stats.column_distinct_count = column_distinct_counts(
+            1,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&lineitem, &lineitem_stats);
+
+        let partsupp = set_manager.get_relation(2);
+        let mut partsupp_stats = RelationStats::with_cardinality(800_000);
+        partsupp_stats.column_distinct_count = column_distinct_counts(
+            2,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&partsupp, &partsupp_stats);
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1, 2]);
+        assert_eq!(estimator.estimate_cardinality(&join), 18_003_645.0);
     }
 
     #[test]

@@ -99,6 +99,17 @@ enum FixedMembershipRepresentation<T> {
     },
 }
 
+/// Borrowed physical representation used to dispatch vector kernels once per
+/// batch instead of once per value.
+pub(crate) enum FixedMembershipView<'a, T> {
+    Sorted(&'a [T]),
+    Dense {
+        base: T,
+        span: usize,
+        bits: &'a [u64],
+    },
+}
+
 /// Immutable membership set for one physical integer width.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FixedMembershipSet<T> {
@@ -170,6 +181,19 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
                 };
                 bits[offset / u64::BITS as usize] & (1_u64 << (offset % u64::BITS as usize)) != 0
             }
+        }
+    }
+
+    pub(crate) fn view(&self) -> FixedMembershipView<'_, T> {
+        match &self.representation {
+            FixedMembershipRepresentation::Sorted(values) => FixedMembershipView::Sorted(values),
+            FixedMembershipRepresentation::Dense {
+                base, span, bits, ..
+            } => FixedMembershipView::Dense {
+                base: *base,
+                span: *span,
+                bits,
+            },
         }
     }
 

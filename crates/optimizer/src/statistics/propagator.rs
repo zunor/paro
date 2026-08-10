@@ -17,9 +17,7 @@ use paro_planner::operator::{
     empty_result::EmptyResult, ColumnBinding, Filter, Join, JoinComparisonType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_storage::statistics::{
-    BaseStatistics, ColumnStatistics, NumericStats, StatsInfo, StringStats,
-};
+use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -415,48 +413,11 @@ impl StatisticsPropagator {
                                     break;
                                 }
                                 if let Some(storage_stats) = storage.column_statistics(col_id) {
-                                    let mut base =
-                                        BaseStatistics::new(get.column_types[out_idx].clone());
-                                    base.copy_validity(&storage_stats);
-                                    let distinct = storage_stats.get_distinct_count();
-                                    if distinct > 0 {
-                                        base.set_distinct_count(distinct);
-                                    }
-
-                                    if let (Some(min), Some(max)) =
-                                        (storage_stats.min_value(), storage_stats.max_value())
-                                    {
-                                        match (&min, &max) {
-                                            (Value::Varchar(min_s), Value::Varchar(max_s)) => {
-                                                StringStats::set_min(&mut base, min_s);
-                                                StringStats::set_max(&mut base, max_s);
-                                                if let Some(max_length) =
-                                                    StringStats::max_string_length(&storage_stats)
-                                                {
-                                                    StringStats::set_max_string_length(
-                                                        &mut base, max_length,
-                                                    );
-                                                }
-                                            }
-                                            _ => {
-                                                if !min.is_null() && !max.is_null() {
-                                                    NumericStats::set_guaranteed_min(
-                                                        &mut base, &min,
-                                                    );
-                                                    NumericStats::set_guaranteed_max(
-                                                        &mut base, &max,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-
                                     let binding = ColumnBinding {
                                         table_index: get.table_index,
                                         column_index: out_idx,
                                     };
-                                    self.statistics_map
-                                        .insert(binding, column_statistics_arc(base));
+                                    self.statistics_map.insert(binding, Arc::new(storage_stats));
                                 }
                             }
                         }
@@ -698,7 +659,10 @@ impl StatisticsPropagator {
                 NumericStats::set_guaranteed_max(&mut new_base, &max);
             }
 
-            Some(column_statistics_arc(new_base))
+            Some(Arc::new(ColumnStatistics::with_distinct(
+                new_base,
+                stats.distinct_stats().map(|distinct| distinct.copy()),
+            )))
         } else {
             None
         }
@@ -924,6 +888,7 @@ mod tests {
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{WindowExpression, WindowFrame};
     use paro_planner::operator::{Aggregate, ExpressionGet, Projection, Window};
+    use paro_storage::statistics::StringStats;
 
     use super::*;
 

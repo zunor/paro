@@ -107,24 +107,12 @@ impl ColumnStatistics {
 
     /// Update distinct statistics with hash values.
     ///
-    /// This method uses sampling to speed up updates.
     /// Does nothing if distinct statistics are not available.
     ///
     /// # Arguments
     /// * `hashes` - Hash values of the data
     /// * `count` - Number of values
-    /// * `is_integral` - Whether the data type is integral (affects sample rate)
-    pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize, is_integral: bool) {
-        if let Some(distinct) = &mut self.distinct_stats {
-            distinct.update_sample(hashes, count, is_integral);
-        }
-    }
-
-    /// Update distinct statistics without sampling.
-    ///
-    /// All provided hash values are inserted into the HyperLogLog.
-    /// Does nothing if distinct statistics are not available.
-    pub fn update_distinct_statistics_full(&mut self, hashes: &[u64], count: usize) {
+    pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize) {
         if let Some(distinct) = &mut self.distinct_stats {
             distinct.update(hashes, count);
         }
@@ -338,8 +326,8 @@ mod tests {
         // Update distinct statistics
         let hashes1: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
         let hashes2: Vec<u64> = (100..200u64).map(murmur_hash_mix).collect();
-        stats1.update_distinct_statistics_full(&hashes1, hashes1.len());
-        stats2.update_distinct_statistics_full(&hashes2, hashes2.len());
+        stats1.update_distinct_statistics(&hashes1, hashes1.len());
+        stats2.update_distinct_statistics(&hashes2, hashes2.len());
 
         let count1 = stats1.get_distinct_count();
         let count2 = stats2.get_distinct_count();
@@ -366,7 +354,7 @@ mod tests {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
 
         let hashes: Vec<u64> = (0..1000u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics(&hashes, hashes.len(), true);
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let count = stats.get_distinct_count();
         assert!(count > 0, "Distinct count should be positive");
@@ -378,7 +366,7 @@ mod tests {
         stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics_full(&hashes, hashes.len());
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let copy = stats.copy();
 
@@ -399,7 +387,7 @@ mod tests {
         stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics_full(&hashes, hashes.len());
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let bytes = stats.to_bytes().expect("Serialization failed");
         let restored = ColumnStatistics::from_bytes(&bytes, LogicalType::Integer)

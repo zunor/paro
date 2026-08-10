@@ -195,6 +195,11 @@ impl Optimizer {
             Box::new(InClausePass),
             Box::new(SearchOptimizationPass),
             Box::new(SegmentPrunerPass),
+            // Join ordering and the later structural passes replace plan
+            // nodes while preserving the old parents. Recompute cardinality
+            // and output statistics over the settled tree so projections and
+            // aggregates cannot retain pre-rewrite estimates.
+            Box::new(StatisticsGatheringPass),
             Box::new(StatisticsPropagationPass),
             // Projection maps are positional annotations over the final logical
             // layout. Derive them only after every structural rewrite (most

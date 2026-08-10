@@ -38,7 +38,7 @@ use paro_storage::buffer::MemoryTag;
 use paro_storage::row::RowLayout;
 
 use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
-use super::hash_kernel::JoinKeyLayout;
+use super::hash_kernel::{JoinKeyLayout, PreparedProbeKeys};
 use super::ht_entry::HtEntry;
 use super::integer_index::{ExactIntegerJoinIndex, ExactIntegerJoinIndexBuilder, IntegerKeyKind};
 use super::scan_structure::ScanStructure;
@@ -174,6 +174,14 @@ pub struct JoinHashTable {
     /// to each parallel table removes a full serialized-row pass at finalize.
     integer_index_build_stats: Mutex<IntegerIndexBuildStats>,
 
+    /// Physical key kind retained even if later input makes the exact index
+    /// ineligible. It is used to materialize hashes for generic fallback.
+    integer_key_kind: Option<IntegerKeyKind>,
+
+    /// Whether any build rows were appended without computing their hash.
+    /// Hashing is deferred while a bounded exact integer index is viable.
+    deferred_hashes: AtomicBool,
+
     /// Lock-free read pointer published with `finalized`.
     probe_integer_index: AtomicPtr<ExactIntegerJoinIndex>,
 
@@ -274,6 +282,10 @@ impl IntegerIndexBuildStats {
             Self::Ineligible => unreachable!("ineligible stats returned above"),
         };
         Ok(())
+    }
+
+    fn exact_index_candidate(self) -> bool {
+        !matches!(self, Self::Ineligible)
     }
 
     fn merge(&mut self, incoming: Self) {
@@ -419,6 +431,11 @@ impl JoinHashTable {
         let found_flag_offset = found_flag_column_index.map(|_| build_row_layout.found_offset());
         let integer_index_build_stats =
             IntegerIndexBuildStats::new(join_type, &equality_types, &equality_comparisons);
+        let integer_key_kind = match integer_index_build_stats {
+            IntegerIndexBuildStats::Empty { kind }
+            | IntegerIndexBuildStats::Bounded { kind, .. } => Some(kind),
+            IntegerIndexBuildStats::Ineligible => None,
+        };
 
         Self {
             buffer_pool,
@@ -439,6 +456,8 @@ impl JoinHashTable {
             entries: Mutex::new(HtEntryTable::default()),
             integer_index: Mutex::new(None),
             integer_index_build_stats: Mutex::new(integer_index_build_stats),
+            integer_key_kind,
+            deferred_hashes: AtomicBool::new(false),
             probe_integer_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
@@ -561,6 +580,7 @@ impl JoinHashTable {
         state: &mut BuildStoreScanState,
         output: &mut Chunk,
     ) -> Result<usize> {
+        self.materialize_deferred_hashes();
         self.build_store
             .lock()
             .unwrap()
@@ -586,6 +606,7 @@ impl JoinHashTable {
     where
         F: FnMut(&Chunk) -> Result<()>,
     {
+        self.materialize_deferred_hashes();
         let empty_store = HashBuildStore::new_with_memory(
             self.buffer_pool.clone(),
             self.allocator.clone(),
@@ -603,6 +624,7 @@ impl JoinHashTable {
             &self.equality_types,
             &self.equality_comparisons,
         );
+        self.deferred_hashes.store(false, Ordering::Release);
         drained_store.drain_spill_chunks(visitor)
     }
 
@@ -619,6 +641,13 @@ impl JoinHashTable {
                 ))
             }
         };
+        if self.deferred_hashes.swap(false, Ordering::AcqRel) {
+            let kind = self
+                .integer_key_kind
+                .expect("deferred integer hashes require a physical key kind");
+            let layout = Arc::clone(self.build_row_layout.base());
+            store.materialize_deferred_hashes(|row_ptr| kind.row_hash(layout.as_ref(), row_ptr, 0));
+        }
         let drained_bytes = store.size_in_bytes();
         if drained_bytes == 0 {
             return Ok(Some(0));
@@ -638,8 +667,20 @@ impl JoinHashTable {
             &self.equality_types,
             &self.equality_comparisons,
         );
+        self.deferred_hashes.store(false, Ordering::Release);
         drained_store.drain_spill_chunks(visitor)?;
         Ok(Some(drained_bytes))
+    }
+
+    fn materialize_deferred_hashes(&self) {
+        let mut store = self.build_store.lock().unwrap();
+        if self.deferred_hashes.swap(false, Ordering::AcqRel) {
+            let kind = self
+                .integer_key_kind
+                .expect("deferred integer hashes require a physical key kind");
+            let layout = Arc::clone(self.build_row_layout.base());
+            store.materialize_deferred_hashes(|row_ptr| kind.row_hash(layout.as_ref(), row_ptr, 0));
+        }
     }
 
     fn prepare_keys(
@@ -704,9 +745,16 @@ impl JoinHashTable {
         Ok(output_count)
     }
 
+    pub(crate) fn prepare_probe_keys<'a>(
+        &self,
+        keys: &'a paro_common::chunk::Chunk,
+    ) -> Result<PreparedProbeKeys<'a>> {
+        self.key_layout.prepare_probe_keys(keys)
+    }
+
     pub(crate) fn key_values_match_build_row(
         &self,
-        keys: &paro_common::chunk::Chunk,
+        keys: &PreparedProbeKeys<'_>,
         probe_row_idx: usize,
         row_ptr: usize,
     ) -> bool {
@@ -760,6 +808,7 @@ impl JoinHashTable {
         self.reset_runtime_state();
         self.build_store.lock().unwrap().reset();
         self.count.store(0, Ordering::Relaxed);
+        self.deferred_hashes.store(false, Ordering::Release);
         *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
             self.join_type,
             &self.equality_types,
@@ -818,26 +867,42 @@ impl JoinHashTable {
             return Ok(0);
         }
 
-        let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
-        if !matches!(*integer_stats, IntegerIndexBuildStats::Ineligible) {
-            let key = keys.column(0).ok_or_else(|| {
-                paro_error::internal("hash join build has no first equality-key column")
-            })?;
-            integer_stats.add_batch(key, keys.size(), &build_sel.as_slice()[..appended_count])?;
-        }
-        drop(integer_stats);
+        let defer_hashes = {
+            let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
+            if integer_stats.exact_index_candidate() {
+                let key = keys.column(0).ok_or_else(|| {
+                    paro_error::internal("hash join build has no first equality-key column")
+                })?;
+                integer_stats.add_batch(
+                    key,
+                    keys.size(),
+                    &build_sel.as_slice()[..appended_count],
+                )?;
+            }
+            integer_stats.exact_index_candidate()
+        };
 
-        hashes.resize(appended_count, 0);
-        self.key_layout
-            .hash_selected_into(keys, build_sel, appended_count, hashes)?;
-        let appended_count = self.build_store.lock().unwrap().append_key_payload_chunk(
+        if !defer_hashes {
+            hashes.resize(appended_count, 0);
+            self.key_layout
+                .hash_selected_into(keys, build_sel, appended_count, hashes)?;
+        }
+
+        let mut store = self.build_store.lock().unwrap();
+        let appended_count = store.append_key_payload_chunk(
             keys,
             payload,
             build_sel,
             appended_count,
-            hashes,
+            (!defer_hashes).then_some(hashes.as_slice()),
             false,
         )?;
+        if defer_hashes {
+            // Publish the deferred state while holding the same store lock that
+            // made the zero hash fields visible to spill/finalize readers.
+            self.deferred_hashes.store(true, Ordering::Release);
+        }
+        drop(store);
 
         // Update count
         self.count.fetch_add(appended_count, Ordering::Relaxed);
@@ -907,6 +972,11 @@ impl JoinHashTable {
             return Ok(());
         }
 
+        // Exact-index admission is speculative. If bounds or uniqueness make
+        // it unsuitable, initialize the canonical hash field once here before
+        // constructing generic pointer chains.
+        self.materialize_deferred_hashes();
+
         // Step 1: Allocate and initialize pointer table
         self.allocate_pointer_table()?;
         self.initialize_pointer_table();
@@ -958,8 +1028,9 @@ impl JoinHashTable {
             Err(error) => return Err(error),
         };
         let mut unique = true;
+        let mut resource_declined = false;
         store.visit_row_ptrs(|row_ptr| {
-            if !unique {
+            if !unique || resource_declined {
                 return Ok(());
             }
             let ordinal = kind
@@ -970,25 +1041,22 @@ impl JoinHashTable {
                         self.equality_types[0]
                     ))
                 })?;
-            unique = index.insert(ordinal, row_ptr)?;
-            Ok(())
+            match index.insert(ordinal, row_ptr) {
+                Ok(inserted) => {
+                    unique = inserted;
+                    Ok(())
+                }
+                Err(error) if error.error_class() == ErrorClass::Resource => {
+                    resource_declined = true;
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
         })?;
-        if !unique {
+        if !unique || resource_declined {
             return Ok(None);
         }
-        let index = match index.finish(self.allocator.clone(), &self.pointer_memory, |populator| {
-            store.visit_row_ptrs(|row_ptr| {
-                let ordinal = kind
-                    .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
-                    .ok_or_else(|| {
-                        paro_error::internal(format!(
-                            "integer join build key does not match declared type {:?}",
-                            self.equality_types[0]
-                        ))
-                    })?;
-                populator.populate_pointer(ordinal, row_ptr)
-            })
-        }) {
+        let index = match index.finish(self.allocator.clone(), &self.pointer_memory) {
             Ok(index) => index,
             // This index is an optional acceleration structure. A transient
             // allocation failure during ranked finalization must fall back to
@@ -1048,6 +1116,9 @@ impl JoinHashTable {
             .lock()
             .unwrap()
             .merge(incoming_stats);
+        if other.deferred_hashes.load(Ordering::Acquire) {
+            self.deferred_hashes.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1327,6 +1398,29 @@ mod tests {
             .build(&keys, &payload)
             .expect_err("tiny query quota must reject hash join build storage");
         assert!(err.to_string().contains("quota"));
+    }
+
+    #[test]
+    fn data_collection_reset_clears_deferred_hash_state() {
+        let table = JoinHashTable::new(
+            create_test_buffer_pool(),
+            paro_common::test_utils::test_allocator(),
+            vec![equality_condition()],
+            vec![LogicalType::Integer],
+            JoinType::Inner,
+            JoinHashTableConfig::default(),
+        );
+        let keys = chunk_from_optional_i32(&[Some(1), Some(2)]);
+        let payload = chunk_from_optional_i32(&[Some(10), Some(20)]);
+
+        table.build(&keys, &payload).unwrap();
+        assert!(table.deferred_hashes.load(Ordering::Acquire));
+
+        table.reset_data_collection();
+
+        assert!(!table.deferred_hashes.load(Ordering::Acquire));
+        assert_eq!(table.count(), 0);
+        assert_eq!(table.build_rows_size_in_bytes(), 0);
     }
 
     fn find_linear_probe_collision_pair() -> (i32, i32) {

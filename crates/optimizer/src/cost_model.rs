@@ -27,6 +27,7 @@ pub struct SelectivityDefaults {
     pub range: f64,
     pub predicate: f64,
     pub like_prefix: f64,
+    pub like_contains: f64,
     pub fulltext_match: f64,
     pub vector_topk_fraction: f64,
     pub is_not_null: f64,
@@ -39,6 +40,7 @@ impl Default for SelectivityDefaults {
             range: 0.3,
             predicate: 0.75,
             like_prefix: 0.25,
+            like_contains: 0.05,
             fulltext_match: 0.1,
             vector_topk_fraction: 0.001,
             is_not_null: 0.9,
@@ -78,12 +80,21 @@ impl CostModel {
             },
             Expression::Operator(operator) => match operator.operator_type {
                 OperatorType::Like | OperatorType::ILike => {
-                    if is_like_prefix_pattern(operator.children.get(1)) {
-                        self.defaults.like_prefix
-                    } else {
-                        self.defaults.predicate
+                    match like_pattern_shape(operator.children.get(1)) {
+                        LikePatternShape::MatchAll => 1.0,
+                        LikePatternShape::Exact => self.defaults.equality,
+                        LikePatternShape::Prefix => self.defaults.like_prefix,
+                        LikePatternShape::Contains | LikePatternShape::Suffix => {
+                            self.defaults.like_contains
+                        }
+                        LikePatternShape::Generic => self.defaults.predicate,
                     }
                 }
+                OperatorType::Not => operator
+                    .children
+                    .first()
+                    .map(|child| 1.0 - self.estimate_selectivity(child, column_stats))
+                    .unwrap_or(self.defaults.predicate),
                 OperatorType::IsNull => 1.0 - self.defaults.is_not_null,
                 OperatorType::IsNotNull => self.defaults.is_not_null,
                 OperatorType::In => {
@@ -239,22 +250,43 @@ fn column_ref_with_constant<'a>(
     }
 }
 
-fn is_like_prefix_pattern(pattern: Option<&Expression>) -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LikePatternShape {
+    MatchAll,
+    Exact,
+    Prefix,
+    Suffix,
+    Contains,
+    Generic,
+}
+
+fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
     let Some(Expression::Constant(constant)) = pattern else {
-        return false;
+        return LikePatternShape::Generic;
     };
     let Value::Varchar(value) = &constant.value else {
-        return false;
+        return LikePatternShape::Generic;
     };
-    value.ends_with('%')
-        && !value[..value.len().saturating_sub(1)].contains('%')
-        && !value.contains('_')
+    if value.contains('_') || value.contains('\\') {
+        return LikePatternShape::Generic;
+    }
+    if !value.is_empty() && value.bytes().all(|byte| byte == b'%') {
+        return LikePatternShape::MatchAll;
+    }
+    let wildcard_count = value.bytes().filter(|byte| *byte == b'%').count();
+    match wildcard_count {
+        0 => LikePatternShape::Exact,
+        1 if value.ends_with('%') => LikePatternShape::Prefix,
+        1 if value.starts_with('%') => LikePatternShape::Suffix,
+        2 if value.starts_with('%') && value.ends_with('%') => LikePatternShape::Contains,
+        _ => LikePatternShape::Generic,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ComparisonExpression, ConstantExpression};
+    use paro_planner::expression::{ComparisonExpression, ConstantExpression, OperatorExpression};
 
     use super::*;
 
@@ -294,5 +326,55 @@ mod tests {
             model.estimate_selectivity(&expr, &HashMap::new()),
             model.defaults.equality
         );
+    }
+
+    #[test]
+    fn like_selectivity_distinguishes_pattern_shapes() {
+        let model = CostModel::default();
+        let like = |pattern: &str| {
+            Expression::Operator(OperatorExpression::new(
+                OperatorType::Like,
+                vec![
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(1, 0),
+                        LogicalType::Varchar,
+                    )),
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Varchar(pattern.to_string()),
+                        LogicalType::Varchar,
+                    )),
+                ],
+                LogicalType::Boolean,
+            ))
+        };
+
+        assert_eq!(
+            model.estimate_selectivity(&like("green"), &HashMap::new()),
+            0.1
+        );
+        assert_eq!(
+            model.estimate_selectivity(&like("green%"), &HashMap::new()),
+            0.25
+        );
+        assert_eq!(
+            model.estimate_selectivity(&like("%green"), &HashMap::new()),
+            0.05
+        );
+        assert_eq!(
+            model.estimate_selectivity(&like("%green%"), &HashMap::new()),
+            0.05
+        );
+        assert_eq!(model.estimate_selectivity(&like("%"), &HashMap::new()), 1.0);
+        assert_eq!(
+            model.estimate_selectivity(&like("gr_en%"), &HashMap::new()),
+            0.75
+        );
+
+        let not_like = Expression::Operator(OperatorExpression::new_unary(
+            OperatorType::Not,
+            like("%green%"),
+            LogicalType::Boolean,
+        ));
+        assert_eq!(model.estimate_selectivity(&not_like, &HashMap::new()), 0.95);
     }
 }

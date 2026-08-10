@@ -157,7 +157,7 @@ impl ScanStructure {
                 break;
             }
 
-            let match_count = self.resolve_predicates_into_pending(keys, hash_table);
+            let match_count = self.resolve_predicates_into_pending(keys, hash_table)?;
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -419,7 +419,7 @@ impl ScanStructure {
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
         while self.count > 0 {
-            let match_count = self.resolve_predicates(keys, hash_table, 0);
+            let match_count = self.resolve_predicates(keys, hash_table, 0)?;
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -473,7 +473,7 @@ impl ScanStructure {
         F: FnMut(&SelectionVector, &[usize], usize, &mut SelectionVector) -> Result<usize>,
     {
         while self.count > 0 {
-            let match_count = self.resolve_predicates(keys, hash_table, 0);
+            let match_count = self.resolve_predicates(keys, hash_table, 0)?;
             self.scratch_sel.set_len(match_count);
             let accepted_count = residual_filter(
                 &self.chain_match_sel,
@@ -602,7 +602,10 @@ impl ScanStructure {
         keys: &paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
         base_offset: usize,
-    ) -> usize {
+    ) -> Result<usize> {
+        let prepared_keys = (!self.exact_key_matches)
+            .then(|| hash_table.prepare_probe_keys(keys))
+            .transpose()?;
         let mut match_count = 0;
 
         for i in 0..self.count {
@@ -613,35 +616,52 @@ impl ScanStructure {
                 continue;
             }
 
-            if self.exact_key_matches || hash_table.key_values_match_build_row(keys, idx, row_ptr) {
+            if self.exact_key_matches
+                || hash_table.key_values_match_build_row(
+                    prepared_keys
+                        .as_ref()
+                        .expect("non-exact join probe must prepare its keys"),
+                    idx,
+                    row_ptr,
+                )
+            {
                 self.chain_match_sel.set(match_count, idx);
                 self.rhs_pointers[base_offset + match_count] = row_ptr as usize;
                 match_count += 1;
             }
         }
 
-        match_count
+        Ok(match_count)
     }
 
     fn resolve_predicates_into_pending(
         &mut self,
         keys: &paro_common::chunk::Chunk,
         hash_table: &JoinHashTable,
-    ) -> usize {
+    ) -> Result<usize> {
+        let prepared_keys = (!self.exact_key_matches)
+            .then(|| hash_table.prepare_probe_keys(keys))
+            .transpose()?;
         let mut match_count = 0;
         for active_idx in 0..self.count {
             let probe_idx = self.sel_vector.get(active_idx);
             let row_ptr = self.pointers[probe_idx];
             if row_ptr != 0
                 && (self.exact_key_matches
-                    || hash_table.key_values_match_build_row(keys, probe_idx, row_ptr))
+                    || hash_table.key_values_match_build_row(
+                        prepared_keys
+                            .as_ref()
+                            .expect("non-exact join probe must prepare its keys"),
+                        probe_idx,
+                        row_ptr,
+                    ))
             {
                 self.chain_match_sel.set(match_count, probe_idx);
                 self.pending_rhs_pointers[match_count] = row_ptr;
                 match_count += 1;
             }
         }
-        match_count
+        Ok(match_count)
     }
 
     /// Scan results for an inner join.
@@ -734,7 +754,7 @@ impl ScanStructure {
             }
 
             let rhs_offset = base_count;
-            let match_count = self.resolve_predicates(keys, hash_table, rhs_offset);
+            let match_count = self.resolve_predicates(keys, hash_table, rhs_offset)?;
             if match_count > 0 {
                 self.scratch_sel.set_len(match_count);
                 let accepted_count = residual_filter(
@@ -970,7 +990,7 @@ impl ScanStructure {
         if !self.probe_matches_ready {
             self.single_match_pointers[..left.size()].fill(0);
             while self.count > 0 {
-                let match_count = self.resolve_predicates(keys, hash_table, 0);
+                let match_count = self.resolve_predicates(keys, hash_table, 0)?;
                 self.scratch_sel.set_len(match_count);
                 let accepted_count = residual_filter(
                     &self.chain_match_sel,
@@ -1131,6 +1151,13 @@ impl ScanStructure {
         result.set_cardinality(count);
         let mut lhs_sel = self.lhs_sel.clone();
         lhs_sel.set_len(count);
+        let lhs_is_identity = count == left.size()
+            && lhs_sel
+                .as_slice()
+                .iter()
+                .take(count)
+                .enumerate()
+                .all(|(row_idx, &selected)| selected as usize == row_idx);
 
         // 1. Copy projected LHS columns
         for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
@@ -1140,11 +1167,18 @@ impl ScanStructure {
                     left.column_count()
                 ))
             })?;
-            // Reference the columns with selection vector
-            result.data[out_idx] = Arc::new(Vector::try_dictionary(
-                left_column.clone(),
-                lhs_sel.clone(),
-            )?);
+            result.data[out_idx] = if lhs_is_identity {
+                // A total, order-preserving match needs no dictionary wrapper.
+                // This is common for foreign-key joins after an exact runtime
+                // filter and prevents downstream joins from composing chains
+                // of identity selections batch after batch.
+                Arc::clone(left_column)
+            } else {
+                Arc::new(Vector::try_dictionary(
+                    Arc::clone(left_column),
+                    lhs_sel.clone(),
+                )?)
+            };
         }
 
         // 2. Gather projected RHS columns

@@ -85,6 +85,7 @@ impl DPJoinNode {
 pub struct CostModel {
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
+    relation_widths: Vec<usize>,
 }
 
 impl CostModel {
@@ -92,6 +93,7 @@ impl CostModel {
     pub fn new() -> Self {
         Self {
             cardinality_estimator: CardinalityEstimator::new(),
+            relation_widths: Vec::new(),
         }
     }
 
@@ -109,6 +111,10 @@ impl CostModel {
             self.cardinality_estimator
                 .init_cardinality_estimator_props(&set, stats);
         }
+        self.relation_widths = relation_stats
+            .iter()
+            .map(|stats| stats.estimated_row_width.max(1))
+            .collect();
     }
 
     /// Compute the cost of joining two nodes.
@@ -132,8 +138,18 @@ impl CostModel {
             .cardinality_estimator
             .estimate_cardinality(&combination);
 
-        // Total cost = join cardinality + cost of producing left + cost of producing right
-        join_cardinality + left.cost + right.cost
+        // Materializing an intermediate is proportional to both its row count
+        // and carried width. Cardinality-only costing treats an integer key and
+        // a wide row with retained strings as identical, encouraging early
+        // dimension joins whose payload is repeatedly serialized by later
+        // breakers.
+        let row_width = combination
+            .relations()
+            .iter()
+            .map(|relation| self.relation_widths.get(*relation).copied().unwrap_or(1))
+            .sum::<usize>()
+            .max(1);
+        join_cardinality * row_width as f64 + left.cost + right.cost
     }
 
     /// Compute the cost and create a new DPJoinNode.

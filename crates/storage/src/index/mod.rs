@@ -71,7 +71,9 @@ mod predicate_result;
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 pub use evaluator::IndexEvaluator;
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
-pub(crate) use fixed_membership::{FixedMembershipKind, FixedMembershipSet, FixedMembershipValue};
+pub(crate) use fixed_membership::{
+    FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,
+};
 pub use fixed_size_allocator::{
     FixedSizeAllocator, FixedSizeAllocatorInfo, DEFAULT_BLOCK_SIZE, VACUUM_THRESHOLD,
 };

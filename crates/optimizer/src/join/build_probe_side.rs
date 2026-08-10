@@ -97,7 +97,7 @@ impl BuildProbeSideOptimizer {
 
     fn build_cost(&self, plan: &LogicalPlan) -> u128 {
         let cardinality = self.estimated_cardinality(plan) as u128;
-        let row_width = self.estimate_row_width(&plan.types()) as u128;
+        let row_width = estimate_row_width(&plan.types()) as u128;
         cardinality.saturating_mul(row_width.max(1))
     }
 
@@ -115,35 +115,36 @@ impl BuildProbeSideOptimizer {
             _ => 1000,
         }
     }
+}
 
-    fn estimate_row_width(&self, types: &[LogicalType]) -> usize {
-        let mut width = 8;
-        for ty in types {
-            width += ty.type_size();
-            width += Self::type_penalty(ty);
-        }
-        width
+/// Estimate the bytes carried by one intermediate execution row.
+///
+/// This is shared by join-order enumeration and final build/probe orientation
+/// so both optimizers assign the same cost to wide and variable-length rows.
+pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
+    let mut width = 8;
+    for ty in types {
+        width += ty.type_size();
+        width += type_penalty(ty);
     }
+    width
+}
 
-    fn type_penalty(ty: &LogicalType) -> usize {
-        match ty {
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::Blob => 8,
-            LogicalType::List(child) => 32 + Self::type_penalty(child),
-            LogicalType::Array(child, _) => 32 + Self::type_penalty(child),
-            LogicalType::Struct(fields) => {
-                16 + fields
-                    .iter()
-                    .map(|(_, ty)| Self::type_penalty(ty))
-                    .sum::<usize>()
-            }
-            _ => 1,
+fn type_penalty(ty: &LogicalType) -> usize {
+    match ty {
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Json
+        | LogicalType::Jsonb
+        | LogicalType::Blob => 8,
+        LogicalType::List(child) => 32 + type_penalty(child),
+        LogicalType::Array(child, _) => 32 + type_penalty(child),
+        LogicalType::Struct(fields) => {
+            16 + fields.iter().map(|(_, ty)| type_penalty(ty)).sum::<usize>()
         }
+        _ => 1,
     }
 }
 

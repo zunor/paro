@@ -465,7 +465,7 @@ impl StatisticsGathering {
             .map(|(idx, &column_id)| {
                 storage
                     .column_statistics(column_id)
-                    .map(|stats| Arc::new(ColumnStatistics::new(stats)))
+                    .map(Arc::new)
                     .unwrap_or_else(|| {
                         ColumnStatistics::create_unknown(
                             get.returned_types

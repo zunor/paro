@@ -147,6 +147,23 @@ impl ZoneMapIndex {
             return PredicateResult::NoneMatch;
         }
 
+        if !self.reader.global_has_null
+            && self
+                .reader
+                .global_min
+                .as_ref()
+                .zip(self.reader.global_max.as_ref())
+                .is_some_and(|(segment_min, segment_max)| {
+                    cmp(segment_min, &lower_bytes) != std::cmp::Ordering::Less
+                        && cmp(segment_max, &upper_bytes) != std::cmp::Ordering::Greater
+                })
+        {
+            // Range predicates are inclusive. Exact segment bounds plus an
+            // all-valid guarantee therefore prove every row satisfies it; the
+            // row-level evaluator may remove this conjunct entirely.
+            return PredicateResult::AllMatch;
+        }
+
         let ranges = self.page_ranges_or_default();
         let mut valid = Vec::new();
         for (idx, range) in ranges.iter().enumerate() {
@@ -498,5 +515,38 @@ mod tests {
             }
             _ => panic!("expected page ranges"),
         }
+    }
+
+    #[test]
+    fn inclusive_range_covering_all_valid_segment_is_exact_all_match() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add(
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&20_i32.to_le_bytes()),
+            false,
+        );
+        writer.add(
+            Bytes::copy_from_slice(&30_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&40_i32.to_le_bytes()),
+            false,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![PageRange::new(0, 3), PageRange::new(3, 6)],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            index.evaluate_predicate(&Predicate::Range {
+                column_id: 0,
+                lower: Value::Integer(10),
+                upper: Value::Integer(40),
+            }),
+            PredicateResult::AllMatch
+        ));
     }
 }

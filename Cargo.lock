@@ -1623,6 +1623,7 @@ name = "paro-execution"
 version = "0.1.0"
 dependencies = [
  "divan",
+ "memchr",
  "num_cpus",
  "parking_lot",
  "paro-catalog",

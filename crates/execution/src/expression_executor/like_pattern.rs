@@ -3,6 +3,7 @@
 
 //! Compiled SQL `LIKE` patterns and selection kernels.
 
+use memchr::memmem::Finder;
 use paro_common::error::Result;
 use paro_common::vector::{SelectionVector, Vector};
 
@@ -38,6 +39,7 @@ enum LikeStrategy {
 #[derive(Debug)]
 struct LiteralSearcher {
     literal: Vec<u8>,
+    finder: Option<Finder<'static>>,
     shifts: Option<Box<[usize; 256]>>,
 }
 
@@ -45,14 +47,20 @@ impl LiteralSearcher {
     const SKIP_SEARCH_MIN_LENGTH: usize = 4;
 
     fn new(literal: Vec<u8>, case_insensitive: bool) -> Self {
-        let shifts = (literal.len() >= Self::SKIP_SEARCH_MIN_LENGTH).then(|| {
-            let mut shifts = Box::new([literal.len(); 256]);
-            for (idx, &byte) in literal[..literal.len() - 1].iter().enumerate() {
-                shifts[normalize(byte, case_insensitive) as usize] = literal.len() - idx - 1;
-            }
-            shifts
-        });
-        Self { literal, shifts }
+        let finder = (!case_insensitive).then(|| Finder::new(&literal).into_owned());
+        let shifts =
+            (case_insensitive && literal.len() >= Self::SKIP_SEARCH_MIN_LENGTH).then(|| {
+                let mut shifts = Box::new([literal.len(); 256]);
+                for (idx, &byte) in literal[..literal.len() - 1].iter().enumerate() {
+                    shifts[normalize(byte, case_insensitive) as usize] = literal.len() - idx - 1;
+                }
+                shifts
+            });
+        Self {
+            literal,
+            finder,
+            shifts,
+        }
     }
 
     #[inline]
@@ -61,6 +69,10 @@ impl LiteralSearcher {
     }
 
     fn find_in(&self, haystack: &[u8], case_insensitive: bool) -> Option<usize> {
+        if let Some(finder) = &self.finder {
+            debug_assert!(!case_insensitive);
+            return finder.find(haystack);
+        }
         let needle = self.as_bytes();
         if needle.is_empty() {
             return Some(0);

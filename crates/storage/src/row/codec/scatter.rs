@@ -37,6 +37,15 @@ impl PreparedColumn<'_> {
             Self::Nested { source } => !source.is_null(row_idx),
         }
     }
+
+    #[inline]
+    fn all_valid(&self) -> bool {
+        match self {
+            Self::Fixed { view, .. } => view.validity().all_valid(),
+            Self::Varlen { view } => view.validity().all_valid(),
+            Self::Nested { source } => source.validity().all_valid(),
+        }
+    }
 }
 
 /// Bytes retained outside a row for one source value.
@@ -79,7 +88,50 @@ impl RowHeapUsage {
 pub struct PreparedRowScatter<'a> {
     columns: Vec<PreparedColumn<'a>>,
     heap_columns: Vec<usize>,
+    all_valid: bool,
     count: usize,
+}
+
+struct PreparedFixedColumn<'a> {
+    view: VectorView<'a>,
+    data: *const u8,
+    source_width: usize,
+    target_offset: usize,
+}
+
+/// Direct scatter program for an all-valid, fixed-width vector batch.
+///
+/// The general prepared scatter keeps per-column variants because it also owns
+/// varlen and nested semantics. Hash and aggregate builds commonly receive
+/// only flat fixed-width values; compiling that shape once removes variant,
+/// validity, and layout dispatch from every cell in the row loop.
+pub struct PreparedFixedRowScatter<'a> {
+    columns: Vec<PreparedFixedColumn<'a>>,
+    validity_width: usize,
+}
+
+impl PreparedFixedRowScatter<'_> {
+    /// Scatter a row whose logical index was validated by the enclosing batch.
+    ///
+    /// # Safety
+    ///
+    /// `row_ptr` must be writable for the layout used to compile this program,
+    /// and `row_idx` must be below the prepared vector cardinality.
+    #[inline]
+    pub unsafe fn scatter_row_unchecked(&self, row_ptr: *mut u8, row_idx: usize) {
+        if self.validity_width != 0 {
+            unsafe { ptr::write_bytes(row_ptr, u8::MAX, self.validity_width) };
+        }
+        for column in &self.columns {
+            let source = unsafe {
+                column
+                    .data
+                    .add(column.view.physical_index(row_idx) * column.source_width)
+            };
+            let target = unsafe { row_ptr.add(column.target_offset) };
+            unsafe { copy_fixed_width(source, target, column.source_width) };
+        }
+    }
 }
 
 impl<'a> PreparedRowScatter<'a> {
@@ -123,10 +175,40 @@ impl<'a> PreparedRowScatter<'a> {
                 }
             });
         }
+        let all_valid = prepared.iter().all(PreparedColumn::all_valid);
         Ok(Self {
             columns: prepared,
             heap_columns,
+            all_valid,
             count,
+        })
+    }
+
+    /// Compile the common all-valid fixed-width shape into a direct row
+    /// scatter program. Shapes containing sequences, NULLs, varlen, or nested
+    /// values keep using [`Self::scatter_row_unchecked`].
+    pub fn fixed_all_valid(&self, layout: &RowLayout) -> Option<PreparedFixedRowScatter<'a>> {
+        if !self.all_valid || self.columns.len() != layout.column_count() {
+            return None;
+        }
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for (column_idx, column) in self.columns.iter().enumerate() {
+            let PreparedColumn::Fixed { view, width, .. } = column else {
+                return None;
+            };
+            let DataRef::Ptr(data) = view.data() else {
+                return None;
+            };
+            columns.push(PreparedFixedColumn {
+                view: view.clone(),
+                data,
+                source_width: *width,
+                target_offset: layout.offsets()[column_idx],
+            });
+        }
+        Some(PreparedFixedRowScatter {
+            columns,
+            validity_width: usize::from(!layout.all_valid()) * layout.validity().flag_width(),
         })
     }
 
@@ -184,20 +266,45 @@ impl<'a> PreparedRowScatter<'a> {
         self.validate_layout(layout)?;
         self.validate_row(row_idx)?;
 
+        unsafe { self.scatter_row_unchecked(layout, row_ptr, row_idx, heap) }
+    }
+
+    /// Scatter a row after the caller has validated the prepared layout and
+    /// source-row bounds for the enclosing batch.
+    ///
+    /// # Safety
+    ///
+    /// In addition to [`Self::scatter_row`]'s requirements, `layout` must be
+    /// the layout used to prepare this scatter and `row_idx < self.count`.
+    pub unsafe fn scatter_row_unchecked(
+        &self,
+        layout: &RowLayout,
+        row_ptr: *mut u8,
+        row_idx: usize,
+        heap: &mut impl RowHeapWriter,
+    ) -> Result<()> {
         if !layout.all_valid() {
-            // The row slot may be recycled by a caller in the future, so make
-            // validity independent of its previous contents.
-            unsafe { ptr::write_bytes(row_ptr, 0, layout.validity().flag_width()) };
+            // All-valid batches dominate analytical joins. Initialize their
+            // row validity in one contiguous write instead of one read-modify-
+            // write per column. The general nullable path starts from zero and
+            // sets only the observed valid cells.
+            unsafe {
+                ptr::write_bytes(
+                    row_ptr,
+                    u8::from(self.all_valid) * u8::MAX,
+                    layout.validity().flag_width(),
+                )
+            };
         }
 
         for (column_idx, column) in self.columns.iter().enumerate() {
             let target = unsafe { row_ptr.add(layout.offsets()[column_idx]) };
-            if !column.is_valid(row_idx) {
+            if !self.all_valid && !column.is_valid(row_idx) {
                 let width = RowLayout::get_type_size(&layout.types()[column_idx]);
                 unsafe { ptr::write_bytes(target, 0, width) };
                 continue;
             }
-            if !layout.all_valid() {
+            if !self.all_valid && !layout.all_valid() {
                 unsafe { unsafe_api::set_row_validity(row_ptr, column_idx) };
             }
 
@@ -208,7 +315,7 @@ impl<'a> PreparedRowScatter<'a> {
                     width,
                 } => match view.data() {
                     DataRef::Ptr(data) => unsafe {
-                        ptr::copy_nonoverlapping(
+                        copy_fixed_width(
                             data.add(view.physical_index(row_idx) * width),
                             target,
                             *width,
@@ -253,6 +360,31 @@ impl<'a> PreparedRowScatter<'a> {
             )));
         }
         Ok(())
+    }
+}
+
+/// Copy the physical widths used by fixed SQL types without routing every
+/// scalar cell through a variable-length libc memcpy call.
+///
+/// # Safety
+///
+/// `source` and `target` must be readable/writable for `width` bytes and must
+/// not overlap.
+#[inline]
+unsafe fn copy_fixed_width(source: *const u8, target: *mut u8, width: usize) {
+    macro_rules! copy_value {
+        ($ty:ty) => {{
+            let value = unsafe { ptr::read_unaligned(source.cast::<$ty>()) };
+            unsafe { ptr::write_unaligned(target.cast::<$ty>(), value) };
+        }};
+    }
+    match width {
+        1 => copy_value!(u8),
+        2 => copy_value!(u16),
+        4 => copy_value!(u32),
+        8 => copy_value!(u64),
+        16 => copy_value!(u128),
+        _ => unsafe { ptr::copy_nonoverlapping(source, target, width) },
     }
 }
 

@@ -116,6 +116,36 @@ where
             }
             return;
         }
+        if *canonical_len == values.len() {
+            match values.last().copied() {
+                None => {
+                    if values.try_push(value).is_err() {
+                        *self = Self::Disabled;
+                    } else {
+                        *canonical_len = 1;
+                    }
+                    return;
+                }
+                Some(last) if value == last => return,
+                Some(last) if value > last => {
+                    if values.try_push(value).is_err() {
+                        *self = Self::Disabled;
+                    } else {
+                        *canonical_len += 1;
+                    }
+                    return;
+                }
+                Some(_) if values.binary_search(&value).is_ok() => return,
+                Some(_) => {}
+            }
+        } else if values.last().copied() == Some(value)
+            || values[..*canonical_len].binary_search(&value).is_ok()
+        {
+            // The canonical prefix doubles as the deduplication index. The
+            // last-value check also keeps runs of a newly observed, out-of-
+            // order value from inflating the pending suffix.
+            return;
+        }
         if values.try_push(value).is_err() {
             // Exact membership is optional. Query-memory pressure degrades to
             // the min/max domain maintained alongside this set.
@@ -1071,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_domain_near_budget_accumulates_a_pending_suffix() {
+    fn exact_domain_ordered_stream_stays_canonical() {
         let memory = MemoryAccountingContext::detached(
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
@@ -1082,12 +1112,10 @@ mod tests {
         for value in 0_i64..63 {
             exact.insert(value, max_values);
         }
-        // Reach the first normalization boundary with 63 distinct values.
-        exact.insert(0, max_values);
-        // A near-full canonical set must buy another O(M) suffix before the
-        // next sort instead of sorting the whole domain once per input row.
-        for _ in 0..62 {
-            exact.insert(0, max_values);
+        // Duplicate values in a sorted domain are rejected by the canonical
+        // prefix rather than being staged for another sort.
+        for value in 0_i64..63 {
+            exact.insert(value, max_values);
         }
 
         let ExactValues::Enabled {
@@ -1096,11 +1124,11 @@ mod tests {
             ..
         } = exact
         else {
-            panic!("near-budget exact domain unexpectedly disabled");
+            panic!("ordered exact domain unexpectedly disabled");
         };
         assert_eq!(canonical_len, 63);
-        assert_eq!(values.len(), 125);
-        assert!(values.capacity() <= 126);
+        assert_eq!(values.len(), 63);
+        assert!(values.capacity() <= 64);
     }
 
     #[test]

@@ -16,7 +16,9 @@ use paro_common::hash::{
 };
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DataRef, SelectionVector, Vector, VectorType};
+use paro_common::vector::{
+    DataRef, DecodedVectorRef, SelectionVector, VarlenView, Vector, VectorType,
+};
 use paro_planner::operator::join::JoinComparisonType;
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
@@ -96,6 +98,27 @@ pub(crate) struct JoinKeyLayout {
     columns: Box<[JoinKeyColumn]>,
 }
 
+/// Batch-local physical views of probe-side join keys.
+///
+/// Hash-chain equality is row-oriented, but resolving a `Vector` through its
+/// dynamic representation for every candidate repeats dictionary selection,
+/// validity, and type dispatch. Preparing those properties once per probe
+/// batch keeps the row loop limited to physical index resolution and value
+/// comparison. The borrowed views also make the lifetime contract explicit:
+/// they cannot outlive the probe chunk whose buffers they reference.
+pub(crate) struct PreparedProbeKeys<'a> {
+    columns: Vec<PreparedProbeColumn<'a>>,
+}
+
+enum PreparedProbeColumn<'a> {
+    Fixed {
+        kind: JoinKeyColumn,
+        view: DecodedVectorRef<'a>,
+    },
+    Varlen(VarlenView<'a>),
+    ValueFallback(&'a Vector),
+}
+
 impl JoinKeyLayout {
     pub(crate) fn new(key_types: &[LogicalType]) -> Self {
         Self {
@@ -142,6 +165,29 @@ impl JoinKeyLayout {
         self.hash_rows_into(keys, Some(selection), count, hashes)
     }
 
+    pub(crate) fn prepare_probe_keys<'a>(&self, keys: &'a Chunk) -> Result<PreparedProbeKeys<'a>> {
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for (col_idx, kind) in self.columns.iter().copied().enumerate() {
+            let vector = keys
+                .column(col_idx)
+                .expect("hash join key column must exist");
+            let prepared = match kind {
+                JoinKeyColumn::Varchar | JoinKeyColumn::Blob => {
+                    PreparedProbeColumn::Varlen(vector.try_to_varlen_view(keys.size())?)
+                }
+                JoinKeyColumn::ValueFallback { .. } => {
+                    PreparedProbeColumn::ValueFallback(vector.as_ref())
+                }
+                _ => PreparedProbeColumn::Fixed {
+                    kind,
+                    view: vector.try_decode_ref(keys.size())?,
+                },
+            };
+            columns.push(prepared);
+        }
+        Ok(PreparedProbeKeys { columns })
+    }
+
     fn hash_rows_into(
         &self,
         keys: &Chunk,
@@ -165,18 +211,36 @@ impl JoinKeyLayout {
 
     pub(crate) fn keys_match_build_row(
         &self,
-        keys: &Chunk,
+        keys: &PreparedProbeKeys<'_>,
         probe_row_idx: usize,
         build_layout: &BuildRowLayout,
         row_ptr: usize,
         comparisons: &[JoinComparisonType],
     ) -> bool {
         let row_ptr = row_ptr as *const u8;
-        for (col_idx, column_kind) in self.columns.iter().copied().enumerate() {
-            let vector = keys
-                .column(col_idx)
-                .expect("hash join key column must exist");
-            let probe_null = vector.is_null(probe_row_idx);
+        if comparisons == [JoinComparisonType::Equal, JoinComparisonType::Equal] {
+            if let [PreparedProbeColumn::Fixed {
+                kind: JoinKeyColumn::I64,
+                view: left,
+            }, PreparedProbeColumn::Fixed {
+                kind: JoinKeyColumn::I64,
+                view: right,
+            }] = keys.columns.as_slice()
+            {
+                // Ordinary equality filtering guarantees both probe and build
+                // keys are non-NULL before chain resolution. Composite BIGINT
+                // keys are common primary/foreign keys; compare the physical
+                // pair directly instead of repeating validity, comparison-mode
+                // and type dispatch for each component.
+                let layout = build_layout.base();
+                return unsafe { left.get_value::<i64>(probe_row_idx) }
+                    == read_row_i64(layout, row_ptr, 0)
+                    && unsafe { right.get_value::<i64>(probe_row_idx) }
+                        == read_row_i64(layout, row_ptr, 1);
+            }
+        }
+        for (col_idx, column) in keys.columns.iter().enumerate() {
+            let probe_null = !column.is_valid(probe_row_idx);
             let build_null = row_value_is_null(build_layout.base(), row_ptr, col_idx);
 
             match comparisons[col_idx] {
@@ -193,14 +257,7 @@ impl JoinKeyLayout {
                 }
             }
 
-            if !self.typed_value_equals_build_row(
-                column_kind,
-                vector,
-                probe_row_idx,
-                build_layout,
-                row_ptr,
-                col_idx,
-            ) {
+            if !column.equals_build_row(probe_row_idx, build_layout, row_ptr, col_idx) {
                 return false;
             }
         }
@@ -240,82 +297,6 @@ impl JoinKeyLayout {
         }
     }
 
-    fn typed_value_equals_build_row(
-        &self,
-        column_kind: JoinKeyColumn,
-        vector: &Vector,
-        probe_row_idx: usize,
-        build_layout: &BuildRowLayout,
-        row_ptr: *const u8,
-        col_idx: usize,
-    ) -> bool {
-        match column_kind {
-            JoinKeyColumn::Boolean => {
-                vector.get_bool(probe_row_idx).unwrap()
-                    == read_row_bool(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I8 => {
-                vector.get_i8(probe_row_idx).unwrap()
-                    == read_row_i8(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I16 => {
-                vector.get_i16(probe_row_idx).unwrap()
-                    == read_row_i16(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I32 => {
-                vector.get_i32(probe_row_idx).unwrap()
-                    == read_row_i32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I64 => {
-                vector.get_i64(probe_row_idx).unwrap()
-                    == read_row_i64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I128 => {
-                vector.get_i128(probe_row_idx).unwrap()
-                    == read_row_i128(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U8 => {
-                vector.get_u8(probe_row_idx).unwrap()
-                    == read_row_u8(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U16 => {
-                vector.get_u16(probe_row_idx).unwrap()
-                    == read_row_u16(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U32 => {
-                vector.get_u32(probe_row_idx).unwrap()
-                    == read_row_u32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U64 => {
-                vector.get_u64(probe_row_idx).unwrap()
-                    == read_row_u64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U128 => {
-                vector.get_u128(probe_row_idx).unwrap()
-                    == read_row_u128(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::F32 => {
-                vector.get_f32(probe_row_idx).unwrap().to_bits()
-                    == read_row_u32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::F64 => {
-                vector.get_f64(probe_row_idx).unwrap().to_bits()
-                    == read_row_u64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::Varchar => {
-                vector.get_string(probe_row_idx).unwrap().as_bytes()
-                    == read_row_varlen_bytes(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::Blob => {
-                vector.get_blob(probe_row_idx).unwrap()
-                    == read_row_varlen_bytes(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::ValueFallback { .. } => {
-                vector.get_value(probe_row_idx) == build_layout.read_value(row_ptr, col_idx)
-            }
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn column_kinds_for_tests(&self) -> Vec<&'static str> {
         self.columns
@@ -339,6 +320,96 @@ impl JoinKeyLayout {
                 JoinKeyColumn::ValueFallback { .. } => "value_fallback",
             })
             .collect()
+    }
+}
+
+impl PreparedProbeColumn<'_> {
+    #[inline]
+    fn is_valid(&self, row_idx: usize) -> bool {
+        match self {
+            Self::Fixed { view, .. } => view.is_valid(row_idx),
+            Self::Varlen(view) => view.is_valid(row_idx),
+            Self::ValueFallback(vector) => !vector.is_null(row_idx),
+        }
+    }
+
+    #[inline]
+    fn equals_build_row(
+        &self,
+        probe_row_idx: usize,
+        build_layout: &BuildRowLayout,
+        row_ptr: *const u8,
+        col_idx: usize,
+    ) -> bool {
+        let layout = build_layout.base();
+        match self {
+            Self::Fixed { kind, view } => match kind {
+                JoinKeyColumn::Boolean => {
+                    (unsafe { view.get_value::<bool>(probe_row_idx) })
+                        == read_row_bool(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I8 => {
+                    (unsafe { view.get_value::<i8>(probe_row_idx) })
+                        == read_row_i8(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I16 => {
+                    (unsafe { view.get_value::<i16>(probe_row_idx) })
+                        == read_row_i16(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I32 => {
+                    (unsafe { view.get_value::<i32>(probe_row_idx) })
+                        == read_row_i32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I64 => {
+                    (unsafe { view.get_value::<i64>(probe_row_idx) })
+                        == read_row_i64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I128 => {
+                    (unsafe { view.get_value::<i128>(probe_row_idx) })
+                        == read_row_i128(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U8 => {
+                    (unsafe { view.get_value::<u8>(probe_row_idx) })
+                        == read_row_u8(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U16 => {
+                    (unsafe { view.get_value::<u16>(probe_row_idx) })
+                        == read_row_u16(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U32 => {
+                    (unsafe { view.get_value::<u32>(probe_row_idx) })
+                        == read_row_u32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U64 => {
+                    (unsafe { view.get_value::<u64>(probe_row_idx) })
+                        == read_row_u64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U128 => {
+                    (unsafe { view.get_value::<u128>(probe_row_idx) })
+                        == read_row_u128(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::F32 => {
+                    (unsafe { view.get_value::<f32>(probe_row_idx) }).to_bits()
+                        == read_row_u32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::F64 => {
+                    (unsafe { view.get_value::<f64>(probe_row_idx) }).to_bits()
+                        == read_row_u64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::Varchar
+                | JoinKeyColumn::Blob
+                | JoinKeyColumn::ValueFallback { .. } => {
+                    unreachable!("non-fixed join key stored in fixed probe view")
+                }
+            },
+            Self::Varlen(view) => {
+                view.get_inline_string(probe_row_idx).as_bytes()
+                    == read_row_varlen_bytes(layout, row_ptr, col_idx)
+            }
+            Self::ValueFallback(vector) => {
+                vector.get_value(probe_row_idx) == build_layout.read_value(row_ptr, col_idx)
+            }
+        }
     }
 }
 

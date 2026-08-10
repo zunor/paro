@@ -5,6 +5,7 @@ use super::predicate_column::PredicateColumnBatch;
 use super::segment_predicate::ComparisonOperator;
 use crate::index::{
     FixedMembership, FixedMembershipKind, FixedMembershipSet, FixedMembershipValue,
+    FixedMembershipView,
 };
 use paro_common::error::{self as paro_error, Result};
 
@@ -430,9 +431,23 @@ fn dispatch_fixed_kernel<T, L, V>(
         return;
     }
     if let Some(inclusions) = &kernel.inclusions {
-        filter_selection(rows, selection, seed, load, valid, |value| {
-            inclusions.contains(value)
-        });
+        match inclusions.view() {
+            FixedMembershipView::Sorted(values) => {
+                filter_selection(rows, selection, seed, load, valid, |value| {
+                    values.binary_search(&value).is_ok()
+                });
+            }
+            FixedMembershipView::Dense { base, span, bits } => {
+                filter_selection(rows, selection, seed, load, valid, |value| {
+                    let Some(offset) = value.offset_from(base).filter(|offset| *offset < span)
+                    else {
+                        return false;
+                    };
+                    bits[offset / u64::BITS as usize] & (1_u64 << (offset % u64::BITS as usize))
+                        != 0
+                });
+            }
+        }
         return;
     }
     if !kernel.exclusions.is_empty() {

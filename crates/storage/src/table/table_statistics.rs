@@ -3,8 +3,7 @@
 
 use super::table_handle::TableHandle;
 use crate::statistics::{
-    BaseStatistics, ColumnStatistics, FullTextIndexStatistics, HnswIndexStatistics,
-    SparseIndexStatistics,
+    ColumnStatistics, FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::ColumnId;
 
@@ -42,17 +41,17 @@ fn merge_fulltext_index_stats(
 }
 
 impl TableHandle {
-    pub fn column_statistics(&self, column_index: usize) -> Option<BaseStatistics> {
+    pub fn column_statistics(&self, column_index: usize) -> Option<ColumnStatistics> {
         let stats = self.tablet().statistics().ok()?;
         let col_stats = stats.column(column_index as u32)?;
-        Some(Self::base_stats_from_column_stats(
+        Some(Self::visible_column_statistics(
             &col_stats.stats,
             col_stats.null_count,
             col_stats.num_rows,
         ))
     }
 
-    pub fn all_column_statistics(&self) -> Vec<BaseStatistics> {
+    pub fn all_column_statistics(&self) -> Vec<ColumnStatistics> {
         let stats = self.tablet().statistics().ok();
         let mut result = Vec::with_capacity(self.types().len());
         for (idx, ty) in self.types().iter().enumerate() {
@@ -60,13 +59,17 @@ impl TableHandle {
                 .as_ref()
                 .and_then(|s| s.column(idx as u32))
                 .map(|col_stats| {
-                    Self::base_stats_from_column_stats(
+                    Self::visible_column_statistics(
                         &col_stats.stats,
                         col_stats.null_count,
                         col_stats.num_rows,
                     )
                 })
-                .unwrap_or_else(|| BaseStatistics::create_empty(ty.clone()));
+                .unwrap_or_else(|| {
+                    ColumnStatistics::new(crate::statistics::BaseStatistics::create_empty(
+                        ty.clone(),
+                    ))
+                });
             result.push(entry);
         }
         result
@@ -200,18 +203,17 @@ impl TableHandle {
         agg
     }
 
-    fn base_stats_from_column_stats(
+    fn visible_column_statistics(
         column_stats: &ColumnStatistics,
         null_count: u64,
         num_rows: u64,
-    ) -> BaseStatistics {
-        let mut stats = column_stats.statistics().copy();
-        stats.set_distinct_count(column_stats.get_distinct_count());
+    ) -> ColumnStatistics {
+        let mut stats = column_stats.copy();
         if null_count > 0 {
-            stats.set_has_null_fast();
+            stats.statistics_mut().set_has_null_fast();
         }
         if num_rows > null_count {
-            stats.set_has_no_null_fast();
+            stats.statistics_mut().set_has_no_null_fast();
         }
         stats
     }

@@ -188,20 +188,42 @@ pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn check_precision_i128(value: i128, precision: u8) -> Result<()> {
-    if precision == 0 || precision > MAX_DECIMAL_PRECISION {
-        return Err(paro_error::invalid_input(format!(
-            "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
-        )));
+/// Precomputed declared-precision guard for a vectorized i128 DECIMAL kernel.
+///
+/// The bound depends only on the bound result type, not on a row. Keeping it
+/// outside the row loop avoids rebuilding `10^precision` for every value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct I128DecimalPrecision {
+    precision: u8,
+    upper_exclusive: u128,
+}
+
+impl I128DecimalPrecision {
+    pub(crate) fn new(precision: u8) -> Result<Self> {
+        if precision == 0 || precision > MAX_DECIMAL_PRECISION {
+            return Err(paro_error::invalid_input(format!(
+                "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
+            )));
+        }
+        let upper_exclusive = pow10_i128(precision)
+            .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?
+            as u128;
+        Ok(Self {
+            precision,
+            upper_exclusive,
+        })
     }
-    let limit = pow10_i128(precision)
-        .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?;
-    if value.unsigned_abs() >= limit as u128 {
-        return Err(paro_error::out_of_range(format!(
-            "Decimal value exceeds precision {precision}"
-        )));
+
+    #[inline]
+    pub(crate) fn check(self, value: i128) -> Result<()> {
+        if value.unsigned_abs() >= self.upper_exclusive {
+            return Err(paro_error::out_of_range(format!(
+                "Decimal value exceeds precision {}",
+                self.precision
+            )));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn to_i128(value: i256, precision: u8) -> Result<i128> {
@@ -279,8 +301,9 @@ mod tests {
         }
 
         assert_eq!(rescale_checked(i128::MAX, 0, 1), None);
-        assert!(check_precision_i128(99_999, 5).is_ok());
-        assert!(check_precision_i128(100_000, 5).is_err());
+        let precision = I128DecimalPrecision::new(5).unwrap();
+        assert!(precision.check(99_999).is_ok());
+        assert!(precision.check(100_000).is_err());
     }
 
     #[test]

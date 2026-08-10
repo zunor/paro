@@ -3,6 +3,65 @@
 
 use super::*;
 
+fn project_spec(expressions: Vec<Expression>) -> ProjectSpec {
+    ProjectSpec {
+        table_index: 0,
+        output_names: (0..expressions.len())
+            .map(|index| format!("column_{index}"))
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        expressions: expressions.into_boxed_slice(),
+    }
+}
+
+#[test]
+fn consecutive_physical_projects_are_composed() {
+    let mut transforms = vec![TransformSpec::Project(project_spec(vec![
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+    ]))];
+    let inner = project_spec(vec![
+        Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+    ]);
+
+    push_project_transform(&mut transforms, &inner);
+
+    let [TransformSpec::Project(project)] = transforms.as_slice() else {
+        panic!("expected one composed projection");
+    };
+    assert!(matches!(
+        &project.expressions[0],
+        Expression::Reference(reference) if reference.index == 0
+    ));
+    assert!(matches!(
+        &project.expressions[1],
+        Expression::Reference(reference) if reference.index == 2
+    ));
+}
+
+#[test]
+fn project_composition_preserves_computed_expression_multiplicity() {
+    use paro_planner::expression::{ComparisonExpression, ComparisonType};
+
+    let computed = Expression::Comparison(ComparisonExpression::new(
+        ComparisonType::Equal,
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(7),
+            LogicalType::Integer,
+        )),
+    ));
+    let mut transforms = vec![TransformSpec::Project(project_spec(vec![
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+    ]))];
+
+    push_project_transform(&mut transforms, &project_spec(vec![computed]));
+
+    assert_eq!(transforms.len(), 2);
+}
+
 #[test]
 fn lowerer_builds_source_transform_sink_pipeline() {
     let plan = linear_plan();

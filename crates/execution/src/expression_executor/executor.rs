@@ -788,6 +788,12 @@ impl ExpressionExecutor {
         slot.prepare_scratch(logical_type, count, allocator)
     }
 
+    /// Prepare the argument container for a function invocation.
+    ///
+    /// Its columns are borrowed references to child results and are replaced
+    /// in full before the function runs. Resetting the previous columns would
+    /// make those shared vectors exclusive (and therefore copy their complete
+    /// buffers) only to drop them immediately afterwards.
     fn prepare_intermediate_chunk<'a>(
         intermediate_types: &[LogicalType],
         intermediate_chunk: &'a mut Option<Chunk>,
@@ -807,14 +813,10 @@ impl ExpressionExecutor {
                 required_capacity,
                 allocator,
             )?);
-        } else if let Some(chunk) = intermediate_chunk.as_mut() {
-            chunk.try_reset(chunk.allocator().clone())?;
         }
-        let chunk = intermediate_chunk
+        Ok(intermediate_chunk
             .as_mut()
-            .expect("intermediate chunk initialized");
-        chunk.set_cardinality(count);
-        Ok(chunk)
+            .expect("intermediate chunk initialized"))
     }
 
     fn store_value(slot: &mut ValueSlot, value: &EvaluatedValue) {
@@ -1408,6 +1410,10 @@ impl ExpressionExecutor {
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
+        // Child results already carry this batch's cardinality. Updating the
+        // chunk after replacing every reference avoids COW of the previous
+        // batch while retaining Chunk's vector/cardinality validation.
+        intermediate.try_set_cardinality(count)?;
         Self::ensure_function_local_state(&expr.function, local_state, runtime)?;
         if let Some(cached_result) = Self::try_dictionary_cached_function(
             expr,
@@ -1472,6 +1478,9 @@ impl ExpressionExecutor {
             )?;
             intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
         }
+        // See `execute_function_into`: this argument chunk borrows the freshly
+        // installed child results and never owns reusable output storage.
+        intermediate.try_set_cardinality(count)?;
         Self::ensure_function_local_state(&expr.function, local_state, runtime)?;
         if let Some(cached_result) = Self::try_dictionary_cached_function(
             expr,

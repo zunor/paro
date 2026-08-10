@@ -63,18 +63,18 @@ impl TryFrom<u8> for HllStorageType {
 /// ```
 #[derive(Clone)]
 pub struct HyperLogLog {
-    /// Register array (M = 64 registers)
+    /// Register array (M = 1024 registers)
     k: [u8; Self::M],
 }
 
 impl HyperLogLog {
-    /// Number of bits used for register index (P = 6)
-    pub const P: usize = 6;
+    /// Number of bits used for register index (P = 10)
+    pub const P: usize = 10;
 
     /// Number of bits used for leading zeros count (Q = 64 - P = 58)
     pub const Q: usize = 64 - Self::P;
 
-    /// Number of registers (M = 2^P = 64)
+    /// Number of registers (M = 2^P = 1024)
     pub const M: usize = 1 << Self::P;
 
     /// Alpha constant: 1 / (2 * ln(2))
@@ -87,7 +87,7 @@ impl HyperLogLog {
 
     /// Get the error rate for this HLL configuration.
     ///
-    /// For P=6, M=64, the error rate is approximately 15.6%.
+    /// For P=10, M=1024, the error rate is approximately 3.9%.
     #[inline]
     pub fn error_rate() -> f64 {
         (PI / 2.0).sqrt() / (Self::M as f64).sqrt()
@@ -478,9 +478,9 @@ mod tests {
     #[test]
     fn test_error_rate() {
         let error_rate = HyperLogLog::error_rate();
-        // For P=6, M=64, error rate should be approximately 15.6%
+        // For P=10, M=1024, error rate should be approximately 3.9%.
         assert!(
-            error_rate > 0.15 && error_rate < 0.17,
+            error_rate > 0.03 && error_rate < 0.05,
             "Error rate {} not in expected range",
             error_rate
         );

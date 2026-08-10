@@ -33,6 +33,31 @@ pub enum ConstraintType {
     Check,
 }
 
+impl ConstraintType {
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::NotNull => 0,
+            Self::Unique => 1,
+            Self::PrimaryKey => 2,
+            Self::ForeignKey => 3,
+            Self::Check => 4,
+        }
+    }
+
+    fn from_byte(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::NotNull),
+            1 => Ok(Self::Unique),
+            2 => Ok(Self::PrimaryKey),
+            3 => Ok(Self::ForeignKey),
+            4 => Ok(Self::Check),
+            _ => Err(paro_error::invalid_input(format!(
+                "invalid table constraint type: {value}"
+            ))),
+        }
+    }
+}
+
 /// Table constraint.
 ///
 #[derive(Debug, Clone)]
@@ -103,6 +128,123 @@ impl Constraint {
             referenced_columns: Some(referenced_columns),
         }
     }
+}
+
+fn write_usize_as_u32(buffer: &mut Vec<u8>, value: usize, label: &str) -> Result<()> {
+    let value = u32::try_from(value).map_err(|_| {
+        paro_error::serialization_error(format!("{label} exceeds catalog format limit"))
+    })?;
+    buffer.write_all(&value.to_le_bytes())?;
+    Ok(())
+}
+
+fn write_string(buffer: &mut Vec<u8>, value: &str) -> Result<()> {
+    write_usize_as_u32(buffer, value.len(), "string length")?;
+    buffer.write_all(value.as_bytes())?;
+    Ok(())
+}
+
+fn write_optional_string(buffer: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
+    match value {
+        Some(value) => {
+            buffer.write_all(&[1])?;
+            write_string(buffer, value)
+        }
+        None => {
+            buffer.write_all(&[0])?;
+            Ok(())
+        }
+    }
+}
+
+fn write_indices(buffer: &mut Vec<u8>, values: &[usize], label: &str) -> Result<()> {
+    write_usize_as_u32(buffer, values.len(), label)?;
+    for &value in values {
+        write_usize_as_u32(buffer, value, label)?;
+    }
+    Ok(())
+}
+
+fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
+    let mut bytes = [0; 4];
+    cursor.read_exact(&mut bytes)?;
+    Ok(u32::from_le_bytes(bytes))
+}
+
+fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
+    let len = read_u32(cursor)? as usize;
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    if len > remaining {
+        return Err(paro_error::invalid_input(format!(
+            "catalog string length {len} exceeds remaining payload {remaining}"
+        )));
+    }
+    let mut bytes = vec![0; len];
+    cursor.read_exact(&mut bytes)?;
+    String::from_utf8(bytes)
+        .map_err(|error| paro_error::invalid_input(format!("invalid catalog UTF-8: {error}")))
+}
+
+fn read_optional_string(cursor: &mut Cursor<&[u8]>) -> Result<Option<String>> {
+    let mut marker = [0];
+    cursor.read_exact(&mut marker)?;
+    match marker[0] {
+        0 => Ok(None),
+        1 => read_string(cursor).map(Some),
+        value => Err(paro_error::invalid_input(format!(
+            "invalid optional-string marker: {value}"
+        ))),
+    }
+}
+
+fn read_indices(cursor: &mut Cursor<&[u8]>) -> Result<Vec<usize>> {
+    let count = read_u32(cursor)? as usize;
+    let remaining = cursor
+        .get_ref()
+        .len()
+        .saturating_sub(cursor.position() as usize);
+    if count > remaining / std::mem::size_of::<u32>() {
+        return Err(paro_error::invalid_input(format!(
+            "catalog index count {count} exceeds remaining payload"
+        )));
+    }
+    (0..count)
+        .map(|_| read_u32(cursor).map(|value| value as usize))
+        .collect()
+}
+
+fn validate_constraint(
+    constraint_type: ConstraintType,
+    columns: &[usize],
+    expression: Option<&str>,
+    referenced_table: Option<&str>,
+    referenced_columns: Option<&[usize]>,
+    column_count: usize,
+) -> Result<()> {
+    if columns.iter().any(|&column| column >= column_count) {
+        return Err(paro_error::invalid_input(
+            "table constraint references an out-of-range column",
+        ));
+    }
+    let valid = match constraint_type {
+        ConstraintType::NotNull => columns.len() == 1,
+        ConstraintType::Unique | ConstraintType::PrimaryKey => !columns.is_empty(),
+        ConstraintType::ForeignKey => {
+            !columns.is_empty()
+                && referenced_table.is_some()
+                && referenced_columns.is_some_and(|referenced| referenced.len() == columns.len())
+        }
+        ConstraintType::Check => expression.is_some(),
+    };
+    if !valid {
+        return Err(paro_error::invalid_input(format!(
+            "invalid serialized {constraint_type:?} table constraint"
+        )));
+    }
+    Ok(())
 }
 
 // --- Column Definition ---
@@ -335,6 +477,8 @@ pub struct TableCatalogEntry {
 }
 
 impl TableCatalogEntry {
+    const SERIALIZATION_VERSION: u32 = 1;
+
     fn descriptor_from_storage(storage: &Arc<TableHandle>) -> Option<TableStorageDescriptor> {
         storage.to_descriptor().ok()
     }
@@ -861,6 +1005,8 @@ impl TableCatalogEntry {
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut buffer = Vec::new();
 
+        buffer.write_all(&Self::SERIALIZATION_VERSION.to_le_bytes())?;
+
         // 1. OID
         buffer.write_all(&self.base.base.object_id.raw().to_le_bytes())?;
 
@@ -888,9 +1034,27 @@ impl TableCatalogEntry {
             buffer.write_all(col_name_bytes)?;
             col.logical_type.serialize(&mut buffer)?;
             buffer.write_all(&[col.not_null as u8])?;
+            write_optional_string(&mut buffer, col.default_value.as_deref())?;
+            write_optional_string(&mut buffer, col.comment.as_deref())?;
         }
 
-        // 7. Storage descriptor
+        // 7. Constraints
+        write_usize_as_u32(&mut buffer, self.constraints.len(), "constraint count")?;
+        for constraint in &self.constraints {
+            buffer.write_all(&[constraint.constraint_type.to_byte()])?;
+            write_indices(&mut buffer, &constraint.columns, "constraint columns")?;
+            write_optional_string(&mut buffer, constraint.expression.as_deref())?;
+            write_optional_string(&mut buffer, constraint.referenced_table.as_deref())?;
+            match &constraint.referenced_columns {
+                Some(columns) => {
+                    buffer.write_all(&[1])?;
+                    write_indices(&mut buffer, columns, "referenced constraint columns")?;
+                }
+                None => buffer.write_all(&[0])?,
+            }
+        }
+
+        // 8. Storage descriptor
         // Persist only descriptor bytes; runtime storage is reconstructed during deserialize.
         let descriptor = if let Some(storage) = &self.storage {
             storage.to_descriptor()?
@@ -905,7 +1069,7 @@ impl TableCatalogEntry {
         buffer.write_all(&(descriptor_bytes.len() as u32).to_le_bytes())?;
         buffer.write_all(&descriptor_bytes)?;
 
-        // 8. Statistics (simplified)
+        // 9. Statistics (simplified)
         if let Some(stats) = &self.statistics {
             buffer.write_all(&[1u8])?;
             buffer.write_all(&stats.row_count.to_le_bytes())?;
@@ -913,7 +1077,7 @@ impl TableCatalogEntry {
             buffer.write_all(&[0u8])?;
         }
 
-        // 9. Optional table comment
+        // 10. Optional table comment
         if let Some(comment) = self.base.base.comment() {
             let comment_bytes = comment.as_bytes();
             buffer.write_all(&[1u8])?;
@@ -934,6 +1098,13 @@ impl TableCatalogEntry {
     ) -> Result<Self> {
         let mut cursor = Cursor::new(bytes);
 
+        let version = read_u32(&mut cursor)?;
+        if version != Self::SERIALIZATION_VERSION {
+            return Err(paro_error::invalid_input(format!(
+                "unsupported table catalog format version: {version}"
+            )));
+        }
+
         // 1. OID
         let mut oid_buf = [0u8; 8];
         cursor.read_exact(&mut oid_buf)?;
@@ -946,20 +1117,10 @@ impl TableCatalogEntry {
 
         // 3. Name
         let mut len_buf = [0u8; 4];
-        cursor.read_exact(&mut len_buf)?;
-        let name_len = u32::from_le_bytes(len_buf) as usize;
-        let mut name_bytes = vec![0u8; name_len];
-        cursor.read_exact(&mut name_bytes)?;
-        let name = String::from_utf8(name_bytes)
-            .map_err(|e| paro_error::internal(format!("Invalid UTF-8 in table name: {}", e)))?;
+        let name = read_string(&mut cursor)?;
 
         // 4. Schema Name
-        cursor.read_exact(&mut len_buf)?;
-        let schema_len = u32::from_le_bytes(len_buf) as usize;
-        let mut schema_bytes = vec![0u8; schema_len];
-        cursor.read_exact(&mut schema_bytes)?;
-        let schema_name = String::from_utf8(schema_bytes)
-            .map_err(|e| paro_error::internal(format!("Invalid UTF-8 in schema name: {}", e)))?;
+        let schema_name = read_string(&mut cursor)?;
 
         // 5. Table type
         let mut byte_buf = [0u8; 1];
@@ -967,19 +1128,20 @@ impl TableCatalogEntry {
         let table_type = TableType::from_byte(byte_buf[0]);
 
         // 6. Columns
-        cursor.read_exact(&mut len_buf)?;
-        let col_count = u32::from_le_bytes(len_buf) as usize;
+        let col_count = read_u32(&mut cursor)? as usize;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        // Every encoded column contains at least a name length, one logical-
+        // type tag, a nullability byte, and two optional-string markers.
+        if col_count > remaining / 8 {
+            return Err(paro_error::invalid_input(format!(
+                "catalog column count {col_count} exceeds remaining payload"
+            )));
+        }
         let mut columns = Vec::with_capacity(col_count);
         let mut column_types = Vec::with_capacity(col_count);
 
         for _ in 0..col_count {
-            cursor.read_exact(&mut len_buf)?;
-            let col_name_len = u32::from_le_bytes(len_buf) as usize;
-            let mut col_name_bytes = vec![0u8; col_name_len];
-            cursor.read_exact(&mut col_name_bytes)?;
-            let col_name = String::from_utf8(col_name_bytes).map_err(|e| {
-                paro_error::internal(format!("Invalid UTF-8 in column name: {}", e))
-            })?;
+            let col_name = read_string(&mut cursor)?;
 
             let col_type = LogicalType::deserialize(&mut cursor)?;
             column_types.push(col_type.clone());
@@ -991,12 +1153,64 @@ impl TableCatalogEntry {
             if not_null {
                 col_def = col_def.with_not_null();
             }
+            col_def.default_value = read_optional_string(&mut cursor)?;
+            col_def.comment = read_optional_string(&mut cursor)?;
             columns.push(col_def);
         }
 
-        // 7. Storage descriptor
+        // 7. Constraints
+        let constraint_count = read_u32(&mut cursor)? as usize;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        // Type, local-column count, two optional strings, and referenced-
+        // column marker form an eight-byte minimum constraint payload.
+        if constraint_count > remaining / 8 {
+            return Err(paro_error::invalid_input(format!(
+                "catalog constraint count {constraint_count} exceeds remaining payload"
+            )));
+        }
+        let mut constraints = Vec::with_capacity(constraint_count);
+        for _ in 0..constraint_count {
+            cursor.read_exact(&mut byte_buf)?;
+            let constraint_type = ConstraintType::from_byte(byte_buf[0])?;
+            let columns = read_indices(&mut cursor)?;
+            let expression = read_optional_string(&mut cursor)?;
+            let referenced_table = read_optional_string(&mut cursor)?;
+            cursor.read_exact(&mut byte_buf)?;
+            let referenced_columns = match byte_buf[0] {
+                0 => None,
+                1 => Some(read_indices(&mut cursor)?),
+                marker => {
+                    return Err(paro_error::invalid_input(format!(
+                        "invalid referenced-columns marker: {marker}"
+                    )));
+                }
+            };
+            validate_constraint(
+                constraint_type,
+                &columns,
+                expression.as_deref(),
+                referenced_table.as_deref(),
+                referenced_columns.as_deref(),
+                col_count,
+            )?;
+            constraints.push(Constraint {
+                constraint_type,
+                columns,
+                expression,
+                referenced_table,
+                referenced_columns,
+            });
+        }
+
+        // 8. Storage descriptor
         cursor.read_exact(&mut len_buf)?;
         let descriptor_len = u32::from_le_bytes(len_buf) as usize;
+        let remaining = bytes.len().saturating_sub(cursor.position() as usize);
+        if descriptor_len > remaining {
+            return Err(paro_error::invalid_input(format!(
+                "storage descriptor length {descriptor_len} exceeds remaining payload {remaining}"
+            )));
+        }
         let mut descriptor_bytes = vec![0u8; descriptor_len];
         cursor.read_exact(&mut descriptor_bytes)?;
         let storage_descriptor = TableStorageDescriptor::deserialize(&descriptor_bytes)?;
@@ -1008,7 +1222,7 @@ impl TableCatalogEntry {
                 .open_from_descriptor(&column_types, &storage_descriptor)?,
         );
 
-        // 8. Statistics marker (strict new-format path)
+        // 9. Statistics marker (strict new-format path)
         if (cursor.position() as usize) >= bytes.len() {
             return Err(paro_error::invalid_input(
                 "table catalog entry missing statistics marker",
@@ -1034,29 +1248,9 @@ impl TableCatalogEntry {
             }
         };
 
-        let comment = if (cursor.position() as usize) < bytes.len() {
-            cursor.read_exact(&mut byte_buf)?;
-            match byte_buf[0] {
-                0 => None,
-                1 => {
-                    cursor.read_exact(&mut len_buf)?;
-                    let comment_len = u32::from_le_bytes(len_buf) as usize;
-                    let mut comment_bytes = vec![0u8; comment_len];
-                    cursor.read_exact(&mut comment_bytes)?;
-                    Some(String::from_utf8(comment_bytes).map_err(|e| {
-                        paro_error::internal(format!("Invalid UTF-8 in table comment: {}", e))
-                    })?)
-                }
-                marker => {
-                    return Err(paro_error::invalid_input(format!(
-                        "invalid table catalog comment marker: {}",
-                        marker
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+        // 10. Table comment. The versioned format always carries the marker;
+        // an early EOF is corruption rather than a legacy no-comment entry.
+        let comment = read_optional_string(&mut cursor)?;
 
         if cursor.position() as usize != bytes.len() {
             return Err(paro_error::invalid_input(
@@ -1074,6 +1268,7 @@ impl TableCatalogEntry {
             timestamp,
         );
         entry.table_type = table_type;
+        entry.constraints = constraints;
         entry.statistics = statistics;
         entry.storage_descriptor = Some(storage_descriptor);
         entry.base.base.set_comment(comment);
@@ -1296,7 +1491,11 @@ mod tests {
 
     fn descriptor_offset(entry_bytes: &[u8]) -> usize {
         let mut cursor = Cursor::new(entry_bytes);
-        cursor.set_position(16); // oid + timestamp
+        assert_eq!(
+            read_u32(&mut cursor).unwrap(),
+            TableCatalogEntry::SERIALIZATION_VERSION
+        );
+        cursor.set_position(cursor.position() + 16); // oid + timestamp
 
         let mut len_buf = [0u8; 4];
         cursor.read_exact(&mut len_buf).unwrap();
@@ -1318,6 +1517,21 @@ mod tests {
 
             let _ = LogicalType::deserialize(&mut cursor).unwrap();
             cursor.set_position(cursor.position() + 1); // not_null
+            let _ = read_optional_string(&mut cursor).unwrap();
+            let _ = read_optional_string(&mut cursor).unwrap();
+        }
+
+        let constraint_count = read_u32(&mut cursor).unwrap();
+        for _ in 0..constraint_count {
+            cursor.set_position(cursor.position() + 1); // constraint type
+            let _ = read_indices(&mut cursor).unwrap();
+            let _ = read_optional_string(&mut cursor).unwrap();
+            let _ = read_optional_string(&mut cursor).unwrap();
+            let mut marker = [0];
+            cursor.read_exact(&mut marker).unwrap();
+            if marker[0] == 1 {
+                let _ = read_indices(&mut cursor).unwrap();
+            }
         }
 
         cursor.read_exact(&mut len_buf).unwrap();
@@ -1463,6 +1677,57 @@ mod tests {
     }
 
     #[test]
+    fn serialization_preserves_columns_and_constraints() {
+        let meta_manager = create_test_meta_manager();
+        let columns = vec![
+            ColumnDefinition::new("tenant_id".to_string(), LogicalType::BigInt)
+                .with_not_null()
+                .with_default("0".to_string())
+                .with_comment("tenant discriminator".to_string()),
+            ColumnDefinition::new("item_id".to_string(), LogicalType::BigInt),
+        ];
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::BigInt, LogicalType::BigInt],
+            meta_manager.clone(),
+        ));
+        let info = CreateTableInfo::new(
+            "main".to_string(),
+            "public".to_string(),
+            "constrained_items".to_string(),
+            columns,
+        )
+        .with_constraints(vec![
+            Constraint::primary_key(vec![0, 1]),
+            Constraint::check("item_id > 0".to_string()),
+        ]);
+        let entry =
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(10_005), 42);
+
+        let restored = TableCatalogEntry::deserialize(
+            &entry.serialize().unwrap(),
+            "main".to_string(),
+            Some(meta_manager),
+        )
+        .unwrap();
+
+        assert_eq!(restored.columns[0].default_value.as_deref(), Some("0"));
+        assert_eq!(
+            restored.columns[0].comment.as_deref(),
+            Some("tenant discriminator")
+        );
+        assert_eq!(restored.constraints.len(), 2);
+        assert_eq!(
+            restored.constraints[0].constraint_type,
+            ConstraintType::PrimaryKey
+        );
+        assert_eq!(restored.constraints[0].columns, vec![0, 1]);
+        assert_eq!(
+            restored.constraints[1].expression.as_deref(),
+            Some("item_id > 0")
+        );
+    }
+
+    #[test]
     fn test_deserialize_rejects_legacy_storage_payload() {
         let meta_manager = create_test_meta_manager();
         let columns = vec![ColumnDefinition::new(
@@ -1494,6 +1759,40 @@ mod tests {
                 .unwrap_err()
                 .to_string();
         assert!(err.contains("invalid table storage descriptor magic"));
+    }
+
+    #[test]
+    fn deserialize_rejects_oversized_string_before_allocation() {
+        let meta_manager = create_test_meta_manager();
+        let columns = vec![ColumnDefinition::new(
+            "id".to_string(),
+            LogicalType::Integer,
+        )];
+        let storage = Arc::new(create_table_with_meta_manager(
+            &[LogicalType::Integer],
+            meta_manager.clone(),
+        ));
+        let entry = TableCatalogEntry::new(
+            "main".to_string(),
+            "public".to_string(),
+            "bounded_allocation".to_string(),
+            columns,
+            storage,
+            CatalogObjectId::from_raw(10_006),
+            42,
+        );
+
+        let mut corrupted = entry.serialize().unwrap();
+        let name_length_offset = std::mem::size_of::<u32>() + 2 * std::mem::size_of::<u64>();
+        corrupted[name_length_offset..name_length_offset + 4]
+            .copy_from_slice(&u32::MAX.to_le_bytes());
+
+        let err =
+            TableCatalogEntry::deserialize(&corrupted, "main".to_string(), Some(meta_manager))
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("catalog string length"));
+        assert!(err.contains("exceeds remaining payload"));
     }
 
     #[test]

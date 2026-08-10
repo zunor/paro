@@ -47,8 +47,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io::{Seek, Write};
 use std::sync::Arc;
 
@@ -529,30 +527,8 @@ fn normalize_stats_logical_type(logical_type: LogicalType) -> LogicalType {
     }
 }
 
-fn is_integral_logical_type(logical_type: &LogicalType) -> bool {
-    matches!(
-        logical_type,
-        LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::HugeInt
-            | LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::UBigInt
-            | LogicalType::UHugeInt
-            | LogicalType::Date
-            | LogicalType::Timestamp
-            | LogicalType::TimestampTz
-            | LogicalType::Time
-    )
-}
-
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    paro_common::hash::hash_bytes(bytes)
 }
 
 fn decode_signed_wide_integer(bytes: &[u8], label: &str) -> Result<i128> {
@@ -619,8 +595,6 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     null_count: u64,
     /// Logical type used for statistics
     stats_logical_type: LogicalType,
-    /// Whether the type is integral (for distinct sampling)
-    distinct_is_integral: bool,
 }
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
@@ -662,7 +636,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 .clone()
                 .unwrap_or_else(|| field_type_to_logical_type(opts.field_type)),
         );
-        let distinct_is_integral = is_integral_logical_type(&stats_logical_type);
         let column_stats =
             ColumnStatistics::new(BaseStatistics::create_empty(stats_logical_type.clone()));
 
@@ -696,7 +669,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             column_stats,
             null_count: 0,
             stats_logical_type,
-            distinct_is_integral,
         })
     }
 
@@ -983,11 +955,8 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         if hashes.is_empty() {
             return;
         }
-        self.column_stats.update_distinct_statistics(
-            &hashes,
-            hashes.len(),
-            self.distinct_is_integral,
-        );
+        self.column_stats
+            .update_distinct_statistics(&hashes, hashes.len());
     }
 
     fn update_statistics_fixed(

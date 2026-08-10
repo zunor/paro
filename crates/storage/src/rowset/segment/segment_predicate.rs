@@ -154,14 +154,25 @@ impl PredicateEvaluator {
         prefetcher: Option<Arc<Prefetcher>>,
         explicit_predicate_columns: Option<Vec<ColumnId>>,
     ) -> Result<Option<Self>> {
+        let Some(tree) = Self::remove_index_proven_conjuncts(tree, evaluator) else {
+            return Ok(None);
+        };
         if !Self::predicate_tree_requires_row_verification(&tree)
             && !Self::requires_row_level_predicate_eval(evaluator, &tree)
         {
             return Ok(None);
         }
 
-        let predicate_columns =
-            explicit_predicate_columns.unwrap_or_else(|| collect_predicate_columns(&tree));
+        let required_predicate_columns = collect_predicate_columns(&tree);
+        let predicate_columns = explicit_predicate_columns.map_or_else(
+            || required_predicate_columns.clone(),
+            |columns| {
+                columns
+                    .into_iter()
+                    .filter(|column| required_predicate_columns.contains(column))
+                    .collect()
+            },
+        );
 
         if predicate_columns.is_empty() {
             return Ok(None);
@@ -222,6 +233,30 @@ impl PredicateEvaluator {
             predicate_column_access,
             allocator: Arc::new(default_allocator()),
         }))
+    }
+
+    /// Remove conjuncts that an exact index result proves true for the entire
+    /// segment. This is deliberately limited to AND: dropping an `AllMatch`
+    /// child from OR would change `TRUE OR x` into `x`.
+    fn remove_index_proven_conjuncts(
+        tree: PredicateTree,
+        evaluator: &IndexEvaluator,
+    ) -> Option<PredicateTree> {
+        if matches!(evaluator.evaluate(&tree), PredicateResult::AllMatch) {
+            return None;
+        }
+        let PredicateTree::And(children) = tree else {
+            return Some(tree);
+        };
+        let residual = children
+            .into_iter()
+            .filter(|child| !matches!(evaluator.evaluate(child), PredicateResult::AllMatch))
+            .collect::<Vec<_>>();
+        match residual.len() {
+            0 => None,
+            1 => residual.into_iter().next(),
+            _ => Some(PredicateTree::And(residual)),
+        }
     }
 
     pub(super) fn requires_row_level_predicate_eval(

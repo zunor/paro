@@ -545,6 +545,7 @@ fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
     assert_eq!(count, 1);
     assert_eq!(result.data[0].get_value(0).to_string(), "1");
     assert_eq!(result.data[1].get_value(0).to_string(), "10");
+    assert!(Arc::ptr_eq(&result.data[0], &left.data[0]));
 
     let mut unmatched_state = ht.create_full_outer_scan_state();
     let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())

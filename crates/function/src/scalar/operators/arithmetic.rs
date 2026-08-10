@@ -10,8 +10,8 @@
 //! - Chunk: ✅
 
 use crate::decimal::{
-    check_precision_i128, pow10_checked, read_decimal, rescale_checked, round_divide_checked,
-    to_i128, write_decimal, DecimalInteger,
+    pow10_checked, rescale_checked, round_divide_checked, to_i128, DecimalInteger,
+    I128DecimalPrecision,
 };
 use crate::scalar::executor::binary::BinaryExecutor;
 use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
@@ -23,7 +23,7 @@ use ethnum::i256;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::Vector;
+use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef, Vector};
 use std::any::Any;
 use std::ops::{Add, Mul, Sub};
 
@@ -366,38 +366,389 @@ fn execute_decimal_rows(
     result_scale: u8,
     op: DecimalArithmeticOp,
 ) -> Result<()> {
+    let left = DecimalInputView::try_new(&chunk.data[0], chunk.size())?;
+    let right = DecimalInputView::try_new(&chunk.data[1], chunk.size())?;
+    let output = DecimalOutput::try_new(result)?;
+    let precision_guard = I128DecimalPrecision::new(precision)?;
+    let native_plan = NativeDecimalPlan::new(op, &left, &right, result_scale);
     for row in 0..chunk.size() {
-        if chunk.data[0].is_null(row) || chunk.data[1].is_null(row) {
-            result.set_null(row, true);
+        if !left.is_valid(row) || !right.is_valid(row) {
+            result.try_set_null(row, true)?;
             continue;
         }
-        let (left, left_scale) = decimal_value_at(&chunk.data[0], row)?;
-        let (right, right_scale) = decimal_value_at(&chunk.data[1], row)?;
-        match evaluate_decimal_operation(op, left, left_scale, right, right_scale, result_scale) {
+        let left_value = left.value_at(row)?;
+        let right_value = right.value_at(row)?;
+        match native_plan.evaluate(left_value, right_value) {
             DecimalEvaluation::Value(value) => {
-                check_precision_i128(value, precision)?;
-                write_decimal(result, row, value)?;
+                precision_guard.check(value)?;
+                // SAFETY: `output` points at the flat result allocation and
+                // `row` is bounded by the chunk/result count.
+                unsafe { output.write(row, value) };
             }
-            DecimalEvaluation::Null => result.set_null(row, true),
+            DecimalEvaluation::Null => result.try_set_null(row, true)?,
             DecimalEvaluation::Overflow => {
                 match evaluate_decimal_operation(
                     op,
-                    i256::from(left),
-                    left_scale,
-                    i256::from(right),
-                    right_scale,
+                    i256::from(left_value),
+                    left.scale,
+                    i256::from(right_value),
+                    right.scale,
                     result_scale,
                 ) {
                     DecimalEvaluation::Value(value) => {
-                        write_decimal(result, row, to_i128(value, precision)?)?;
+                        let value = to_i128(value, precision)?;
+                        // SAFETY: same bounds and allocation contract as the
+                        // native path above.
+                        unsafe { output.write(row, value) };
                     }
-                    DecimalEvaluation::Null => result.set_null(row, true),
+                    DecimalEvaluation::Null => result.try_set_null(row, true)?,
                     DecimalEvaluation::Overflow => return Err(decimal_overflow(op)),
                 }
             }
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecimalInputKind {
+    I8,
+    I16,
+    I32,
+    I64,
+    I128,
+    U8,
+    U16,
+    U32,
+    U64,
+    U128,
+}
+
+struct DecimalInputView<'a> {
+    access: DecimalInputAccess<'a>,
+    kind: DecimalInputKind,
+    scale: u8,
+}
+
+enum DecimalInputAccess<'a> {
+    DirectI64(*const i64),
+    DirectI128(*const i128),
+    SelectedI64(DecodedVectorRef<'a>),
+    SelectedI128(DecodedVectorRef<'a>),
+    Constant(i128),
+    Decoded(DecodedVectorRef<'a>),
+}
+
+impl<'a> DecimalInputView<'a> {
+    fn try_new(vector: &'a Vector, count: usize) -> Result<Self> {
+        let (kind, scale) = match vector.logical_type() {
+            LogicalType::Decimal { precision, scale } if *precision <= 18 => {
+                (DecimalInputKind::I64, *scale)
+            }
+            LogicalType::Decimal { scale, .. } => (DecimalInputKind::I128, *scale),
+            LogicalType::TinyInt => (DecimalInputKind::I8, 0),
+            LogicalType::SmallInt => (DecimalInputKind::I16, 0),
+            LogicalType::Integer => (DecimalInputKind::I32, 0),
+            LogicalType::BigInt => (DecimalInputKind::I64, 0),
+            LogicalType::HugeInt => (DecimalInputKind::I128, 0),
+            LogicalType::UTinyInt => (DecimalInputKind::U8, 0),
+            LogicalType::USmallInt => (DecimalInputKind::U16, 0),
+            LogicalType::UInteger => (DecimalInputKind::U32, 0),
+            LogicalType::UBigInt => (DecimalInputKind::U64, 0),
+            LogicalType::UHugeInt => (DecimalInputKind::U128, 0),
+            ty => {
+                return Err(paro_error::internal(format!(
+                    "unsupported decimal arithmetic type {ty}"
+                )))
+            }
+        };
+        let decoded = vector.try_decode_ref(count)?;
+        let access = if decoded.validity().all_valid() {
+            match (kind, decoded.data(), decoded.sel()) {
+                (DecimalInputKind::I64, DataRef::Ptr(data), SelectionRef::Incremental { .. }) => {
+                    DecimalInputAccess::DirectI64(data.cast::<i64>())
+                }
+                (DecimalInputKind::I64, DataRef::Ptr(data), SelectionRef::Range { offset, .. }) => {
+                    DecimalInputAccess::DirectI64(unsafe { data.cast::<i64>().add(*offset) })
+                }
+                (DecimalInputKind::I128, DataRef::Ptr(data), SelectionRef::Incremental { .. }) => {
+                    DecimalInputAccess::DirectI128(data.cast::<i128>())
+                }
+                (
+                    DecimalInputKind::I128,
+                    DataRef::Ptr(data),
+                    SelectionRef::Range { offset, .. },
+                ) => DecimalInputAccess::DirectI128(unsafe { data.cast::<i128>().add(*offset) }),
+                (_, _, SelectionRef::Constant { .. }) => {
+                    DecimalInputAccess::Constant(read_decimal_input(&decoded, kind, 0)?)
+                }
+                (DecimalInputKind::I64, DataRef::Ptr(_), _) => {
+                    DecimalInputAccess::SelectedI64(decoded)
+                }
+                (DecimalInputKind::I128, DataRef::Ptr(_), _) => {
+                    DecimalInputAccess::SelectedI128(decoded)
+                }
+                _ => DecimalInputAccess::Decoded(decoded),
+            }
+        } else {
+            DecimalInputAccess::Decoded(decoded)
+        };
+        Ok(Self {
+            access,
+            kind,
+            scale,
+        })
+    }
+
+    #[inline]
+    fn is_valid(&self, row: usize) -> bool {
+        match &self.access {
+            DecimalInputAccess::DirectI64(_)
+            | DecimalInputAccess::DirectI128(_)
+            | DecimalInputAccess::SelectedI64(_)
+            | DecimalInputAccess::SelectedI128(_)
+            | DecimalInputAccess::Constant(_) => true,
+            DecimalInputAccess::Decoded(decoded) => decoded.is_valid(row),
+        }
+    }
+
+    #[inline]
+    fn value_at(&self, row: usize) -> Result<i128> {
+        match &self.access {
+            DecimalInputAccess::DirectI64(values) => Ok(unsafe { *values.add(row) } as i128),
+            DecimalInputAccess::DirectI128(values) => Ok(unsafe { *values.add(row) }),
+            DecimalInputAccess::SelectedI64(decoded) => {
+                Ok(unsafe { decoded.get_value::<i64>(row) } as i128)
+            }
+            DecimalInputAccess::SelectedI128(decoded) => {
+                Ok(unsafe { decoded.get_value::<i128>(row) })
+            }
+            DecimalInputAccess::Constant(value) => Ok(*value),
+            DecimalInputAccess::Decoded(decoded) => read_decimal_input(decoded, self.kind, row),
+        }
+    }
+
+    fn constant_value(&self) -> Option<i128> {
+        match self.access {
+            DecimalInputAccess::Constant(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecimalScaleTransform {
+    Identity,
+    Multiply(i128),
+    Divide(i128),
+    Overflow,
+}
+
+impl DecimalScaleTransform {
+    fn new(source_scale: u8, target_scale: u8) -> Self {
+        use std::cmp::Ordering;
+        match target_scale.cmp(&source_scale) {
+            Ordering::Equal => Self::Identity,
+            Ordering::Greater => pow10_checked::<i128>(target_scale - source_scale)
+                .map_or(Self::Overflow, Self::Multiply),
+            Ordering::Less => pow10_checked::<i128>(source_scale - target_scale)
+                .map_or(Self::Overflow, Self::Divide),
+        }
+    }
+
+    #[inline]
+    fn apply(self, value: i128) -> Option<i128> {
+        match self {
+            Self::Identity => Some(value),
+            Self::Multiply(factor) => value.checked_mul(factor),
+            Self::Divide(divisor) => round_divide_checked(value, divisor),
+            Self::Overflow => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeDecimalOperand {
+    Input(DecimalScaleTransform),
+    Constant(Option<i128>),
+}
+
+impl NativeDecimalOperand {
+    fn new(input: &DecimalInputView<'_>, result_scale: u8) -> Self {
+        let transform = DecimalScaleTransform::new(input.scale, result_scale);
+        input
+            .constant_value()
+            .map_or(Self::Input(transform), |value| {
+                Self::Constant(transform.apply(value))
+            })
+    }
+
+    #[inline]
+    fn apply(self, value: i128) -> Option<i128> {
+        match self {
+            Self::Input(transform) => transform.apply(value),
+            Self::Constant(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum NativeDecimalPlan {
+    Add {
+        left: NativeDecimalOperand,
+        right: NativeDecimalOperand,
+    },
+    Sub {
+        left: NativeDecimalOperand,
+        right: NativeDecimalOperand,
+    },
+    Mul(DecimalScaleTransform),
+    Div {
+        left_scale: u8,
+        right_scale: u8,
+        result_scale: u8,
+    },
+    Mod {
+        left: NativeDecimalOperand,
+        right: NativeDecimalOperand,
+    },
+}
+
+impl NativeDecimalPlan {
+    fn new(
+        op: DecimalArithmeticOp,
+        left: &DecimalInputView<'_>,
+        right: &DecimalInputView<'_>,
+        result_scale: u8,
+    ) -> Self {
+        match op {
+            DecimalArithmeticOp::Add => Self::Add {
+                left: NativeDecimalOperand::new(left, result_scale),
+                right: NativeDecimalOperand::new(right, result_scale),
+            },
+            DecimalArithmeticOp::Sub => Self::Sub {
+                left: NativeDecimalOperand::new(left, result_scale),
+                right: NativeDecimalOperand::new(right, result_scale),
+            },
+            DecimalArithmeticOp::Mul => Self::Mul(DecimalScaleTransform::new(
+                left.scale.saturating_add(right.scale),
+                result_scale,
+            )),
+            DecimalArithmeticOp::Div => Self::Div {
+                left_scale: left.scale,
+                right_scale: right.scale,
+                result_scale,
+            },
+            DecimalArithmeticOp::Mod => Self::Mod {
+                left: NativeDecimalOperand::new(left, result_scale),
+                right: NativeDecimalOperand::new(right, result_scale),
+            },
+        }
+    }
+
+    #[inline]
+    fn evaluate(self, left_value: i128, right_value: i128) -> DecimalEvaluation<i128> {
+        let value = match self {
+            Self::Add { left, right } => left
+                .apply(left_value)
+                .zip(right.apply(right_value))
+                .and_then(|(left, right)| left.checked_add(right)),
+            Self::Sub { left, right } => left
+                .apply(left_value)
+                .zip(right.apply(right_value))
+                .and_then(|(left, right)| left.checked_sub(right)),
+            Self::Mul(transform) => left_value
+                .checked_mul(right_value)
+                .and_then(|value| transform.apply(value)),
+            Self::Div { .. } if right_value == 0 => return DecimalEvaluation::Null,
+            Self::Div {
+                left_scale,
+                right_scale,
+                result_scale,
+            } => divide_decimal_checked(
+                left_value,
+                left_scale,
+                right_value,
+                right_scale,
+                result_scale,
+            ),
+            Self::Mod { .. } if right_value == 0 => return DecimalEvaluation::Null,
+            Self::Mod { left, right } => left
+                .apply(left_value)
+                .zip(right.apply(right_value))
+                .and_then(|(left, right)| left.checked_rem(right)),
+        };
+        value
+            .map(DecimalEvaluation::Value)
+            .unwrap_or(DecimalEvaluation::Overflow)
+    }
+}
+
+fn read_decimal_input(
+    decoded: &DecodedVectorRef<'_>,
+    kind: DecimalInputKind,
+    row: usize,
+) -> Result<i128> {
+    if matches!(decoded.data(), DataRef::SequenceI64 { .. }) {
+        // Sequence vectors have one canonical i64 physical representation;
+        // their logical type was validated when the vector was built.
+        return Ok(unsafe { decoded.get_value::<i64>(row) as i128 });
+    }
+
+    // SAFETY: `kind` comes from the logical type that defines the decoded
+    // vector's fixed-width physical representation, and `row` is in bounds.
+    unsafe {
+        Ok(match kind {
+            DecimalInputKind::I8 => decoded.get_value::<i8>(row) as i128,
+            DecimalInputKind::I16 => decoded.get_value::<i16>(row) as i128,
+            DecimalInputKind::I32 => decoded.get_value::<i32>(row) as i128,
+            DecimalInputKind::I64 => decoded.get_value::<i64>(row) as i128,
+            DecimalInputKind::I128 => decoded.get_value::<i128>(row),
+            DecimalInputKind::U8 => decoded.get_value::<u8>(row) as i128,
+            DecimalInputKind::U16 => decoded.get_value::<u16>(row) as i128,
+            DecimalInputKind::U32 => decoded.get_value::<u32>(row) as i128,
+            DecimalInputKind::U64 => decoded.get_value::<u64>(row) as i128,
+            DecimalInputKind::U128 => {
+                i128::try_from(decoded.get_value::<u128>(row)).map_err(|_| {
+                    paro_error::out_of_range("UHUGEINT cannot be represented as DECIMAL")
+                })?
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DecimalOutput {
+    I64(*mut i64),
+    I128(*mut i128),
+}
+
+impl DecimalOutput {
+    fn try_new(result: &mut Vector) -> Result<Self> {
+        match result.logical_type() {
+            LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+                Ok(Self::I64(result.as_mut_slice::<i64>().as_mut_ptr()))
+            }
+            LogicalType::Decimal { .. } => {
+                Ok(Self::I128(result.as_mut_slice::<i128>().as_mut_ptr()))
+            }
+            _ => Err(paro_error::internal(
+                "DECIMAL writer received a non-DECIMAL result vector",
+            )),
+        }
+    }
+
+    /// # Safety
+    ///
+    /// `row` must be within the output vector allocation. `value` must already
+    /// satisfy the declared DECIMAL precision.
+    #[inline]
+    unsafe fn write(self, row: usize, value: i128) {
+        match self {
+            Self::I64(output) => unsafe { *output.add(row) = value as i64 },
+            Self::I128(output) => unsafe { *output.add(row) = value },
+        }
+    }
 }
 
 fn evaluate_decimal_operation<T: DecimalInteger>(
@@ -451,35 +802,6 @@ fn evaluate_decimal_operation<T: DecimalInteger>(
 
 fn decimal_overflow(op: DecimalArithmeticOp) -> paro_common::error::ParoError {
     paro_error::out_of_range(format!("Decimal {} overflow", decimal_op_name(op)))
-}
-
-fn decimal_value_at(vector: &Vector, row: usize) -> Result<(i128, u8)> {
-    let value = unsafe {
-        match vector.logical_type() {
-            LogicalType::Decimal { .. } => read_decimal(vector, row),
-            LogicalType::TinyInt => (vector.get_fixed::<i8>(row) as i128, 0),
-            LogicalType::SmallInt => (vector.get_fixed::<i16>(row) as i128, 0),
-            LogicalType::Integer => (vector.get_fixed::<i32>(row) as i128, 0),
-            LogicalType::BigInt => (vector.get_fixed::<i64>(row) as i128, 0),
-            LogicalType::HugeInt => (vector.get_fixed::<i128>(row), 0),
-            LogicalType::UTinyInt => (vector.get_fixed::<u8>(row) as i128, 0),
-            LogicalType::USmallInt => (vector.get_fixed::<u16>(row) as i128, 0),
-            LogicalType::UInteger => (vector.get_fixed::<u32>(row) as i128, 0),
-            LogicalType::UBigInt => (vector.get_fixed::<u64>(row) as i128, 0),
-            LogicalType::UHugeInt => (
-                i128::try_from(vector.get_fixed::<u128>(row)).map_err(|_| {
-                    paro_error::out_of_range("UHUGEINT cannot be represented as DECIMAL")
-                })?,
-                0,
-            ),
-            ty => {
-                return Err(paro_error::internal(format!(
-                    "unsupported decimal arithmetic type {ty}"
-                )))
-            }
-        }
-    };
-    Ok(value)
 }
 
 fn divide_decimal_checked<T: DecimalInteger>(

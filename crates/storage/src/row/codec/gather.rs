@@ -113,9 +113,7 @@ where
         if unsafe { row_value_is_valid(layout, row_ptr, column_idx) } {
             // SAFETY: both cells are live, non-overlapping, and exactly `width`
             // bytes wide according to the shared logical type.
-            unsafe {
-                ptr::copy_nonoverlapping(row_ptr.add(offset), target.add(row_idx * width), width);
-            }
+            unsafe { copy_fixed_width(row_ptr.add(offset), target.add(row_idx * width), width) };
         } else {
             // Keep null payload bytes deterministic for consumers that perform
             // unconditional physical reads behind a validity check.
@@ -153,24 +151,52 @@ where
         // SAFETY: the row pointer and column offset identify a live varlen cell.
         let cell = unsafe { row_ptr.add(offset) };
         let len = unsafe { ptr::read_unaligned(cell.cast::<u32>()) as usize };
-        let bytes = if len <= INLINE_LENGTH {
-            // SAFETY: the 16-byte inline cell contains `len <= 12` payload bytes.
-            unsafe { std::slice::from_raw_parts(cell.add(4), len) }
-        } else {
-            let heap_ptr = unsafe { ptr::read_unaligned(cell.add(8).cast::<*const u8>()) };
-            if heap_ptr.is_null() {
-                return Err(paro_error::internal(format!(
-                    "row gather found null heap pointer for {len}-byte value"
-                )));
-            }
-            // SAFETY: the row owner keeps the referenced varlen allocation live.
-            unsafe { std::slice::from_raw_parts(heap_ptr, len) }
-        };
+        if len <= INLINE_LENGTH {
+            // Row varlen cells deliberately share InlineString's 16-byte
+            // inline representation. Copying the complete cell avoids
+            // reconstructing the same length/prefix/suffix for every value.
+            let value = unsafe { ptr::read_unaligned(cell.cast::<InlineString>()) };
+            unsafe { ptr::write(entries.add(row_idx), value) };
+            continue;
+        }
+
+        let heap_ptr = unsafe { ptr::read_unaligned(cell.add(8).cast::<*const u8>()) };
+        if heap_ptr.is_null() {
+            return Err(paro_error::internal(format!(
+                "row gather found null heap pointer for {len}-byte value"
+            )));
+        }
+        // SAFETY: the row owner keeps the referenced varlen allocation live.
+        let bytes = unsafe { std::slice::from_raw_parts(heap_ptr, len) };
         let value = heap.try_add_blob(bytes)?;
-        // SAFETY: `entries` has capacity for `count` values.
         unsafe { ptr::write(entries.add(row_idx), value) };
     }
     Ok(())
+}
+
+/// Copy the scalar widths used by fixed SQL types without a variable-length
+/// libc call for every gathered cell.
+///
+/// # Safety
+///
+/// `source` and `target` must be readable/writable for `width` non-overlapping
+/// bytes.
+#[inline]
+unsafe fn copy_fixed_width(source: *const u8, target: *mut u8, width: usize) {
+    macro_rules! copy_value {
+        ($ty:ty) => {{
+            let value = unsafe { ptr::read_unaligned(source.cast::<$ty>()) };
+            unsafe { ptr::write_unaligned(target.cast::<$ty>(), value) };
+        }};
+    }
+    match width {
+        1 => copy_value!(u8),
+        2 => copy_value!(u16),
+        4 => copy_value!(u32),
+        8 => copy_value!(u64),
+        16 => copy_value!(u128),
+        _ => unsafe { ptr::copy_nonoverlapping(source, target, width) },
+    }
 }
 
 unsafe fn gather_nested<F>(

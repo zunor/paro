@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use paro_catalog::entry::ConstraintType;
 use paro_common::error::Result;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
@@ -38,6 +39,40 @@ fn integral_domain_cardinality(stats: &ColumnStatistics) -> Option<usize> {
     let minimum = integral_ordinal(&minimum)?;
     let maximum = integral_ordinal(&maximum)?;
     usize::try_from(maximum.checked_sub(minimum)?.checked_add(1)?).ok()
+}
+
+fn declared_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
+    let get = match &plan.operator {
+        LogicalOperator::Get(get) => get,
+        LogicalOperator::Filter(filter) => return declared_unique_keys(&filter.child),
+        _ => return Vec::new(),
+    };
+    let Some(table) = &get.table else {
+        return Vec::new();
+    };
+
+    table
+        .constraints
+        .iter()
+        .filter(|constraint| {
+            matches!(
+                constraint.constraint_type,
+                ConstraintType::Unique | ConstraintType::PrimaryKey
+            ) && !constraint.columns.is_empty()
+        })
+        .filter_map(|constraint| {
+            constraint
+                .columns
+                .iter()
+                .map(|column_id| {
+                    get.column_ids
+                        .iter()
+                        .position(|candidate| candidate == column_id)
+                        .map(|column_index| ColumnBinding::new(get.table_index, column_index))
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect()
 }
 
 fn integral_ordinal(value: &paro_common::runtime_value::Value) -> Option<u128> {
@@ -468,6 +503,9 @@ impl JoinOrderOptimizer {
     ) {
         let cardinality = self.estimate_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
+        stats.estimated_row_width =
+            crate::join::build_probe_side::estimate_row_width(&plan.types());
+        stats.unique_keys = declared_unique_keys(plan);
         stats.column_distinct_count = plan
             .get_column_bindings()
             .into_iter()
@@ -1042,7 +1080,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let mut column_stats = ColumnStatistics::new(BaseStatistics::new(LogicalType::Integer));
-        column_stats.update_distinct_statistics_full(&hashes, hashes.len());
+        column_stats.update_distinct_statistics(&hashes, hashes.len());
         assert!(column_stats.get_distinct_count() > 9);
 
         let mut optimizer = JoinOrderOptimizer::new();
