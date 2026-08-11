@@ -19,6 +19,7 @@ use crate::rowset::column::{
 };
 use crate::rowset::page::CompressionType;
 use crate::rowset::page_reader::PageReader;
+use crate::rowset::scan_cost::ScanAccessCostModel;
 use crate::rowset::segment_statistics::SegmentStatistics;
 use crate::tablet::{ColumnId, TabletSchemaRef};
 use arc_swap::ArcSwapOption;
@@ -43,6 +44,7 @@ pub struct SegmentOptions {
     pub cache_decompressed: bool,
     pub cache_decoded: bool,
     pub parallel_decompressor: Option<crate::compression::ParallelDecompressor>,
+    pub scan_access_cost: ScanAccessCostModel,
 }
 
 impl Default for SegmentOptions {
@@ -56,6 +58,7 @@ impl Default for SegmentOptions {
             cache_decompressed: false,
             cache_decoded: false,
             parallel_decompressor: None,
+            scan_access_cost: ScanAccessCostModel::default(),
         }
     }
 }
@@ -103,6 +106,11 @@ impl SegmentOptions {
         self
     }
 
+    pub fn with_scan_access_cost(mut self, model: ScanAccessCostModel) -> Self {
+        self.scan_access_cost = model;
+        self
+    }
+
     pub(crate) fn runtime_equivalent(&self, other: &Self) -> bool {
         self.verify_checksum == other.verify_checksum
             && self.compression == other.compression
@@ -110,6 +118,7 @@ impl SegmentOptions {
             && self.predicates.len() == other.predicates.len()
             && self.cache_decompressed == other.cache_decompressed
             && self.cache_decoded == other.cache_decoded
+            && self.scan_access_cost == other.scan_access_cost
             && match (&self.page_cache, &other.page_cache) {
                 (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,

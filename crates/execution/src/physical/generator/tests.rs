@@ -478,7 +478,10 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("fully pushed filter should lower to rowset scan root");
     };
-    assert_eq!(spec.column_ids.as_ref(), [0]);
+    assert_eq!(
+        spec.column_projection.explicit_columns(),
+        Some([0].as_slice())
+    );
     assert!(spec.residual_predicates.is_empty());
     assert!(!spec.late_materialize);
     let Some(PredicateTree::And(children)) = spec.predicate.as_ref() else {
@@ -488,6 +491,36 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     assert!(physical
         .format_explain_text_with_spec(&paro_planner::operator::ExplainSpec::default())
         .contains("Pushed Predicate"));
+}
+
+#[test]
+fn zero_column_rowset_projection_never_enables_late_materialization() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let mut filter = Filter::new(
+        get,
+        vec![comparison(
+            ComparisonType::Equal,
+            ref_expr(0, LogicalType::Integer),
+            int_const(42),
+        )],
+    );
+    filter.projection_map = paro_planner::operator::ProjectionMap::none();
+    let mut plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+    plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(1));
+
+    let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&plan)
+        .expect("zero-column filter should lower");
+    let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+        panic!("fully pushed zero-column filter should lower to rowset scan");
+    };
+
+    assert_eq!(
+        spec.column_projection.explicit_columns(),
+        Some([].as_slice())
+    );
+    assert!(!spec.late_materialize);
 }
 
 #[test]

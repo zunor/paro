@@ -30,7 +30,8 @@ impl PipelineLowerer<'_> {
             else {
                 continue;
             };
-            let Some(&probe_column_id) = rowset.scan.column_ids.get(source_index) else {
+            let Some(probe_column_id) = rowset.scan.column_projection.column_id(source_index)
+            else {
                 continue;
             };
             let Ok(probe_column_id) = u32::try_from(probe_column_id) else {

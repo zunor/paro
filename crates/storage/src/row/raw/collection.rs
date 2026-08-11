@@ -1107,8 +1107,8 @@ mod tests {
 
         let mut lstate1 = RawRowScanState::new();
         let mut lstate2 = RawRowScanState::new();
-        let mut out1 = test_chunk_with_capacity(&[LogicalType::Integer], 2048);
-        let mut out2 = test_chunk_with_capacity(&[LogicalType::Integer], 2048);
+        let mut out1 = test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
+        let mut out2 = test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
 
         let mut seen = Vec::new();
         loop {

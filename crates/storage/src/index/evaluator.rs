@@ -72,6 +72,13 @@ impl IndexEvaluator {
                         }
                         None => intersect(&candidates, &child.candidates),
                     };
+                    if matches!(candidates, PredicateResult::NoneMatch) {
+                        // `guaranteed ⊆ candidates` makes the proof empty too;
+                        // no remaining child can make an AND row eligible.
+                        return IndexPredicateEvaluation::candidates_only(
+                            PredicateResult::NoneMatch,
+                        );
+                    }
                     guaranteed = match &self.page_layout {
                         Some(layout) => {
                             intersect_with_layout(&guaranteed, &child.guaranteed, layout)
@@ -115,6 +122,10 @@ impl IndexEvaluator {
         let mut candidates = PredicateResult::Unknown;
         let mut guaranteed = PredicateResult::NoneMatch;
         for index in indexes {
+            if !matches!(candidates, PredicateResult::Unknown) && !index.provides_predicate_proof()
+            {
+                continue;
+            }
             let result = index.evaluate_predicate_with_proof(predicate);
             if matches!(candidates, PredicateResult::Unknown)
                 && !matches!(result.candidates, PredicateResult::Unknown)
@@ -151,6 +162,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
     use roaring::RoaringBitmap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockIndex {
         name: String,
@@ -158,6 +170,7 @@ mod tests {
         column_ids: Vec<ColumnId>,
         logical_types: Vec<LogicalType>,
         result: PredicateResult,
+        evaluations: AtomicUsize,
     }
 
     impl MockIndex {
@@ -168,6 +181,7 @@ mod tests {
                 column_ids: vec![0],
                 logical_types: vec![LogicalType::Integer],
                 result,
+                evaluations: AtomicUsize::new(0),
             }
         }
     }
@@ -234,6 +248,7 @@ mod tests {
         }
 
         fn evaluate_predicate(&self, _predicate: &Predicate) -> PredicateResult {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
             self.result.clone()
         }
     }
@@ -298,5 +313,46 @@ mod tests {
         let tree = PredicateTree::And(vec![pred_left, pred_right]);
         let result = evaluator.evaluate(&tree);
         assert!(matches!(result, PredicateResult::Bitmap(_)));
+    }
+
+    #[test]
+    fn and_stops_after_the_candidate_set_becomes_empty() {
+        let rejecting = Arc::new(MockIndex::new("ART", PredicateResult::NoneMatch));
+        let evaluator = IndexEvaluator::new(vec![rejecting.clone()]);
+        let leaf = |value| {
+            PredicateTree::leaf(Predicate::Eq {
+                column_id: 0,
+                value: paro_common::runtime_value::Value::Integer(value),
+            })
+        };
+
+        let result = evaluator.evaluate_with_proof(&PredicateTree::And(vec![leaf(1), leaf(2)]));
+
+        assert!(matches!(result.candidates, PredicateResult::NoneMatch));
+        assert!(matches!(result.guaranteed, PredicateResult::NoneMatch));
+        assert_eq!(rejecting.evaluations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn candidate_only_indexes_stop_after_the_highest_priority_answer() {
+        let art = Arc::new(MockIndex::new(
+            "ART",
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
+        ));
+        let bloom = Arc::new(MockIndex::new(
+            "BLOOM",
+            PredicateResult::PageRanges(vec![PageRange::new(0, 10)]),
+        ));
+        let evaluator = IndexEvaluator::new(vec![bloom.clone(), art.clone()]);
+        let predicate = PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: paro_common::runtime_value::Value::Integer(1),
+        });
+
+        let result = evaluator.evaluate_with_proof(&predicate);
+
+        assert!(matches!(result.candidates, PredicateResult::Bitmap(_)));
+        assert_eq!(art.evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(bloom.evaluations.load(Ordering::Relaxed), 0);
     }
 }

@@ -48,4 +48,4 @@ pub use view::{
 };
 
 /// Default vector size (number of rows per vector).
-pub const VECTOR_SIZE: usize = 2048;
+pub const VECTOR_SIZE: usize = 4096;

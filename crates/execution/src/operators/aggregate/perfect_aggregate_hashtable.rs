@@ -12,12 +12,12 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DecodedVectorRef, SelectionRef, SelectionVector, Vector};
+use paro_common::vector::{DecodedVectorRef, SelectionVector, Vector};
 use paro_function::aggregate::{
-    AggregateCombineType, AggregateComparison, AggregateDirectUpdate, AggregateInputData,
-    AggregateStateInput, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
-    ValidatedDirectGroupSlots,
+    AggregateCombineType, AggregateComparison, AggregateInputData, AggregateStateInput,
+    DirectGroupSlotSource, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
 };
+use smallvec::SmallVec;
 
 use super::aggregate_kernel::{
     combine_states, destroy_states, filtered_input_vectors_for_aggregate, finalize_states,
@@ -27,6 +27,15 @@ use super::aggregate_kernel::{
 use super::aggregate_object::AggregateObject;
 use super::aggregate_state::AggregateStateLayout;
 use super::perfect_hash_key::PerfectHashKeyDomain;
+
+mod support;
+
+pub(crate) use support::compile_direct_update_program;
+use support::{
+    accounted_vec_from_reservation, bytes_to_words, compact_state_addresses,
+    direct_update_scratch_bytes, pointer_vector_from_slice, validate_addresses_vector,
+    validate_aggregate_inputs, validate_filter,
+};
 
 /// Scan cursor for a perfect aggregate hash table.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -55,75 +64,104 @@ struct PerfectHashSlotLayout {
     slot_count: usize,
 }
 
-/// Batch-local codec for a dictionary-backed perfect-hash key.
+/// Batch-local codec for a repeated VARCHAR perfect-hash key.
 ///
 /// Codes are compiled only for physical dictionary entries referenced by the
 /// logical batch. Dictionary vectors intentionally retain unused child rows;
 /// validating those rows would make an unobserved value affect query
 /// semantics. The codec is key-column generic and composes through the normal
 /// mixed-radix slot layout, so one, two, and wider key tuples share one path.
+/// Flat inputs decline when their physical domain is not smaller than the
+/// logical batch; the ordinary row-wise encoder is already optimal there.
 struct PreparedDictionaryKey<'a> {
-    selection: &'a SelectionRef<'a>,
+    domain: &'a PerfectHashKeyDomain,
+    group: &'a DecodedVectorRef<'a>,
+    selection: &'a paro_common::vector::SelectionRef<'a>,
     selection_data: *const u32,
     physical_count: usize,
-    codes: Vec<(usize, usize)>,
+    minimum: i128,
+    cardinality: usize,
+    group_idx: usize,
+    codes: Vec<usize>,
 }
 
 impl<'a> PreparedDictionaryKey<'a> {
+    const UNPREPARED: usize = usize::MAX;
+
     fn try_new(
-        domain: &PerfectHashKeyDomain,
+        domain: &'a PerfectHashKeyDomain,
+        group: &'a DecodedVectorRef<'a>,
+        rows: usize,
         minimum: i128,
         cardinality: usize,
         group_idx: usize,
-        group: &'a DecodedVectorRef<'a>,
-        rows: usize,
     ) -> Result<Option<Self>> {
         if domain.logical_type() != &LogicalType::Varchar || !group.validity().all_valid() {
             return Ok(None);
         }
-        let mut codes = Vec::with_capacity(rows.min(group.physical_count()));
-        for row in 0..rows {
-            let physical_idx = group.physical_index(row);
-            if physical_idx >= group.physical_count() {
-                return Err(paro_error::internal(
-                    "decoded perfect-hash dictionary index is out of bounds",
-                ));
-            }
-            codes.push((physical_idx, 0));
-        }
-        codes.sort_unstable_by_key(|(physical_idx, _)| *physical_idx);
-        codes.dedup_by_key(|(physical_idx, _)| *physical_idx);
-        for (physical_idx, code) in &mut codes {
-            let value = domain.encode_decoded(group, *physical_idx)?;
-            *code = adjust_group_value(value, minimum, cardinality, group_idx)?;
+        let physical_count = group.physical_count();
+        if physical_count >= rows {
+            return Ok(None);
         }
         Ok(Some(Self {
+            domain,
+            group,
             selection: group.sel(),
             selection_data: group
                 .sel()
                 .materialized_indices()
                 .map_or(std::ptr::null(), <[u32]>::as_ptr),
-            physical_count: group.physical_count(),
-            codes,
+            physical_count,
+            minimum,
+            cardinality,
+            group_idx,
+            codes: vec![Self::UNPREPARED; physical_count],
         }))
     }
 
     #[inline(always)]
-    fn encoded(&self, row: usize) -> Result<usize> {
+    fn encoded(&mut self, row: usize) -> Result<usize> {
         let physical_idx = if self.selection_data.is_null() {
             self.selection.get(row)
         } else {
             unsafe { *self.selection_data.add(row) as usize }
         };
-        if physical_idx >= self.physical_count {
-            return Err(paro_error::internal(
-                "decoded perfect-hash dictionary index is out of bounds",
-            ));
+        // Dictionary construction validates the complete logical-to-physical
+        // mapping once. Rechecking it for every grouping consumer would turn a
+        // vector invariant into a row-loop tax.
+        debug_assert!(physical_idx < self.physical_count);
+        let code = unsafe { self.codes.get_unchecked_mut(physical_idx) };
+        if *code == Self::UNPREPARED {
+            let value = self.domain.encode_decoded(self.group, physical_idx)?;
+            *code = adjust_group_value(value, self.minimum, self.cardinality, self.group_idx)?;
         }
-        self.codes
-            .binary_search_by_key(&physical_idx, |(physical_idx, _)| *physical_idx)
-            .map(|index| self.codes[index].1)
-            .map_err(|_| paro_error::internal("perfect-hash dictionary code was not prepared"))
+        Ok(*code)
+    }
+}
+
+/// Batch-local execution strategy for perfect-hash group keys.
+///
+/// The two-dictionary-key shape is common for low-cardinality analytical
+/// groups. Compiling it once removes key-count and optional-codec dispatch
+/// from the row loop while the generic mixed-radix representation remains the
+/// complete fallback for arbitrary key tuples.
+enum PreparedSlotEncoding<'a> {
+    DictionaryPair {
+        first: PreparedDictionaryKey<'a>,
+        second: PreparedDictionaryKey<'a>,
+    },
+    Generic(SmallVec<[Option<PreparedDictionaryKey<'a>>; 4]>),
+}
+
+impl<'a> PreparedSlotEncoding<'a> {
+    fn new(mut keys: SmallVec<[Option<PreparedDictionaryKey<'a>>; 4]>) -> Self {
+        if keys.len() == 2 && keys[0].is_some() && keys[1].is_some() {
+            let second = keys.pop().flatten().expect("second key was checked");
+            let first = keys.pop().flatten().expect("first key was checked");
+            Self::DictionaryPair { first, second }
+        } else {
+            Self::Generic(keys)
+        }
     }
 }
 
@@ -184,6 +222,7 @@ impl PerfectHashSlotLayout {
         })
     }
 
+    #[cfg(test)]
     fn add_component(&self, slot: usize, group_idx: usize, encoded: usize) -> Result<usize> {
         let cardinality = self.cardinalities[group_idx];
         if encoded >= cardinality {
@@ -210,6 +249,18 @@ impl PerfectHashSlotLayout {
 
     fn decode_component(&self, slot: usize, group_idx: usize) -> usize {
         (slot / self.strides[group_idx]) % self.cardinalities[group_idx]
+    }
+
+    /// Encode the common two-key shape through the canonical mixed-radix
+    /// layout. Keeping this arithmetic beside `decode_component` prevents hot
+    /// paths from silently choosing a different component order.
+    #[inline(always)]
+    fn encode_pair(&self, first: usize, second: usize) -> usize {
+        debug_assert_eq!(self.cardinalities.len(), 2);
+        debug_assert!(first < self.cardinalities[0]);
+        debug_assert!(second < self.cardinalities[1]);
+        // `try_new` proved the complete mixed-radix domain fits in usize.
+        first * self.strides[0] + second * self.strides[1]
     }
 }
 
@@ -238,10 +289,6 @@ pub struct PerfectAggregateHashTable {
     aggregate_inputs: Vec<Vec<usize>>,
     direct_update_program: Option<DirectGroupedAggregateProgram>,
     direct_update_scratch: Option<DirectGroupedAggregateScratch>,
-    /// Scratch owned exclusively by `try_update_direct_groups`. Public
-    /// address-producing and aggregate-update methods never communicate
-    /// through this buffer.
-    direct_slots: AccountedVec<usize>,
     // 0 = empty, 1 = occupied
     occupancy: AccountedVec<u8>,
     // Keep row storage 8-byte aligned so aggregate states can be safely cast to typed pointers.
@@ -316,29 +363,11 @@ impl PerfectAggregateHashTable {
         let total_groups = slot_layout.slot_count;
 
         let state_layout = AggregateStateLayout::new(&aggregate_objects)?;
-        let mut direct_update_program = DirectGroupedAggregateProgram::new(aggregate_objects.len());
-        for (aggregate_index, object) in aggregate_objects.iter().enumerate() {
-            let Some(inputs) = aggregate_inputs.get(aggregate_index) else {
-                continue;
-            };
-            if object.is_distinct() || object.filter.is_some() || !object.order_bys.is_empty() {
-                continue;
-            }
-            let input = direct_payload_input(object, inputs);
-            direct_update_program.try_add(
-                aggregate_index,
-                object.function.direct_update,
-                state_layout.state_offset(aggregate_index),
-                input,
-            );
-        }
+        let direct_update_program =
+            compile_direct_update_program(&aggregate_objects, &aggregate_inputs, &state_layout);
         let direct_update_program = direct_update_program
             .has_updates()
             .then_some(direct_update_program);
-        let direct_update_scratch = match direct_update_program.as_ref() {
-            Some(program) => program.try_create_scratch(total_groups, &memory)?,
-            None => None,
-        };
         let row_width = state_layout.total_size().max(1);
         let total_bytes = row_width.checked_mul(total_groups).ok_or_else(|| {
             paro_error::internal(format!(
@@ -346,26 +375,40 @@ impl PerfectAggregateHashTable {
             ))
         })?;
         let total_words = bytes_to_words(total_bytes)?;
-        let mut data = accounted_vec_for_context(
-            &memory,
+        let direct_scratch_bytes =
+            direct_update_scratch_bytes(direct_update_program.as_ref(), total_groups).ok_or_else(
+                || paro_error::internal("perfect aggregate scratch byte-size overflow"),
+            )?;
+        let reserved_bytes = total_words
+            .checked_mul(size_of::<u64>())
+            .and_then(|bytes| bytes.checked_add(total_groups))
+            .and_then(|bytes| bytes.checked_add(direct_scratch_bytes))
+            .ok_or_else(|| paro_error::internal("perfect aggregate reservation overflow"))?;
+        let reservation = memory.reserve_grant(reserved_bytes)?;
+        let direct_update_scratch = match direct_update_program.as_ref() {
+            Some(program) => program.try_create_scratch_with_grant(
+                total_groups,
+                &reservation,
+                memory.tag(),
+                memory.accounting_class(),
+            )?,
+            None => None,
+        };
+        let mut data = accounted_vec_from_reservation(
+            &reservation,
+            total_words,
             MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
+            memory.accounting_class(),
         )?;
         data.try_resize_with(total_words, MaybeUninit::uninit)?;
-        let mut occupancy = accounted_vec_for_context(
-            &memory.with_class(MemoryAccountingClass::Metadata),
+        let mut occupancy = accounted_vec_from_reservation(
+            &reservation,
+            total_groups,
             MemoryTag::HashTable,
             MemoryAccountingClass::Metadata,
         )?;
         occupancy.try_resize_with(total_groups, || 0)?;
-        let mut direct_slots = accounted_vec_for_context(
-            &memory,
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        )?;
-        if direct_update_scratch.is_some() {
-            direct_slots.try_reserve(paro_common::vector::VECTOR_SIZE)?;
-        }
+        debug_assert_eq!(reservation.available_bytes(), 0);
         Ok(Self {
             group_domains,
             group_minima,
@@ -375,7 +418,6 @@ impl PerfectAggregateHashTable {
             aggregate_inputs,
             direct_update_program,
             direct_update_scratch,
-            direct_slots,
             occupancy,
             data,
             row_width,
@@ -412,8 +454,7 @@ impl PerfectAggregateHashTable {
                 SelectionVector::try_with_capacity(groups.size(), groups.allocator().clone())?;
         }
         new_groups.set_len(groups.size());
-        let new_group_count =
-            self.find_or_create_groups_inner(groups, Some(address_data), Some(new_groups), false)?;
+        let new_group_count = self.find_or_create_groups_inner(groups, address_data, new_groups)?;
         new_groups.set_len(new_group_count);
         Ok(new_group_count)
     }
@@ -441,7 +482,14 @@ impl PerfectAggregateHashTable {
             return Ok(false);
         };
 
-        self.find_or_create_groups_inner(groups, None, None, true)?;
+        let decoded_groups = decode_group_batch(groups, self.group_domains.len())?;
+        let slot_encoding = prepare_slot_encoding(
+            &self.group_domains,
+            &self.group_minima,
+            &self.slot_layout,
+            &decoded_groups,
+            groups.size(),
+        )?;
         let state_base = self.data.as_mut_ptr().cast::<u8>();
         let program = self
             .direct_update_program
@@ -451,19 +499,57 @@ impl PerfectAggregateHashTable {
             .direct_update_scratch
             .as_mut()
             .expect("direct scratch was validated");
-        let slots = ValidatedDirectGroupSlots::try_new(
-            &self.direct_slots,
-            payload.size(),
-            self.slot_layout.slot_count,
-        )?;
-        let executed = unsafe {
-            program.execute_reduced_slots_prepared(
-                &prepared_input,
-                &slots,
-                scratch,
-                state_base,
-                self.row_width,
-            )?
+        let occupancy = &mut self.occupancy;
+        let state_layout = &self.state_layout;
+        let aggregate_objects = &self.aggregate_objects;
+        let group_count = &mut self.count;
+        macro_rules! execute_source {
+            ($slots:expr) => {{
+                let mut slots = $slots;
+                unsafe {
+                    program.execute_reduced_slot_source_prepared(
+                        &prepared_input,
+                        &mut slots,
+                        scratch,
+                        state_base,
+                        self.row_width,
+                        |slot, state_ptr| {
+                            if occupancy[slot] == 0 {
+                                // SAFETY: the slot source proves domain
+                                // membership and this callback runs before
+                                // reduced state is consumed.
+                                initialize_state_at_address(
+                                    state_layout,
+                                    aggregate_objects,
+                                    state_ptr,
+                                );
+                                occupancy[slot] = 1;
+                                *group_count += 1;
+                            }
+                        },
+                    )?
+                }
+            }};
+        }
+        let executed = match slot_encoding {
+            PreparedSlotEncoding::DictionaryPair { first, second } => {
+                execute_source!(PreparedDictionaryPairSlots {
+                    slot_layout: &self.slot_layout,
+                    first,
+                    second,
+                    rows: groups.size(),
+                })
+            }
+            PreparedSlotEncoding::Generic(prepared_keys) => {
+                execute_source!(PreparedGenericGroupSlots {
+                    group_domains: &self.group_domains,
+                    group_minima: &self.group_minima,
+                    slot_layout: &self.slot_layout,
+                    decoded_groups: &decoded_groups,
+                    prepared_keys,
+                    rows: groups.size(),
+                })
+            }
         };
         if !executed {
             return Err(paro_error::internal(
@@ -476,62 +562,37 @@ impl PerfectAggregateHashTable {
     fn find_or_create_groups_inner(
         &mut self,
         groups: &Chunk,
-        address_data: Option<*mut *mut u8>,
-        mut new_groups: Option<&mut SelectionVector>,
-        collect_direct_slots: bool,
+        address_data: *mut *mut u8,
+        new_groups: &mut SelectionVector,
     ) -> Result<usize> {
         if groups.size() == 0 {
-            if collect_direct_slots {
-                self.direct_slots.clear();
-            }
             return Ok(0);
         }
-        let decoded_groups = (0..self.group_domains.len())
-            .map(|group_idx| {
-                groups
-                    .column(group_idx)
-                    .ok_or_else(|| {
-                        paro_error::internal(format!(
-                            "Missing group key column for perfect hash table: group_idx={group_idx}"
-                        ))
-                    })
-                    .and_then(|column| column.try_decode_ref(groups.size()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        if collect_direct_slots {
-            self.direct_slots.clear();
-        }
-        let prepared_keys = decoded_groups
-            .iter()
-            .enumerate()
-            .map(|(group_idx, group)| {
-                PreparedDictionaryKey::try_new(
-                    &self.group_domains[group_idx],
-                    self.group_minima[group_idx],
-                    self.slot_layout.cardinalities[group_idx],
-                    group_idx,
-                    group,
-                    groups.size(),
-                )
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let decoded_groups = decode_group_batch(groups, self.group_domains.len())?;
+        let mut slot_encoding = prepare_slot_encoding(
+            &self.group_domains,
+            &self.group_minima,
+            &self.slot_layout,
+            &decoded_groups,
+            groups.size(),
+        )?;
         let mut new_group_count = 0usize;
         for row_idx in 0..groups.size() {
-            let slot = self.compute_slot_from_prepared(&decoded_groups, &prepared_keys, row_idx)?;
-            if collect_direct_slots {
-                self.direct_slots.try_push(slot)?;
-            }
+            let slot = compute_slot_from_prepared(
+                &self.group_domains,
+                &self.group_minima,
+                &self.slot_layout,
+                &decoded_groups,
+                &mut slot_encoding,
+                row_idx,
+            )?;
             let state_ptr = self.state_ptr(slot);
-            if let Some(address_data) = address_data {
-                unsafe { *address_data.add(row_idx) = state_ptr };
-            }
+            unsafe { *address_data.add(row_idx) = state_ptr };
             if self.occupancy[slot] == 0 {
                 self.initialize_state(state_ptr);
                 self.occupancy[slot] = 1;
                 self.count += 1;
-                if let Some(new_groups) = new_groups.as_deref_mut() {
-                    new_groups.try_set(new_group_count, row_idx)?;
-                }
+                new_groups.try_set(new_group_count, row_idx)?;
                 new_group_count += 1;
             }
         }
@@ -1077,54 +1138,6 @@ impl PerfectAggregateHashTable {
         )
     }
 
-    fn compute_slot_from_prepared(
-        &self,
-        decoded_groups: &[DecodedVectorRef<'_>],
-        prepared_keys: &[Option<PreparedDictionaryKey<'_>>],
-        row_idx: usize,
-    ) -> Result<usize> {
-        if prepared_keys.len() != self.group_domains.len() {
-            return Err(paro_error::internal(
-                "perfect aggregate prepared key count mismatch",
-            ));
-        }
-        let mut slot = 0usize;
-        for group_idx in 0..self.group_domains.len() {
-            let encoded = match &prepared_keys[group_idx] {
-                Some(prepared) => prepared.encoded(row_idx)?,
-                None => self.encoded_group_value(&decoded_groups[group_idx], row_idx, group_idx)?,
-            };
-            slot = self.slot_layout.add_component(slot, group_idx, encoded)?;
-        }
-        if slot >= self.total_groups() {
-            return Err(paro_error::internal(format!(
-                "Perfect aggregate slot out of bounds: slot={slot}, total_groups={}",
-                self.total_groups()
-            )));
-        }
-        Ok(slot)
-    }
-
-    fn encoded_group_value(
-        &self,
-        decoded_group: &DecodedVectorRef<'_>,
-        row_idx: usize,
-        group_idx: usize,
-    ) -> Result<usize> {
-        let physical_idx = decoded_group.physical_index(row_idx);
-        if !decoded_group.validity().is_valid(physical_idx) {
-            return Ok(0);
-        }
-
-        let value = self.group_domains[group_idx].encode_decoded(decoded_group, physical_idx)?;
-        adjust_group_value(
-            value,
-            self.group_minima[group_idx],
-            self.slot_layout.cardinalities[group_idx],
-            group_idx,
-        )
-    }
-
     fn decode_group_value(&self, slot: usize, group_idx: usize) -> Result<Option<Value>> {
         let encoded = self.slot_layout.decode_component(slot, group_idx);
         if encoded == 0 {
@@ -1230,203 +1243,240 @@ impl PerfectAggregateHashTable {
     }
 }
 
+fn decode_group_batch<'a>(
+    groups: &'a Chunk,
+    group_count: usize,
+) -> Result<SmallVec<[DecodedVectorRef<'a>; 4]>> {
+    (0..group_count)
+        .map(|group_idx| {
+            groups
+                .column(group_idx)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "Missing group key column for perfect hash table: group_idx={group_idx}"
+                    ))
+                })
+                .and_then(|column| column.try_decode_ref(groups.size()))
+        })
+        .collect()
+}
+
+fn prepare_slot_encoding<'a>(
+    group_domains: &'a [PerfectHashKeyDomain],
+    group_minima: &[i128],
+    slot_layout: &PerfectHashSlotLayout,
+    decoded_groups: &'a [DecodedVectorRef<'a>],
+    rows: usize,
+) -> Result<PreparedSlotEncoding<'a>> {
+    let keys = decoded_groups
+        .iter()
+        .enumerate()
+        .map(|(group_idx, group)| {
+            PreparedDictionaryKey::try_new(
+                &group_domains[group_idx],
+                group,
+                rows,
+                group_minima[group_idx],
+                slot_layout.cardinalities[group_idx],
+                group_idx,
+            )
+        })
+        .collect::<Result<SmallVec<[_; 4]>>>()?;
+    Ok(PreparedSlotEncoding::new(keys))
+}
+
+struct PreparedDictionaryPairSlots<'a> {
+    slot_layout: &'a PerfectHashSlotLayout,
+    first: PreparedDictionaryKey<'a>,
+    second: PreparedDictionaryKey<'a>,
+    rows: usize,
+}
+
+// SAFETY: both dictionary codecs validate their values against the component
+// domains before the canonical mixed-radix encoder composes the slot. Cached
+// physical codes make replay deterministic.
+unsafe impl DirectGroupSlotSource for PreparedDictionaryPairSlots<'_> {
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slot_layout.slot_count
+    }
+
+    #[inline(always)]
+    fn slot_at(&mut self, row: usize) -> Result<usize> {
+        let slot = self
+            .slot_layout
+            .encode_pair(self.first.encoded(row)?, self.second.encoded(row)?);
+        debug_assert!(slot < self.slot_layout.slot_count);
+        Ok(slot)
+    }
+}
+
+struct PreparedGenericGroupSlots<'a> {
+    group_domains: &'a [PerfectHashKeyDomain],
+    group_minima: &'a [i128],
+    slot_layout: &'a PerfectHashSlotLayout,
+    decoded_groups: &'a [DecodedVectorRef<'a>],
+    prepared_keys: SmallVec<[Option<PreparedDictionaryKey<'a>>; 4]>,
+    rows: usize,
+}
+
+// SAFETY: `compute_slot_from_prepared` validates every component against its
+// declared domain before composing the canonical mixed-radix slot. Dictionary
+// caches are memoized by physical row, so replay returns the same slot.
+unsafe impl DirectGroupSlotSource for PreparedGenericGroupSlots<'_> {
+    fn len(&self) -> usize {
+        self.rows
+    }
+
+    fn slot_count(&self) -> usize {
+        self.slot_layout.slot_count
+    }
+
+    #[inline(always)]
+    fn slot_at(&mut self, row: usize) -> Result<usize> {
+        compute_generic_slot_from_prepared(
+            self.group_domains,
+            self.group_minima,
+            self.slot_layout,
+            self.decoded_groups,
+            &mut self.prepared_keys,
+            row,
+        )
+    }
+}
+
+#[inline(always)]
+fn compute_slot_from_prepared(
+    group_domains: &[PerfectHashKeyDomain],
+    group_minima: &[i128],
+    slot_layout: &PerfectHashSlotLayout,
+    decoded_groups: &[DecodedVectorRef<'_>],
+    slot_encoding: &mut PreparedSlotEncoding<'_>,
+    row_idx: usize,
+) -> Result<usize> {
+    if let PreparedSlotEncoding::DictionaryPair { first, second } = slot_encoding {
+        let slot = slot_layout.encode_pair(first.encoded(row_idx)?, second.encoded(row_idx)?);
+        debug_assert!(slot < slot_layout.slot_count);
+        return Ok(slot);
+    }
+    let PreparedSlotEncoding::Generic(prepared_keys) = slot_encoding else {
+        unreachable!("dictionary pair returned above")
+    };
+    compute_generic_slot_from_prepared(
+        group_domains,
+        group_minima,
+        slot_layout,
+        decoded_groups,
+        prepared_keys,
+        row_idx,
+    )
+}
+
+#[inline(always)]
+fn compute_generic_slot_from_prepared(
+    group_domains: &[PerfectHashKeyDomain],
+    group_minima: &[i128],
+    slot_layout: &PerfectHashSlotLayout,
+    decoded_groups: &[DecodedVectorRef<'_>],
+    prepared_keys: &mut [Option<PreparedDictionaryKey<'_>>],
+    row_idx: usize,
+) -> Result<usize> {
+    if prepared_keys.len() != group_domains.len() {
+        return Err(paro_error::internal(
+            "perfect aggregate prepared key count mismatch",
+        ));
+    }
+    let slot = match group_domains.len() {
+        1 => encoded_group_component(
+            group_domains,
+            group_minima,
+            slot_layout,
+            decoded_groups,
+            prepared_keys,
+            row_idx,
+            0,
+        )?,
+        2 => {
+            let first = encoded_group_component(
+                group_domains,
+                group_minima,
+                slot_layout,
+                decoded_groups,
+                prepared_keys,
+                row_idx,
+                0,
+            )?;
+            let second = encoded_group_component(
+                group_domains,
+                group_minima,
+                slot_layout,
+                decoded_groups,
+                prepared_keys,
+                row_idx,
+                1,
+            )?;
+            slot_layout.encode_pair(first, second)
+        }
+        _ => {
+            let mut slot = 0usize;
+            for group_idx in 0..group_domains.len() {
+                let encoded = encoded_group_component(
+                    group_domains,
+                    group_minima,
+                    slot_layout,
+                    decoded_groups,
+                    prepared_keys,
+                    row_idx,
+                    group_idx,
+                )?;
+                // Construction validated the mixed-radix product and every
+                // component is range-checked by `adjust_group_value`.
+                slot += encoded * slot_layout.strides[group_idx];
+            }
+            slot
+        }
+    };
+    debug_assert!(slot < slot_layout.slot_count);
+    Ok(slot)
+}
+
+#[inline(always)]
+fn encoded_group_component(
+    group_domains: &[PerfectHashKeyDomain],
+    group_minima: &[i128],
+    slot_layout: &PerfectHashSlotLayout,
+    decoded_groups: &[DecodedVectorRef<'_>],
+    prepared_keys: &mut [Option<PreparedDictionaryKey<'_>>],
+    row_idx: usize,
+    group_idx: usize,
+) -> Result<usize> {
+    match &mut prepared_keys[group_idx] {
+        Some(prepared) => prepared.encoded(row_idx),
+        None => {
+            let decoded_group = &decoded_groups[group_idx];
+            let physical_idx = decoded_group.physical_index(row_idx);
+            if !decoded_group.validity().is_valid(physical_idx) {
+                return Ok(0);
+            }
+            let value = group_domains[group_idx].encode_decoded(decoded_group, physical_idx)?;
+            adjust_group_value(
+                value,
+                group_minima[group_idx],
+                slot_layout.cardinalities[group_idx],
+                group_idx,
+            )
+        }
+    }
+}
+
 impl Drop for PerfectAggregateHashTable {
     fn drop(&mut self) {
         let _ = self.destroy();
     }
 }
 
-fn compact_state_addresses(
-    addresses: &mut Vector,
-    selection: &SelectionVector,
-    count: usize,
-) -> Result<()> {
-    if count > selection.len() || selection.len() > addresses.len() {
-        return Err(paro_error::internal(format!(
-            "invalid aggregate state-filter compaction: selected={count}, selection={}, addresses={}",
-            selection.len(),
-            addresses.len()
-        )));
-    }
-    // Selection indices are monotonically increasing, so forward in-place
-    // compaction never overwrites a source pointer before it is read.
-    unsafe {
-        let data = addresses.flat_data_mut::<*mut u8>();
-        for output_row in 0..count {
-            *data.add(output_row) = *data.add(selection.get(output_row));
-        }
-    }
-    addresses.try_set_count(count)
-}
-
-fn validate_aggregate_inputs(
-    aggregate_objects: &[AggregateObject],
-    aggregate_inputs: &[Vec<usize>],
-) -> Result<()> {
-    if aggregate_objects.len() != aggregate_inputs.len() {
-        return Err(paro_error::internal(format!(
-            "Aggregate input mapping count mismatch: objects={} mappings={}",
-            aggregate_objects.len(),
-            aggregate_inputs.len()
-        )));
-    }
-    for (idx, (object, inputs)) in aggregate_objects
-        .iter()
-        .zip(aggregate_inputs.iter())
-        .enumerate()
-    {
-        if inputs.len() != object.child_count {
-            return Err(paro_error::internal(format!(
-                "Aggregate input mapping arity mismatch at index {idx}: expected={} actual={}",
-                object.child_count,
-                inputs.len()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn direct_payload_input(object: &AggregateObject, inputs: &[usize]) -> Option<usize> {
-    if object.function.direct_update == Some(AggregateDirectUpdate::CountStar) {
-        return None;
-    }
-    inputs.first().copied()
-}
-
-fn validate_addresses_vector(addresses: &Vector, row_count: usize) -> Result<()> {
-    if addresses.capacity() < row_count {
-        return Err(paro_error::internal(format!(
-            "Address vector capacity too small: required={row_count}, capacity={}",
-            addresses.capacity()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_filter(filter: &SelectionVector, payload_rows: usize) -> Result<()> {
-    for idx in 0..filter.len() {
-        let row = filter.get(idx);
-        if row >= payload_rows {
-            return Err(paro_error::internal(format!(
-                "Filter selection index out of bounds: selection[{idx}]={row}, payload_rows={payload_rows}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn pointer_vector_from_slice(
-    ptrs: &[*mut u8],
-    allocator: Arc<dyn paro_common::allocator::Allocator>,
-) -> Result<Vector> {
-    let mut result = Vector::try_new(LogicalType::BigInt, ptrs.len(), allocator)?;
-    result.set_count(ptrs.len());
-    unsafe {
-        let result_data = result.flat_data_mut::<*mut u8>();
-        for (idx, ptr) in ptrs.iter().enumerate() {
-            *result_data.add(idx) = *ptr;
-        }
-    }
-    Ok(result)
-}
-
-fn bytes_to_words(bytes: usize) -> Result<usize> {
-    let word = size_of::<u64>();
-    let words = bytes.checked_add(word - 1).ok_or_else(|| {
-        paro_error::internal(format!(
-            "Perfect aggregate row storage byte-size overflow: bytes={bytes}"
-        ))
-    })?;
-    Ok(words / word)
-}
-
-fn accounted_vec_for_context<T>(
-    memory: &MemoryAccountingContext,
-    tag: MemoryTag,
-    class: MemoryAccountingClass,
-) -> Result<AccountedVec<T>> {
-    Ok(AccountedVec::new_with_accounting(
-        memory.grant()?,
-        tag,
-        class,
-    ))
-}
-
 #[cfg(test)]
-mod tests {
-    use std::collections::HashSet;
-    use std::sync::Arc;
-
-    use paro_common::types::LogicalType;
-
-    use super::{PerfectHashKeyDomain, PerfectHashSlotLayout, PreparedDictionaryKey};
-
-    #[test]
-    fn mixed_radix_layout_is_dense_and_round_trips_every_component() {
-        let layout = PerfectHashSlotLayout::try_new(vec![3, 5, 2]).expect("layout");
-        assert_eq!(layout.strides, vec![10, 2, 1]);
-        assert_eq!(layout.slot_count, 30);
-
-        let mut slots = HashSet::new();
-        for first in 0..3 {
-            for second in 0..5 {
-                for third in 0..2 {
-                    let mut slot = 0;
-                    for (group_idx, encoded) in [first, second, third].into_iter().enumerate() {
-                        slot = layout
-                            .add_component(slot, group_idx, encoded)
-                            .expect("component");
-                    }
-                    assert!(slots.insert(slot));
-                    assert_eq!(layout.decode_component(slot, 0), first);
-                    assert_eq!(layout.decode_component(slot, 1), second);
-                    assert_eq!(layout.decode_component(slot, 2), third);
-                }
-            }
-        }
-        assert_eq!(slots.len(), layout.slot_count);
-    }
-
-    #[test]
-    fn mixed_radix_layout_rejects_invalid_domains_and_components() {
-        assert!(PerfectHashSlotLayout::try_new(vec![1]).is_err());
-        let layout = PerfectHashSlotLayout::try_new(vec![3]).expect("layout");
-        assert!(layout.add_component(0, 0, 3).is_err());
-    }
-
-    #[test]
-    fn dictionary_key_codec_ignores_unreferenced_physical_values() {
-        let child = Arc::new(paro_common::test_utils::test_string_vector(&[
-            "A",
-            "not-a-single-byte-key",
-            "B",
-        ]));
-        let dictionary = paro_common::test_utils::test_dictionary(child, vec![0_u32, 2]);
-        let decoded = dictionary.try_decode_ref(2).expect("dictionary decode");
-        let domain = PerfectHashKeyDomain::try_new(LogicalType::Varchar).expect("domain");
-        let prepared = PreparedDictionaryKey::try_new(&domain, 66, 3, 0, &decoded, 2)
-            .expect("prepare key")
-            .expect("small dictionary key");
-
-        assert_eq!(prepared.encoded(0).unwrap(), 1);
-        assert_eq!(prepared.encoded(1).unwrap(), 2);
-    }
-
-    #[test]
-    fn dictionary_key_codec_is_not_limited_by_q1_cardinality() {
-        let values = (b'A'..=b'T')
-            .map(|value| char::from(value).to_string())
-            .collect::<Vec<_>>();
-        let references = values.iter().map(String::as_str).collect::<Vec<_>>();
-        let child = Arc::new(paro_common::test_utils::test_string_vector(&references));
-        let dictionary = paro_common::test_utils::test_dictionary(child, vec![0_u32, 19]);
-        let decoded = dictionary.try_decode_ref(2).expect("dictionary decode");
-        let domain = PerfectHashKeyDomain::try_new(LogicalType::Varchar).expect("domain");
-        let prepared = PreparedDictionaryKey::try_new(&domain, 66, 21, 0, &decoded, 2)
-            .expect("prepare key")
-            .expect("dictionary key");
-
-        assert_eq!(prepared.encoded(0).unwrap(), 1);
-        assert_eq!(prepared.encoded(1).unwrap(), 20);
-    }
-}
+mod tests;

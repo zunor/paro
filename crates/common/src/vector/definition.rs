@@ -53,6 +53,10 @@ pub struct Vector {
     /// Number of logical elements
     pub(super) count: usize,
     /// For DICTIONARY: logical-to-physical row mapping
+    ///
+    /// Dictionary construction guarantees every logical index is inside the
+    /// canonical base child's cardinality. Producers that already validated
+    /// indices may transfer that proof through the explicit unsafe constructor.
     /// For SEQUENCE: unused
     pub(super) selection: VectorSelection,
     /// Multi-purpose shared child vector:
@@ -623,8 +627,14 @@ impl Vector {
     /// Used when manually populating the vector.
     #[inline]
     pub fn try_set_len(&mut self, len: usize) -> Result<()> {
-        if self.vector_type == VectorType::Flat && self.buffer.element_size() > 0 {
-            debug_assert!(len <= self.buffer.capacity(), "Length exceeds capacity");
+        if self.vector_type == VectorType::Flat
+            && self.buffer.element_size() > 0
+            && len > self.buffer.capacity()
+        {
+            return Err(paro_error::out_of_range(format!(
+                "vector length exceeds capacity: length={len}, capacity={}",
+                self.buffer.capacity()
+            )));
         }
         // Also need to resize validity mask if needed
         if len > self.validity.len() {

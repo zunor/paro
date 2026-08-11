@@ -4,6 +4,7 @@
 use super::*;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 use crate::operators::aggregate::build_helpers::aggregate_objects;
+use crate::operators::aggregate::perfect_aggregate_hashtable::compile_direct_update_program;
 use crate::operators::aggregate::tuple_layout::TupleLayout;
 use crate::physical::specs::GroupKeyEncoding;
 use paro_planner::operator::DistinctType;
@@ -421,13 +422,23 @@ fn perfect_hash_max_local_tables(
         .max(1)
         .checked_add(1)
         .and_then(|bytes_per_slot| bytes_per_slot.checked_mul(slots))?;
-    let scratch_bytes =
-        paro_function::aggregate::DirectGroupedAggregateProgram::conservative_scratch_bytes(
-            objects.len(),
-            slots,
-        )
-        .unwrap_or(0)
-        .checked_add(paro_common::vector::VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>())?)?;
+    let direct_program = compile_direct_update_program(
+        &objects,
+        &spec
+            .aggregate_inputs
+            .iter()
+            .map(|inputs| inputs.to_vec())
+            .collect::<Vec<_>>(),
+        &layout,
+    );
+    let aggregate_scratch_bytes = direct_program.scratch_bytes(slots)?;
+    let scratch_bytes = if aggregate_scratch_bytes == 0 {
+        0
+    } else {
+        aggregate_scratch_bytes.checked_add(
+            paro_common::vector::VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>())?,
+        )?
+    };
     let bytes_per_table = storage_bytes.checked_add(scratch_bytes)?;
     let table_budget = max_memory / PERFECT_HASH_MEMORY_BUDGET_DIVISOR;
     let admitted_tables = table_budget / bytes_per_table;

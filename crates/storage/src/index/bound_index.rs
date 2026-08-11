@@ -167,6 +167,13 @@ pub trait BoundIndex: Index {
         IndexPredicateEvaluation::candidates_only(self.evaluate_predicate(predicate))
     }
 
+    /// Whether this index can establish guaranteed-true rows in addition to
+    /// candidate pruning. Evaluators use this capability to avoid probing
+    /// candidate-only indexes after a higher-priority candidate result wins.
+    fn provides_predicate_proof(&self) -> bool {
+        false
+    }
+
     // =========================================================================
     // Data Manipulation
     // =========================================================================

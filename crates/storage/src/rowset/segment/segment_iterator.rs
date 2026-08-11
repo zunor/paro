@@ -8,7 +8,6 @@ use crate::buffer::{BufferPool, Prefetcher};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::column::{ColumnBatch, ColumnIterator, OrderedRowIds};
-use crate::rowset::scan_cost::ScanAccessCostModel;
 use crate::tablet::ColumnId;
 use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
@@ -71,6 +70,8 @@ pub struct SegmentIterator {
     predicate_guaranteed: PredicateResult,
     predicate_evaluator: Option<PredicateEvaluator>,
     late_materialization: Option<LateMaterializationState>,
+    sparse_batch_streak: u8,
+    dense_batch_streak: u8,
     eager_predicate_matches: Vec<usize>,
     selection_tracker: ColumnDataBytesTracker,
     rowid_tracker: ColumnDataBytesTracker,
@@ -453,6 +454,8 @@ impl SegmentIterator {
             predicate_guaranteed: PredicateResult::NoneMatch,
             predicate_evaluator: None,
             late_materialization: None,
+            sparse_batch_streak: 0,
+            dense_batch_streak: 0,
             eager_predicate_matches: Vec::new(),
             selection_tracker: ColumnDataBytesTracker::new(buffer_pool.clone()),
             rowid_tracker: ColumnDataBytesTracker::new(buffer_pool),
@@ -884,7 +887,30 @@ impl SegmentIterator {
                 rows_read = Some(count);
                 columns.push((*column_id, batch));
             }
-            let rows_read = rows_read.unwrap_or(0);
+            let mut predicate_batches_read = None;
+            let rows_read = match rows_read {
+                Some(rows_read) => rows_read,
+                None if predicate_guaranteed => to_read,
+                None => {
+                    let (rows_read, batches) = self
+                        .predicate_evaluator
+                        .as_mut()
+                        .expect("eager predicate mode requires an evaluator")
+                        .read_next_batch(to_read)?;
+                    predicate_batches_read = Some(batches);
+                    rows_read
+                }
+            };
+            if predicate_guaranteed {
+                // Index proof replaces row-level evaluation, but the
+                // independent predicate readers still have to cross the same
+                // ordinal span. Seeking preserves alignment without decoding
+                // values whose truth is already proven.
+                self.predicate_evaluator
+                    .as_mut()
+                    .expect("eager predicate mode requires an evaluator")
+                    .seek_to_ordinal(start_ordinal + rows_read as u64)?;
+            }
             if rows_read == 0 {
                 self.current_ordinal = start_ordinal + to_read as u64;
                 continue;
@@ -895,24 +921,44 @@ impl SegmentIterator {
                 self.eager_predicate_matches.clear();
                 self.eager_predicate_matches.extend(0..rows_read);
             } else {
-                let predicate_batches = self
+                let evaluator = self
                     .predicate_evaluator
                     .as_ref()
-                    .expect("eager predicate mode requires an evaluator")
-                    .prepare_projected_batches(&columns, rows_read)?
-                    .ok_or_else(|| {
-                        paro_error::internal(
-                            "eager predicate mode is missing a projected predicate column",
-                        )
-                    })?;
-                self.predicate_evaluator
-                    .as_ref()
-                    .expect("eager predicate mode requires an evaluator")
-                    .evaluate_batch(
+                    .expect("eager predicate mode requires an evaluator");
+                if let Some(predicate_batches) = predicate_batches_read.as_ref() {
+                    evaluator.evaluate_batch(
+                        predicate_batches,
+                        rows_read,
+                        &mut self.eager_predicate_matches,
+                    )?;
+                } else if let Some(predicate_batches) =
+                    evaluator.prepare_projected_batches(&columns, rows_read)?
+                {
+                    evaluator.evaluate_batch(
                         &predicate_batches,
                         rows_read,
                         &mut self.eager_predicate_matches,
                     )?;
+                } else {
+                    let (predicate_rows, predicate_batches) = self
+                        .predicate_evaluator
+                        .as_mut()
+                        .expect("eager predicate mode requires an evaluator")
+                        .read_next_batch(rows_read)?;
+                    if predicate_rows != rows_read {
+                        return Err(paro_error::data_corrupted(
+                            "Eager predicate reader row count mismatch",
+                        ));
+                    }
+                    self.predicate_evaluator
+                        .as_ref()
+                        .expect("eager predicate mode requires an evaluator")
+                        .evaluate_batch(
+                            &predicate_batches,
+                            rows_read,
+                            &mut self.eager_predicate_matches,
+                        )?;
+                }
             }
 
             let selection_bitmap = match &self.evaluated_selection {
@@ -934,12 +980,21 @@ impl SegmentIterator {
             }
 
             let all_match = self.eager_predicate_matches.len() == rows_read;
-            let adapt_to_sparse = !materialize_sequential_rowids
-                && !ScanAccessCostModel::default().sequential_materialization_is_cheaper(
-                    self.eager_predicate_matches.len(),
-                    rows_read,
-                );
-            if adapt_to_sparse {
+            let sparse_batch = !materialize_sequential_rowids
+                && !self
+                    .options
+                    .scan_access_cost
+                    .sequential_materialization_is_cheaper(
+                        self.eager_predicate_matches.len(),
+                        rows_read,
+                    );
+            if sparse_batch {
+                self.sparse_batch_streak = self.sparse_batch_streak.saturating_add(1);
+                self.dense_batch_streak = 0;
+            } else {
+                self.sparse_batch_streak = 0;
+            }
+            if self.sparse_batch_streak >= 2 {
                 let evaluator = self
                     .predicate_evaluator
                     .as_ref()
@@ -948,28 +1003,14 @@ impl SegmentIterator {
                     &self.column_iterators,
                     evaluator,
                 ));
-                let rowids = self
-                    .eager_predicate_matches
-                    .iter()
-                    .map(|&row| (start_ordinal + row as u64) as u32)
-                    .collect::<Vec<_>>();
-                let ordered_rowids = OrderedRowIds::try_new(&rowids)?;
-                let mut compact_columns = Vec::with_capacity(self.column_iterators.len());
-                for (column_id, iterator) in &mut self.column_iterators {
-                    compact_columns.push((
-                        *column_id,
-                        iterator.read_by_ordered_rowids(&ordered_rowids)?,
-                    ));
-                }
+                // Eager evaluation may have reused projected predicate columns,
+                // leaving the independent predicate readers at the previous
+                // ordinal. Synchronize every reader before the next batch is
+                // dispatched through the late path; seeking to the output
+                // iterators' current ordinal does not decode the current batch
+                // again.
                 self.seek_columns_to_ordinal(self.current_ordinal)?;
-                self.rowid_tracker.reset();
-                return Ok(SegmentBatch {
-                    rowids: Vec::new(),
-                    rows: rowids.len(),
-                    physical_rows: rowids.len(),
-                    selection: None,
-                    columns: compact_columns,
-                });
+                self.sparse_batch_streak = 0;
             }
             let selection = (!all_match).then(|| {
                 self.eager_predicate_matches
@@ -1070,33 +1111,50 @@ impl SegmentIterator {
                 predicate_proof_span(&self.predicate_guaranteed, start_ordinal, max_rowid);
             let remaining = (proof_end - start_ordinal) as usize;
             let to_read = batch_size.min(remaining);
-            let (rows_read, predicate_batches) = self
-                .predicate_evaluator
-                .as_mut()
-                .expect("late materialization requires predicate evaluator")
-                .read_next_batch(to_read)?;
+            let (rows_read, predicate_batches) = if predicate_guaranteed {
+                self.predicate_evaluator
+                    .as_mut()
+                    .expect("late materialization requires predicate evaluator")
+                    .seek_to_ordinal(start_ordinal + to_read as u64)?;
+                (to_read, Vec::new())
+            } else {
+                self.predicate_evaluator
+                    .as_mut()
+                    .expect("late materialization requires predicate evaluator")
+                    .read_next_batch(to_read)?
+            };
             if rows_read == 0 {
                 self.current_ordinal = max_rowid;
                 continue;
             }
 
-            let state = self
-                .late_materialization
-                .as_mut()
-                .expect("late materialization requires selection state");
-            if predicate_guaranteed {
-                state.predicate_matches.clear();
-                state.predicate_matches.extend(0..rows_read);
-            } else {
-                self.predicate_evaluator
-                    .as_ref()
-                    .expect("late materialization requires predicate evaluator")
-                    .evaluate_batch(&predicate_batches, rows_read, &mut state.predicate_matches)?;
+            {
+                let state = self
+                    .late_materialization
+                    .as_mut()
+                    .expect("late materialization requires selection state");
+                if predicate_guaranteed {
+                    state.predicate_matches.clear();
+                    state.predicate_matches.extend(0..rows_read);
+                } else {
+                    self.predicate_evaluator
+                        .as_ref()
+                        .expect("late materialization requires predicate evaluator")
+                        .evaluate_batch(
+                            &predicate_batches,
+                            rows_read,
+                            &mut state.predicate_matches,
+                        )?;
+                }
             }
             let selection_bitmap = match &self.evaluated_selection {
                 PredicateResult::Bitmap(bitmap) => Some(bitmap),
                 _ => None,
             };
+            let state = self
+                .late_materialization
+                .as_mut()
+                .expect("late materialization requires selection state");
             state.predicate_matches.retain(|&row_idx| {
                 let ordinal = self.current_ordinal + row_idx as u64;
                 !(selection_bitmap.is_some_and(|bitmap| !bitmap.contains(ordinal as u32))
@@ -1107,14 +1165,27 @@ impl SegmentIterator {
             });
             let dense_matches = (!materialize_sequential_rowids
                 && state.rowids.is_empty()
-                && dense_materialization_is_cheaper(state.predicate_matches.len(), rows_read))
+                && self
+                    .options
+                    .scan_access_cost
+                    .sequential_materialization_is_cheaper(
+                        state.predicate_matches.len(),
+                        rows_read,
+                    ))
             .then(|| std::mem::take(&mut state.predicate_matches));
             if let Some(predicate_matches) = dense_matches {
+                self.dense_batch_streak = self.dense_batch_streak.saturating_add(1);
+                self.sparse_batch_streak = 0;
                 let dense_batch =
                     self.materialize_dense_selection(start_ordinal, rows_read, &predicate_matches)?;
                 self.current_ordinal += rows_read as u64;
+                if self.dense_batch_streak >= 2 {
+                    self.late_materialization = None;
+                    self.dense_batch_streak = 0;
+                }
                 return Ok(dense_batch);
             }
+            self.dense_batch_streak = 0;
             for reused in &mut state.reused_predicate_columns {
                 let batch = predicate_batches
                     .get(reused.predicate_idx)
@@ -1233,15 +1304,6 @@ impl SegmentIterator {
     pub fn num_columns(&self) -> usize {
         self.column_iterators.len()
     }
-}
-
-/// Ordered row-id gathering performs lookup and scatter work for every value.
-/// Sequential decoding wins once at least half of the physical batch survives;
-/// the threshold is the break-even point for the scan cost model's 2x gather
-/// access penalty.
-fn dense_materialization_is_cheaper(selected_rows: usize, physical_rows: usize) -> bool {
-    ScanAccessCostModel::default()
-        .sequential_materialization_is_cheaper(selected_rows, physical_rows)
 }
 
 impl std::fmt::Debug for SegmentIterator {

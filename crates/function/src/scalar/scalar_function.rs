@@ -513,7 +513,7 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Hash)]
     struct TestBindData {
         value: i32,
     }
@@ -528,6 +528,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .is_some_and(|other| other == self)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            crate::scalar::function_data_fingerprint(self)
         }
 
         fn as_any(&self) -> &dyn Any {

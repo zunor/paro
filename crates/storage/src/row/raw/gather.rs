@@ -34,6 +34,12 @@ pub fn gather_chunk(
     chunk: &mut Chunk,
     count: usize,
 ) -> Result<()> {
+    if count > chunk.capacity() {
+        return Err(paro_error::out_of_range(format!(
+            "raw-row gather exceeds output capacity: rows={count}, capacity={}",
+            chunk.capacity()
+        )));
+    }
     let layout = collection.layout();
 
     // Gather each column

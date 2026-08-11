@@ -15,6 +15,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 /// Trait for storing extra data during function binding.
@@ -44,8 +45,44 @@ pub trait FunctionData: Debug + Send + Sync {
     /// Check equality with another FunctionData.
     fn equals(&self, other: &dyn FunctionData) -> bool;
 
+    /// Stable semantic fingerprint used by expression caching and CSE.
+    ///
+    /// Equal bind data must return the same value. Pointer identity is not a
+    /// semantic property: independently bound equivalent expressions need to
+    /// share compiled programs and common subexpressions.
+    fn fingerprint(&self) -> u64;
+
     /// Downcast to concrete type.
     fn as_any(&self) -> &dyn Any;
+}
+
+/// Hash ordinary bind-data values through the same deterministic FNV-1a
+/// stream used by expression fingerprints.
+pub fn function_data_fingerprint<T: Hash>(value: &T) -> u64 {
+    let mut hasher = FunctionDataHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+struct FunctionDataHasher(u64);
+
+impl FunctionDataHasher {
+    fn new() -> Self {
+        Self(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FunctionDataHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.0 ^= u64::from(*byte);
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
 }
 
 impl Clone for Box<dyn FunctionData> {

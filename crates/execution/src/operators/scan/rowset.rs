@@ -17,7 +17,7 @@ use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptio
 use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
-use crate::physical::specs::RowsetScanSpec;
+use crate::physical::specs::{RowsetColumnProjection, RowsetScanSpec};
 use crate::pipeline::graph::RowsetSourceSpec;
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
@@ -43,11 +43,12 @@ pub struct RowsetSourceExec {
 pub struct RowsetSourceDesc {
     pub table_index: usize,
     pub table: Arc<paro_catalog::entry::TableCatalogEntry>,
-    pub column_ids: Box<[usize]>,
+    pub column_projection: RowsetColumnProjection,
     pub emit_row_id: bool,
     pub returned_types: Box<[paro_common::types::LogicalType]>,
     pub predicate: Option<PredicateTree>,
     pub late_materialize: bool,
+    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     pub scan_order: Option<SegmentOrderOptions>,
     pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterDesc]>,
 }
@@ -64,11 +65,12 @@ impl RowsetSourceDesc {
         Self {
             table_index: spec.table_index,
             table: spec.table.clone(),
-            column_ids: spec.column_ids.clone(),
+            column_projection: spec.column_projection.clone(),
             emit_row_id: spec.emit_row_id,
             returned_types: spec.returned_types.clone(),
             predicate: spec.predicate.clone(),
             late_materialize: spec.late_materialize,
+            scan_access_cost: spec.scan_access_cost,
             scan_order: spec.scan_order.clone(),
             dynamic_runtime_filters: Vec::new().into_boxed_slice(),
         }
@@ -105,7 +107,8 @@ impl RowsetSourceExec {
         let overlay = TxnOverlayReader::for_tablet(&table.tablet(), &ctx.query.transaction)?;
         let segment_options = SegmentOptions::default()
             .with_page_cache(ctx.query.session.page_cache().clone())
-            .with_cache_decoded(true);
+            .with_cache_decoded(true)
+            .with_scan_access_cost(self.desc.scan_access_cost);
         let mut segments = storage_snapshot.segments_with_options(segment_options.clone())?;
         if let Some(overlay) = &overlay {
             let visible_rowsets = segments
@@ -123,10 +126,11 @@ impl RowsetSourceExec {
             reorder_segments(&mut segments, order);
         }
         let overlay_delete_vectors = overlay.as_ref().and_then(TxnOverlayReader::delete_vectors);
-        let column_projection = if self.desc.column_ids.is_empty() && !self.desc.emit_row_id {
-            ColumnProjection::new((0..table.types().len()).collect())
-        } else {
-            ColumnProjection::new(self.desc.column_ids.to_vec())
+        let column_projection = match &self.desc.column_projection {
+            RowsetColumnProjection::All => {
+                ColumnProjection::new((0..table.types().len()).collect())
+            }
+            RowsetColumnProjection::Columns(columns) => ColumnProjection::new(columns.to_vec()),
         };
         let predicate = self.effective_predicate(ctx)?;
         let predicate_columns = predicate
@@ -291,7 +295,7 @@ mod tests {
     #[test]
     fn morsels_expose_workers_without_fragmenting_large_scans() {
         assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
-        assert_eq!(rowset_morsel_rows(10_000, 4), 2_500);
+        assert_eq!(rowset_morsel_rows(10_000, 4), MIN_ROWSET_MORSEL_ROWS);
         assert_eq!(rowset_morsel_rows(200_000, 4), 50_000);
         assert_eq!(rowset_morsel_rows(800_000, 4), 200_000);
         assert_eq!(rowset_morsel_rows(6_000_000, 4), MAX_ROWSET_MORSEL_ROWS);

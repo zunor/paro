@@ -45,9 +45,9 @@ use super::specs::{
     FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping,
     GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
     NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec,
-    RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec,
-    TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec,
-    VectorSearchSpec, WindowSpec,
+    RowsetColumnProjection, RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec,
+    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec,
+    UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;
@@ -74,6 +74,7 @@ pub struct PlanBuildContext {
     /// planner has no budget information and must use conservative defaults.
     pub max_memory: usize,
     pub max_threads: usize,
+    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 }
 
 impl Default for PlanBuildContext {
@@ -83,6 +84,7 @@ impl Default for PlanBuildContext {
             rowset_scan_pushdown: true,
             max_memory: 0,
             max_threads: 1,
+            scan_access_cost: Default::default(),
         }
     }
 }

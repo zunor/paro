@@ -5,6 +5,12 @@
 
 use super::*;
 
+mod factor_chain;
+#[cfg(test)]
+mod factor_chain_tests;
+
+pub use factor_chain::{is_decimal_factor_fusion, try_execute_decimal_factor_chain};
+
 trait DirectDecimalReader: Copy {
     /// # Safety
     ///
@@ -69,6 +75,54 @@ trait DirectI64DecimalReader: Copy {
     unsafe fn read_i64(self, row: usize) -> i64;
 }
 
+trait DirectFusionDecimalReader: DirectDecimalReader {
+    /// Return the low i64 word and whether narrowing changed the exact value.
+    ///
+    /// # Safety
+    ///
+    /// `row` must be within the prepared input vector.
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool);
+}
+
+impl DirectFusionDecimalReader for DirectI64Reader {
+    #[inline(always)]
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool) {
+        (unsafe { self.read_i64(row) }, false)
+    }
+}
+
+impl DirectFusionDecimalReader for DirectMaterializedI64Reader {
+    #[inline(always)]
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool) {
+        (unsafe { self.read_i64(row) }, false)
+    }
+}
+
+impl DirectFusionDecimalReader for DirectSelectedI64Reader<'_> {
+    #[inline(always)]
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool) {
+        (unsafe { self.read_i64(row) }, false)
+    }
+}
+
+impl DirectFusionDecimalReader for DirectI128Reader {
+    #[inline(always)]
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool) {
+        let value = unsafe { self.read(row) };
+        let narrow = value as i64;
+        (narrow, i128::from(narrow) != value)
+    }
+}
+
+impl DirectFusionDecimalReader for DirectSelectedI128Reader<'_> {
+    #[inline(always)]
+    unsafe fn read_narrow(self, row: usize) -> (i64, bool) {
+        let value = unsafe { self.read(row) };
+        let narrow = value as i64;
+        (narrow, i128::from(narrow) != value)
+    }
+}
+
 impl DirectI64DecimalReader for DirectI64Reader {
     #[inline(always)]
     unsafe fn read_i64(self, row: usize) -> i64 {
@@ -123,7 +177,7 @@ impl DirectI64DecimalReader for DirectI64ConstantReader {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum I64ScaleTransform {
     Identity,
     Multiply(i64),
@@ -168,7 +222,7 @@ fn round_divide_i64(value: i64, divisor: i64) -> Option<i64> {
     quotient.checked_add(if (value < 0) == (divisor < 0) { 1 } else { -1 })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum I64NativeDecimalOperand {
     Input(I64ScaleTransform),
     Constant(i64),
@@ -193,9 +247,13 @@ impl I64NativeDecimalOperand {
             Self::Constant(value) => Some(value),
         }
     }
+
+    fn bind_constant(self, value: i64) -> Option<Self> {
+        self.apply(value).map(Self::Constant)
+    }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum I64NativeDecimalPlan {
     Add {
         left: I64NativeDecimalOperand,
@@ -234,6 +292,106 @@ impl SimpleI64Operand {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum PreparedFactorInner {
+    Add {
+        left: SimpleI64Operand,
+        right: SimpleI64Operand,
+    },
+    Sub {
+        left: SimpleI64Operand,
+        right: SimpleI64Operand,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PreparedCommonFactor {
+    inner: PreparedFactorInner,
+    outer: I64ScaleTransform,
+    inner_limit: Option<u64>,
+    outer_limit: Option<u64>,
+}
+
+impl PreparedCommonFactor {
+    pub(super) fn try_new(plan: DecimalFactorFusionBindData) -> Option<Self> {
+        let inner = match plan.inner.narrow.0 {
+            I64NativeDecimalPlan::Add { left, right } => PreparedFactorInner::Add {
+                left: SimpleI64Operand::try_from_native(left)?,
+                right: SimpleI64Operand::try_from_native(right)?,
+            },
+            I64NativeDecimalPlan::Sub { left, right } => PreparedFactorInner::Sub {
+                left: SimpleI64Operand::try_from_native(left)?,
+                right: SimpleI64Operand::try_from_native(right)?,
+            },
+            I64NativeDecimalPlan::Mul(_) => return None,
+        };
+        let I64NativeDecimalPlan::Mul(outer) = plan.outer.narrow.0 else {
+            return None;
+        };
+        Some(Self {
+            inner,
+            outer,
+            inner_limit: decimal_i64_limit(plan.inner.precision),
+            outer_limit: decimal_i64_limit(plan.outer.precision),
+        })
+    }
+
+    #[inline(always)]
+    pub(super) fn evaluate(self, outer: i64, inner: i64) -> (i64, bool) {
+        let (inner, inner_overflowed) = match self.inner {
+            PreparedFactorInner::Add { left, right } => {
+                left.value(inner).overflowing_add(right.value(inner))
+            }
+            PreparedFactorInner::Sub { left, right } => {
+                left.value(inner).overflowing_sub(right.value(inner))
+            }
+        };
+        let (multiplied, multiply_overflowed) = outer.overflowing_mul(inner);
+        let (outer, transform_overflowed) = match self.outer {
+            I64ScaleTransform::Identity => (multiplied, false),
+            I64ScaleTransform::Multiply(factor) => multiplied.overflowing_mul(factor),
+            I64ScaleTransform::Divide(divisor) if divisor > 0 => {
+                (round_divide_positive_i64(multiplied, divisor), false)
+            }
+            I64ScaleTransform::Divide(_) => (0, true),
+        };
+        let invalid = inner_overflowed
+            | multiply_overflowed
+            | transform_overflowed
+            | self
+                .inner_limit
+                .is_some_and(|limit| inner.unsigned_abs() >= limit)
+            | self
+                .outer_limit
+                .is_some_and(|limit| outer.unsigned_abs() >= limit);
+        (outer, invalid)
+    }
+}
+
+/// Round an i64 quotient away from zero at a half boundary.
+///
+/// `divisor` is a positive decimal scale factor. Therefore division cannot hit
+/// `i64::MIN / -1`; when rounding is needed the quotient magnitude is strictly
+/// smaller than the dividend, so adding one unit cannot overflow either.
+#[inline(always)]
+fn round_divide_positive_i64(value: i64, divisor: i64) -> i64 {
+    debug_assert!(divisor > 0);
+    let quotient = value / divisor;
+    let remainder = value % divisor;
+    let threshold = (divisor as u64) / 2 + (divisor as u64) % 2;
+    if remainder.unsigned_abs() < threshold {
+        quotient
+    } else if value < 0 {
+        quotient - 1
+    } else {
+        quotient + 1
+    }
+}
+
+fn decimal_i64_limit(precision: u8) -> Option<u64> {
+    (precision <= 18).then(|| 10_u64.pow(u32::from(precision)))
+}
+
 impl I64NativeDecimalPlan {
     fn try_from_native(plan: NativeDecimalPlan) -> Option<Self> {
         match plan {
@@ -250,6 +408,69 @@ impl I64NativeDecimalPlan {
             }
             NativeDecimalPlan::Div { .. } | NativeDecimalPlan::Mod { .. } => None,
         }
+    }
+
+    #[inline(always)]
+    fn evaluate(self, left_value: i64, right_value: i64) -> (i64, bool) {
+        let value = match self {
+            Self::Add { left, right } => left
+                .apply(left_value)
+                .zip(right.apply(right_value))
+                .and_then(|(left, right)| left.checked_add(right)),
+            Self::Sub { left, right } => left
+                .apply(left_value)
+                .zip(right.apply(right_value))
+                .and_then(|(left, right)| left.checked_sub(right)),
+            Self::Mul(transform) => left_value
+                .checked_mul(right_value)
+                .and_then(|value| transform.apply(value)),
+        };
+        value.map_or((0, true), |value| (value, false))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) struct I64FusionPlan(I64NativeDecimalPlan);
+
+impl I64FusionPlan {
+    pub(super) fn try_from_native(plan: NativeDecimalPlan) -> Option<Self> {
+        I64NativeDecimalPlan::try_from_native(plan).map(Self)
+    }
+
+    #[inline(always)]
+    pub(super) fn evaluate(self, left: i64, right: i64) -> (i64, bool) {
+        self.0.evaluate(left, right)
+    }
+
+    pub(super) fn bind_constant(self, side: DecimalOperandSide, value: i64) -> Option<Self> {
+        let plan = match self.0 {
+            I64NativeDecimalPlan::Add { left, right } => I64NativeDecimalPlan::Add {
+                left: if side == DecimalOperandSide::Left {
+                    left.bind_constant(value)?
+                } else {
+                    left
+                },
+                right: if side == DecimalOperandSide::Right {
+                    right.bind_constant(value)?
+                } else {
+                    right
+                },
+            },
+            I64NativeDecimalPlan::Sub { left, right } => I64NativeDecimalPlan::Sub {
+                left: if side == DecimalOperandSide::Left {
+                    left.bind_constant(value)?
+                } else {
+                    left
+                },
+                right: if side == DecimalOperandSide::Right {
+                    right.bind_constant(value)?
+                } else {
+                    right
+                },
+            },
+            I64NativeDecimalPlan::Mul(transform) => I64NativeDecimalPlan::Mul(transform),
+        };
+        Some(Self(plan))
     }
 }
 
@@ -445,6 +666,258 @@ pub(super) fn execute_direct_decimal_rows(
         }
         _ => Ok(false),
     }
+}
+
+pub(super) fn execute_direct_decimal_factor_rows(
+    outer: &DecimalInputView<'_>,
+    inner: &DecimalInputView<'_>,
+    output: DecimalOutput,
+    plan: DecimalFactorFusionBindData,
+    count: usize,
+) -> Result<bool> {
+    macro_rules! execute_pair {
+        ($outer:expr, $inner:expr) => {{
+            match output {
+                DecimalOutput::I64(output) => execute_decimal_factor_pair(
+                    $outer,
+                    $inner,
+                    DirectI64Writer(output),
+                    plan,
+                    count,
+                )?,
+                DecimalOutput::I128(output) => execute_decimal_factor_pair(
+                    $outer,
+                    $inner,
+                    DirectI128Writer(output),
+                    plan,
+                    count,
+                )?,
+            }
+            return Ok(true);
+        }};
+    }
+
+    match (&outer.access, &inner.access) {
+        (DecimalInputAccess::DirectI64(outer), DecimalInputAccess::DirectI64(inner)) => {
+            execute_pair!(DirectI64Reader(*outer), DirectI64Reader(*inner));
+        }
+        (DecimalInputAccess::DirectI64(outer), DecimalInputAccess::SelectedI64(inner)) => {
+            if let Some(inner) = DirectMaterializedI64Reader::try_new(inner) {
+                execute_pair!(DirectI64Reader(*outer), inner);
+            }
+            execute_pair!(DirectI64Reader(*outer), DirectSelectedI64Reader(inner));
+        }
+        (DecimalInputAccess::SelectedI64(outer), DecimalInputAccess::DirectI64(inner)) => {
+            if let Some(outer) = DirectMaterializedI64Reader::try_new(outer) {
+                execute_pair!(outer, DirectI64Reader(*inner));
+            }
+            execute_pair!(DirectSelectedI64Reader(outer), DirectI64Reader(*inner));
+        }
+        (DecimalInputAccess::SelectedI64(outer), DecimalInputAccess::SelectedI64(inner)) => {
+            if let (Some(outer), Some(inner)) = (
+                DirectMaterializedI64Reader::try_new(outer),
+                DirectMaterializedI64Reader::try_new(inner),
+            ) {
+                execute_pair!(outer, inner);
+            }
+            execute_pair!(
+                DirectSelectedI64Reader(outer),
+                DirectSelectedI64Reader(inner)
+            );
+        }
+        (DecimalInputAccess::DirectI128(outer), DecimalInputAccess::DirectI64(inner)) => {
+            execute_pair!(DirectI128Reader(*outer), DirectI64Reader(*inner));
+        }
+        (DecimalInputAccess::DirectI128(outer), DecimalInputAccess::SelectedI64(inner)) => {
+            if let Some(inner) = DirectMaterializedI64Reader::try_new(inner) {
+                execute_pair!(DirectI128Reader(*outer), inner);
+            }
+            execute_pair!(DirectI128Reader(*outer), DirectSelectedI64Reader(inner));
+        }
+        (DecimalInputAccess::SelectedI128(outer), DecimalInputAccess::DirectI64(inner)) => {
+            execute_pair!(DirectSelectedI128Reader(outer), DirectI64Reader(*inner));
+        }
+        (DecimalInputAccess::SelectedI128(outer), DecimalInputAccess::SelectedI64(inner)) => {
+            execute_pair!(
+                DirectSelectedI128Reader(outer),
+                DirectSelectedI64Reader(inner)
+            );
+        }
+        (DecimalInputAccess::DirectI64(outer), DecimalInputAccess::DirectI128(inner)) => {
+            execute_pair!(DirectI64Reader(*outer), DirectI128Reader(*inner));
+        }
+        (DecimalInputAccess::SelectedI64(outer), DecimalInputAccess::DirectI128(inner)) => {
+            execute_pair!(DirectSelectedI64Reader(outer), DirectI128Reader(*inner));
+        }
+        (DecimalInputAccess::DirectI128(outer), DecimalInputAccess::DirectI128(inner)) => {
+            execute_pair!(DirectI128Reader(*outer), DirectI128Reader(*inner));
+        }
+        (DecimalInputAccess::SelectedI128(outer), DecimalInputAccess::DirectI128(inner)) => {
+            execute_pair!(DirectSelectedI128Reader(outer), DirectI128Reader(*inner));
+        }
+        (DecimalInputAccess::DirectI64(outer), DecimalInputAccess::SelectedI128(inner)) => {
+            execute_pair!(DirectI64Reader(*outer), DirectSelectedI128Reader(inner));
+        }
+        (DecimalInputAccess::SelectedI64(outer), DecimalInputAccess::SelectedI128(inner)) => {
+            execute_pair!(
+                DirectSelectedI64Reader(outer),
+                DirectSelectedI128Reader(inner)
+            );
+        }
+        (DecimalInputAccess::DirectI128(outer), DecimalInputAccess::SelectedI128(inner)) => {
+            execute_pair!(DirectI128Reader(*outer), DirectSelectedI128Reader(inner));
+        }
+        (DecimalInputAccess::SelectedI128(outer), DecimalInputAccess::SelectedI128(inner)) => {
+            execute_pair!(
+                DirectSelectedI128Reader(outer),
+                DirectSelectedI128Reader(inner)
+            );
+        }
+        _ => Ok(false),
+    }
+}
+
+fn execute_decimal_factor_pair<O, I, W>(
+    outer: O,
+    inner: I,
+    output: W,
+    plan: DecimalFactorFusionBindData,
+    count: usize,
+) -> Result<()>
+where
+    O: DirectFusionDecimalReader,
+    I: DirectFusionDecimalReader,
+    W: DirectDecimalWriter,
+{
+    let specialized = try_execute_common_factor_pair(outer, inner, output, plan, count);
+    if specialized == Some(true) {
+        return Ok(());
+    }
+    if specialized.is_none() {
+        let mut invalid = false;
+        for row in 0..count {
+            let (outer_value, outer_wide) = unsafe { outer.read_narrow(row) };
+            let (inner_value, inner_wide) = unsafe { inner.read_narrow(row) };
+            let (value, arithmetic_failed) = plan.evaluate_i64(outer_value, inner_value);
+            invalid |= outer_wide | inner_wide | arithmetic_failed;
+            unsafe { output.write(row, i128::from(value)) };
+        }
+        if !invalid {
+            return Ok(());
+        }
+    }
+
+    for row in 0..count {
+        let value = plan.evaluate_exact(unsafe { outer.read(row) }, unsafe { inner.read(row) })?;
+        unsafe { output.write(row, value) };
+    }
+    Ok(())
+}
+
+fn try_execute_common_factor_pair<O, I, W>(
+    outer: O,
+    inner: I,
+    output: W,
+    plan: DecimalFactorFusionBindData,
+    count: usize,
+) -> Option<bool>
+where
+    O: DirectFusionDecimalReader,
+    I: DirectFusionDecimalReader,
+    W: DirectDecimalWriter,
+{
+    let prepared = PreparedCommonFactor::try_new(plan)?;
+    let inner_limit = prepared.inner_limit;
+    let outer_limit = prepared.outer_limit;
+
+    macro_rules! execute_inner {
+        ($left:expr, $right:expr, $combine:expr) => {{
+            let (Some(left), Some(right)) = (
+                SimpleI64Operand::try_from_native($left),
+                SimpleI64Operand::try_from_native($right),
+            ) else {
+                return None;
+            };
+            macro_rules! execute {
+                ($finish_outer:expr) => {
+                    execute_common_factor_loop(
+                        outer,
+                        inner,
+                        output,
+                        count,
+                        inner_limit,
+                        outer_limit,
+                        |value| $combine(left.value(value), right.value(value)),
+                        $finish_outer,
+                    )
+                };
+            }
+            return Some(match prepared.outer {
+                I64ScaleTransform::Identity => {
+                    execute!(|outer: i64, inner: i64| outer.checked_mul(inner))
+                }
+                I64ScaleTransform::Multiply(factor) => execute!(|outer: i64, inner: i64| {
+                    outer
+                        .checked_mul(inner)
+                        .and_then(|value| value.checked_mul(factor))
+                }),
+                I64ScaleTransform::Divide(divisor) => execute!(|outer: i64, inner: i64| {
+                    outer
+                        .checked_mul(inner)
+                        .and_then(|value| round_divide_i64(value, divisor))
+                }),
+            });
+        }};
+    }
+
+    match plan.inner.narrow.0 {
+        I64NativeDecimalPlan::Add { left, right } => {
+            execute_inner!(left, right, i64::checked_add)
+        }
+        I64NativeDecimalPlan::Sub { left, right } => {
+            execute_inner!(left, right, i64::checked_sub)
+        }
+        I64NativeDecimalPlan::Mul(_) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_common_factor_loop<O, I, W, Inner, Outer>(
+    outer: O,
+    inner: I,
+    output: W,
+    count: usize,
+    inner_limit: Option<u64>,
+    outer_limit: Option<u64>,
+    evaluate_inner: Inner,
+    evaluate_outer: Outer,
+) -> bool
+where
+    O: DirectFusionDecimalReader,
+    I: DirectFusionDecimalReader,
+    W: DirectDecimalWriter,
+    Inner: Fn(i64) -> Option<i64>,
+    Outer: Fn(i64, i64) -> Option<i64>,
+{
+    let mut invalid = false;
+    for row in 0..count {
+        let (outer_value, outer_wide) = unsafe { outer.read_narrow(row) };
+        let (inner_value, inner_wide) = unsafe { inner.read_narrow(row) };
+        let Some(inner_value) = evaluate_inner(inner_value) else {
+            invalid = true;
+            continue;
+        };
+        let Some(value) = evaluate_outer(outer_value, inner_value) else {
+            invalid = true;
+            continue;
+        };
+        invalid |= outer_wide
+            | inner_wide
+            | inner_limit.is_some_and(|limit| inner_value.unsigned_abs() >= limit)
+            | outer_limit.is_some_and(|limit| value.unsigned_abs() >= limit);
+        unsafe { output.write(row, i128::from(value)) };
+    }
+    !invalid
 }
 
 #[derive(Clone, Copy)]

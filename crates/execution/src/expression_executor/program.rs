@@ -16,11 +16,17 @@ use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_function::scalar::cast::{BoundCastInfo, CastDispatch};
+use paro_function::scalar::operators::arithmetic::{try_decimal_factor_fusion, DecimalOperandSide};
 use paro_function::scalar::{
     BoundScalarFunction, DictionaryStrategy, FunctionErrorMode, FunctionNullHandling,
     FunctionSideEffects, FunctionStability, ScalarDispatch,
 };
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
+
+mod fusion;
+
+use fusion::compile_decimal_factor_chains;
+pub use fusion::PhysicalDecimalFactorChain;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpressionBackend {
@@ -303,7 +309,7 @@ impl StableExpressionHasher {
         match &function.bind_data {
             Some(data) => {
                 self.tag(1);
-                self.write_usize(Arc::as_ptr(data) as *const () as usize);
+                self.write_u64(data.fingerprint());
             }
             None => self.tag(0),
         }
@@ -516,6 +522,7 @@ fn operator_tag(value: OperatorType) -> u8 {
 pub struct PhysicalExpressionProgram {
     roots: Vec<PhysicalExpression>,
     shared_nodes: Vec<PhysicalExpression>,
+    decimal_factor_chains: Vec<PhysicalDecimalFactorChain>,
     scratch_layout: ExpressionScratchLayout,
     root_to_unique: Vec<usize>,
     root_first_output: Vec<usize>,
@@ -587,13 +594,21 @@ impl PhysicalExpressionProgram {
             }
         }
 
+        let shared_nodes = compiler
+            .shared_nodes
+            .into_iter()
+            .map(|node| node.expect("shared expression candidate was not compiled"))
+            .collect::<Vec<_>>();
+        let decimal_factor_chains = compile_decimal_factor_chains(
+            &roots,
+            &shared_nodes,
+            &root_to_unique,
+            &root_first_output,
+        );
         Self {
             roots,
-            shared_nodes: compiler
-                .shared_nodes
-                .into_iter()
-                .map(|node| node.expect("shared expression candidate was not compiled"))
-                .collect(),
+            shared_nodes,
+            decimal_factor_chains,
             scratch_layout: ExpressionScratchLayout {
                 slots: compiler.scratch_slots.into_boxed_slice(),
             },
@@ -637,6 +652,11 @@ impl PhysicalExpressionProgram {
     #[inline]
     pub fn shared_nodes(&self) -> &[PhysicalExpression] {
         &self.shared_nodes
+    }
+
+    #[inline]
+    pub fn decimal_factor_chains(&self) -> &[PhysicalDecimalFactorChain] {
+        &self.decimal_factor_chains
     }
 
     #[inline]
@@ -856,6 +876,9 @@ impl ProgramCompiler {
     fn compile_expression_inner(&mut self, expr: &Expression) -> CompiledExpr {
         match expr {
             Expression::Function(expr) => {
+                if let Some(fused) = self.try_compile_decimal_factor_fusion(expr) {
+                    return fused;
+                }
                 let children = expr
                     .children
                     .iter()
@@ -993,6 +1016,67 @@ impl ProgramCompiler {
             }
         }
     }
+
+    fn try_compile_decimal_factor_fusion(
+        &mut self,
+        expr: &paro_planner::expression::FunctionExpression,
+    ) -> Option<CompiledExpr> {
+        if expr.children.len() != 2
+            || expr.function.stability != FunctionStability::Consistent
+            || expr.function.side_effects != FunctionSideEffects::NoSideEffects
+        {
+            return None;
+        }
+        for nested_side in [DecimalOperandSide::Left, DecimalOperandSide::Right] {
+            let nested_idx = usize::from(nested_side == DecimalOperandSide::Right);
+            let Expression::Function(nested) = &expr.children[nested_idx] else {
+                continue;
+            };
+            if nested.children.len() != 2
+                || nested.function.stability != FunctionStability::Consistent
+                || nested.function.side_effects != FunctionSideEffects::NoSideEffects
+                || self
+                    .shared_slots_by_fingerprint
+                    .contains_key(&expression_fingerprint(&expr.children[nested_idx]))
+            {
+                continue;
+            }
+            for constant_side in [DecimalOperandSide::Left, DecimalOperandSide::Right] {
+                let constant_idx = usize::from(constant_side == DecimalOperandSide::Right);
+                let Expression::Constant(constant) = &nested.children[constant_idx] else {
+                    continue;
+                };
+                let outer_variable_idx = usize::from(nested_side == DecimalOperandSide::Left);
+                let inner_variable_idx = usize::from(constant_side == DecimalOperandSide::Left);
+                let Some(function) = try_decimal_factor_fusion(
+                    &expr.function,
+                    &nested.function,
+                    &constant.value,
+                    &expr.children[outer_variable_idx].return_type(),
+                    &nested.children[inner_variable_idx].return_type(),
+                    &nested.children[constant_idx].return_type(),
+                    nested_side,
+                    constant_side,
+                ) else {
+                    continue;
+                };
+                let children = [
+                    self.compile_expression(&expr.children[outer_variable_idx]),
+                    self.compile_expression(&nested.children[inner_variable_idx]),
+                ];
+                let cse_safe = children.iter().all(|child| child.cse_safe);
+                return Some(CompiledExpr {
+                    expr: PhysicalExpression::Function(PhysicalFunctionExpression {
+                        function,
+                        children: children.into_iter().map(|child| child.expr).collect(),
+                        return_type: expr.return_type.clone(),
+                    }),
+                    cse_safe,
+                });
+            }
+        }
+        None
+    }
 }
 
 struct SharedExpressionCandidates {
@@ -1002,9 +1086,24 @@ struct SharedExpressionCandidates {
 
 impl SharedExpressionCandidates {
     fn from_expressions<'a>(exprs: impl Iterator<Item = &'a Expression>) -> Self {
+        let exprs = exprs.collect::<Vec<_>>();
+        let mut raw_counts = HashMap::<u64, (usize, LogicalType)>::new();
+        for expr in &exprs {
+            count_cse_candidates(expr, &mut raw_counts);
+        }
+        let raw_candidates = raw_counts
+            .iter()
+            .filter_map(|(fingerprint, (count, _))| (*count >= 2).then_some(*fingerprint))
+            .collect::<HashSet<_>>();
+
+        // Count repeated work in the graph that will actually be evaluated.
+        // Once a candidate subtree has been expanded, later occurrences are a
+        // reference to that result; recursively recounting its descendants
+        // would create redundant nested shared slots and block local kernels.
+        let mut expanded = HashSet::new();
         let mut counts = HashMap::<u64, (usize, LogicalType)>::new();
         for expr in exprs {
-            count_cse_candidates(expr, &mut counts);
+            count_effective_cse_candidates(expr, &raw_candidates, &mut expanded, &mut counts);
         }
 
         let mut slots_by_fingerprint = HashMap::new();
@@ -1027,6 +1126,61 @@ impl SharedExpressionCandidates {
             slots_by_fingerprint,
             slots,
         }
+    }
+}
+
+fn count_effective_cse_candidates(
+    expr: &Expression,
+    raw_candidates: &HashSet<u64>,
+    expanded: &mut HashSet<u64>,
+    counts: &mut HashMap<u64, (usize, LogicalType)>,
+) {
+    let fingerprint = expression_fingerprint(expr);
+    if raw_candidates.contains(&fingerprint) {
+        let entry = counts
+            .entry(fingerprint)
+            .or_insert_with(|| (0, expr.return_type()));
+        entry.0 += 1;
+        if !expanded.insert(fingerprint) {
+            return;
+        }
+    }
+
+    match expr {
+        Expression::Function(expr) => {
+            for child in &expr.children {
+                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
+            }
+        }
+        Expression::Cast(expr) => {
+            count_effective_cse_candidates(&expr.child, raw_candidates, expanded, counts)
+        }
+        Expression::Comparison(expr) => {
+            count_effective_cse_candidates(&expr.left, raw_candidates, expanded, counts);
+            count_effective_cse_candidates(&expr.right, raw_candidates, expanded, counts);
+        }
+        Expression::Conjunction(expr) => {
+            for child in &expr.children {
+                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
+            }
+        }
+        Expression::Case(expr) => {
+            count_effective_cse_candidates(&expr.check, raw_candidates, expanded, counts);
+            count_effective_cse_candidates(&expr.result_if_true, raw_candidates, expanded, counts);
+            count_effective_cse_candidates(&expr.result_if_false, raw_candidates, expanded, counts);
+        }
+        Expression::Operator(expr) => {
+            for child in &expr.children {
+                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
+            }
+        }
+        Expression::Constant(_)
+        | Expression::ColumnRef(_)
+        | Expression::Parameter(_)
+        | Expression::Reference(_)
+        | Expression::Aggregate(_)
+        | Expression::Subquery(_)
+        | Expression::Window(_) => {}
     }
 }
 
@@ -1111,4 +1265,122 @@ fn expression_shareable(expr: &Expression) -> bool {
             | Expression::Case(_)
             | Expression::Operator(_)
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use paro_function::scalar::operators::arithmetic::register_arithmetic_functions;
+    use paro_function::scalar::{ScalarBindInput, ScalarFunctionSet};
+    use paro_planner::expression::{ConstantExpression, FunctionExpression, ReferenceExpression};
+
+    fn bind_decimal(name: &str, arguments: &[LogicalType]) -> BoundScalarFunction {
+        let mut set = ScalarFunctionSet::new(name.to_string());
+        register_arithmetic_functions(&mut set);
+        let (function, target_types) = set.bind(arguments).unwrap();
+        function
+            .bind(&ScalarBindInput::new(
+                target_types,
+                vec![None; arguments.len()],
+            ))
+            .unwrap()
+    }
+
+    fn reference(index: usize, ty: LogicalType) -> Expression {
+        Expression::Reference(ReferenceExpression::new(index, ty))
+    }
+
+    fn integer_one() -> Expression {
+        Expression::Constant(ConstantExpression {
+            value: Value::Integer(1),
+            return_type: LogicalType::Integer,
+        })
+    }
+
+    #[test]
+    fn decimal_factor_fusion_preserves_shared_expression_boundaries() {
+        let price_type = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let factor_type = LogicalType::Decimal {
+            precision: 4,
+            scale: 2,
+        };
+        let discount = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
+        let discount_expr = Expression::Function(FunctionExpression::new(
+            discount.clone(),
+            vec![integer_one(), reference(1, factor_type.clone())],
+            discount.return_type.clone(),
+        ));
+        let discounted_price =
+            bind_decimal("*", &[price_type.clone(), discount.return_type.clone()]);
+        let discounted_price_expr = Expression::Function(FunctionExpression::new(
+            discounted_price.clone(),
+            vec![reference(0, price_type.clone()), discount_expr],
+            discounted_price.return_type.clone(),
+        ));
+
+        // Bind an equivalent producer independently. Semantic bind-data
+        // fingerprints, rather than Arc identity, must still expose the common
+        // subexpression used by the output root and the charge expression.
+        let discount_for_charge = bind_decimal("-", &[LogicalType::Integer, factor_type.clone()]);
+        let discount_for_charge_expr = Expression::Function(FunctionExpression::new(
+            discount_for_charge.clone(),
+            vec![integer_one(), reference(1, factor_type.clone())],
+            discount_for_charge.return_type.clone(),
+        ));
+        let discounted_price_for_charge = bind_decimal(
+            "*",
+            &[price_type.clone(), discount_for_charge.return_type.clone()],
+        );
+        let discounted_price_for_charge_expr = Expression::Function(FunctionExpression::new(
+            discounted_price_for_charge.clone(),
+            vec![reference(0, price_type), discount_for_charge_expr],
+            discounted_price_for_charge.return_type.clone(),
+        ));
+
+        let tax = bind_decimal("+", &[factor_type.clone(), LogicalType::Integer]);
+        let tax_expr = Expression::Function(FunctionExpression::new(
+            tax.clone(),
+            vec![reference(2, factor_type), integer_one()],
+            tax.return_type.clone(),
+        ));
+        let charge = bind_decimal(
+            "*",
+            &[
+                discounted_price.return_type.clone(),
+                tax.return_type.clone(),
+            ],
+        );
+        let charge_expr = Expression::Function(FunctionExpression::new(
+            charge.clone(),
+            vec![discounted_price_for_charge_expr, tax_expr],
+            charge.return_type.clone(),
+        ));
+
+        let program = PhysicalExpressionProgram::compile(
+            &[discounted_price_expr, charge_expr],
+            ExpressionProgramVersion::anonymous(),
+        );
+        assert_eq!(program.shared_expression_count(), 1);
+        let PhysicalExpression::Function(shared) = program.shared_node(0) else {
+            panic!("shared discounted price should compile as a fused function")
+        };
+        assert_eq!(shared.function.name, "decimal_factor_fusion");
+
+        let PhysicalExpression::Function(charge) = program.root(1) else {
+            panic!("charge should compile as a fused function")
+        };
+        assert_eq!(charge.function.name, "decimal_factor_fusion");
+        assert!(matches!(charge.children[0], PhysicalExpression::Shared(_)));
+        assert_eq!(
+            program.decimal_factor_chains(),
+            &[PhysicalDecimalFactorChain {
+                producer_output: 0,
+                consumer_output: 1,
+                shared_slot: 0,
+            }]
+        );
+    }
 }

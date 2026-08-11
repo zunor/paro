@@ -18,7 +18,7 @@
 //! ```ignore
 //! // Writing
 //! let mut writer = ZoneMapIndexWriter::new();
-//! writer.add(min_bytes, max_bytes, has_null);
+//! writer.add(min_bytes, max_bytes, has_null, BoundsPrecision::Exact);
 //! let data = writer.finish();
 //!
 //! // Reading
@@ -32,4 +32,4 @@ mod bound_index;
 mod zonemap_index;
 
 pub use bound_index::ZoneMapIndex;
-pub use zonemap_index::{ZoneMapEntry, ZoneMapIndexReader, ZoneMapIndexWriter};
+pub use zonemap_index::{BoundsPrecision, ZoneMapEntry, ZoneMapIndexReader, ZoneMapIndexWriter};

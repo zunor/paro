@@ -22,14 +22,32 @@ pub struct ZoneMapEntry {
     pub bounds_exact: bool,
 }
 
+/// Provenance of serialized zone-map bounds.
+///
+/// Candidate pruning accepts conservative bounds, while predicate proofs may
+/// only consume exact observed bounds. Requiring this value at every writer
+/// call prevents a future truncating encoder from accidentally opting into
+/// proof semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundsPrecision {
+    Exact,
+    Conservative,
+}
+
+impl BoundsPrecision {
+    fn is_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
+}
+
 impl ZoneMapEntry {
     /// Create a new zone map entry.
-    pub fn new(min: Bytes, max: Bytes, has_null: bool) -> Self {
+    pub fn new(min: Bytes, max: Bytes, has_null: bool, precision: BoundsPrecision) -> Self {
         ZoneMapEntry {
             min,
             max,
             has_null,
-            bounds_exact: true,
+            bounds_exact: precision.is_exact(),
         }
     }
 }
@@ -59,25 +77,17 @@ impl ZoneMapIndexWriter {
     }
 
     /// Add a zone map entry for a page.
-    pub fn add(&mut self, min: Bytes, max: Bytes, has_null: bool) {
-        self.add_with_cmp_and_precision(min, max, has_null, true, |left, right| left.cmp(right));
+    pub fn add(&mut self, min: Bytes, max: Bytes, has_null: bool, precision: BoundsPrecision) {
+        self.add_with_cmp(min, max, has_null, precision, |left, right| left.cmp(right));
     }
 
-    /// Add conservative bounds which are safe for candidate pruning but may
-    /// not be used to prove every row satisfies a predicate.
-    pub fn add_inexact_with_cmp<F>(&mut self, min: Bytes, max: Bytes, has_null: bool, cmp: F)
-    where
-        F: Fn(&[u8], &[u8]) -> std::cmp::Ordering,
-    {
-        self.add_with_cmp_and_precision(min, max, has_null, false, cmp);
-    }
-
-    fn add_with_cmp_and_precision<F>(
+    /// Add a zone-map entry with an explicit bounds provenance and comparator.
+    pub fn add_with_cmp<F>(
         &mut self,
         min: Bytes,
         max: Bytes,
         has_null: bool,
-        bounds_exact: bool,
+        precision: BoundsPrecision,
         cmp: F,
     ) where
         F: Fn(&[u8], &[u8]) -> std::cmp::Ordering,
@@ -101,16 +111,8 @@ impl ZoneMapIndexWriter {
             min,
             max,
             has_null,
-            bounds_exact,
+            bounds_exact: precision.is_exact(),
         });
-    }
-
-    /// Add a zone map entry with custom comparator.
-    pub fn add_with_cmp<F>(&mut self, min: Bytes, max: Bytes, has_null: bool, cmp: F)
-    where
-        F: Fn(&[u8], &[u8]) -> std::cmp::Ordering,
-    {
-        self.add_with_cmp_and_precision(min, max, has_null, true, cmp);
     }
 
     /// Finish and serialize the index.
@@ -382,11 +384,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();
@@ -416,11 +420,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();
@@ -453,6 +459,7 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();

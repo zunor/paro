@@ -139,13 +139,16 @@ impl<'a> StatisticsResolver<'a> {
         }
     }
 
-    fn get(&self, expression: &Expression) -> Option<&'a Arc<ColumnStatistics>> {
-        let binding = match expression {
+    fn binding(&self, expression: &Expression) -> Option<ColumnBinding> {
+        Some(match expression {
             Expression::ColumnRef(column) => column.binding,
             Expression::Reference(reference) => *self.positional_bindings?.get(reference.index)?,
             _ => return None,
-        };
-        self.column_stats.get(&binding)
+        })
+    }
+
+    fn get(&self, expression: &Expression) -> Option<&'a Arc<ColumnStatistics>> {
+        self.column_stats.get(&self.binding(expression)?)
     }
 }
 
@@ -174,18 +177,17 @@ impl CostModel {
             Expression::Comparison(comparison) => SelectivityEstimate::estimated(
                 self.estimate_comparison_selectivity(comparison, resolver),
             ),
-            Expression::Conjunction(conjunction) => {
-                let children = || {
+            Expression::Conjunction(conjunction) => match conjunction.conjunction_type {
+                ConjunctionType::And => {
+                    self.estimate_conjunction(conjunction.children.iter(), resolver)
+                }
+                ConjunctionType::Or => disjunction_estimate(
                     conjunction
                         .children
                         .iter()
-                        .map(|child| self.estimate_selectivity_with_provenance(child, resolver))
-                };
-                match conjunction.conjunction_type {
-                    ConjunctionType::And => conjunction_estimate(children()),
-                    ConjunctionType::Or => disjunction_estimate(children()),
-                }
-            }
+                        .map(|child| self.estimate_selectivity_with_provenance(child, resolver)),
+                ),
+            },
             Expression::Operator(operator) => match operator.operator_type {
                 OperatorType::Like => SelectivityEstimate::estimated(
                     match like_pattern_shape(operator.children.get(1)) {
@@ -303,11 +305,7 @@ impl CostModel {
             return CardinalityEstimate::exact(base_cardinality);
         }
 
-        let combined = conjunction_estimate(
-            expressions
-                .iter()
-                .map(|expr| self.estimate_selectivity_with_provenance(expr, resolver)),
-        );
+        let combined = self.estimate_conjunction(expressions.iter(), resolver);
         let combined_selectivity = combined.fraction;
 
         let expected = ((base_cardinality as f64) * combined_selectivity).round() as u64;
@@ -376,6 +374,62 @@ impl CostModel {
                     .unwrap_or(self.defaults.range)
             }
         }
+    }
+
+    /// Estimate an implicit or explicit AND after coalescing ordered bounds on
+    /// the same integral column. Treating `x >= a` and `x < b` as independent
+    /// events systematically overestimates bounded intervals; their shared
+    /// statistics domain makes the intersection directly measurable.
+    fn estimate_conjunction<'e>(
+        &self,
+        expressions: impl IntoIterator<Item = &'e Expression>,
+        resolver: &StatisticsResolver<'_>,
+    ) -> SelectivityEstimate {
+        let mut flattened = Vec::new();
+        for expression in expressions {
+            flatten_and(expression, &mut flattened);
+        }
+
+        let mut intervals = Vec::<IntegralIntervalEstimate>::new();
+        let mut interval_by_binding = HashMap::<ColumnBinding, usize>::new();
+        let mut interval_for_expression = vec![None; flattened.len()];
+        for (expression_idx, expression) in flattened.iter().copied().enumerate() {
+            let Some(constraint) = integral_range_constraint(expression, resolver) else {
+                continue;
+            };
+            let interval_idx = match interval_by_binding.get(&constraint.binding).copied() {
+                Some(interval_idx) => interval_idx,
+                None => {
+                    let interval_idx = intervals.len();
+                    intervals.push(IntegralIntervalEstimate::new(expression_idx, &constraint));
+                    interval_by_binding.insert(constraint.binding, interval_idx);
+                    interval_idx
+                }
+            };
+            let interval = &mut intervals[interval_idx];
+            if interval.domain != constraint.domain
+                || interval.minimum != constraint.minimum
+                || interval.maximum != constraint.maximum
+            {
+                continue;
+            }
+            interval.intersect(constraint.bound, constraint.constant);
+            interval_for_expression[expression_idx] = Some(interval_idx);
+        }
+
+        conjunction_estimate(flattened.iter().enumerate().filter_map(
+            |(expression_idx, expression)| match interval_for_expression[expression_idx] {
+                Some(interval_idx)
+                    if intervals[interval_idx].first_expression == expression_idx =>
+                {
+                    Some(SelectivityEstimate::estimated(
+                        intervals[interval_idx].selectivity(),
+                    ))
+                }
+                Some(_) => None,
+                None => Some(self.estimate_selectivity_with_provenance(expression, resolver)),
+            },
+        ))
     }
 
     fn estimate_in_selectivity(
@@ -453,6 +507,150 @@ fn reverse_comparison(comparison_type: ComparisonType) -> ComparisonType {
         ComparisonType::GreaterThan => ComparisonType::LessThan,
         ComparisonType::GreaterThanOrEqual => ComparisonType::LessThanOrEqual,
         other => other,
+    }
+}
+
+fn flatten_and<'e>(expression: &'e Expression, output: &mut Vec<&'e Expression>) {
+    if let Expression::Conjunction(conjunction) = expression {
+        if conjunction.conjunction_type == ConjunctionType::And {
+            for child in &conjunction.children {
+                flatten_and(child, output);
+            }
+            return;
+        }
+    }
+    output.push(expression);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct IntegralRangeConstraint {
+    binding: ColumnBinding,
+    domain: IntegralDomain,
+    minimum: u128,
+    maximum: u128,
+    bound: IntegralRangeBound,
+    constant: u128,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegralRangeBound {
+    Upper { inclusive: bool },
+    Lower { inclusive: bool },
+}
+
+fn integral_range_constraint(
+    expression: &Expression,
+    resolver: &StatisticsResolver<'_>,
+) -> Option<IntegralRangeConstraint> {
+    let Expression::Comparison(comparison) = expression else {
+        return None;
+    };
+    if !matches!(
+        comparison.comparison_type,
+        ComparisonType::LessThan
+            | ComparisonType::LessThanOrEqual
+            | ComparisonType::GreaterThan
+            | ComparisonType::GreaterThanOrEqual
+    ) {
+        return None;
+    }
+    let (column, constant, comparison_type) = column_constant_comparison(comparison)?;
+    let binding = resolver.binding(column)?;
+    let stats = resolver.get(column)?;
+    let minimum = ordered_integral_value(&NumericStats::min(stats.statistics())?)?;
+    let maximum = ordered_integral_value(&NumericStats::max(stats.statistics())?)?;
+    let constant = ordered_integral_value(constant)?;
+    if minimum.domain != maximum.domain
+        || minimum.domain != constant.domain
+        || minimum.coordinate > maximum.coordinate
+    {
+        return None;
+    }
+    let bound = match comparison_type {
+        ComparisonType::LessThan => IntegralRangeBound::Upper { inclusive: false },
+        ComparisonType::LessThanOrEqual => IntegralRangeBound::Upper { inclusive: true },
+        ComparisonType::GreaterThan => IntegralRangeBound::Lower { inclusive: false },
+        ComparisonType::GreaterThanOrEqual => IntegralRangeBound::Lower { inclusive: true },
+        _ => return None,
+    };
+    Some(IntegralRangeConstraint {
+        binding,
+        domain: minimum.domain,
+        minimum: minimum.coordinate,
+        maximum: maximum.coordinate,
+        bound,
+        constant: constant.coordinate,
+    })
+}
+
+#[derive(Debug)]
+struct IntegralIntervalEstimate {
+    domain: IntegralDomain,
+    minimum: u128,
+    maximum: u128,
+    lower: u128,
+    upper: u128,
+    empty: bool,
+    first_expression: usize,
+}
+
+impl IntegralIntervalEstimate {
+    fn new(first_expression: usize, constraint: &IntegralRangeConstraint) -> Self {
+        Self {
+            domain: constraint.domain,
+            minimum: constraint.minimum,
+            maximum: constraint.maximum,
+            lower: constraint.minimum,
+            upper: constraint.maximum,
+            empty: false,
+            first_expression,
+        }
+    }
+
+    fn intersect(&mut self, bound: IntegralRangeBound, constant: u128) {
+        if self.empty {
+            return;
+        }
+        match bound {
+            IntegralRangeBound::Upper { inclusive: false } => {
+                if constant <= self.minimum {
+                    self.empty = true;
+                } else {
+                    self.upper = self.upper.min(constant - 1);
+                }
+            }
+            IntegralRangeBound::Upper { inclusive: true } => {
+                if constant < self.minimum {
+                    self.empty = true;
+                } else {
+                    self.upper = self.upper.min(constant);
+                }
+            }
+            IntegralRangeBound::Lower { inclusive: false } => {
+                if constant >= self.maximum {
+                    self.empty = true;
+                } else {
+                    self.lower = self.lower.max(constant + 1);
+                }
+            }
+            IntegralRangeBound::Lower { inclusive: true } => {
+                if constant > self.maximum {
+                    self.empty = true;
+                } else {
+                    self.lower = self.lower.max(constant);
+                }
+            }
+        }
+        self.empty |= self.lower > self.upper;
+    }
+
+    fn selectivity(&self) -> f64 {
+        if self.empty {
+            return 0.0;
+        }
+        let domain = self.maximum.saturating_sub(self.minimum).saturating_add(1) as f64;
+        let matching = self.lower.abs_diff(self.upper).saturating_add(1) as f64;
+        clamp_selectivity(matching.min(domain) / domain)
     }
 }
 
@@ -771,6 +969,44 @@ mod tests {
                 ComparisonType::LessThanOrEqual,
             ),
             Some(1.0)
+        );
+    }
+
+    #[test]
+    fn conjunction_coalesces_bounds_on_the_same_integral_column() {
+        let model = CostModel::default();
+        let binding = ColumnBinding::new(1, 0);
+        let mut stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+        );
+        NumericStats::set_guaranteed_min(stats.statistics_mut(), &Value::Integer(0));
+        NumericStats::set_guaranteed_max(stats.statistics_mut(), &Value::Integer(9));
+        let column_stats = HashMap::from([(binding, Arc::new(stats))]);
+        let comparison = |comparison_type, value| {
+            Expression::Comparison(ComparisonExpression::new(
+                comparison_type,
+                Expression::ColumnRef(ColumnRefExpression::new(binding, LogicalType::Integer)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(value),
+                    LogicalType::Integer,
+                )),
+            ))
+        };
+        let expression =
+            Expression::Conjunction(paro_planner::expression::ConjunctionExpression::new(
+                ConjunctionType::And,
+                vec![
+                    comparison(ComparisonType::GreaterThanOrEqual, 2),
+                    comparison(ComparisonType::LessThan, 5),
+                ],
+            ));
+
+        assert_eq!(model.estimate_selectivity(&expression, &column_stats), 0.3);
+        assert_eq!(
+            model
+                .estimate_filter_cardinality(64, &[expression], &column_stats)
+                .expected,
+            19
         );
     }
 

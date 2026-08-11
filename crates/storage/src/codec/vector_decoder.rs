@@ -237,15 +237,21 @@ fn decode_storage_dictionary_batch(
                 )));
             }
         }
-        return Vector::try_with_dictionary(
-            Arc::new(child),
-            SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?,
-            DictionaryInfo {
-                unique_len,
-                provenance_id,
-                source: DictionarySource::Storage,
-            },
-        );
+        let selection =
+            SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?;
+        // SAFETY: every storage code was checked against `dictionary_len` in
+        // the loop immediately above.
+        return unsafe {
+            Vector::try_with_validated_dictionary(
+                Arc::new(child),
+                selection,
+                DictionaryInfo {
+                    unique_len,
+                    provenance_id,
+                    source: DictionarySource::Storage,
+                },
+            )
+        };
     }
 
     let mut selection = Vec::with_capacity(rows);
@@ -267,15 +273,20 @@ fn decode_storage_dictionary_batch(
         selection.push(code);
     }
 
-    Vector::try_with_dictionary(
-        Arc::new(child),
-        SelectionVector::try_from_indices(selection, allocator)?,
-        DictionaryInfo {
-            unique_len,
-            provenance_id,
-            source: DictionarySource::Storage,
-        },
-    )
+    let selection = SelectionVector::try_from_indices(selection, allocator)?;
+    // SAFETY: non-null codes were checked against `dictionary_len`; null rows
+    // map to the appended null slot at `dictionary_len < unique_len`.
+    unsafe {
+        Vector::try_with_validated_dictionary(
+            Arc::new(child),
+            selection,
+            DictionaryInfo {
+                unique_len,
+                provenance_id,
+                source: DictionarySource::Storage,
+            },
+        )
+    }
 }
 
 pub(crate) fn decode_column_batch(

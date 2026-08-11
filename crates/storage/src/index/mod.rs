@@ -130,4 +130,6 @@ pub use short_key::{
     KEY_MAXIMAL_MARKER, KEY_MINIMAL_MARKER, KEY_NORMAL_MARKER, KEY_NULL_FIRST_MARKER,
     KEY_NULL_LAST_MARKER,
 };
-pub use zonemap::{ZoneMapEntry, ZoneMapIndex, ZoneMapIndexReader, ZoneMapIndexWriter};
+pub use zonemap::{
+    BoundsPrecision, ZoneMapEntry, ZoneMapIndex, ZoneMapIndexReader, ZoneMapIndexWriter,
+};

@@ -6,7 +6,7 @@ use super::{
     VectorBuffer, VectorSelection, VectorType,
 };
 use crate::allocator::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
 use crate::types::{InlineString, LogicalType};
 use std::sync::Arc;
@@ -315,7 +315,11 @@ impl Vector {
         child: Arc<Vector>,
         selection: VectorSelection,
         dictionary_info: DictionaryInfo,
+        selection_is_validated: bool,
     ) -> Result<Self> {
+        if !selection_is_validated {
+            selection.validate_child_bounds(child.len())?;
+        }
         let (base_child, combined_selection) = if child.vector_type == VectorType::Dictionary {
             let base_child = child
                 .child
@@ -367,6 +371,38 @@ impl Vector {
                 provenance_id: None,
                 source: DictionarySource::GenericSelection,
             },
+            false,
+        )
+    }
+
+    /// Create a generic dictionary overlay from a selection whose child
+    /// bounds were validated by its producer.
+    ///
+    /// # Safety
+    ///
+    /// Every selection index must be strictly smaller than `child.len()`.
+    pub unsafe fn try_dictionary_validated<S>(child: Arc<Vector>, selection: S) -> Result<Self>
+    where
+        S: Into<SelectionVector>,
+    {
+        let unique_len = if child.vector_type == VectorType::Dictionary {
+            child
+                .child
+                .as_ref()
+                .expect("Dictionary vector missing child")
+                .len()
+        } else {
+            child.len()
+        };
+        Self::try_dictionary_with_info(
+            child,
+            VectorSelection::Materialized(selection.into()),
+            DictionaryInfo {
+                unique_len,
+                provenance_id: None,
+                source: DictionarySource::GenericSelection,
+            },
+            true,
         )
     }
 
@@ -383,6 +419,29 @@ impl Vector {
             child,
             VectorSelection::Materialized(selection.into()),
             dictionary_info,
+            false,
+        )
+    }
+
+    /// Create a dictionary vector from a selection whose child bounds were
+    /// validated by its producer while decoding or constructing the indices.
+    ///
+    /// # Safety
+    ///
+    /// Every selection index must be strictly smaller than `child.len()`.
+    pub unsafe fn try_with_validated_dictionary<S>(
+        child: Arc<Vector>,
+        selection: S,
+        dictionary_info: DictionaryInfo,
+    ) -> Result<Self>
+    where
+        S: Into<SelectionVector>,
+    {
+        Self::try_dictionary_with_info(
+            child,
+            VectorSelection::Materialized(selection.into()),
+            dictionary_info,
+            true,
         )
     }
 
@@ -408,12 +467,18 @@ impl Vector {
                 provenance_id: None,
                 source: DictionarySource::GenericSelection,
             },
+            false,
         )
     }
 
     /// Create a zero-copy range view over this vector.
     pub fn slice_ref(&self, offset: usize, len: usize) -> Result<Self> {
-        debug_assert!(offset + len <= self.len(), "vector range out of bounds");
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return Err(paro_error::out_of_range(format!(
+                "vector range offset={offset} length={len} exceeds cardinality {}",
+                self.len()
+            )));
+        }
         match self.vector_type {
             VectorType::Constant => {
                 let mut result = self.reference();
@@ -430,6 +495,7 @@ impl Vector {
                     Arc::new(self.reference()),
                     VectorSelection::Range { offset, count: len },
                     dictionary_info,
+                    true,
                 )
             }
         }

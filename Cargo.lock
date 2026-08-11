@@ -1639,6 +1639,7 @@ dependencies = [
  "paro-storage",
  "paro-transaction",
  "serde_json",
+ "smallvec",
  "tokio-util",
  "tracing",
 ]

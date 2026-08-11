@@ -15,8 +15,9 @@ use crate::aggregate::{
 use crate::decimal::{
     pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128, write_decimal,
 };
+use crate::scalar::function_data_fingerprint;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum DecimalAggregateOp {
     Sum,
     Min,
@@ -26,7 +27,7 @@ pub(crate) enum DecimalAggregateOp {
     Last,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DecimalAggregateBindData {
     op: DecimalAggregateOp,
     input_scale: u8,
@@ -43,6 +44,10 @@ impl FunctionData for DecimalAggregateBindData {
 
     fn equals(&self, other: &dyn FunctionData) -> bool {
         other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
     }
 
     fn as_any(&self) -> &dyn Any {

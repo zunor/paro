@@ -18,15 +18,39 @@ pub struct RowsetScanSpec {
     pub returned_types: Box<[LogicalType]>,
     pub relation_name: Option<String>,
     pub relation_alias: Option<String>,
-    pub column_ids: Box<[usize]>,
+    pub column_projection: RowsetColumnProjection,
     pub emit_row_id: bool,
     pub column_types: Box<[LogicalType]>,
     pub table: Arc<TableCatalogEntry>,
     pub predicate: Option<PredicateTree>,
     pub residual_predicates: Box<[Expression]>,
     pub late_materialize: bool,
+    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     pub scan_order: Option<SegmentOrderOptions>,
     pub runtime_filter_expressions: Box<[Expression]>,
+}
+
+/// Physical base-table projection without overloading an empty column list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowsetColumnProjection {
+    All,
+    Columns(Box<[usize]>),
+}
+
+impl RowsetColumnProjection {
+    pub fn column_id(&self, output_index: usize) -> Option<usize> {
+        match self {
+            Self::All => Some(output_index),
+            Self::Columns(columns) => columns.get(output_index).copied(),
+        }
+    }
+
+    pub fn explicit_columns(&self) -> Option<&[usize]> {
+        match self {
+            Self::All => None,
+            Self::Columns(columns) => Some(columns),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

@@ -3,14 +3,15 @@
 
 //! Shared access-cost policy for rowset scan planning and runtime adaptation.
 
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::{LogicalType, PhysicalType};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScanAccessCostModel {
-    pub unknown_selectivity: f64,
-    pub gather_access_penalty: f64,
-    pub default_variable_width: usize,
-    pub default_nested_width: usize,
+    unknown_selectivity: f64,
+    gather_access_penalty: f64,
+    default_variable_width: usize,
+    default_nested_width: usize,
 }
 
 impl Default for ScanAccessCostModel {
@@ -25,6 +26,35 @@ impl Default for ScanAccessCostModel {
 }
 
 impl ScanAccessCostModel {
+    pub fn try_new(
+        unknown_selectivity: f64,
+        gather_access_penalty: f64,
+        default_variable_width: usize,
+        default_nested_width: usize,
+    ) -> Result<Self> {
+        if !unknown_selectivity.is_finite() || !(0.0..=1.0).contains(&unknown_selectivity) {
+            return Err(paro_error::invalid_input(
+                "scan unknown selectivity must be finite and in [0, 1]",
+            ));
+        }
+        if !gather_access_penalty.is_finite() || gather_access_penalty <= 0.0 {
+            return Err(paro_error::invalid_input(
+                "scan gather access penalty must be finite and positive",
+            ));
+        }
+        if default_variable_width == 0 || default_nested_width == 0 {
+            return Err(paro_error::invalid_input(
+                "scan fallback widths must be positive",
+            ));
+        }
+        Ok(Self {
+            unknown_selectivity,
+            gather_access_penalty,
+            default_variable_width,
+            default_nested_width,
+        })
+    }
+
     pub fn estimated_width(self, ty: &LogicalType) -> usize {
         match ty.physical_type() {
             PhysicalType::Varchar => self.default_variable_width,

@@ -8,6 +8,7 @@ use crate::tablet::{ColumnId, TabletRef};
 use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
 use paro_common::allocator::Allocator;
 use paro_common::error::Result;
+use paro_common::vector::VECTOR_SIZE;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,7 +80,7 @@ impl Default for TabletReaderParams {
             version: i64::MAX,
             columns: None,
             projection: None,
-            batch_size: 4096,
+            batch_size: VECTOR_SIZE,
             use_direct_io: false,
             predicate_tree: None,
             late_materialize: false,

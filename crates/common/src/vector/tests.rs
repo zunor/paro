@@ -616,6 +616,17 @@ fn test_dictionary_marks_generic_selection_source() {
 }
 
 #[test]
+fn test_dictionary_rejects_selection_outside_child_cardinality() {
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20]));
+    let selection = crate::test_utils::test_selection(vec![0, 2]);
+
+    let error = Vector::try_dictionary(base, selection)
+        .expect_err("out-of-bounds dictionary selection must be rejected");
+
+    assert!(error.to_string().contains("outside child cardinality 2"));
+}
+
+#[test]
 fn test_generic_dictionary_overlay_strips_storage_provenance() {
     let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
     let storage_dict = Arc::new(crate::test_utils::test_with_dictionary(
@@ -1874,4 +1885,15 @@ fn test_try_copy_at_array_out_of_order_preserves_written_extent() {
             3,
         )
     );
+}
+
+#[test]
+fn test_try_set_len_rejects_flat_capacity_overflow() {
+    let mut vector =
+        Vector::try_new(LogicalType::Integer, 4, Arc::new(DefaultAllocator::new())).unwrap();
+
+    let error = vector.try_set_len(5).unwrap_err();
+
+    assert!(error.to_string().contains("vector length exceeds capacity"));
+    assert_eq!(vector.len(), 0);
 }

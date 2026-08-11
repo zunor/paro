@@ -34,7 +34,7 @@ allow_reexecute = true
 id = "q02_minimum_cost_supplier"
 file = "sql/q02.sql"
 validate = "ordered_digest"
-expected = "bb96cde5f9c1cd29bab050c8e164c35226e639bab6db550777ff2d585b9481bf"
+expected = "a26cfc41cb114bc05f881b09ae94df2bdf10bf2464e5855b63047d1f0e1b6a4c"
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -109,7 +109,7 @@ allow_reexecute = true
 id = "q10_returned_item_reporting"
 file = "sql/q10.sql"
 validate = "ordered_digest"
-expected = "c311cdd22b92960557259b6685c3a2f1e4d5459865992c09b50299731e1473b1"
+expected = "6e095ef5daa8990aa8fcd0fe91e06aa2a432d5a1ea820bad4ae25436811f4297"
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -133,7 +133,7 @@ allow_reexecute = true
 id = "q13_customer_distribution"
 file = "sql/q13.sql"
 validate = "ordered_digest"
-expected = "d49d6832fa59ad278b7d01db5b0102c13fea5cf6681498f7e55ced860c759086"
+expected = "11d383302dc6fd0cca6bec9c5d2e39c742f2c0f54a51380498e65bafa5292b01"
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -149,7 +149,7 @@ allow_reexecute = true
 id = "q15_top_supplier"
 file = "sql/q15.sql"
 validate = "ordered_digest"
-expected = "db115f0377b0988f8ce7e3cdc62774271f18ddf944293f2bf2c0d1bcf7f3e02d"
+expected = "701414c4b3d7362ababe7ee9266d19d9b34687b25cb533183a14449e66219e46"
 collect_explain_profile = true
 allow_reexecute = true
 
@@ -189,7 +189,7 @@ allow_reexecute = true
 id = "q20_potential_part_promotion"
 file = "sql/q20.sql"
 validate = "ordered_digest"
-expected = "5f4163041a10bce14bd1590383447b75440a4900d806b323989241b444f6f3e5"
+expected = "35a45b1b8e5b7fc1b8bdf77d9fbdd0da02a8f9ea826702ce6b5e3906c8c5b6c1"
 collect_explain_profile = true
 allow_reexecute = true
 

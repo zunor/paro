@@ -428,12 +428,16 @@ impl BoundIndex for ZoneMapIndex {
         }
         self.evaluate_zonemap(predicate)
     }
+
+    fn provides_predicate_proof(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::zonemap::ZoneMapIndexWriter;
+    use crate::index::zonemap::{BoundsPrecision, ZoneMapIndexWriter};
 
     fn i32_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
         i32::from_le_bytes(left.try_into().unwrap())
@@ -447,11 +451,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
         let data = writer.finish();
         let ranges = vec![PageRange::new(0, 3), PageRange::new(3, 6)];
@@ -486,11 +492,13 @@ mod tests {
             Bytes::copy_from_slice(&10_i32.to_le_bytes()),
             Bytes::copy_from_slice(&20_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::copy_from_slice(&30_i32.to_le_bytes()),
             Bytes::copy_from_slice(&40_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Exact,
         );
         let index = ZoneMapIndex::from_bytes(
             "zm",
@@ -519,12 +527,14 @@ mod tests {
             Bytes::copy_from_slice(&10_i32.to_le_bytes()),
             Bytes::copy_from_slice(&10_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Exact,
             i32_cmp,
         );
         writer.add_with_cmp(
             Bytes::copy_from_slice(&15_i32.to_le_bytes()),
             Bytes::copy_from_slice(&30_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Exact,
             i32_cmp,
         );
         let index = ZoneMapIndex::from_bytes(
@@ -555,6 +565,7 @@ mod tests {
             Bytes::copy_from_slice(&10_i32.to_le_bytes()),
             Bytes::copy_from_slice(&20_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Exact,
             i32_cmp,
         );
         let index = ZoneMapIndex::from_bytes(
@@ -577,10 +588,11 @@ mod tests {
     #[test]
     fn inexact_bounds_never_prove_value_predicates() {
         let mut writer = ZoneMapIndexWriter::new();
-        writer.add_inexact_with_cmp(
+        writer.add_with_cmp(
             Bytes::copy_from_slice(&10_i32.to_le_bytes()),
             Bytes::copy_from_slice(&20_i32.to_le_bytes()),
             false,
+            BoundsPrecision::Conservative,
             i32_cmp,
         );
         let index = ZoneMapIndex::from_bytes(

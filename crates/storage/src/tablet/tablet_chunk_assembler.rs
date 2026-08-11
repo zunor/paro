@@ -96,6 +96,16 @@ impl TabletReader {
                 "Column batch selection length does not match logical rows",
             ));
         }
+        if let Some(index) = selection.as_ref().and_then(|selection| {
+            selection
+                .iter()
+                .copied()
+                .find(|index| *index as usize >= physical_rows)
+        }) {
+            return Err(paro_error::data_corrupted(format!(
+                "column batch selection index {index} exceeds physical row count {physical_rows}"
+            )));
+        }
 
         let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
@@ -143,7 +153,12 @@ impl TabletReader {
         if let Some(selection) = &selection {
             for vector in &mut read_vectors {
                 if vector.len() == physical_rows {
-                    *vector = Arc::new(Vector::try_dictionary(vector.clone(), selection.clone())?);
+                    // SAFETY: the shared selection was checked once against
+                    // `physical_rows` before applying it to every projected
+                    // vector in this batch.
+                    *vector = Arc::new(unsafe {
+                        Vector::try_dictionary_validated(vector.clone(), selection.clone())?
+                    });
                 } else if vector.len() != rows {
                     return Err(paro_error::data_corrupted(format!(
                         "Selected column vector has {} rows, expected {rows} logical or {physical_rows} physical rows",

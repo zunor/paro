@@ -148,33 +148,46 @@ fn segment_materialized_batch_api_forces_late_materialization() {
         .unwrap(),
     );
 
-    let predicate = PredicateTree::leaf(Predicate::Eq {
+    let adaptive_predicate = PredicateTree::leaf(Predicate::In {
         column_id: 0,
-        value: Value::Integer(7),
+        values: vec![Value::Integer(7), Value::Integer(17)],
     });
 
     let mut eager = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
         &segment,
         vec![0, 1],
         None,
-        Some(predicate.clone()),
+        Some(adaptive_predicate),
         None,
     )
     .unwrap();
     let eager_batch = eager.next_batch_with_rowid_policy(10, false).unwrap();
     assert_eq!(eager_batch.rows, 1);
-    assert_eq!(eager_batch.physical_rows, 1);
-    assert!(eager_batch.selection.is_none());
+    assert_eq!(eager_batch.physical_rows, 10);
+    assert_eq!(eager_batch.selection.as_deref(), Some([7_u32].as_slice()));
     assert_eq!(
         i32::from_le_bytes(eager_batch.columns[0].1.data[..4].try_into().unwrap()),
-        7
+        0
     );
     assert_eq!(
         i32::from_le_bytes(eager_batch.columns[1].1.data[..4].try_into().unwrap()),
-        107
+        100
+    );
+    assert!(!eager.uses_late_materialize());
+
+    let second_eager_batch = eager.next_batch_with_rowid_policy(10, false).unwrap();
+    assert_eq!(second_eager_batch.rows, 1);
+    assert_eq!(second_eager_batch.physical_rows, 10);
+    assert_eq!(
+        second_eager_batch.selection.as_deref(),
+        Some([7_u32].as_slice())
     );
     assert!(eager.uses_late_materialize());
 
+    let predicate = PredicateTree::leaf(Predicate::Eq {
+        column_id: 0,
+        value: Value::Integer(7),
+    });
     let mut iter = SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
         &segment,
         vec![0, 1],
@@ -245,10 +258,16 @@ fn late_materialization_adapts_to_observed_batch_density() {
         column_id: 0,
         value: Value::Integer(18),
     }));
-    let dense_batch = dense.next_batch_with_rowid_policy(20, false).unwrap();
-    assert_eq!(dense_batch.rows, 18);
-    assert_eq!(dense_batch.physical_rows, 20);
-    let expected_selection = (0u32..18).collect::<Vec<_>>();
+    let first_dense_batch = dense.next_batch_with_rowid_policy(10, false).unwrap();
+    assert_eq!(first_dense_batch.rows, 10);
+    assert_eq!(first_dense_batch.physical_rows, 10);
+    assert!(first_dense_batch.selection.is_none());
+    assert!(dense.uses_late_materialize());
+
+    let dense_batch = dense.next_batch_with_rowid_policy(10, false).unwrap();
+    assert_eq!(dense_batch.rows, 8);
+    assert_eq!(dense_batch.physical_rows, 10);
+    let expected_selection = (0u32..8).collect::<Vec<_>>();
     assert_eq!(
         dense_batch.selection.as_deref(),
         Some(expected_selection.as_slice())
@@ -256,8 +275,9 @@ fn late_materialization_adapts_to_observed_batch_density() {
     assert!(dense_batch.rowids.is_empty());
     assert_eq!(
         dense_batch.columns[0].1.data.len(),
-        20 * std::mem::size_of::<i32>()
+        10 * std::mem::size_of::<i32>()
     );
+    assert!(!dense.uses_late_materialize());
 
     let mut sparse = make_iter(PredicateTree::leaf(Predicate::Eq {
         column_id: 0,

@@ -62,13 +62,18 @@ impl PhysicalPlanGenerator {
             }
         }
 
+        let column_projection = if column_ids.is_empty() && !emit_row_id {
+            RowsetColumnProjection::All
+        } else {
+            RowsetColumnProjection::Columns(column_ids.into_boxed_slice())
+        };
         let late_materialize = self.ctx.rowset_scan_pushdown
             && should_late_materialize(
                 &predicate,
-                &column_ids,
-                emit_row_id,
+                &column_projection,
                 &table,
                 estimated_selectivity,
+                self.ctx.scan_access_cost,
             );
 
         Ok(RowsetScanSpec {
@@ -77,11 +82,12 @@ impl PhysicalPlanGenerator {
             returned_types: get.returned_types.clone().into_boxed_slice(),
             relation_name: get.relation_name.clone(),
             relation_alias: get.relation_alias.clone(),
-            column_ids: column_ids.into_boxed_slice(),
+            column_projection,
             emit_row_id,
             column_types: get.column_types.clone().into_boxed_slice(),
             table,
             late_materialize,
+            scan_access_cost: self.ctx.scan_access_cost,
             predicate,
             residual_predicates: residual_predicates.into_boxed_slice(),
             scan_order: self
@@ -583,15 +589,15 @@ fn project_rowset_scan_spec(
 
     spec.output_names = output_names.into_boxed_slice();
     spec.returned_types = returned_types.into_boxed_slice();
-    spec.column_ids = column_ids.into_boxed_slice();
+    spec.column_projection = RowsetColumnProjection::Columns(column_ids.into_boxed_slice());
     spec.column_types = column_types.into_boxed_slice();
     spec.emit_row_id = emit_row_id;
     spec.late_materialize = should_late_materialize(
         &spec.predicate,
-        &spec.column_ids,
-        emit_row_id,
+        &spec.column_projection,
         &spec.table,
         estimated_selectivity,
+        spec.scan_access_cost,
     );
     Ok(())
 }
@@ -617,24 +623,22 @@ fn estimated_filter_selectivity(
 /// work for selective runtime filters without specializing for any workload.
 fn should_late_materialize(
     predicate: &Option<PredicateTree>,
-    column_ids: &[usize],
-    emit_row_id: bool,
+    projection: &RowsetColumnProjection,
     table: &TableCatalogEntry,
     estimated_selectivity: Option<f64>,
+    access_cost: ScanAccessCostModel,
 ) -> bool {
     let Some(predicate) = predicate else {
         return false;
     };
-    let access_cost = ScanAccessCostModel::default();
     let predicate_columns = collect_predicate_columns(predicate);
     if predicate_columns.is_empty() {
         return false;
     }
 
-    let output_columns = if column_ids.is_empty() && !emit_row_id {
-        (0..table.columns.len()).collect::<Vec<_>>()
-    } else {
-        column_ids.to_vec()
+    let output_columns = match projection {
+        RowsetColumnProjection::All => (0..table.columns.len()).collect::<Vec<_>>(),
+        RowsetColumnProjection::Columns(columns) => columns.to_vec(),
     };
     let output_columns = output_columns.into_iter().collect::<HashSet<_>>();
     let deferred_width = output_columns

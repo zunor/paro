@@ -41,7 +41,6 @@ pub struct ColdCounters {
 pub struct OperatorMemoryAccount {
     hot: CacheAligned<HotCounters>,
     cold: ColdCounters,
-    tag_bytes: [AtomicUsize; MEMORY_TAG_COUNT],
     domain_tag_bytes: [[AtomicUsize; MEMORY_TAG_COUNT]; MEMORY_DOMAIN_COUNT],
     issued_bytes: AtomicUsize,
     revoke_requested_bytes: AtomicUsize,
@@ -57,7 +56,6 @@ impl OperatorMemoryAccount {
         Self {
             hot: CacheAligned(HotCounters::default()),
             cold: ColdCounters::default(),
-            tag_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
             domain_tag_bytes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicUsize::new(0))),
             issued_bytes: AtomicUsize::new(0),
             revoke_requested_bytes: AtomicUsize::new(0),
@@ -122,7 +120,12 @@ impl OperatorMemoryAccount {
         MemoryTag::all()
             .iter()
             .filter_map(|tag| {
-                let bytes = self.tag_bytes[tag.as_index()].load(Ordering::Relaxed);
+                let bytes = MemoryDomain::all().iter().fold(0usize, |total, domain| {
+                    total.saturating_add(
+                        self.domain_tag_bytes[domain.as_index()][tag.as_index()]
+                            .load(Ordering::Relaxed),
+                    )
+                });
                 (bytes > 0).then_some(MemoryTagBytes { tag: *tag, bytes })
             })
             .collect()
@@ -277,7 +280,7 @@ impl MemoryOwner for OperatorMemoryAccount {
         bytes: usize,
     ) {
         add_class_bytes(&self.hot.0, &self.cold, class, bytes);
-        add_tag_bytes(&self.tag_bytes, &self.domain_tag_bytes, domain, tag, bytes);
+        add_tag_bytes(&self.domain_tag_bytes, domain, tag, bytes);
         self.parent.record_allocation(domain, tag, class, bytes);
     }
 
@@ -289,7 +292,7 @@ impl MemoryOwner for OperatorMemoryAccount {
         bytes: usize,
     ) {
         sub_class_bytes(&self.hot.0, &self.cold, class, bytes);
-        sub_tag_bytes(&self.tag_bytes, &self.domain_tag_bytes, domain, tag, bytes);
+        sub_tag_bytes(&self.domain_tag_bytes, domain, tag, bytes);
         self.parent.release_allocation(domain, tag, class, bytes);
     }
 
@@ -338,24 +341,20 @@ impl MemoryOwner for OperatorMemoryAccount {
 }
 
 fn add_tag_bytes(
-    tag_bytes: &[AtomicUsize; MEMORY_TAG_COUNT],
     domain_tag_bytes: &[[AtomicUsize; MEMORY_TAG_COUNT]; MEMORY_DOMAIN_COUNT],
     domain: MemoryDomain,
     tag: MemoryTag,
     bytes: usize,
 ) {
-    tag_bytes[tag.as_index()].fetch_add(bytes, Ordering::Relaxed);
     domain_tag_bytes[domain.as_index()][tag.as_index()].fetch_add(bytes, Ordering::Relaxed);
 }
 
 fn sub_tag_bytes(
-    tag_bytes: &[AtomicUsize; MEMORY_TAG_COUNT],
     domain_tag_bytes: &[[AtomicUsize; MEMORY_TAG_COUNT]; MEMORY_DOMAIN_COUNT],
     domain: MemoryDomain,
     tag: MemoryTag,
     bytes: usize,
 ) {
-    saturating_sub(&tag_bytes[tag.as_index()], bytes);
     saturating_sub(&domain_tag_bytes[domain.as_index()][tag.as_index()], bytes);
 }
 

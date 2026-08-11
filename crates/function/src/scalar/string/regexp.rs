@@ -8,6 +8,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use regex::Regex;
 
+use crate::scalar::function_data_fingerprint;
 use crate::{
     BoundScalarFunction, ExpressionState, FunctionData, FunctionErrorMode, FunctionLocalState,
     ScalarBindInput, ScalarFunction, ScalarFunctionSet,
@@ -19,7 +20,7 @@ enum BoundRegexp {
     Invalid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 struct RegexpBindData {
     pattern: String,
     case_insensitive: bool,
@@ -36,6 +37,10 @@ impl FunctionData for RegexpBindData {
         };
 
         self.pattern == other.pattern && self.case_insensitive == other.case_insensitive
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

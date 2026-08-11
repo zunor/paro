@@ -271,6 +271,18 @@ impl Chunk {
         self.capacity = capacity;
     }
 
+    /// Remove every column handle while retaining the chunk container's
+    /// allocated column capacity and row capacity.
+    ///
+    /// This is useful for short-lived argument chunks whose columns borrow
+    /// vectors owned elsewhere. Clearing the handles at the end of the call
+    /// releases those borrows without reallocating the `Vec` on the next use.
+    pub fn clear_columns(&mut self) {
+        self.data.clear();
+        self.count = 0;
+        self.reset_state = None;
+    }
+
     // ========== Column Access ==========
 
     /// Get a reference to a column Arc by index.

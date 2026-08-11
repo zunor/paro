@@ -3,7 +3,7 @@
 
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -373,6 +373,32 @@ impl VectorSelection {
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+
+    /// Validate that every logical row resolves inside a child vector.
+    /// Dictionary vectors establish this invariant at construction so decoded
+    /// readers can use their physical mapping without repeated bounds checks.
+    pub(crate) fn validate_child_bounds(&self, child_count: usize) -> Result<()> {
+        let invalid = match self {
+            Self::None => None,
+            Self::Materialized(selection) => selection
+                .as_slice()
+                .iter()
+                .copied()
+                .find(|index| *index as usize >= child_count)
+                .map(|index| index as usize),
+            Self::Range { offset, count } => offset
+                .checked_add(*count)
+                .filter(|end| *end <= child_count)
+                .is_none()
+                .then_some(*offset),
+        };
+        if let Some(index) = invalid {
+            return Err(paro_error::out_of_range(format!(
+                "dictionary selection index {index} is outside child cardinality {child_count}"
+            )));
+        }
+        Ok(())
     }
 
     #[inline]

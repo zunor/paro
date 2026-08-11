@@ -7,12 +7,13 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
+use crate::scalar::function_data_fingerprint;
 use crate::{
     scalar::executor::varlen::VarcharResultWriter, BoundScalarFunction, ExpressionState,
     FunctionData, FunctionErrorMode, ScalarBindInput, ScalarFunction, ScalarFunctionSet,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct SubstringBindData {
     start: Option<i64>,
     length: Option<i64>,
@@ -30,12 +31,16 @@ impl FunctionData for SubstringBindData {
             .is_some_and(|other| other == self)
     }
 
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct CountBindData {
     count: i64,
 }
@@ -50,6 +55,10 @@ impl FunctionData for CountBindData {
             .as_any()
             .downcast_ref::<Self>()
             .is_some_and(|other| other == self)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {

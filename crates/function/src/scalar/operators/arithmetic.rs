@@ -18,13 +18,15 @@ use crate::decimal::{
 use crate::scalar::executor::binary::BinaryExecutor;
 use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
 use crate::scalar::{
-    BoundScalarFunction, ExpressionState, FunctionData, ScalarBindInput, ScalarFunction,
-    ScalarFunctionSet,
+    function_data_fingerprint, BoundScalarFunction, ExpressionState, FunctionData, ScalarBindInput,
+    ScalarFunction, ScalarFunctionSet,
 };
-use direct_decimal::execute_direct_decimal_rows;
+use direct_decimal::{execute_direct_decimal_factor_rows, execute_direct_decimal_rows};
+pub use direct_decimal::{is_decimal_factor_fusion, try_execute_decimal_factor_chain};
 use ethnum::i256;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef, Vector};
 use std::any::Any;
@@ -135,7 +137,7 @@ pub fn register_arithmetic_functions(set: &mut ScalarFunctionSet) {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DecimalArithmeticOp {
     Add,
     Sub,
@@ -150,7 +152,7 @@ enum DecimalEvaluation<T> {
     Overflow,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct DecimalArithmeticBindData {
     op: DecimalArithmeticOp,
 }
@@ -164,9 +166,225 @@ impl FunctionData for DecimalArithmeticBindData {
         other.as_any().downcast_ref::<Self>() == Some(self)
     }
 
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
+}
+
+/// Position of a nested or constant operand in a binary DECIMAL expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DecimalOperandSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct BoundDecimalFusionOp {
+    op: DecimalArithmeticOp,
+    native: NativeDecimalPlan,
+    narrow: direct_decimal::I64FusionPlan,
+    precision: u8,
+    left_scale: u8,
+    right_scale: u8,
+    result_scale: u8,
+}
+
+impl BoundDecimalFusionOp {
+    fn try_from_bound(
+        function: &BoundScalarFunction,
+        left_type: &LogicalType,
+        right_type: &LogicalType,
+    ) -> Option<Self> {
+        let op = function
+            .bind_data
+            .as_deref()?
+            .as_any()
+            .downcast_ref::<DecimalArithmeticBindData>()?
+            .op;
+        if matches!(op, DecimalArithmeticOp::Div | DecimalArithmeticOp::Mod) {
+            return None;
+        }
+        let (_, left_scale) = decimal_shape(left_type).ok()?;
+        let (_, right_scale) = decimal_shape(right_type).ok()?;
+        let LogicalType::Decimal {
+            precision,
+            scale: result_scale,
+        } = &function.return_type
+        else {
+            return None;
+        };
+        let native =
+            NativeDecimalPlan::for_input_scales(op, left_scale, right_scale, *result_scale);
+        Some(Self {
+            op,
+            native,
+            narrow: direct_decimal::I64FusionPlan::try_from_native(native)?,
+            precision: *precision,
+            left_scale,
+            right_scale,
+            result_scale: *result_scale,
+        })
+    }
+
+    #[inline(always)]
+    fn evaluate_i64(self, left: i64, right: i64) -> (i64, bool) {
+        let (value, overflowed) = self.narrow.evaluate(left, right);
+        let precision_exceeded = if self.precision <= 18 {
+            let limit = 10_i64.pow(u32::from(self.precision));
+            value.unsigned_abs() >= limit as u64
+        } else {
+            false
+        };
+        (value, overflowed | precision_exceeded)
+    }
+
+    fn evaluate_exact(self, left: i128, right: i128) -> Result<i128> {
+        if let DecimalEvaluation::Value(value) = self.native.evaluate(left, right) {
+            I128DecimalPrecision::new(self.precision)?.check(value)?;
+            return Ok(value);
+        }
+        match evaluate_decimal_operation(
+            self.op,
+            i256::from(left),
+            self.left_scale,
+            i256::from(right),
+            self.right_scale,
+            self.result_scale,
+        ) {
+            DecimalEvaluation::Value(value) => to_i128(value, self.precision),
+            DecimalEvaluation::Null => Err(paro_error::internal(
+                "non-null fused decimal arithmetic produced NULL",
+            )),
+            DecimalEvaluation::Overflow => Err(decimal_overflow(self.op)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DecimalFactorFusionBindData {
+    outer: BoundDecimalFusionOp,
+    inner: BoundDecimalFusionOp,
+    nested_side: DecimalOperandSide,
+    constant_side: DecimalOperandSide,
+    constant: i128,
+}
+
+impl FunctionData for DecimalFactorFusionBindData {
+    fn clone_box(&self) -> Box<dyn FunctionData> {
+        Box::new(*self)
+    }
+
+    fn equals(&self, other: &dyn FunctionData) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+impl DecimalFactorFusionBindData {
+    #[inline(always)]
+    fn evaluate_i64(self, outer: i64, inner: i64) -> (i64, bool) {
+        let (inner, inner_failed) = match self.constant_side {
+            DecimalOperandSide::Left => self.inner.evaluate_i64(self.constant as i64, inner),
+            DecimalOperandSide::Right => self.inner.evaluate_i64(inner, self.constant as i64),
+        };
+        let (outer, outer_failed) = match self.nested_side {
+            DecimalOperandSide::Left => self.outer.evaluate_i64(inner, outer),
+            DecimalOperandSide::Right => self.outer.evaluate_i64(outer, inner),
+        };
+        (
+            outer,
+            inner_failed | outer_failed | (i128::from(self.constant as i64) != self.constant),
+        )
+    }
+
+    fn evaluate_exact(self, outer: i128, inner: i128) -> Result<i128> {
+        let inner = match self.constant_side {
+            DecimalOperandSide::Left => self.inner.evaluate_exact(self.constant, inner),
+            DecimalOperandSide::Right => self.inner.evaluate_exact(inner, self.constant),
+        }?;
+        match self.nested_side {
+            DecimalOperandSide::Left => self.outer.evaluate_exact(inner, outer),
+            DecimalOperandSide::Right => self.outer.evaluate_exact(outer, inner),
+        }
+    }
+}
+
+/// Build an execution-only two-input function for a DECIMAL expression whose
+/// nested binary child has one constant operand.
+///
+/// The returned function preserves the two original bound arithmetic kernels
+/// as its semantic authority; it only changes the vector traversal shape.
+pub fn try_decimal_factor_fusion(
+    outer: &BoundScalarFunction,
+    inner: &BoundScalarFunction,
+    constant: &Value,
+    outer_variable_type: &LogicalType,
+    inner_variable_type: &LogicalType,
+    constant_type: &LogicalType,
+    nested_side: DecimalOperandSide,
+    constant_side: DecimalOperandSide,
+) -> Option<BoundScalarFunction> {
+    let (outer_left, outer_right) = match nested_side {
+        DecimalOperandSide::Left => (&inner.return_type, outer_variable_type),
+        DecimalOperandSide::Right => (outer_variable_type, &inner.return_type),
+    };
+    let (inner_left, inner_right) = match constant_side {
+        DecimalOperandSide::Left => (constant_type, inner_variable_type),
+        DecimalOperandSide::Right => (inner_variable_type, constant_type),
+    };
+    let outer_plan = BoundDecimalFusionOp::try_from_bound(outer, outer_left, outer_right)?;
+    let mut inner_plan = BoundDecimalFusionOp::try_from_bound(inner, inner_left, inner_right)?;
+    let constant = match constant {
+        Value::TinyInt(value) => i128::from(*value),
+        Value::SmallInt(value) => i128::from(*value),
+        Value::Integer(value) => i128::from(*value),
+        Value::BigInt(value) => i128::from(*value),
+        Value::HugeInt(value) => *value,
+        Value::UTinyInt(value) => i128::from(*value),
+        Value::USmallInt(value) => i128::from(*value),
+        Value::UInteger(value) => i128::from(*value),
+        Value::UBigInt(value) => i128::from(*value),
+        Value::UHugeInt(value) => i128::try_from(*value).ok()?,
+        Value::Decimal(value, _, _) => *value,
+        _ => return None,
+    };
+    if outer_plan.op != DecimalArithmeticOp::Mul
+        || !matches!(
+            inner_plan.op,
+            DecimalArithmeticOp::Add | DecimalArithmeticOp::Sub
+        )
+    {
+        return None;
+    }
+    inner_plan.narrow = inner_plan
+        .narrow
+        .bind_constant(constant_side, i64::try_from(constant).ok()?)?;
+    Some(
+        BoundScalarFunction::from(ScalarFunction::new(
+            "decimal_factor_fusion".to_string(),
+            vec![outer_variable_type.clone(), inner_variable_type.clone()],
+            outer.return_type.clone(),
+            execute_decimal_factor_arithmetic,
+        ))
+        .with_bind_data(DecimalFactorFusionBindData {
+            outer: outer_plan,
+            inner: inner_plan,
+            nested_side,
+            constant_side,
+            constant,
+        }),
+    )
 }
 
 fn bind_decimal_add(arguments: &[LogicalType]) -> Result<(ScalarFunction, Vec<LogicalType>)> {
@@ -362,6 +580,55 @@ fn execute_decimal_arithmetic(
     execute_decimal_rows(chunk, result, precision, scale, bind_data.op)
 }
 
+fn execute_decimal_factor_arithmetic(
+    chunk: &Chunk,
+    state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    let plan = state
+        .bind_data()
+        .and_then(|data| data.as_any().downcast_ref::<DecimalFactorFusionBindData>())
+        .cloned()
+        .ok_or_else(|| paro_error::internal("decimal factor fusion bind data is missing"))?;
+    let [outer, inner] = chunk.data.as_slice() else {
+        return Err(paro_error::internal(
+            "decimal factor fusion requires two variable inputs",
+        ));
+    };
+    let LogicalType::Decimal { precision, .. } = result.logical_type().clone() else {
+        return Err(paro_error::internal(
+            "decimal factor fusion result is not DECIMAL",
+        ));
+    };
+    result.set_count(chunk.size());
+    let outer = DecimalInputView::try_new(outer, chunk.size())?;
+    let inner = DecimalInputView::try_new(inner, chunk.size())?;
+    let output = DecimalOutput::try_new(result)?;
+    if execute_direct_decimal_factor_rows(&outer, &inner, output, plan, chunk.size())? {
+        return Ok(());
+    }
+    for row in 0..chunk.size() {
+        if !outer.is_valid(row) || !inner.is_valid(row) {
+            result.try_set_null(row, true)?;
+            continue;
+        }
+        let value = plan.evaluate_exact(outer.value_at(row)?, inner.value_at(row)?)?;
+        // SAFETY: `result` is a flat DECIMAL vector sized to `chunk.size()`,
+        // and exact evaluation enforced the declared output precision.
+        unsafe {
+            if precision <= 18 {
+                result.set_flat::<i64>(
+                    row,
+                    i64::try_from(value).map_err(|_| decimal_overflow(plan.outer.op))?,
+                );
+            } else {
+                result.set_flat::<i128>(row, value);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn execute_decimal_rows(
     chunk: &Chunk,
     result: &mut Vector,
@@ -552,7 +819,7 @@ impl<'a> DecimalInputView<'a> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum DecimalScaleTransform {
     Identity,
     Multiply(i128),
@@ -583,7 +850,7 @@ impl DecimalScaleTransform {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum NativeDecimalOperand {
     Input(DecimalScaleTransform),
     Constant(Option<i128>),
@@ -608,7 +875,7 @@ impl NativeDecimalOperand {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum NativeDecimalPlan {
     Add {
         left: NativeDecimalOperand,
@@ -658,6 +925,39 @@ impl NativeDecimalPlan {
             DecimalArithmeticOp::Mod => Self::Mod {
                 left: NativeDecimalOperand::new(left, result_scale),
                 right: NativeDecimalOperand::new(right, result_scale),
+            },
+        }
+    }
+
+    fn for_input_scales(
+        op: DecimalArithmeticOp,
+        left_scale: u8,
+        right_scale: u8,
+        result_scale: u8,
+    ) -> Self {
+        let operand =
+            |scale| NativeDecimalOperand::Input(DecimalScaleTransform::new(scale, result_scale));
+        match op {
+            DecimalArithmeticOp::Add => Self::Add {
+                left: operand(left_scale),
+                right: operand(right_scale),
+            },
+            DecimalArithmeticOp::Sub => Self::Sub {
+                left: operand(left_scale),
+                right: operand(right_scale),
+            },
+            DecimalArithmeticOp::Mul => Self::Mul(DecimalScaleTransform::new(
+                left_scale.saturating_add(right_scale),
+                result_scale,
+            )),
+            DecimalArithmeticOp::Div => Self::Div {
+                left_scale,
+                right_scale,
+                result_scale,
+            },
+            DecimalArithmeticOp::Mod => Self::Mod {
+                left: operand(left_scale),
+                right: operand(right_scale),
             },
         }
     }

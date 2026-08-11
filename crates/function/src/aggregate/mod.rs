@@ -22,7 +22,7 @@ mod direct_update;
 pub mod distributive;
 
 pub use direct_update::{
-    DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
+    DirectGroupSlotSource, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
     PreparedDirectGroupedAggregateInput, ValidatedDirectGroupSlots,
 };
 
@@ -893,7 +893,7 @@ mod tests {
     use std::any::Any;
 
     /// Example bind data for AVG function (stores precision info)
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Hash)]
     struct AvgBindData {
         precision: u8,
         scale: u8,
@@ -909,6 +909,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .map_or(false, |o| self == o)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            crate::scalar::function_data_fingerprint(self)
         }
 
         fn as_any(&self) -> &dyn Any {

@@ -127,6 +127,65 @@ pub enum CompiledExpressionState {
     Subquery(SubqueryExpressionState),
 }
 
+impl CompiledExpressionState {
+    /// Release references into the current input/output batch while retaining
+    /// node-owned scratch allocations for the next batch.
+    ///
+    /// Borrowed child results are deliberately stored in separate slots from
+    /// owned result scratch. Keeping the former past the batch boundary would
+    /// make otherwise reusable output buffers shared and force copy-on-write
+    /// during the next reset.
+    pub fn release_batch_references(&mut self) {
+        match self {
+            Self::Function(state) => {
+                if let Some(intermediate) = &mut state.intermediate_chunk {
+                    intermediate.clear_columns();
+                }
+                for child in &mut state.child_states {
+                    child.release_batch_references();
+                }
+            }
+            Self::Cast(state) => {
+                state.child_result = ValueSlot::Empty;
+                state.child.release_batch_references();
+            }
+            Self::Comparison(state) => {
+                state.left_result = ValueSlot::Empty;
+                state.right_result = ValueSlot::Empty;
+                state.left.release_batch_references();
+                state.right.release_batch_references();
+            }
+            Self::Conjunction(state) => {
+                for child in &mut state.child_states {
+                    child.release_batch_references();
+                }
+            }
+            Self::Case(state) => {
+                state.check_result = ValueSlot::Empty;
+                state.true_result = ValueSlot::Empty;
+                state.false_result = ValueSlot::Empty;
+                state.check.release_batch_references();
+                state.result_if_true.release_batch_references();
+                state.result_if_false.release_batch_references();
+            }
+            Self::Operator(state) => {
+                for child_result in &mut state.child_results {
+                    *child_result = ValueSlot::Empty;
+                }
+                for child in &mut state.child_states {
+                    child.release_batch_references();
+                }
+            }
+            Self::Constant(_)
+            | Self::Parameter(_)
+            | Self::ColumnRef(_)
+            | Self::Reference(_)
+            | Self::Shared(_)
+            | Self::Subquery(_) => {}
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct ExecuteFunctionState {
     pub child_states: Vec<CompiledExpressionState>,

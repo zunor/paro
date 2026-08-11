@@ -134,6 +134,19 @@ impl MemoryAccountingContext {
         }
     }
 
+    /// Reserve a bounded structure's complete capacity with one owner call.
+    ///
+    /// Callers can split the returned grant among independently owned fields.
+    /// This preserves exact per-allocation publication while avoiding one
+    /// contended capacity acquisition for every fixed-size child buffer.
+    pub fn reserve_grant(&self, bytes: usize) -> MemoryResult<super::MemoryGrant> {
+        if let Some(owner) = self.owner() {
+            super::MemoryGrant::new(bytes, self.domain, owner)
+        } else {
+            Ok(super::MemoryGrant::detached(bytes, self.domain))
+        }
+    }
+
     pub fn allocate_buffer(
         &self,
         allocator: Arc<dyn Allocator>,
