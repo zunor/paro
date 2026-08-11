@@ -44,8 +44,10 @@ impl PerfectHashAggregateEmitSourceExec {
         ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        let mut local = PerfectHashAggregateEmitSourceLocal::default();
-        local.state_filter = compile_state_filter(&self.spec)?;
+        let mut local = PerfectHashAggregateEmitSourceLocal {
+            state_filter: compile_state_filter(&self.spec)?,
+            ..Default::default()
+        };
         if !self.spec.having_filter.is_empty() {
             if self.spec.having_filter.len() != 1 {
                 return Err(paro_error::internal(
@@ -167,7 +169,9 @@ impl PerfectHashAggregateEmitSourceExec {
     }
 }
 
-fn compile_state_filter(spec: &AggregateSpec) -> Result<Option<PerfectAggregateStateFilter>> {
+pub(crate) fn compile_state_filter(
+    spec: &AggregateSpec,
+) -> Result<Option<PerfectAggregateStateFilter>> {
     let [paro_planner::expression::Expression::Comparison(comparison)] =
         spec.having_filter.as_ref()
     else {

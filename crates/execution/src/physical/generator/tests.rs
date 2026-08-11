@@ -442,6 +442,75 @@ fn arena_generator_fuses_aggregate_only_having_into_aggregate_emit() {
 }
 
 #[test]
+fn aggregate_having_fusion_preserves_an_independent_output_projection() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![ref_expr(0, LogicalType::Integer)],
+            vec![],
+            vec![count],
+            vec![],
+        )),
+    );
+    let mut filter = Filter::new(
+        aggregate,
+        vec![comparison(
+            ComparisonType::GreaterThan,
+            ref_expr(1, LogicalType::BigInt),
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(10),
+                LogicalType::BigInt,
+            )),
+        )],
+    );
+    // COUNT is required by HAVING but not by the parent plan.
+    filter.projection_map = vec![0].into();
+    let having = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator.generate(&having).expect("HAVING should lower");
+
+    let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
+        panic!("projected HAVING should retain an explicit output projection");
+    };
+    assert_eq!(project.expressions.len(), 1);
+    assert!(matches!(
+        &project.expressions[0],
+        Expression::Reference(reference) if reference.index == 0
+    ));
+    let [aggregate_id] = plan.child_ids(&plan.node(plan.root).children) else {
+        panic!("HAVING projection should have one aggregate child");
+    };
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(*aggregate_id).kind else {
+        panic!("HAVING predicate should remain attached to the aggregate");
+    };
+    assert_eq!(spec.having_filter.len(), 1);
+    assert!(plan
+        .nodes
+        .iter()
+        .all(|node| !matches!(node.kind, PhysicalNodeKind::Filter(_))));
+}
+
+#[test]
 fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     let ctx = BindContext::new();
     let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));

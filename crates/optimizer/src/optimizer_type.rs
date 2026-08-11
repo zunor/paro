@@ -27,6 +27,8 @@ pub enum OptimizerType {
     InClause,
     /// Reorders joins for optimal execution.
     JoinOrder,
+    /// Reuses grouped aggregates across redundant detail joins.
+    AggregateJoinSubsumption,
     /// Eliminates redundant joins introduced by `DelimGet`.
     DelimJoinElimination,
     /// Rewrites UNNEST operations.
@@ -89,7 +91,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 38] = [
+    pub const ALL: [OptimizerType; 39] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -98,6 +100,7 @@ impl OptimizerType {
         OptimizerType::RegexRange,
         OptimizerType::InClause,
         OptimizerType::JoinOrder,
+        OptimizerType::AggregateJoinSubsumption,
         OptimizerType::DelimJoinElimination,
         OptimizerType::UnnestRewriter,
         OptimizerType::UnusedColumns,
@@ -144,6 +147,7 @@ impl OptimizerType {
             OptimizerType::RegexRange => "regex_range",
             OptimizerType::InClause => "in_clause",
             OptimizerType::JoinOrder => "join_order",
+            OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
             OptimizerType::DelimJoinElimination => "delim_join_elimination",
             OptimizerType::UnnestRewriter => "unnest_rewriter",
             OptimizerType::UnusedColumns => "unused_columns",
@@ -197,6 +201,7 @@ impl FromStr for OptimizerType {
             "regex_range" => Ok(OptimizerType::RegexRange),
             "in_clause" => Ok(OptimizerType::InClause),
             "join_order" => Ok(OptimizerType::JoinOrder),
+            "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
             "delim_join_elimination" => Ok(OptimizerType::DelimJoinElimination),
             "unnest_rewriter" => Ok(OptimizerType::UnnestRewriter),
             "unused_columns" => Ok(OptimizerType::UnusedColumns),

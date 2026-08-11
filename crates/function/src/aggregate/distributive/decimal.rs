@@ -6,11 +6,12 @@ use std::any::Any;
 use ethnum::i256;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{Vector, VectorType};
+use paro_common::vector::{SelectionVector, Vector, VectorType};
 
 use crate::aggregate::{
-    AggregateComparison, AggregateDirectUpdate, AggregateFunction, AggregateInputData,
-    AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
+    AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateFunction,
+    AggregateInputData, AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor,
+    FunctionData, PreparedDirectAggregateStatePredicate,
 };
 use crate::decimal::{
     pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128, write_decimal,
@@ -60,22 +61,46 @@ pub(in crate::aggregate) struct DecimalNarrowState {
     // Aggregate state buffers guarantee 8-byte alignment. Store i128 as words
     // instead of imposing its 16-byte alignment on the aggregate state ABI.
     value_words: [u64; 2],
-    is_set: bool,
-    overflowed: bool,
 }
 
 impl DecimalNarrowState {
-    fn value(&self) -> i128 {
+    // DECIMAL values are strictly bounded by 10^38, while these sentinels sit
+    // at the bottom of the i128 domain. A narrow SUM is admitted only when the
+    // maximum input magnitude times usize::MAX fits in i128, so neither a
+    // valid input nor a mathematically reachable partial sum can alias them.
+    // Encoding lifecycle in-band keeps the exact accumulator at 16 bytes.
+    const UNSET: [u64; 2] = [0, 1_u64 << 63];
+    const OVERFLOWED: [u64; 2] = [1, 1_u64 << 63];
+
+    pub(in crate::aggregate) fn value(&self) -> i128 {
         (((self.value_words[1] as u128) << 64) | self.value_words[0] as u128) as i128
     }
 
-    fn set_value(&mut self, value: i128) {
+    pub(in crate::aggregate) fn set_value(&mut self, value: i128) {
         let value = value as u128;
         self.value_words = [value as u64, (value >> 64) as u64];
+        debug_assert_ne!(self.value_words, Self::UNSET);
+        debug_assert_ne!(self.value_words, Self::OVERFLOWED);
+    }
+
+    pub(in crate::aggregate) fn reset(&mut self) {
+        self.value_words = Self::UNSET;
     }
 
     fn set_i64(&mut self, value: i64) {
         self.value_words = [value as u64, if value < 0 { u64::MAX } else { 0 }];
+    }
+
+    pub(in crate::aggregate) fn is_set(&self) -> bool {
+        self.value_words != Self::UNSET
+    }
+
+    pub(in crate::aggregate) fn overflowed(&self) -> bool {
+        self.value_words == Self::OVERFLOWED
+    }
+
+    pub(in crate::aggregate) fn mark_overflowed(&mut self) {
+        self.value_words = Self::OVERFLOWED;
     }
 
     #[inline]
@@ -88,22 +113,30 @@ impl DecimalNarrowState {
             }
     }
 
-    fn add(&mut self, value: i128) {
+    pub(in crate::aggregate) fn add(&mut self, value: i128) {
+        if self.overflowed() {
+            return;
+        }
+        if !self.is_set() {
+            self.set_value(value);
+            return;
+        }
         if let Ok(value) = i64::try_from(value) {
             self.add_i64(value);
             return;
         }
         match self.value().checked_add(value) {
             Some(value) => self.set_value(value),
-            None => self.overflowed = true,
+            None => self.mark_overflowed(),
         }
-        self.is_set = true;
     }
 
     pub(in crate::aggregate) fn add_i64(&mut self, value: i64) {
-        if !self.is_set {
+        if self.overflowed() {
+            return;
+        }
+        if !self.is_set() {
             self.set_i64(value);
-            self.is_set = true;
             return;
         }
         if self.value_is_i64() {
@@ -114,7 +147,7 @@ impl DecimalNarrowState {
         }
         match self.value().checked_add(i128::from(value)) {
             Some(sum) => self.set_value(sum),
-            None => self.overflowed = true,
+            None => self.mark_overflowed(),
         }
     }
 
@@ -197,7 +230,7 @@ impl DecimalSumState {
         }
     }
 
-    fn add_state(&mut self, source: &Self) {
+    pub(in crate::aggregate) fn add_state(&mut self, source: &Self) {
         if self.overflowed() || source.overflowed() {
             self.value_words = Self::OVERFLOWED;
         } else if !source.is_set() {
@@ -410,6 +443,35 @@ pub(crate) fn bind_sum(arguments: &[LogicalType]) -> Result<(AggregateFunction, 
     bind(arguments, DecimalAggregateOp::Sum, "sum")
 }
 
+pub(in crate::aggregate) fn prepare_direct_state_predicate(
+    function: &AggregateFunction,
+    comparison: AggregateComparison,
+    constant: &paro_common::runtime_value::Value,
+) -> Result<Option<PreparedDirectAggregateStatePredicate>> {
+    if function.direct_update
+        != Some(AggregateDirectUpdate::Decimal(
+            DecimalDirectUpdate::NarrowSumI64,
+        ))
+    {
+        return Ok(None);
+    }
+    let data = function
+        .bind_data
+        .as_deref()
+        .and_then(|data| data.as_any().downcast_ref::<DecimalAggregateBindData>())
+        .ok_or_else(|| paro_error::internal("decimal SUM lost its bind data"))?;
+    debug_assert_eq!((data.op, data.wide_sum), (DecimalAggregateOp::Sum, false));
+    let constant = sum_filter_constant(data, constant)?;
+    Ok(Some(
+        PreparedDirectAggregateStatePredicate::decimal_narrow_sum(
+            comparison,
+            constant,
+            data.output_limit,
+            data.output_precision,
+        ),
+    ))
+}
+
 pub(crate) fn bind_min(arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)> {
     bind(arguments, DecimalAggregateOp::Min, "min")
 }
@@ -523,20 +585,20 @@ fn bind(
         _ => function,
     };
     if op == DecimalAggregateOp::Sum {
-        function = function.with_state_filter(if wide_sum {
-            filter_wide_sum_state
-        } else {
-            filter_narrow_sum_state
-        });
+        function = function
+            .with_algebra(AggregateAlgebra::Sum)
+            .with_state_filter(if wide_sum {
+                filter_wide_sum_state
+            } else {
+                filter_narrow_sum_state
+            });
     }
     Ok((function, arguments.to_vec()))
 }
 
 unsafe fn initialize_narrow(state: *mut u8) {
     let state = &mut *(state as *mut DecimalNarrowState);
-    state.value_words = [0; 2];
-    state.is_set = false;
-    state.overflowed = false;
+    state.reset();
 }
 
 unsafe fn initialize_sum(state: *mut u8) {
@@ -662,7 +724,7 @@ unsafe fn simple_update(
             continue;
         }
         update_narrow_state(state, read_decimal(inputs[0], row).0, data.op);
-        if data.op == DecimalAggregateOp::First && state.is_set {
+        if data.op == DecimalAggregateOp::First && state.is_set() {
             return;
         }
     }
@@ -799,7 +861,7 @@ unsafe fn simple_update_direct<I: DirectDecimalAggregateInput>(
             let state = unsafe { &mut *(state as *mut DecimalNarrowState) };
             for row in 0..count {
                 update_narrow_state(state, unsafe { input.value(row) }, op);
-                if op == DecimalAggregateOp::First && state.is_set {
+                if op == DecimalAggregateOp::First && state.is_set() {
                     return;
                 }
             }
@@ -810,26 +872,22 @@ unsafe fn simple_update_direct<I: DirectDecimalAggregateInput>(
 fn update_narrow_state(state: &mut DecimalNarrowState, value: i128, op: DecimalAggregateOp) {
     match op {
         DecimalAggregateOp::Min => {
-            if !state.is_set || value < state.value() {
+            if !state.is_set() || value < state.value() {
                 state.set_value(value);
-                state.is_set = true;
             }
         }
         DecimalAggregateOp::Max => {
-            if !state.is_set || value > state.value() {
+            if !state.is_set() || value > state.value() {
                 state.set_value(value);
-                state.is_set = true;
             }
         }
         DecimalAggregateOp::First => {
-            if !state.is_set {
+            if !state.is_set() {
                 state.set_value(value);
-                state.is_set = true;
             }
         }
         DecimalAggregateOp::Last => {
             state.set_value(value);
-            state.is_set = true;
         }
         DecimalAggregateOp::Sum | DecimalAggregateOp::Avg => {
             unreachable!("SUM and AVG use dedicated states")
@@ -881,10 +939,9 @@ unsafe fn combine(source: &Vector, target: &Vector, input_data: &AggregateInputD
             for row in 0..count {
                 let source = &*(*source_ptrs.add(row) as *const DecimalNarrowState);
                 let target = &mut *(*target_ptrs.add(row) as *mut DecimalNarrowState);
-                if source.overflowed {
-                    target.overflowed = true;
-                }
-                if source.is_set {
+                if source.overflowed() {
+                    target.mark_overflowed();
+                } else if source.is_set() {
                     target.add(source.value());
                 }
             }
@@ -902,31 +959,27 @@ unsafe fn combine(source: &Vector, target: &Vector, input_data: &AggregateInputD
     for row in 0..count {
         let source = &*(*source_ptrs.add(row) as *const DecimalNarrowState);
         let target = &mut *(*target_ptrs.add(row) as *mut DecimalNarrowState);
-        if !source.is_set {
+        if !source.is_set() {
             continue;
         }
         match data.op {
             DecimalAggregateOp::Min => {
-                if !target.is_set || source.value() < target.value() {
+                if !target.is_set() || source.value() < target.value() {
                     target.set_value(source.value());
-                    target.is_set = true;
                 }
             }
             DecimalAggregateOp::Max => {
-                if !target.is_set || source.value() > target.value() {
+                if !target.is_set() || source.value() > target.value() {
                     target.set_value(source.value());
-                    target.is_set = true;
                 }
             }
             DecimalAggregateOp::First => {
-                if !target.is_set {
+                if !target.is_set() {
                     target.set_value(source.value());
-                    target.is_set = true;
                 }
             }
             DecimalAggregateOp::Last => {
                 target.set_value(source.value());
-                target.is_set = true;
             }
             DecimalAggregateOp::Sum | DecimalAggregateOp::Avg => {
                 unreachable!("SUM and AVG handled above")
@@ -969,11 +1022,11 @@ unsafe fn finalize(
     }
     for row in 0..count {
         let state = &*(*state_ptrs.add(row) as *const DecimalNarrowState);
-        if !state.is_set {
+        if !state.is_set() {
             result.set_null(row, true);
             continue;
         }
-        if state.overflowed {
+        if state.overflowed() {
             return Err(paro_error::out_of_range(format!(
                 "Decimal {} aggregate overflow",
                 data.op.name()
@@ -1046,19 +1099,63 @@ unsafe fn filter_narrow_sum_state(
 ) -> Result<usize> {
     let data = bind_data(input_data);
     debug_assert_eq!((data.op, data.wide_sum), (DecimalAggregateOp::Sum, false));
-    filter_sum_values(data, comparison, constant, selection, count, |row| {
-        let state = &*(states.state_ptr(row) as *const DecimalNarrowState);
-        if !state.is_set {
-            return Ok(None);
-        }
-        if state.overflowed {
-            return Err(paro_error::out_of_range("Decimal SUM aggregate overflow"));
-        }
-        let value = rescale_checked(state.value(), data.input_scale, data.output_scale)
-            .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?;
-        check_output_precision(value, data)?;
-        Ok(Some(value))
-    })
+    // A narrow SUM is admitted only after proving that every mathematically
+    // reachable sum fits both i128 and DECIMAL(38). SUM also preserves the
+    // input scale, so the bound constant and state can be compared directly.
+    // Keep the wide path below for aggregates that require rescaling and an
+    // output-precision check per group.
+    debug_assert_eq!(data.input_scale, data.output_scale);
+    let constant = sum_filter_constant(data, constant)?;
+    validate_state_filter_selection(selection, count)?;
+
+    macro_rules! filter_rows {
+        ($state_ptr:expr, $matches:expr) => {{
+            selection.set_len(count);
+            let mut selected = 0usize;
+            for row in 0..count {
+                let state = unsafe { &*($state_ptr(row) as *const DecimalNarrowState) };
+                if !state.is_set() {
+                    continue;
+                }
+                if state.overflowed() {
+                    return Err(paro_error::out_of_range("Decimal SUM aggregate overflow"));
+                }
+                let value = state.value();
+                // The admission proof makes this branch false for all valid
+                // executions. Retain the check so corrupted or manually
+                // constructed states fail closed instead of crossing the
+                // aggregate ABI with an out-of-domain result.
+                check_output_precision(value, data)?;
+                if $matches(value, constant) {
+                    selection.try_set(selected, row)?;
+                    selected += 1;
+                }
+            }
+            selection.set_len(selected);
+            Ok(selected)
+        }};
+    }
+
+    macro_rules! dispatch_comparison {
+        ($state_ptr:expr) => {{
+            match comparison {
+                AggregateComparison::Equal => filter_rows!($state_ptr, |a, b| a == b),
+                AggregateComparison::NotEqual => filter_rows!($state_ptr, |a, b| a != b),
+                AggregateComparison::LessThan => filter_rows!($state_ptr, |a, b| a < b),
+                AggregateComparison::GreaterThan => filter_rows!($state_ptr, |a, b| a > b),
+                AggregateComparison::LessThanOrEqual => filter_rows!($state_ptr, |a, b| a <= b),
+                AggregateComparison::GreaterThanOrEqual => {
+                    filter_rows!($state_ptr, |a, b| a >= b)
+                }
+            }
+        }};
+    }
+
+    if let Some(cursor) = states.direct_cursor() {
+        dispatch_comparison!(|row| cursor.state_ptr(row))
+    } else {
+        dispatch_comparison!(|row| states.state_ptr(row))
+    }
 }
 
 unsafe fn filter_wide_sum_state(
@@ -1088,26 +1185,8 @@ fn filter_sum_values(
     count: usize,
     mut value_at: impl FnMut(usize) -> Result<Option<i128>>,
 ) -> Result<usize> {
-    let paro_common::runtime_value::Value::Decimal(constant, constant_precision, constant_scale) =
-        constant
-    else {
-        return Err(paro_error::internal(format!(
-            "decimal aggregate state filter requires DECIMAL constant, got {constant:?}"
-        )));
-    };
-    if (*constant_precision, *constant_scale) != (data.output_precision, data.output_scale) {
-        return Err(paro_error::internal(format!(
-            "decimal aggregate state-filter constant type mismatch: expected=DECIMAL({}, {}) actual=DECIMAL({constant_precision}, {constant_scale})",
-            data.output_precision, data.output_scale
-        )));
-    }
-    let constant = *constant;
-    if selection.capacity() < count {
-        return Err(paro_error::internal(format!(
-            "aggregate state-filter selection too small: capacity={}, count={count}",
-            selection.capacity()
-        )));
-    }
+    let constant = sum_filter_constant(data, constant)?;
+    validate_state_filter_selection(selection, count)?;
     selection.set_len(count);
     let mut selected = 0usize;
     for row in 0..count {
@@ -1129,6 +1208,36 @@ fn filter_sum_values(
     }
     selection.set_len(selected);
     Ok(selected)
+}
+
+fn sum_filter_constant(
+    data: &DecimalAggregateBindData,
+    constant: &paro_common::runtime_value::Value,
+) -> Result<i128> {
+    let paro_common::runtime_value::Value::Decimal(constant, constant_precision, constant_scale) =
+        constant
+    else {
+        return Err(paro_error::internal(format!(
+            "decimal aggregate state filter requires DECIMAL constant, got {constant:?}"
+        )));
+    };
+    if (*constant_precision, *constant_scale) != (data.output_precision, data.output_scale) {
+        return Err(paro_error::internal(format!(
+            "decimal aggregate state-filter constant type mismatch: expected=DECIMAL({}, {}) actual=DECIMAL({constant_precision}, {constant_scale})",
+            data.output_precision, data.output_scale
+        )));
+    }
+    Ok(*constant)
+}
+
+fn validate_state_filter_selection(selection: &SelectionVector, count: usize) -> Result<()> {
+    if selection.capacity() < count {
+        return Err(paro_error::internal(format!(
+            "aggregate state-filter selection too small: capacity={}, count={count}",
+            selection.capacity()
+        )));
+    }
+    Ok(())
 }
 
 #[inline]

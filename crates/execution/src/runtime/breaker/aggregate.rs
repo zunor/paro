@@ -857,13 +857,18 @@ impl AggregateSpilledOutput {
 #[derive(Debug)]
 pub struct PerfectHashAggregateRuntimeState {
     pub table: Option<PerfectAggregateHashTable>,
+    pub pending_tables: Vec<PerfectAggregateHashTable>,
 }
 
 impl PerfectHashAggregateRuntimeState {
     fn destroy(&mut self) -> Result<()> {
-        self.table
-            .as_mut()
-            .map_or(Ok(()), PerfectAggregateHashTable::destroy)
+        if let Some(table) = self.table.as_mut() {
+            table.destroy()?;
+        }
+        for table in &mut self.pending_tables {
+            table.destroy()?;
+        }
+        Ok(())
     }
 }
 

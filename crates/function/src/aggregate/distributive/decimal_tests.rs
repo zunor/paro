@@ -8,9 +8,7 @@ use std::sync::Arc;
 
 fn initialized_narrow_state() -> DecimalNarrowState {
     DecimalNarrowState {
-        value_words: [0; 2],
-        is_set: false,
-        overflowed: false,
+        value_words: DecimalNarrowState::UNSET,
     }
 }
 
@@ -28,6 +26,20 @@ fn initialized_average_state() -> DecimalAverageState {
         overflowed: false,
         wide: false,
     }
+}
+
+#[test]
+fn narrow_decimal_state_keeps_lifecycle_in_band() {
+    assert_eq!(std::mem::size_of::<DecimalNarrowState>(), 16);
+
+    let mut state = initialized_narrow_state();
+    assert!(!state.is_set());
+    state.add_i64(7);
+    assert!(state.is_set());
+    assert!(!state.overflowed());
+    assert_eq!(state.value(), 7);
+    state.mark_overflowed();
+    assert!(state.overflowed());
 }
 
 #[test]
@@ -311,10 +323,7 @@ fn decimal_state_obeys_the_eight_byte_aggregate_alignment_contract() {
     assert_eq!(std::mem::align_of::<DecimalNarrowState>(), 8);
     assert_eq!(std::mem::align_of::<DecimalSumState>(), 8);
     assert_eq!(std::mem::align_of::<DecimalAverageState>(), 8);
-    assert_eq!(
-        std::mem::size_of::<DecimalSumState>(),
-        std::mem::size_of::<DecimalNarrowState>()
-    );
+    assert!(std::mem::size_of::<DecimalNarrowState>() < std::mem::size_of::<DecimalSumState>());
     assert!(std::mem::size_of::<DecimalNarrowState>() < std::mem::size_of::<DecimalAverageState>());
     let state_words = std::mem::size_of::<DecimalAverageState>().div_ceil(8);
     let mut storage = vec![0_u64; state_words + 1];
@@ -451,7 +460,6 @@ fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
     ];
     for (state, value) in states.iter_mut().zip([29_900, 30_000, 30_100]) {
         state.set_value(value);
-        state.is_set = true;
     }
 
     let mut addresses = paro_common::test_utils::test_vector(LogicalType::BigInt);

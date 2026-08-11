@@ -19,13 +19,13 @@ use crate::context::OptimizationContext;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
-    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CteFilterPusherPass,
-    CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass,
-    FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
-    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
-    JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass, ReorderFilterPass,
-    SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass,
-    TopNPass, UnusedColumnsPass,
+    AggregateJoinSubsumptionPass, BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass,
+    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
+    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
+    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
+    JoinFilterPushdownPass, JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass,
+    ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
+    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -186,6 +186,13 @@ impl Optimizer {
             Box::new(ReorderFilterPass),
             Box::new(JoinEliminationPass),
             Box::new(JoinOrderPass),
+            // Join ordering exposes the full reduction-join shape. Reuse its
+            // grouped aggregates before unused-column pruning hides partials.
+            Box::new(AggregateJoinSubsumptionPass),
+            // Aggregate subsumption changes both row production and the
+            // statistics-visible HAVING shape. Re-derive costing inputs before
+            // final build/probe orientation consumes them.
+            Box::new(StatisticsGatheringPass),
             Box::new(UnusedColumnsPass {
                 binder: unused_columns_binder,
             }),

@@ -6,7 +6,8 @@
 //!
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateAlgebra, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -128,46 +129,55 @@ pub fn get_sum_function() -> AggregateFunctionSet {
     set.set_dynamic_bind(super::decimal::bind_sum);
 
     // Integer -> BigInt
-    set.add_function(AggregateFunction::new(
-        "sum".to_string(),
-        vec![LogicalType::Integer],
-        LogicalType::BigInt,
-        std::mem::size_of::<SumState<i64>>(),
-        sum_i32::initialize,
-        sum_i32::update,
-        sum_i32::combine,
-        sum_i32::finalize,
-        Some(sum_i32::simple_update),
-        None,
-    ));
+    set.add_function(
+        AggregateFunction::new(
+            "sum".to_string(),
+            vec![LogicalType::Integer],
+            LogicalType::BigInt,
+            std::mem::size_of::<SumState<i64>>(),
+            sum_i32::initialize,
+            sum_i32::update,
+            sum_i32::combine,
+            sum_i32::finalize,
+            Some(sum_i32::simple_update),
+            None,
+        )
+        .with_algebra(AggregateAlgebra::Sum),
+    );
 
     // BigInt -> HugeInt
-    set.add_function(AggregateFunction::new(
-        "sum".to_string(),
-        vec![LogicalType::BigInt],
-        LogicalType::HugeInt,
-        std::mem::size_of::<SumState<i128>>(),
-        sum_i64::initialize,
-        sum_i64::update,
-        sum_i64::combine,
-        sum_i64::finalize,
-        Some(sum_i64::simple_update),
-        None,
-    ));
+    set.add_function(
+        AggregateFunction::new(
+            "sum".to_string(),
+            vec![LogicalType::BigInt],
+            LogicalType::HugeInt,
+            std::mem::size_of::<SumState<i128>>(),
+            sum_i64::initialize,
+            sum_i64::update,
+            sum_i64::combine,
+            sum_i64::finalize,
+            Some(sum_i64::simple_update),
+            None,
+        )
+        .with_algebra(AggregateAlgebra::Sum),
+    );
 
     // Double -> Double
-    set.add_function(AggregateFunction::new(
-        "sum".to_string(),
-        vec![LogicalType::Double],
-        LogicalType::Double,
-        std::mem::size_of::<SumState<f64>>(),
-        sum_f64::initialize,
-        sum_f64::update,
-        sum_f64::combine,
-        sum_f64::finalize,
-        Some(sum_f64::simple_update),
-        None,
-    ));
+    set.add_function(
+        AggregateFunction::new(
+            "sum".to_string(),
+            vec![LogicalType::Double],
+            LogicalType::Double,
+            std::mem::size_of::<SumState<f64>>(),
+            sum_f64::initialize,
+            sum_f64::update,
+            sum_f64::combine,
+            sum_f64::finalize,
+            Some(sum_f64::simple_update),
+            None,
+        )
+        .with_algebra(AggregateAlgebra::Sum),
+    );
 
     set
 }

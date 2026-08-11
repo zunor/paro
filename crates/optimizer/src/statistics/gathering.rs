@@ -20,6 +20,7 @@ use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
 use crate::context::OptimizationContext;
+use crate::statistics::aggregate_filter::estimate_grouped_sum_filter_selectivity;
 
 #[derive(Default)]
 pub struct StatisticsGathering {
@@ -210,6 +211,14 @@ impl StatisticsGathering {
         ctx: &OptimizationContext,
     ) -> Option<CardinalityEstimate> {
         let child = filter.child.stats.estimated_cardinality?;
+        if let Some(selectivity) =
+            estimate_grouped_sum_filter_selectivity(filter, &ctx.column_stats)
+        {
+            return Some(
+                ctx.cost_model
+                    .estimate_cardinality_from_selectivity(child.expected, selectivity),
+            );
+        }
         let child_bindings = filter.child.get_column_bindings();
         Some(ctx.cost_model.estimate_filter_cardinality_with_positions(
             child.expected,

@@ -306,18 +306,35 @@ impl CostModel {
         }
 
         let combined = self.estimate_conjunction(expressions.iter(), resolver);
-        let combined_selectivity = combined.fraction;
+        self.cardinality_from_selectivity(base_cardinality, combined.fraction, combined.proven)
+    }
 
-        let expected = ((base_cardinality as f64) * combined_selectivity).round() as u64;
-        let expected = if combined.proven && combined_selectivity == 0.0 {
+    pub(crate) fn estimate_cardinality_from_selectivity(
+        &self,
+        base_cardinality: u64,
+        selectivity: f64,
+    ) -> CardinalityEstimate {
+        self.cardinality_from_selectivity(base_cardinality, selectivity, false)
+    }
+
+    fn cardinality_from_selectivity(
+        &self,
+        base_cardinality: u64,
+        selectivity: f64,
+        proven: bool,
+    ) -> CardinalityEstimate {
+        if base_cardinality == 0 {
+            return CardinalityEstimate::exact(0);
+        }
+        let selectivity = clamp_selectivity(selectivity);
+        let expected = ((base_cardinality as f64) * selectivity).round() as u64;
+        let expected = if proven && selectivity == 0.0 {
             0
         } else {
             expected.max(1)
         };
-        let min = ((base_cardinality as f64) * (combined_selectivity * 0.5).clamp(0.0, 1.0)).floor()
-            as u64;
-        let max = ((base_cardinality as f64) * (combined_selectivity * 1.5).clamp(0.0, 1.0)).ceil()
-            as u64;
+        let min = ((base_cardinality as f64) * (selectivity * 0.5).clamp(0.0, 1.0)).floor() as u64;
+        let max = ((base_cardinality as f64) * (selectivity * 1.5).clamp(0.0, 1.0)).ceil() as u64;
 
         CardinalityEstimate {
             min,

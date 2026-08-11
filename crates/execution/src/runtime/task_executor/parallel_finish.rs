@@ -71,7 +71,11 @@ fn wait_for_parallel_finish_group(
                 return Err(error);
             }
         }
-        scheduler.execute_tasks_for_producer(producer, &marker, usize::MAX);
+        // The completion thread participates in the group, but must not drain
+        // the producer greedily: doing so turns a parallel finish group into a
+        // serial loop before scheduler workers can claim sibling tasks. Help
+        // with one task, then observe/wait for progress from the whole group.
+        scheduler.execute_tasks_for_producer(producer, &marker, 1);
         if let Some(error) = scheduler.get_error_for_producer(producer) {
             cancel_parallel_finish_and_drain(scheduler, producer, coordinator);
             return Err(paro_error::internal(error.to_string()));

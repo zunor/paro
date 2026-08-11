@@ -4,4 +4,5 @@
 //! Aggregate optimization passes.
 
 pub mod common;
+pub mod join_subsumption;
 pub mod statistics_exec;

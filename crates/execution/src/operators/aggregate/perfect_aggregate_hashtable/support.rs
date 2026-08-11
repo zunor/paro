@@ -144,7 +144,12 @@ pub(super) fn direct_update_scratch_bytes(
     program: Option<&DirectGroupedAggregateProgram>,
     slot_count: usize,
 ) -> Option<usize> {
-    program.map_or(Some(0), |program| program.scratch_bytes(slot_count))
+    let Some(program) = program else {
+        return Some(0);
+    };
+    program
+        .scratch_bytes(slot_count)?
+        .checked_add(program.materialized_slot_bytes()?)
 }
 
 pub(super) fn accounted_vec_from_reservation<T>(

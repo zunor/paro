@@ -7,11 +7,15 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_planner::expression::AggregateType;
 
 use super::{
-    compute_slot_from_prepared, decode_group_batch, prepare_slot_encoding, PerfectHashKeyDomain,
-    PerfectHashSlotLayout, PreparedDictionaryKey, PreparedSlotEncoding,
+    compute_slot_from_prepared, decode_group_batch, prepare_slot_encoding,
+    PerfectAggregateHashTable, PerfectHashKeyDomain, PerfectHashSlotLayout, PreparedDictionaryKey,
+    PreparedSlotEncoding,
 };
+use crate::operators::aggregate::aggregate_object::AggregateObject;
 
 #[test]
 fn mixed_radix_layout_is_dense_and_round_trips_every_component() {
@@ -44,6 +48,42 @@ fn mixed_radix_layout_rejects_invalid_domains_and_components() {
     assert!(PerfectHashSlotLayout::try_new(vec![1]).is_err());
     let layout = PerfectHashSlotLayout::try_new(vec![3]).expect("layout");
     assert!(layout.add_component(0, 0, 3).is_err());
+}
+
+#[test]
+fn large_domain_run_reducer_preserves_repeated_nonconsecutive_groups() {
+    let allocator = paro_common::test_utils::test_allocator();
+    let object = AggregateObject {
+        function: get_count_star_function(),
+        bind_info: None,
+        child_count: 0,
+        payload_size: 8,
+        aggr_type: AggregateType::NonDistinct,
+        return_type: LogicalType::BigInt,
+        filter: None,
+        order_bys: Vec::new(),
+    };
+    let mut table = PerfectAggregateHashTable::new(
+        vec![LogicalType::Integer],
+        vec![object],
+        vec![Vec::new()],
+        vec![0],
+        vec![100],
+        allocator.clone(),
+    )
+    .unwrap();
+    assert!(table.direct_update_scratch.is_none());
+
+    let groups = paro_common::test_utils::test_chunk_from_vectors(vec![
+        paro_common::test_utils::test_i32_vector(&[1, 1, 2, 1]),
+    ]);
+    let mut payload = Chunk::try_initialize(&[], groups.size(), allocator).unwrap();
+    payload.try_set_cardinality(groups.size()).unwrap();
+    assert!(table.try_update_direct_groups(&groups, &payload).unwrap());
+
+    assert_eq!(table.count(), 2);
+    assert_eq!(unsafe { *table.state_ptr(2).cast::<i64>() }, 3);
+    assert_eq!(unsafe { *table.state_ptr(3).cast::<i64>() }, 1);
 }
 
 #[test]
@@ -137,7 +177,7 @@ fn assert_two_key_roundtrip(
     let mut prepared =
         prepare_slot_encoding(&domains, &minima, &layout, &decoded, groups.size()).unwrap();
     assert_eq!(
-        matches!(prepared, PreparedSlotEncoding::DictionaryPair { .. }),
+        matches!(prepared, PreparedSlotEncoding::Pair { .. }),
         expect_dictionary_pair
     );
 

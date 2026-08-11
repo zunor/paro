@@ -8,6 +8,7 @@ use paro_planner::binder::Binder;
 use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
+use crate::aggregate::join_subsumption::AggregateJoinSubsumption;
 use crate::aggregate::statistics_exec::AggregateStatisticsExecutor;
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
@@ -250,6 +251,22 @@ impl Rewriter for JoinOrderPass {
             &ctx.column_stats,
             &ctx.bind_context,
         )
+    }
+}
+
+pub struct AggregateJoinSubsumptionPass;
+
+impl Rewriter for AggregateJoinSubsumptionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateJoinSubsumption
+    }
+
+    fn rewrite(
+        &mut self,
+        plan: LogicalPlan,
+        _ctx: &mut OptimizationContext,
+    ) -> Result<LogicalPlan> {
+        Ok(AggregateJoinSubsumption::new().optimize_plan(plan))
     }
 }
 

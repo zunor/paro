@@ -355,6 +355,7 @@ mod tests {
             name: name.to_string(),
             arguments: children.iter().map(|child| child.return_type()).collect(),
             return_type: return_type.clone(),
+            algebra: None,
             state_size: 8,
             initialize: noop_initialize,
             update: noop_update,

@@ -22,12 +22,26 @@ mod direct_update;
 pub mod distributive;
 
 pub use direct_update::{
-    DirectGroupSlotSource, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
+    prepare_direct_state_predicate, DirectGroupSlotSource, DirectGroupedAggregateProgram,
+    DirectGroupedAggregateScratch, PreparedDirectAggregateStatePredicate,
     PreparedDirectGroupedAggregateInput, ValidatedDirectGroupSlots,
 };
 
 // Re-export FunctionData from scalar module
 pub use crate::scalar::FunctionData;
+
+/// Algebraic identity exposed by an aggregate implementation.
+///
+/// Optimizers may use this marker to compose aggregate states across a
+/// partitioning boundary. It is deliberately attached to the bound function
+/// rather than inferred from its display name: extension aggregates may reuse
+/// built-in names without inheriting their algebraic laws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateAlgebra {
+    /// Additive decomposition over non-NULL inputs using the aggregate's
+    /// declared update/combine semantics (including floating-point rounding).
+    Sum,
+}
 
 /// Function to initialize the state.
 ///
@@ -320,6 +334,9 @@ pub struct AggregateFunction {
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
 
+    /// Algebraic identity available to logical aggregate rewrites.
+    pub algebra: Option<AggregateAlgebra>,
+
     /// Size of the state in bytes.
     pub state_size: usize,
 
@@ -396,6 +413,7 @@ impl AggregateFunction {
             name,
             arguments,
             return_type,
+            algebra: None,
             state_size,
             initialize,
             update,
@@ -415,6 +433,11 @@ impl AggregateFunction {
 
     pub fn with_state_filter(mut self, filter: AggregateStateFilterFn) -> Self {
         self.state_filter = Some(filter);
+        self
+    }
+
+    pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
+        self.algebra = Some(algebra);
         self
     }
 

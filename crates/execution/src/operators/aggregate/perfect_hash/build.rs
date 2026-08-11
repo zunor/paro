@@ -17,6 +17,7 @@ use crate::operators::aggregate::build_helpers::{
     create_perfect_aggregate_table, group_payload_refs, projected_payload_chunk,
     query_perfect_hash_memory, update_perfect_aggregate_table,
 };
+use crate::operators::aggregate::perfect_hash::parallel_merge::prepare_parallel_perfect_merge;
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -41,7 +42,10 @@ impl PerfectHashAggregateSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
         handle.initialize(AggregateRuntimeState::Perfect(
-            PerfectHashAggregateRuntimeState { table: None },
+            PerfectHashAggregateRuntimeState {
+                table: None,
+                pending_tables: Vec::new(),
+            },
         ))?;
         ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
             AggregateBuildCompactionReclaimer::new(handle.clone()),
@@ -159,7 +163,6 @@ impl PerfectHashAggregateSinkExec {
         let Some(local_table) = local.table.take() else {
             return Ok(MergePoll::Done);
         };
-        let mut local_table = Some(local_table);
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Perfect(global) = state else {
                 return Err(paro_error::internal(
@@ -167,20 +170,12 @@ impl PerfectHashAggregateSinkExec {
                 ));
             };
             if global.table.is_none() {
-                global.table = local_table.take();
+                global.table = Some(local_table);
                 return Ok(());
             }
-            let global_table = global.table.as_mut().ok_or_else(|| {
-                paro_error::internal("perfect aggregate global table disappeared during merge")
-            })?;
-            let local_table = local_table.as_mut().ok_or_else(|| {
-                paro_error::internal("perfect aggregate local table was already adopted")
-            })?;
-            global_table.combine(local_table)
+            global.pending_tables.push(local_table);
+            Ok(())
         })?;
-        if let Some(mut local_table) = local_table {
-            local_table.destroy()?;
-        }
         Ok(MergePoll::Done)
     }
 
@@ -194,10 +189,20 @@ impl PerfectHashAggregateSinkExec {
 
     pub(crate) fn finish_work(
         &self,
-        _ctx: &mut OperatorFinishContext,
-        _global: &SinkGlobal,
+        ctx: &mut OperatorFinishContext,
+        global: &SinkGlobal,
     ) -> Result<FinishWork> {
-        Ok(FinishWork::None)
+        let SinkGlobal::PerfectHashAggregate(global) = global else {
+            return Err(paro_error::internal(
+                "perfect aggregate sink global state mismatch",
+            ));
+        };
+        prepare_parallel_perfect_merge(
+            global.handle.clone(),
+            ctx.query.session.number_of_threads().max(1),
+            super::emit::compile_state_filter(&self.spec)?,
+            query_perfect_hash_memory(ctx.query),
+        )
     }
 
     pub(crate) fn finish(
@@ -216,6 +221,12 @@ impl PerfectHashAggregateSinkExec {
                     "aggregate handle does not contain perfect aggregate state",
                 ));
             };
+            if !global.pending_tables.is_empty() {
+                return Err(paro_error::internal(format!(
+                    "perfect aggregate finish left {} local tables unmerged",
+                    global.pending_tables.len()
+                )));
+            }
             if global.table.is_none() {
                 global.table = Some(create_perfect_aggregate_table(
                     &self.spec,

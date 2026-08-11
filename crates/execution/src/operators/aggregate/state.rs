@@ -106,14 +106,6 @@ impl Drop for UngroupedAggregateEmitSourceLocal {
     }
 }
 
-impl Drop for PerfectHashAggregateEmitSourceLocal {
-    fn drop(&mut self) {
-        if let Some(table) = self.table.as_mut() {
-            let _ = table.destroy();
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct HashAggregateBuildSinkLocal {
     pub aggregate_objects: Arc<[AggregateObject]>,

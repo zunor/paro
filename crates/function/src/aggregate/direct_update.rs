@@ -10,12 +10,85 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{
     AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
 };
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef, Vector, VECTOR_SIZE};
 use smallvec::SmallVec;
 
 use super::distributive::decimal::{DecimalAverageState, DecimalNarrowState, DecimalSumState};
-use super::{AggregateDirectUpdate, AggregateStateInput, DecimalDirectUpdate};
+use super::{
+    AggregateComparison, AggregateDirectUpdate, AggregateFunction, AggregateStateInput,
+    DecimalDirectUpdate,
+};
+
+/// Comparison compiled once for direct-address aggregate state traversal.
+///
+/// This capability is intentionally narrower than [`super::AggregateStateFilterFn`]:
+/// it admits only fixed-width states whose validation and comparison can be
+/// performed from one state address without vector materialization.
+#[derive(Debug, Clone)]
+pub struct PreparedDirectAggregateStatePredicate {
+    comparison: AggregateComparison,
+    constant: i128,
+    output_limit: i128,
+    output_precision: u8,
+}
+
+impl PreparedDirectAggregateStatePredicate {
+    pub(super) fn decimal_narrow_sum(
+        comparison: AggregateComparison,
+        constant: i128,
+        output_limit: i128,
+        output_precision: u8,
+    ) -> Self {
+        Self {
+            comparison,
+            constant,
+            output_limit,
+            output_precision,
+        }
+    }
+
+    /// Evaluate one initialized aggregate state.
+    ///
+    /// # Safety
+    ///
+    /// `state` must point to the bound fixed-width state used to prepare this
+    /// predicate and remain live for the duration of the call.
+    #[inline(always)]
+    pub unsafe fn matches(&self, state: *const u8) -> Result<bool> {
+        let state = unsafe { &*state.cast::<DecimalNarrowState>() };
+        if !state.is_set() {
+            return Ok(false);
+        }
+        if state.overflowed() {
+            return Err(paro_error::out_of_range("Decimal SUM aggregate overflow"));
+        }
+        let value = state.value();
+        if value.unsigned_abs() >= self.output_limit as u128 {
+            return Err(paro_error::out_of_range(format!(
+                "Decimal SUM result exceeds precision {}",
+                self.output_precision
+            )));
+        }
+        Ok(match self.comparison {
+            AggregateComparison::Equal => value == self.constant,
+            AggregateComparison::NotEqual => value != self.constant,
+            AggregateComparison::LessThan => value < self.constant,
+            AggregateComparison::GreaterThan => value > self.constant,
+            AggregateComparison::LessThanOrEqual => value <= self.constant,
+            AggregateComparison::GreaterThanOrEqual => value >= self.constant,
+        })
+    }
+}
+
+pub fn prepare_direct_state_predicate(
+    function: &AggregateFunction,
+    comparison: AggregateComparison,
+    constant: &Value,
+) -> Result<Option<PreparedDirectAggregateStatePredicate>> {
+    super::distributive::decimal::prepare_direct_state_predicate(function, comparison, constant)
+}
 
 #[derive(Debug, Clone)]
 struct DirectDecimalInputUpdates {
@@ -55,8 +128,8 @@ pub struct DirectGroupedAggregateProgram {
 /// Batch-local accumulators for a small direct-addressing group domain.
 ///
 /// The scratch is fully grant-accounted and bounded to one vector of group
-/// slots. Larger domains keep the row-at-a-time direct update path rather than
-/// paying to initialize sparse temporary state.
+/// slots. Larger domains use the allocation-free run reducer rather than
+/// paying to initialize sparse domain-sized temporary state.
 #[derive(Debug)]
 pub struct DirectGroupedAggregateScratch {
     slot_count: usize,
@@ -278,6 +351,72 @@ impl DirectGroupedAggregateProgram {
         self.update_count == self.handled.len()
     }
 
+    /// Whether every compiled aggregate can combine two same-slot state rows
+    /// without materializing address vectors through the generic ABI.
+    pub fn supports_direct_combine(&self) -> bool {
+        self.handles_all()
+            && self
+                .decimal_inputs
+                .iter()
+                .all(|source| source.averages.is_empty())
+    }
+
+    /// Whether a complete initialized state row can be byte-copied into
+    /// uninitialized storage without creating shared ownership.
+    ///
+    /// The admitted states are fixed-width counts and DECIMAL sums. They own
+    /// no allocator-backed payload and their combine implementation already
+    /// covers every aggregate in the row.
+    pub fn supports_trivial_state_copy(&self) -> bool {
+        self.supports_direct_combine()
+    }
+
+    /// Combine one pair of same-layout aggregate state rows directly.
+    ///
+    /// Returning `false` means no state was modified and the caller must use
+    /// the generic aggregate combine ABI.
+    ///
+    /// # Safety
+    ///
+    /// `source` and `target` must point to initialized rows compiled for this
+    /// program. They must not overlap and the caller must own `target`.
+    #[inline(always)]
+    pub unsafe fn combine_direct_rows(&self, source: *const u8, target: *mut u8) -> bool {
+        if !self.supports_direct_combine() {
+            return false;
+        }
+        for &offset in &self.count_star_offsets {
+            let source = unsafe { *source.add(offset).cast::<i64>() };
+            let target = unsafe { &mut *target.add(offset).cast::<i64>() };
+            *target += source;
+        }
+        for decimal in &self.decimal_inputs {
+            match &decimal.sums {
+                DirectDecimalSums::Narrow(offsets) => {
+                    for &offset in offsets {
+                        let source = unsafe { &*source.add(offset).cast::<DecimalNarrowState>() };
+                        let target =
+                            unsafe { &mut *target.add(offset).cast::<DecimalNarrowState>() };
+                        if source.overflowed() {
+                            target.mark_overflowed();
+                        } else if source.is_set() {
+                            target.add(source.value());
+                        }
+                    }
+                }
+                DirectDecimalSums::Wide(offsets) => {
+                    for &offset in offsets {
+                        let source = unsafe { &*source.add(offset).cast::<DecimalSumState>() };
+                        let target = unsafe { &mut *target.add(offset).cast::<DecimalSumState>() };
+                        target.add_state(source);
+                    }
+                }
+                DirectDecimalSums::None => {}
+            }
+        }
+        true
+    }
+
     /// Validate and decode every direct input before grouped state is mutated.
     ///
     /// Execution can retain this opaque view across group lookup, avoiding a
@@ -311,6 +450,20 @@ impl DirectGroupedAggregateProgram {
             .checked_add(std::mem::size_of::<usize>())?
             .checked_mul(slot_count)?
             .checked_add(slot_count.checked_mul(std::mem::size_of::<usize>())?)
+    }
+
+    /// Batch-local storage required to materialize a canonical slot stream.
+    ///
+    /// A complete direct program consumes each encoded group slot during both
+    /// occupancy handling and aggregate reduction. Materializing once avoids
+    /// replaying potentially expensive key codecs while keeping the storage
+    /// bounded by vector capacity rather than the group domain.
+    pub fn materialized_slot_bytes(&self) -> Option<usize> {
+        if self.handles_all() {
+            VECTOR_SIZE.checked_mul(std::mem::size_of::<usize>())
+        } else {
+            Some(0)
+        }
     }
 
     pub fn try_create_scratch(
@@ -484,6 +637,41 @@ impl DirectGroupedAggregateProgram {
         }
     }
 
+    /// Collapse a materialized slot batch and initialize each touched state
+    /// before its first reduced update.
+    ///
+    /// # Safety
+    ///
+    /// The state allocation and initializer must satisfy the contract of
+    /// `execute_reduced_slot_source_prepared`.
+    pub unsafe fn execute_reduced_slots_prepared_with_initializer<F>(
+        &self,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        slots: &ValidatedDirectGroupSlots<'_>,
+        scratch: &mut DirectGroupedAggregateScratch,
+        state_base: *mut u8,
+        state_stride: usize,
+        initialize_slot: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(usize, *mut u8),
+    {
+        let mut source = ValidatedSlotSource {
+            slots: slots.as_slice(),
+            slot_count: slots.slot_count,
+        };
+        unsafe {
+            self.execute_reduced_slot_source_prepared(
+                inputs,
+                &mut source,
+                scratch,
+                state_base,
+                state_stride,
+                initialize_slot,
+            )
+        }
+    }
+
     /// Collapse a replayable slot stream and update direct-addressing states.
     ///
     /// `initialize_slot` runs exactly once for every non-empty reduced slot,
@@ -541,6 +729,148 @@ impl DirectGroupedAggregateProgram {
         }
         scratch.touched_slots.clear();
         Ok(true)
+    }
+
+    /// Reduce consecutive equal slots without allocating domain-sized scratch.
+    ///
+    /// This is the complete direct-update path for large perfect domains. It
+    /// preserves arbitrary input order—non-clustered keys simply form runs of
+    /// length one—while clustered analytical keys write aggregate state once
+    /// per run instead of once per row.
+    ///
+    /// # Safety
+    ///
+    /// `state_base + slot * state_stride` must provide one writable state row
+    /// for the complete source domain. `initialize_slot` must establish valid
+    /// state before the callback returns when the slot was previously empty.
+    pub unsafe fn execute_run_reduced_slot_source_prepared<S, F>(
+        &self,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        slot_source: &mut S,
+        state_base: *mut u8,
+        state_stride: usize,
+        mut initialize_slot: F,
+    ) -> Result<bool>
+    where
+        S: DirectGroupSlotSource,
+        F: FnMut(usize, *mut u8),
+    {
+        if !self.handles_all() || inputs.len() != self.decimal_inputs.len() {
+            return Ok(false);
+        }
+        if slot_source.is_empty() {
+            return Ok(true);
+        }
+
+        let mut run_start = 0usize;
+        let mut run_slot = slot_source.slot_at(0)?;
+        for row in 1..=slot_source.len() {
+            let next_slot = if row < slot_source.len() {
+                Some(slot_source.slot_at(row)?)
+            } else {
+                None
+            };
+            if next_slot == Some(run_slot) {
+                continue;
+            }
+            let base = unsafe { state_base.add(run_slot * state_stride) };
+            initialize_slot(run_slot, base);
+            unsafe { self.apply_direct_run(inputs, run_start..row, base) };
+            if let Some(slot) = next_slot {
+                run_start = row;
+                run_slot = slot;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Run-reduce a materialized, already validated slot batch.
+    ///
+    /// # Safety
+    ///
+    /// The state allocation and initializer must satisfy the same contract as
+    /// `execute_run_reduced_slot_source_prepared`.
+    pub unsafe fn execute_run_reduced_slots_prepared<F>(
+        &self,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        slots: &ValidatedDirectGroupSlots<'_>,
+        state_base: *mut u8,
+        state_stride: usize,
+        initialize_slot: F,
+    ) -> Result<bool>
+    where
+        F: FnMut(usize, *mut u8),
+    {
+        let mut source = ValidatedSlotSource {
+            slots: slots.as_slice(),
+            slot_count: slots.slot_count,
+        };
+        unsafe {
+            self.execute_run_reduced_slot_source_prepared(
+                inputs,
+                &mut source,
+                state_base,
+                state_stride,
+                initialize_slot,
+            )
+        }
+    }
+
+    unsafe fn apply_direct_run(
+        &self,
+        inputs: &PreparedDirectGroupedAggregateInput<'_>,
+        rows: std::ops::Range<usize>,
+        base: *mut u8,
+    ) {
+        let row_count = rows.len();
+        for &state_offset in &self.count_star_offsets {
+            unsafe { *base.add(state_offset).cast::<i64>() += row_count as i64 };
+        }
+        for (source_idx, source) in self.decimal_inputs.iter().enumerate() {
+            match source.width {
+                DirectDecimalWidth::I64 => {
+                    let mut sum = 0_i128;
+                    for row in rows.clone() {
+                        let physical_row = inputs.shared_physical_row(row);
+                        sum +=
+                            i128::from(unsafe { inputs.value_i64(source_idx, row, physical_row) });
+                    }
+                    if let DirectDecimalSums::Narrow(offsets) = &source.sums {
+                        for &state_offset in offsets {
+                            let state = unsafe {
+                                &mut *base.add(state_offset).cast::<DecimalNarrowState>()
+                            };
+                            state.add_direct_i128(sum);
+                        }
+                    }
+                    for &state_offset in &source.averages {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                        state.update_direct_i128(sum, row_count as u64);
+                    }
+                }
+                DirectDecimalWidth::I128 => {
+                    let mut sum = i256::ZERO;
+                    for row in rows.clone() {
+                        let physical_row = inputs.shared_physical_row(row);
+                        sum +=
+                            i256::from(unsafe { inputs.value_i128(source_idx, row, physical_row) });
+                    }
+                    if let DirectDecimalSums::Wide(offsets) = &source.sums {
+                        for &state_offset in offsets {
+                            let state =
+                                unsafe { &mut *base.add(state_offset).cast::<DecimalSumState>() };
+                            state.add_direct_i256(sum);
+                        }
+                    }
+                    for &state_offset in &source.averages {
+                        let state =
+                            unsafe { &mut *base.add(state_offset).cast::<DecimalAverageState>() };
+                        state.update_direct_i256(sum, row_count as u64);
+                    }
+                }
+            }
+        }
     }
 
     #[inline]

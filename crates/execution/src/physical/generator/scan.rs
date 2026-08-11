@@ -139,18 +139,13 @@ impl PhysicalPlanGenerator {
         filter: &LogicalFilter,
         filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
-        if filter
-            .projection_map
-            .is_identity(filter.child.types().len())
-        {
-            if let LogicalOperator::Aggregate(aggregate) = &filter.child.operator {
-                if let Some(having_filter) = rebase_aggregate_only_filter(
-                    filter.expressions.clone(),
-                    aggregate.groups.len(),
-                    aggregate.aggregates.len(),
-                ) {
-                    return self.lower_aggregate_with_having(aggregate, having_filter);
-                }
+        if let LogicalOperator::Aggregate(aggregate) = &filter.child.operator {
+            if let Some(having_filter) = rebase_aggregate_only_filter(
+                filter.expressions.clone(),
+                aggregate.groups.len(),
+                aggregate.aggregates.len(),
+            ) {
+                return self.lower_aggregate_filter(filter, aggregate, having_filter);
             }
         }
         if self.ctx.rowset_scan_pushdown {
@@ -178,6 +173,69 @@ impl PhysicalPlanGenerator {
                 .into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Filter(spec), vec![child]))
+    }
+
+    /// Attach aggregate-only HAVING predicates to the aggregate emit path
+    /// while preserving the filter's independently derived output projection.
+    ///
+    /// HAVING dependencies and output dependencies are deliberately separate:
+    /// column lifetime analysis may remove an aggregate value from the parent
+    /// layout even though the value is still required to decide whether a
+    /// group survives. The aggregate owns that predicate; a projection above
+    /// it owns the final carrier shape.
+    fn lower_aggregate_filter(
+        &mut self,
+        filter: &LogicalFilter,
+        aggregate: &LogicalAggregate,
+        having_filter: Box<[Expression]>,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        let aggregate_width = aggregate.returned_types.len();
+        let projection = filter.projection_map.to_indices(aggregate_width);
+        let (aggregate_kind, aggregate_children) =
+            self.lower_aggregate_with_having(aggregate, having_filter)?;
+        if filter.projection_map.is_identity(aggregate_width) {
+            return Ok((aggregate_kind, aggregate_children));
+        }
+
+        let aggregate_output =
+            physical_output_row_type_for_kind(filter.child.as_ref(), &aggregate_kind)?;
+        let aggregate_label = OperatorLabel::new(filter.child.id, aggregate_kind.name());
+        let aggregate_id = self.push_node(
+            aggregate_kind,
+            aggregate_output,
+            aggregate_children,
+            aggregate_label,
+            filter.child.stats.estimated_cardinality,
+        );
+
+        let expressions = projection
+            .iter()
+            .map(|&index| {
+                aggregate
+                    .returned_types
+                    .get(index)
+                    .cloned()
+                    .map(|ty| Expression::Reference(ReferenceExpression::new(index, ty)))
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "aggregate HAVING projection index {index} is out of bounds for {aggregate_width} columns"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_names = project_by_index(
+            &filter.child.output_names(),
+            &projection,
+            "aggregate HAVING output",
+        )?;
+        Ok((
+            PhysicalNodeKind::Project(ProjectSpec {
+                table_index: aggregate.group_index,
+                expressions: expressions.into_boxed_slice(),
+                output_names: output_names.into_boxed_slice(),
+            }),
+            vec![aggregate_id],
+        ))
     }
 
     fn lower_filter_over_get(
