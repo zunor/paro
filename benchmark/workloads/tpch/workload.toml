@@ -5,6 +5,10 @@
 name = "tpch"
 description = "TPC-H analytical query performance"
 run_order = 90
+
+# The ordered_digest_v1 oracles were audited row-for-row against DuckDB 1.4.4
+# at SF1. In particular q02/q10/q13/q15/q20 contain 100/20/42/1/186 rows and
+# match DuckDB exactly; their earlier hashes were stale workload metadata.
 minimum_server_buffer_pool = "2GiB"
 
 [params]

@@ -25,8 +25,11 @@ impl ExpressionExecutor {
         result: &mut Chunk,
         shared: &mut SharedEvaluation<'_>,
     ) -> Result<bool> {
-        let Some(PhysicalExpression::Function(producer)) = shared.nodes.get(chain.shared_slot)
-        else {
+        let nodes = shared.nodes;
+        let shared_states = shared.states;
+        let epoch = shared.epoch;
+        let slots = &mut *shared.slots;
+        let Some(PhysicalExpression::Function(producer)) = nodes.get(chain.shared_slot) else {
             return Ok(false);
         };
         let PhysicalExpression::Function(consumer) = physical.root(chain.consumer_output) else {
@@ -38,11 +41,17 @@ impl ExpressionExecutor {
         else {
             return Ok(false);
         };
-        let Some(producer_state_slot) = shared.states.get(chain.shared_slot).cloned() else {
+        let Some(producer_state_slot) = shared_states.get(chain.shared_slot) else {
             return Ok(false);
         };
-        let Some(mut producer_state) = SharedStateLease::take(&producer_state_slot) else {
+        let Some(mut producer_state) = SharedStateLease::take(producer_state_slot) else {
             return Ok(false);
+        };
+        let mut nested = SharedEvaluation {
+            nodes,
+            states: shared_states,
+            slots,
+            epoch,
         };
 
         let CompiledExpressionState::Function(producer_state) = producer_state.state_mut() else {
@@ -74,7 +83,7 @@ impl ExpressionExecutor {
             input.count,
             runtime,
             input.params,
-            shared,
+            &mut nested,
         )?;
         let producer_inner = Self::execute_value(
             &producer.children[1],
@@ -84,7 +93,7 @@ impl ExpressionExecutor {
             input.count,
             runtime,
             input.params,
-            shared,
+            &mut nested,
         )?;
         let consumer_other = Self::execute_value(
             &consumer.children[consumer_other_idx],
@@ -94,7 +103,7 @@ impl ExpressionExecutor {
             input.count,
             runtime,
             input.params,
-            shared,
+            &mut nested,
         )?;
 
         let (producer_result, consumer_result) = two_output_vectors(
@@ -114,8 +123,8 @@ impl ExpressionExecutor {
         if executed {
             producer_result.set_len(input.count);
             consumer_result.set_len(input.count);
-            let signature = shared.signature(input.selection, input.count);
-            let slot = shared.slots.get_mut(chain.shared_slot).ok_or_else(|| {
+            let signature = nested.signature(input.selection, input.count);
+            let slot = nested.slots.get_mut(chain.shared_slot).ok_or_else(|| {
                 paro_error::internal("shared expression scratch slot out of bounds")
             })?;
             slot.value.set_value(producer_result.reference());

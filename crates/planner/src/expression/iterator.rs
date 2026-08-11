@@ -15,9 +15,9 @@ impl ExpressionIterator {
     /// Visit an expression tree in pre-order with explicit subtree pruning.
     /// All child enumeration remains centralized here, so adding an expression
     /// variant cannot silently omit it from downstream analyses.
-    pub fn visit(
-        expr: &Expression,
-        visitor: &mut impl FnMut(&Expression) -> ExpressionVisitDecision,
+    pub fn visit<'a>(
+        expr: &'a Expression,
+        visitor: &mut impl FnMut(&'a Expression) -> ExpressionVisitDecision,
     ) {
         if visitor(expr) == ExpressionVisitDecision::SkipChildren {
             return;
@@ -25,7 +25,7 @@ impl ExpressionIterator {
         Self::enumerate_children(expr, |child| Self::visit(child, visitor));
     }
 
-    pub fn enumerate_children(expr: &Expression, mut f: impl FnMut(&Expression)) {
+    pub fn enumerate_children<'a>(expr: &'a Expression, mut f: impl FnMut(&'a Expression)) {
         match expr {
             Expression::Aggregate(e) => {
                 for child in &e.children {
@@ -135,7 +135,10 @@ impl ExpressionIterator {
         }
     }
 
-    pub fn enumerate_window_children(window: &WindowExpression, mut f: impl FnMut(&Expression)) {
+    pub fn enumerate_window_children<'a>(
+        window: &'a WindowExpression,
+        mut f: impl FnMut(&'a Expression),
+    ) {
         for child in &window.children {
             f(child);
         }

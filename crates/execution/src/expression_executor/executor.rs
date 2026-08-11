@@ -5,11 +5,12 @@
 
 mod fusion;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
+use std::fmt;
 use std::sync::Arc;
 
-use parking_lot::Mutex;
+use smallvec::SmallVec;
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
@@ -59,7 +60,7 @@ pub struct CompiledExpressionProgram {
 #[derive(Debug)]
 pub struct CompiledExecutorState {
     states: Vec<CompiledExpressionState>,
-    shared_states: Vec<Arc<Mutex<Option<CompiledExpressionState>>>>,
+    shared_states: Vec<SharedStateSlot>,
     shared_slots: Vec<SharedExpressionSlot>,
     batch_epoch: u64,
 }
@@ -70,8 +71,8 @@ impl CompiledExecutorState {
             state.release_batch_references();
         }
         for state in &self.shared_states {
-            if let Some(state) = state.lock().as_mut() {
-                state.release_batch_references();
+            if let Some(mut state) = SharedStateLease::take(state) {
+                state.state_mut().release_batch_references();
             }
         }
         for slot in &mut self.shared_slots {
@@ -93,6 +94,31 @@ pub struct VectorKernelInput<'a> {
     pub params: Option<&'a ParameterBindings>,
     pub selection: Option<&'a SelectionVector>,
     pub count: usize,
+}
+
+struct FusedOutputSet {
+    outputs: SmallVec<[bool; 64]>,
+}
+
+impl FusedOutputSet {
+    fn new(output_count: usize) -> Self {
+        let mut outputs = SmallVec::new();
+        outputs.resize(output_count, false);
+        Self { outputs }
+    }
+
+    fn pair_is_available(&self, first: usize, second: usize) -> bool {
+        !self.outputs[first] && !self.outputs[second]
+    }
+
+    fn mark_pair(&mut self, first: usize, second: usize) {
+        self.outputs[first] = true;
+        self.outputs[second] = true;
+    }
+
+    fn contains(&self, output: usize) -> bool {
+        self.outputs[output]
+    }
 }
 
 impl<'a> VectorKernelInput<'a> {
@@ -127,25 +153,39 @@ impl<'a> VectorKernelInput<'a> {
 
 struct SharedEvaluation<'a> {
     nodes: &'a [PhysicalExpression],
-    states: &'a [Arc<Mutex<Option<CompiledExpressionState>>>],
+    states: &'a [SharedStateSlot],
     slots: &'a mut [SharedExpressionSlot],
     epoch: u64,
 }
 
 /// Temporarily owns a shared expression state and restores it on every exit,
-/// including panic unwinding. The independently owned state slot lets nested
-/// evaluation borrow the rest of `SharedEvaluation` without raw pointers or
-/// an unwind fence in the vector hot path.
-struct SharedStateLease {
-    slot: Arc<Mutex<Option<CompiledExpressionState>>>,
+/// including panic unwinding. State cells and scratch slots are disjoint
+/// fields, so nested evaluation can reborrow the latter without a lock, raw
+/// pointer, or unwind fence in the vector hot path.
+struct SharedStateLease<'a> {
+    slot: &'a SharedStateSlot,
     state: Option<CompiledExpressionState>,
 }
 
-impl SharedStateLease {
-    fn take(slot: &Arc<Mutex<Option<CompiledExpressionState>>>) -> Option<Self> {
-        let state = slot.lock().take()?;
+struct SharedStateSlot(Cell<Option<CompiledExpressionState>>);
+
+impl SharedStateSlot {
+    fn new(state: CompiledExpressionState) -> Self {
+        Self(Cell::new(Some(state)))
+    }
+}
+
+impl fmt::Debug for SharedStateSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedStateSlot(..)")
+    }
+}
+
+impl<'a> SharedStateLease<'a> {
+    fn take(slot: &'a SharedStateSlot) -> Option<Self> {
+        let state = slot.0.take()?;
         Some(Self {
-            slot: Arc::clone(slot),
+            slot,
             state: Some(state),
         })
     }
@@ -157,13 +197,13 @@ impl SharedStateLease {
     }
 }
 
-impl Drop for SharedStateLease {
+impl Drop for SharedStateLease<'_> {
     fn drop(&mut self) {
-        let previous = self.slot.lock().replace(
+        let previous = self.slot.0.replace(Some(
             self.state
                 .take()
                 .expect("shared state lease always restores its state"),
-        );
+        ));
         debug_assert!(previous.is_none(), "shared state slot restored twice");
     }
 }
@@ -251,17 +291,24 @@ impl SharedEvaluation<'_> {
                 .write_into(result);
         }
 
-        let node = self
-            .nodes
+        let nodes = self.nodes;
+        let states = self.states;
+        let epoch = self.epoch;
+        let slots = &mut *self.slots;
+        let node = nodes
             .get(expr.slot)
             .ok_or_else(|| paro_error::internal("shared expression node out of bounds"))?;
-        let state_slot = self
-            .states
+        let state_slot = states
             .get(expr.slot)
-            .cloned()
             .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
-        let mut state = SharedStateLease::take(&state_slot)
+        let mut state = SharedStateLease::take(state_slot)
             .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
+        let mut nested = SharedEvaluation {
+            nodes,
+            states,
+            slots,
+            epoch,
+        };
         ExpressionExecutor::execute_into_inner(
             node,
             state.state_mut(),
@@ -271,11 +318,11 @@ impl SharedEvaluation<'_> {
             runtime,
             params,
             result,
-            self,
+            &mut nested,
         )?;
         drop(state);
 
-        let slot = self
+        let slot = nested
             .slots
             .get_mut(expr.slot)
             .ok_or_else(|| paro_error::internal("shared expression scratch slot out of bounds"))?;
@@ -294,13 +341,21 @@ impl SharedEvaluation<'_> {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let state_slot = self
-            .states
+        let nodes = self.nodes;
+        let states = self.states;
+        let epoch = self.epoch;
+        let slots = &mut *self.slots;
+        let state_slot = states
             .get(slot)
-            .cloned()
             .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
-        let mut state = SharedStateLease::take(&state_slot)
+        let mut state = SharedStateLease::take(state_slot)
             .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
+        let mut nested = SharedEvaluation {
+            nodes,
+            states,
+            slots,
+            epoch,
+        };
         ExpressionExecutor::execute_value(
             node,
             state.state_mut(),
@@ -309,7 +364,7 @@ impl SharedEvaluation<'_> {
             count,
             runtime,
             params,
-            self,
+            &mut nested,
         )
     }
 }
@@ -415,11 +470,7 @@ impl ExpressionExecutor {
             .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
             .collect();
         let shared_states = (0..physical.shared_expression_count())
-            .map(|slot| {
-                Arc::new(Mutex::new(Some(Self::initialize(
-                    physical.shared_node(slot),
-                ))))
-            })
+            .map(|slot| SharedStateSlot::new(Self::initialize(physical.shared_node(slot))))
             .collect();
         let shared_slots = physical
             .scratch_layout()
@@ -612,16 +663,11 @@ impl ExpressionExecutor {
                 epoch: *batch_epoch,
             };
             (|| {
-                let mut fused_output_mask = 0_u64;
+                let mut fused_outputs = FusedOutputSet::new(physical.root_count());
                 for chain in physical.decimal_factor_chains() {
-                    if chain.producer_output >= u64::BITS as usize
-                        || chain.consumer_output >= u64::BITS as usize
+                    if !fused_outputs
+                        .pair_is_available(chain.producer_output, chain.consumer_output)
                     {
-                        continue;
-                    }
-                    let chain_mask =
-                        (1_u64 << chain.producer_output) | (1_u64 << chain.consumer_output);
-                    if fused_output_mask & chain_mask != 0 {
                         continue;
                     }
                     if Self::try_execute_decimal_factor_chain(
@@ -633,12 +679,11 @@ impl ExpressionExecutor {
                         result,
                         &mut shared,
                     )? {
-                        fused_output_mask |= chain_mask;
+                        fused_outputs.mark_pair(chain.producer_output, chain.consumer_output);
                     }
                 }
                 for expr_idx in 0..physical.root_count() {
-                    if expr_idx < u64::BITS as usize && fused_output_mask & (1_u64 << expr_idx) != 0
-                    {
+                    if fused_outputs.contains(expr_idx) {
                         continue;
                     }
                     let first_output = physical.root_first_output(expr_idx);
@@ -4576,6 +4621,34 @@ mod tests {
         assert!(cache.contains_program(std::slice::from_ref(&keep), &version));
         assert!(cache.contains_program(std::slice::from_ref(&insert), &version));
         assert!(!cache.contains_program(std::slice::from_ref(&evict), &version));
+    }
+
+    #[test]
+    fn expression_program_cache_rejects_identities_larger_than_its_node_budget() {
+        let expr = greater_than_i32(0, 10);
+        let version = ExpressionProgramVersion::anonymous();
+        let mut cache =
+            crate::expression_executor::physical::ExpressionProgramCache::with_limits(16, 1);
+
+        let first = cache.get_or_compile(std::slice::from_ref(&expr), version.clone());
+        let second = cache.get_or_compile(std::slice::from_ref(&expr), version);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn fused_output_set_tracks_wide_projections_without_a_fixed_bit_limit() {
+        let mut outputs = FusedOutputSet::new(130);
+
+        assert!(outputs.pair_is_available(64, 129));
+        outputs.mark_pair(64, 129);
+
+        assert!(outputs.contains(64));
+        assert!(outputs.contains(129));
+        assert!(!outputs.pair_is_available(0, 64));
     }
 
     #[test]

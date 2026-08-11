@@ -8,30 +8,31 @@
 //! separate backends behind the same program/cache versioning later.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
 use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_function::scalar::cast::{BoundCastInfo, CastContextDependency, CastDispatch};
+use paro_function::scalar::cast::BoundCastInfo;
 use paro_function::scalar::operators::arithmetic::{try_decimal_factor_fusion, DecimalOperandSide};
-use paro_function::scalar::{
-    BoundScalarFunction, DictionaryStrategy, FunctionErrorMode, FunctionNullHandling,
-    FunctionSideEffects, FunctionStability, ScalarDispatch,
-};
+use paro_function::scalar::{BoundScalarFunction, FunctionSideEffects, FunctionStability};
 use paro_planner::expression::{
     ComparisonType, ConjunctionType, Expression, ExpressionIterator, ExpressionVisitDecision,
     OperatorType,
 };
 
+mod fingerprint;
 mod fusion;
 mod identity;
 
+use fingerprint::ExpressionFingerprintCatalog;
+pub use fingerprint::{expression_fingerprint, expression_list_fingerprints};
 use fusion::compile_decimal_factor_chains;
 pub use fusion::PhysicalDecimalFactorChain;
-use identity::{ExpressionIdentity, ExpressionIdentityMap, ExpressionIdentitySet};
+use identity::{
+    ExpressionIdentity, ExpressionIdentityRef, ExpressionIdentityRefMap, ExpressionIdentityRefSet,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpressionBackend {
@@ -70,6 +71,7 @@ impl ExpressionProgramVersion {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ExpressionProgramCacheBucketKey {
     root_fingerprints: Box<[u64]>,
+    retained_identity_nodes: usize,
     backend: ExpressionBackend,
     physical_semantics_version: u32,
     visible_generation: u64,
@@ -82,12 +84,17 @@ impl ExpressionProgramCacheBucketKey {
     }
 
     fn from_expressions<'a>(
-        exprs: impl Iterator<Item = &'a Expression>,
+        exprs: impl Iterator<Item = &'a Expression> + Clone,
         version: &ExpressionProgramVersion,
     ) -> Self {
-        let root_fingerprints = exprs.map(expression_fingerprint).collect::<Vec<_>>();
+        let catalog = ExpressionFingerprintCatalog::from_expressions(exprs.clone());
+        let retained_identity_nodes = catalog.retained_nodes(exprs.clone());
+        let root_fingerprints = exprs
+            .map(|expression| catalog.fingerprint(expression))
+            .collect::<Vec<_>>();
         Self {
             root_fingerprints: root_fingerprints.into_boxed_slice(),
+            retained_identity_nodes,
             backend: version.backend,
             physical_semantics_version: version.physical_semantics_version,
             visible_generation: version.visible_generation,
@@ -97,14 +104,17 @@ impl ExpressionProgramCacheBucketKey {
 }
 
 const DEFAULT_PROGRAM_CACHE_LIMIT: usize = 4096;
+const DEFAULT_PROGRAM_CACHE_IDENTITY_NODE_LIMIT: usize = 262_144;
 
 #[derive(Debug)]
 pub struct ExpressionProgramCache {
     programs: HashMap<ExpressionProgramCacheBucketKey, Vec<CachedProgramEntry>>,
     lru: VecDeque<(ExpressionProgramCacheBucketKey, u64, u64)>,
     entry_count: usize,
+    retained_identity_nodes: usize,
     next_entry_id: u64,
     max_entries: usize,
+    max_identity_nodes: usize,
     access_epoch: u64,
     hits: u64,
     misses: u64,
@@ -114,24 +124,34 @@ pub struct ExpressionProgramCache {
 struct CachedProgramEntry {
     id: u64,
     root_identities: Box<[ExpressionIdentity]>,
+    retained_identity_nodes: usize,
     program: Arc<PhysicalExpressionProgram>,
     epoch: u64,
 }
 
 impl Default for ExpressionProgramCache {
     fn default() -> Self {
-        Self::with_capacity_limit(DEFAULT_PROGRAM_CACHE_LIMIT)
+        Self::with_limits(
+            DEFAULT_PROGRAM_CACHE_LIMIT,
+            DEFAULT_PROGRAM_CACHE_IDENTITY_NODE_LIMIT,
+        )
     }
 }
 
 impl ExpressionProgramCache {
     pub fn with_capacity_limit(max_entries: usize) -> Self {
+        Self::with_limits(max_entries, max_entries.saturating_mul(64).max(1))
+    }
+
+    pub fn with_limits(max_entries: usize, max_identity_nodes: usize) -> Self {
         Self {
             programs: HashMap::new(),
             lru: VecDeque::new(),
             entry_count: 0,
+            retained_identity_nodes: 0,
             next_entry_id: 0,
             max_entries: max_entries.max(1),
+            max_identity_nodes: max_identity_nodes.max(1),
             access_epoch: 0,
             hits: 0,
             misses: 0,
@@ -146,7 +166,8 @@ impl ExpressionProgramCache {
         let key = ExpressionProgramCacheBucketKey::new(exprs, &version);
         let identities = exprs
             .iter()
-            .map(ExpressionIdentity::new)
+            .zip(key.root_fingerprints.iter().copied())
+            .map(|(expression, fingerprint)| ExpressionIdentityRef::new(expression, fingerprint))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.get_or_compile_with(key, identities, |root_fingerprints| {
@@ -163,7 +184,8 @@ impl ExpressionProgramCache {
             ExpressionProgramCacheBucketKey::from_expressions(exprs.iter().copied(), &version);
         let identities = exprs
             .iter()
-            .map(|expr| ExpressionIdentity::new(expr))
+            .zip(key.root_fingerprints.iter().copied())
+            .map(|(expression, fingerprint)| ExpressionIdentityRef::new(expression, fingerprint))
             .collect::<Vec<_>>()
             .into_boxed_slice();
         self.get_or_compile_with(key, identities, |root_fingerprints| {
@@ -178,14 +200,14 @@ impl ExpressionProgramCache {
     fn get_or_compile_with(
         &mut self,
         key: ExpressionProgramCacheBucketKey,
-        root_identities: Box<[ExpressionIdentity]>,
+        root_identities: Box<[ExpressionIdentityRef<'_>]>,
         compile: impl FnOnce(Vec<u64>) -> PhysicalExpressionProgram,
     ) -> Arc<PhysicalExpressionProgram> {
         let epoch = self.next_epoch();
         if let Some(entry) = self.programs.get_mut(&key).and_then(|bucket| {
             bucket
                 .iter_mut()
-                .find(|entry| entry.root_identities == root_identities)
+                .find(|entry| identities_match(&entry.root_identities, &root_identities))
         }) {
             self.hits += 1;
             entry.epoch = epoch;
@@ -193,10 +215,15 @@ impl ExpressionProgramCache {
             let program = Arc::clone(&entry.program);
             self.lru.push_back((key, entry_id, epoch));
             self.compact_stale_lru_if_needed();
+            self.debug_assert_accounting();
             return program;
         }
         self.misses += 1;
         let program = Arc::new(compile(key.root_fingerprints.to_vec()));
+        if key.retained_identity_nodes > self.max_identity_nodes {
+            self.debug_assert_accounting();
+            return program;
+        }
         self.next_entry_id = self.next_entry_id.wrapping_add(1).max(1);
         let entry_id = self.next_entry_id;
         self.programs
@@ -204,14 +231,23 @@ impl ExpressionProgramCache {
             .or_default()
             .push(CachedProgramEntry {
                 id: entry_id,
-                root_identities,
+                root_identities: root_identities
+                    .iter()
+                    .copied()
+                    .map(ExpressionIdentity::snapshot)
+                    .collect(),
+                retained_identity_nodes: key.retained_identity_nodes,
                 program: Arc::clone(&program),
                 epoch,
             });
         self.entry_count += 1;
+        self.retained_identity_nodes = self
+            .retained_identity_nodes
+            .saturating_add(key.retained_identity_nodes);
         self.lru.push_back((key, entry_id, epoch));
         self.evict_over_limit();
         self.compact_stale_lru_if_needed();
+        self.debug_assert_accounting();
         program
     }
 
@@ -221,7 +257,9 @@ impl ExpressionProgramCache {
     }
 
     fn evict_over_limit(&mut self) {
-        while self.entry_count > self.max_entries {
+        while self.entry_count > self.max_entries
+            || self.retained_identity_nodes > self.max_identity_nodes
+        {
             let Some((victim, entry_id, epoch)) = self.lru.pop_front() else {
                 break;
             };
@@ -231,8 +269,11 @@ impl ExpressionProgramCache {
                     .iter()
                     .position(|entry| entry.id == entry_id && entry.epoch == epoch)
                 {
-                    bucket.swap_remove(index);
+                    let removed = bucket.swap_remove(index);
                     self.entry_count -= 1;
+                    self.retained_identity_nodes = self
+                        .retained_identity_nodes
+                        .saturating_sub(removed.retained_identity_nodes);
                 }
                 remove_bucket = bucket.is_empty();
             }
@@ -256,6 +297,23 @@ impl ExpressionProgramCache {
         self.lru = entries.into();
     }
 
+    fn debug_assert_accounting(&self) {
+        debug_assert_eq!(
+            self.entry_count,
+            self.programs.values().map(Vec::len).sum::<usize>(),
+            "expression program cache entry accounting diverged from bucket storage"
+        );
+        debug_assert_eq!(
+            self.retained_identity_nodes,
+            self.programs
+                .values()
+                .flatten()
+                .map(|entry| entry.retained_identity_nodes)
+                .sum::<usize>(),
+            "expression program cache identity-node accounting diverged from bucket storage"
+        );
+    }
+
     #[cfg(test)]
     pub fn contains_program(
         &self,
@@ -265,12 +323,13 @@ impl ExpressionProgramCache {
         let key = ExpressionProgramCacheBucketKey::new(exprs, version);
         let identities = exprs
             .iter()
-            .map(ExpressionIdentity::new)
+            .zip(key.root_fingerprints.iter().copied())
+            .map(|(expression, fingerprint)| ExpressionIdentityRef::new(expression, fingerprint))
             .collect::<Vec<_>>();
         self.programs.get(&key).is_some_and(|bucket| {
             bucket
                 .iter()
-                .any(|entry| entry.root_identities.as_ref() == identities)
+                .any(|entry| identities_match(&entry.root_identities, &identities))
         })
     }
 
@@ -289,283 +348,12 @@ impl ExpressionProgramCache {
     }
 }
 
-pub fn expression_list_fingerprints(exprs: &[Expression]) -> Vec<u64> {
-    exprs.iter().map(expression_fingerprint).collect()
-}
-
-pub fn expression_fingerprint(expr: &Expression) -> u64 {
-    let mut hasher = StableExpressionHasher::new();
-    hasher.hash_expression(expr);
-    hasher.finish()
-}
-
-struct StableExpressionHasher {
-    state: u64,
-}
-
-impl StableExpressionHasher {
-    fn new() -> Self {
-        Self {
-            state: 0xcbf29ce484222325,
-        }
-    }
-
-    fn finish(&self) -> u64 {
-        self.state
-    }
-
-    fn tag(&mut self, value: u8) {
-        self.write_u8(value);
-    }
-
-    fn hash_value<T: Hash>(&mut self, value: &T) {
-        value.hash(self);
-    }
-
-    fn hash_str_value(&mut self, value: &str) {
-        self.write_usize(value.len());
-        self.write(value.as_bytes());
-    }
-
-    fn hash_exprs(&mut self, exprs: &[Expression]) {
-        self.write_usize(exprs.len());
-        for expr in exprs {
-            self.hash_expression(expr);
-        }
-    }
-
-    fn hash_function(&mut self, function: &BoundScalarFunction) {
-        self.hash_str_value(&function.name);
-        self.hash_value(&function.arguments);
-        self.hash_value(&function.return_type);
-        self.hash_value(&function.varargs);
-        self.tag(function_stability_tag(function.stability));
-        self.tag(function_null_handling_tag(function.null_handling));
-        self.tag(function_side_effects_tag(function.side_effects));
-        self.tag(function_error_mode_tag(function.error_mode));
-        self.hash_dictionary_strategy(function.dictionary_strategy);
-        self.hash_scalar_dispatch(function.dispatch);
-        match function.init_local_state {
-            Some(init) => {
-                self.tag(1);
-                self.write_usize(init as usize);
-            }
-            None => self.tag(0),
-        }
-        match &function.bind_data {
-            Some(data) => {
-                self.tag(1);
-                self.write_u64(data.fingerprint());
-            }
-            None => self.tag(0),
-        }
-    }
-
-    fn hash_scalar_dispatch(&mut self, dispatch: ScalarDispatch) {
-        match dispatch {
-            ScalarDispatch::Direct(function) => {
-                self.tag(0);
-                self.write_usize(function as usize);
-            }
-            ScalarDispatch::Variadic(function) => {
-                self.tag(1);
-                self.write_usize(function as usize);
-            }
-        }
-    }
-
-    fn hash_dictionary_strategy(&mut self, strategy: DictionaryStrategy) {
-        match strategy {
-            DictionaryStrategy::Materialize => self.tag(0),
-            DictionaryStrategy::StorageDictionaryCache { input_idx } => {
-                self.tag(1);
-                self.write_usize(input_idx);
-            }
-        }
-    }
-
-    fn hash_cast(&mut self, cast: &BoundCastInfo) {
-        match cast.dispatch {
-            CastDispatch::Fixed(function) => {
-                self.tag(0);
-                self.write_usize(function as usize);
-            }
-            CastDispatch::Varlen(function) => {
-                self.tag(1);
-                self.write_usize(function as usize);
-            }
-            CastDispatch::Array(function) => {
-                self.tag(2);
-                self.write_usize(function as usize);
-            }
-            CastDispatch::Struct(function) => {
-                self.tag(3);
-                self.write_usize(function as usize);
-            }
-        }
-        self.tag(match cast.context_dependency() {
-            CastContextDependency::Independent => 0,
-            CastContextDependency::Runtime => 1,
-        });
-        match &cast.cast_data {
-            Some(data) => {
-                self.tag(1);
-                self.write_usize(Arc::as_ptr(data) as *const () as usize);
-            }
-            None => self.tag(0),
-        }
-    }
-
-    fn hash_expression(&mut self, expr: &Expression) {
-        match expr {
-            Expression::Constant(expr) => {
-                self.tag(0);
-                self.hash_value(&expr.return_type);
-                self.hash_value(&expr.value);
-            }
-            Expression::ColumnRef(expr) => {
-                self.tag(1);
-                self.hash_value(&expr.binding);
-                self.hash_value(&expr.return_type);
-                self.write_usize(expr.depth);
-            }
-            Expression::Function(expr) => {
-                self.tag(2);
-                self.hash_function(&expr.function);
-                self.hash_value(&expr.return_type);
-                self.hash_exprs(&expr.children);
-            }
-            Expression::Cast(expr) => {
-                self.tag(3);
-                self.hash_expression(&expr.child);
-                self.hash_value(&expr.target_type);
-                self.write_u8(u8::from(expr.try_cast));
-                self.hash_cast(&expr.cast_info);
-            }
-            Expression::Conjunction(expr) => {
-                self.tag(4);
-                self.tag(conjunction_tag(expr.conjunction_type));
-                self.hash_exprs(&expr.children);
-            }
-            Expression::Case(expr) => {
-                self.tag(5);
-                self.hash_expression(&expr.check);
-                self.hash_expression(&expr.result_if_true);
-                self.hash_expression(&expr.result_if_false);
-                self.hash_value(&expr.return_type);
-            }
-            Expression::Comparison(expr) => {
-                self.tag(6);
-                self.tag(comparison_tag(expr.comparison_type));
-                self.hash_expression(&expr.left);
-                self.hash_expression(&expr.right);
-            }
-            Expression::Operator(expr) => {
-                self.tag(7);
-                self.tag(operator_tag(expr.operator_type));
-                self.hash_value(&expr.return_type);
-                self.hash_exprs(&expr.children);
-            }
-            Expression::Parameter(expr) => {
-                self.tag(8);
-                self.write_usize(expr.slot.index.index());
-                self.hash_value(&expr.slot.ty);
-            }
-            Expression::Reference(expr) => {
-                self.tag(9);
-                self.write_usize(expr.index);
-                self.hash_value(&expr.return_type);
-            }
-            Expression::Aggregate(_) => {
-                self.tag(10);
-            }
-            Expression::Subquery(_) => {
-                self.tag(11);
-            }
-            Expression::Window(_) => {
-                self.tag(12);
-            }
-        }
-    }
-}
-
-impl Hasher for StableExpressionHasher {
-    fn finish(&self) -> u64 {
-        self.state
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= u64::from(*byte);
-            self.state = self.state.wrapping_mul(0x100000001b3);
-        }
-    }
-}
-
-fn function_stability_tag(value: FunctionStability) -> u8 {
-    match value {
-        FunctionStability::Consistent => 0,
-        FunctionStability::ConsistentWithinQuery => 1,
-        FunctionStability::Volatile => 2,
-    }
-}
-
-fn function_null_handling_tag(value: FunctionNullHandling) -> u8 {
-    match value {
-        FunctionNullHandling::DefaultNullHandling => 0,
-        FunctionNullHandling::SpecialHandling => 1,
-    }
-}
-
-fn function_side_effects_tag(value: FunctionSideEffects) -> u8 {
-    match value {
-        FunctionSideEffects::NoSideEffects => 0,
-        FunctionSideEffects::HasSideEffects => 1,
-    }
-}
-
-fn function_error_mode_tag(value: FunctionErrorMode) -> u8 {
-    match value {
-        FunctionErrorMode::CanError => 0,
-        FunctionErrorMode::Infallible => 1,
-    }
-}
-
-fn conjunction_tag(value: ConjunctionType) -> u8 {
-    match value {
-        ConjunctionType::And => 0,
-        ConjunctionType::Or => 1,
-    }
-}
-
-fn comparison_tag(value: ComparisonType) -> u8 {
-    match value {
-        ComparisonType::Equal => 0,
-        ComparisonType::NotEqual => 1,
-        ComparisonType::LessThan => 2,
-        ComparisonType::LessThanOrEqual => 3,
-        ComparisonType::GreaterThan => 4,
-        ComparisonType::GreaterThanOrEqual => 5,
-        ComparisonType::DistinctFrom => 6,
-        ComparisonType::NotDistinctFrom => 7,
-    }
-}
-
-fn operator_tag(value: OperatorType) -> u8 {
-    match value {
-        OperatorType::Not => 0,
-        OperatorType::IsNull => 1,
-        OperatorType::IsNotNull => 2,
-        OperatorType::Like => 3,
-        OperatorType::ILike => 4,
-        OperatorType::In => 5,
-        OperatorType::NotIn => 6,
-        OperatorType::Coalesce => 7,
-        OperatorType::ArrayConstructor => 8,
-        OperatorType::ArrayExtract => 9,
-        OperatorType::StructConstructor => 10,
-        OperatorType::ErrorIfMultipleRows => 11,
-    }
+fn identities_match(owned: &[ExpressionIdentity], borrowed: &[ExpressionIdentityRef<'_>]) -> bool {
+    owned.len() == borrowed.len()
+        && owned
+            .iter()
+            .zip(borrowed)
+            .all(|(owned, borrowed)| owned.matches(*borrowed))
 }
 
 #[derive(Debug, Clone)]
@@ -615,11 +403,13 @@ impl PhysicalExpressionProgram {
     where
         I: Iterator<Item = &'a Expression> + Clone,
     {
-        let shared_candidates = SharedExpressionCandidates::from_expressions(exprs.clone());
-        let mut compiler = ProgramCompiler::new(shared_candidates);
+        let exprs = exprs.collect::<Vec<_>>();
+        let fingerprints = ExpressionFingerprintCatalog::from_expressions(exprs.iter().copied());
+        let shared_candidates = SharedExpressionCandidates::from_expressions(&exprs, &fingerprints);
+        let mut compiler = ProgramCompiler::new(shared_candidates, &fingerprints);
         let mut root_to_unique = Vec::with_capacity(root_count);
         let mut root_first_output = Vec::with_capacity(root_count);
-        let mut unique_by_identity = ExpressionIdentityMap::default();
+        let mut unique_by_identity = ExpressionIdentityRefMap::default();
         let mut roots = Vec::new();
 
         debug_assert_eq!(root_count, root_fingerprints.len());
@@ -627,7 +417,7 @@ impl PhysicalExpressionProgram {
             let compiled = compiler.compile_expression(expr);
             if compiled.cse_safe {
                 let unique =
-                    *unique_by_identity.get_or_insert_with(ExpressionIdentity::new(expr), || {
+                    *unique_by_identity.get_or_insert_with(fingerprints.identity(expr), || {
                         roots.push(compiled.expr.clone());
                         roots.len() - 1
                     });
@@ -879,8 +669,9 @@ pub struct PhysicalSharedExpression {
     pub return_type: LogicalType,
 }
 
-struct ProgramCompiler {
-    shared_slots_by_identity: ExpressionIdentityMap<usize>,
+struct ProgramCompiler<'a> {
+    fingerprints: &'a ExpressionFingerprintCatalog,
+    shared_slots_by_identity: ExpressionIdentityRefMap<'a, usize>,
     shared_nodes: Vec<Option<PhysicalExpression>>,
     scratch_slots: Vec<ExpressionScratchSlot>,
     compiling_shared: HashSet<usize>,
@@ -891,9 +682,13 @@ struct CompiledExpr {
     cse_safe: bool,
 }
 
-impl ProgramCompiler {
-    fn new(shared_candidates: SharedExpressionCandidates) -> Self {
+impl<'a> ProgramCompiler<'a> {
+    fn new(
+        shared_candidates: SharedExpressionCandidates<'a>,
+        fingerprints: &'a ExpressionFingerprintCatalog,
+    ) -> Self {
         Self {
+            fingerprints,
             shared_slots_by_identity: shared_candidates.slots_by_identity,
             shared_nodes: vec![None; shared_candidates.slots.len()],
             scratch_slots: shared_candidates.slots,
@@ -901,9 +696,9 @@ impl ProgramCompiler {
         }
     }
 
-    fn compile_expression(&mut self, expr: &Expression) -> CompiledExpr {
-        let identity = ExpressionIdentity::new(expr);
-        if let Some(&slot) = self.shared_slots_by_identity.get(&identity) {
+    fn compile_expression(&mut self, expr: &'a Expression) -> CompiledExpr {
+        let identity = self.fingerprints.identity(expr);
+        if let Some(&slot) = self.shared_slots_by_identity.get(identity) {
             if !self.compiling_shared.contains(&slot) {
                 if self.shared_nodes[slot].is_none() {
                     self.compiling_shared.insert(slot);
@@ -923,7 +718,7 @@ impl ProgramCompiler {
         self.compile_expression_inner(expr)
     }
 
-    fn compile_expression_inner(&mut self, expr: &Expression) -> CompiledExpr {
+    fn compile_expression_inner(&mut self, expr: &'a Expression) -> CompiledExpr {
         match expr {
             Expression::Function(expr) => {
                 if let Some(fused) = self.try_compile_decimal_factor_fusion(expr) {
@@ -1069,7 +864,7 @@ impl ProgramCompiler {
 
     fn try_compile_decimal_factor_fusion(
         &mut self,
-        expr: &paro_planner::expression::FunctionExpression,
+        expr: &'a paro_planner::expression::FunctionExpression,
     ) -> Option<CompiledExpr> {
         if expr.children.len() != 2
             || expr.function.stability != FunctionStability::Consistent
@@ -1087,7 +882,7 @@ impl ProgramCompiler {
                 || nested.function.side_effects != FunctionSideEffects::NoSideEffects
                 || self
                     .shared_slots_by_identity
-                    .contains(&ExpressionIdentity::new(&expr.children[nested_idx]))
+                    .contains(self.fingerprints.identity(&expr.children[nested_idx]))
             {
                 continue;
             }
@@ -1129,19 +924,21 @@ impl ProgramCompiler {
     }
 }
 
-struct SharedExpressionCandidates {
-    slots_by_identity: ExpressionIdentityMap<usize>,
+struct SharedExpressionCandidates<'a> {
+    slots_by_identity: ExpressionIdentityRefMap<'a, usize>,
     slots: Vec<ExpressionScratchSlot>,
 }
 
-impl SharedExpressionCandidates {
-    fn from_expressions<'a>(exprs: impl Iterator<Item = &'a Expression>) -> Self {
-        let exprs = exprs.collect::<Vec<_>>();
-        let mut raw_counts = ExpressionIdentityMap::<(usize, LogicalType)>::default();
-        for expr in &exprs {
-            count_cse_candidates(expr, &mut raw_counts);
+impl<'a> SharedExpressionCandidates<'a> {
+    fn from_expressions(
+        exprs: &[&'a Expression],
+        fingerprints: &ExpressionFingerprintCatalog,
+    ) -> Self {
+        let mut raw_counts = ExpressionIdentityRefMap::<(usize, LogicalType)>::default();
+        for expr in exprs {
+            count_cse_candidates(expr, fingerprints, &mut raw_counts);
         }
-        let mut raw_candidates = ExpressionIdentitySet::default();
+        let mut raw_candidates = ExpressionIdentityRefSet::default();
         for (identity, (count, _)) in raw_counts.into_entries() {
             if count >= 2 {
                 raw_candidates.insert(identity);
@@ -1152,13 +949,19 @@ impl SharedExpressionCandidates {
         // Once a candidate subtree has been expanded, later occurrences are a
         // reference to that result; recursively recounting its descendants
         // would create redundant nested shared slots and block local kernels.
-        let mut expanded = ExpressionIdentitySet::default();
-        let mut counts = ExpressionIdentityMap::<(usize, LogicalType)>::default();
+        let mut expanded = ExpressionIdentityRefSet::default();
+        let mut counts = ExpressionIdentityRefMap::<(usize, LogicalType)>::default();
         for expr in exprs {
-            count_effective_cse_candidates(expr, &raw_candidates, &mut expanded, &mut counts);
+            count_effective_cse_candidates(
+                expr,
+                fingerprints,
+                &raw_candidates,
+                &mut expanded,
+                &mut counts,
+            );
         }
 
-        let mut slots_by_identity = ExpressionIdentityMap::default();
+        let mut slots_by_identity = ExpressionIdentityRefMap::default();
         let mut slots = Vec::new();
         let mut counted = counts.into_entries().collect::<Vec<_>>();
         counted.sort_unstable_by_key(|(identity, _)| identity.fingerprint);
@@ -1178,19 +981,20 @@ impl SharedExpressionCandidates {
     }
 }
 
-fn count_effective_cse_candidates(
-    expr: &Expression,
-    raw_candidates: &ExpressionIdentitySet,
-    expanded: &mut ExpressionIdentitySet,
-    counts: &mut ExpressionIdentityMap<(usize, LogicalType)>,
+fn count_effective_cse_candidates<'a>(
+    expr: &'a Expression,
+    fingerprints: &ExpressionFingerprintCatalog,
+    raw_candidates: &ExpressionIdentityRefSet<'a>,
+    expanded: &mut ExpressionIdentityRefSet<'a>,
+    counts: &mut ExpressionIdentityRefMap<'a, (usize, LogicalType)>,
 ) {
     ExpressionIterator::visit(expr, &mut |expr| {
-        let identity = ExpressionIdentity::new(expr);
-        if !raw_candidates.contains(&identity) {
+        let identity = fingerprints.identity(expr);
+        if !raw_candidates.contains(identity) {
             return ExpressionVisitDecision::Descend;
         }
         counts
-            .get_or_insert_with(identity.clone(), || (0, expr.return_type()))
+            .get_or_insert_with(identity, || (0, expr.return_type()))
             .0 += 1;
         if expanded.insert(identity) {
             ExpressionVisitDecision::Descend
@@ -1200,14 +1004,15 @@ fn count_effective_cse_candidates(
     });
 }
 
-fn count_cse_candidates(
-    expr: &Expression,
-    counts: &mut ExpressionIdentityMap<(usize, LogicalType)>,
+fn count_cse_candidates<'a>(
+    expr: &'a Expression,
+    fingerprints: &ExpressionFingerprintCatalog,
+    counts: &mut ExpressionIdentityRefMap<'a, (usize, LogicalType)>,
 ) {
     ExpressionIterator::visit(expr, &mut |expr| {
         if expression_cse_safe(expr) && expression_shareable(expr) {
             counts
-                .get_or_insert_with(ExpressionIdentity::new(expr), || (0, expr.return_type()))
+                .get_or_insert_with(fingerprints.identity(expr), || (0, expr.return_type()))
                 .0 += 1;
         }
         ExpressionVisitDecision::Descend
@@ -1345,9 +1150,10 @@ mod tests {
         );
         assert_eq!(program.unique_root_count(), 2);
 
-        let candidates = SharedExpressionCandidates::from_expressions(
-            [&first, &first, &second, &second].into_iter(),
-        );
+        let expressions = [&first, &first, &second, &second];
+        let fingerprints =
+            ExpressionFingerprintCatalog::from_expressions(expressions.iter().copied());
+        let candidates = SharedExpressionCandidates::from_expressions(&expressions, &fingerprints);
         assert_eq!(candidates.slots.len(), 2);
 
         let mut cache = ExpressionProgramCache::default();

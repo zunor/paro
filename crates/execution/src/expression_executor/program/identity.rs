@@ -12,8 +12,6 @@ use paro_function::scalar::{
 };
 use paro_planner::expression::Expression;
 
-use super::expression_fingerprint;
-
 /// Fingerprints accelerate bucket lookup; full execution identity decides
 /// equality. A hash collision can therefore only cost a comparison and can
 /// never merge two expressions.
@@ -24,11 +22,16 @@ pub(super) struct ExpressionIdentity {
 }
 
 impl ExpressionIdentity {
-    pub(super) fn new(expression: &Expression) -> Self {
+    pub(super) fn snapshot(identity: ExpressionIdentityRef<'_>) -> Self {
         Self {
-            fingerprint: expression_fingerprint(expression),
-            expression: expression.clone(),
+            fingerprint: identity.fingerprint,
+            expression: identity.expression.clone(),
         }
+    }
+
+    pub(super) fn matches(&self, identity: ExpressionIdentityRef<'_>) -> bool {
+        self.fingerprint == identity.fingerprint
+            && expression_execution_identity_equals(&self.expression, identity.expression)
     }
 }
 
@@ -41,19 +44,46 @@ impl PartialEq for ExpressionIdentity {
 
 impl Eq for ExpressionIdentity {}
 
-/// Collision-safe map whose hash table only owns immutable fingerprints.
+/// Borrowed collision-safe identity used while compiling an expression tree.
 ///
-/// Expression snapshots live in bucket values rather than hash keys. This is
-/// important because rejected planner variants may contain catalog objects
-/// with interior mutability; only the scalar identity comparator is allowed to
-/// inspect snapshots.
+/// Creating one is constant-time: the fingerprint comes from the program's
+/// bottom-up fingerprint catalog and the expression is never cloned.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ExpressionIdentityRef<'a> {
+    pub(super) fingerprint: u64,
+    expression: &'a Expression,
+}
+
+impl<'a> ExpressionIdentityRef<'a> {
+    pub(super) fn new(expression: &'a Expression, fingerprint: u64) -> Self {
+        Self {
+            fingerprint,
+            expression,
+        }
+    }
+}
+
+impl PartialEq for ExpressionIdentityRef<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.fingerprint == other.fingerprint
+            && (std::ptr::eq(self.expression, other.expression)
+                || expression_execution_identity_equals(self.expression, other.expression))
+    }
+}
+
+impl Eq for ExpressionIdentityRef<'_> {}
+
+/// Collision-safe borrowed map whose hash table only owns fingerprints.
+///
+/// The expressions belong to the caller's bound tree. Counts, candidate sets,
+/// and compiler lookups therefore retain no cloned subtrees.
 #[derive(Debug)]
-pub(super) struct ExpressionIdentityMap<V> {
-    buckets: HashMap<u64, Vec<(ExpressionIdentity, V)>>,
+pub(super) struct ExpressionIdentityRefMap<'a, V> {
+    buckets: HashMap<u64, Vec<(ExpressionIdentityRef<'a>, V)>>,
     len: usize,
 }
 
-impl<V> Default for ExpressionIdentityMap<V> {
+impl<'a, V> Default for ExpressionIdentityRefMap<'a, V> {
     fn default() -> Self {
         Self {
             buckets: HashMap::new(),
@@ -62,22 +92,22 @@ impl<V> Default for ExpressionIdentityMap<V> {
     }
 }
 
-impl<V> ExpressionIdentityMap<V> {
-    pub(super) fn get(&self, identity: &ExpressionIdentity) -> Option<&V> {
+impl<'a, V> ExpressionIdentityRefMap<'a, V> {
+    pub(super) fn get(&self, identity: ExpressionIdentityRef<'_>) -> Option<&V> {
         self.buckets
             .get(&identity.fingerprint)?
             .iter()
-            .find(|(candidate, _)| candidate == identity)
+            .find(|(candidate, _)| candidate == &identity)
             .map(|(_, value)| value)
     }
 
-    pub(super) fn contains(&self, identity: &ExpressionIdentity) -> bool {
+    pub(super) fn contains(&self, identity: ExpressionIdentityRef<'_>) -> bool {
         self.get(identity).is_some()
     }
 
     pub(super) fn get_or_insert_with(
         &mut self,
-        identity: ExpressionIdentity,
+        identity: ExpressionIdentityRef<'a>,
         create: impl FnOnce() -> V,
     ) -> &mut V {
         let bucket = self.buckets.entry(identity.fingerprint).or_default();
@@ -92,7 +122,7 @@ impl<V> ExpressionIdentityMap<V> {
         &mut bucket.last_mut().expect("identity bucket was appended").1
     }
 
-    pub(super) fn insert(&mut self, identity: ExpressionIdentity, value: V) -> bool {
+    pub(super) fn insert(&mut self, identity: ExpressionIdentityRef<'a>, value: V) -> bool {
         let bucket = self.buckets.entry(identity.fingerprint).or_default();
         if bucket.iter().any(|(candidate, _)| candidate == &identity) {
             return false;
@@ -102,20 +132,20 @@ impl<V> ExpressionIdentityMap<V> {
         true
     }
 
-    pub(super) fn into_entries(self) -> impl Iterator<Item = (ExpressionIdentity, V)> {
+    pub(super) fn into_entries(self) -> impl Iterator<Item = (ExpressionIdentityRef<'a>, V)> {
         self.buckets.into_values().flatten()
     }
 }
 
 #[derive(Debug, Default)]
-pub(super) struct ExpressionIdentitySet(ExpressionIdentityMap<()>);
+pub(super) struct ExpressionIdentityRefSet<'a>(ExpressionIdentityRefMap<'a, ()>);
 
-impl ExpressionIdentitySet {
-    pub(super) fn contains(&self, identity: &ExpressionIdentity) -> bool {
+impl<'a> ExpressionIdentityRefSet<'a> {
+    pub(super) fn contains(&self, identity: ExpressionIdentityRef<'_>) -> bool {
         self.0.contains(identity)
     }
 
-    pub(super) fn insert(&mut self, identity: ExpressionIdentity) -> bool {
+    pub(super) fn insert(&mut self, identity: ExpressionIdentityRef<'a>) -> bool {
         self.0.insert(identity, ())
     }
 }

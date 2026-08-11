@@ -3,9 +3,10 @@
 
 """Versioned, exact benchmark result serialization.
 
-Digest protocols are immutable once published.  A representation change must
-add a new protocol function and validation mode instead of silently changing
-existing workload oracles.
+This module freezes the exact normalization already used by the harness as
+protocol v1. Digest protocols are immutable once named: a future
+representation change must add a new function and validation mode instead of
+silently changing existing workload oracles.
 """
 
 from __future__ import annotations
