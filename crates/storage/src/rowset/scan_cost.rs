@@ -16,12 +16,8 @@ pub struct ScanAccessCostModel {
 
 impl Default for ScanAccessCostModel {
     fn default() -> Self {
-        Self {
-            unknown_selectivity: 0.25,
-            gather_access_penalty: 2.0,
-            default_variable_width: 32,
-            default_nested_width: 64,
-        }
+        Self::try_new(0.25, 2.0, 32, 64)
+            .expect("built-in scan access costs must satisfy public validation")
     }
 }
 

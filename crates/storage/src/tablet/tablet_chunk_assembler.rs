@@ -9,7 +9,7 @@ use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
+use paro_common::vector::{SelectionVector, ValidatedVectorSelection, Vector};
 use std::sync::Arc;
 
 impl TabletReader {
@@ -96,21 +96,18 @@ impl TabletReader {
                 "Column batch selection length does not match logical rows",
             ));
         }
-        if let Some(index) = selection.as_ref().and_then(|selection| {
-            selection
-                .iter()
-                .copied()
-                .find(|index| *index as usize >= physical_rows)
-        }) {
-            return Err(paro_error::data_corrupted(format!(
-                "column batch selection index {index} exceeds physical row count {physical_rows}"
-            )));
-        }
-
         let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
         let selection = selection
             .map(|indices| SelectionVector::try_from_owned_indices(indices, allocator.clone()))
+            .transpose()?
+            .map(|selection| {
+                ValidatedVectorSelection::try_new(selection, physical_rows).map_err(|error| {
+                    paro_error::data_corrupted(format!(
+                        "invalid column batch selection for {physical_rows} rows: {error}"
+                    ))
+                })
+            })
             .transpose()?;
         let mut batch_hint = 0usize;
 
@@ -153,12 +150,10 @@ impl TabletReader {
         if let Some(selection) = &selection {
             for vector in &mut read_vectors {
                 if vector.len() == physical_rows {
-                    // SAFETY: the shared selection was checked once against
-                    // `physical_rows` before applying it to every projected
-                    // vector in this batch.
-                    *vector = Arc::new(unsafe {
-                        Vector::try_dictionary_validated(vector.clone(), selection.clone())?
-                    });
+                    *vector = Arc::new(Vector::try_dictionary_from_validated(
+                        vector.clone(),
+                        selection.clone(),
+                    )?);
                 } else if vector.len() != rows {
                     return Err(paro_error::data_corrupted(format!(
                         "Selected column vector has {} rows, expected {rows} logical or {physical_rows} physical rows",
@@ -195,10 +190,7 @@ impl TabletReader {
             )?));
         }
 
-        Ok(Chunk::from_arc_vectors(
-            output_vectors,
-            self.allocator.clone(),
-        ))
+        Chunk::try_from_arc_vectors_with_cardinality(output_vectors, rows, self.allocator.clone())
     }
 
     fn load_base_rowids(

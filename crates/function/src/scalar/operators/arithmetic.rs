@@ -22,7 +22,7 @@ use crate::scalar::{
     ScalarFunction, ScalarFunctionSet,
 };
 use direct_decimal::{execute_direct_decimal_factor_rows, execute_direct_decimal_rows};
-pub use direct_decimal::{is_decimal_factor_fusion, try_execute_decimal_factor_chain};
+pub use direct_decimal::{try_execute_decimal_factor_chain, DecimalFactorChainPlan};
 use ethnum::i256;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -345,18 +345,38 @@ pub fn try_decimal_factor_fusion(
     };
     let outer_plan = BoundDecimalFusionOp::try_from_bound(outer, outer_left, outer_right)?;
     let mut inner_plan = BoundDecimalFusionOp::try_from_bound(inner, inner_left, inner_right)?;
-    let constant = match constant {
-        Value::TinyInt(value) => i128::from(*value),
-        Value::SmallInt(value) => i128::from(*value),
-        Value::Integer(value) => i128::from(*value),
-        Value::BigInt(value) => i128::from(*value),
-        Value::HugeInt(value) => *value,
-        Value::UTinyInt(value) => i128::from(*value),
-        Value::USmallInt(value) => i128::from(*value),
-        Value::UInteger(value) => i128::from(*value),
-        Value::UBigInt(value) => i128::from(*value),
-        Value::UHugeInt(value) => i128::try_from(*value).ok()?,
-        Value::Decimal(value, _, _) => *value,
+    let constant = match (constant, constant_type) {
+        (
+            Value::Decimal(value, _, value_scale),
+            LogicalType::Decimal {
+                precision,
+                scale: declared_scale,
+            },
+        ) if value_scale == declared_scale => {
+            I128DecimalPrecision::new(*precision)
+                .ok()?
+                .check(*value)
+                .ok()?;
+            *value
+        }
+        (Value::Decimal(_, _, _), LogicalType::Decimal { .. }) => {
+            // A constant's raw integer is meaningless without its scale. The
+            // generic vector path canonicalizes values through the declared
+            // result type; decline fusion until the constant representation
+            // carries one authoritative scale.
+            return None;
+        }
+        (_, ty) if !ty.is_integral() => return None,
+        (Value::TinyInt(value), _) => i128::from(*value),
+        (Value::SmallInt(value), _) => i128::from(*value),
+        (Value::Integer(value), _) => i128::from(*value),
+        (Value::BigInt(value), _) => i128::from(*value),
+        (Value::HugeInt(value), _) => *value,
+        (Value::UTinyInt(value), _) => i128::from(*value),
+        (Value::USmallInt(value), _) => i128::from(*value),
+        (Value::UInteger(value), _) => i128::from(*value),
+        (Value::UBigInt(value), _) => i128::from(*value),
+        (Value::UHugeInt(value), _) => i128::try_from(*value).ok()?,
         _ => return None,
     };
     if outer_plan.op != DecimalArithmeticOp::Mul

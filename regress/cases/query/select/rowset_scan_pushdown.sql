@@ -24,6 +24,8 @@ FROM generate_series(1, 64) AS t(g);
 CREATE TABLE rowset_pushdown_dim(k INT);
 INSERT INTO rowset_pushdown_dim VALUES (2), (5), (8);
 
+-- Cardinality-only scans must not materialize an arbitrary payload column.
+SELECT COUNT(*) FROM rowset_pushdown_case;
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k >= 2 AND k < 5;
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k IN (1, 4, 9);

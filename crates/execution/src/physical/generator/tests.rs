@@ -478,10 +478,7 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("fully pushed filter should lower to rowset scan root");
     };
-    assert_eq!(
-        spec.column_projection.explicit_columns(),
-        Some([0].as_slice())
-    );
+    assert_eq!(spec.column_projection.columns(), [0].as_slice());
     assert!(spec.residual_predicates.is_empty());
     assert!(!spec.late_materialize);
     let Some(PredicateTree::And(children)) = spec.predicate.as_ref() else {
@@ -516,10 +513,7 @@ fn zero_column_rowset_projection_never_enables_late_materialization() {
         panic!("fully pushed zero-column filter should lower to rowset scan");
     };
 
-    assert_eq!(
-        spec.column_projection.explicit_columns(),
-        Some([].as_slice())
-    );
+    assert!(spec.column_projection.columns().is_empty());
     assert!(!spec.late_materialize);
 }
 

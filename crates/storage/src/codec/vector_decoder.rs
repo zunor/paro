@@ -9,7 +9,9 @@ use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DictionaryInfo, DictionarySource, SelectionVector, Vector};
+use paro_common::vector::{
+    DictionaryInfo, DictionarySource, SelectionVector, ValidatedVectorSelection, Vector,
+};
 use std::sync::Arc;
 
 pub(crate) fn build_vector_from_bytes(
@@ -223,35 +225,18 @@ fn decode_storage_dictionary_batch(
     let null_index = dictionary_len as u32;
     #[cfg(target_endian = "little")]
     if nulls.is_none() {
-        for row_idx in 0..rows {
-            let code_offset = row_idx * std::mem::size_of::<u32>();
-            let code = u32::from_le_bytes(
-                batch.codes[code_offset..code_offset + std::mem::size_of::<u32>()]
-                    .try_into()
-                    .expect("u32-aligned storage dictionary codes"),
-            );
-            if code as usize >= dictionary_len {
-                return Err(paro_error::data_corrupted(format!(
-                    "storage dictionary code {} out of range {}",
-                    code, dictionary_len
-                )));
-            }
-        }
         let selection =
             SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?;
-        // SAFETY: every storage code was checked against `dictionary_len` in
-        // the loop immediately above.
-        return unsafe {
-            Vector::try_with_validated_dictionary(
-                Arc::new(child),
-                selection,
-                DictionaryInfo {
-                    unique_len,
-                    provenance_id,
-                    source: DictionarySource::Storage,
-                },
-            )
-        };
+        let selection = validate_storage_dictionary_selection(selection, child.len())?;
+        return Vector::try_with_validated_dictionary(
+            Arc::new(child),
+            selection,
+            DictionaryInfo {
+                unique_len,
+                provenance_id,
+                source: DictionarySource::Storage,
+            },
+        );
     }
 
     let mut selection = Vec::with_capacity(rows);
@@ -274,19 +259,25 @@ fn decode_storage_dictionary_batch(
     }
 
     let selection = SelectionVector::try_from_indices(selection, allocator)?;
-    // SAFETY: non-null codes were checked against `dictionary_len`; null rows
-    // map to the appended null slot at `dictionary_len < unique_len`.
-    unsafe {
-        Vector::try_with_validated_dictionary(
-            Arc::new(child),
-            selection,
-            DictionaryInfo {
-                unique_len,
-                provenance_id,
-                source: DictionarySource::Storage,
-            },
-        )
-    }
+    let selection = validate_storage_dictionary_selection(selection, child.len())?;
+    Vector::try_with_validated_dictionary(
+        Arc::new(child),
+        selection,
+        DictionaryInfo {
+            unique_len,
+            provenance_id,
+            source: DictionarySource::Storage,
+        },
+    )
+}
+
+fn validate_storage_dictionary_selection(
+    selection: SelectionVector,
+    child_count: usize,
+) -> Result<ValidatedVectorSelection> {
+    ValidatedVectorSelection::try_new(selection, child_count).map_err(|error| {
+        paro_error::data_corrupted(format!("invalid storage dictionary code: {error}"))
+    })
 }
 
 pub(crate) fn decode_column_batch(

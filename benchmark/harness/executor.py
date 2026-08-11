@@ -7,8 +7,6 @@ from __future__ import annotations
 
 from contextlib import suppress
 from dataclasses import dataclass, field
-from datetime import date, datetime, time
-from decimal import Decimal
 import json
 import subprocess
 import threading
@@ -16,6 +14,7 @@ import time as time_module
 from typing import Any, Mapping
 
 from .loader import QueryDef, WorkloadDef
+from .result_protocol import normalize_row_v1
 from .validator import BenchmarkValidator
 
 
@@ -254,7 +253,7 @@ class BenchmarkExecutor:
             if self._profile_pid > 0:
                 query_result.rss_after_kb = _read_process_rss_kb(self._profile_pid)
 
-            query_result.result_rows = [_normalize_row(row) for row in last_rows]
+            query_result.result_rows = [normalize_row_v1(row) for row in last_rows]
             outcome = validator.validate_query(query, query_result.result_rows)
             query_result.validation_result = outcome.status
             query_result.validation_detail = outcome.detail
@@ -425,10 +424,6 @@ class BenchmarkExecutor:
             }
         except Exception:
             return None
-
-
-def _normalize_row(row: tuple[Any, ...]) -> list[Any]:
-    return [_normalize_value(value) for value in row]
 
 
 def _build_explain_analyze_sql(sql: str) -> str:
@@ -702,27 +697,6 @@ def _per_chunk(numerator: Any, rows: Any, chunk_size: int = VECTOR_SIZE) -> floa
     if count is None or row_count is None or row_count <= 0:
         return None
     return (float(count) * float(chunk_size)) / float(row_count)
-
-
-def _normalize_value(value: Any) -> Any:
-    if isinstance(value, Decimal):
-        # JSON numbers and Python floats cannot represent DECIMAL exactly.
-        # Keep the fixed-point representation returned by the server so strong
-        # benchmark validation detects scale and low-order digit regressions.
-        return format(value, "f")
-    if isinstance(value, (date, datetime, time)):
-        return value.isoformat()
-    if isinstance(value, memoryview):
-        return value.tobytes().hex()
-    if isinstance(value, bytes):
-        return value.hex()
-    if isinstance(value, tuple):
-        return [_normalize_value(v) for v in value]
-    if isinstance(value, list):
-        return [_normalize_value(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _normalize_value(v) for k, v in value.items()}
-    return value
 
 
 def _split_sql_statements(script: str) -> list[str]:

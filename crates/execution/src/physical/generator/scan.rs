@@ -62,11 +62,7 @@ impl PhysicalPlanGenerator {
             }
         }
 
-        let column_projection = if column_ids.is_empty() && !emit_row_id {
-            RowsetColumnProjection::All
-        } else {
-            RowsetColumnProjection::Columns(column_ids.into_boxed_slice())
-        };
+        let column_projection = RowsetColumnProjection::new(column_ids);
         let late_materialize = self.ctx.rowset_scan_pushdown
             && should_late_materialize(
                 &predicate,
@@ -589,7 +585,7 @@ fn project_rowset_scan_spec(
 
     spec.output_names = output_names.into_boxed_slice();
     spec.returned_types = returned_types.into_boxed_slice();
-    spec.column_projection = RowsetColumnProjection::Columns(column_ids.into_boxed_slice());
+    spec.column_projection = RowsetColumnProjection::new(column_ids);
     spec.column_types = column_types.into_boxed_slice();
     spec.emit_row_id = emit_row_id;
     spec.late_materialize = should_late_materialize(
@@ -636,11 +632,7 @@ fn should_late_materialize(
         return false;
     }
 
-    let output_columns = match projection {
-        RowsetColumnProjection::All => (0..table.columns.len()).collect::<Vec<_>>(),
-        RowsetColumnProjection::Columns(columns) => columns.to_vec(),
-    };
-    let output_columns = output_columns.into_iter().collect::<HashSet<_>>();
+    let output_columns = projection.columns().iter().copied().collect::<HashSet<_>>();
     let deferred_width = output_columns
         .iter()
         .filter(|column_id| !predicate_columns.contains(&(**column_id as u32)))

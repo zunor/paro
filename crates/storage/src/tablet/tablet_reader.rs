@@ -133,9 +133,9 @@ impl RowsetCursor {
             if let Some((start, end)) = params.segment_ordinal_range {
                 iter.set_ordinal_range(start, end)?;
             }
-            if iter.num_columns() == 0 && !params.emit_row_id && projection.is_empty() {
-                continue;
-            };
+            // A zero-column iterator is a cardinality source, not an empty
+            // segment. SegmentIterator advances it from segment ordinals so
+            // COUNT(*) can avoid materializing an arbitrary payload column.
             segment_iters.push(iter);
         }
 

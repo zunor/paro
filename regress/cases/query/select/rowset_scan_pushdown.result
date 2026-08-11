@@ -29,6 +29,10 @@ CREATE TABLE
 INSERT INTO rowset_pushdown_dim VALUES (2), (5), (8);
 INSERT 0 3
 
+SELECT COUNT(*) FROM rowset_pushdown_case;
+COUNT(*)
+64
+
 SELECT COUNT(*) FROM rowset_pushdown_case WHERE k = 3;
 COUNT(*)
 7
@@ -59,7 +63,6 @@ PROJECTION  (rows=1)
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
       Pushed Predicate: col#1 = 3
-      Late Materialize: auto
       Cardinality: [3, 6, 10]
       Output Schema: (none)
 
@@ -89,10 +92,9 @@ PROJECTION  (rows=1)
     Output: aggr_0
     Cardinality: [1, 1, 1]
     Output Schema: aggr_0 BIGINT
-    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=26)
+    ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
       Pushed Predicate: col#1 < 5 AND col#1 >= 2
-      Late Materialize: auto
-      Cardinality: [12, 26, 39]
+      Cardinality: [9, 19, 29]
       Output Schema: (none)
 
 EXPLAIN (VERBOSE)
@@ -109,7 +111,6 @@ PROJECTION  (rows=1)
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=19)
       Pushed Predicate: col#1 IN (1, 4, 9)
-      Late Materialize: auto
       Cardinality: [9, 19, 29]
       Output Schema: (none)
 
@@ -127,7 +128,6 @@ PROJECTION  (rows=1)
     Output Schema: aggr_0 BIGINT
     ->  ROWSET_SCAN on public.rowset_pushdown_case  (rows=6)
       Pushed Predicate: col#2 IS NULL
-      Late Materialize: auto
       Cardinality: [3, 6, 10]
       Output Schema: (none)
 

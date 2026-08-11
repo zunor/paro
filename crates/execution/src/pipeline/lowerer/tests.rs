@@ -1117,9 +1117,7 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         returned_types: vec![LogicalType::Integer].into_boxed_slice(),
         relation_name: Some("t".to_string()),
         relation_alias: None,
-        column_projection: crate::physical::specs::RowsetColumnProjection::Columns(
-            vec![0].into_boxed_slice(),
-        ),
+        column_projection: crate::physical::specs::RowsetColumnProjection::new(vec![0]),
         emit_row_id: false,
         column_types: vec![LogicalType::Integer].into_boxed_slice(),
         table,

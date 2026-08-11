@@ -36,7 +36,7 @@ pub(crate) use definition::VectorResetState;
 pub use definition::{DictionaryInfo, DictionarySource, Vector};
 pub use selection_vector::{
     reset_selection_materialization_count, selection_materialization_count, SelectionVector,
-    VectorSelection,
+    ValidatedVectorSelection, VectorSelection,
 };
 pub use string_heap::StringHeap;
 pub use validity_mask::{ValidityMask, BITS_PER_VALUE, MAX_ENTRY};

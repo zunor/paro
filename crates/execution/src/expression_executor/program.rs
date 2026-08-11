@@ -15,18 +15,23 @@ use paro_common::runtime_value::Value;
 use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_function::scalar::cast::{BoundCastInfo, CastDispatch};
+use paro_function::scalar::cast::{BoundCastInfo, CastContextDependency, CastDispatch};
 use paro_function::scalar::operators::arithmetic::{try_decimal_factor_fusion, DecimalOperandSide};
 use paro_function::scalar::{
     BoundScalarFunction, DictionaryStrategy, FunctionErrorMode, FunctionNullHandling,
     FunctionSideEffects, FunctionStability, ScalarDispatch,
 };
-use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
+use paro_planner::expression::{
+    ComparisonType, ConjunctionType, Expression, ExpressionIterator, ExpressionVisitDecision,
+    OperatorType,
+};
 
 mod fusion;
+mod identity;
 
 use fusion::compile_decimal_factor_chains;
 pub use fusion::PhysicalDecimalFactorChain;
+use identity::{ExpressionIdentity, ExpressionIdentityMap, ExpressionIdentitySet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExpressionBackend {
@@ -63,7 +68,7 @@ impl ExpressionProgramVersion {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ExpressionProgramCacheKey {
+struct ExpressionProgramCacheBucketKey {
     root_fingerprints: Box<[u64]>,
     backend: ExpressionBackend,
     physical_semantics_version: u32,
@@ -71,12 +76,16 @@ pub struct ExpressionProgramCacheKey {
     settings_fingerprint: u64,
 }
 
-impl ExpressionProgramCacheKey {
-    pub fn new(exprs: &[Expression], version: &ExpressionProgramVersion) -> Self {
-        Self::from_fingerprints(expression_list_fingerprints(exprs), version)
+impl ExpressionProgramCacheBucketKey {
+    fn new(exprs: &[Expression], version: &ExpressionProgramVersion) -> Self {
+        Self::from_expressions(exprs.iter(), version)
     }
 
-    fn from_fingerprints(root_fingerprints: Vec<u64>, version: &ExpressionProgramVersion) -> Self {
+    fn from_expressions<'a>(
+        exprs: impl Iterator<Item = &'a Expression>,
+        version: &ExpressionProgramVersion,
+    ) -> Self {
+        let root_fingerprints = exprs.map(expression_fingerprint).collect::<Vec<_>>();
         Self {
             root_fingerprints: root_fingerprints.into_boxed_slice(),
             backend: version.backend,
@@ -85,18 +94,16 @@ impl ExpressionProgramCacheKey {
             settings_fingerprint: version.settings_fingerprint,
         }
     }
-
-    pub fn root_fingerprints(&self) -> &[u64] {
-        &self.root_fingerprints
-    }
 }
 
 const DEFAULT_PROGRAM_CACHE_LIMIT: usize = 4096;
 
 #[derive(Debug)]
 pub struct ExpressionProgramCache {
-    programs: HashMap<ExpressionProgramCacheKey, CachedProgramEntry>,
-    lru: VecDeque<(ExpressionProgramCacheKey, u64)>,
+    programs: HashMap<ExpressionProgramCacheBucketKey, Vec<CachedProgramEntry>>,
+    lru: VecDeque<(ExpressionProgramCacheBucketKey, u64, u64)>,
+    entry_count: usize,
+    next_entry_id: u64,
     max_entries: usize,
     access_epoch: u64,
     hits: u64,
@@ -105,6 +112,8 @@ pub struct ExpressionProgramCache {
 
 #[derive(Debug)]
 struct CachedProgramEntry {
+    id: u64,
+    root_identities: Box<[ExpressionIdentity]>,
     program: Arc<PhysicalExpressionProgram>,
     epoch: u64,
 }
@@ -120,6 +129,8 @@ impl ExpressionProgramCache {
         Self {
             programs: HashMap::new(),
             lru: VecDeque::new(),
+            entry_count: 0,
+            next_entry_id: 0,
             max_entries: max_entries.max(1),
             access_epoch: 0,
             hits: 0,
@@ -132,8 +143,13 @@ impl ExpressionProgramCache {
         exprs: &[Expression],
         version: ExpressionProgramVersion,
     ) -> Arc<PhysicalExpressionProgram> {
-        let key = ExpressionProgramCacheKey::new(exprs, &version);
-        self.get_or_compile_with(key, |root_fingerprints| {
+        let key = ExpressionProgramCacheBucketKey::new(exprs, &version);
+        let identities = exprs
+            .iter()
+            .map(ExpressionIdentity::new)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.get_or_compile_with(key, identities, |root_fingerprints| {
             PhysicalExpressionProgram::compile_with_fingerprints(exprs, version, root_fingerprints)
         })
     }
@@ -143,14 +159,14 @@ impl ExpressionProgramCache {
         exprs: &[&Expression],
         version: ExpressionProgramVersion,
     ) -> Arc<PhysicalExpressionProgram> {
-        let key = ExpressionProgramCacheKey::from_fingerprints(
-            exprs
-                .iter()
-                .map(|expr| expression_fingerprint(expr))
-                .collect(),
-            &version,
-        );
-        self.get_or_compile_with(key, |root_fingerprints| {
+        let key =
+            ExpressionProgramCacheBucketKey::from_expressions(exprs.iter().copied(), &version);
+        let identities = exprs
+            .iter()
+            .map(|expr| ExpressionIdentity::new(expr))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        self.get_or_compile_with(key, identities, |root_fingerprints| {
             PhysicalExpressionProgram::compile_refs_with_fingerprints(
                 exprs,
                 version,
@@ -161,28 +177,39 @@ impl ExpressionProgramCache {
 
     fn get_or_compile_with(
         &mut self,
-        key: ExpressionProgramCacheKey,
+        key: ExpressionProgramCacheBucketKey,
+        root_identities: Box<[ExpressionIdentity]>,
         compile: impl FnOnce(Vec<u64>) -> PhysicalExpressionProgram,
     ) -> Arc<PhysicalExpressionProgram> {
         let epoch = self.next_epoch();
-        if let Some(entry) = self.programs.get_mut(&key) {
+        if let Some(entry) = self.programs.get_mut(&key).and_then(|bucket| {
+            bucket
+                .iter_mut()
+                .find(|entry| entry.root_identities == root_identities)
+        }) {
             self.hits += 1;
             entry.epoch = epoch;
+            let entry_id = entry.id;
             let program = Arc::clone(&entry.program);
-            self.lru.push_back((key, epoch));
+            self.lru.push_back((key, entry_id, epoch));
             self.compact_stale_lru_if_needed();
             return program;
         }
         self.misses += 1;
         let program = Arc::new(compile(key.root_fingerprints.to_vec()));
-        self.programs.insert(
-            key.clone(),
-            CachedProgramEntry {
+        self.next_entry_id = self.next_entry_id.wrapping_add(1).max(1);
+        let entry_id = self.next_entry_id;
+        self.programs
+            .entry(key.clone())
+            .or_default()
+            .push(CachedProgramEntry {
+                id: entry_id,
+                root_identities,
                 program: Arc::clone(&program),
                 epoch,
-            },
-        );
-        self.lru.push_back((key, epoch));
+            });
+        self.entry_count += 1;
+        self.lru.push_back((key, entry_id, epoch));
         self.evict_over_limit();
         self.compact_stale_lru_if_needed();
         program
@@ -194,15 +221,22 @@ impl ExpressionProgramCache {
     }
 
     fn evict_over_limit(&mut self) {
-        while self.programs.len() > self.max_entries {
-            let Some((victim, epoch)) = self.lru.pop_front() else {
+        while self.entry_count > self.max_entries {
+            let Some((victim, entry_id, epoch)) = self.lru.pop_front() else {
                 break;
             };
-            if self
-                .programs
-                .get(&victim)
-                .is_some_and(|entry| entry.epoch == epoch)
-            {
+            let mut remove_bucket = false;
+            if let Some(bucket) = self.programs.get_mut(&victim) {
+                if let Some(index) = bucket
+                    .iter()
+                    .position(|entry| entry.id == entry_id && entry.epoch == epoch)
+                {
+                    bucket.swap_remove(index);
+                    self.entry_count -= 1;
+                }
+                remove_bucket = bucket.is_empty();
+            }
+            if remove_bucket {
                 self.programs.remove(&victim);
             }
         }
@@ -212,11 +246,14 @@ impl ExpressionProgramCache {
         if self.lru.len() <= self.max_entries.saturating_mul(4).max(16) {
             return;
         }
-        let mut fresh = VecDeque::with_capacity(self.programs.len());
-        for (key, entry) in &self.programs {
-            fresh.push_back((key.clone(), entry.epoch));
+        let mut entries = Vec::with_capacity(self.entry_count);
+        for (key, bucket) in &self.programs {
+            for entry in bucket {
+                entries.push((key.clone(), entry.id, entry.epoch));
+            }
         }
-        self.lru = fresh;
+        entries.sort_unstable_by_key(|(_, _, epoch)| *epoch);
+        self.lru = entries.into();
     }
 
     #[cfg(test)]
@@ -225,8 +262,16 @@ impl ExpressionProgramCache {
         exprs: &[Expression],
         version: &ExpressionProgramVersion,
     ) -> bool {
-        let key = ExpressionProgramCacheKey::new(exprs, version);
-        self.programs.contains_key(&key)
+        let key = ExpressionProgramCacheBucketKey::new(exprs, version);
+        let identities = exprs
+            .iter()
+            .map(ExpressionIdentity::new)
+            .collect::<Vec<_>>();
+        self.programs.get(&key).is_some_and(|bucket| {
+            bucket
+                .iter()
+                .any(|entry| entry.root_identities.as_ref() == identities)
+        })
     }
 
     #[cfg(test)]
@@ -240,7 +285,7 @@ impl ExpressionProgramCache {
     }
 
     pub fn len(&self) -> usize {
-        self.programs.len()
+        self.entry_count
     }
 }
 
@@ -293,6 +338,7 @@ impl StableExpressionHasher {
         self.hash_str_value(&function.name);
         self.hash_value(&function.arguments);
         self.hash_value(&function.return_type);
+        self.hash_value(&function.varargs);
         self.tag(function_stability_tag(function.stability));
         self.tag(function_null_handling_tag(function.null_handling));
         self.tag(function_side_effects_tag(function.side_effects));
@@ -357,6 +403,10 @@ impl StableExpressionHasher {
                 self.write_usize(function as usize);
             }
         }
+        self.tag(match cast.context_dependency() {
+            CastContextDependency::Independent => 0,
+            CastContextDependency::Runtime => 1,
+        });
         match &cast.cast_data {
             Some(data) => {
                 self.tag(1);
@@ -569,17 +619,18 @@ impl PhysicalExpressionProgram {
         let mut compiler = ProgramCompiler::new(shared_candidates);
         let mut root_to_unique = Vec::with_capacity(root_count);
         let mut root_first_output = Vec::with_capacity(root_count);
-        let mut unique_by_key = HashMap::new();
+        let mut unique_by_identity = ExpressionIdentityMap::default();
         let mut roots = Vec::new();
 
         debug_assert_eq!(root_count, root_fingerprints.len());
-        for (expr, root_fingerprint) in exprs.zip(root_fingerprints.iter().copied()) {
+        for expr in exprs {
             let compiled = compiler.compile_expression(expr);
             if compiled.cse_safe {
-                let unique = *unique_by_key.entry(root_fingerprint).or_insert_with(|| {
-                    roots.push(compiled.expr.clone());
-                    roots.len() - 1
-                });
+                let unique =
+                    *unique_by_identity.get_or_insert_with(ExpressionIdentity::new(expr), || {
+                        roots.push(compiled.expr.clone());
+                        roots.len() - 1
+                    });
                 root_to_unique.push(unique);
                 let first = root_to_unique
                     .iter()
@@ -753,7 +804,6 @@ impl ExpressionScratchLayout {
 #[derive(Debug, Clone)]
 pub struct ExpressionScratchSlot {
     pub return_type: LogicalType,
-    pub fingerprint: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -830,10 +880,10 @@ pub struct PhysicalSharedExpression {
 }
 
 struct ProgramCompiler {
-    shared_slots_by_fingerprint: HashMap<u64, usize>,
+    shared_slots_by_identity: ExpressionIdentityMap<usize>,
     shared_nodes: Vec<Option<PhysicalExpression>>,
     scratch_slots: Vec<ExpressionScratchSlot>,
-    compiling_shared: HashSet<u64>,
+    compiling_shared: HashSet<usize>,
 }
 
 struct CompiledExpr {
@@ -844,7 +894,7 @@ struct CompiledExpr {
 impl ProgramCompiler {
     fn new(shared_candidates: SharedExpressionCandidates) -> Self {
         Self {
-            shared_slots_by_fingerprint: shared_candidates.slots_by_fingerprint,
+            shared_slots_by_identity: shared_candidates.slots_by_identity,
             shared_nodes: vec![None; shared_candidates.slots.len()],
             scratch_slots: shared_candidates.slots,
             compiling_shared: HashSet::new(),
@@ -852,13 +902,13 @@ impl ProgramCompiler {
     }
 
     fn compile_expression(&mut self, expr: &Expression) -> CompiledExpr {
-        let fingerprint = expression_fingerprint(expr);
-        if let Some(&slot) = self.shared_slots_by_fingerprint.get(&fingerprint) {
-            if !self.compiling_shared.contains(&fingerprint) {
+        let identity = ExpressionIdentity::new(expr);
+        if let Some(&slot) = self.shared_slots_by_identity.get(&identity) {
+            if !self.compiling_shared.contains(&slot) {
                 if self.shared_nodes[slot].is_none() {
-                    self.compiling_shared.insert(fingerprint);
+                    self.compiling_shared.insert(slot);
                     let compiled = self.compile_expression_inner(expr);
-                    self.compiling_shared.remove(&fingerprint);
+                    self.compiling_shared.remove(&slot);
                     self.shared_nodes[slot] = Some(compiled.expr);
                 }
                 return CompiledExpr {
@@ -1036,8 +1086,8 @@ impl ProgramCompiler {
                 || nested.function.stability != FunctionStability::Consistent
                 || nested.function.side_effects != FunctionSideEffects::NoSideEffects
                 || self
-                    .shared_slots_by_fingerprint
-                    .contains_key(&expression_fingerprint(&expr.children[nested_idx]))
+                    .shared_slots_by_identity
+                    .contains(&ExpressionIdentity::new(&expr.children[nested_idx]))
             {
                 continue;
             }
@@ -1080,50 +1130,49 @@ impl ProgramCompiler {
 }
 
 struct SharedExpressionCandidates {
-    slots_by_fingerprint: HashMap<u64, usize>,
+    slots_by_identity: ExpressionIdentityMap<usize>,
     slots: Vec<ExpressionScratchSlot>,
 }
 
 impl SharedExpressionCandidates {
     fn from_expressions<'a>(exprs: impl Iterator<Item = &'a Expression>) -> Self {
         let exprs = exprs.collect::<Vec<_>>();
-        let mut raw_counts = HashMap::<u64, (usize, LogicalType)>::new();
+        let mut raw_counts = ExpressionIdentityMap::<(usize, LogicalType)>::default();
         for expr in &exprs {
             count_cse_candidates(expr, &mut raw_counts);
         }
-        let raw_candidates = raw_counts
-            .iter()
-            .filter_map(|(fingerprint, (count, _))| (*count >= 2).then_some(*fingerprint))
-            .collect::<HashSet<_>>();
+        let mut raw_candidates = ExpressionIdentitySet::default();
+        for (identity, (count, _)) in raw_counts.into_entries() {
+            if count >= 2 {
+                raw_candidates.insert(identity);
+            }
+        }
 
         // Count repeated work in the graph that will actually be evaluated.
         // Once a candidate subtree has been expanded, later occurrences are a
         // reference to that result; recursively recounting its descendants
         // would create redundant nested shared slots and block local kernels.
-        let mut expanded = HashSet::new();
-        let mut counts = HashMap::<u64, (usize, LogicalType)>::new();
+        let mut expanded = ExpressionIdentitySet::default();
+        let mut counts = ExpressionIdentityMap::<(usize, LogicalType)>::default();
         for expr in exprs {
             count_effective_cse_candidates(expr, &raw_candidates, &mut expanded, &mut counts);
         }
 
-        let mut slots_by_fingerprint = HashMap::new();
+        let mut slots_by_identity = ExpressionIdentityMap::default();
         let mut slots = Vec::new();
-        let mut counted = counts.into_iter().collect::<Vec<_>>();
-        counted.sort_unstable_by_key(|(fingerprint, _)| *fingerprint);
-        for (fingerprint, (count, return_type)) in counted {
+        let mut counted = counts.into_entries().collect::<Vec<_>>();
+        counted.sort_unstable_by_key(|(identity, _)| identity.fingerprint);
+        for (identity, (count, return_type)) in counted {
             if count < 2 {
                 continue;
             }
             let slot = slots.len();
-            slots_by_fingerprint.insert(fingerprint, slot);
-            slots.push(ExpressionScratchSlot {
-                return_type,
-                fingerprint,
-            });
+            slots_by_identity.insert(identity, slot);
+            slots.push(ExpressionScratchSlot { return_type });
         }
 
         Self {
-            slots_by_fingerprint,
+            slots_by_identity,
             slots,
         }
     }
@@ -1131,102 +1180,38 @@ impl SharedExpressionCandidates {
 
 fn count_effective_cse_candidates(
     expr: &Expression,
-    raw_candidates: &HashSet<u64>,
-    expanded: &mut HashSet<u64>,
-    counts: &mut HashMap<u64, (usize, LogicalType)>,
+    raw_candidates: &ExpressionIdentitySet,
+    expanded: &mut ExpressionIdentitySet,
+    counts: &mut ExpressionIdentityMap<(usize, LogicalType)>,
 ) {
-    let fingerprint = expression_fingerprint(expr);
-    if raw_candidates.contains(&fingerprint) {
-        let entry = counts
-            .entry(fingerprint)
-            .or_insert_with(|| (0, expr.return_type()));
-        entry.0 += 1;
-        if !expanded.insert(fingerprint) {
-            return;
+    ExpressionIterator::visit(expr, &mut |expr| {
+        let identity = ExpressionIdentity::new(expr);
+        if !raw_candidates.contains(&identity) {
+            return ExpressionVisitDecision::Descend;
         }
-    }
-
-    match expr {
-        Expression::Function(expr) => {
-            for child in &expr.children {
-                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
-            }
+        counts
+            .get_or_insert_with(identity.clone(), || (0, expr.return_type()))
+            .0 += 1;
+        if expanded.insert(identity) {
+            ExpressionVisitDecision::Descend
+        } else {
+            ExpressionVisitDecision::SkipChildren
         }
-        Expression::Cast(expr) => {
-            count_effective_cse_candidates(&expr.child, raw_candidates, expanded, counts)
-        }
-        Expression::Comparison(expr) => {
-            count_effective_cse_candidates(&expr.left, raw_candidates, expanded, counts);
-            count_effective_cse_candidates(&expr.right, raw_candidates, expanded, counts);
-        }
-        Expression::Conjunction(expr) => {
-            for child in &expr.children {
-                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
-            }
-        }
-        Expression::Case(expr) => {
-            count_effective_cse_candidates(&expr.check, raw_candidates, expanded, counts);
-            count_effective_cse_candidates(&expr.result_if_true, raw_candidates, expanded, counts);
-            count_effective_cse_candidates(&expr.result_if_false, raw_candidates, expanded, counts);
-        }
-        Expression::Operator(expr) => {
-            for child in &expr.children {
-                count_effective_cse_candidates(child, raw_candidates, expanded, counts);
-            }
-        }
-        Expression::Constant(_)
-        | Expression::ColumnRef(_)
-        | Expression::Parameter(_)
-        | Expression::Reference(_)
-        | Expression::Aggregate(_)
-        | Expression::Subquery(_)
-        | Expression::Window(_) => {}
-    }
+    });
 }
 
-fn count_cse_candidates(expr: &Expression, counts: &mut HashMap<u64, (usize, LogicalType)>) {
-    if expression_cse_safe(expr) && expression_shareable(expr) {
-        let fingerprint = expression_fingerprint(expr);
-        let entry = counts
-            .entry(fingerprint)
-            .or_insert_with(|| (0, expr.return_type()));
-        entry.0 += 1;
-    }
-
-    match expr {
-        Expression::Function(expr) => {
-            for child in &expr.children {
-                count_cse_candidates(child, counts);
-            }
+fn count_cse_candidates(
+    expr: &Expression,
+    counts: &mut ExpressionIdentityMap<(usize, LogicalType)>,
+) {
+    ExpressionIterator::visit(expr, &mut |expr| {
+        if expression_cse_safe(expr) && expression_shareable(expr) {
+            counts
+                .get_or_insert_with(ExpressionIdentity::new(expr), || (0, expr.return_type()))
+                .0 += 1;
         }
-        Expression::Cast(expr) => count_cse_candidates(&expr.child, counts),
-        Expression::Comparison(expr) => {
-            count_cse_candidates(&expr.left, counts);
-            count_cse_candidates(&expr.right, counts);
-        }
-        Expression::Conjunction(expr) => {
-            for child in &expr.children {
-                count_cse_candidates(child, counts);
-            }
-        }
-        Expression::Case(expr) => {
-            count_cse_candidates(&expr.check, counts);
-            count_cse_candidates(&expr.result_if_true, counts);
-            count_cse_candidates(&expr.result_if_false, counts);
-        }
-        Expression::Operator(expr) => {
-            for child in &expr.children {
-                count_cse_candidates(child, counts);
-            }
-        }
-        Expression::Constant(_)
-        | Expression::ColumnRef(_)
-        | Expression::Parameter(_)
-        | Expression::Reference(_)
-        | Expression::Aggregate(_)
-        | Expression::Subquery(_)
-        | Expression::Window(_) => {}
-    }
+        ExpressionVisitDecision::Descend
+    });
 }
 
 fn expression_cse_safe(expr: &Expression) -> bool {
@@ -1269,9 +1254,13 @@ fn expression_shareable(expr: &Expression) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::any::Any;
+
     use super::*;
     use paro_function::scalar::operators::arithmetic::register_arithmetic_functions;
-    use paro_function::scalar::{ScalarBindInput, ScalarFunctionSet};
+    use paro_function::scalar::{
+        ExpressionState, FunctionData, ScalarBindInput, ScalarFunction, ScalarFunctionSet,
+    };
     use paro_planner::expression::{ConstantExpression, FunctionExpression, ReferenceExpression};
 
     fn bind_decimal(name: &str, arguments: &[LogicalType]) -> BoundScalarFunction {
@@ -1295,6 +1284,84 @@ mod tests {
             value: Value::Integer(1),
             return_type: LogicalType::Integer,
         })
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct CollidingBindData(u8);
+
+    impl FunctionData for CollidingBindData {
+        fn clone_box(&self) -> Box<dyn FunctionData> {
+            Box::new(self.clone())
+        }
+
+        fn equals(&self, other: &dyn FunctionData) -> bool {
+            other.as_any().downcast_ref::<Self>() == Some(self)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            7
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+    }
+
+    fn collision_dispatch(
+        _input: &paro_common::chunk::Chunk,
+        _state: &dyn ExpressionState,
+        _result: &mut paro_common::vector::Vector,
+    ) -> paro_common::error::Result<()> {
+        Ok(())
+    }
+
+    fn colliding_expression(id: u8) -> Expression {
+        let function = BoundScalarFunction::from(ScalarFunction::new(
+            "collision_test".to_string(),
+            vec![LogicalType::Integer],
+            LogicalType::Integer,
+            collision_dispatch,
+        ))
+        .with_bind_data(CollidingBindData(id));
+        Expression::Function(FunctionExpression::new(
+            function,
+            vec![reference(0, LogicalType::Integer)],
+            LogicalType::Integer,
+        ))
+    }
+
+    #[test]
+    fn expression_fingerprints_are_only_collision_buckets() {
+        let first = colliding_expression(1);
+        let second = colliding_expression(2);
+        assert_eq!(
+            expression_fingerprint(&first),
+            expression_fingerprint(&second)
+        );
+
+        let program = PhysicalExpressionProgram::compile(
+            &[first.clone(), second.clone()],
+            ExpressionProgramVersion::anonymous(),
+        );
+        assert_eq!(program.unique_root_count(), 2);
+
+        let candidates = SharedExpressionCandidates::from_expressions(
+            [&first, &first, &second, &second].into_iter(),
+        );
+        assert_eq!(candidates.slots.len(), 2);
+
+        let mut cache = ExpressionProgramCache::default();
+        cache.get_or_compile(
+            std::slice::from_ref(&first),
+            ExpressionProgramVersion::anonymous(),
+        );
+        cache.get_or_compile(
+            std::slice::from_ref(&second),
+            ExpressionProgramVersion::anonymous(),
+        );
+        assert_eq!(cache.misses(), 2);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.len(), 2);
     }
 
     #[test]
@@ -1374,13 +1441,12 @@ mod tests {
         };
         assert_eq!(charge.function.name, "decimal_factor_fusion");
         assert!(matches!(charge.children[0], PhysicalExpression::Shared(_)));
-        assert_eq!(
-            program.decimal_factor_chains(),
-            &[PhysicalDecimalFactorChain {
-                producer_output: 0,
-                consumer_output: 1,
-                shared_slot: 0,
-            }]
-        );
+        let [chain] = program.decimal_factor_chains() else {
+            panic!("expected one decimal factor chain")
+        };
+        assert_eq!(chain.producer_output, 0);
+        assert_eq!(chain.consumer_output, 1);
+        assert_eq!(chain.shared_slot, 0);
+        assert_eq!(chain.consumer_shared_side, DecimalOperandSide::Left);
     }
 }

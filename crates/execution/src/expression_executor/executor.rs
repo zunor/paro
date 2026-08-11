@@ -7,8 +7,9 @@ mod fusion;
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::Arc;
+
+use parking_lot::Mutex;
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
@@ -58,7 +59,7 @@ pub struct CompiledExpressionProgram {
 #[derive(Debug)]
 pub struct CompiledExecutorState {
     states: Vec<CompiledExpressionState>,
-    shared_states: Vec<Option<CompiledExpressionState>>,
+    shared_states: Vec<Arc<Mutex<Option<CompiledExpressionState>>>>,
     shared_slots: Vec<SharedExpressionSlot>,
     batch_epoch: u64,
 }
@@ -68,8 +69,10 @@ impl CompiledExecutorState {
         for state in &mut self.states {
             state.release_batch_references();
         }
-        for state in self.shared_states.iter_mut().flatten() {
-            state.release_batch_references();
+        for state in &self.shared_states {
+            if let Some(state) = state.lock().as_mut() {
+                state.release_batch_references();
+            }
         }
         for slot in &mut self.shared_slots {
             slot.value = ValueSlot::Empty;
@@ -124,9 +127,45 @@ impl<'a> VectorKernelInput<'a> {
 
 struct SharedEvaluation<'a> {
     nodes: &'a [PhysicalExpression],
-    states: &'a mut [Option<CompiledExpressionState>],
+    states: &'a [Arc<Mutex<Option<CompiledExpressionState>>>],
     slots: &'a mut [SharedExpressionSlot],
     epoch: u64,
+}
+
+/// Temporarily owns a shared expression state and restores it on every exit,
+/// including panic unwinding. The independently owned state slot lets nested
+/// evaluation borrow the rest of `SharedEvaluation` without raw pointers or
+/// an unwind fence in the vector hot path.
+struct SharedStateLease {
+    slot: Arc<Mutex<Option<CompiledExpressionState>>>,
+    state: Option<CompiledExpressionState>,
+}
+
+impl SharedStateLease {
+    fn take(slot: &Arc<Mutex<Option<CompiledExpressionState>>>) -> Option<Self> {
+        let state = slot.lock().take()?;
+        Some(Self {
+            slot: Arc::clone(slot),
+            state: Some(state),
+        })
+    }
+
+    fn state_mut(&mut self) -> &mut CompiledExpressionState {
+        self.state
+            .as_mut()
+            .expect("shared state lease always owns its state")
+    }
+}
+
+impl Drop for SharedStateLease {
+    fn drop(&mut self) {
+        let previous = self.slot.lock().replace(
+            self.state
+                .take()
+                .expect("shared state lease always restores its state"),
+        );
+        debug_assert!(previous.is_none(), "shared state slot restored twice");
+    }
 }
 
 thread_local! {
@@ -216,22 +255,25 @@ impl SharedEvaluation<'_> {
             .nodes
             .get(expr.slot)
             .ok_or_else(|| paro_error::internal("shared expression node out of bounds"))?;
-        let mut state = self
+        let state_slot = self
             .states
-            .get_mut(expr.slot)
-            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?
-            .take()
+            .get(expr.slot)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
+        let mut state = SharedStateLease::take(&state_slot)
             .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
-        let execution = catch_unwind(AssertUnwindSafe(|| {
-            ExpressionExecutor::execute_into_inner(
-                node, &mut state, chunk, sel, count, runtime, params, result, self,
-            )
-        }));
-        self.states[expr.slot] = Some(state);
-        match execution {
-            Ok(result) => result?,
-            Err(payload) => resume_unwind(payload),
-        }
+        ExpressionExecutor::execute_into_inner(
+            node,
+            state.state_mut(),
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+            result,
+            self,
+        )?;
+        drop(state);
 
         let slot = self
             .slots
@@ -252,22 +294,23 @@ impl SharedEvaluation<'_> {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let mut state = self
+        let state_slot = self
             .states
-            .get_mut(slot)
-            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?
-            .take()
+            .get(slot)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
+        let mut state = SharedStateLease::take(&state_slot)
             .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
-        let value = catch_unwind(AssertUnwindSafe(|| {
-            ExpressionExecutor::execute_value(
-                node, &mut state, chunk, sel, count, runtime, params, self,
-            )
-        }));
-        self.states[slot] = Some(state);
-        match value {
-            Ok(value) => value,
-            Err(payload) => resume_unwind(payload),
-        }
+        ExpressionExecutor::execute_value(
+            node,
+            state.state_mut(),
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+            self,
+        )
     }
 }
 
@@ -372,7 +415,11 @@ impl ExpressionExecutor {
             .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
             .collect();
         let shared_states = (0..physical.shared_expression_count())
-            .map(|slot| Some(Self::initialize(physical.shared_node(slot))))
+            .map(|slot| {
+                Arc::new(Mutex::new(Some(Self::initialize(
+                    physical.shared_node(slot),
+                ))))
+            })
             .collect();
         let shared_slots = physical
             .scratch_layout()
@@ -949,9 +996,13 @@ impl ExpressionExecutor {
         } else if let Some(chunk) = intermediate_chunk.as_mut() {
             chunk.clear_columns();
         }
-        Ok(intermediate_chunk
+        let intermediate = intermediate_chunk
             .as_mut()
-            .expect("intermediate chunk initialized"))
+            .expect("intermediate chunk initialized");
+        // Cardinality is independent of physical columns. Zero-argument
+        // functions still receive one logical input row in scalar projections.
+        intermediate.try_set_cardinality(count)?;
+        Ok(intermediate)
     }
 
     fn store_value(slot: &mut ValueSlot, value: &EvaluatedValue) {
@@ -4257,6 +4308,33 @@ mod tests {
         assert_eq!(first_output_ptr, second_output_ptr);
         assert_eq!(output.get_value(0, 0), Some(Value::Integer(5)));
         assert_eq!(output.get_value(0, 1), Some(Value::Integer(6)));
+    }
+
+    #[test]
+    fn zero_argument_functions_receive_the_input_cardinality_and_runtime_context() {
+        let session = TestStatementContextBuilder::minimal()
+            .with_current_user("alice")
+            .build();
+        let runtime = test_runtime(session);
+        let function = BoundScalarFunction::from(
+            paro_function::scalar::system::get_current_user_functions().functions[0].clone(),
+        );
+        let expression = Expression::Function(FunctionExpression::new(
+            function,
+            Vec::new(),
+            LogicalType::Varchar,
+        ));
+        let mut executor = ExpressionExecutor::new(&expression);
+        let mut input =
+            Chunk::try_new(paro_common::test_utils::test_allocator()).expect("input chunk");
+        input.set_cardinality(1);
+
+        let result = executor
+            .execute_expression(0, &input, None, 1, &runtime)
+            .expect("zero-argument function execution");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get_string(0), Some("alice"));
     }
 
     #[test]

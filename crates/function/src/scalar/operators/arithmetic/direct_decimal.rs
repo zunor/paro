@@ -9,7 +9,7 @@ mod factor_chain;
 #[cfg(test)]
 mod factor_chain_tests;
 
-pub use factor_chain::{is_decimal_factor_fusion, try_execute_decimal_factor_chain};
+pub use factor_chain::{try_execute_decimal_factor_chain, DecimalFactorChainPlan};
 
 trait DirectDecimalReader: Copy {
     /// # Safety

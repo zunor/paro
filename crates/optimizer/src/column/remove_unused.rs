@@ -171,15 +171,6 @@ impl<'a> RemoveUnusedColumns<'a> {
             }
         }
 
-        // Ensure at least one column
-        if new_column_ids.is_empty() && !get.column_ids.is_empty() {
-            new_column_ids.push(get.column_ids[0]);
-            new_column_types.push(get.column_types[0].clone());
-            if !get.names.is_empty() {
-                new_names.push(get.names[0].clone());
-            }
-        }
-
         get.column_ids = new_column_ids;
         get.column_types = new_column_types.clone();
         get.returned_types = new_column_types;

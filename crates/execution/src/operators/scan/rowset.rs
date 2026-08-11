@@ -126,12 +126,8 @@ impl RowsetSourceExec {
             reorder_segments(&mut segments, order);
         }
         let overlay_delete_vectors = overlay.as_ref().and_then(TxnOverlayReader::delete_vectors);
-        let column_projection = match &self.desc.column_projection {
-            RowsetColumnProjection::All => {
-                ColumnProjection::new((0..table.types().len()).collect())
-            }
-            RowsetColumnProjection::Columns(columns) => ColumnProjection::new(columns.to_vec()),
-        };
+        let column_projection =
+            ColumnProjection::new(self.desc.column_projection.columns().to_vec());
         let predicate = self.effective_predicate(ctx)?;
         let predicate_columns = predicate
             .as_ref()

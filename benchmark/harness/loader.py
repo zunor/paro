@@ -19,7 +19,7 @@ VALIDATE_MODES = {
     "scalar_gte",
     "row_count",
     "ordered_rows",
-    "ordered_digest",
+    "ordered_digest_v1",
     "text_contains_all",
 }
 

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DictionaryInfo, DictionarySource, SelectionVector, StringHeap, ValidityMask, Vector,
-    VectorBuffer, VectorSelection, VectorType,
+    DictionaryInfo, DictionarySource, SelectionVector, StringHeap, ValidatedVectorSelection,
+    ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
 };
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
@@ -375,16 +375,18 @@ impl Vector {
         )
     }
 
-    /// Create a generic dictionary overlay from a selection whose child
-    /// bounds were validated by its producer.
-    ///
-    /// # Safety
-    ///
-    /// Every selection index must be strictly smaller than `child.len()`.
-    pub unsafe fn try_dictionary_validated<S>(child: Arc<Vector>, selection: S) -> Result<Self>
-    where
-        S: Into<SelectionVector>,
-    {
+    /// Create a generic dictionary overlay from a reusable bounds proof.
+    pub fn try_dictionary_from_validated(
+        child: Arc<Vector>,
+        selection: ValidatedVectorSelection,
+    ) -> Result<Self> {
+        if selection.child_count != child.len() {
+            return Err(paro_error::invalid_input(format!(
+                "validated dictionary selection targets {} rows, child has {}",
+                selection.child_count,
+                child.len()
+            )));
+        }
         let unique_len = if child.vector_type == VectorType::Dictionary {
             child
                 .child
@@ -396,7 +398,7 @@ impl Vector {
         };
         Self::try_dictionary_with_info(
             child,
-            VectorSelection::Materialized(selection.into()),
+            selection.selection,
             DictionaryInfo {
                 unique_len,
                 provenance_id: None,
@@ -423,26 +425,20 @@ impl Vector {
         )
     }
 
-    /// Create a dictionary vector from a selection whose child bounds were
-    /// validated by its producer while decoding or constructing the indices.
-    ///
-    /// # Safety
-    ///
-    /// Every selection index must be strictly smaller than `child.len()`.
-    pub unsafe fn try_with_validated_dictionary<S>(
+    /// Create a dictionary vector with provenance from a reusable bounds proof.
+    pub fn try_with_validated_dictionary(
         child: Arc<Vector>,
-        selection: S,
+        selection: ValidatedVectorSelection,
         dictionary_info: DictionaryInfo,
-    ) -> Result<Self>
-    where
-        S: Into<SelectionVector>,
-    {
-        Self::try_dictionary_with_info(
-            child,
-            VectorSelection::Materialized(selection.into()),
-            dictionary_info,
-            true,
-        )
+    ) -> Result<Self> {
+        if selection.child_count != child.len() {
+            return Err(paro_error::invalid_input(format!(
+                "validated dictionary selection targets {} rows, child has {}",
+                selection.child_count,
+                child.len()
+            )));
+        }
+        Self::try_dictionary_with_info(child, selection.selection, dictionary_info, true)
     }
 
     /// Create a dictionary vector from a first-class selection representation.

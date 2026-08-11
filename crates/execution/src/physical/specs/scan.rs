@@ -30,26 +30,25 @@ pub struct RowsetScanSpec {
     pub runtime_filter_expressions: Box<[Expression]>,
 }
 
-/// Physical base-table projection without overloading an empty column list.
+/// Exact physical base-table projection.
+///
+/// An empty projection means that only row cardinality is requested. Reading
+/// every table column is represented by listing every column explicitly at the
+/// logical scan boundary, so no layer has to guess what an empty list means.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RowsetColumnProjection {
-    All,
-    Columns(Box<[usize]>),
-}
+pub struct RowsetColumnProjection(Box<[usize]>);
 
 impl RowsetColumnProjection {
-    pub fn column_id(&self, output_index: usize) -> Option<usize> {
-        match self {
-            Self::All => Some(output_index),
-            Self::Columns(columns) => columns.get(output_index).copied(),
-        }
+    pub fn new(columns: impl Into<Box<[usize]>>) -> Self {
+        Self(columns.into())
     }
 
-    pub fn explicit_columns(&self) -> Option<&[usize]> {
-        match self {
-            Self::All => None,
-            Self::Columns(columns) => Some(columns),
-        }
+    pub fn column_id(&self, output_index: usize) -> Option<usize> {
+        self.0.get(output_index).copied()
+    }
+
+    pub fn columns(&self) -> &[usize] {
+        &self.0
     }
 }
 

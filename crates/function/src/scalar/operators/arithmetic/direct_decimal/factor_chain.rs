@@ -5,12 +5,45 @@
 
 use super::*;
 
-pub fn is_decimal_factor_fusion(function: &BoundScalarFunction) -> bool {
-    function
-        .bind_data
-        .as_deref()
-        .and_then(|data| data.as_any().downcast_ref::<DecimalFactorFusionBindData>())
-        .is_some()
+/// Fully validated execution contract for a producer-consumer factor chain.
+///
+/// Construction proves that the consumer argument receiving the producer has
+/// exactly the producer's declared DECIMAL type. Execution therefore cannot
+/// accidentally combine two unrelated bound kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecimalFactorChainPlan {
+    first: DecimalFactorFusionBindData,
+    second: DecimalFactorFusionBindData,
+    second_shared_side: DecimalOperandSide,
+}
+
+impl DecimalFactorChainPlan {
+    pub fn try_new(
+        first_function: &BoundScalarFunction,
+        second_function: &BoundScalarFunction,
+        second_shared_side: DecimalOperandSide,
+    ) -> Option<Self> {
+        let first = first_function
+            .bind_data
+            .as_deref()?
+            .as_any()
+            .downcast_ref::<DecimalFactorFusionBindData>()
+            .copied()?;
+        let second = second_function
+            .bind_data
+            .as_deref()?
+            .as_any()
+            .downcast_ref::<DecimalFactorFusionBindData>()
+            .copied()?;
+        let shared_argument = second_function
+            .arguments
+            .get(usize::from(second_shared_side == DecimalOperandSide::Right))?;
+        (shared_argument == &first_function.return_type).then_some(Self {
+            first,
+            second,
+            second_shared_side,
+        })
+    }
 }
 
 /// Execute two DECIMAL factor functions whose first result is the outer input
@@ -21,8 +54,7 @@ pub fn is_decimal_factor_fusion(function: &BoundScalarFunction) -> bool {
 /// output is modified.
 #[allow(clippy::too_many_arguments)]
 pub fn try_execute_decimal_factor_chain(
-    first_function: &BoundScalarFunction,
-    second_function: &BoundScalarFunction,
+    plan: DecimalFactorChainPlan,
     first_outer: &Vector,
     first_inner: &Vector,
     second_inner: &Vector,
@@ -30,31 +62,15 @@ pub fn try_execute_decimal_factor_chain(
     second_result: &mut Vector,
     count: usize,
 ) -> Result<bool> {
-    let Some(first_plan) = first_function
-        .bind_data
-        .as_deref()
-        .and_then(|data| data.as_any().downcast_ref::<DecimalFactorFusionBindData>())
-        .copied()
-    else {
-        return Ok(false);
-    };
-    let Some(second_plan) = second_function
-        .bind_data
-        .as_deref()
-        .and_then(|data| data.as_any().downcast_ref::<DecimalFactorFusionBindData>())
-        .copied()
-    else {
-        return Ok(false);
-    };
     let first_outer = DecimalInputView::try_new(first_outer, count)?;
     let first_inner = DecimalInputView::try_new(first_inner, count)?;
     let second_inner = DecimalInputView::try_new(second_inner, count)?;
     let first_output = DecimalOutput::try_new(first_result)?;
     let second_output = DecimalOutput::try_new(second_result)?;
-    let Some(first_prepared) = PreparedCommonFactor::try_new(first_plan) else {
+    let Some(first_prepared) = PreparedCommonFactor::try_new(plan.first) else {
         return Ok(false);
     };
-    let Some(second_prepared) = PreparedCommonFactor::try_new(second_plan) else {
+    let Some(second_prepared) = PreparedCommonFactor::try_new(plan.second) else {
         return Ok(false);
     };
     execute_decimal_factor_chain(
@@ -63,8 +79,7 @@ pub fn try_execute_decimal_factor_chain(
         &second_inner,
         first_output,
         second_output,
-        first_plan,
-        second_plan,
+        plan,
         first_prepared,
         second_prepared,
         count,
@@ -192,8 +207,7 @@ pub(super) fn execute_decimal_factor_chain(
     second_inner: &DecimalInputView<'_>,
     first_output: DecimalOutput,
     second_output: DecimalOutput,
-    first_plan: DecimalFactorFusionBindData,
-    second_plan: DecimalFactorFusionBindData,
+    plan: DecimalFactorChainPlan,
     first_prepared: PreparedCommonFactor,
     second_prepared: PreparedCommonFactor,
     count: usize,
@@ -209,8 +223,7 @@ pub(super) fn execute_decimal_factor_chain(
                         $inputs,
                         DirectI64Writer(first),
                         DirectI64Writer(second),
-                        first_plan,
-                        second_plan,
+                        plan,
                         first_prepared,
                         second_prepared,
                         count,
@@ -221,8 +234,7 @@ pub(super) fn execute_decimal_factor_chain(
                         $inputs,
                         DirectI64Writer(first),
                         DirectI128Writer(second),
-                        first_plan,
-                        second_plan,
+                        plan,
                         first_prepared,
                         second_prepared,
                         count,
@@ -233,8 +245,7 @@ pub(super) fn execute_decimal_factor_chain(
                         $inputs,
                         DirectI128Writer(first),
                         DirectI64Writer(second),
-                        first_plan,
-                        second_plan,
+                        plan,
                         first_prepared,
                         second_prepared,
                         count,
@@ -245,8 +256,7 @@ pub(super) fn execute_decimal_factor_chain(
                         $inputs,
                         DirectI128Writer(first),
                         DirectI128Writer(second),
-                        first_plan,
-                        second_plan,
+                        plan,
                         first_prepared,
                         second_prepared,
                         count,
@@ -288,8 +298,7 @@ fn execute_decimal_factor_chain_loop<I, W1, W2>(
     inputs: I,
     first_output: W1,
     second_output: W2,
-    first_plan: DecimalFactorFusionBindData,
-    second_plan: DecimalFactorFusionBindData,
+    plan: DecimalFactorChainPlan,
     first_prepared: PreparedCommonFactor,
     second_prepared: PreparedCommonFactor,
     count: usize,
@@ -303,7 +312,10 @@ where
     for row in 0..count {
         let (first_outer, first_inner, second_inner) = unsafe { inputs.read(row) };
         let (first, first_failed) = first_prepared.evaluate(first_outer, first_inner);
-        let (second, second_failed) = second_prepared.evaluate(first, second_inner);
+        let (second, second_failed) = match plan.second_shared_side {
+            DecimalOperandSide::Left => second_prepared.evaluate(first, second_inner),
+            DecimalOperandSide::Right => second_prepared.evaluate(second_inner, first),
+        };
         invalid |= first_failed | second_failed;
         unsafe {
             first_output.write(row, i128::from(first));
@@ -319,8 +331,15 @@ where
     // the same semantics as evaluating both scalar functions independently.
     for row in 0..count {
         let (first_outer, first_inner, second_inner) = unsafe { inputs.read(row) };
-        let first = first_plan.evaluate_exact(i128::from(first_outer), i128::from(first_inner))?;
-        let second = second_plan.evaluate_exact(first, i128::from(second_inner))?;
+        let first = plan
+            .first
+            .evaluate_exact(i128::from(first_outer), i128::from(first_inner))?;
+        let second = match plan.second_shared_side {
+            DecimalOperandSide::Left => plan.second.evaluate_exact(first, i128::from(second_inner)),
+            DecimalOperandSide::Right => {
+                plan.second.evaluate_exact(i128::from(second_inner), first)
+            }
+        }?;
         unsafe {
             first_output.write(row, first);
             second_output.write(row, second);

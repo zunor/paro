@@ -6,15 +6,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import hashlib
-import json
 import threading
 from typing import Any, Callable
 
 from .loader import QueryDef
+from .result_protocol import normalize_row_v1, normalize_value_v1, ordered_rows_digest_v1
 
 
-STRONG_VALIDATE_MODES = {"scalar_equals", "ordered_rows", "ordered_digest"}
+STRONG_VALIDATE_MODES = {"scalar_equals", "ordered_rows", "ordered_digest_v1"}
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,7 @@ class BenchmarkValidator:
             return ValidationOutcome("FAIL", f"expected row_count={expected}, got {actual}")
 
         if mode == "ordered_rows":
-            actual_rows = [_normalize_row(row) for row in rows]
+            actual_rows = [normalize_row_v1(row) for row in rows]
             expected_rows = _normalize_expected_rows(expected)
             if actual_rows == expected_rows:
                 return ValidationOutcome("PASS")
@@ -68,13 +67,15 @@ class BenchmarkValidator:
                 f"ordered rows mismatch: expected {expected_rows!r}, got {actual_rows!r}",
             )
 
-        if mode == "ordered_digest":
+        if mode == "ordered_digest_v1":
             if not isinstance(expected, str) or len(expected) != 64:
-                return ValidationOutcome("FAIL", "ordered_digest expected must be a SHA-256 hex digest")
-            actual = ordered_rows_digest(rows)
+                return ValidationOutcome(
+                    "FAIL", "ordered_digest_v1 expected must be a SHA-256 hex digest"
+                )
+            actual = ordered_rows_digest_v1(rows)
             if actual == expected.lower():
                 return ValidationOutcome("PASS")
-            preview = [_normalize_row(row) for row in rows[:5]]
+            preview = [normalize_row_v1(row) for row in rows[:5]]
             return ValidationOutcome(
                 "FAIL",
                 f"expected ordered digest {expected.lower()}, got {actual}; "
@@ -154,33 +155,10 @@ def _normalize_expected_rows(expected: Any) -> list[list[Any]]:
     normalized: list[list[Any]] = []
     for row in expected:
         if isinstance(row, list):
-            normalized.append([_normalize_value(v) for v in row])
+            normalized.append([normalize_value_v1(v) for v in row])
         else:
-            normalized.append([_normalize_value(row)])
+            normalized.append([normalize_value_v1(row)])
     return normalized
-
-
-def ordered_rows_digest(rows: list[list[Any]]) -> str:
-    """Return a stable, type-preserving digest for an ordered SQL result.
-
-    Executor normalization has already converted exact DECIMAL and temporal
-    values to strings. JSON then supplies unambiguous row/value boundaries,
-    while sorted object keys keep nested values deterministic.
-    """
-
-    normalized = [_normalize_row(row) for row in rows]
-    payload = json.dumps(
-        normalized,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        allow_nan=False,
-    ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
-
-
-def _normalize_row(row: list[Any]) -> list[Any]:
-    return [_normalize_value(v) for v in row]
 
 
 def _normalize_expected_needles(expected: Any) -> list[str]:
@@ -194,18 +172,8 @@ def _normalize_expected_needles(expected: Any) -> list[str]:
 def _render_rows_text(rows: list[list[Any]]) -> str:
     rendered_rows: list[str] = []
     for row in rows:
-        rendered_rows.append("\t".join(str(_normalize_value(value)) for value in row))
+        rendered_rows.append("\t".join(str(normalize_value_v1(value)) for value in row))
     return "\n".join(rendered_rows)
-
-
-def _normalize_value(value: Any) -> Any:
-    if isinstance(value, tuple):
-        return [_normalize_value(v) for v in value]
-    if isinstance(value, list):
-        return [_normalize_value(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _normalize_value(v) for k, v in value.items()}
-    return value
 
 
 def _safe_close(conn: Any) -> None:

@@ -9,8 +9,9 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 use super::super::{
-    register_arithmetic_functions, try_decimal_factor_fusion, BoundScalarFunction,
-    DecimalOperandSide, ExpressionState, FunctionData, ScalarBindInput, ScalarFunctionSet,
+    register_arithmetic_functions, try_decimal_factor_fusion, try_execute_decimal_factor_chain,
+    BoundScalarFunction, DecimalFactorChainPlan, DecimalOperandSide, ExpressionState, FunctionData,
+    ScalarBindInput, ScalarFunctionSet,
 };
 
 struct BindState {
@@ -139,4 +140,127 @@ fn handles_integer_constant_nulls_and_exact_fallback() {
         unsafe { result.get_fixed::<i128>(0) },
         950_000_000_000_000_000_000
     );
+}
+
+#[test]
+fn declines_decimal_constants_whose_value_scale_disagrees_with_declared_type() {
+    let factor_type = LogicalType::Decimal {
+        precision: 4,
+        scale: 2,
+    };
+    let price_type = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    let inner = bind_decimal_operator("-", &[factor_type.clone(), factor_type.clone()]);
+    let outer = bind_decimal_operator("*", &[price_type.clone(), inner.return_type.clone()]);
+
+    assert!(try_decimal_factor_fusion(
+        &outer,
+        &inner,
+        &Value::Decimal(100, 4, 3),
+        &price_type,
+        &factor_type,
+        &factor_type,
+        DecimalOperandSide::Right,
+        DecimalOperandSide::Left,
+    )
+    .is_none());
+}
+
+#[test]
+fn factor_chain_plan_supports_a_right_hand_shared_operand() {
+    let factor_type = LogicalType::Decimal {
+        precision: 4,
+        scale: 2,
+    };
+    let price_type = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    let producer_inner = bind_decimal_operator("-", &[LogicalType::Integer, factor_type.clone()]);
+    let producer_outer = bind_decimal_operator(
+        "*",
+        &[price_type.clone(), producer_inner.return_type.clone()],
+    );
+    let producer = try_decimal_factor_fusion(
+        &producer_outer,
+        &producer_inner,
+        &Value::Integer(1),
+        &price_type,
+        &factor_type,
+        &LogicalType::Integer,
+        DecimalOperandSide::Right,
+        DecimalOperandSide::Left,
+    )
+    .expect("producer factor should fuse");
+
+    let consumer_inner =
+        bind_decimal_operator("+", &[LogicalType::Integer, producer.return_type.clone()]);
+    let consumer_outer = bind_decimal_operator(
+        "*",
+        &[factor_type.clone(), consumer_inner.return_type.clone()],
+    );
+    let consumer = try_decimal_factor_fusion(
+        &consumer_outer,
+        &consumer_inner,
+        &Value::Integer(1),
+        &factor_type,
+        &producer.return_type,
+        &LogicalType::Integer,
+        DecimalOperandSide::Right,
+        DecimalOperandSide::Left,
+    )
+    .expect("consumer factor should fuse");
+    let plan = DecimalFactorChainPlan::try_new(&producer, &consumer, DecimalOperandSide::Right)
+        .expect("consumer right argument has the producer type");
+    assert!(
+        DecimalFactorChainPlan::try_new(&producer, &consumer, DecimalOperandSide::Left,).is_none()
+    );
+
+    let mut prices = paro_common::test_utils::test_vector(price_type);
+    prices.set_count(2);
+    prices.set_i64(0, 10_000);
+    prices.set_i64(1, 20_000);
+    let mut discounts = paro_common::test_utils::test_vector(factor_type.clone());
+    discounts.set_count(2);
+    discounts.set_i64(0, 5);
+    discounts.set_i64(1, 10);
+    let mut multipliers = paro_common::test_utils::test_vector(factor_type);
+    multipliers.set_count(2);
+    multipliers.set_i64(0, 200);
+    multipliers.set_i64(1, 300);
+
+    let expected_producer =
+        execute_fused_factor(&producer, prices.reference(), discounts.reference());
+    let expected_consumer = execute_fused_factor(
+        &consumer,
+        multipliers.reference(),
+        expected_producer.reference(),
+    );
+    let mut actual_producer = paro_common::test_utils::test_vector(producer.return_type.clone());
+    let mut actual_consumer = paro_common::test_utils::test_vector(consumer.return_type.clone());
+    assert!(try_execute_decimal_factor_chain(
+        plan,
+        &prices,
+        &discounts,
+        &multipliers,
+        &mut actual_producer,
+        &mut actual_consumer,
+        2,
+    )
+    .expect("factor chain execution"));
+    actual_producer.set_count(2);
+    actual_consumer.set_count(2);
+
+    for row in 0..2 {
+        assert_eq!(
+            actual_producer.get_value(row),
+            expected_producer.get_value(row)
+        );
+        assert_eq!(
+            actual_consumer.get_value(row),
+            expected_consumer.get_value(row)
+        );
+    }
 }

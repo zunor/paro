@@ -866,6 +866,44 @@ fn test_tablet_reader_row_id_only_projection() {
 }
 
 #[test]
+fn test_tablet_reader_cardinality_only_projection() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let schema = create_test_schema();
+    let rowset_dir = base.join("rowset_cardinality_only");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment = create_segment_with_values(&schema, 0, &[1, 2, 3], &segment_path);
+
+    let meta = RowsetMetaBuilder::with_id(10, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let params = TabletReaderParams::with_version(0)
+        .with_projection(ColumnProjection::new(Vec::new()))
+        .with_batch_size(10);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+
+    let chunk = reader
+        .get_next_chunk()
+        .unwrap()
+        .expect("cardinality-only chunk should exist");
+    assert_eq!(chunk.column_count(), 0);
+    assert_eq!(chunk.len(), 3);
+    assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
 fn test_tablet_reader_missing_column_projection() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path();

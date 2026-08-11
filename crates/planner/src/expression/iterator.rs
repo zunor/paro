@@ -5,7 +5,26 @@ use crate::expression::{Expression, WindowExpression, WindowFrameBound};
 
 pub struct ExpressionIterator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionVisitDecision {
+    Descend,
+    SkipChildren,
+}
+
 impl ExpressionIterator {
+    /// Visit an expression tree in pre-order with explicit subtree pruning.
+    /// All child enumeration remains centralized here, so adding an expression
+    /// variant cannot silently omit it from downstream analyses.
+    pub fn visit(
+        expr: &Expression,
+        visitor: &mut impl FnMut(&Expression) -> ExpressionVisitDecision,
+    ) {
+        if visitor(expr) == ExpressionVisitDecision::SkipChildren {
+            return;
+        }
+        Self::enumerate_children(expr, |child| Self::visit(child, visitor));
+    }
+
     pub fn enumerate_children(expr: &Expression, mut f: impl FnMut(&Expression)) {
         match expr {
             Expression::Aggregate(e) => {

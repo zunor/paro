@@ -345,6 +345,36 @@ pub enum VectorSelection {
     },
 }
 
+/// A logical-to-physical mapping proven to fit one exact child cardinality.
+///
+/// Fields are private so the proof can only be established by the validating
+/// constructor. The value is cheaply cloneable and may be applied to several
+/// same-sized column vectors in one batch without rescanning every index.
+#[derive(Debug, Clone)]
+pub struct ValidatedVectorSelection {
+    pub(super) selection: VectorSelection,
+    pub(super) child_count: usize,
+}
+
+impl ValidatedVectorSelection {
+    pub fn try_new(selection: impl Into<VectorSelection>, child_count: usize) -> Result<Self> {
+        let selection = selection.into();
+        selection.validate_child_bounds(child_count)?;
+        Ok(Self {
+            selection,
+            child_count,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.selection.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selection.is_empty()
+    }
+}
+
 impl VectorSelection {
     #[inline]
     pub fn none() -> Self {
