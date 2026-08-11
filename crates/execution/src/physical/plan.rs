@@ -309,7 +309,8 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         }
         PhysicalNodeKind::HashJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
-            push_join_conditions(&mut properties, &spec.conditions);
+            push_join_conditions(&mut properties, &spec.key_conditions);
+            push_join_conditions(&mut properties, &spec.residual_conditions);
         }
         PhysicalNodeKind::NestedLoopJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());

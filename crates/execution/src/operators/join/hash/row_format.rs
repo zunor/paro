@@ -26,7 +26,7 @@ impl HashJoinRowFormat {
         let payload_count = payload_types.len();
         logical_types.extend(payload_types);
         if has_found_flag {
-            logical_types.push(LogicalType::Boolean);
+            logical_types.push(LogicalType::UTinyInt);
         }
         logical_types.push(LogicalType::UBigInt);
         Self {
@@ -102,7 +102,7 @@ mod tests {
                 LogicalType::Integer,
                 LogicalType::Varchar,
                 LogicalType::Boolean,
-                LogicalType::Boolean,
+                LogicalType::UTinyInt,
                 LogicalType::UBigInt,
             ]
         );

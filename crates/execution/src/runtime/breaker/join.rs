@@ -123,6 +123,28 @@ impl JoinBuildHandle {
         join_type: JoinType,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
+        let build_output_count = build_types.len();
+        self.initialize_table_with_output_count(
+            buffer_pool,
+            allocator,
+            conditions,
+            build_types,
+            build_output_count,
+            join_type,
+            memory,
+        )
+    }
+
+    pub fn initialize_table_with_output_count(
+        &self,
+        buffer_pool: Arc<BufferPool>,
+        allocator: Arc<dyn Allocator>,
+        conditions: Vec<JoinCondition>,
+        build_types: Vec<LogicalType>,
+        build_output_count: usize,
+        join_type: JoinType,
+        memory: MemoryAccountingContext,
+    ) -> Result<Arc<JoinHashTable>> {
         let runtime_filter_key_types = conditions
             .iter()
             .map(|condition| condition.right.return_type())
@@ -141,11 +163,12 @@ impl JoinBuildHandle {
             }
             JoinHashTableState::Uninitialized => {}
         }
-        let table = Arc::new(JoinHashTable::new_with_memory(
+        let table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
             buffer_pool,
             allocator,
             conditions,
             build_types,
+            build_output_count,
             join_type,
             JoinHashTableConfig::default(),
             memory,

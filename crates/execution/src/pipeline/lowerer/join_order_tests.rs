@@ -135,7 +135,7 @@ fn left_deep_probe_does_not_trace_build_payload_to_rowset() {
         _ => panic!("expected hash join plan"),
     };
     let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
-    spec.conditions[0].left =
+    spec.key_conditions[0].left =
         Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer));
     let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
     let source = lowerer.attach_hash_join_runtime_filters(

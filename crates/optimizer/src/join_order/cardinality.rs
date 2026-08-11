@@ -1039,12 +1039,25 @@ impl CardinalityEstimator {
                 .and_then(|bindings| {
                     let preserved = *self.binding_stats.get(&bindings.preserved)?;
                     let filtering = *self.binding_stats.get(&bindings.filtering)?;
-                    (preserved.distinct_count > 0).then_some((
+                    let estimate = (preserved.distinct_count > 0).then_some((
                         (filtering.distinct_count as f64
                             / preserved.distinct_count.max(filtering.distinct_count) as f64)
                             .clamp(0.0, 1.0),
                         1.0 / preserved.relation_cardinality.max(1) as f64,
-                    ))
+                    ));
+                    trace!(
+                        target: targets::OPTIMIZER,
+                        filter_index = filter.filter_info.filter_index,
+                        join_type = ?filter.filter_info.join_type,
+                        preserved_binding = ?bindings.preserved,
+                        filtering_binding = ?bindings.filtering,
+                        preserved_ndv = preserved.distinct_count,
+                        filtering_ndv = filtering.distinct_count,
+                        preserved_rows = preserved.relation_cardinality,
+                        filtering_rows = filtering.relation_cardinality,
+                        "Estimated reduction-join key coverage"
+                    );
+                    estimate
                 })
         } else {
             None
@@ -1086,13 +1099,18 @@ impl CardinalityEstimator {
                 if conj.conjunction_type == ConjunctionType::Or {
                     return None;
                 }
-                // Check children for comparison
-                for child in &conj.children {
-                    if let Some(kind) = Self::get_comparison_type(child) {
-                        return Some(kind);
-                    }
-                }
-                None
+                // Equality determines the hash domain of a mixed conjunction
+                // regardless of SQL predicate order. Residual inequalities
+                // refine matches inside that domain; they must not hide the
+                // equality simply because they appear first.
+                conj.children
+                    .iter()
+                    .filter_map(Self::get_comparison_type)
+                    .min_by_key(|kind| match kind {
+                        ComparisonKind::Equal => 0,
+                        ComparisonKind::NotEqual => 1,
+                        ComparisonKind::Range => 2,
+                    })
             }
             _ => None,
         }

@@ -19,7 +19,7 @@ impl PipelineLowerer<'_> {
         let SourceSpec::Rowset(rowset) = &mut source else {
             return source;
         };
-        for (build_key_index, condition) in spec.conditions.iter().enumerate() {
+        for (build_key_index, condition) in spec.key_conditions.iter().enumerate() {
             if condition.comparison != JoinComparisonType::Equal {
                 continue;
             }
@@ -80,7 +80,10 @@ impl PipelineLowerer<'_> {
 }
 
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
-    matches!(join_type, JoinType::Inner | JoinType::Semi)
+    matches!(
+        join_type,
+        JoinType::Inner | JoinType::Semi | JoinType::RightSemi | JoinType::RightAnti
+    )
 }
 
 /// Trace a downstream join-key reference back to the rowset source.

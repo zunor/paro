@@ -67,6 +67,8 @@ pub struct ScanStructure {
     pub hashes: Vec<u64>,
     /// Reusable flags for residual-filtered probe rows.
     accepted_flags: Vec<bool>,
+    /// Per-candidate existential match bits for a fused reduction cascade.
+    candidate_match_masks: Vec<u8>,
     /// Number of matches to be returned in current batch.
     pub match_count: usize,
     /// Whether the scan is finished.
@@ -219,6 +221,7 @@ impl ScanStructure {
             probe_matches_ready: false,
             hashes: vec![0; VECTOR_SIZE],
             accepted_flags: vec![false; VECTOR_SIZE],
+            candidate_match_masks: vec![0; VECTOR_SIZE],
             match_count: 0,
             finished: false,
             is_null: true,
@@ -242,6 +245,7 @@ impl ScanStructure {
         self.single_match_pointers.resize(capacity, 0);
         self.hashes.resize(capacity, 0);
         self.accepted_flags.resize(capacity, false);
+        self.candidate_match_masks.resize(capacity, 0);
         self.sel_vector = SelectionVector::try_incremental(capacity, self.allocator.clone())?;
         self.probe_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
         self.continue_sel = SelectionVector::try_with_capacity(capacity, self.allocator.clone())?;
@@ -498,6 +502,39 @@ impl ScanStructure {
             self.advance_pointers();
         }
 
+        Ok(())
+    }
+
+    /// Visit each equality-key candidate once and atomically publish all
+    /// existential reduction bits accepted by `classify_matches`.
+    pub fn mark_right_matches_with_masks<F>(
+        &mut self,
+        keys: &paro_common::chunk::Chunk,
+        hash_table: &JoinHashTable,
+        mut classify_matches: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&SelectionVector, &[usize], usize, &mut [u8]) -> Result<()>,
+    {
+        let prepared_keys = self.prepare_probe_keys(keys, hash_table)?;
+        while self.count > 0 {
+            let match_count = self.resolve_predicates(prepared_keys.as_ref(), hash_table, 0);
+            let masks = &mut self.candidate_match_masks[..match_count];
+            masks.fill(0);
+            classify_matches(
+                &self.chain_match_sel,
+                &self.rhs_pointers[..match_count],
+                match_count,
+                masks,
+            )?;
+            for (candidate_idx, &mask) in masks.iter().enumerate() {
+                if mask != 0 {
+                    hash_table.mark_build_side_match_mask(self.rhs_pointers[candidate_idx], mask);
+                }
+            }
+            self.advance_pointers();
+        }
+        self.finished = true;
         Ok(())
     }
 
@@ -812,7 +849,7 @@ impl ScanStructure {
                 &self.scratch_sel,
                 unmatched_count,
                 left_projection_map,
-                &hash_table.build_types,
+                hash_table.build_output_types(),
                 result,
             )?;
         }
@@ -1053,7 +1090,7 @@ impl ScanStructure {
             )?);
         }
 
-        for build_idx in 0..hash_table.build_types.len() {
+        for build_idx in 0..hash_table.build_output_count() {
             let vector = result.column_mut(right_offset + build_idx).ok_or_else(|| {
                 paro_common::error::internal(format!(
                     "single join output column {} is missing",
@@ -1108,7 +1145,7 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
     ) -> Result<()> {
-        let expected_column_count = left_projection_map.len() + hash_table.build_types.len();
+        let expected_column_count = left_projection_map.len() + hash_table.build_output_count();
         let left_layout_matches =
             left_projection_map
                 .iter()
@@ -1123,7 +1160,7 @@ impl ScanStructure {
                 });
         let right_layout_matches =
             hash_table
-                .build_types
+                .build_output_types()
                 .iter()
                 .enumerate()
                 .all(|(build_idx, build_type)| {
@@ -1147,7 +1184,7 @@ impl ScanStructure {
                 })?;
                 expected_types.push(left_column.logical_type().clone());
             }
-            expected_types.extend(hash_table.build_types.iter().cloned());
+            expected_types.extend(hash_table.build_output_types().iter().cloned());
             *result = paro_common::chunk::Chunk::try_initialize(
                 &expected_types,
                 VECTOR_SIZE.max(count),
@@ -1192,7 +1229,7 @@ impl ScanStructure {
         // 2. Gather projected RHS columns
         let right_result_offset = left_projection_map.len();
         let unique_rhs_count = self.prepare_rhs_dictionary(count)?;
-        for (build_idx, build_type) in hash_table.build_types.iter().enumerate() {
+        for (build_idx, build_type) in hash_table.build_output_types().iter().enumerate() {
             let output_idx = right_result_offset + build_idx;
             let use_dictionary = unique_rhs_count < count
                 && dictionary_gather_is_smaller(build_type, count, unique_rhs_count);

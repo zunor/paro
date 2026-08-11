@@ -858,6 +858,74 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&plan).unwrap()
 }
 
+fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let capture = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["capture".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let dependent = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
+    );
+    let mut delim_join = ComparisonJoin::new(
+        JoinType::Inner,
+        capture,
+        dependent,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    delim_join.duplicate_eliminated_columns = vec![Expression::Reference(
+        ReferenceExpression::new(0, LogicalType::Integer),
+    )];
+    let delim_probe = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
+    let probe = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                2,
+                delim_probe,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_output_names(vec!["projected_capture".to_string()]),
+        ),
+    );
+    let build = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["build".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            probe,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&outer).unwrap()
+}
+
 fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let left = LogicalPlan::new(

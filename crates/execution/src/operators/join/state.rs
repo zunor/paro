@@ -10,8 +10,10 @@ use paro_common::vector::{SelectionVector, Vector};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::scan_structure::ScanStructure;
-use crate::join_hashtable::{FullOuterScanState, JoinHashTable};
+use crate::join_hashtable::{FullOuterScanState, GroupedReductionExtrema, JoinHashTable};
 use crate::memory_runtime::QueryMemoryPool;
+use crate::operators::join::hash::residual::HashJoinResidualProbeState;
+use crate::operators::join::hash::source_predicate::ReductionSourcePredicateState;
 use crate::runtime::breaker::{
     JoinBuildSpillBuffer, JoinProbeSpillBuffer, JoinRuntimeFilterBuilder,
 };
@@ -22,6 +24,15 @@ pub struct HashJoinProbeTransformLocal {
     pub probe_keys: Option<Chunk>,
     pub probe_key_types: Box<[LogicalType]>,
     pub probe_key_executors: Box<[ExpressionExecutor]>,
+    pub residual: Option<HashJoinResidualProbeState>,
+    pub reduction_residuals: Box<[Option<HashJoinResidualProbeState>]>,
+    pub reduction_source_predicates: Box<[ReductionSourcePredicateState]>,
+    pub reduction_source_masks: Vec<u8>,
+    pub reduction_channel_map: Vec<u8>,
+    pub reduction_selection: Option<SelectionVector>,
+    pub(crate) reduction_extrema: Option<Arc<GroupedReductionExtrema>>,
+    pub reduction_extrema_unavailable: bool,
+    pub reduction_group_slots: Vec<usize>,
     pub probe_hashes: Option<Vector>,
     pub probe_spill_chunk: Option<Chunk>,
     pub probe_spill_buffer: Option<JoinProbeSpillBuffer>,
@@ -160,6 +171,11 @@ impl SortRangeJoinProbeTransformLocal {
 pub struct HashJoinSpillReplaySourceLocal {
     pub probe_key_types: Box<[LogicalType]>,
     pub probe_key_executors: Box<[ExpressionExecutor]>,
+    pub residual: Option<HashJoinResidualProbeState>,
+    pub reduction_residuals: Box<[Option<HashJoinResidualProbeState>]>,
+    pub reduction_source_predicates: Box<[ReductionSourcePredicateState]>,
+    pub reduction_source_masks: Vec<u8>,
+    pub reduction_selection: Option<SelectionVector>,
     pub current: Option<HashJoinSpillReplayPartitionLocal>,
 }
 
@@ -180,6 +196,7 @@ pub struct HashJoinSpillReplayPartitionLocal {
 #[derive(Debug, Default)]
 pub struct HashJoinUnmatchedSourceLocal {
     pub scan_state: Option<FullOuterScanState>,
+    pub reduction_channel_masks: Box<[u8]>,
 }
 
 #[derive(Debug, Default)]
@@ -195,6 +212,9 @@ pub struct HashJoinBuildSinkLocal {
     pub(crate) query_memory: Option<Arc<QueryMemoryPool>>,
     pub build_key_types: Box<[LogicalType]>,
     pub build_key_executors: Box<[ExpressionExecutor]>,
+    pub build_residual_types: Box<[LogicalType]>,
+    pub build_residual_executors: Box<[ExpressionExecutor]>,
+    pub build_residuals: Option<Chunk>,
 }
 
 impl Drop for HashJoinBuildSinkLocal {

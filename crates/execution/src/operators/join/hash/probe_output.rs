@@ -11,9 +11,11 @@ use paro_planner::operator::join::{AntiJoinMode, JoinType};
 
 use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::JoinHashTable;
+use crate::operators::join::hash::residual::HashJoinResidualProbeState;
 use crate::operators::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
 };
+use crate::runtime::context::QueryRuntimeContext;
 
 pub(crate) fn scan_hash_join_results(
     join_type: JoinType,
@@ -24,7 +26,72 @@ pub(crate) fn scan_hash_join_results(
     hash_table: &JoinHashTable,
     scan_structure: &mut ScanStructure,
     left_projection: &[usize],
+    residual: Option<&mut HashJoinResidualProbeState>,
+    runtime: &QueryRuntimeContext,
 ) -> Result<usize> {
+    if let Some(residual) = residual {
+        let mut select = |lhs_sel: &SelectionVector,
+                          rhs_pointers: &[usize],
+                          match_count: usize,
+                          output: &mut SelectionVector| {
+            residual.select_matches(
+                runtime,
+                hash_table,
+                lhs_sel,
+                rhs_pointers,
+                match_count,
+                output,
+            )
+        };
+        return match join_type {
+            JoinType::Inner | JoinType::Right => scan_structure.next_inner_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Left | JoinType::Outer => scan_structure.next_left_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Semi => scan_structure.next_semi_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Anti if anti_join_mode == AntiJoinMode::Regular => scan_structure
+                .next_anti_join_with_filter(
+                    probe_keys,
+                    input,
+                    output,
+                    hash_table,
+                    left_projection,
+                    &mut select,
+                ),
+            JoinType::Single => scan_structure.next_single_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::RightSemi | JoinType::RightAnti => scan_structure
+                .next_right_semi_or_anti_join_with_filter(probe_keys, hash_table, &mut select),
+            JoinType::Mark | JoinType::Anti | JoinType::Invalid => Err(paro_error::internal(
+                "hash join residual predicate is not valid for this join mode",
+            )),
+        };
+    }
     match join_type {
         JoinType::Inner | JoinType::Right => {
             scan_structure.next_inner_join(probe_keys, input, output, hash_table, left_projection)

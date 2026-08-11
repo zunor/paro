@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use paro_planner::operator::JoinCondition;
 
 pub(crate) fn is_streaming_window_supported(spec: &WindowSpec) -> bool {
     spec.expressions.iter().all(|expr| {
@@ -69,11 +70,27 @@ pub(crate) fn hash_join_probe_transform(
         handle,
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
-        conditions: spec.conditions.clone(),
+        conditions: all_hash_join_conditions(spec),
         left_projection: spec.left_projection.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
+        reduction_cascade: spec.reduction_cascade.clone(),
     })
+}
+
+pub(crate) fn all_hash_join_conditions(spec: &HashJoinSpec) -> Box<[JoinCondition]> {
+    spec.key_conditions
+        .iter()
+        .chain(spec.residual_conditions.iter())
+        .chain(
+            spec.reduction_cascade
+                .iter()
+                .flat_map(|cascade| cascade.predicates.iter())
+                .map(|predicate| &predicate.condition),
+        )
+        .cloned()
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
 }
 
 pub(crate) fn cross_product_probe_transform(

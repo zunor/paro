@@ -240,34 +240,21 @@ where
                 if incoming.is_empty() {
                     return;
                 }
-                let normalized_len = values.len();
-                let missing = incoming
-                    .iter()
-                    .filter(|value| values.binary_search(value).is_err())
-                    .count();
-                if missing > max_values.saturating_sub(normalized_len) {
+                let merged_len = sorted_union_len(values, &incoming);
+                if merged_len > max_values {
                     *self = Self::Disabled;
                     return;
                 }
-                if missing > 0 && values.try_reserve(missing).is_err() {
+                let additional = merged_len.saturating_sub(values.len());
+                if additional == 0 {
+                    return;
+                }
+                if values.try_resize_with(merged_len, || incoming[0]).is_err() {
                     *self = Self::Disabled;
                     return;
                 }
-                for value in incoming.iter().copied() {
-                    if values[..normalized_len].binary_search(&value).is_ok() {
-                        continue;
-                    }
-                    // `incoming` is normalized, so appended values cannot
-                    // duplicate one another. Only the original sorted prefix
-                    // needs a lookup while the suffix is appended.
-                    if values.try_push(value).is_err() {
-                        *self = Self::Disabled;
-                        return;
-                    }
-                }
-                if values.len() != normalized_len {
-                    normalize_exact_values(values, canonical_len);
-                }
+                merge_sorted_union_from_end(values, merged_len - additional, &incoming);
+                *canonical_len = merged_len;
             }
         }
     }
@@ -313,6 +300,53 @@ where
             _reservation: Some(RuntimeFilterReservation(reservation)),
         }
     }
+}
+
+fn sorted_union_len<T: Ord>(left: &[T], right: &[T]) -> usize {
+    let (mut left_idx, mut right_idx, mut count) = (0usize, 0usize, 0usize);
+    while left_idx < left.len() && right_idx < right.len() {
+        match left[left_idx].cmp(&right[right_idx]) {
+            std::cmp::Ordering::Less => left_idx += 1,
+            std::cmp::Ordering::Greater => right_idx += 1,
+            std::cmp::Ordering::Equal => {
+                left_idx += 1;
+                right_idx += 1;
+            }
+        }
+        count += 1;
+    }
+    count + left.len().saturating_sub(left_idx) + right.len().saturating_sub(right_idx)
+}
+
+fn merge_sorted_union_from_end<T: Copy + Ord>(output: &mut [T], left_len: usize, right: &[T]) {
+    let (mut left_idx, mut right_idx, mut write_idx) = (left_len, right.len(), output.len());
+    while left_idx > 0 && right_idx > 0 {
+        let left = output[left_idx - 1];
+        let right_value = right[right_idx - 1];
+        let value = match left.cmp(&right_value) {
+            std::cmp::Ordering::Greater => {
+                left_idx -= 1;
+                left
+            }
+            std::cmp::Ordering::Less => {
+                right_idx -= 1;
+                right_value
+            }
+            std::cmp::Ordering::Equal => {
+                left_idx -= 1;
+                right_idx -= 1;
+                left
+            }
+        };
+        write_idx -= 1;
+        output[write_idx] = value;
+    }
+    while right_idx > 0 {
+        right_idx -= 1;
+        write_idx -= 1;
+        output[write_idx] = right[right_idx];
+    }
+    debug_assert_eq!(write_idx, left_idx);
 }
 
 fn exact_pending_limit(canonical_len: usize, max_values: usize) -> usize {
@@ -1129,6 +1163,64 @@ mod tests {
         assert_eq!(canonical_len, 63);
         assert_eq!(values.len(), 63);
         assert!(values.capacity() <= 64);
+    }
+
+    #[test]
+    fn exact_domain_merge_preserves_sorted_unique_union() {
+        let max_values = 64;
+        let mut left = ExactValues::mutable(MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        ));
+        let mut right = ExactValues::mutable(MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        ));
+        for value in [5_i64, 1, 3, 3] {
+            left.insert(value, max_values);
+        }
+        for value in [4_i64, 3, 2, 2] {
+            right.insert(value, max_values);
+        }
+
+        left.merge(right, max_values);
+        let ExactValues::Enabled {
+            values,
+            canonical_len,
+            ..
+        } = left
+        else {
+            panic!("exact domain unexpectedly disabled");
+        };
+        assert_eq!(canonical_len, 5);
+        assert_eq!(values.as_slice(), &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sorted_union_helpers_match_every_small_set_pair() {
+        const DOMAIN_SIZE: usize = 8;
+        for left_mask in 0_u16..(1 << DOMAIN_SIZE) {
+            let left = (0..DOMAIN_SIZE)
+                .filter(|bit| left_mask & (1 << bit) != 0)
+                .map(|bit| bit as i32 - 3)
+                .collect::<Vec<_>>();
+            for right_mask in 0_u16..(1 << DOMAIN_SIZE) {
+                let right = (0..DOMAIN_SIZE)
+                    .filter(|bit| right_mask & (1 << bit) != 0)
+                    .map(|bit| bit as i32 - 3)
+                    .collect::<Vec<_>>();
+                let expected = (0..DOMAIN_SIZE)
+                    .filter(|bit| (left_mask | right_mask) & (1 << bit) != 0)
+                    .map(|bit| bit as i32 - 3)
+                    .collect::<Vec<_>>();
+
+                assert_eq!(sorted_union_len(&left, &right), expected.len());
+                let mut actual = left.clone();
+                actual.resize(expected.len(), 0);
+                merge_sorted_union_from_end(&mut actual, left.len(), &right);
+                assert_eq!(actual, expected);
+            }
+        }
     }
 
     #[test]

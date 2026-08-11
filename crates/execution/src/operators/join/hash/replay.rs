@@ -18,11 +18,14 @@ use crate::operators::join::hash::memory::hash_join_memory_context;
 use crate::operators::join::hash::probe_output::{
     emit_empty_build_probe_result, scan_hash_join_results,
 };
+use crate::operators::join::hash::residual::HashJoinResidualProbeState;
+use crate::operators::join::hash::source_predicate::ReductionSourcePredicateState;
 use crate::operators::join::hash::spill::probe_input_from_spill_chunk_into;
 use crate::operators::join::join_result_helpers::{
     construct_right_outer_scan_result, construct_semi_join_result,
 };
 use crate::operators::output::ensure_source_output;
+use crate::physical::specs::HashReductionCascadeSpec;
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -36,11 +39,14 @@ pub struct HashJoinSpillReplaySourceExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
-    pub conditions: Box<[JoinCondition]>,
+    pub key_conditions: Box<[JoinCondition]>,
+    pub residual_conditions: Box<[JoinCondition]>,
     pub probe_types: Box<[LogicalType]>,
+    pub build_output_count: usize,
     pub build_payload_types: Box<[LogicalType]>,
     pub left_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 impl HashJoinSpillReplaySourceExec {
@@ -59,9 +65,9 @@ impl HashJoinSpillReplaySourceExec {
     ) -> Result<SourceLocal> {
         Ok(SourceLocal::HashJoinSpillReplay(
             HashJoinSpillReplaySourceLocal {
-                probe_key_types: join_key_types(&self.conditions, JoinKeySide::Probe),
+                probe_key_types: join_key_types(&self.key_conditions, JoinKeySide::Probe),
                 probe_key_executors: self
-                    .conditions
+                    .key_conditions
                     .iter()
                     .map(|condition| {
                         ExpressionExecutor::with_expressions_for_session(
@@ -71,6 +77,48 @@ impl HashJoinSpillReplaySourceExec {
                     })
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
+                residual: HashJoinResidualProbeState::new(
+                    &self.residual_conditions,
+                    ctx.query.session.as_ref(),
+                ),
+                reduction_residuals: self
+                    .reduction_cascade
+                    .as_ref()
+                    .map(|cascade| {
+                        cascade
+                            .predicates
+                            .iter()
+                            .map(|predicate| {
+                                HashJoinResidualProbeState::new_at_offset(
+                                    std::slice::from_ref(&predicate.condition),
+                                    predicate.build_residual_offset,
+                                    ctx.query.session.as_ref(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice()
+                    })
+                    .unwrap_or_default(),
+                reduction_source_predicates: self
+                    .reduction_cascade
+                    .as_ref()
+                    .map(|cascade| {
+                        cascade
+                            .source_predicates
+                            .iter()
+                            .map(|predicate| {
+                                ReductionSourcePredicateState::new(
+                                    &predicate.expression,
+                                    predicate.predicate_mask,
+                                    ctx.query.session.as_ref(),
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice()
+                    })
+                    .unwrap_or_default(),
+                reduction_source_masks: Vec::new(),
+                reduction_selection: None,
                 current: None,
             },
         ))
@@ -119,7 +167,15 @@ impl HashJoinSpillReplaySourceExec {
                 .as_mut()
                 .expect("hash join replay partition initialized");
             if current.probe_in_progress {
-                let count = self.scan_current_probe(current, output)?;
+                let count = self.scan_current_probe(
+                    ctx,
+                    current,
+                    local.residual.as_mut(),
+                    &mut local.reduction_residuals,
+                    &local.reduction_source_masks,
+                    &mut local.reduction_selection,
+                    output,
+                )?;
                 if count > 0 {
                     return Ok(SourcePoll::Output);
                 }
@@ -171,12 +227,38 @@ impl HashJoinSpillReplaySourceExec {
             evaluate_join_keys_into(
                 ctx,
                 replay_input,
-                &self.conditions,
+                &self.key_conditions,
                 &mut local.probe_key_executors,
                 &local.probe_key_types,
                 JoinKeySide::Probe,
                 &mut current.probe_keys,
             )?;
+            if let Some(residual) = local.residual.as_mut() {
+                residual.evaluate_probe(ctx, replay_input)?;
+            }
+            for residual in local.reduction_residuals.iter_mut().flatten() {
+                residual.evaluate_probe(ctx, replay_input)?;
+            }
+            if local.reduction_selection.is_none() {
+                local.reduction_selection = Some(SelectionVector::try_with_capacity(
+                    VECTOR_SIZE,
+                    output.allocator().clone(),
+                )?);
+            }
+            let selection = local
+                .reduction_selection
+                .as_mut()
+                .ok_or_else(|| paro_error::internal("hash reduction replay selection missing"))?;
+            local.reduction_source_masks.resize(replay_input.size(), 0);
+            local.reduction_source_masks.fill(0);
+            for predicate in local.reduction_source_predicates.iter_mut() {
+                predicate.evaluate_into(
+                    replay_input,
+                    ctx.query,
+                    selection,
+                    &mut local.reduction_source_masks,
+                )?;
+            }
             let probe_keys = current
                 .probe_keys
                 .as_ref()
@@ -200,11 +282,12 @@ impl HashJoinSpillReplaySourceExec {
             return Ok(None);
         };
         let template = handle.require_table()?;
-        let hash_table = Arc::new(JoinHashTable::new_with_memory(
+        let hash_table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
             template.buffer_pool().clone(),
             ctx.query.allocator(MemoryTag::HashTable),
-            self.conditions.to_vec(),
+            self.key_conditions.to_vec(),
             self.build_payload_types.to_vec(),
+            self.build_output_count,
             self.join_type,
             JoinHashTableConfig::default(),
             hash_join_memory_context(ctx.query),
@@ -245,7 +328,12 @@ impl HashJoinSpillReplaySourceExec {
 
     fn scan_current_probe(
         &self,
+        ctx: &OperatorCallContext,
         current: &mut HashJoinSpillReplayPartitionLocal,
+        residual: Option<&mut HashJoinResidualProbeState>,
+        reduction_residuals: &mut [Option<HashJoinResidualProbeState>],
+        reduction_source_masks: &[u8],
+        reduction_selection: &mut Option<SelectionVector>,
         output: &mut Chunk,
     ) -> Result<usize> {
         ensure_source_output(output, &self.output_types, VECTOR_SIZE)?;
@@ -257,6 +345,65 @@ impl HashJoinSpillReplaySourceExec {
             .probe_input
             .as_ref()
             .ok_or_else(|| paro_error::internal("hash join replay probe input missing"))?;
+        if let Some(cascade) = &self.reduction_cascade {
+            if reduction_selection.is_none() {
+                *reduction_selection = Some(SelectionVector::try_with_capacity(
+                    VECTOR_SIZE,
+                    output.allocator().clone(),
+                )?);
+            }
+            let selection = reduction_selection
+                .as_mut()
+                .ok_or_else(|| paro_error::internal("hash reduction replay selection missing"))?;
+            current.scan_structure.mark_right_matches_with_masks(
+                probe_keys,
+                current.hash_table.as_ref(),
+                |lhs_sel, rhs_pointers, match_count, masks| {
+                    for (predicate, residual) in cascade
+                        .predicates
+                        .iter()
+                        .zip(reduction_residuals.iter_mut())
+                    {
+                        let accepted_count = if let Some(residual) = residual.as_mut() {
+                            residual.select_matches(
+                                ctx.query,
+                                current.hash_table.as_ref(),
+                                lhs_sel,
+                                rhs_pointers,
+                                match_count,
+                                selection,
+                            )?
+                        } else {
+                            selection.set_len(match_count);
+                            for idx in 0..match_count {
+                                selection.set(idx, idx);
+                            }
+                            match_count
+                        };
+                        for accepted_idx in 0..accepted_count {
+                            masks[selection.get(accepted_idx)] |= predicate.predicate_mask;
+                        }
+                    }
+                    for candidate_idx in 0..match_count {
+                        masks[candidate_idx] |= reduction_source_masks[lhs_sel.get(candidate_idx)];
+                    }
+                    for candidate_mask in masks {
+                        let accepted_predicates = *candidate_mask;
+                        *candidate_mask = cascade
+                            .steps
+                            .iter()
+                            .filter(|step| {
+                                accepted_predicates & step.predicate_mask == step.predicate_mask
+                            })
+                            .fold(0u8, |mask, step| mask | step.match_mask);
+                    }
+                    Ok(())
+                },
+            )?;
+            current.probe_in_progress = false;
+            output.try_set_cardinality(0)?;
+            return Ok(0);
+        }
         let count = scan_hash_join_results(
             self.join_type,
             self.anti_join_mode,
@@ -266,6 +413,8 @@ impl HashJoinSpillReplaySourceExec {
             current.hash_table.as_ref(),
             &mut current.scan_structure,
             &self.left_projection,
+            residual,
+            ctx.query,
         )?;
         if current.scan_structure.finished {
             current.probe_in_progress = false;
@@ -292,13 +441,22 @@ impl HashJoinSpillReplaySourceExec {
             .get_or_insert_with(FullOuterScanState::new);
         let emit_found = matches!(self.join_type, JoinType::RightSemi);
         let mut build_chunk = Chunk::try_initialize(
-            &current.hash_table.build_types,
+            current.hash_table.build_output_types(),
             VECTOR_SIZE,
             output.allocator().clone(),
         )?;
-        let count = current
-            .hash_table
-            .scan_full_outer(scan_state, emit_found, &mut build_chunk)?;
+        let count = if let Some(cascade) = &self.reduction_cascade {
+            current.hash_table.scan_reduction_cascade(
+                scan_state,
+                cascade.required_mask,
+                cascade.forbidden_mask,
+                &mut build_chunk,
+            )?
+        } else {
+            current
+                .hash_table
+                .scan_full_outer(scan_state, emit_found, &mut build_chunk)?
+        };
         if count == 0 {
             output.try_set_cardinality(0)?;
             return Ok(0);

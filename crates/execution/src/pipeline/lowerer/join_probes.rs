@@ -505,9 +505,10 @@ impl<'a> PipelineLowerer<'a> {
             SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                 handle,
                 join_type: spec.join_type,
-                conditions: spec.conditions.clone(),
+                conditions: all_hash_join_conditions(spec),
                 build_projection: spec.build_input_projection.clone(),
                 build_payload_types: spec.build_payload_types.clone(),
+                build_output_count: spec.build_output_count,
                 required: Default::default(),
                 force_external: spec.force_external,
             }),
@@ -563,12 +564,14 @@ impl<'a> PipelineLowerer<'a> {
             handle,
             join_type: spec.join_type,
             anti_join_mode: spec.anti_join_mode,
-            conditions: spec.conditions.clone(),
+            conditions: all_hash_join_conditions(spec),
             probe_types: self.plan.node(*left).output.types.clone(),
             build_payload_types: spec.build_payload_types.clone(),
+            build_output_count: spec.build_output_count,
             left_projection: spec.left_projection.clone(),
             output_names: spec.output_names.clone(),
             output_types: spec.output_types.clone(),
+            reduction_cascade: spec.reduction_cascade.clone(),
         });
         let replay = self.push_pipeline(
             replay_source,
@@ -595,6 +598,7 @@ impl<'a> PipelineLowerer<'a> {
                 left_output_types: spec.left_output_types.clone(),
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
+                reduction_cascade: spec.reduction_cascade.clone(),
             });
             let unmatched = self.push_pipeline(
                 source,
@@ -700,9 +704,10 @@ impl<'a> PipelineLowerer<'a> {
                     SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                         handle,
                         join_type: spec.join_type,
-                        conditions: spec.conditions.clone(),
+                        conditions: all_hash_join_conditions(&spec),
                         build_projection: spec.build_input_projection.clone(),
                         build_payload_types: spec.build_payload_types.clone(),
+                        build_output_count: spec.build_output_count,
                         required: Default::default(),
                         force_external: false,
                     }),
@@ -792,6 +797,15 @@ impl<'a> PipelineLowerer<'a> {
             PhysicalNodeKind::ExternalTable(_) => {
                 self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
             }
+            PhysicalNodeKind::MaterializedCte(_)
+            | PhysicalNodeKind::RecursiveCte(_)
+            | PhysicalNodeKind::DelimJoin(_) => {
+                // Control regions are complete subtree producers, never
+                // streaming transforms. Materialize their output as a probe
+                // source so join orientation remains a cost decision instead
+                // of being constrained by which child owns the region.
+                self.collect_probe_roles_source_fallback(root, pipelines, dependencies)
+            }
             _ => {
                 // A probe chain can only inline streaming operators and joins.  Other
                 // breaker roots (for example a grouped aggregate on the left side of
@@ -802,15 +816,8 @@ impl<'a> PipelineLowerer<'a> {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
                 }
                 if let Some(tail) = self.collect_tail_to_breaker(root, |kind| {
-                    matches!(
-                        kind,
-                        PhysicalNodeKind::HashJoin(_)
-                            | PhysicalNodeKind::NestedLoopJoin(_)
-                            | PhysicalNodeKind::SortRangeJoin(_)
-                            | PhysicalNodeKind::ClassicIeJoin(_)
-                            | PhysicalNodeKind::CrossProduct(_)
-                            | PhysicalNodeKind::ExternalTable(_)
-                    )
+                    Self::is_tail_breaker(kind)
+                        || matches!(kind, PhysicalNodeKind::MaterializedCte(_))
                 })? {
                     let (source, mut transforms, pending_builds) =
                         self.collect_probe_roles(tail.breaker, pipelines, dependencies)?;

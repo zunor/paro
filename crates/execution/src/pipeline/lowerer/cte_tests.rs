@@ -216,6 +216,26 @@ fn left_delim_join_lowers_to_correlated_subquery_region() {
 }
 
 #[test]
+fn delim_join_can_feed_hash_probe_through_materialized_boundary() {
+    let plan = hash_join_with_delim_probe_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.control_regions.len(), 1);
+    assert!(graph
+        .pipelines
+        .iter()
+        .any(|pipeline| matches!(pipeline.sink, SinkSpec::Materialize(_))));
+    assert!(graph.pipelines.iter().any(|pipeline| {
+        matches!(pipeline.source, SourceSpec::Materialized(_))
+            && pipeline
+                .transforms
+                .iter()
+                .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+    }));
+}
+
+#[test]
 fn delim_join_keeps_recursive_dependent_as_control_region_root() {
     let plan = left_delim_join_with_recursive_dependent_plan();
     let mut lowerer = PipelineLowerer::new(&plan);

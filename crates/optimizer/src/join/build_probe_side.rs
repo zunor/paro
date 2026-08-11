@@ -56,15 +56,37 @@ impl BuildProbeSideOptimizer {
     }
 
     fn try_flip_comparison_join(&self, join: &mut paro_planner::operator::ComparisonJoin) {
-        // Only INNER joins participate in build/probe side selection here.
-        // Other join types keep their existing side contract.
-        if join.join_type != JoinType::Inner {
+        // Reduction joins have explicit right-preserving inverses, so they can
+        // choose the smaller build relation without changing multiplicity or
+        // their one-side output contract. Outer joins retain their current
+        // orientation because unmatched-row emission is a separate pipeline.
+        if !matches!(
+            join.join_type,
+            JoinType::Inner
+                | JoinType::Semi
+                | JoinType::Anti
+                | JoinType::RightSemi
+                | JoinType::RightAnti
+        ) {
             return;
         }
 
         let Some(inverse_type) = join.join_type.inverse() else {
             return;
         };
+
+        if matches!(
+            join.join_type,
+            JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti
+        ) && contains_control_region_boundary(join.right.as_ref())
+        {
+            // Swapping always moves the current right child onto the probe
+            // side. A control region can feed that side only through a full
+            // materialization boundary, which is qualitatively different from
+            // choosing the cheaper in-memory hash build. Keep the region as a
+            // build producer and let join ordering optimize inside it.
+            return;
+        }
 
         let left_cost = self.build_cost(join.left.as_ref());
         let right_cost = self.build_cost(join.right.as_ref());
@@ -115,6 +137,22 @@ impl BuildProbeSideOptimizer {
             _ => 1000,
         }
     }
+}
+
+fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
+    let owns_region = matches!(
+        &plan.operator,
+        LogicalOperator::Join(Join::Comparison(join))
+            if !join.duplicate_eliminated_columns.is_empty()
+    ) || matches!(
+        &plan.operator,
+        LogicalOperator::MaterializedCTE(_) | LogicalOperator::RecursiveCTE(_)
+    );
+    owns_region
+        || plan
+            .children()
+            .iter()
+            .any(|child| contains_control_region_boundary(child))
 }
 
 /// Estimate the bytes carried by one intermediate execution row.
@@ -257,6 +295,91 @@ mod tests {
             }
             _ => panic!("expected comparison join"),
         }
+    }
+
+    #[test]
+    fn build_probe_flips_reduction_join_to_smaller_preserved_build_side() {
+        let ctx = BindContext::new();
+        let preserved = expression_get(0, 1, vec![LogicalType::Integer]);
+        let filtering = expression_get(1, 64, vec![LogicalType::Integer]);
+        let join = ComparisonJoin::new(
+            JoinType::Semi,
+            plan_with_cardinality(&ctx, preserved, 1),
+            plan_with_cardinality(&ctx, filtering, 64),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::RightSemi);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 1);
+        assert!(join.left_projection_map.is_none());
+        assert!(join.right_projection_map.is_all());
+    }
+
+    #[test]
+    fn build_probe_keeps_control_region_off_reduction_probe_side() {
+        let ctx = BindContext::new();
+        let preserved = expression_get(0, 1, vec![LogicalType::Integer]);
+        let dependent_left = expression_get(1, 64, vec![LogicalType::Integer]);
+        let dependent_right = expression_get(2, 1, vec![LogicalType::Integer]);
+        let mut dependent = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, dependent_left, 64),
+            plan_with_cardinality(&ctx, dependent_right, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(2, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer),
+        )];
+        let join = ComparisonJoin::new(
+            JoinType::Semi,
+            plan_with_cardinality(&ctx, preserved, 1),
+            plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Semi);
+        assert_eq!(join.left.stats.estimated_cardinality.unwrap().expected, 1);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
     }
 
     #[test]

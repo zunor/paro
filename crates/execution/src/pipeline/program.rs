@@ -42,6 +42,10 @@ use super::graph::{
 };
 use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
 
+#[path = "program_join_conditions.rs"]
+mod join_conditions;
+use join_conditions::{hash_key_conditions, hash_residual_conditions};
+
 #[derive(Debug, Clone)]
 pub enum StatementProgram {
     Pipeline {
@@ -387,11 +391,14 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
-                    conditions: spec.conditions.clone(),
+                    key_conditions: hash_key_conditions(&spec.conditions),
+                    residual_conditions: hash_residual_conditions(&spec.conditions),
                     probe_types: spec.probe_types.clone(),
+                    build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
                     left_projection: spec.left_projection.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             SourceSpec::HashJoinUnmatched(spec) => {
@@ -400,6 +407,7 @@ impl OperatorRuntimeRegistry {
                     join_type: spec.join_type,
                     left_output_types: spec.left_output_types.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             SourceSpec::HashAggregateEmit(spec) => {
@@ -472,9 +480,11 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
-                    conditions: spec.conditions.clone(),
+                    key_conditions: hash_key_conditions(&spec.conditions),
+                    residual_conditions: hash_residual_conditions(&spec.conditions),
                     left_projection: spec.left_projection.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             TransformSpec::NestedLoopJoinProbe(spec) => {
@@ -564,8 +574,10 @@ impl OperatorRuntimeRegistry {
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 join_type: spec.join_type,
-                conditions: spec.conditions.clone(),
+                key_conditions: hash_key_conditions(&spec.conditions),
+                residual_conditions: hash_residual_conditions(&spec.conditions),
                 build_projection: spec.build_projection.clone(),
+                build_output_count: spec.build_output_count,
                 build_payload_types: spec.build_payload_types.clone(),
                 required: spec.required.clone(),
                 force_external: spec.force_external,
@@ -1336,9 +1348,11 @@ mod tests {
                             conditions: Box::new([join_condition()]),
                             probe_types: Box::new([LogicalType::Integer]),
                             build_payload_types: Box::new([LogicalType::Integer]),
+                            build_output_count: 1,
                             left_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),
                             output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                            reduction_cascade: None,
                         },
                     ),
                     transforms: vec![TransformSpec::HashJoinProbe(
@@ -1350,6 +1364,7 @@ mod tests {
                             left_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),
                             output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                            reduction_cascade: None,
                         },
                     )],
                     sink: SinkSpec::HashJoinBuild(super::super::graph::HashJoinBuildSinkSpec {
@@ -1358,6 +1373,7 @@ mod tests {
                         conditions: Box::new([join_condition()]),
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
+                        build_output_count: 1,
                         required: Default::default(),
                         force_external: false,
                     }),

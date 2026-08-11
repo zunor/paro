@@ -544,6 +544,7 @@ struct WorkUnitId(u64);
 enum SharedSourceWorker {
     RowsetScan,
     HashAggregateEmit,
+    HashJoinUnmatched,
     SortEmit,
 }
 
@@ -1242,6 +1243,12 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
                 worker: SharedSourceWorker::HashAggregateEmit,
             })
         }
+        SourceGlobal::HashJoinUnmatched(global) if global.work_count() > 1 => {
+            Some(SourceWork::SharedWorkers {
+                count: global.work_count(),
+                worker: SharedSourceWorker::HashJoinUnmatched,
+            })
+        }
         SourceGlobal::SortEmit(_) => Some(SourceWork::SharedWorkers {
             count: 1,
             worker: SharedSourceWorker::SortEmit,
@@ -1267,6 +1274,10 @@ fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignmen
         (
             SourceLocal::HashAggregateEmit(_),
             SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashAggregateEmit),
+        )
+        | (
+            SourceLocal::HashJoinUnmatched(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::HashJoinUnmatched),
         )
         | (
             SourceLocal::SortEmit(_),

@@ -5,12 +5,14 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::{
-    ConjunctionExpression, ConjunctionType, ConstantExpression, Expression, ReferenceExpression,
+    ColumnRefExpression, ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
+    ExpressionIterator, ReferenceExpression,
 };
 use paro_planner::operator::join::{
     AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
@@ -43,11 +45,13 @@ use super::specs::{
     CrossProductSpec, CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec,
     DelimScanTarget, DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec,
     FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping,
-    GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
-    NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec,
-    RowsetColumnProjection, RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec,
-    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec,
-    UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, HashReductionCascadeSpec,
+    HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
+    HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
+    MaterializedCteSpec, NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind,
+    ProjectSpec, RecursiveCteSpec, RowsetColumnProjection, RowsetScanSpec, SearchSourceSpec,
+    SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec,
+    UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;

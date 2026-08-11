@@ -15,9 +15,9 @@ use crate::physical::specs::{
     AdaptiveSearchSpec, AggregateSpec, ChunkScanSpec, ClassicIeJoinSpec, CopyToFileSpec,
     DeleteSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec,
     ExternalTableSpec, FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec,
-    GraphScanSpec, GraphShortestPathSpec, InsertSpec, LimitSpec, ProjectSpec, RowsetScanSpec,
-    SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
-    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    GraphScanSpec, GraphShortestPathSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec,
+    ProjectSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
+    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -618,9 +618,11 @@ pub struct HashJoinSpillReplaySourceSpec {
     pub conditions: Box<[JoinCondition]>,
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
+    pub build_output_count: usize,
     pub left_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -630,6 +632,7 @@ pub struct HashJoinUnmatchedSourceSpec {
     pub left_output_types: Box<[LogicalType]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -799,6 +802,7 @@ pub struct HashJoinProbeSpec {
     pub left_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -970,6 +974,7 @@ pub struct HashJoinBuildSinkSpec {
     pub conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_payload_types: Box<[LogicalType]>,
+    pub build_output_count: usize,
     pub required: RequiredProperties,
     pub force_external: bool,
 }

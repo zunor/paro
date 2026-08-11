@@ -9,7 +9,9 @@ pub(crate) mod payload;
 pub(crate) mod probe;
 pub(crate) mod probe_output;
 pub(crate) mod replay;
+pub(crate) mod residual;
 pub mod row_format;
+pub(crate) mod source_predicate;
 pub(crate) mod spill;
 pub(crate) mod unmatched;
 

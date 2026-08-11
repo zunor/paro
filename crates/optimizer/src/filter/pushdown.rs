@@ -5,8 +5,9 @@
 
 use std::collections::{HashMap, HashSet};
 
+use paro_common::runtime_value::Value;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::expression::{ConjunctionType, OperatorType};
+use paro_planner::expression::{ComparisonType, ConjunctionType, OperatorType};
 use paro_planner::operator::empty_result::EmptyResult;
 use paro_planner::operator::Filter as PlannerFilter;
 use paro_planner::operator::{
@@ -580,6 +581,7 @@ impl FilterPushdown {
         left_bindings: HashSet<usize>,
         right_bindings: HashSet<usize>,
     ) -> LogicalOperator {
+        self.lower_consumed_exists_marker(&mut cj);
         let mut left_pushdown = FilterPushdown::new();
         let mut right_pushdown = FilterPushdown::new();
         let mut left_unsat = false;
@@ -632,6 +634,44 @@ impl FilterPushdown {
                 remaining_filters,
             ))
         }
+    }
+
+    /// Lower a correlated EXISTS marker as soon as its sole consumer is a
+    /// top-level truth test.
+    ///
+    /// EXISTS is intrinsically two-valued, unlike IN/ANY. The dependent-join
+    /// flattener records that distinction as `mark_null_condition_start =
+    /// None`, so both positive and negative consumers can become ordinary
+    /// SEMI/ANTI joins without retaining a materialized marker column.
+    fn lower_consumed_exists_marker(&mut self, join: &mut ComparisonJoin) {
+        if join.join_type != JoinType::Mark || join.mark_null_condition_start.is_some() {
+            return;
+        }
+        let Some(mark_index) = join.mark_index else {
+            return;
+        };
+        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
+        let marker_filters = self
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(_, filter)| filter.bindings.contains(&mark_index))
+            .collect::<Vec<_>>();
+        let [(filter_index, filter)] = marker_filters.as_slice() else {
+            return;
+        };
+        let Some(expected) = marker_truth_test(&filter.filter, mark_binding) else {
+            return;
+        };
+
+        self.filters.remove(*filter_index);
+        join.join_type = if expected {
+            JoinType::Semi
+        } else {
+            JoinType::Anti
+        };
+        join.mark_index = None;
+        join.mark_null_condition_start = None;
     }
 
     /// Push down through a semi/anti join.
@@ -997,6 +1037,52 @@ fn projection_reference_crosses_execution_boundary(proj: &Projection, expr: &Exp
 impl Default for FilterPushdown {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn marker_truth_test(
+    expression: &Expression,
+    marker: paro_planner::operator::ColumnBinding,
+) -> Option<bool> {
+    match expression {
+        Expression::ColumnRef(column) if column.depth == 0 && column.binding == marker => {
+            Some(true)
+        }
+        Expression::Operator(operator)
+            if operator.operator_type == OperatorType::Not
+                && matches!(
+                    operator.children.as_slice(),
+                    [Expression::ColumnRef(column)]
+                        if column.depth == 0 && column.binding == marker
+                ) =>
+        {
+            Some(false)
+        }
+        Expression::Comparison(comparison) => {
+            let (comparison_type, constant) =
+                match (comparison.left.as_ref(), comparison.right.as_ref()) {
+                    (Expression::ColumnRef(column), Expression::Constant(constant))
+                        if column.depth == 0 && column.binding == marker =>
+                    {
+                        (comparison.comparison_type, constant)
+                    }
+                    (Expression::Constant(constant), Expression::ColumnRef(column))
+                        if column.depth == 0 && column.binding == marker =>
+                    {
+                        (comparison.comparison_type, constant)
+                    }
+                    _ => return None,
+                };
+            let Value::Boolean(value) = constant.value else {
+                return None;
+            };
+            match comparison_type {
+                ComparisonType::Equal | ComparisonType::NotDistinctFrom => Some(value),
+                ComparisonType::NotEqual | ComparisonType::DistinctFrom => Some(!value),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }
 

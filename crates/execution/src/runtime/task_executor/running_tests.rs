@@ -748,6 +748,7 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -773,6 +774,7 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -993,6 +995,7 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -1021,6 +1024,7 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,

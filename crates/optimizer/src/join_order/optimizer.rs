@@ -13,7 +13,9 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::{
     duplicate_operator_preserving_indices, duplicate_plan_preserving_indices,
 };
-use paro_planner::expression::{ComparisonType, Expression};
+use paro_planner::expression::{
+    ComparisonType, ConjunctionExpression, ConjunctionType, Expression,
+};
 use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType,
     JoinCondition, JoinType, LogicalOperator,
@@ -419,15 +421,25 @@ impl JoinOrderOptimizer {
                 if matches!(join.join_type, JoinType::Semi | JoinType::Anti) =>
             {
                 if at_region_root {
-                    // The preserved side remains visible after a reduction
-                    // join, so its inner-join region may be reordered around
-                    // the SEMI/ANTI edge. The non-preserved side must remain
-                    // atomic: extracting any of its relations would allow the
-                    // enumerator to move them past the reduction point, after
-                    // which their bindings no longer exist.
-                    self.extract_join_relations(ctx, bind_context, &join.left, filters, false)?;
-                    self.add_relation_plan(ctx, bind_context, &join.right);
-                    Self::extract_comparison_join_filters(join, filters);
+                    if matches!(
+                        join.left.operator,
+                        LogicalOperator::Join(Join::Comparison(ref child))
+                            if matches!(child.join_type, JoinType::Semi | JoinType::Anti)
+                    ) {
+                        // Consecutive reductions over the same preserved side
+                        // are commutative filters. Expose only that cascade as
+                        // a join-order region; the preserved input beneath it
+                        // has already been optimized recursively and remains
+                        // atomic here.
+                        self.extract_reduction_cascade(ctx, bind_context, join, filters);
+                    } else {
+                        // A single reduction retains the established behavior:
+                        // its preserved inner-join region may be reordered
+                        // around the reduction edge.
+                        self.extract_join_relations(ctx, bind_context, &join.left, filters, false)?;
+                        self.add_relation_plan(ctx, bind_context, &join.right);
+                        Self::extract_comparison_join_filters(join, filters);
+                    }
                 } else {
                     self.add_relation_plan(ctx, bind_context, plan);
                 }
@@ -483,16 +495,54 @@ impl JoinOrderOptimizer {
         Ok(())
     }
 
+    fn extract_reduction_cascade(
+        &mut self,
+        ctx: &StatementContext,
+        bind_context: &BindContext,
+        join: &ComparisonJoin,
+        filters: &mut Vec<ExtractedFilter>,
+    ) {
+        if let LogicalOperator::Join(Join::Comparison(child)) = &join.left.operator {
+            if matches!(child.join_type, JoinType::Semi | JoinType::Anti) {
+                self.extract_reduction_cascade(ctx, bind_context, child, filters);
+            } else {
+                self.add_relation_plan(ctx, bind_context, &join.left);
+            }
+        } else {
+            self.add_relation_plan(ctx, bind_context, &join.left);
+        }
+        self.add_relation_plan(ctx, bind_context, &join.right);
+        Self::extract_comparison_join_filters(join, filters);
+    }
+
     fn extract_comparison_join_filters(join: &ComparisonJoin, filters: &mut Vec<ExtractedFilter>) {
-        filters.extend(join.conditions.iter().map(|condition| {
+        let expressions = join.conditions.iter().map(|condition| {
             let expression =
                 Expression::Comparison(paro_planner::expression::ComparisonExpression {
                     left: Box::new(condition.left.clone()),
                     right: Box::new(condition.right.clone()),
                     comparison_type: Self::to_comparison_type(condition.comparison),
                 });
-            ExtractedFilter::new(expression, join.join_type, join.anti_join_mode)
-        }));
+            expression
+        });
+        if matches!(join.join_type, JoinType::Semi | JoinType::Anti) {
+            let expressions = expressions.collect::<Vec<_>>();
+            let expression = match expressions.as_slice() {
+                [] => return,
+                [expression] => expression.clone(),
+                _ => Expression::Conjunction(ConjunctionExpression::new(
+                    ConjunctionType::And,
+                    expressions,
+                )),
+            };
+            filters.push(ExtractedFilter::new(
+                expression,
+                join.join_type,
+                join.anti_join_mode,
+            ));
+        } else {
+            filters.extend(expressions.map(ExtractedFilter::inner));
+        }
     }
 
     fn add_relation_plan(

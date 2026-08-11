@@ -8,6 +8,7 @@
 //! global variables.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
@@ -95,6 +96,32 @@ pub struct BreakerHandleGlobal<T> {
     pub handle: Arc<T>,
 }
 
+#[derive(Debug)]
+pub struct HashJoinUnmatchedSourceGlobal {
+    pub handle: Arc<JoinBuildHandle>,
+    next_block: AtomicUsize,
+}
+
+impl HashJoinUnmatchedSourceGlobal {
+    pub fn new(handle: Arc<JoinBuildHandle>) -> Self {
+        Self {
+            handle,
+            next_block: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn work_count(&self) -> usize {
+        self.handle
+            .table()
+            .map_or(0, |table| table.build_block_count())
+    }
+
+    pub fn claim_block(&self, block_count: usize) -> Option<usize> {
+        let block_idx = self.next_block.fetch_add(1, Ordering::Relaxed);
+        (block_idx < block_count).then_some(block_idx)
+    }
+}
+
 // ─── Enums ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -109,7 +136,7 @@ pub enum SourceGlobal {
     Materialized(Arc<MaterializedSourceGlobal>),
     ClassicIeJoin(Arc<crate::operators::join::sort_range::ClassicIeJoinSourceGlobal>),
     HashJoinSpillReplay(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
-    HashJoinUnmatched(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
+    HashJoinUnmatched(Arc<HashJoinUnmatchedSourceGlobal>),
     HashAggregateEmit(Arc<HashAggregateEmitSourceGlobal>),
     UngroupedAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
     PerfectHashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),

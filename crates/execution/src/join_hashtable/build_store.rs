@@ -170,18 +170,28 @@ impl BuildRowLayout {
     }
 
     #[inline]
-    pub fn set_found(&self, row_ptr: *mut u8, found: bool) {
+    pub fn set_match_mask(&self, row_ptr: *mut u8, mask: u8) {
         unsafe {
-            (*(row_ptr.add(self.found_offset) as *const AtomicU8))
-                .store(u8::from(found), Ordering::Relaxed);
+            (*(row_ptr.add(self.found_offset) as *const AtomicU8)).store(mask, Ordering::Relaxed);
         }
     }
 
     #[inline]
-    pub fn found(&self, row_ptr: *const u8) -> bool {
+    pub fn mark_match_mask(&self, row_ptr: *mut u8, mask: u8) {
         unsafe {
-            (*(row_ptr.add(self.found_offset) as *const AtomicU8)).load(Ordering::Relaxed) != 0
+            (*(row_ptr.add(self.found_offset) as *const AtomicU8))
+                .fetch_or(mask, Ordering::Relaxed);
         }
+    }
+
+    #[inline]
+    pub fn match_mask(&self, row_ptr: *const u8) -> u8 {
+        unsafe { (*(row_ptr.add(self.found_offset) as *const AtomicU8)).load(Ordering::Relaxed) }
+    }
+
+    #[inline]
+    pub fn found(&self, row_ptr: *const u8) -> bool {
+        self.match_mask(row_ptr) != 0
     }
 
     pub fn read_value(&self, row_ptr: *const u8, col_idx: usize) -> Value {
@@ -218,6 +228,36 @@ impl BuildRowLayout {
             )
         }
     }
+
+    /// Read one fixed-width payload cell without materializing a [`Value`].
+    ///
+    /// # Safety
+    /// `row_ptr` must reference a live row owned by this layout, and `T` must
+    /// be the physical representation of the selected payload column.
+    pub unsafe fn read_payload_fixed<T: Copy>(
+        &self,
+        row_ptr: *const u8,
+        build_idx: usize,
+    ) -> Option<T> {
+        if build_idx >= self.payload_count {
+            return None;
+        }
+        let column_idx = self.payload_base_col_idx(build_idx);
+        debug_assert_eq!(
+            self.base.types()[column_idx].physical_size(),
+            std::mem::size_of::<T>(),
+            "fixed payload reader physical width mismatch"
+        );
+        if !self.base.all_valid()
+            && !unsafe { paro_storage::row::codec::unsafe_api::row_is_valid(row_ptr, column_idx) }
+        {
+            return None;
+        }
+        let value_ptr = unsafe { row_ptr.add(self.base.offsets()[column_idx]) }.cast::<T>();
+        // SAFETY: guaranteed by the method contract and the row layout's
+        // physical-width assertion above.
+        Some(unsafe { value_ptr.read_unaligned() })
+    }
 }
 
 /// One contiguous build-row slab.
@@ -231,6 +271,44 @@ struct BuildBlock {
     row_count: usize,
     max_rows: usize,
     used_bytes: usize,
+}
+
+/// Immutable view of one contiguous build-row slab.
+///
+/// The address is represented as an integer deliberately: [`HashBuildStore`]
+/// also owns memory-accounting state that is not `Sync`, while the initialized
+/// row bytes themselves are immutable after the build phase. The store must
+/// remain locked and alive for the lifetime of every range returned by
+/// [`HashBuildStore::block_ranges`].
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BuildBlockRange {
+    base: usize,
+    row_width: usize,
+    row_count: usize,
+    row_offset: usize,
+}
+
+impl BuildBlockRange {
+    #[inline]
+    pub(super) fn row_count(self) -> usize {
+        self.row_count
+    }
+
+    #[inline]
+    pub(super) fn row_offset(self) -> usize {
+        self.row_offset
+    }
+
+    /// Return a row address within this slab.
+    ///
+    /// # Safety
+    /// The originating [`HashBuildStore`] must still own the slab, no writer
+    /// may mutate its row storage, and `row_idx` must be below `row_count()`.
+    #[inline]
+    pub(super) unsafe fn row_ptr(self, row_idx: usize) -> usize {
+        debug_assert!(row_idx < self.row_count);
+        self.base + row_idx * self.row_width
+    }
 }
 
 /// Owns nested row values without allowing their addresses to move.
@@ -438,10 +516,34 @@ impl std::fmt::Debug for BuildBlock {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct BuildStoreScanState {
     block_idx: usize,
     row_idx: usize,
+    block_end: usize,
+    global_row_idx: usize,
+}
+
+impl Default for BuildStoreScanState {
+    fn default() -> Self {
+        Self {
+            block_idx: 0,
+            row_idx: 0,
+            block_end: usize::MAX,
+            global_row_idx: 0,
+        }
+    }
+}
+
+impl BuildStoreScanState {
+    pub fn for_block(block_idx: usize, global_row_idx: usize) -> Self {
+        Self {
+            block_idx,
+            row_idx: 0,
+            block_end: block_idx.saturating_add(1),
+            global_row_idx,
+        }
+    }
 }
 
 pub struct HashBuildStore {
@@ -616,8 +718,8 @@ impl HashBuildStore {
             |output_idx, _| {
                 found_vector
                     .as_ref()
-                    .and_then(|vector| vector.get_bool(output_idx))
-                    .unwrap_or(false)
+                    .and_then(|vector| vector.get_u8(output_idx))
+                    .unwrap_or(0)
             },
         )
     }
@@ -694,7 +796,7 @@ impl HashBuildStore {
             selected_count,
             |output_idx| selection.get(output_idx),
             |output_idx, _| Ok(hashes.map_or(0, |hashes| hashes[output_idx])),
-            |_, _| found,
+            |_, _| u8::from(found),
         )
     }
 
@@ -725,7 +827,7 @@ impl HashBuildStore {
     where
         S: Fn(usize) -> usize,
         H: Fn(usize, usize) -> Result<u64>,
-        F: Fn(usize, usize) -> bool,
+        F: Fn(usize, usize) -> u8,
     {
         let (row_usage, total_usage) = if source.has_heap_values() {
             let mut row_usage = Vec::with_capacity(output_count);
@@ -793,10 +895,10 @@ impl HashBuildStore {
                             }
                         }
                         let hash = hash_at(output_idx, source_row_idx)?;
-                        let found = found_at(output_idx, source_row_idx);
+                        let match_mask = found_at(output_idx, source_row_idx);
                         layout.set_hash(row_ptr, hash);
                         layout.set_next(row_ptr, ptr::null());
-                        layout.set_found(row_ptr, found);
+                        layout.set_match_mask(row_ptr, match_mask);
                         #[cfg(debug_assertions)]
                         unsafe {
                             source.debug_assert_row_initialized(
@@ -806,7 +908,7 @@ impl HashBuildStore {
                             );
                             debug_assert_eq!(layout.hash(row_ptr), hash);
                             debug_assert!(layout.next(row_ptr).is_null());
-                            debug_assert_eq!(layout.found(row_ptr), found);
+                            debug_assert_eq!(layout.match_mask(row_ptr), match_mask);
                         }
                         Ok(())
                     })?;
@@ -949,16 +1051,56 @@ impl HashBuildStore {
         build_types: &[LogicalType],
         output: &mut Chunk,
     ) -> Result<usize> {
+        let (required_mask, forbidden_mask) = if emit_found { (1, 0) } else { (0, 1) };
+        self.scan_payload_rows_by_mask(state, required_mask, forbidden_mask, build_types, output)
+    }
+
+    pub fn scan_payload_rows_by_mask(
+        &self,
+        state: &mut BuildStoreScanState,
+        required_mask: u8,
+        forbidden_mask: u8,
+        build_types: &[LogicalType],
+        output: &mut Chunk,
+    ) -> Result<usize> {
+        self.scan_payload_rows_where(state, build_types, output, |row_ptr| {
+            let match_mask = self.layout.match_mask(row_ptr);
+            Ok(match_mask & required_mask == required_mask && match_mask & forbidden_mask == 0)
+        })
+    }
+
+    pub(super) fn scan_payload_rows_where(
+        &self,
+        state: &mut BuildStoreScanState,
+        build_types: &[LogicalType],
+        output: &mut Chunk,
+        mut include: impl FnMut(*const u8) -> Result<bool>,
+    ) -> Result<usize> {
+        self.scan_payload_rows_where_indexed(state, build_types, output, |_, row_ptr| {
+            include(row_ptr)
+        })
+    }
+
+    pub(super) fn scan_payload_rows_where_indexed(
+        &self,
+        state: &mut BuildStoreScanState,
+        build_types: &[LogicalType],
+        output: &mut Chunk,
+        mut include: impl FnMut(usize, *const u8) -> Result<bool>,
+    ) -> Result<usize> {
         ensure_chunk(output, build_types, VECTOR_SIZE)?;
         output.try_reset(output.allocator().clone())?;
 
         let mut scanned = 0usize;
-        while state.block_idx < self.blocks.len() && scanned < VECTOR_SIZE {
+        let block_end = state.block_end.min(self.blocks.len());
+        while state.block_idx < block_end && scanned < VECTOR_SIZE {
             let block = &self.blocks[state.block_idx];
             while state.row_idx < block.row_count() && scanned < VECTOR_SIZE {
                 let row_ptr = block.row_ptr(state.row_idx);
-                if self.layout.found(row_ptr) != emit_found {
-                    state.row_idx += 1;
+                let global_row_idx = state.global_row_idx;
+                state.row_idx += 1;
+                state.global_row_idx += 1;
+                if !include(global_row_idx, row_ptr)? {
                     continue;
                 }
 
@@ -973,7 +1115,6 @@ impl HashBuildStore {
                 }
 
                 scanned += 1;
-                state.row_idx += 1;
             }
 
             if state.row_idx >= block.row_count() {
@@ -986,10 +1127,45 @@ impl HashBuildStore {
         Ok(scanned)
     }
 
+    #[inline]
+    pub fn block_count(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(super) fn block_row_offset(&self, block_idx: usize) -> usize {
+        self.blocks
+            .iter()
+            .take(block_idx)
+            .map(BuildBlock::row_count)
+            .sum()
+    }
+
     pub fn all_row_ptrs(&self) -> Vec<usize> {
         self.blocks
             .iter()
             .flat_map(|block| (0..block.row_count()).map(|row_idx| block.row_ptr(row_idx) as usize))
+            .collect()
+    }
+
+    /// Snapshot the initialized row slabs for read-only parallel finalization.
+    ///
+    /// The returned descriptors borrow the allocations logically rather than
+    /// through Rust lifetimes. Callers must keep this store alive and prevent
+    /// mutation until every consumer has completed.
+    pub(super) fn block_ranges(&self) -> Vec<BuildBlockRange> {
+        let mut row_offset = 0usize;
+        self.blocks
+            .iter()
+            .map(|block| {
+                let range = BuildBlockRange {
+                    base: block.data.as_ptr() as usize,
+                    row_width: block.row_width,
+                    row_count: block.row_count,
+                    row_offset,
+                };
+                row_offset += block.row_count;
+                range
+            })
             .collect()
     }
 
@@ -1019,7 +1195,7 @@ impl HashBuildStore {
             output
                 .column_mut(found_col_idx)
                 .expect("spill found column must exist")
-                .set_value(output_idx, &Value::Boolean(layout.found(row_ptr)));
+                .set_value(output_idx, &Value::UTinyInt(layout.match_mask(row_ptr)));
         }
         output
             .column_mut(layout.hash_input_col_idx())
@@ -1121,9 +1297,9 @@ mod tests {
         payload.set_string(1, "short");
         payload.set_count(2);
 
-        let mut found = paro_common::test_utils::test_vector(LogicalType::Boolean);
-        found.set_bool(0, true);
-        found.set_bool(1, false);
+        let mut found = paro_common::test_utils::test_vector(LogicalType::UTinyInt);
+        found.set_u8(0, 1);
+        found.set_u8(1, 0);
         found.set_count(2);
 
         let mut hashes = paro_common::test_utils::test_vector(LogicalType::UBigInt);
@@ -1162,7 +1338,7 @@ mod tests {
                 "this string is long enough to spill".to_string()
             ))
         );
-        assert_eq!(output.get_value(2, 0), Some(Value::Boolean(true)));
+        assert_eq!(output.get_value(2, 0), Some(Value::UTinyInt(1)));
         assert_eq!(output.get_value(3, 1), Some(Value::UBigInt(502)));
     }
 }

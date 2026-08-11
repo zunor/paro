@@ -45,6 +45,7 @@ fn run_null_aware_anti_join(
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -69,6 +70,7 @@ fn run_null_aware_anti_join(
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["payload".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -198,6 +200,7 @@ fn hash_join_output_more_yields_between_output_chunks() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -223,6 +226,7 @@ fn hash_join_output_more_yields_between_output_chunks() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -344,6 +348,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
             conditions: vec![join_condition()].into_boxed_slice(),
             build_projection: vec![1].into_boxed_slice(),
             build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+            build_output_count: 1,
             required: Default::default(),
             force_external: false,
         }),
@@ -386,6 +391,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                             LogicalType::Integer,
                         ]
                         .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: second_handle,
@@ -401,6 +407,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                             LogicalType::Integer,
                         ]
                         .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                 ],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -552,6 +559,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -598,6 +606,7 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                         output_names: vec!["nation".into(), "payload".into()].into_boxed_slice(),
                         output_types: vec![LogicalType::Integer, LogicalType::Integer]
                             .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                     TransformSpec::CrossProductProbe(CrossProductProbeSpec {
                         handle: cross_handle,
@@ -910,6 +919,7 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -935,6 +945,7 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -1038,6 +1049,7 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: false,
                 }),
@@ -1063,6 +1075,7 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -1078,6 +1091,7 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),

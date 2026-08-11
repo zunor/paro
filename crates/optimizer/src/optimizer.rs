@@ -227,6 +227,7 @@ impl Optimizer {
 #[cfg(test)]
 mod tests {
     use paro_context::test_support::TestStatementContextBuilder;
+    use paro_planner::operator::{Join, LogicalOperator};
     use paro_planner::planner::Planner;
 
     use super::Optimizer;
@@ -269,5 +270,48 @@ mod tests {
         optimizer
             .optimize(plan)
             .expect("optimize correlated HAVING without losing delim keys");
+    }
+
+    #[test]
+    fn consumed_correlated_exists_lowers_to_direct_existence_join() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let mut planner = Planner::new(session.clone());
+        let statement = paro_parser::parse_one(
+            "SELECT o.k \
+             FROM (VALUES (1, 10), (1, 20), (2, 30)) AS o(k, s) \
+             WHERE EXISTS ( \
+                 SELECT 1 \
+                 FROM (VALUES (1, 10), (1, 20), (2, 30)) AS i(k, s) \
+                 WHERE i.k = o.k AND i.s <> o.s \
+             )",
+        )
+        .expect("parse correlated EXISTS")
+        .stmt;
+        planner
+            .create_plan(statement)
+            .expect("plan correlated EXISTS");
+        let plan = planner.take_plan().expect("logical plan");
+        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+        let optimized = optimizer
+            .optimize(plan)
+            .expect("optimize correlated EXISTS");
+
+        fn contains_delim_join(plan: &paro_planner::plan::LogicalPlan) -> bool {
+            if matches!(
+                &plan.operator,
+                LogicalOperator::Join(Join::Comparison(join))
+                    if !join.duplicate_eliminated_columns.is_empty()
+            ) {
+                return true;
+            }
+            plan.children()
+                .iter()
+                .any(|child| contains_delim_join(child))
+        }
+
+        assert!(
+            !contains_delim_join(&optimized),
+            "consumed EXISTS should not retain a delimiter control region: {optimized:#?}"
+        );
     }
 }

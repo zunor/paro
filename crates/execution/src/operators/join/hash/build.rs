@@ -20,7 +20,9 @@ use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types
 use crate::operators::join::hash::memory::{
     hash_join_memory_context, hash_join_spill_memory_context,
 };
-use crate::operators::join::hash::payload::build_payload_chunk_ref;
+use crate::operators::join::hash::payload::{
+    build_payload_chunk_ref, build_payload_with_extras_ref,
+};
 use crate::physical::properties::MemoryClass;
 use crate::physical::properties::RequiredProperties;
 use crate::runtime::breaker::{
@@ -37,8 +39,10 @@ use crate::runtime::state::{BreakerHandleGlobal, HashJoinBuildSinkLocal, SinkGlo
 pub struct HashJoinBuildSinkExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
-    pub conditions: Box<[JoinCondition]>,
+    pub key_conditions: Box<[JoinCondition]>,
+    pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
+    pub build_output_count: usize,
     pub build_payload_types: Box<[LogicalType]>,
     pub required: RequiredProperties,
     pub force_external: bool,
@@ -47,11 +51,12 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        handle.initialize_table(
+        handle.initialize_table_with_output_count(
             ctx.query.session.buffer_pool().clone(),
             ctx.query.allocator(MemoryTag::HashTable),
-            self.conditions.to_vec(),
+            self.key_conditions.to_vec(),
             self.build_payload_types.to_vec(),
+            self.build_output_count,
             self.join_type,
             hash_join_memory_context(ctx.query),
         )?;
@@ -73,12 +78,14 @@ impl HashJoinBuildSinkExec {
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
         let handle = ctx.handles.get(self.handle)?;
-        let build_key_types = join_key_types(&self.conditions, JoinKeySide::Build);
-        let hash_table = Arc::new(JoinHashTable::new_with_memory(
+        let build_key_types = join_key_types(&self.key_conditions, JoinKeySide::Build);
+        let build_residual_types = join_key_types(&self.residual_conditions, JoinKeySide::Build);
+        let hash_table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
             ctx.query.session.buffer_pool().clone(),
             ctx.query.allocator(MemoryTag::HashTable),
-            self.conditions.to_vec(),
+            self.key_conditions.to_vec(),
             self.build_payload_types.to_vec(),
+            self.build_output_count,
             self.join_type,
             JoinHashTableConfig::default(),
             hash_join_memory_context(ctx.query),
@@ -118,7 +125,7 @@ impl HashJoinBuildSinkExec {
             query_memory,
             build_key_types,
             build_key_executors: self
-                .conditions
+                .key_conditions
                 .iter()
                 .map(|condition| {
                     ExpressionExecutor::with_expressions_for_session(
@@ -128,6 +135,19 @@ impl HashJoinBuildSinkExec {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            build_residual_types,
+            build_residual_executors: self
+                .residual_conditions
+                .iter()
+                .map(|condition| {
+                    ExpressionExecutor::with_expressions_for_session(
+                        std::slice::from_ref(&condition.right),
+                        ctx.query.session.as_ref(),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            build_residuals: None,
         }))
     }
 
@@ -154,7 +174,7 @@ impl HashJoinBuildSinkExec {
         evaluate_join_keys_into(
             ctx,
             input,
-            &self.conditions,
+            &self.key_conditions,
             &mut local.build_key_executors,
             &local.build_key_types,
             JoinKeySide::Build,
@@ -164,12 +184,34 @@ impl HashJoinBuildSinkExec {
             .build_keys
             .as_ref()
             .ok_or_else(|| paro_error::internal("hash join build key chunk missing"))?;
-        let payload_chunk = build_payload_chunk_ref(
-            input,
-            &self.build_projection,
-            &self.build_payload_types,
-            &mut local.build_payload,
-        )?;
+        let payload_chunk = if self.residual_conditions.is_empty() {
+            build_payload_chunk_ref(
+                input,
+                &self.build_projection,
+                &self.build_payload_types,
+                &mut local.build_payload,
+            )?
+        } else {
+            evaluate_join_keys_into(
+                ctx,
+                input,
+                &self.residual_conditions,
+                &mut local.build_residual_executors,
+                &local.build_residual_types,
+                JoinKeySide::Build,
+                &mut local.build_residuals,
+            )?;
+            build_payload_with_extras_ref(
+                input,
+                &self.build_projection,
+                &self.build_payload_types,
+                local
+                    .build_residuals
+                    .as_ref()
+                    .ok_or_else(|| paro_error::internal("hash join residual payload missing"))?,
+                &mut local.build_payload,
+            )?
+        };
         let build_selection = ensure_build_selection(
             &mut local.build_selection,
             key_chunk.size(),
@@ -318,7 +360,7 @@ fn finalize_in_memory_hash_join(
 ) -> Result<()> {
     let table = handle.require_table()?;
     let published = publish_runtime_filter(ctx, handle)?;
-    table.finalize()?;
+    table.finalize_with_parallelism(ctx.query.session.number_of_threads().max(1))?;
     handle.completion.mark_complete();
     if published {
         record_runtime_filter_installed(ctx);

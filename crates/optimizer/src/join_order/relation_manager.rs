@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_common::logging::targets;
-use paro_planner::expression::{Expression, ExpressionIterator};
+use paro_planner::expression::{ComparisonType, Expression, ExpressionIterator};
 use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
 };
@@ -488,28 +488,46 @@ impl RelationManager {
                         left_bindings.extend(child_left);
                         right_bindings.extend(child_right);
                     }
-
-                    if filter_info.left_binding.is_none() {
-                        if let Some(binding) = Self::extract_column_binding(&comp.left) {
-                            let Some(relation) = self.get_relation_id(binding.table_index) else {
-                                return false;
-                            };
-                            filter_info.set_left_binding(binding, relation);
-                        }
-                    }
-                    if filter_info.right_binding.is_none() {
-                        if let Some(binding) = Self::extract_column_binding(&comp.right) {
-                            let Some(relation) = self.get_relation_id(binding.table_index) else {
-                                return false;
-                            };
-                            filter_info.set_right_binding(binding, relation);
-                        }
-                    }
                 }
 
                 if !left_bindings.is_empty() && !right_bindings.is_empty() {
                     filter_info.set_left_set(set_manager.get_relation_from_set(&left_bindings));
                     filter_info.set_right_set(set_manager.get_relation_from_set(&right_bindings));
+                }
+
+                // A conjunction is one existential predicate, but its direct
+                // key statistics must come from an equality child. Predicate
+                // order is not semantic: choosing the first comparison makes
+                // `a <> b AND k = k` lose the hash-domain estimate merely
+                // because the residual happened to be written first.
+                let key = conj
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        Expression::Comparison(comparison)
+                            if matches!(
+                                comparison.comparison_type,
+                                ComparisonType::Equal | ComparisonType::NotDistinctFrom
+                            ) =>
+                        {
+                            Some(comparison)
+                        }
+                        _ => None,
+                    })
+                    .next();
+                if let Some(key) = key {
+                    if let Some(binding) = Self::extract_column_binding(&key.left) {
+                        let Some(relation) = self.get_relation_id(binding.table_index) else {
+                            return false;
+                        };
+                        filter_info.set_left_binding(binding, relation);
+                    }
+                    if let Some(binding) = Self::extract_column_binding(&key.right) {
+                        let Some(relation) = self.get_relation_id(binding.table_index) else {
+                            return false;
+                        };
+                        filter_info.set_right_binding(binding, relation);
+                    }
                 }
             }
             _ => {}

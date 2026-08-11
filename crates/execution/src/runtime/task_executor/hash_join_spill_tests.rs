@@ -42,9 +42,11 @@ fn hash_join_spill_replay_source_is_independent_from_probe_for_in_memory_builds(
                 conditions: vec![join_condition()].into_boxed_slice(),
                 probe_types: vec![LogicalType::Integer].into_boxed_slice(),
                 build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                build_output_count: 1,
                 left_projection: vec![0].into_boxed_slice(),
                 output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                 output_types: vec![LogicalType::Integer, LogicalType::Integer].into_boxed_slice(),
+                reduction_cascade: None,
             }),
             transforms: Vec::new(),
             sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -134,6 +136,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Varchar].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: true,
                 }),
@@ -159,6 +162,7 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Varchar]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -175,10 +179,12 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Varchar].into_boxed_slice(),
+                    build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Varchar]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -289,6 +295,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: true,
                 }),
@@ -311,6 +318,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -327,10 +335,12 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -347,6 +357,7 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -467,6 +478,7 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: true,
                 }),
@@ -484,10 +496,12 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -593,6 +607,7 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                     conditions: vec![join_condition()].into_boxed_slice(),
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     required: Default::default(),
                     force_external: true,
                 }),
@@ -619,6 +634,7 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -635,10 +651,12 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                     probe_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "mark".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Boolean]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
