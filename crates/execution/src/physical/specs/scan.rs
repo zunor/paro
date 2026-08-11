@@ -74,7 +74,6 @@ pub struct FilterSpec {
 
 #[derive(Debug, Clone)]
 pub struct ProjectSpec {
-    pub table_index: usize,
     pub expressions: Box<[Expression]>,
     pub output_names: Box<[String]>,
 }

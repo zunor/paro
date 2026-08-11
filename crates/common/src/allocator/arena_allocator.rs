@@ -323,23 +323,25 @@ impl ArenaAllocator {
             .allocated_size
             .checked_add(other.allocated_size)
             .ok_or_else(|| paro_error::out_of_range("arena allocation accounting overflow"))?;
-        let Some(other_head) = other.head.take() else {
+        let Some(mut other_head) = other.head.take() else {
             return Ok(());
         };
         let other_tail = other.tail;
         debug_assert!(!other_tail.is_null());
 
-        if let Some(mut current_head) = self.head.take() {
-            // The absorbed list becomes the newer prefix. Its oldest chunk
-            // points at our former head, whose back-reference points to the
-            // absorbed tail.
-            current_head.prev = other_tail;
-            // SAFETY: `other_tail` belongs to `other_head` and remains stable
-            // while its owning Box chain is moved into `self` below.
+        if self.head.is_some() {
+            // Preserve the target head as the allocation head. Absorbed
+            // chunks only carry ownership for already-built states; making
+            // them the head would strand unused capacity in the target's
+            // current chunk and make future allocations depend on merge order.
+            other_head.prev = self.tail;
+            // SAFETY: `self.tail` is the oldest live chunk in `self`, has no
+            // successor, and remains stable while `other_head` is moved into
+            // its `next` link.
             unsafe {
-                (*other_tail).next = Some(current_head);
+                (*self.tail).next = Some(other_head);
             }
-            self.head = Some(other_head);
+            self.tail = other_tail;
         } else {
             self.tail = other_tail;
             self.head = Some(other_head);
@@ -753,6 +755,13 @@ mod tests {
             assert_eq!(source_ptr.read(), 22);
             assert_eq!(source_large_ptr.read(), 33);
         }
+        let capacity_after_absorb = target.allocation_size();
+        target.allocate(4).unwrap();
+        assert_eq!(
+            target.allocation_size(),
+            capacity_after_absorb,
+            "post-absorb allocation should keep using the target's partial head"
+        );
         target.reset();
         assert!(!target.is_empty());
     }

@@ -23,7 +23,7 @@ use super::slot_bitmap::SLOT_WORD_BITS;
 use super::support::pointer_vector_from_slice;
 use super::{
     combine_states, initialize_state_at_address, AggregateObject, AggregateStateLayout,
-    PerfectAggregateHashTable, PerfectAggregateStateFilter,
+    FinalizedPerfectAggregateTable, PerfectAggregateHashTable, PerfectAggregateStateFilter,
 };
 
 const MIN_SLOTS_PER_TASK: usize = 64 * 1024;
@@ -345,7 +345,11 @@ impl ParallelPerfectAggregateMerge {
             .as_ref()
             .expect("state-filter merge requires filter identity");
         let state_offset = self.state_layout.state_offset(filter.aggregate_index);
-        debug_assert!(program.supports_trivial_state_copy());
+        if !program.supports_trivial_state_copy() {
+            return Err(paro_error::internal(
+                "state-filtered perfect aggregate merge requires trivially copyable states",
+            ));
+        }
         let mut selected_slots = AccountedVec::new_with_accounting(
             self.memory.reserve_grant(0)?,
             MemoryTag::HashTable,
@@ -406,20 +410,18 @@ impl ParallelPerfectAggregateMerge {
                 let mask = 1_u64 << bit;
                 let target_state = unsafe { self.target_states.add(slot * self.row_width) };
                 let mut state = (target_bits & mask != 0).then_some(target_state);
-                let mut source_count = 0usize;
-                let mut only_source = std::ptr::null_mut();
+                let mut only_source: *mut u8 = std::ptr::null_mut();
                 for (source, source_bits) in self.source_views.iter().zip(&source_words) {
                     if *source_bits & mask == 0 {
                         continue;
                     }
                     let source_state = unsafe { source.states.add(slot * self.row_width) };
-                    source_count += 1;
                     if let Some(target) = state {
                         let combined = unsafe {
                             program.combine_direct_rows(source_state.cast_const(), target)
                         };
                         debug_assert!(combined, "direct combine program declined after admission");
-                    } else if source_count == 1 {
+                    } else if only_source.is_null() {
                         only_source = source_state;
                     } else {
                         // A group shared by multiple source tables needs a
@@ -440,29 +442,13 @@ impl ParallelPerfectAggregateMerge {
                         debug_assert!(combined, "direct combine program declined after admission");
                     }
                 }
-                let (candidate_state, deferred_copy) = match state {
-                    Some(state) => (state, std::ptr::null_mut()),
-                    None => {
-                        debug_assert_eq!(source_count, 1);
-                        (only_source, only_source)
-                    }
-                };
+                let candidate_state = state.ok_or_else(|| {
+                    paro_error::internal(
+                        "duplicate perfect aggregate slot had fewer than two state owners",
+                    )
+                })?;
                 if !unsafe { predicate.matches(candidate_state.add(state_offset))? } {
                     continue;
-                }
-                if !deferred_copy.is_null() {
-                    // SAFETY: deferred sources are initialized fixed-width,
-                    // non-owning states admitted by `supports_trivial_state_copy`.
-                    // This task exclusively owns the target occupancy word.
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            deferred_copy.cast::<MaybeUninit<u8>>(),
-                            target_state.cast::<MaybeUninit<u8>>(),
-                            self.row_width,
-                        );
-                        *target_occupancy |= mask;
-                    }
-                    added_count += 1;
                 }
                 selected_slots.try_push(slot)?;
             }
@@ -527,7 +513,7 @@ impl ParallelPerfectAggregateMerge {
     /// # Safety contract
     /// The finish driver calls this exactly once after observing completion of
     /// every scheduled task with acquire ordering.
-    pub(crate) fn finish(&self) -> Result<PerfectAggregateHashTable> {
+    pub(crate) fn finish(&self) -> Result<FinalizedPerfectAggregateTable> {
         if self.finished.swap(true, Ordering::AcqRel) {
             return Err(paro_error::internal(
                 "perfect aggregate parallel merge finished more than once",
@@ -574,9 +560,10 @@ impl ParallelPerfectAggregateMerge {
                 let task_slots = task_slots.as_mut().expect("preselections were validated");
                 slots.try_extend(task_slots.drain())?;
             }
-            target.install_preselection(filter.clone(), slots);
+            slots.as_mut_slice().sort_unstable();
+            return FinalizedPerfectAggregateTable::try_preselected(target, filter.clone(), slots);
         }
-        Ok(target)
+        Ok(FinalizedPerfectAggregateTable::complete(target))
     }
 }
 
@@ -641,7 +628,7 @@ mod tests {
                 let state = table.state_ptr(slot);
                 table.initialize_state(state);
                 unsafe { *state.cast::<i64>() = (table_idx + 1) as i64 };
-                table.occupancy.set(slot);
+                table.occupancy.set(slot).unwrap();
                 table.count += 1;
             }
         }
@@ -670,7 +657,8 @@ mod tests {
             worker.join().unwrap().unwrap();
         }
 
-        let table = merge.finish().unwrap();
+        let finalized = merge.finish().unwrap();
+        let table = finalized.table();
         assert_eq!(table.count(), 2);
         for slot in [7, SLOTS / 2 + 9] {
             assert_eq!(unsafe { *table.state_ptr(slot).cast::<i64>() }, 6);
@@ -775,10 +763,11 @@ mod tests {
             worker.join().unwrap().unwrap();
         }
 
-        let table = merge.finish().unwrap();
-        assert!(!table.occupancy.is_set(3)); // key=2
-        assert!(table.occupancy.is_set(5)); // key=4
-        let preselection = table.preselection.as_ref().unwrap();
+        let finalized = merge.finish().unwrap();
+        let table = finalized.table();
+        assert!(!table.occupancy.is_set(3).unwrap()); // key=2
+        assert!(table.occupancy.is_set(5).unwrap()); // key=4
+        let preselection = finalized.preselection().unwrap();
         assert_eq!(preselection.filter, filter);
         let mut selected_slots = preselection.slots.as_slice().to_vec();
         selected_slots.sort_unstable();

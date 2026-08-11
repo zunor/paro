@@ -33,7 +33,9 @@ use crate::operators::aggregate::payload_spill::{
     AggregateSpilledPayload, AggregateSpilledState, AggregateStateEncoding,
     AggregateStateSpillBuffer,
 };
-use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
+use crate::operators::aggregate::perfect_aggregate_hashtable::{
+    FinalizedPerfectAggregateTable, PerfectAggregateHashTable,
+};
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::runtime::context::OperatorCleanupContext;
@@ -667,10 +669,10 @@ impl AggregateRuntimeState {
         match self {
             Self::Hash(state) => state.reclaimable_finalized_memory(),
             Self::Ungrouped(_) => 0,
-            Self::Perfect(state) => state
-                .table
-                .as_ref()
-                .map_or(0, PerfectAggregateHashTable::reclaimable_finalized_memory),
+            Self::Perfect(state) => state.finalized_table.as_ref().map_or(
+                0,
+                FinalizedPerfectAggregateTable::reclaimable_finalized_memory,
+            ),
         }
     }
 
@@ -702,7 +704,7 @@ impl AggregateRuntimeState {
             Self::Ungrouped(_) => Ok(ReclaimStats::empty(target_bytes)),
             Self::Perfect(state) => {
                 let reclaimed = state
-                    .table
+                    .finalized_table
                     .as_mut()
                     .map_or(0, |table| table.reclaim_finalized_memory(target_bytes));
                 Ok(ReclaimStats::new(target_bytes, reclaimed, 0))
@@ -856,13 +858,17 @@ impl AggregateSpilledOutput {
 
 #[derive(Debug)]
 pub struct PerfectHashAggregateRuntimeState {
-    pub table: Option<PerfectAggregateHashTable>,
-    pub pending_tables: Vec<PerfectAggregateHashTable>,
+    pub(crate) build_table: Option<PerfectAggregateHashTable>,
+    pub(crate) finalized_table: Option<FinalizedPerfectAggregateTable>,
+    pub(crate) pending_tables: Vec<PerfectAggregateHashTable>,
 }
 
 impl PerfectHashAggregateRuntimeState {
     fn destroy(&mut self) -> Result<()> {
-        if let Some(table) = self.table.as_mut() {
+        if let Some(table) = self.build_table.as_mut() {
+            table.destroy()?;
+        }
+        if let Some(table) = self.finalized_table.as_mut() {
             table.destroy()?;
         }
         for table in &mut self.pending_tables {

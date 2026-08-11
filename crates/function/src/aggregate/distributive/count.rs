@@ -140,7 +140,7 @@ impl CountFunction {
 }
 
 pub fn get_count_star_function() -> AggregateFunction {
-    AggregateFunction::new(
+    let function = AggregateFunction::new(
         "count_star".to_string(),
         vec![],
         LogicalType::BigInt,
@@ -151,8 +151,10 @@ pub fn get_count_star_function() -> AggregateFunction {
         CountFunction::finalize,
         Some(CountFunction::simple_update_star),
         None,
-    )
-    .with_direct_update(AggregateDirectUpdate::CountStar)
+    );
+    // SAFETY: COUNT state is one inline i64 with no external ownership.
+    unsafe { function.with_trivially_copyable_state() }
+        .with_direct_update(AggregateDirectUpdate::CountStar)
 }
 
 pub fn get_count_function() -> AggregateFunctionSet {
@@ -169,21 +171,21 @@ pub fn get_count_function() -> AggregateFunctionSet {
     ];
 
     for t in types {
-        set.add_function(
-            AggregateFunction::new(
-                "count".to_string(),
-                vec![t],
-                LogicalType::BigInt,
-                std::mem::size_of::<i64>(),
-                CountFunction::initialize,
-                CountFunction::update,
-                CountFunction::combine,
-                CountFunction::finalize,
-                Some(CountFunction::simple_update),
-                None,
-            )
-            .with_distinct_run_update(CountFunction::update_distinct_runs),
+        let function = AggregateFunction::new(
+            "count".to_string(),
+            vec![t],
+            LogicalType::BigInt,
+            std::mem::size_of::<i64>(),
+            CountFunction::initialize,
+            CountFunction::update,
+            CountFunction::combine,
+            CountFunction::finalize,
+            Some(CountFunction::simple_update),
+            None,
         );
+        // SAFETY: COUNT state is one inline i64 with no external ownership.
+        let function = unsafe { function.with_trivially_copyable_state() };
+        set.add_function(function.with_distinct_run_update(CountFunction::update_distinct_runs));
     }
 
     set

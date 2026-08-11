@@ -43,6 +43,19 @@ pub enum AggregateAlgebra {
     Sum,
 }
 
+/// Ownership model of one initialized aggregate state.
+///
+/// `InlineCopy` is a correctness-bearing capability: every readable byte is
+/// contained in the fixed-width state row, and duplicating that row cannot
+/// create aliased ownership. Execution paths that copy raw state bytes must
+/// require this capability instead of inferring it from an update/combine
+/// optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateStateOwnership {
+    Opaque,
+    InlineCopy,
+}
+
 /// Function to initialize the state.
 ///
 /// # Safety
@@ -337,6 +350,8 @@ pub struct AggregateFunction {
     /// Algebraic identity available to logical aggregate rewrites.
     pub algebra: Option<AggregateAlgebra>,
 
+    state_ownership: AggregateStateOwnership,
+
     /// Size of the state in bytes.
     pub state_size: usize,
 
@@ -414,6 +429,7 @@ impl AggregateFunction {
             arguments,
             return_type,
             algebra: None,
+            state_ownership: AggregateStateOwnership::Opaque,
             state_size,
             initialize,
             update,
@@ -439,6 +455,26 @@ impl AggregateFunction {
     pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
         self.algebra = Some(algebra);
         self
+    }
+
+    /// Declare that an initialized state is a self-contained, trivially
+    /// copyable value with no external ownership.
+    ///
+    /// # Safety
+    ///
+    /// Copying the complete state object representation into suitably aligned
+    /// uninitialized storage must produce an independent valid state. In
+    /// particular, readable fields cannot borrow or own external storage.
+    pub unsafe fn with_trivially_copyable_state(mut self) -> Self {
+        self.state_ownership = AggregateStateOwnership::InlineCopy;
+        self
+    }
+
+    /// Whether byte-copying one initialized state creates another independent
+    /// valid state. A destructor is an unconditional veto even if a function
+    /// was configured inconsistently.
+    pub fn state_is_trivially_copyable(&self) -> bool {
+        self.state_ownership == AggregateStateOwnership::InlineCopy && self.destructor.is_none()
     }
 
     /// Set the reducer used when DISTINCT finalization has contiguous group runs.

@@ -230,7 +230,6 @@ impl PhysicalPlanGenerator {
         )?;
         Ok((
             PhysicalNodeKind::Project(ProjectSpec {
-                table_index: aggregate.group_index,
                 expressions: expressions.into_boxed_slice(),
                 output_names: output_names.into_boxed_slice(),
             }),
@@ -295,7 +294,6 @@ impl PhysicalPlanGenerator {
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.generate_node(project.child.as_ref())?;
         let spec = ProjectSpec {
-            table_index: project.table_index,
             expressions: project.expressions.clone().into_boxed_slice(),
             output_names: align_output_names(
                 project.output_names.clone(),

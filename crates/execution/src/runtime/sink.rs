@@ -345,6 +345,29 @@ pub struct FinishTaskGroup {
     pub task_count_hint: usize,
     pub driver: Arc<dyn ParallelFinishDriver>,
     pub memory_class: MemoryClass,
+    pub coordinator_participation: FinishCoordinatorParticipation,
+}
+
+/// How aggressively the pipeline-completion thread should help a parallel
+/// finish group while scheduler workers consume the same producer.
+///
+/// This is an operator policy rather than a scheduler heuristic: some finish
+/// tasks are independent partitions that benefit from immediate draining,
+/// while reductions over shared state need the coordinator to yield after one
+/// task so sibling workers can make progress in parallel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishCoordinatorParticipation {
+    DrainAvailable,
+    SingleTask,
+}
+
+impl FinishCoordinatorParticipation {
+    pub fn max_tasks(self) -> usize {
+        match self {
+            Self::DrainAvailable => usize::MAX,
+            Self::SingleTask => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +428,7 @@ impl FinishTaskGroupRunner {
                 run: Box::new(run),
             }),
             memory_class,
+            coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
         }
     }
 }

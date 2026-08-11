@@ -180,25 +180,27 @@ impl Optimizer {
             Box::new(CteInliningPass),
             Box::new(DelimJoinEliminationPass),
             Box::new(EmptyResultPullupPass),
+            // Canonicalize comma joins and mixed predicates before semantic
+            // join rewrites and cost-based ordering inspect the graph.
+            Box::new(MixedJoinPredicatePass),
             // Planning statistics: collect base-column bounds and distinct
             // counts before join ordering consumes them as cost inputs.
             Box::new(StatisticsGatheringPass),
             Box::new(ReorderFilterPass),
             Box::new(JoinEliminationPass),
-            Box::new(JoinOrderPass),
-            // Join ordering exposes the full reduction-join shape. Reuse its
-            // grouped aggregates before unused-column pruning hides partials.
+            // Remove redundant detail scans while their semantic join edge is
+            // still explicit, before cost-based ordering sees the graph.
             Box::new(AggregateJoinSubsumptionPass),
-            // Aggregate subsumption changes both row production and the
-            // statistics-visible HAVING shape. Re-derive costing inputs before
-            // final build/probe orientation consumes them.
+            // The rewrite changes both row production and the
+            // statistics-visible HAVING shape. Re-derive cost inputs so join
+            // ordering optimizes the reduced graph rather than a stale tree.
             Box::new(StatisticsGatheringPass),
+            Box::new(JoinOrderPass),
             Box::new(UnusedColumnsPass {
                 binder: unused_columns_binder,
             }),
             Box::new(BuildProbeSidePass),
             Box::new(JoinFilterPushdownPass),
-            Box::new(MixedJoinPredicatePass),
             Box::new(TopNPass),
             Box::new(LimitPushdownPass),
             Box::new(InClausePass),

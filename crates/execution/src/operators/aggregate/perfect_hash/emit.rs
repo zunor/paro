@@ -114,7 +114,12 @@ impl PerfectHashAggregateEmitSourceExec {
                     "aggregate handle does not contain perfect aggregate state",
                 ));
             };
-            local.table = Some(state.table.ok_or_else(|| {
+            if state.build_table.is_some() || !state.pending_tables.is_empty() {
+                return Err(paro_error::internal(
+                    "finalized perfect aggregate state retained mutable build tables",
+                ));
+            }
+            local.table = Some(state.finalized_table.ok_or_else(|| {
                 paro_error::internal("finalized perfect aggregate state has no table")
             })?);
         }

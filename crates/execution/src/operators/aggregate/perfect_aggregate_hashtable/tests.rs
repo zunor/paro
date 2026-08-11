@@ -4,7 +4,9 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::distributive::count::get_count_star_function;
@@ -16,6 +18,10 @@ use super::{
     PreparedSlotEncoding,
 };
 use crate::operators::aggregate::aggregate_object::AggregateObject;
+
+fn key_memory() -> MemoryAccountingContext {
+    MemoryAccountingContext::detached(MemoryTag::HashTable, MemoryAccountingClass::Revocable)
+}
 
 #[test]
 fn mixed_radix_layout_is_dense_and_round_trips_every_component() {
@@ -96,9 +102,10 @@ fn dictionary_key_codec_ignores_unreferenced_physical_values() {
     let dictionary = paro_common::test_utils::test_dictionary(child, vec![0_u32, 2, 0, 2]);
     let decoded = dictionary.try_decode_ref(4).expect("dictionary decode");
     let domain = PerfectHashKeyDomain::try_new(LogicalType::Varchar).expect("domain");
-    let mut prepared = PreparedDictionaryKey::try_new(&domain, &decoded, 4, 66, 3, 0)
-        .expect("prepare key")
-        .expect("small dictionary key");
+    let mut prepared =
+        PreparedDictionaryKey::try_new(&domain, &decoded, 4, 66, 3, 0, &key_memory())
+            .expect("prepare key")
+            .expect("small dictionary key");
 
     assert_eq!(prepared.encoded(0).unwrap(), 1);
     assert_eq!(prepared.encoded(1).unwrap(), 2);
@@ -117,9 +124,10 @@ fn dictionary_key_codec_is_not_limited_by_q1_cardinality() {
     let dictionary = paro_common::test_utils::test_dictionary(child, selection);
     let decoded = dictionary.try_decode_ref(40).expect("dictionary decode");
     let domain = PerfectHashKeyDomain::try_new(LogicalType::Varchar).expect("domain");
-    let mut prepared = PreparedDictionaryKey::try_new(&domain, &decoded, 40, 66, 21, 0)
-        .expect("prepare key")
-        .expect("dictionary key");
+    let mut prepared =
+        PreparedDictionaryKey::try_new(&domain, &decoded, 40, 66, 21, 0, &key_memory())
+            .expect("prepare key")
+            .expect("dictionary key");
 
     assert_eq!(prepared.encoded(0).unwrap(), 1);
     assert_eq!(prepared.encoded(1).unwrap(), 20);
@@ -174,8 +182,15 @@ fn assert_two_key_roundtrip(
     let minima = vec![i128::from(b'A') + 1, i128::from(b'F') + 1];
     let layout = PerfectHashSlotLayout::try_new(vec![19, 11]).unwrap();
     let decoded = decode_group_batch(groups, 2).unwrap();
-    let mut prepared =
-        prepare_slot_encoding(&domains, &minima, &layout, &decoded, groups.size()).unwrap();
+    let mut prepared = prepare_slot_encoding(
+        &domains,
+        &minima,
+        &layout,
+        &decoded,
+        groups.size(),
+        &key_memory(),
+    )
+    .unwrap();
     assert_eq!(
         matches!(prepared, PreparedSlotEncoding::Pair { .. }),
         expect_dictionary_pair

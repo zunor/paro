@@ -26,8 +26,8 @@ use super::group_hash::GroupHashScratch;
 use super::group_key_codec::GroupKeyEncoder;
 use super::ordered_helpers::OrderedAggregateCollector;
 use super::perfect_aggregate_hashtable::{
-    PerfectAggregateHashTable, PerfectAggregateScanScratch, PerfectAggregateStateFilter,
-    PerfectHTScanPosition,
+    FinalizedPerfectAggregateTable, PerfectAggregateHashTable, PerfectAggregateScanScratch,
+    PerfectAggregateStateFilter, PerfectHTScanPosition,
 };
 use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
 use super::row_format::AggregateGroupFormat;
@@ -82,7 +82,7 @@ pub struct UngroupedAggregateEmitSourceLocal {
 
 #[derive(Debug, Default)]
 pub struct PerfectHashAggregateEmitSourceLocal {
-    pub table: Option<PerfectAggregateHashTable>,
+    pub(crate) table: Option<FinalizedPerfectAggregateTable>,
     pub position: PerfectHTScanPosition,
     pub(crate) scan_scratch: Option<PerfectAggregateScanScratch>,
     pub(crate) state_filter: Option<PerfectAggregateStateFilter>,

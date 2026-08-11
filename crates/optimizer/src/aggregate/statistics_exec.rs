@@ -351,26 +351,18 @@ mod tests {
         children: Vec<Expression>,
         return_type: LogicalType,
     ) -> Expression {
-        let function = AggregateFunction {
-            name: name.to_string(),
-            arguments: children.iter().map(|child| child.return_type()).collect(),
-            return_type: return_type.clone(),
-            algebra: None,
-            state_size: 8,
-            initialize: noop_initialize,
-            update: noop_update,
-            combine: noop_combine,
-            finalize: noop_finalize,
-            state_filter: None,
-            simple_update: None,
-            distinct_run_update: None,
-            direct_update: None,
-            destructor: None,
-            state_serialize: None,
-            state_deserialize: None,
-            varargs: None,
-            bind_data: None,
-        };
+        let function = AggregateFunction::new(
+            name.to_string(),
+            children.iter().map(|child| child.return_type()).collect(),
+            return_type.clone(),
+            8,
+            noop_initialize,
+            noop_update,
+            noop_combine,
+            noop_finalize,
+            None,
+            None,
+        );
         Expression::Aggregate(AggregateExpression::new(function, children, return_type))
     }
 

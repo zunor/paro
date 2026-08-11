@@ -11,8 +11,9 @@ use paro_scheduler::task::{ProducerToken, Task, TaskExecutionMode, TaskExecution
 
 use crate::explain::profiler::{OperatorProfiler, ProfileWorkerContext};
 use crate::runtime::{
-    FinishTaskGroup, FinishTaskId, FinishTaskPoll, OperatorWakeScope, PipelineRuntime,
-    PipelineTaskId, PipelineTaskStepContext, QueryRuntimeContext, WorkGroupCompletion,
+    FinishCoordinatorParticipation, FinishTaskGroup, FinishTaskId, FinishTaskPoll,
+    OperatorWakeScope, PipelineRuntime, PipelineTaskId, PipelineTaskStepContext,
+    QueryRuntimeContext, WorkGroupCompletion,
 };
 use crate::thread_context::ThreadContext;
 
@@ -48,7 +49,13 @@ pub(super) fn run_parallel_finish_tasks(
         })
         .collect::<Vec<_>>();
     producer.schedule_tasks(tasks);
-    wait_for_parallel_finish_group(scheduler.as_ref(), &producer, &coordinator, query.as_ref())
+    wait_for_parallel_finish_group(
+        scheduler.as_ref(),
+        &producer,
+        &coordinator,
+        query.as_ref(),
+        group.coordinator_participation,
+    )
 }
 
 fn wait_for_parallel_finish_group(
@@ -56,6 +63,7 @@ fn wait_for_parallel_finish_group(
     producer: &ProducerToken,
     coordinator: &WorkGroupCompletion,
     query: &QueryRuntimeContext,
+    participation: FinishCoordinatorParticipation,
 ) -> Result<()> {
     let marker = std::sync::atomic::AtomicBool::new(true);
     loop {
@@ -71,14 +79,17 @@ fn wait_for_parallel_finish_group(
                 return Err(error);
             }
         }
-        // The completion thread participates in the group, but must not drain
-        // the producer greedily: doing so turns a parallel finish group into a
-        // serial loop before scheduler workers can claim sibling tasks. Help
-        // with one task, then observe/wait for progress from the whole group.
-        scheduler.execute_tasks_for_producer(producer, &marker, 1);
+        let completed =
+            scheduler.execute_tasks_for_producer(producer, &marker, participation.max_tasks());
         if let Some(error) = scheduler.get_error_for_producer(producer) {
             cancel_parallel_finish_and_drain(scheduler, producer, coordinator);
             return Err(paro_error::internal(error.to_string()));
+        }
+        // A task completed synchronously, so there is already observable
+        // progress. Only enter the timed wait when scheduler workers own all
+        // remaining work; otherwise one timeout would be paid per task.
+        if completed != 0 {
+            continue;
         }
         let remaining = match coordinator.snapshot() {
             Ok(None) => return Ok(()),

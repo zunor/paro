@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::runtime::FinishCoordinatorParticipation;
 
 #[test]
 fn client_result_sink_backpressure_retains_sink_input_without_clone() {
@@ -126,7 +127,6 @@ fn streaming_limit_stop_pipeline_still_runs_completion() {
         source: SourceSpec::Dummy(DummyScanSpec),
         transforms: vec![
             TransformSpec::Project(ProjectSpec {
-                table_index: 0,
                 expressions: vec![int_constant(1)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
             }),
@@ -173,7 +173,6 @@ fn transform_stop_pipeline_flushes_only_downstream_transforms() {
                 hnsw_ef_hint: None,
             }),
             TransformSpec::Project(ProjectSpec {
-                table_index: 0,
                 expressions: vec![int_constant(1)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
             }),
@@ -363,6 +362,7 @@ fn finish_task_error_cancels_group_as_operator_error() {
             cancel_reason: cancel_reason.clone(),
         }),
         memory_class: MemoryClass::Blocking,
+        coordinator_participation: FinishCoordinatorParticipation::SingleTask,
     });
 
     let thread = ThreadContext::single_threaded();
@@ -406,6 +406,7 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
             completed.clone(),
         )),
         memory_class: MemoryClass::Blocking,
+        coordinator_participation: FinishCoordinatorParticipation::SingleTask,
     });
 
     let thread = ThreadContext::single_threaded();
@@ -446,6 +447,7 @@ fn finish_task_discovery_error_cancels_group_as_operator_error() {
             cancel_reason: cancel_reason.clone(),
         }),
         memory_class: MemoryClass::Blocking,
+        coordinator_participation: FinishCoordinatorParticipation::SingleTask,
     });
 
     let thread = ThreadContext::single_threaded();
@@ -489,6 +491,7 @@ fn cancellation_cleans_pending_finish_group_without_recording_operator_error() {
             cancel_reason: cancel_reason.clone(),
         }),
         memory_class: MemoryClass::Blocking,
+        coordinator_participation: FinishCoordinatorParticipation::SingleTask,
     });
 
     let thread = ThreadContext::single_threaded();
@@ -549,6 +552,7 @@ fn finish_group_pending_blockers_keep_wake_registration() {
                 cancel_reason: Arc::new(Mutex::new(None)),
             }),
             memory_class: MemoryClass::Blocking,
+            coordinator_participation: FinishCoordinatorParticipation::SingleTask,
         });
 
         let thread = ThreadContext::single_threaded();

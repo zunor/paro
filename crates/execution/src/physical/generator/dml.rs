@@ -115,7 +115,6 @@ impl PhysicalPlanGenerator {
 
         let project_id = self.push_node(
             PhysicalNodeKind::Project(ProjectSpec {
-                table_index: update.table_index as usize,
                 expressions: projection_exprs.into_boxed_slice(),
                 output_names: output_names.clone().into_boxed_slice(),
             }),

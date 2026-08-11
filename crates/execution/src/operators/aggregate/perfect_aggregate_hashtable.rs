@@ -28,7 +28,7 @@ use super::aggregate_state::AggregateStateLayout;
 use super::perfect_hash_key::PerfectHashKeyDomain;
 
 mod key_encoding;
-mod parallel_merge;
+mod reduction;
 mod slot_bitmap;
 mod support;
 
@@ -37,7 +37,7 @@ use key_encoding::{
 };
 #[cfg(test)]
 use key_encoding::{PreparedDictionaryKey, PreparedSlotEncoding};
-pub(crate) use parallel_merge::ParallelPerfectAggregateMerge;
+pub(crate) use reduction::ParallelPerfectAggregateMerge;
 use slot_bitmap::SlotBitmap;
 pub(crate) use support::compile_direct_update_program;
 use support::{
@@ -76,6 +76,19 @@ struct PerfectAggregatePreselection {
     slots: AccountedVec<usize>,
 }
 
+/// Scan-only result of perfect-hash aggregation finalization.
+///
+/// A state-filtered parallel reduction may intentionally omit groups that
+/// cannot reach the output. Such a table is not a valid input to any future
+/// update or combine operation, so the lossy selection lives in this finalized
+/// type rather than weakening [`PerfectAggregateHashTable`]'s occupancy
+/// invariant.
+#[derive(Debug)]
+pub(crate) struct FinalizedPerfectAggregateTable {
+    table: PerfectAggregateHashTable,
+    preselection: Option<PerfectAggregatePreselection>,
+}
+
 impl PerfectAggregateScanScratch {
     pub(crate) fn try_new(
         aggregate_types: &[LogicalType],
@@ -110,8 +123,8 @@ pub struct PerfectAggregateHashTable {
     data: AccountedVec<MaybeUninit<u64>>,
     row_width: usize,
     aggregate_allocator: ArenaAllocator,
+    memory: MemoryAccountingContext,
     count: usize,
-    preselection: Option<PerfectAggregatePreselection>,
 }
 
 impl PerfectAggregateHashTable {
@@ -245,8 +258,8 @@ impl PerfectAggregateHashTable {
             data,
             row_width,
             aggregate_allocator: ArenaAllocator::new(allocator),
+            memory,
             count: 0,
-            preselection: None,
         })
     }
 
@@ -313,6 +326,7 @@ impl PerfectAggregateHashTable {
             &self.slot_layout,
             &decoded_groups,
             groups.size(),
+            &self.memory,
         )?;
         let direct_slots = self
             .direct_slots
@@ -329,15 +343,11 @@ impl PerfectAggregateHashTable {
                 row,
             )?)?;
         }
-        // SAFETY: the canonical encoder validated every materialized slot
-        // against this table's immutable mixed-radix domain.
-        let slots = unsafe {
-            ValidatedDirectGroupSlots::from_validated_prefix(
-                direct_slots,
-                groups.size(),
-                self.slot_layout.slot_count,
-            )
-        };
+        let slots = ValidatedDirectGroupSlots::try_new(
+            direct_slots,
+            groups.size(),
+            self.slot_layout.slot_count,
+        )?;
         let state_base = self.data.as_mut_ptr().cast::<u8>();
         let program = self
             .direct_update_program
@@ -349,15 +359,16 @@ impl PerfectAggregateHashTable {
         let aggregate_objects = &self.aggregate_objects;
         let group_count = &mut self.count;
         let mut initialize_slot = |slot, state_ptr| {
-            if !occupancy.is_set(slot) {
+            if !occupancy.is_set(slot)? {
                 // SAFETY: materialized slots prove domain membership and this
                 // callback runs before reduced state is consumed.
                 unsafe {
                     initialize_state_at_address(state_layout, aggregate_objects, state_ptr);
                 }
-                occupancy.set(slot);
+                occupancy.set(slot)?;
                 *group_count += 1;
             }
+            Ok(())
         };
         let executed = if let Some(scratch) = direct_update_scratch.as_mut() {
             unsafe {
@@ -405,6 +416,7 @@ impl PerfectAggregateHashTable {
             &self.slot_layout,
             &decoded_groups,
             groups.size(),
+            &self.memory,
         )?;
         let mut new_group_count = 0usize;
         for row_idx in 0..groups.size() {
@@ -418,9 +430,9 @@ impl PerfectAggregateHashTable {
             )?;
             let state_ptr = self.state_ptr(slot);
             unsafe { *address_data.add(row_idx) = state_ptr };
-            if !self.occupancy.is_set(slot) {
+            if !self.occupancy.is_set(slot)? {
                 self.initialize_state(state_ptr);
-                self.occupancy.set(slot);
+                self.occupancy.set(slot)?;
                 self.count += 1;
                 new_groups.try_set(new_group_count, row_idx)?;
                 new_group_count += 1;
@@ -603,7 +615,6 @@ impl PerfectAggregateHashTable {
 
     /// Combine aggregate states from another perfect hash table into this table.
     pub fn combine(&mut self, other: &mut Self) -> Result<()> {
-        self.preselection = None;
         self.ensure_compatible(other)?;
         if other.count == 0 {
             return Ok(());
@@ -621,7 +632,7 @@ impl PerfectAggregateHashTable {
 
         for slot in other.occupancy.set_bits(0..self.total_groups()) {
             let source_state = other.state_ptr(slot);
-            if !self.occupancy.is_set(slot) {
+            if !self.occupancy.is_set(slot)? {
                 let target_state = self.state_ptr(slot);
                 if direct_combine_program
                     .as_ref()
@@ -637,12 +648,12 @@ impl PerfectAggregateHashTable {
                             self.row_width,
                         );
                     }
-                    self.occupancy.set(slot);
+                    self.occupancy.set(slot)?;
                     self.count += 1;
                     continue;
                 }
                 self.initialize_state(target_state);
-                self.occupancy.set(slot);
+                self.occupancy.set(slot)?;
                 self.count += 1;
             }
             if let Some(program) = direct_combine_program.as_ref() {
@@ -683,6 +694,29 @@ impl PerfectAggregateHashTable {
         Ok(true)
     }
 
+    fn scan_selected_slots(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+        selected_slots: &[usize],
+    ) -> Result<bool> {
+        scratch.slots.clear();
+        let start = position.offset.min(selected_slots.len());
+        let end = start
+            .saturating_add(result.capacity())
+            .min(selected_slots.len());
+        scratch.slots.extend_from_slice(&selected_slots[start..end]);
+        position.offset = end;
+        if start == end {
+            result.try_set_cardinality(0)?;
+            return Ok(false);
+        }
+        self.finalize_slots(scratch)?;
+        self.write_selected_slots(result, scratch, None)?;
+        Ok(true)
+    }
+
     pub(crate) fn scan_with_aggregate_filter(
         &mut self,
         position: &mut PerfectHTScanPosition,
@@ -714,13 +748,6 @@ impl PerfectAggregateHashTable {
         selection: &mut SelectionVector,
         filter: &PerfectAggregateStateFilter,
     ) -> Result<bool> {
-        if self
-            .preselection
-            .as_ref()
-            .is_some_and(|preselection| preselection.filter == *filter)
-        {
-            return self.scan_with_scratch(position, result, scratch);
-        }
         let object = self
             .aggregate_objects
             .get(filter.aggregate_index)
@@ -787,13 +814,6 @@ impl PerfectAggregateHashTable {
         slots: &mut Vec<usize>,
     ) -> bool {
         slots.clear();
-        if let Some(preselection) = self.preselection.as_ref() {
-            let start = position.offset.min(preselection.slots.len());
-            let end = start.saturating_add(capacity).min(preselection.slots.len());
-            slots.extend_from_slice(&preselection.slots[start..end]);
-            position.offset = end;
-            return start != end;
-        }
         let total_groups = self.total_groups();
         let mut occupied = self.occupancy.set_bits(position.offset..total_groups);
         while slots.len() < capacity {
@@ -933,7 +953,6 @@ impl PerfectAggregateHashTable {
         self.destroy_initialized_states()?;
         self.occupancy.clear();
         self.count = 0;
-        self.preselection = None;
         self.aggregate_allocator.reset();
         Ok(())
     }
@@ -975,11 +994,7 @@ impl PerfectAggregateHashTable {
     }
 
     pub fn external_accounted_memory_usage(&self) -> usize {
-        self.data.capacity() * size_of::<MaybeUninit<u64>>()
-            + self.occupancy.capacity_bytes()
-            + self.preselection.as_ref().map_or(0, |preselection| {
-                preselection.slots.capacity() * size_of::<usize>()
-            })
+        self.data.capacity() * size_of::<MaybeUninit<u64>>() + self.occupancy.capacity_bytes()
     }
 
     pub fn reclaimable_finalized_memory(&self) -> usize {
@@ -1114,17 +1129,6 @@ impl PerfectAggregateHashTable {
         Ok(())
     }
 
-    fn install_preselection(
-        &mut self,
-        filter: PerfectAggregateStateFilter,
-        slots: AccountedVec<usize>,
-    ) {
-        debug_assert!(slots
-            .iter()
-            .all(|slot| *slot < self.total_groups() && self.occupancy.is_set(*slot)));
-        self.preselection = Some(PerfectAggregatePreselection { filter, slots });
-    }
-
     #[inline]
     fn state_ptr(&self, slot: usize) -> *mut u8 {
         debug_assert!(slot < self.total_groups());
@@ -1134,6 +1138,116 @@ impl PerfectAggregateHashTable {
         // storage is written by every aggregate initializer before an occupied
         // slot can be consumed, combined, finalized, or destroyed.
         unsafe { (self.data.as_ptr() as *mut u8).add(offset) }
+    }
+}
+
+impl FinalizedPerfectAggregateTable {
+    pub(crate) fn complete(table: PerfectAggregateHashTable) -> Self {
+        Self {
+            table,
+            preselection: None,
+        }
+    }
+
+    fn try_preselected(
+        table: PerfectAggregateHashTable,
+        filter: PerfectAggregateStateFilter,
+        slots: AccountedVec<usize>,
+    ) -> Result<Self> {
+        let mut previous = None;
+        for &slot in slots.iter() {
+            if !table.occupancy.is_set(slot)? {
+                return Err(paro_error::internal(format!(
+                    "perfect aggregate preselection contains unoccupied slot {slot}"
+                )));
+            }
+            if previous.is_some_and(|previous| previous >= slot) {
+                return Err(paro_error::internal(
+                    "perfect aggregate preselection must be strictly ordered",
+                ));
+            }
+            previous = Some(slot);
+        }
+        Ok(Self {
+            table,
+            preselection: Some(PerfectAggregatePreselection { filter, slots }),
+        })
+    }
+
+    pub(crate) fn scan_with_scratch(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+    ) -> Result<bool> {
+        if let Some(preselection) = self.preselection.as_ref() {
+            return self
+                .table
+                .scan_selected_slots(position, result, scratch, &preselection.slots);
+        }
+        self.table.scan_with_scratch(position, result, scratch)
+    }
+
+    pub(crate) fn scan_with_state_filter(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+        selection: &mut SelectionVector,
+        filter: &PerfectAggregateStateFilter,
+    ) -> Result<bool> {
+        if let Some(preselection) = self.preselection.as_ref() {
+            if preselection.filter != *filter {
+                return Err(paro_error::internal(
+                    "finalized perfect aggregate table was scanned with a different state filter",
+                ));
+            }
+            return self
+                .table
+                .scan_selected_slots(position, result, scratch, &preselection.slots);
+        }
+        self.table
+            .scan_with_state_filter(position, result, scratch, selection, filter)
+    }
+
+    pub(crate) fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut PerfectHTScanPosition,
+        result: &mut Chunk,
+        scratch: &mut PerfectAggregateScanScratch,
+        selection: &mut SelectionVector,
+        select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        if self.preselection.is_some() {
+            return Err(paro_error::internal(
+                "preselected perfect aggregate output cannot apply an unrelated finalized-value filter",
+            ));
+        }
+        self.table
+            .scan_with_aggregate_filter(position, result, scratch, selection, select)
+    }
+
+    pub(crate) fn destroy(&mut self) -> Result<()> {
+        self.preselection = None;
+        self.table.destroy()
+    }
+
+    pub(crate) fn reclaimable_finalized_memory(&self) -> usize {
+        self.table.reclaimable_finalized_memory()
+    }
+
+    pub(crate) fn reclaim_finalized_memory(&mut self, target_bytes: usize) -> usize {
+        self.table.reclaim_finalized_memory(target_bytes)
+    }
+
+    #[cfg(test)]
+    fn table(&self) -> &PerfectAggregateHashTable {
+        &self.table
+    }
+
+    #[cfg(test)]
+    fn preselection(&self) -> Option<&PerfectAggregatePreselection> {
+        self.preselection.as_ref()
     }
 }
 

@@ -3,8 +3,10 @@
 
 //! Batch-local group-key preparation and canonical mixed-radix slot encoding.
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef};
 use smallvec::SmallVec;
@@ -108,7 +110,7 @@ pub(super) struct PreparedDictionaryKey<'a> {
     minimum: i128,
     cardinality: usize,
     group_idx: usize,
-    codes: Vec<usize>,
+    codes: AccountedVec<usize>,
 }
 
 impl<'a> PreparedDictionaryKey<'a> {
@@ -121,6 +123,7 @@ impl<'a> PreparedDictionaryKey<'a> {
         minimum: i128,
         cardinality: usize,
         group_idx: usize,
+        memory: &MemoryAccountingContext,
     ) -> Result<Option<Self>> {
         if domain.logical_type() != &LogicalType::Varchar || !group.validity().all_valid() {
             return Ok(None);
@@ -129,6 +132,12 @@ impl<'a> PreparedDictionaryKey<'a> {
         if physical_count >= rows {
             return Ok(None);
         }
+        let mut codes = AccountedVec::new_with_accounting(
+            memory.reserve_grant(0)?,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        );
+        codes.try_resize_with(physical_count, || Self::UNPREPARED)?;
         Ok(Some(Self {
             domain,
             group,
@@ -141,7 +150,7 @@ impl<'a> PreparedDictionaryKey<'a> {
             minimum,
             cardinality,
             group_idx,
-            codes: vec![Self::UNPREPARED; physical_count],
+            codes,
         }))
     }
 
@@ -351,6 +360,7 @@ pub(super) fn prepare_slot_encoding<'a>(
     slot_layout: &PerfectHashSlotLayout,
     decoded_groups: &'a [DecodedVectorRef<'a>],
     rows: usize,
+    memory: &MemoryAccountingContext,
 ) -> Result<PreparedSlotEncoding<'a>> {
     let keys = decoded_groups
         .iter()
@@ -363,6 +373,7 @@ pub(super) fn prepare_slot_encoding<'a>(
                 group_minima[group_idx],
                 slot_layout.cardinalities[group_idx],
                 group_idx,
+                memory,
             )?;
             Ok(dictionary.map(PreparedGroupKey::Dictionary).or_else(|| {
                 PreparedIntegerKey::try_new(

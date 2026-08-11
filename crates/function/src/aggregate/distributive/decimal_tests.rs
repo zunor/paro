@@ -71,13 +71,14 @@ fn direct_decimal_program_fuses_shared_group_and_input_updates() {
     let average_offset = std::mem::size_of::<DecimalNarrowState>();
     let count_offset = average_offset + std::mem::size_of::<DecimalAverageState>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(3);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0)));
-    assert!(program.try_add(1, average.direct_update, average_offset, Some(0),));
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
     assert!(program.try_add(
         2,
         Some(AggregateDirectUpdate::CountStar),
         count_offset,
         None,
+        true,
     ));
     assert!(program.has_updates());
 
@@ -134,8 +135,8 @@ fn direct_decimal_program_uses_the_bound_i128_physical_width() {
     let sum_offset = 0;
     let average_offset = std::mem::size_of::<DecimalSumState>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0)));
-    assert!(program.try_add(1, average.direct_update, average_offset, Some(0)));
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
 
     let state_bytes = average_offset + std::mem::size_of::<DecimalAverageState>();
     let mut storage = vec![0_u64; state_bytes.div_ceil(std::mem::size_of::<u64>())];
@@ -179,13 +180,14 @@ fn reduced_direct_decimal_program_aggregates_i128_values_by_slot() {
     let count_offset = average_offset + std::mem::size_of::<DecimalAverageState>();
     let state_stride = count_offset + std::mem::size_of::<i64>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(3);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0)));
-    assert!(program.try_add(1, average.direct_update, average_offset, Some(0)));
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
     assert!(program.try_add(
         2,
         Some(AggregateDirectUpdate::CountStar),
         count_offset,
         None,
+        true,
     ));
 
     let mut storage = vec![0_u64; (state_stride * 2).div_ceil(std::mem::size_of::<u64>())];
@@ -256,8 +258,8 @@ fn reduced_direct_decimal_program_promotes_batch_totals_beyond_i128() {
     let average_offset = std::mem::size_of::<DecimalSumState>();
     let state_stride = average_offset + std::mem::size_of::<DecimalAverageState>();
     let mut program = crate::aggregate::DirectGroupedAggregateProgram::new(2);
-    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0)));
-    assert!(program.try_add(1, average.direct_update, average_offset, Some(0)));
+    assert!(program.try_add(0, sum.direct_update, sum_offset, Some(0), true));
+    assert!(program.try_add(1, average.direct_update, average_offset, Some(0), true,));
 
     let mut storage = vec![0_u64; state_stride.div_ceil(std::mem::size_of::<u64>())];
     let state_base = storage.as_mut_ptr().cast::<u8>();

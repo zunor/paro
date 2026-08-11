@@ -19,7 +19,10 @@ use paro_common::memory::MemoryAccountingClass;
 use crate::physical::properties::MemoryClass;
 use crate::runtime::breaker::{SortHandle, SortMaterializationBuild};
 use crate::runtime::context::{FinishTaskId, OperatorFinishContext};
-use crate::runtime::sink::{FinishTaskGroup, FinishTaskPoll, NextFinishTask, ParallelFinishDriver};
+use crate::runtime::sink::{
+    FinishCoordinatorParticipation, FinishTaskGroup, FinishTaskPoll, NextFinishTask,
+    ParallelFinishDriver,
+};
 
 const MATERIALIZED_SORT_AVAILABLE_MEMORY_DIVISOR: usize = 4;
 
@@ -45,6 +48,7 @@ impl SortMaterializeFinalizeDriver {
                 remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
+            coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
         }
     }
 

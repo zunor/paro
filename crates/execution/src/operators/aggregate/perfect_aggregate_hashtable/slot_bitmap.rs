@@ -43,22 +43,37 @@ impl SlotBitmap {
     }
 
     #[inline(always)]
-    pub(super) fn is_set(&self, slot: usize) -> bool {
-        debug_assert!(slot < self.slots);
+    pub(super) fn is_set(&self, slot: usize) -> Result<bool> {
+        if slot >= self.slots {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate occupancy slot out of bounds: slot={slot}, slots={}",
+                self.slots
+            )));
+        }
         let mask = 1_u64 << (slot % SLOT_WORD_BITS);
-        unsafe { *self.words.get_unchecked(slot / SLOT_WORD_BITS) & mask != 0 }
+        let value = self.words.get(slot / SLOT_WORD_BITS).ok_or_else(|| {
+            paro_error::internal("perfect aggregate occupancy storage is inconsistent")
+        })?;
+        Ok(*value & mask != 0)
     }
 
     /// Mark a slot and return whether it transitioned from empty.
     #[inline(always)]
-    pub(super) fn set(&mut self, slot: usize) -> bool {
-        debug_assert!(slot < self.slots);
+    pub(super) fn set(&mut self, slot: usize) -> Result<bool> {
+        if slot >= self.slots {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate occupancy slot out of bounds: slot={slot}, slots={}",
+                self.slots
+            )));
+        }
         let word = slot / SLOT_WORD_BITS;
         let mask = 1_u64 << (slot % SLOT_WORD_BITS);
-        let value = unsafe { self.words.get_unchecked_mut(word) };
+        let value = self.words.get_mut(word).ok_or_else(|| {
+            paro_error::internal("perfect aggregate occupancy storage is inconsistent")
+        })?;
         let inserted = *value & mask == 0;
         *value |= mask;
-        inserted
+        Ok(inserted)
     }
 
     pub(super) fn clear(&mut self) {
@@ -176,8 +191,8 @@ mod tests {
         )
         .unwrap();
         for slot in [0, 1, 63, 64, 65, 127, 128, 129] {
-            assert!(bitmap.set(slot));
-            assert!(!bitmap.set(slot));
+            assert!(bitmap.set(slot).unwrap());
+            assert!(!bitmap.set(slot).unwrap());
         }
 
         assert_eq!(

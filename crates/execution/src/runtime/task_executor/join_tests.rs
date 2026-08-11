@@ -1166,7 +1166,6 @@ fn project_filter_limit_chain_pushes_without_dyn_dispatch() {
                 projection_map: vec![1].into_boxed_slice(),
             }),
             TransformSpec::Project(ProjectSpec {
-                table_index: 0,
                 expressions: vec![reference(0, LogicalType::Integer)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
             }),

@@ -22,7 +22,10 @@ use crate::physical::properties::MemoryClass;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{AggregateHandle, AggregateRuntimeState};
 use crate::runtime::context::{FinishTaskId, OperatorFinishContext};
-use crate::runtime::sink::{FinishTaskGroup, FinishTaskPoll, NextFinishTask, ParallelFinishDriver};
+use crate::runtime::sink::{
+    FinishCoordinatorParticipation, FinishTaskGroup, FinishTaskPoll, NextFinishTask,
+    ParallelFinishDriver,
+};
 
 #[derive(Debug)]
 struct DistinctFinalizePartition {
@@ -71,6 +74,7 @@ impl DistinctFinalizeDriver {
                 remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
+            coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
         }
     }
 

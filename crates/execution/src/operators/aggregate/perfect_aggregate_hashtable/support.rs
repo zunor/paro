@@ -88,6 +88,7 @@ pub(crate) fn compile_direct_update_program(
             object.function.direct_update,
             state_layout.state_offset(aggregate_index),
             direct_payload_input(object, inputs),
+            object.function.state_is_trivially_copyable(),
         );
     }
     program

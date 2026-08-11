@@ -1073,7 +1073,6 @@ mod tests {
                     projection_map: Box::new([0]),
                 }),
                 TransformSpec::Project(ProjectSpec {
-                    table_index: 8,
                     expressions: Box::new([Expression::Reference(ReferenceExpression::new(
                         0,
                         LogicalType::Integer,

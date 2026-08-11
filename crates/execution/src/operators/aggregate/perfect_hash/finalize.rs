@@ -16,7 +16,8 @@ use crate::physical::properties::MemoryClass;
 use crate::runtime::breaker::{AggregateHandle, AggregateRuntimeState};
 use crate::runtime::context::{FinishTaskId, OperatorFinishContext};
 use crate::runtime::sink::{
-    FinishTaskGroup, FinishTaskPoll, FinishWork, NextFinishTask, ParallelFinishDriver,
+    FinishCoordinatorParticipation, FinishTaskGroup, FinishTaskPoll, FinishWork, NextFinishTask,
+    ParallelFinishDriver,
 };
 
 #[derive(Debug)]
@@ -42,16 +43,19 @@ impl PerfectAggregateMergeDriver {
                 remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
+            coordinator_participation: FinishCoordinatorParticipation::SingleTask,
         }
     }
 
     fn complete_task(&self) -> Result<()> {
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel);
-        if remaining == 0 {
-            return Err(paro_error::internal(
-                "perfect aggregate merge completed more tasks than scheduled",
-            ));
-        }
+        let remaining = self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_err(|_| {
+                paro_error::internal("perfect aggregate merge completed more tasks than scheduled")
+            })?;
         if remaining != 1 {
             return Ok(());
         }
@@ -63,12 +67,15 @@ impl PerfectAggregateMergeDriver {
                     "aggregate handle does not contain perfect aggregate state",
                 ));
             };
-            if global.table.is_some() || !global.pending_tables.is_empty() {
+            if global.build_table.is_some()
+                || global.finalized_table.is_some()
+                || !global.pending_tables.is_empty()
+            {
                 return Err(paro_error::internal(
                     "parallel perfect aggregate merge result has no empty destination",
                 ));
             }
-            global.table = Some(table);
+            global.finalized_table = Some(table);
             Ok(())
         })
     }
@@ -113,7 +120,12 @@ pub(crate) fn prepare_parallel_perfect_merge(
                 "aggregate handle does not contain perfect aggregate state",
             ));
         };
-        if let Some(table) = global.table.take() {
+        if global.finalized_table.is_some() {
+            return Err(paro_error::internal(
+                "perfect aggregate merge prepared after finalization",
+            ));
+        }
+        if let Some(table) = global.build_table.take() {
             tables.push(table);
         }
         tables.append(&mut global.pending_tables);
@@ -130,7 +142,7 @@ pub(crate) fn prepare_parallel_perfect_merge(
                         "aggregate handle does not contain perfect aggregate state",
                     ));
                 };
-                global.table = Some(table);
+                global.build_table = Some(table);
                 Ok(())
             })?;
         }

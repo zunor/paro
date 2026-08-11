@@ -17,7 +17,7 @@ use crate::operators::aggregate::build_helpers::{
     create_perfect_aggregate_table, group_payload_refs, projected_payload_chunk,
     query_perfect_hash_memory, update_perfect_aggregate_table,
 };
-use crate::operators::aggregate::perfect_hash::parallel_merge::prepare_parallel_perfect_merge;
+use crate::operators::aggregate::perfect_hash::finalize::prepare_parallel_perfect_merge;
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -43,7 +43,8 @@ impl PerfectHashAggregateSinkExec {
         let handle = ctx.handles.get(self.handle)?;
         handle.initialize(AggregateRuntimeState::Perfect(
             PerfectHashAggregateRuntimeState {
-                table: None,
+                build_table: None,
+                finalized_table: None,
                 pending_tables: Vec::new(),
             },
         ))?;
@@ -169,8 +170,13 @@ impl PerfectHashAggregateSinkExec {
                     "aggregate handle does not contain perfect aggregate state",
                 ));
             };
-            if global.table.is_none() {
-                global.table = Some(local_table);
+            if global.finalized_table.is_some() {
+                return Err(paro_error::internal(
+                    "perfect aggregate local table merged after finalization",
+                ));
+            }
+            if global.build_table.is_none() {
+                global.build_table = Some(local_table);
                 return Ok(());
             }
             global.pending_tables.push(local_table);
@@ -227,12 +233,25 @@ impl PerfectHashAggregateSinkExec {
                     global.pending_tables.len()
                 )));
             }
-            if global.table.is_none() {
-                global.table = Some(create_perfect_aggregate_table(
-                    &self.spec,
-                    ctx.query.allocator(MemoryTag::HashTable),
-                    query_perfect_hash_memory(ctx.query),
-                )?);
+            if global.finalized_table.is_none() {
+                let table = global.build_table.take().map_or_else(
+                    || {
+                        create_perfect_aggregate_table(
+                            &self.spec,
+                            ctx.query.allocator(MemoryTag::HashTable),
+                            query_perfect_hash_memory(ctx.query),
+                        )
+                    },
+                    Ok,
+                )?;
+                global.finalized_table = Some(
+                    crate::operators::aggregate::perfect_aggregate_hashtable::FinalizedPerfectAggregateTable::complete(table),
+                );
+            }
+            if global.build_table.is_some() {
+                return Err(paro_error::internal(
+                    "perfect aggregate finish retained a mutable table after finalization",
+                ));
             }
             Ok(())
         })?;

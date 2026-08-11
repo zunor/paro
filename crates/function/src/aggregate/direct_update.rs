@@ -123,6 +123,7 @@ pub struct DirectGroupedAggregateProgram {
     count_star_offsets: Vec<usize>,
     handled: Vec<bool>,
     update_count: usize,
+    all_states_trivially_copyable: bool,
 }
 
 /// Batch-local accumulators for a small direct-addressing group domain.
@@ -211,25 +212,6 @@ impl<'a> ValidatedDirectGroupSlots<'a> {
         Ok(Self { slots, slot_count })
     }
 
-    /// Construct a slot view whose domain was proven by the producer.
-    ///
-    /// # Safety
-    ///
-    /// `slots[..count]` must exist and every value in that prefix must be
-    /// strictly smaller than `slot_count`.
-    pub unsafe fn from_validated_prefix(
-        slots: &'a [usize],
-        count: usize,
-        slot_count: usize,
-    ) -> Self {
-        debug_assert!(count <= slots.len());
-        debug_assert!(slots[..count].iter().all(|slot| *slot < slot_count));
-        Self {
-            slots: unsafe { slots.get_unchecked(..count) },
-            slot_count,
-        }
-    }
-
     fn as_slice(&self) -> &'a [usize] {
         self.slots
     }
@@ -255,6 +237,7 @@ impl DirectGroupedAggregateProgram {
             count_star_offsets: Vec::new(),
             handled: vec![false; aggregate_count],
             update_count: 0,
+            all_states_trivially_copyable: true,
         }
     }
 
@@ -264,6 +247,7 @@ impl DirectGroupedAggregateProgram {
         update: Option<AggregateDirectUpdate>,
         state_offset: usize,
         input_index: Option<usize>,
+        state_is_trivially_copyable: bool,
     ) -> bool {
         let Some(update) = update else {
             return false;
@@ -336,6 +320,7 @@ impl DirectGroupedAggregateProgram {
         }
         *handled = true;
         self.update_count += 1;
+        self.all_states_trivially_copyable &= state_is_trivially_copyable;
         true
     }
 
@@ -368,7 +353,7 @@ impl DirectGroupedAggregateProgram {
     /// no allocator-backed payload and their combine implementation already
     /// covers every aggregate in the row.
     pub fn supports_trivial_state_copy(&self) -> bool {
-        self.supports_direct_combine()
+        self.supports_direct_combine() && self.all_states_trivially_copyable
     }
 
     /// Combine one pair of same-layout aggregate state rows directly.
@@ -632,7 +617,7 @@ impl DirectGroupedAggregateProgram {
                 scratch,
                 state_base,
                 state_stride,
-                |_, _| {},
+                |_, _| Ok(()),
             )
         }
     }
@@ -654,7 +639,7 @@ impl DirectGroupedAggregateProgram {
         initialize_slot: F,
     ) -> Result<bool>
     where
-        F: FnMut(usize, *mut u8),
+        F: FnMut(usize, *mut u8) -> Result<()>,
     {
         let mut source = ValidatedSlotSource {
             slots: slots.as_slice(),
@@ -694,7 +679,7 @@ impl DirectGroupedAggregateProgram {
     ) -> Result<bool>
     where
         S: DirectGroupSlotSource,
-        F: FnMut(usize, *mut u8),
+        F: FnMut(usize, *mut u8) -> Result<()>,
     {
         if scratch.decimal_sources.len() != self.decimal_inputs.len()
             || slot_source.slot_count() != scratch.slot_count
@@ -714,7 +699,7 @@ impl DirectGroupedAggregateProgram {
                         continue;
                     }
                     let base = unsafe { state_base.add(slot * state_stride) };
-                    initialize_slot(slot, base);
+                    initialize_slot(slot, base)?;
                     self.apply_reduced_slot(base, slot, scratch, &widths);
                 }
             }
@@ -722,7 +707,7 @@ impl DirectGroupedAggregateProgram {
                 for touched_idx in 0..scratch.touched_slots.len() {
                     let slot = scratch.touched_slots[touched_idx];
                     let base = unsafe { state_base.add(slot * state_stride) };
-                    initialize_slot(slot, base);
+                    initialize_slot(slot, base)?;
                     self.apply_reduced_slot(base, slot, scratch, &widths);
                 }
             }
@@ -753,7 +738,7 @@ impl DirectGroupedAggregateProgram {
     ) -> Result<bool>
     where
         S: DirectGroupSlotSource,
-        F: FnMut(usize, *mut u8),
+        F: FnMut(usize, *mut u8) -> Result<()>,
     {
         if !self.handles_all() || inputs.len() != self.decimal_inputs.len() {
             return Ok(false);
@@ -774,7 +759,7 @@ impl DirectGroupedAggregateProgram {
                 continue;
             }
             let base = unsafe { state_base.add(run_slot * state_stride) };
-            initialize_slot(run_slot, base);
+            initialize_slot(run_slot, base)?;
             unsafe { self.apply_direct_run(inputs, run_start..row, base) };
             if let Some(slot) = next_slot {
                 run_start = row;
@@ -799,7 +784,7 @@ impl DirectGroupedAggregateProgram {
         initialize_slot: F,
     ) -> Result<bool>
     where
-        F: FnMut(usize, *mut u8),
+        F: FnMut(usize, *mut u8) -> Result<()>,
     {
         let mut source = ValidatedSlotSource {
             slots: slots.as_slice(),

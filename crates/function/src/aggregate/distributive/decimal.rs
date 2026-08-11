@@ -56,6 +56,15 @@ impl FunctionData for DecimalAggregateBindData {
     }
 }
 
+/// Largest DECIMAL input precision whose exact SUM over every addressable row
+/// fits in the narrow i128 state. This threshold and the sentinel proof below
+/// are one admission contract; changing either must preserve both assertions.
+const NARROW_SUM_MAX_INPUT_PRECISION: u8 = 18;
+const DECIMAL_18_MAX: i128 = 999_999_999_999_999_999;
+const NARROW_SUM_MAX_ABS: i128 = DECIMAL_18_MAX * usize::MAX as i128;
+const _: () = assert!(NARROW_SUM_MAX_ABS < i128::MAX);
+const _: () = assert!(-NARROW_SUM_MAX_ABS > i128::MIN + 1);
+
 #[repr(C)]
 pub(in crate::aggregate) struct DecimalNarrowState {
     // Aggregate state buffers guarantee 8-byte alignment. Store i128 as words
@@ -89,6 +98,8 @@ impl DecimalNarrowState {
 
     fn set_i64(&mut self, value: i64) {
         self.value_words = [value as u64, if value < 0 { u64::MAX } else { 0 }];
+        debug_assert_ne!(self.value_words, Self::UNSET);
+        debug_assert_ne!(self.value_words, Self::OVERFLOWED);
     }
 
     pub(in crate::aggregate) fn is_set(&self) -> bool {
@@ -460,7 +471,7 @@ pub(in crate::aggregate) fn prepare_direct_state_predicate(
         .as_deref()
         .and_then(|data| data.as_any().downcast_ref::<DecimalAggregateBindData>())
         .ok_or_else(|| paro_error::internal("decimal SUM lost its bind data"))?;
-    debug_assert_eq!((data.op, data.wide_sum), (DecimalAggregateOp::Sum, false));
+    validate_narrow_sum_bind_data(data)?;
     let constant = sum_filter_constant(data, constant)?;
     Ok(Some(
         PreparedDirectAggregateStatePredicate::decimal_narrow_sum(
@@ -532,7 +543,7 @@ fn bind(
         unreachable!()
     };
     let wide_sum = op == DecimalAggregateOp::Sum && decimal_sum_requires_wide_state(*precision)?;
-    let mut function = AggregateFunction::new(
+    let function = AggregateFunction::new(
         name.to_string(),
         arguments.to_vec(),
         LogicalType::Decimal {
@@ -556,8 +567,11 @@ fn bind(
         finalize,
         Some(simple_update),
         None,
-    )
-    .with_bind_data(DecimalAggregateBindData {
+    );
+    // SAFETY: every decimal aggregate state is an inline integer/word struct;
+    // none owns external storage or installs a destructor.
+    let function = unsafe { function.with_trivially_copyable_state() };
+    let mut function = function.with_bind_data(DecimalAggregateBindData {
         op,
         input_scale: *scale,
         output_precision,
@@ -1098,13 +1112,12 @@ unsafe fn filter_narrow_sum_state(
     count: usize,
 ) -> Result<usize> {
     let data = bind_data(input_data);
-    debug_assert_eq!((data.op, data.wide_sum), (DecimalAggregateOp::Sum, false));
+    validate_narrow_sum_bind_data(data)?;
     // A narrow SUM is admitted only after proving that every mathematically
     // reachable sum fits both i128 and DECIMAL(38). SUM also preserves the
     // input scale, so the bound constant and state can be compared directly.
     // Keep the wide path below for aggregates that require rescaling and an
     // output-precision check per group.
-    debug_assert_eq!(data.input_scale, data.output_scale);
     let constant = sum_filter_constant(data, constant)?;
     validate_state_filter_selection(selection, count)?;
 
@@ -1258,14 +1271,27 @@ fn sum_output_value(state: &DecimalSumState, data: &DecimalAggregateBindData) ->
 }
 
 fn decimal_sum_requires_wide_state(input_precision: u8) -> Result<bool> {
-    let maximum = pow10_i128(input_precision)
-        .and_then(|limit| limit.checked_sub(1))
-        .ok_or_else(|| {
-            paro_error::out_of_range(format!(
-                "Decimal SUM input precision {input_precision} exceeds i128"
-            ))
-        })?;
-    Ok(maximum.checked_mul(usize::MAX as i128).is_none())
+    pow10_i128(input_precision).ok_or_else(|| {
+        paro_error::out_of_range(format!(
+            "Decimal SUM input precision {input_precision} exceeds i128"
+        ))
+    })?;
+    Ok(input_precision > NARROW_SUM_MAX_INPUT_PRECISION)
+}
+
+fn validate_narrow_sum_bind_data(data: &DecimalAggregateBindData) -> Result<()> {
+    if (data.op, data.wide_sum) != (DecimalAggregateOp::Sum, false) {
+        return Err(paro_error::internal(
+            "narrow decimal SUM state filter was bound to an incompatible aggregate",
+        ));
+    }
+    if data.input_scale != data.output_scale {
+        return Err(paro_error::internal(format!(
+            "narrow decimal SUM requires an unchanged scale: input={}, output={}",
+            data.input_scale, data.output_scale
+        )));
+    }
+    Ok(())
 }
 
 fn bind_data<'a>(input_data: &'a AggregateInputData<'_>) -> &'a DecimalAggregateBindData {

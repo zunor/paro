@@ -173,12 +173,12 @@ pub use scratch::{
 };
 pub use sink::{
     CancelReason, ClientResultSinkExec, CopyToFileSinkExec, CteMaterializeSinkExec, DeleteSinkExec,
-    DelimCaptureSinkExec, DynSinkExec, ExternalTableSinkExec, FinishPoll, FinishTaskGroup,
-    FinishTaskPoll, FinishWork, HashAggregateBuildSinkExec, HashJoinBuildSinkExec, InsertSinkExec,
-    MaterializeSinkExec, MergePoll, NextFinishTask, ParallelFinishDriver,
-    PerfectHashAggregateSinkExec, PrepareFinishPoll, RecursiveTableAppendSinkExec,
-    SetOperationInputSinkExec, SinkExec, SinkPoll, SortBuildSinkExec, TopNBuildSinkExec,
-    UngroupedAggregateSinkExec, UpdateSinkExec, WindowBuildSinkExec,
+    DelimCaptureSinkExec, DynSinkExec, ExternalTableSinkExec, FinishCoordinatorParticipation,
+    FinishPoll, FinishTaskGroup, FinishTaskPoll, FinishWork, HashAggregateBuildSinkExec,
+    HashJoinBuildSinkExec, InsertSinkExec, MaterializeSinkExec, MergePoll, NextFinishTask,
+    ParallelFinishDriver, PerfectHashAggregateSinkExec, PrepareFinishPoll,
+    RecursiveTableAppendSinkExec, SetOperationInputSinkExec, SinkExec, SinkPoll, SortBuildSinkExec,
+    TopNBuildSinkExec, UngroupedAggregateSinkExec, UpdateSinkExec, WindowBuildSinkExec,
 };
 pub use source::{
     AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, CteScanSourceExec,
