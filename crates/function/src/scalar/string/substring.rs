@@ -11,6 +11,7 @@ use crate::scalar::function_data_fingerprint;
 use crate::{
     scalar::executor::varlen::VarcharResultWriter, BoundScalarFunction, ExpressionState,
     FunctionData, FunctionErrorMode, ScalarBindInput, ScalarFunction, ScalarFunctionSet,
+    ScalarPredicateProjection,
 };
 
 #[derive(Debug, Clone, PartialEq, Hash)]
@@ -77,6 +78,11 @@ fn bind_substring_2(
             start: Some(start),
             length: None,
         });
+        bound = bound.with_predicate_projection(ScalarPredicateProjection::Utf8Substring {
+            source_argument: 0,
+            start,
+            length: None,
+        });
     }
     Ok(bound)
 }
@@ -91,6 +97,13 @@ fn bind_substring_3(
     let length = input.constant_value(2).and_then(Value::as_i64);
     if start.is_some() || length.is_some() {
         bound = bound.with_bind_data(SubstringBindData { start, length });
+    }
+    if let (Some(start), Some(length)) = (start, length) {
+        bound = bound.with_predicate_projection(ScalarPredicateProjection::Utf8Substring {
+            source_argument: 0,
+            start,
+            length: Some(length),
+        });
     }
     Ok(bound)
 }

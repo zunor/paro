@@ -30,5 +30,5 @@ pub use local_state::FunctionLocalState;
 pub use scalar_function::{
     BoundScalarFunction, DictionaryStrategy, FunctionErrorMode, FunctionNullHandling,
     FunctionSideEffects, FunctionStability, InitLocalStateFn, ScalarBindFn, ScalarBindInput,
-    ScalarDispatch, ScalarFunction, ScalarFunctionFn, ScalarFunctionSet,
+    ScalarDispatch, ScalarFunction, ScalarFunctionFn, ScalarFunctionSet, ScalarPredicateProjection,
 };

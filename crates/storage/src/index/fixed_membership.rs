@@ -121,7 +121,10 @@ impl<T: FixedMembershipValue> FixedMembershipSet<T> {
         Self::from_values_with_policy(values, FixedMembershipBuildPolicy::default())
     }
 
-    fn from_values_with_policy(mut values: Vec<T>, policy: FixedMembershipBuildPolicy) -> Self {
+    pub(crate) fn from_values_with_policy(
+        mut values: Vec<T>,
+        policy: FixedMembershipBuildPolicy,
+    ) -> Self {
         if values.is_empty() {
             return Self {
                 representation: FixedMembershipRepresentation::Sorted(Arc::from([])),

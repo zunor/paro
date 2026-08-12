@@ -14,6 +14,7 @@ use paro_common::vector::Vector;
 use crate::codec::vector_decoder;
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
+use crate::rowset::encoding::BinaryPlainPageSlice;
 
 /// The least materialized representation accepted by every predicate that
 /// references a column. A decoded consumer dominates typed consumers.
@@ -80,10 +81,14 @@ pub(super) struct StorageDictionaryPredicateBatch {
 /// evaluation borrows values directly from it, and late materialization copies
 /// only selected encoded rows into the output batch.
 pub(super) struct RawVarlenPredicateBatch {
-    data: Bytes,
+    source: RawVarlenSource,
     nulls: Option<Bytes>,
-    row_ends: Box<[u32]>,
     utf8_verified: bool,
+}
+
+enum RawVarlenSource {
+    LengthPrefixed { data: Bytes, row_ends: Box<[u32]> },
+    BinaryPlain(BinaryPlainPageSlice),
 }
 
 impl RawVarlenPredicateBatch {
@@ -108,6 +113,31 @@ impl RawVarlenPredicateBatch {
             }
         };
         let validate_utf8 = utf8_type && !batch.has_verified_utf8();
+
+        if let Some(storage) = batch.storage_binary_plain {
+            if storage.rows() != rows {
+                return Err(paro_error::data_corrupted(
+                    "BinaryPlain predicate batch row count mismatch",
+                ));
+            }
+            if validate_utf8 {
+                for row_idx in 0..rows {
+                    let value = storage.row_value_ref(row_idx).ok_or_else(|| {
+                        paro_error::data_corrupted("BinaryPlain predicate row is missing")
+                    })?;
+                    std::str::from_utf8(value).map_err(|_| {
+                        paro_error::data_corrupted(
+                            "BinaryPlain predicate VARCHAR is not valid UTF-8",
+                        )
+                    })?;
+                }
+            }
+            return Ok(Self {
+                source: RawVarlenSource::BinaryPlain(storage),
+                nulls: batch.nulls,
+                utf8_verified: utf8_type,
+            });
+        }
 
         let mut offset = 0usize;
         let mut row_ends = Vec::with_capacity(rows);
@@ -148,9 +178,11 @@ impl RawVarlenPredicateBatch {
         }
 
         Ok(Self {
-            data: batch.data,
+            source: RawVarlenSource::LengthPrefixed {
+                data: batch.data,
+                row_ends: row_ends.into_boxed_slice(),
+            },
             nulls: batch.nulls,
-            row_ends: row_ends.into_boxed_slice(),
             utf8_verified: utf8_type,
         })
     }
@@ -165,14 +197,19 @@ impl RawVarlenPredicateBatch {
         if self.is_null(row_idx) {
             return None;
         }
-        let row_start = if row_idx == 0 {
-            0
-        } else {
-            self.row_ends[row_idx - 1] as usize
-        };
-        let value_start = row_start + std::mem::size_of::<u32>();
-        let row_end = self.row_ends[row_idx] as usize;
-        Some(&self.data[value_start..row_end])
+        match &self.source {
+            RawVarlenSource::LengthPrefixed { data, row_ends } => {
+                let row_start = if row_idx == 0 {
+                    0
+                } else {
+                    row_ends[row_idx - 1] as usize
+                };
+                let value_start = row_start + std::mem::size_of::<u32>();
+                let row_end = row_ends[row_idx] as usize;
+                Some(&data[value_start..row_end])
+            }
+            RawVarlenSource::BinaryPlain(storage) => storage.row_value_ref(row_idx),
+        }
     }
 
     fn append_encoded_row(
@@ -181,16 +218,17 @@ impl RawVarlenPredicateBatch {
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
     ) -> Result<()> {
-        let row_end = *self.row_ends.get(row_idx).ok_or_else(|| {
+        if self.is_null(row_idx) {
+            values.extend_from_slice(&0u32.to_le_bytes());
+            nulls.push(1);
+            return Ok(());
+        }
+        let value = self.row_value(row_idx).ok_or_else(|| {
             paro_error::data_corrupted("Reusable varlen predicate row is out of bounds")
-        })? as usize;
-        let row_start = if row_idx == 0 {
-            0
-        } else {
-            self.row_ends[row_idx - 1] as usize
-        };
-        values.extend_from_slice(&self.data[row_start..row_end]);
-        nulls.push(u8::from(self.is_null(row_idx)));
+        })?;
+        values.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        values.extend_from_slice(value);
+        nulls.push(0);
         Ok(())
     }
 }

@@ -15,8 +15,8 @@
 use crate::buffer::{PrefetchItem, Prefetcher};
 use crate::metrics::storage_metrics;
 use crate::rowset::encoding::{
-    BinaryDictPageDecoder, BinaryPlainPageDecoder, BitShufflePageDecoder, PlainPageDecoder,
-    RlePageDecoder,
+    BinaryDictPageDecoder, BinaryPlainPageDecoder, BinaryPlainPageSlice, BitShufflePageDecoder,
+    PlainPageDecoder, RlePageDecoder,
 };
 use crate::rowset::page::{
     EncodingType, NullEncoding, PageFooter, PageReadOptions, CURRENT_DATA_PAGE_FORMAT_VERSION,
@@ -42,6 +42,10 @@ pub struct ColumnBatch {
     pub nulls: Option<Bytes>,
     /// Optional storage dictionary payload for storage-aware dictionary execution.
     pub storage_dictionary: Option<StorageDictionaryBatch>,
+    /// Optional borrowed slice of a validated BinaryPlain page. This form is
+    /// emitted only by `next_predicate_batch`; ordinary readers retain their
+    /// owning length-prefixed representation.
+    pub(crate) storage_binary_plain: Option<BinaryPlainPageSlice>,
     /// Page-local span seeks used by read_by_rowids() to assemble this batch.
     pub page_run_seeks: usize,
     /// Semantic guarantees established before this batch reached execution.
@@ -127,6 +131,7 @@ impl ColumnBatch {
             data,
             nulls,
             storage_dictionary: None,
+            storage_binary_plain: None,
             page_run_seeks: 0,
             integrity: ColumnBatchIntegrity::Unverified,
         }
@@ -137,6 +142,21 @@ impl ColumnBatch {
             data: codes.clone(),
             nulls,
             storage_dictionary: Some(StorageDictionaryBatch { dictionary, codes }),
+            storage_binary_plain: None,
+            page_run_seeks: 0,
+            integrity: ColumnBatchIntegrity::Unverified,
+        }
+    }
+
+    pub(crate) fn with_storage_binary_plain(
+        batch: BinaryPlainPageSlice,
+        nulls: Option<Bytes>,
+    ) -> Self {
+        Self {
+            data: Bytes::new(),
+            nulls,
+            storage_dictionary: None,
+            storage_binary_plain: Some(batch),
             page_run_seeks: 0,
             integrity: ColumnBatchIntegrity::Unverified,
         }
@@ -161,6 +181,7 @@ impl ColumnBatch {
             data: Bytes::new(),
             nulls: None,
             storage_dictionary: None,
+            storage_binary_plain: None,
             page_run_seeks: 0,
             integrity: ColumnBatchIntegrity::Unverified,
         }
@@ -200,6 +221,16 @@ impl ColumnBatch {
             return decoder.string_at(code).map(Some).ok_or_else(|| {
                 paro_error::data_corrupted(format!("storage dictionary code {} out of range", code))
             });
+        }
+        if let Some(storage_binary_plain) = &self.storage_binary_plain {
+            return storage_binary_plain
+                .row_value(row_idx)
+                .map(Some)
+                .ok_or_else(|| {
+                    paro_error::out_of_range(format!(
+                        "storage BinaryPlain row {row_idx} out of range"
+                    ))
+                });
         }
 
         let mut offset = 0usize;
@@ -256,6 +287,13 @@ pub trait ColumnIterator: Send + Sync {
     /// # Returns
     /// Tuple of (values_read, batch)
     fn next_batch(&mut self, n: usize) -> Result<(usize, ColumnBatch)>;
+
+    /// Read a predicate-only batch. Implementations may return a borrowed,
+    /// storage-native representation because the batch never crosses the scan
+    /// materialization boundary.
+    fn next_predicate_batch(&mut self, n: usize) -> Result<(usize, ColumnBatch)> {
+        self.next_batch(n)
+    }
 
     /// Read values by row IDs.
     ///
@@ -357,6 +395,15 @@ impl PageDecoderImpl {
                     result.extend_from_slice(value);
                 }
                 Ok((values.len(), Bytes::from(result)))
+            }
+        }
+    }
+
+    fn next_binary_plain_batch(&mut self, n: usize) -> Result<Option<BinaryPlainPageSlice>> {
+        match self {
+            Self::BinaryPlain(decoder) => decoder.next_encoded_batch(n).map(Some),
+            Self::Plain(_) | Self::BitShuffle(_) | Self::Rle(_) | Self::Dictionary { .. } => {
+                Ok(None)
             }
         }
     }
@@ -514,7 +561,6 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 return Ok(());
             }
         }
-
         let (body, footer, _) = self.page_reader.read_page(&mut self.reader, &page_opts)?;
 
         // Verify it's a data page
@@ -1028,6 +1074,60 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         )))
     }
 
+    fn try_next_binary_plain_predicate_batch(
+        &mut self,
+        n: usize,
+    ) -> Result<Option<(usize, ColumnBatch)>> {
+        if self.current_ordinal >= self.meta.num_rows || n == 0 {
+            return Ok(None);
+        }
+        if !self.meta.field_type.is_variable_length()
+            || self.meta.encoding != EncodingType::Plain
+            || !self.ensure_page_loaded(DecodedPageAccess::Sequential)?
+        {
+            return Ok(None);
+        }
+        let page_remaining = self
+            .current_decoder
+            .as_ref()
+            .map(|decoder| decoder.count().saturating_sub(decoder.current_index()) as usize)
+            .unwrap_or(0);
+        // A predicate evaluator advances every referenced column by the same
+        // logical count. Crossing a page here could shorten only this column's
+        // batch, so retain the owning multi-page fallback at boundaries.
+        if n > page_remaining {
+            return Ok(None);
+        }
+        let Some(batch) = self
+            .current_decoder
+            .as_mut()
+            .expect("page was loaded above")
+            .next_binary_plain_batch(n)?
+        else {
+            return Ok(None);
+        };
+        let count = batch.rows();
+        debug_assert_eq!(count, n);
+        let nulls = if let Some(null_decoder) = &mut self.current_null_decoder {
+            let (null_count, null_bytes) = null_decoder.next_batch(count)?;
+            if null_count != count {
+                return Err(paro_error::data_corrupted(
+                    "Null map count mismatch with BinaryPlain predicate page",
+                ));
+            }
+            Some(null_bytes)
+        } else {
+            None
+        };
+        self.current_ordinal += count as u64;
+        Ok(Some((
+            count,
+            self.attach_current_page_integrity(ColumnBatch::with_storage_binary_plain(
+                batch, nulls,
+            )),
+        )))
+    }
+
     fn try_read_varlen_storage_dictionary_by_rowids<S: RowIdSequence + ?Sized>(
         &mut self,
         rowids: &S,
@@ -1464,6 +1564,13 @@ impl<R: Read + Seek + Send + Sync> ColumnIterator for ScalarColumnIterator<R> {
                 batch
             },
         ))
+    }
+
+    fn next_predicate_batch(&mut self, n: usize) -> Result<(usize, ColumnBatch)> {
+        if let Some(batch) = self.try_next_binary_plain_predicate_batch(n)? {
+            return Ok(batch);
+        }
+        self.next_batch(n)
     }
 
     fn read_by_rowids(&mut self, rowids: &[u64]) -> Result<ColumnBatch> {

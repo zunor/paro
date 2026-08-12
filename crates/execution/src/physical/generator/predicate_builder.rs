@@ -13,7 +13,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
-use paro_function::scalar::FunctionExecContext;
+use paro_function::scalar::{FunctionExecContext, ScalarPredicateProjection};
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::get::Get;
 use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
@@ -326,6 +326,9 @@ fn build_operator_predicate(
             if op.children.len() < 2 {
                 return Ok(None);
             }
+            if let Some(predicate) = build_projected_prefix_membership(op, get)? {
+                return Ok(Some(predicate));
+            }
             let col_idx = match extract_scan_column_index(&op.children[0]) {
                 Some(idx) => idx,
                 None => return Ok(None),
@@ -348,6 +351,65 @@ fn build_operator_predicate(
         }
         _ => Ok(None),
     }
+}
+
+/// Rewrite a membership predicate over a leading fixed-width UTF-8 substring
+/// into an equivalent binary prefix predicate over the source column.
+///
+/// An ASCII result of exactly `length` bytes can only be produced when the
+/// source begins with those same ASCII codepoints. Restricting the rewrite to
+/// that domain keeps it exact for arbitrary UTF-8 source strings; shorter,
+/// longer, or non-ASCII constants stay on the general expression path.
+fn build_projected_prefix_membership(
+    op: &paro_planner::expression::OperatorExpression,
+    get: &Get,
+) -> Result<Option<PredicateTree>> {
+    let Some(Expression::Function(function)) = op.children.first() else {
+        return Ok(None);
+    };
+    let Some(ScalarPredicateProjection::Utf8Substring {
+        source_argument,
+        start: 1,
+        length: Some(length),
+    }) = function.function.predicate_projection.as_ref()
+    else {
+        return Ok(None);
+    };
+    let Ok(length) = usize::try_from(*length) else {
+        return Ok(None);
+    };
+    if length == 0 {
+        return Ok(None);
+    }
+    let Some(source) = function.children.get(*source_argument) else {
+        return Ok(None);
+    };
+    let Some(col_idx) = extract_scan_column_index(source) else {
+        return Ok(None);
+    };
+    if get.column_types.get(col_idx) != Some(&LogicalType::Varchar) {
+        return Ok(None);
+    }
+
+    let mut prefixes = Vec::with_capacity(op.children.len() - 1);
+    for child in &op.children[1..] {
+        let Some(Value::Varchar(value)) = evaluate_bound_constant(child)? else {
+            return Ok(None);
+        };
+        if !value.is_ascii() || value.len() != length {
+            return Ok(None);
+        }
+        prefixes.push(value);
+    }
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    let Some(column_id) = get.column_ids.get(col_idx) else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateTree::leaf(Predicate::StringPrefixIn {
+        column_id: *column_id as u32,
+        prefixes,
+    })))
 }
 
 fn build_like_prefix_predicate(
@@ -511,8 +573,11 @@ mod tests {
     };
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
+    use paro_function::scalar::string::get_substring_functions;
+    use paro_function::scalar::ScalarBindInput;
     use paro_planner::expression::{
-        CastExpression, ConstantExpression, OperatorExpression, ReferenceExpression,
+        CastExpression, ConstantExpression, FunctionExpression, OperatorExpression,
+        ReferenceExpression,
     };
     use paro_planner::operator::Get;
 
@@ -727,6 +792,89 @@ mod tests {
         );
         assert_eq!(
             build_predicate(&like_expression("MEDIUM_POLISHED%", false), &get).unwrap(),
+            None
+        );
+    }
+
+    fn substring_in_expression(values: &[&str], start: i64, length: i64) -> Expression {
+        let set = get_substring_functions();
+        let (function, _) = set
+            .bind(&[
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+            ])
+            .unwrap();
+        let function = function
+            .bind(&ScalarBindInput::new(
+                vec![
+                    LogicalType::Varchar,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                ],
+                vec![
+                    None,
+                    Some(Value::BigInt(start)),
+                    Some(Value::BigInt(length)),
+                ],
+            ))
+            .unwrap();
+        let constant_bigint = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(value),
+                LogicalType::BigInt,
+            ))
+        };
+        let substring = Expression::Function(FunctionExpression::new(
+            function,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+                constant_bigint(start),
+                constant_bigint(length),
+            ],
+            LogicalType::Varchar,
+        ));
+        let mut children = vec![substring];
+        children.extend(values.iter().map(|value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::Varchar((*value).to_string()),
+                LogicalType::Varchar,
+            ))
+        }));
+        Expression::Operator(OperatorExpression::new(
+            OperatorType::In,
+            children,
+            LogicalType::Boolean,
+        ))
+    }
+
+    #[test]
+    fn leading_fixed_ascii_substring_membership_is_pushed_as_prefix_union() {
+        let get = Get::new_without_table(7, vec!["phone".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["31", "13", "31"], 1, 2), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefixIn {
+                column_id: 0,
+                prefixes: vec!["13".to_string(), "31".to_string()],
+            }))
+        );
+    }
+
+    #[test]
+    fn substring_membership_rewrite_declines_non_equivalent_domains() {
+        let get = Get::new_without_table(7, vec!["phone".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["13"], 2, 2), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["1"], 1, 2), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["你好"], 1, 2), &get).unwrap(),
             None
         );
     }

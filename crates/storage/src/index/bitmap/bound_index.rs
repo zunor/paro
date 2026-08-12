@@ -428,6 +428,7 @@ impl BoundIndex for BitmapIndex {
             Predicate::IsNotNull { .. } => self.evaluate_is_not_null(),
             Predicate::FixedIn { .. }
             | Predicate::StringPrefix { .. }
+            | Predicate::StringPrefixIn { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }

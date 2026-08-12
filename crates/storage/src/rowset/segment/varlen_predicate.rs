@@ -8,6 +8,8 @@ use std::cell::RefCell;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
 
+use crate::index::{FixedMembershipBuildPolicy, FixedMembershipSet};
+
 use super::predicate_column::PredicateColumnBatch;
 use super::segment_predicate::ComparisonOperator;
 
@@ -21,6 +23,164 @@ struct VarlenBound {
 struct DictionaryPredicateCache {
     dictionary: Bytes,
     matches: Box<[bool]>,
+}
+
+/// Normalized union of binary string prefixes.
+///
+/// Short equal-width domains use the fixed-width dense/sorted membership
+/// representation; long equal-width domains use a binary search over borrowed
+/// leading bytes. Mixed-width domains retain general `starts_with` semantics.
+/// Redundant prefixes are removed once during compilation.
+#[derive(Debug)]
+pub(super) struct VarlenPrefixMembership {
+    prefixes: Vec<Box<[u8]>>,
+    uniform_width: Option<usize>,
+    packed: Option<PackedPrefixMembership>,
+    dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
+}
+
+#[derive(Debug)]
+enum PackedPrefixMembership {
+    I32(FixedMembershipSet<i32>),
+    I64(FixedMembershipSet<i64>),
+    I128(FixedMembershipSet<i128>),
+}
+
+impl PackedPrefixMembership {
+    fn new(width: usize, prefixes: &[Box<[u8]>]) -> Self {
+        let policy = FixedMembershipBuildPolicy::new(1 << 16, 256);
+        match width {
+            1..=4 => Self::I32(FixedMembershipSet::from_values_with_policy(
+                prefixes
+                    .iter()
+                    .map(|prefix| pack_prefix(prefix) as i32)
+                    .collect(),
+                policy,
+            )),
+            5..=7 => Self::I64(FixedMembershipSet::from_values_with_policy(
+                prefixes
+                    .iter()
+                    .map(|prefix| pack_prefix(prefix) as i64)
+                    .collect(),
+                policy,
+            )),
+            8 => Self::I128(FixedMembershipSet::from_values_with_policy(
+                prefixes.iter().map(|prefix| pack_prefix(prefix)).collect(),
+                policy,
+            )),
+            _ => unreachable!("packed prefix width is bounded by construction"),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, prefix: &[u8]) -> bool {
+        let packed = pack_prefix(prefix);
+        match self {
+            Self::I32(values) => values.contains(packed as i32),
+            Self::I64(values) => values.contains(packed as i64),
+            Self::I128(values) => values.contains(packed),
+        }
+    }
+}
+
+impl VarlenPrefixMembership {
+    pub(super) fn new(prefixes: impl IntoIterator<Item = Box<[u8]>>) -> Self {
+        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        let mut normalized = Vec::<Box<[u8]>>::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            if !normalized
+                .iter()
+                .any(|existing| prefix.starts_with(existing.as_ref()))
+            {
+                normalized.push(prefix);
+            }
+        }
+        let uniform_width = normalized
+            .first()
+            .map(|prefix| prefix.len())
+            .filter(|width| normalized.iter().all(|prefix| prefix.len() == *width));
+        let packed = uniform_width
+            .filter(|width| (1..=8).contains(width))
+            .map(|width| PackedPrefixMembership::new(width, &normalized));
+        Self {
+            prefixes: normalized,
+            uniform_width,
+            packed,
+            dictionary_cache: RefCell::new(None),
+        }
+    }
+
+    #[inline]
+    pub(super) fn matches(&self, value: &[u8]) -> bool {
+        if let (Some(width), Some(packed)) = (self.uniform_width, &self.packed) {
+            let Some(prefix) = value.get(..width) else {
+                return false;
+            };
+            return packed.contains(prefix);
+        }
+        if let Some(width) = self.uniform_width {
+            let Some(value_prefix) = value.get(..width) else {
+                return false;
+            };
+            return self
+                .prefixes
+                .binary_search_by(|prefix| prefix.as_ref().cmp(value_prefix))
+                .is_ok();
+        }
+        self.prefixes
+            .iter()
+            .any(|prefix| value.starts_with(prefix.as_ref()))
+    }
+
+    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
+        (2, self.prefixes.len())
+    }
+
+    pub(super) fn filter_batch(
+        &self,
+        batch: &PredicateColumnBatch,
+        rows: usize,
+        selection: &mut Vec<usize>,
+        seed: bool,
+    ) -> Result<()> {
+        if let Some(batch) = batch.storage_dictionary() {
+            let mut cache = self.dictionary_cache.borrow_mut();
+            let dictionary = batch.encoded_dictionary();
+            let cache_matches = cache.as_ref().is_some_and(|cache| {
+                cache.dictionary.len() == dictionary.len()
+                    && cache.dictionary.as_ptr() == dictionary.as_ptr()
+            });
+            if !cache_matches {
+                let matches = (0..batch.dictionary_len())
+                    .map(|code| self.matches(&batch.dictionary_value(code)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                *cache = Some(DictionaryPredicateCache {
+                    dictionary: dictionary.clone(),
+                    matches,
+                });
+            }
+            batch.filter_codes(
+                &cache
+                    .as_ref()
+                    .expect("dictionary cache initialized")
+                    .matches,
+                selection,
+                seed,
+            );
+            return Ok(());
+        }
+        filter_varlen_batch(batch, rows, selection, seed, |value| self.matches(value))
+    }
+}
+
+#[inline]
+fn pack_prefix(prefix: &[u8]) -> i128 {
+    prefix.iter().fold(0_i128, |packed, byte| {
+        (packed << u8::BITS) | i128::from(*byte)
+    })
 }
 
 /// Normalized conjunction over one binary-comparable varlen column.
@@ -485,5 +645,23 @@ mod tests {
 
         values.merge(VarlenConjunction::from_prefix(b"MEDIUM POLISHED", false));
         assert!(!values.matches(b"MEDIUM POLISHED COPPER"));
+    }
+
+    #[test]
+    fn short_uniform_prefixes_compile_to_fixed_membership() {
+        let prefixes = VarlenPrefixMembership::new(
+            [b"13".as_slice(), b"31".as_slice(), b"18".as_slice()]
+                .into_iter()
+                .map(Box::<[u8]>::from),
+        );
+
+        assert!(matches!(
+            prefixes.packed,
+            Some(PackedPrefixMembership::I32(_))
+        ));
+        assert!(prefixes.matches(b"13-555-1234"));
+        assert!(prefixes.matches(b"31"));
+        assert!(!prefixes.matches(b"3"));
+        assert!(!prefixes.matches(b"99-555-1234"));
     }
 }

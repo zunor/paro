@@ -113,6 +113,22 @@ impl ScalarBindInput {
 pub type ScalarBindFn =
     fn(function: &ScalarFunction, input: &ScalarBindInput) -> Result<BoundScalarFunction>;
 
+/// A bound scalar result that can be projected back onto one input argument.
+///
+/// This metadata describes semantics, not an implementation detail. Consumers
+/// such as scan predicate builders may use it only when they can prove that a
+/// predicate over the result has an equivalent predicate over the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarPredicateProjection {
+    /// A substring over Unicode scalar positions. `start` follows SQL's
+    /// one-based convention and `length` is the requested character count.
+    Utf8Substring {
+        source_argument: usize,
+        start: i64,
+        length: Option<i64>,
+    },
+}
+
 #[derive(Clone)]
 pub struct ScalarFunction {
     pub name: String,
@@ -218,6 +234,7 @@ pub struct BoundScalarFunction {
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
     pub dispatch: ScalarDispatch,
+    pub predicate_projection: Option<ScalarPredicateProjection>,
     pub init_local_state: Option<InitLocalStateFn>,
     pub stability: FunctionStability,
     pub null_handling: FunctionNullHandling,
@@ -235,6 +252,7 @@ impl Debug for BoundScalarFunction {
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
             .field("dispatch", &self.dispatch)
+            .field("predicate_projection", &self.predicate_projection)
             .field("has_init_local_state", &self.init_local_state.is_some())
             .field("stability", &self.stability)
             .field("null_handling", &self.null_handling)
@@ -254,6 +272,7 @@ impl From<ScalarFunction> for BoundScalarFunction {
             arguments: function.arguments,
             return_type: function.return_type,
             dispatch: function.dispatch,
+            predicate_projection: None,
             init_local_state: function.init_local_state,
             stability: function.stability,
             null_handling: function.null_handling,
@@ -283,6 +302,11 @@ impl BoundScalarFunction {
 
     pub fn with_bind_data<T: FunctionData + 'static>(mut self, data: T) -> Self {
         self.bind_data = Some(Arc::new(data));
+        self
+    }
+
+    pub fn with_predicate_projection(mut self, projection: ScalarPredicateProjection) -> Self {
+        self.predicate_projection = Some(projection);
         self
     }
 

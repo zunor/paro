@@ -3,7 +3,7 @@
 
 use crate::codec::{nested_payload_codec, physical_layout};
 use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
-use crate::rowset::encoding::BinaryPlainPageDecoder;
+use crate::rowset::encoding::{BinaryPlainPageDecoder, BinaryPlainPageSlice};
 use bytes::Bytes;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
@@ -271,6 +271,35 @@ fn decode_storage_dictionary_batch(
     )
 }
 
+fn decode_storage_binary_plain_batch(
+    logical_type: &LogicalType,
+    batch: &BinaryPlainPageSlice,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
+) -> Result<Vector> {
+    if batch.rows() != rows {
+        return Err(paro_error::data_corrupted(
+            "BinaryPlain batch row count does not match requested rows",
+        ));
+    }
+    let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
+    let (entries, _validity, heap) = vector.begin_varlen_write(rows);
+    for row_idx in 0..rows {
+        let value = batch
+            .row_value_ref(row_idx)
+            .ok_or_else(|| paro_error::data_corrupted("BinaryPlain batch row is missing"))?;
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        let entry = heap.try_add_blob(value)?;
+        // SAFETY: begin_varlen_write returned exactly `rows` writable entries.
+        unsafe { entries.add(row_idx).write(entry) };
+    }
+    Ok(vector)
+}
+
 fn validate_storage_dictionary_selection(
     selection: SelectionVector,
     child_count: usize,
@@ -297,6 +326,20 @@ pub(crate) fn decode_column_batch(
             storage_provenance_id,
             batch.has_verified_utf8(),
         );
+    }
+
+    if let Some(storage_binary_plain) = &batch.storage_binary_plain {
+        let mut vector = decode_storage_binary_plain_batch(
+            logical_type,
+            storage_binary_plain,
+            rows,
+            allocator,
+            !batch.has_verified_utf8() && !matches!(logical_type, LogicalType::Blob),
+        )?;
+        if let Some(nulls) = batch.nulls.as_deref() {
+            apply_nulls(&mut vector, nulls, rows)?;
+        }
+        return Ok(vector);
     }
 
     let mut vector = build_vector_from_bytes_with_utf8_validation(

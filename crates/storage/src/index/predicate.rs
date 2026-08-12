@@ -83,6 +83,15 @@ pub enum Predicate {
         prefix: String,
         negated: bool,
     },
+    /// Binary VARCHAR value starts with at least one prefix.
+    ///
+    /// This is the storage form for exact rewrites such as a fixed-width
+    /// leading substring membership predicate. Prefixes are alternatives, not
+    /// a conjunction.
+    StringPrefixIn {
+        column_id: ColumnId,
+        prefixes: Vec<String>,
+    },
     /// left_column op right_column. This cannot be answered by a single-column
     /// index and is always verified against rows selected by other predicates.
     ColumnComparison {
@@ -108,7 +117,8 @@ impl Predicate {
             | Predicate::Range { column_id, .. }
             | Predicate::IsNull { column_id }
             | Predicate::IsNotNull { column_id }
-            | Predicate::StringPrefix { column_id, .. } => Some(*column_id),
+            | Predicate::StringPrefix { column_id, .. }
+            | Predicate::StringPrefixIn { column_id, .. } => Some(*column_id),
             Predicate::ColumnComparison { .. } => None,
         }
     }
@@ -149,6 +159,18 @@ impl fmt::Display for Predicate {
                 f,
                 "col#{column_id} {} PREFIX {prefix:?}",
                 if *negated { "NOT" } else { "HAS" }
+            ),
+            Predicate::StringPrefixIn {
+                column_id,
+                prefixes,
+            } => write!(
+                f,
+                "col#{column_id} HAS PREFIX IN ({})",
+                prefixes
+                    .iter()
+                    .map(|prefix| format!("{prefix:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             Predicate::ColumnComparison {
                 left_column_id,

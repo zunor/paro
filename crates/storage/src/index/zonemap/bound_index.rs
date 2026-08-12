@@ -200,6 +200,7 @@ fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPr
         Predicate::IsNotNull { .. } => Some(EncodedPredicate::IsNotNull),
         Predicate::FixedIn { .. }
         | Predicate::StringPrefix { .. }
+        | Predicate::StringPrefixIn { .. }
         | Predicate::ColumnComparison { .. } => None,
     }
 }
