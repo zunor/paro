@@ -6,4 +6,6 @@
 pub mod common;
 pub mod join_preaggregation;
 pub mod join_subsumption;
+pub mod post_reduction;
+mod semantic_kernels;
 pub mod statistics_exec;

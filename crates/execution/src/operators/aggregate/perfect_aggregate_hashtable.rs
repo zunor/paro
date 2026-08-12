@@ -14,8 +14,9 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 use paro_function::aggregate::{
-    AggregateCombineType, AggregateComparison, AggregateInputData, AggregateStateInput,
-    DirectGroupedAggregateProgram, DirectGroupedAggregateScratch, ValidatedDirectGroupSlots,
+    AggregateCombineType, AggregateComparison, AggregateFinalizeProjection, AggregateInputData,
+    AggregateStateInput, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
+    ValidatedDirectGroupSlots,
 };
 
 use super::aggregate_kernel::{
@@ -66,8 +67,24 @@ pub(crate) struct PerfectAggregateScanScratch {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PerfectAggregateStateFilter {
     pub aggregate_index: usize,
+    pub projection: AggregateFinalizeProjection,
     pub comparison: AggregateComparison,
     pub constant: Value,
+}
+
+impl PerfectAggregateStateFilter {
+    /// Whether applying this predicate before generic aggregate finalization
+    /// still validates every aggregate state in every occupied group.
+    ///
+    /// Aggregate finalizers are fallible. A direct state filter may omit a
+    /// group before the ordinary finalize-all pass, so it is correctness-safe
+    /// only when the filtered state is the complete aggregate row. This
+    /// conservative boundary can be widened later with an explicit proof that
+    /// every omitted finalizer is infallible.
+    #[inline]
+    pub(crate) fn has_complete_finalize_coverage(&self, aggregate_count: usize) -> bool {
+        aggregate_count == 1 && self.aggregate_index == 0
+    }
 }
 
 #[derive(Debug)]
@@ -87,6 +104,8 @@ struct PerfectAggregatePreselection {
 pub(crate) struct FinalizedPerfectAggregateTable {
     table: PerfectAggregateHashTable,
     preselection: Option<PerfectAggregatePreselection>,
+    #[cfg(test)]
+    post_reduction_visit_count: usize,
 }
 
 impl PerfectAggregateScanScratch {
@@ -748,6 +767,13 @@ impl PerfectAggregateHashTable {
         selection: &mut SelectionVector,
         filter: &PerfectAggregateStateFilter,
     ) -> Result<bool> {
+        if !filter.has_complete_finalize_coverage(self.aggregate_objects.len()) {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate state filter lacks complete finalize coverage: index={}, aggregates={}",
+                filter.aggregate_index,
+                self.aggregate_objects.len()
+            )));
+        }
         let object = self
             .aggregate_objects
             .get(filter.aggregate_index)
@@ -785,6 +811,7 @@ impl PerfectAggregateHashTable {
                 state_filter(
                     &states,
                     &input_data,
+                    &filter.projection,
                     filter.comparison,
                     &filter.constant,
                     selection,
@@ -1146,6 +1173,8 @@ impl FinalizedPerfectAggregateTable {
         Self {
             table,
             preselection: None,
+            #[cfg(test)]
+            post_reduction_visit_count: 0,
         }
     }
 
@@ -1154,6 +1183,13 @@ impl FinalizedPerfectAggregateTable {
         filter: PerfectAggregateStateFilter,
         slots: AccountedVec<usize>,
     ) -> Result<Self> {
+        if !filter.has_complete_finalize_coverage(table.aggregate_objects.len()) {
+            return Err(paro_error::internal(format!(
+                "perfect aggregate preselection lacks complete finalize coverage: index={}, aggregates={}",
+                filter.aggregate_index,
+                table.aggregate_objects.len()
+            )));
+        }
         let mut previous = None;
         for &slot in slots.iter() {
             if !table.occupancy.is_set(slot)? {
@@ -1171,6 +1207,8 @@ impl FinalizedPerfectAggregateTable {
         Ok(Self {
             table,
             preselection: Some(PerfectAggregatePreselection { filter, slots }),
+            #[cfg(test)]
+            post_reduction_visit_count: 0,
         })
     }
 
@@ -1186,6 +1224,41 @@ impl FinalizedPerfectAggregateTable {
                 .scan_selected_slots(position, result, scratch, &preselection.slots);
         }
         self.table.scan_with_scratch(position, result, scratch)
+    }
+
+    /// Whether the merge/seal phase validated every occupied state and
+    /// materialized the exact slot set for the post predicate.
+    #[cfg(test)]
+    pub(crate) fn has_preselection(&self) -> bool {
+        self.preselection.is_some()
+    }
+
+    /// Visit finalized values for every occupied group without applying the
+    /// emit-time preselection or advancing its cursor.
+    ///
+    /// A post-aggregate reduction is logically evaluated before the predicate
+    /// derived from it and before any independent HAVING predicate. It must
+    /// therefore observe the complete group domain even when emit can use a
+    /// state-filter preselection.
+    pub(crate) fn visit_all_finalized_aggregates(
+        &mut self,
+        scratch: &mut PerfectAggregateScanScratch,
+        mut visit: impl FnMut(&Chunk) -> Result<()>,
+    ) -> Result<()> {
+        #[cfg(test)]
+        {
+            self.post_reduction_visit_count = self.post_reduction_visit_count.saturating_add(1);
+        }
+        let mut position = PerfectHTScanPosition::default();
+        while self.table.collect_occupied_slots(
+            &mut position,
+            scratch.aggregates.capacity(),
+            &mut scratch.slots,
+        ) {
+            self.table.finalize_slots(scratch)?;
+            visit(&scratch.aggregates)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn scan_with_state_filter(
@@ -1248,6 +1321,11 @@ impl FinalizedPerfectAggregateTable {
     #[cfg(test)]
     fn preselection(&self) -> Option<&PerfectAggregatePreselection> {
         self.preselection.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn post_reduction_visit_count(&self) -> usize {
+        self.post_reduction_visit_count
     }
 }
 

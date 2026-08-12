@@ -10,6 +10,7 @@ use paro_planner::plan::LogicalPlan;
 use crate::aggregate::common::CommonAggregateOptimizer;
 use crate::aggregate::join_preaggregation;
 use crate::aggregate::join_subsumption;
+use crate::aggregate::post_reduction;
 use crate::aggregate::statistics_exec::AggregateStatisticsExecutor;
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
@@ -288,6 +289,19 @@ impl Rewriter for AggregateJoinPreaggregationPass {
 }
 
 pub struct StatisticsGatheringPass;
+
+/// Reuse a grouped aggregate to derive an alpha-equivalent scalar reduction.
+pub struct AggregatePostReductionPass;
+
+impl Rewriter for AggregatePostReductionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregatePostReduction
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(post_reduction::optimize_plan(plan, &ctx.bind_context))
+    }
+}
 
 impl Rewriter for StatisticsGatheringPass {
     fn optimizer_type(&self) -> OptimizerType {

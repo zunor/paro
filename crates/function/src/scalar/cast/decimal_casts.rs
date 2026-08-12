@@ -10,6 +10,7 @@ use paro_common::runtime_value::{format_decimal_i128, Value};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
+use crate::decimal::{cast_i128_decimal, I128DecimalPrecision, PreparedI128DecimalCast};
 use crate::scalar::executor::varlen::VarcharResultWriter;
 
 use super::{BindCastInput, BoundCastInfo, CastExecCtx};
@@ -32,59 +33,15 @@ fn pow10_i128(exp: u8) -> Result<i128> {
     Ok(value)
 }
 
-fn decimal_limit(precision: u8) -> Result<i128> {
-    if precision == 0 {
-        return Err(paro_error::invalid_input("Decimal precision must be > 0"));
-    }
-    pow10_i128(precision)
-}
-
 fn check_decimal_precision(value: i128, precision: u8) -> Result<()> {
-    let limit = decimal_limit(precision)?;
-    let abs = value
-        .checked_abs()
-        .ok_or_else(|| paro_error::out_of_range("Decimal value overflow"))?;
-    if abs >= limit {
-        return Err(paro_error::out_of_range(format!(
-            "Decimal value {} exceeds precision {}",
-            value, precision
-        )));
-    }
-    Ok(())
-}
-
-fn round_divide(value: i128, divisor: i128) -> i128 {
-    let mut quotient = value / divisor;
-    let remainder = value % divisor;
-    if remainder == 0 {
-        return quotient;
-    }
-    let rem_abs = remainder.abs();
-    if rem_abs * 2 >= divisor {
-        if value >= 0 {
-            quotient += 1;
-        } else {
-            quotient -= 1;
-        }
-    }
-    quotient
+    I128DecimalPrecision::new(precision)?.check(value)
 }
 
 fn rescale_decimal(value: i128, from_scale: u8, to_scale: u8) -> Result<i128> {
-    if from_scale == to_scale {
-        return Ok(value);
-    }
-    if to_scale > from_scale {
-        let diff = to_scale - from_scale;
-        let factor = pow10_i128(diff)?;
-        return value
-            .checked_mul(factor)
-            .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"));
-    }
-
-    let diff = from_scale - to_scale;
-    let divisor = pow10_i128(diff)?;
-    Ok(round_divide(value, divisor))
+    // Precision 38 is the complete physical DECIMAL domain, so this helper
+    // preserves the old rescale-only contract while sharing the exact cast
+    // implementation with finalized aggregate projections.
+    cast_i128_decimal(value, from_scale, DECIMAL_MAX_PRECISION, to_scale)
 }
 
 fn parse_decimal_string(s: &str) -> Result<(i128, u8)> {
@@ -383,6 +340,7 @@ pub fn decimal_to_decimal_cast(
 ) -> Result<bool> {
     let (source_precision, source_scale) = decimal_params(input.logical_type())?;
     let (target_precision, target_scale) = decimal_params(result.logical_type())?;
+    let cast = PreparedI128DecimalCast::new(source_scale, target_precision, target_scale)?;
 
     let mut all_success = true;
     result.set_count(count);
@@ -394,7 +352,7 @@ pub fn decimal_to_decimal_cast(
         }
 
         let value = decimal_value_from_vector(input, i, source_precision)?;
-        let scaled = match rescale_decimal(value, source_scale, target_scale) {
+        let scaled = match cast.cast(value) {
             Ok(v) => v,
             Err(err) => {
                 if ctx.try_cast {

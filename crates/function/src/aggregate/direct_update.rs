@@ -10,85 +10,12 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{
     AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
 };
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{DataRef, DecodedVectorRef, SelectionRef, Vector, VECTOR_SIZE};
 use smallvec::SmallVec;
 
 use super::distributive::decimal::{DecimalAverageState, DecimalNarrowState, DecimalSumState};
-use super::{
-    AggregateComparison, AggregateDirectUpdate, AggregateFunction, AggregateStateInput,
-    DecimalDirectUpdate,
-};
-
-/// Comparison compiled once for direct-address aggregate state traversal.
-///
-/// This capability is intentionally narrower than [`super::AggregateStateFilterFn`]:
-/// it admits only fixed-width states whose validation and comparison can be
-/// performed from one state address without vector materialization.
-#[derive(Debug, Clone)]
-pub struct PreparedDirectAggregateStatePredicate {
-    comparison: AggregateComparison,
-    constant: i128,
-    output_limit: i128,
-    output_precision: u8,
-}
-
-impl PreparedDirectAggregateStatePredicate {
-    pub(super) fn decimal_narrow_sum(
-        comparison: AggregateComparison,
-        constant: i128,
-        output_limit: i128,
-        output_precision: u8,
-    ) -> Self {
-        Self {
-            comparison,
-            constant,
-            output_limit,
-            output_precision,
-        }
-    }
-
-    /// Evaluate one initialized aggregate state.
-    ///
-    /// # Safety
-    ///
-    /// `state` must point to the bound fixed-width state used to prepare this
-    /// predicate and remain live for the duration of the call.
-    #[inline(always)]
-    pub unsafe fn matches(&self, state: *const u8) -> Result<bool> {
-        let state = unsafe { &*state.cast::<DecimalNarrowState>() };
-        if !state.is_set() {
-            return Ok(false);
-        }
-        if state.overflowed() {
-            return Err(paro_error::out_of_range("Decimal SUM aggregate overflow"));
-        }
-        let value = state.value();
-        if value.unsigned_abs() >= self.output_limit as u128 {
-            return Err(paro_error::out_of_range(format!(
-                "Decimal SUM result exceeds precision {}",
-                self.output_precision
-            )));
-        }
-        Ok(match self.comparison {
-            AggregateComparison::Equal => value == self.constant,
-            AggregateComparison::NotEqual => value != self.constant,
-            AggregateComparison::LessThan => value < self.constant,
-            AggregateComparison::GreaterThan => value > self.constant,
-            AggregateComparison::LessThanOrEqual => value <= self.constant,
-            AggregateComparison::GreaterThanOrEqual => value >= self.constant,
-        })
-    }
-}
-
-pub fn prepare_direct_state_predicate(
-    function: &AggregateFunction,
-    comparison: AggregateComparison,
-    constant: &Value,
-) -> Result<Option<PreparedDirectAggregateStatePredicate>> {
-    super::distributive::decimal::prepare_direct_state_predicate(function, comparison, constant)
-}
+use super::{AggregateDirectUpdate, AggregateStateInput, DecimalDirectUpdate};
 
 #[derive(Debug, Clone)]
 struct DirectDecimalInputUpdates {

@@ -486,6 +486,23 @@ fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &Aggre
                 .join(", "),
         );
     }
+    if let Some(reduction) = &spec.post_reduction {
+        push_string_property(
+            properties,
+            "Post Reduction",
+            reduction
+                .reducers
+                .iter()
+                .map(format_expr)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        push_string_property(
+            properties,
+            "Post Predicate",
+            format_expr(&reduction.predicate),
+        );
+    }
     if !spec.grouping_sets.is_empty() {
         push_string_property(
             properties,

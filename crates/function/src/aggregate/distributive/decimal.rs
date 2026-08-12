@@ -9,12 +9,13 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VectorType};
 
 use crate::aggregate::{
-    AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateFunction,
-    AggregateInputData, AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor,
-    FunctionData, PreparedDirectAggregateStatePredicate,
+    AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateFinalizeProjection,
+    AggregateFunction, AggregateInputData, AggregateStateInput, DecimalDirectUpdate,
+    DirectAggregateStateCursor, FunctionData, PreparedDirectAggregateStatePredicate,
 };
 use crate::decimal::{
-    pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128, write_decimal,
+    cast_i128_decimal, pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128,
+    write_decimal,
 };
 use crate::scalar::function_data_fingerprint;
 
@@ -454,33 +455,78 @@ pub(crate) fn bind_sum(arguments: &[LogicalType]) -> Result<(AggregateFunction, 
     bind(arguments, DecimalAggregateOp::Sum, "sum")
 }
 
+fn decimal_sum_partial_merge(source: &AggregateFunction) -> Option<AggregateFunction> {
+    let LogicalType::Decimal { precision: 38, .. } = source.return_type else {
+        return None;
+    };
+    bind_sum(std::slice::from_ref(&source.return_type))
+        .ok()
+        .map(|(function, _)| function)
+}
+
+fn decimal_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunction> {
+    let [LogicalType::Decimal { scale, .. }] = source.arguments.as_slice() else {
+        return None;
+    };
+    if source.return_type
+        != (LogicalType::Decimal {
+            precision: 38,
+            scale: *scale,
+        })
+    {
+        return None;
+    }
+    bind_sum(&source.arguments)
+        .ok()
+        .map(|(function, _)| function)
+}
+
 pub(in crate::aggregate) fn prepare_direct_state_predicate(
     function: &AggregateFunction,
+    projection: &AggregateFinalizeProjection,
     comparison: AggregateComparison,
     constant: &paro_common::runtime_value::Value,
 ) -> Result<Option<PreparedDirectAggregateStatePredicate>> {
-    if function.direct_update
-        != Some(AggregateDirectUpdate::Decimal(
-            DecimalDirectUpdate::NarrowSumI64,
-        ))
-    {
-        return Ok(None);
-    }
+    let direct_update = match function.direct_update {
+        Some(AggregateDirectUpdate::Decimal(
+            direct_update @ (DecimalDirectUpdate::NarrowSumI64 | DecimalDirectUpdate::WideSumI128),
+        )) => direct_update,
+        _ => return Ok(None),
+    };
     let data = function
         .bind_data
         .as_deref()
         .and_then(|data| data.as_any().downcast_ref::<DecimalAggregateBindData>())
         .ok_or_else(|| paro_error::internal("decimal SUM lost its bind data"))?;
-    validate_narrow_sum_bind_data(data)?;
-    let constant = sum_filter_constant(data, constant)?;
-    Ok(Some(
-        PreparedDirectAggregateStatePredicate::decimal_narrow_sum(
-            comparison,
-            constant,
-            data.output_limit,
-            data.output_precision,
-        ),
-    ))
+    let constant = projected_sum_filter_constant(data, projection, constant)?;
+    let predicate = match direct_update {
+        DecimalDirectUpdate::NarrowSumI64 => {
+            validate_narrow_sum_bind_data(data)?;
+            PreparedDirectAggregateStatePredicate::decimal_narrow_sum(
+                comparison,
+                constant,
+                projection.clone(),
+                data.output_scale,
+                data.output_limit,
+                data.output_precision,
+            )?
+        }
+        DecimalDirectUpdate::WideSumI128 => {
+            validate_wide_sum_bind_data(data)?;
+            PreparedDirectAggregateStatePredicate::decimal_wide_sum(
+                comparison,
+                constant,
+                projection.clone(),
+                data.output_scale,
+                data.input_scale,
+                data.output_scale,
+                data.output_limit,
+                data.output_precision,
+            )?
+        }
+        DecimalDirectUpdate::AverageI64 | DecimalDirectUpdate::AverageI128 => unreachable!(),
+    };
+    Ok(Some(predicate))
 }
 
 pub(crate) fn bind_min(arguments: &[LogicalType]) -> Result<(AggregateFunction, Vec<LogicalType>)> {
@@ -601,11 +647,14 @@ fn bind(
     if op == DecimalAggregateOp::Sum {
         function = function
             .with_algebra(AggregateAlgebra::Sum)
+            .with_partial_merge(decimal_sum_partial_merge)
+            .with_input_rollup(decimal_sum_input_rollup)
             .with_state_filter(if wide_sum {
                 filter_wide_sum_state
             } else {
                 filter_narrow_sum_state
-            });
+            })
+            .with_direct_state_filter(prepare_direct_state_predicate);
     }
     Ok((function, arguments.to_vec()))
 }
@@ -1106,6 +1155,7 @@ unsafe fn finalize_average(
 unsafe fn filter_narrow_sum_state(
     states: &AggregateStateInput,
     input_data: &AggregateInputData,
+    projection: &AggregateFinalizeProjection,
     comparison: AggregateComparison,
     constant: &paro_common::runtime_value::Value,
     selection: &mut paro_common::vector::SelectionVector,
@@ -1118,7 +1168,7 @@ unsafe fn filter_narrow_sum_state(
     // input scale, so the bound constant and state can be compared directly.
     // Keep the wide path below for aggregates that require rescaling and an
     // output-precision check per group.
-    let constant = sum_filter_constant(data, constant)?;
+    let constant = projected_sum_filter_constant(data, projection, constant)?;
     validate_state_filter_selection(selection, count)?;
 
     macro_rules! filter_rows {
@@ -1139,6 +1189,9 @@ unsafe fn filter_narrow_sum_state(
                 // constructed states fail closed instead of crossing the
                 // aggregate ABI with an out-of-domain result.
                 check_output_precision(value, data)?;
+                let Some(value) = project_sum_value(data, projection, value)? else {
+                    continue;
+                };
                 if $matches(value, constant) {
                     selection.try_set(selected, row)?;
                     selected += 1;
@@ -1174,6 +1227,7 @@ unsafe fn filter_narrow_sum_state(
 unsafe fn filter_wide_sum_state(
     states: &AggregateStateInput,
     input_data: &AggregateInputData,
+    projection: &AggregateFinalizeProjection,
     comparison: AggregateComparison,
     constant: &paro_common::runtime_value::Value,
     selection: &mut paro_common::vector::SelectionVector,
@@ -1181,29 +1235,41 @@ unsafe fn filter_wide_sum_state(
 ) -> Result<usize> {
     let data = bind_data(input_data);
     debug_assert_eq!((data.op, data.wide_sum), (DecimalAggregateOp::Sum, true));
-    filter_sum_values(data, comparison, constant, selection, count, |row| {
-        let state = &*(states.state_ptr(row) as *const DecimalSumState);
-        if !state.is_set() {
-            return Ok(None);
-        }
-        sum_output_value(state, data).map(Some)
-    })
+    filter_sum_values(
+        data,
+        projection,
+        comparison,
+        constant,
+        selection,
+        count,
+        |row| {
+            let state = &*(states.state_ptr(row) as *const DecimalSumState);
+            if !state.is_set() {
+                return Ok(None);
+            }
+            sum_output_value(state, data).map(Some)
+        },
+    )
 }
 
 fn filter_sum_values(
     data: &DecimalAggregateBindData,
+    projection: &AggregateFinalizeProjection,
     comparison: AggregateComparison,
     constant: &paro_common::runtime_value::Value,
     selection: &mut paro_common::vector::SelectionVector,
     count: usize,
     mut value_at: impl FnMut(usize) -> Result<Option<i128>>,
 ) -> Result<usize> {
-    let constant = sum_filter_constant(data, constant)?;
+    let constant = projected_sum_filter_constant(data, projection, constant)?;
     validate_state_filter_selection(selection, count)?;
     selection.set_len(count);
     let mut selected = 0usize;
     for row in 0..count {
         let Some(value) = value_at(row)? else {
+            continue;
+        };
+        let Some(value) = project_sum_value(data, projection, value)? else {
             continue;
         };
         let matches = match comparison {
@@ -1223,24 +1289,49 @@ fn filter_sum_values(
     Ok(selected)
 }
 
-fn sum_filter_constant(
+fn projected_sum_filter_constant(
     data: &DecimalAggregateBindData,
+    projection: &AggregateFinalizeProjection,
     constant: &paro_common::runtime_value::Value,
 ) -> Result<i128> {
-    let paro_common::runtime_value::Value::Decimal(constant, constant_precision, constant_scale) =
-        constant
-    else {
+    let (expected_precision, expected_scale) = match projection {
+        AggregateFinalizeProjection::Identity => (data.output_precision, data.output_scale),
+        AggregateFinalizeProjection::DecimalCast {
+            target_precision,
+            target_scale,
+            ..
+        } => (*target_precision, *target_scale),
+    };
+    let paro_common::runtime_value::Value::Decimal(value, precision, scale) = constant else {
         return Err(paro_error::internal(format!(
             "decimal aggregate state filter requires DECIMAL constant, got {constant:?}"
         )));
     };
-    if (*constant_precision, *constant_scale) != (data.output_precision, data.output_scale) {
+    if (*precision, *scale) != (expected_precision, expected_scale) {
         return Err(paro_error::internal(format!(
-            "decimal aggregate state-filter constant type mismatch: expected=DECIMAL({}, {}) actual=DECIMAL({constant_precision}, {constant_scale})",
-            data.output_precision, data.output_scale
+            "decimal aggregate state-filter constant type mismatch: expected=DECIMAL({expected_precision}, {expected_scale}) actual=DECIMAL({precision}, {scale})"
         )));
     }
-    Ok(*constant)
+    Ok(*value)
+}
+
+fn project_sum_value(
+    data: &DecimalAggregateBindData,
+    projection: &AggregateFinalizeProjection,
+    value: i128,
+) -> Result<Option<i128>> {
+    match projection {
+        AggregateFinalizeProjection::Identity => Ok(Some(value)),
+        AggregateFinalizeProjection::DecimalCast {
+            target_precision,
+            target_scale,
+            try_cast,
+        } => match cast_i128_decimal(value, data.output_scale, *target_precision, *target_scale) {
+            Ok(value) => Ok(Some(value)),
+            Err(_) if *try_cast => Ok(None),
+            Err(error) => Err(error),
+        },
+    }
 }
 
 fn validate_state_filter_selection(selection: &SelectionVector, count: usize) -> Result<()> {
@@ -1255,19 +1346,46 @@ fn validate_state_filter_selection(selection: &SelectionVector, count: usize) ->
 
 #[inline]
 fn sum_output_value(state: &DecimalSumState, data: &DecimalAggregateBindData) -> Result<i128> {
+    wide_sum_output_value(
+        state,
+        data.input_scale,
+        data.output_scale,
+        data.output_limit,
+        data.output_precision,
+    )?
+    .ok_or_else(|| paro_error::internal("unset Decimal SUM state cannot produce a value"))
+}
+
+/// Finalize one wide SUM state without materializing a vector. This is the
+/// single validation path shared by ordinary finalization and direct-address
+/// state predicates, so both report unset, accumulator overflow, scale
+/// overflow, and declared-precision overflow identically.
+pub(in crate::aggregate) fn wide_sum_output_value(
+    state: &DecimalSumState,
+    input_scale: u8,
+    output_scale: u8,
+    output_limit: i128,
+    output_precision: u8,
+) -> Result<Option<i128>> {
+    if !state.is_set() {
+        return Ok(None);
+    }
     if state.overflowed() {
         return Err(paro_error::out_of_range("Decimal SUM aggregate overflow"));
     }
     let value = state.try_i128().ok_or_else(|| {
         paro_error::out_of_range(format!(
-            "Decimal SUM result exceeds precision {}",
-            data.output_precision
+            "Decimal SUM result exceeds precision {output_precision}"
         ))
     })?;
-    let value = rescale_checked(value, data.input_scale, data.output_scale)
+    let value = rescale_checked(value, input_scale, output_scale)
         .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?;
-    check_output_precision(value, data)?;
-    Ok(value)
+    if value.unsigned_abs() >= output_limit as u128 {
+        return Err(paro_error::out_of_range(format!(
+            "Decimal SUM result exceeds precision {output_precision}"
+        )));
+    }
+    Ok(Some(value))
 }
 
 fn decimal_sum_requires_wide_state(input_precision: u8) -> Result<bool> {
@@ -1290,6 +1408,15 @@ fn validate_narrow_sum_bind_data(data: &DecimalAggregateBindData) -> Result<()> 
             "narrow decimal SUM requires an unchanged scale: input={}, output={}",
             data.input_scale, data.output_scale
         )));
+    }
+    Ok(())
+}
+
+fn validate_wide_sum_bind_data(data: &DecimalAggregateBindData) -> Result<()> {
+    if (data.op, data.wide_sum) != (DecimalAggregateOp::Sum, true) {
+        return Err(paro_error::internal(
+            "wide decimal SUM state filter was bound to an incompatible aggregate",
+        ));
     }
     Ok(())
 }

@@ -11,6 +11,7 @@ use paro_function::scalar::FunctionExecContext;
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateScanScratch;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateStateFilter;
+use crate::operators::aggregate::post_reduction::PostAggregateFilterLocal;
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -42,13 +43,32 @@ impl PerfectHashAggregateEmitSourceExec {
     pub(crate) fn create_local(
         &self,
         ctx: &mut PipelineInitContext,
-        _global: &SourceGlobal,
+        global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        let mut local = PerfectHashAggregateEmitSourceLocal {
-            state_filter: compile_state_filter(&self.spec)?,
-            ..Default::default()
-        };
-        if !self.spec.having_filter.is_empty() {
+        let mut local = PerfectHashAggregateEmitSourceLocal::default();
+        if let Some(post) = &self.spec.post_reduction {
+            let SourceGlobal::PerfectHashAggregateEmit(global) = global else {
+                return Err(paro_error::internal(
+                    "perfect aggregate emit source global state mismatch",
+                ));
+            };
+            let scalar_values = global.handle.post_reduction_values()?;
+            local.state_filter = compile_post_state_filter(&self.spec, scalar_values)?;
+            if local.state_filter.is_none() {
+                local.post_filter = Some(PostAggregateFilterLocal::new(
+                    post,
+                    &self.spec.having_filter,
+                    scalar_values,
+                    ctx.query,
+                )?);
+            }
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+        } else if !self.spec.having_filter.is_empty() {
+            local.state_filter = compile_state_filter(&self.spec)?;
             if self.spec.having_filter.len() != 1 {
                 return Err(paro_error::internal(
                     "aggregate HAVING lowering requires one normalized predicate",
@@ -142,6 +162,20 @@ impl PerfectHashAggregateEmitSourceExec {
             )? {
                 return Ok(SourcePoll::Output);
             }
+        } else if let (Some(filter), Some(selection)) =
+            (local.post_filter.as_mut(), local.having_selection.as_mut())
+        {
+            if table.scan_with_aggregate_filter(
+                &mut local.position,
+                output,
+                scratch,
+                selection,
+                |aggregates, count, selection| {
+                    filter.select(aggregates, count, ctx.query, selection)
+                },
+            )? {
+                return Ok(SourcePoll::Output);
+            }
         } else if let (Some(executor), Some(selection)) = (
             local.having_executor.as_mut(),
             local.having_selection.as_mut(),
@@ -172,6 +206,55 @@ impl PerfectHashAggregateEmitSourceExec {
         output.try_set_cardinality(0)?;
         Ok(SourcePoll::Finished)
     }
+}
+
+pub(crate) fn compile_post_state_filter(
+    spec: &AggregateSpec,
+    scalar_values: &[Arc<paro_common::vector::Vector>],
+) -> Result<Option<PerfectAggregateStateFilter>> {
+    if !spec.having_filter.is_empty() {
+        return Ok(None);
+    }
+    let Some(post) = &spec.post_reduction else {
+        return Ok(None);
+    };
+    let Some(plan) = post.state_filter_plan() else {
+        return Ok(None);
+    };
+    let Some(scalar_type) = post.scalar_types.get(plan.scalar_index) else {
+        return Ok(None);
+    };
+    let Some(scalar) = scalar_values.get(plan.scalar_index) else {
+        return Ok(None);
+    };
+    if scalar.len() != 1 || scalar.logical_type() != scalar_type {
+        return Ok(None);
+    }
+    let constant = scalar.get_value(0);
+    if constant.is_null() {
+        return Ok(None);
+    }
+    let Some(paro_planner::expression::Expression::Aggregate(aggregate)) =
+        spec.aggregates.get(plan.aggregate_index)
+    else {
+        return Ok(None);
+    };
+    if aggregate.function.state_filter.is_none()
+        || post.aggregate_types.get(plan.aggregate_index) != Some(&aggregate.return_type)
+        || constant.logical_type() != *scalar_type
+    {
+        return Ok(None);
+    }
+    let filter = PerfectAggregateStateFilter {
+        aggregate_index: plan.aggregate_index,
+        projection: plan.projection,
+        comparison: plan.comparison,
+        constant,
+    };
+    if !filter.has_complete_finalize_coverage(spec.aggregates.len()) {
+        return Ok(None);
+    }
+    Ok(Some(filter))
 }
 
 pub(crate) fn compile_state_filter(
@@ -227,11 +310,16 @@ pub(crate) fn compile_state_filter(
     let Some(comparison) = map_comparison(comparison_type) else {
         return Ok(None);
     };
-    Ok(Some(PerfectAggregateStateFilter {
+    let filter = PerfectAggregateStateFilter {
         aggregate_index: reference.index,
+        projection: paro_function::aggregate::AggregateFinalizeProjection::Identity,
         comparison,
         constant,
-    }))
+    };
+    if !filter.has_complete_finalize_coverage(spec.aggregates.len()) {
+        return Ok(None);
+    }
+    Ok(Some(filter))
 }
 
 fn state_filter_types_match(

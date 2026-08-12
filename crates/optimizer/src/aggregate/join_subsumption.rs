@@ -85,7 +85,10 @@ struct AggregateJoinSubsumption;
 
 impl AggregateJoinSubsumption {
     fn outer_sum(aggregate: &Aggregate) -> Option<OuterSum> {
-        if aggregate.aggregates.len() != 1 || !aggregate.grouping_functions.is_empty() {
+        if aggregate.post_reduction.is_some()
+            || aggregate.aggregates.len() != 1
+            || !aggregate.grouping_functions.is_empty()
+        {
             return None;
         }
         let Expression::Aggregate(sum) = &aggregate.aggregates[0] else {
@@ -679,7 +682,7 @@ mod tests {
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
     use paro_planner::operator::{
         Aggregate, ColumnBinding, ExpressionGet, Get, Join, JoinCondition, JoinType,
-        LogicalOperator, Projection,
+        LogicalOperator, PostAggregateReduction, Projection,
     };
     use paro_planner::plan::LogicalPlan;
     use paro_storage::table::table_factory::TableFactory;
@@ -898,5 +901,30 @@ mod tests {
             .left
             .get_column_bindings()
             .contains(&ColumnBinding::new(REDUCTION_PROJECTION, 1)));
+    }
+
+    #[test]
+    fn annotated_outer_aggregate_is_not_subsumed() {
+        let table = detail_table(70_005);
+        let mut plan = q18_shape(table.clone(), table);
+        let LogicalOperator::Aggregate(outer) = &mut plan.operator else {
+            panic!("outer aggregate");
+        };
+        outer.post_reduction = Some(PostAggregateReduction {
+            reduction_index: 99,
+            reducers: vec![sum(column(OUTER_AGGREGATE, 0, decimal(38)))],
+            scalar_expressions: vec![column(99, 0, decimal(38))],
+            predicate: column(99, 0, decimal(38)),
+        });
+
+        let optimized = optimize_plan(plan);
+        let LogicalOperator::Aggregate(outer) = &optimized.operator else {
+            panic!("outer aggregate");
+        };
+        let Expression::Aggregate(sum) = &outer.aggregates[0] else {
+            panic!("outer sum");
+        };
+        assert_eq!(sum.function.arguments, [decimal(15)]);
+        assert!(outer.post_reduction.is_some());
     }
 }

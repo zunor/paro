@@ -1,6 +1,5 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
-
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
@@ -922,6 +921,7 @@ mod tests {
             aggregate_inputs: Box::new([]),
             aggregate_filters: Box::new([]),
             aggregate_orders: Box::new([]),
+            post_reduction: None,
             having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),

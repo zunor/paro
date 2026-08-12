@@ -317,6 +317,21 @@ impl CostModel {
         self.cardinality_from_selectivity(base_cardinality, selectivity, false)
     }
 
+    pub(crate) fn apply_selectivity_to_cardinality(
+        &self,
+        base: CardinalityEstimate,
+        selectivity: f64,
+    ) -> CardinalityEstimate {
+        let min = self.cardinality_from_selectivity(base.min, selectivity, false);
+        let expected = self.cardinality_from_selectivity(base.expected, selectivity, false);
+        let max = self.cardinality_from_selectivity(base.max, selectivity, false);
+        CardinalityEstimate {
+            min: min.min,
+            expected: expected.expected,
+            max: max.max.max(expected.expected),
+        }
+    }
+
     fn cardinality_from_selectivity(
         &self,
         base_cardinality: u64,

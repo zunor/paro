@@ -31,6 +31,8 @@ pub enum OptimizerType {
     AggregateJoinSubsumption,
     /// Pre-aggregates multiplicative nullable join sides by their join key.
     AggregateJoinPreaggregation,
+    /// Derives scalar reductions from finalized alpha-equivalent grouped aggregates.
+    AggregatePostReduction,
     /// Eliminates redundant joins introduced by `DelimGet`.
     DelimJoinElimination,
     /// Rewrites UNNEST operations.
@@ -93,7 +95,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 40] = [
+    pub const ALL: [OptimizerType; 41] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -104,6 +106,7 @@ impl OptimizerType {
         OptimizerType::JoinOrder,
         OptimizerType::AggregateJoinSubsumption,
         OptimizerType::AggregateJoinPreaggregation,
+        OptimizerType::AggregatePostReduction,
         OptimizerType::DelimJoinElimination,
         OptimizerType::UnnestRewriter,
         OptimizerType::UnusedColumns,
@@ -152,6 +155,7 @@ impl OptimizerType {
             OptimizerType::JoinOrder => "join_order",
             OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
             OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
+            OptimizerType::AggregatePostReduction => "aggregate_post_reduction",
             OptimizerType::DelimJoinElimination => "delim_join_elimination",
             OptimizerType::UnnestRewriter => "unnest_rewriter",
             OptimizerType::UnusedColumns => "unused_columns",
@@ -207,6 +211,7 @@ impl FromStr for OptimizerType {
             "join_order" => Ok(OptimizerType::JoinOrder),
             "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
             "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
+            "aggregate_post_reduction" => Ok(OptimizerType::AggregatePostReduction),
             "delim_join_elimination" => Ok(OptimizerType::DelimJoinElimination),
             "unnest_rewriter" => Ok(OptimizerType::UnnestRewriter),
             "unused_columns" => Ok(OptimizerType::UnusedColumns),

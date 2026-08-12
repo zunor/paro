@@ -28,6 +28,36 @@ fn initialized_average_state() -> DecimalAverageState {
     }
 }
 
+fn execute_single(function: &AggregateFunction, input: &Vector) -> Result<Vector> {
+    let mut storage = vec![0_u64; function.state_size.div_ceil(std::mem::size_of::<u64>())];
+    let state_ptr = storage.as_mut_ptr().cast::<u8>();
+    let mut arena = ArenaAllocator::new(Arc::new(default_allocator()));
+    unsafe {
+        (function.initialize)(state_ptr);
+        let input_data = AggregateInputData::new(
+            function.bind_data.as_deref(),
+            &mut arena,
+            crate::aggregate::AggregateCombineType::PreserveInput,
+        );
+        function.simple_update.unwrap()(&[input], &input_data, state_ptr, input.len());
+    }
+
+    let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
+    states.set_count(1);
+    unsafe { *states.flat_data_mut::<*mut u8>() = state_ptr };
+    let mut result = paro_common::test_utils::test_vector(function.return_type.clone());
+    result.set_count(1);
+    unsafe {
+        let input_data = AggregateInputData::new(
+            function.bind_data.as_deref(),
+            &mut arena,
+            crate::aggregate::AggregateCombineType::PreserveInput,
+        );
+        (function.finalize)(&states, &input_data, &mut result, 1)?;
+    }
+    Ok(result)
+}
+
 #[test]
 fn narrow_decimal_state_keeps_lifecycle_in_band() {
     assert_eq!(std::mem::size_of::<DecimalNarrowState>(), 16);
@@ -445,6 +475,262 @@ fn decimal_sum_is_exact_across_i128_intermediate_overflow() {
 }
 
 #[test]
+fn finalized_decimal_sum_partials_use_wide_closed_accumulator() {
+    let input_type = LogicalType::Decimal {
+        precision: 18,
+        scale: 2,
+    };
+    let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+    assert_eq!(sum.state_size, std::mem::size_of::<DecimalNarrowState>());
+
+    let merge = sum.partial_merge_function().unwrap();
+    let result_type = LogicalType::Decimal {
+        precision: 38,
+        scale: 2,
+    };
+    assert_eq!(merge.arguments, vec![result_type.clone()]);
+    assert_eq!(merge.return_type, result_type.clone());
+    assert_eq!(merge.state_size, std::mem::size_of::<DecimalSumState>());
+
+    let maximum = 10_i128.pow(38) - 1;
+    let mut partials = paro_common::test_utils::test_vector(result_type);
+    partials.set_count(4);
+    partials.set_i128(0, maximum);
+    partials.set_i128(1, maximum);
+    partials.set_i128(2, -maximum);
+    partials.set_i128(3, 0);
+    partials.set_null(3, true);
+
+    let result = execute_single(&merge, &partials).unwrap();
+    assert_eq!(result.get_i128(0), Some(maximum));
+}
+
+#[test]
+fn finalized_decimal_sum_partials_preserve_precision_overflow() {
+    let input_type = LogicalType::Decimal {
+        precision: 18,
+        scale: 0,
+    };
+    let (sum, _) = bind_sum(&[input_type]).unwrap();
+    let merge = sum.partial_merge_function().unwrap();
+    let mut partials = paro_common::test_utils::test_vector(merge.return_type.clone());
+    partials.set_count(2);
+    partials.set_i128(0, 10_i128.pow(38) - 1);
+    partials.set_i128(1, 1);
+
+    let error = execute_single(&merge, &partials).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Decimal SUM result exceeds precision 38"));
+}
+
+#[test]
+fn decimal_sum_exposes_canonical_exact_input_rollup() {
+    for input_type in [
+        LogicalType::Decimal {
+            precision: 18,
+            scale: 2,
+        },
+        LogicalType::Decimal {
+            precision: 38,
+            scale: 6,
+        },
+    ] {
+        let (sum, _) = bind_sum(std::slice::from_ref(&input_type)).unwrap();
+        let rollup = sum.input_rollup_function().unwrap();
+        assert!(sum.execution_semantics_equal(&rollup));
+
+        let reducer = sum.partial_merge_function().unwrap();
+        let reducer_rollup = reducer.input_rollup_function().unwrap();
+        assert!(reducer.execution_semantics_equal(&reducer_rollup));
+    }
+}
+
+#[test]
+fn prepared_wide_decimal_sum_predicate_preserves_finalize_validation() {
+    let input_type = LogicalType::Decimal {
+        precision: 38,
+        scale: 2,
+    };
+    let (sum, _) = bind_sum(&[input_type]).unwrap();
+    assert_eq!(
+        sum.direct_update,
+        Some(AggregateDirectUpdate::Decimal(
+            DecimalDirectUpdate::WideSumI128
+        ))
+    );
+    let predicate = prepare_direct_state_predicate(
+        &sum,
+        &crate::aggregate::AggregateFinalizeProjection::Identity,
+        AggregateComparison::GreaterThan,
+        &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut unset = initialized_sum_state();
+    let mut below = initialized_sum_state();
+    below.add_i128(29_900);
+    let mut above = initialized_sum_state();
+    above.add_i128(30_100);
+    assert!(!unsafe { predicate.matches(std::ptr::from_mut(&mut unset).cast()) }.unwrap());
+    assert!(!unsafe { predicate.matches(std::ptr::from_mut(&mut below).cast()) }.unwrap());
+    assert!(unsafe { predicate.matches(std::ptr::from_mut(&mut above).cast()) }.unwrap());
+
+    let mut precision_overflow = initialized_sum_state();
+    precision_overflow.add_i128(10_i128.pow(38));
+    let error = unsafe { predicate.matches(std::ptr::from_mut(&mut precision_overflow).cast()) }
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Decimal SUM result exceeds precision 38"));
+
+    let mut accumulator_overflow = initialized_sum_state();
+    accumulator_overflow.value_words = DecimalSumState::OVERFLOWED;
+    let error = unsafe { predicate.matches(std::ptr::from_mut(&mut accumulator_overflow).cast()) }
+        .unwrap_err();
+    assert!(error.to_string().contains("Decimal SUM aggregate overflow"));
+}
+
+#[test]
+fn prepared_decimal_sum_predicate_applies_bound_cast_scale_and_try_semantics() {
+    use crate::aggregate::AggregateFinalizeProjection;
+
+    let (sum, _) = bind_sum(&[LogicalType::Decimal {
+        precision: 38,
+        scale: 2,
+    }])
+    .unwrap();
+    let scale_up = AggregateFinalizeProjection::DecimalCast {
+        target_precision: 38,
+        target_scale: 12,
+        try_cast: false,
+    };
+    let predicate = prepare_direct_state_predicate(
+        &sum,
+        &scale_up,
+        AggregateComparison::GreaterThan,
+        &paro_common::runtime_value::Value::Decimal(30_000_000_000_000, 38, 12),
+    )
+    .unwrap()
+    .unwrap();
+    let mut above = initialized_sum_state();
+    above.add_i128(30_001);
+    assert!(unsafe { predicate.matches(std::ptr::from_mut(&mut above).cast()) }.unwrap());
+
+    let narrow_cast = AggregateFinalizeProjection::DecimalCast {
+        target_precision: 3,
+        target_scale: 2,
+        try_cast: false,
+    };
+    let predicate = prepare_direct_state_predicate(
+        &sum,
+        &narrow_cast,
+        AggregateComparison::GreaterThan,
+        &paro_common::runtime_value::Value::Decimal(0, 3, 2),
+    )
+    .unwrap()
+    .unwrap();
+    let mut cast_overflow = initialized_sum_state();
+    cast_overflow.add_i128(1_000);
+    assert!(unsafe { predicate.matches(std::ptr::from_mut(&mut cast_overflow).cast()) }.is_err());
+
+    let try_cast = AggregateFinalizeProjection::DecimalCast {
+        target_precision: 3,
+        target_scale: 2,
+        try_cast: true,
+    };
+    let predicate = prepare_direct_state_predicate(
+        &sum,
+        &try_cast,
+        AggregateComparison::GreaterThan,
+        &paro_common::runtime_value::Value::Decimal(0, 3, 2),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(!unsafe { predicate.matches(std::ptr::from_mut(&mut cast_overflow).cast()) }.unwrap());
+
+    // TRY_CAST only nullifies an error in the projection. The source SUM must
+    // still observe its own precision/finalize contract first.
+    let mut source_overflow = initialized_sum_state();
+    source_overflow.add_i128(10_i128.pow(38));
+    let error =
+        unsafe { predicate.matches(std::ptr::from_mut(&mut source_overflow).cast()) }.unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("Decimal SUM result exceeds precision 38"));
+
+    let scale_down = AggregateFinalizeProjection::DecimalCast {
+        target_precision: 37,
+        target_scale: 1,
+        try_cast: false,
+    };
+    let positive = prepare_direct_state_predicate(
+        &sum,
+        &scale_down,
+        AggregateComparison::Equal,
+        &paro_common::runtime_value::Value::Decimal(13, 37, 1),
+    )
+    .unwrap()
+    .unwrap();
+    let negative = prepare_direct_state_predicate(
+        &sum,
+        &scale_down,
+        AggregateComparison::Equal,
+        &paro_common::runtime_value::Value::Decimal(-13, 37, 1),
+    )
+    .unwrap()
+    .unwrap();
+    let mut positive_half = initialized_sum_state();
+    positive_half.add_i128(125);
+    let mut negative_half = initialized_sum_state();
+    negative_half.add_i128(-125);
+    assert!(unsafe { positive.matches(std::ptr::from_mut(&mut positive_half).cast()) }.unwrap());
+    assert!(unsafe { negative.matches(std::ptr::from_mut(&mut negative_half).cast()) }.unwrap());
+}
+
+#[test]
+fn prepared_narrow_decimal_sum_predicate_remains_direct() {
+    let (sum, _) = bind_sum(&[LogicalType::Decimal {
+        precision: 18,
+        scale: 2,
+    }])
+    .unwrap();
+    let predicate = prepare_direct_state_predicate(
+        &sum,
+        &crate::aggregate::AggregateFinalizeProjection::Identity,
+        AggregateComparison::LessThanOrEqual,
+        &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
+    )
+    .unwrap()
+    .unwrap();
+
+    let mut equal = initialized_narrow_state();
+    equal.set_value(30_000);
+    let mut above = initialized_narrow_state();
+    above.set_value(30_001);
+    assert!(unsafe { predicate.matches(std::ptr::from_mut(&mut equal).cast()) }.unwrap());
+    assert!(!unsafe { predicate.matches(std::ptr::from_mut(&mut above).cast()) }.unwrap());
+}
+
+#[test]
+fn wide_decimal_sum_direct_output_rescales_before_comparison() {
+    let mut state = initialized_sum_state();
+    state.add_i128(123);
+    assert_eq!(
+        wide_sum_output_value(&state, 1, 3, 10_i128.pow(38), 38).unwrap(),
+        Some(12_300)
+    );
+
+    // Rescaling is part of the same fallible finalize contract used by the
+    // direct predicate, rather than an unchecked comparison-only shortcut.
+    let mut state = initialized_sum_state();
+    state.add_i128(10_i128.pow(37));
+    let error = wide_sum_output_value(&state, 0, 2, 10_i128.pow(38), 38).unwrap_err();
+    assert!(error.to_string().contains("Decimal scale overflow"));
+}
+
+#[test]
 fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
     let data = DecimalAggregateBindData {
         op: DecimalAggregateOp::Sum,
@@ -487,6 +773,7 @@ fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
         filter_narrow_sum_state(
             &state_input,
             &input_data,
+            &crate::aggregate::AggregateFinalizeProjection::Identity,
             AggregateComparison::GreaterThan,
             &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
             &mut selection,
@@ -501,6 +788,7 @@ fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
         filter_narrow_sum_state(
             &state_input,
             &input_data,
+            &crate::aggregate::AggregateFinalizeProjection::Identity,
             AggregateComparison::GreaterThan,
             &paro_common::runtime_value::Value::Decimal(300_000, 38, 3),
             &mut selection,
@@ -515,6 +803,7 @@ fn decimal_sum_state_filter_preserves_null_and_precision_semantics() {
         filter_narrow_sum_state(
             &state_input,
             &input_data,
+            &crate::aggregate::AggregateFinalizeProjection::Identity,
             AggregateComparison::GreaterThan,
             &paro_common::runtime_value::Value::Decimal(30_000, 38, 2),
             &mut selection,

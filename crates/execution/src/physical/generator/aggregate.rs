@@ -10,6 +10,7 @@ use crate::operators::aggregate::tuple_layout::TupleLayout;
 use crate::physical::specs::GroupKeyEncoding;
 use paro_function::aggregate::distributive::first_last::get_first_function;
 use paro_function::aggregate::AggregateFunction;
+use paro_function::scalar::function_data_equals;
 use paro_planner::operator::DistinctType;
 use paro_storage::statistics::{NumericStats, StringStats};
 
@@ -74,6 +75,10 @@ fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupL
     if aggregate.groups.len() < 2
         || !aggregate.grouping_functions.is_empty()
         || !plain_grouping_set(aggregate)
+        // Post-reduction positional domains address the SQL aggregate list.
+        // Do not append hidden dependent-group states until that representation
+        // carries an explicit source/output map for the reduction runtime.
+        || aggregate.post_reduction.is_some()
     {
         return None;
     }
@@ -470,6 +475,7 @@ impl PhysicalPlanGenerator {
             aggregate_inputs: aggregate_inputs.into_boxed_slice(),
             aggregate_filters: aggregate_filters.into_boxed_slice(),
             aggregate_orders: aggregate_orders.into_boxed_slice(),
+            post_reduction: lower_post_aggregate_reduction(aggregate)?,
             having_filter,
             perfect_hash,
             output_names: aggregate
@@ -491,6 +497,8 @@ impl PhysicalPlanGenerator {
                 None => spec.perfect_hash = None,
             }
         }
+        finalize_post_aggregate_strategy(&mut spec);
+        spec.verify_post_reduction()?;
         Ok((PhysicalNodeKind::Aggregate(spec), vec![child]))
     }
 
@@ -544,12 +552,198 @@ impl PhysicalPlanGenerator {
             aggregate_inputs: Box::new([]),
             aggregate_filters: Box::new([]),
             aggregate_orders: Box::new([]),
+            post_reduction: None,
             having_filter: Box::new([]),
             perfect_hash: None,
             output_names: child_names.into_boxed_slice(),
             output_types: child_types.into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Aggregate(spec), vec![child]))
+    }
+}
+
+fn lower_post_aggregate_reduction(
+    aggregate: &LogicalAggregate,
+) -> Result<Option<PostAggregateReductionSpec>> {
+    aggregate.verify_post_reduction()?;
+    let Some(reduction) = &aggregate.post_reduction else {
+        return Ok(None);
+    };
+
+    let mut reducers = reduction.reducers.clone();
+    for (reducer_idx, reducer) in reducers.iter_mut().enumerate() {
+        let Expression::Aggregate(reducer) = reducer else {
+            return Err(paro_error::internal(format!(
+                "validated post-aggregate reducer {reducer_idx} lost its aggregate root"
+            )));
+        };
+        for (child_idx, child) in reducer.children.iter_mut().enumerate() {
+            let Expression::ColumnRef(column) = child else {
+                return Err(paro_error::internal(format!(
+                    "validated post-aggregate reducer {reducer_idx} argument {child_idx} lost its aggregate binding"
+                )));
+            };
+            if column.depth != 0
+                || column.binding.table_index != aggregate.aggregate_index
+                || column.binding.column_index >= aggregate.aggregates.len()
+            {
+                return Err(paro_error::internal(format!(
+                    "post-aggregate reducer {reducer_idx} argument {child_idx} cannot be lowered to the aggregate-only value domain"
+                )));
+            }
+            *child = Expression::Reference(ReferenceExpression::new(
+                column.binding.column_index,
+                column.return_type.clone(),
+            ));
+        }
+    }
+    let reducer_types = reducers
+        .iter()
+        .map(Expression::return_type)
+        .collect::<Vec<_>>();
+    // The current perfect-table seal proves finalize semantics through the
+    // same direct predicate that filters its sole aggregate state. With more
+    // aggregate columns, a rejected row could otherwise hide a finalize-time
+    // error in an unrelated state. Keep rollup admission single-state until
+    // the aggregate ABI exposes complete per-row finalize validation.
+    let input_rollup_sources = (aggregate.aggregates.len() == 1 && reducers.len() == 1)
+        .then(|| {
+            reducers
+                .iter()
+                .map(|reducer| {
+                    let Expression::Aggregate(reducer) = reducer else {
+                        return None;
+                    };
+                    let [Expression::Reference(reference)] = reducer.children.as_slice() else {
+                        return None;
+                    };
+                    let Expression::Aggregate(source) =
+                        aggregate.aggregates.get(reference.index)?
+                    else {
+                        return None;
+                    };
+                    if source.is_distinct()
+                        || source.filter.is_some()
+                        || !source.order_bys.is_empty()
+                        || source.function.destructor.is_some()
+                        || !source.function.state_is_trivially_copyable()
+                        || source.return_type != reducer.return_type
+                        || reference.return_type != source.return_type
+                    {
+                        return None;
+                    }
+                    let expected_source = source.function.input_rollup_function()?;
+                    let expected_reducer = source.function.partial_merge_function()?;
+                    (expected_source.execution_semantics_equal(&source.function)
+                        && expected_reducer.execution_semantics_equal(&reducer.function)
+                        && function_data_equals(
+                            source.bind_info.as_ref(),
+                            source.function.bind_data.as_ref(),
+                        )
+                        && function_data_equals(
+                            reducer.bind_info.as_ref(),
+                            reducer.function.bind_data.as_ref(),
+                        ))
+                    .then_some(reference.index)
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .flatten()
+        .map(Vec::into_boxed_slice);
+    let scalar_expressions = reduction.scalar_expressions.clone();
+    let scalar_types = scalar_expressions
+        .iter()
+        .map(Expression::return_type)
+        .collect::<Vec<_>>();
+    let mut predicate = reduction.predicate.clone();
+    rebase_post_reduction_predicate(
+        &mut predicate,
+        aggregate.aggregate_index,
+        reduction.reduction_index,
+        aggregate.aggregates.len(),
+        scalar_types.len(),
+    )?;
+
+    Ok(Some(PostAggregateReductionSpec {
+        aggregate_types: aggregate
+            .aggregates
+            .iter()
+            .map(Expression::return_type)
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+        reducers: reducers.into_boxed_slice(),
+        reducer_types: reducer_types.into_boxed_slice(),
+        scalar_expressions: scalar_expressions.into_boxed_slice(),
+        scalar_types: scalar_types.into_boxed_slice(),
+        predicate,
+        input_rollup_sources,
+    }))
+}
+
+fn rebase_post_reduction_predicate(
+    expression: &mut Expression,
+    aggregate_index: usize,
+    reduction_index: usize,
+    aggregate_count: usize,
+    scalar_count: usize,
+) -> Result<()> {
+    match expression {
+        Expression::ColumnRef(column) => {
+            if column.depth != 0 {
+                return Err(paro_error::internal(
+                    "post-aggregate reduction predicate retained a correlated column",
+                ));
+            }
+            let index = if column.binding.table_index == aggregate_index {
+                if column.binding.column_index >= aggregate_count {
+                    return Err(paro_error::internal(
+                        "post-aggregate reduction predicate aggregate reference is out of bounds",
+                    ));
+                }
+                column.binding.column_index
+            } else if column.binding.table_index == reduction_index {
+                if column.binding.column_index >= scalar_count {
+                    return Err(paro_error::internal(
+                        "post-aggregate reduction predicate scalar reference is out of bounds",
+                    ));
+                }
+                aggregate_count
+                    .checked_add(column.binding.column_index)
+                    .ok_or_else(|| {
+                        paro_error::internal(
+                            "post-aggregate reduction predicate reference index overflow",
+                        )
+                    })?
+            } else {
+                return Err(paro_error::internal(
+                    "post-aggregate reduction predicate retained an unavailable binding",
+                ));
+            };
+            *expression =
+                Expression::Reference(ReferenceExpression::new(index, column.return_type.clone()));
+            Ok(())
+        }
+        Expression::Reference(_)
+        | Expression::Aggregate(_)
+        | Expression::Subquery(_)
+        | Expression::Window(_) => Err(paro_error::internal(
+            "post-aggregate reduction predicate retained an invalid expression domain",
+        )),
+        _ => {
+            let mut result = Ok(());
+            ExpressionIterator::enumerate_children_mut(expression, |child| {
+                if result.is_ok() {
+                    result = rebase_post_reduction_predicate(
+                        child,
+                        aggregate_index,
+                        reduction_index,
+                        aggregate_count,
+                        scalar_count,
+                    );
+                }
+            });
+            result
+        }
     }
 }
 
@@ -592,4 +786,104 @@ fn perfect_hash_max_local_tables(
     let table_budget = max_memory / PERFECT_HASH_MEMORY_BUDGET_DIVISOR;
     let admitted_tables = table_budget / bytes_per_table;
     (admitted_tables > 0).then_some(admitted_tables.min(parallelism.max(1)))
+}
+
+/// Resolve a proof-level input-rollup candidate into a concrete execution
+/// strategy only after the complete aggregate representation and memory
+/// admission are known. Unsupported shapes retain the preserving finalized-
+/// group traversal rather than making physical specialization a query
+/// correctness requirement.
+fn finalize_post_aggregate_strategy(spec: &mut AggregateSpec) {
+    let candidate = spec
+        .post_reduction
+        .as_ref()
+        .is_some_and(|post| post.input_rollup_sources.is_some());
+    if candidate && !can_execute_post_input_rollup(spec) {
+        spec.post_reduction
+            .as_mut()
+            .expect("input-rollup candidate requires post reduction")
+            .input_rollup_sources = None;
+    }
+}
+
+fn can_execute_post_input_rollup(spec: &AggregateSpec) -> bool {
+    let Some(post) = &spec.post_reduction else {
+        return false;
+    };
+    let Some(sources) = post.input_rollup_sources.as_deref() else {
+        return false;
+    };
+    let Some(perfect) = &spec.perfect_hash else {
+        return false;
+    };
+    if perfect.max_local_tables <= 1
+        || !spec.having_filter.is_empty()
+        || !spec.has_plain_grouping_domain()
+        || spec.aggregates.len() != 1
+        || post.reducers.len() != 1
+        || sources != [0]
+    {
+        return false;
+    }
+    let Some(state_filter) = post.state_filter_plan() else {
+        return false;
+    };
+    if state_filter.aggregate_index != 0 {
+        return false;
+    }
+    let Some(Expression::Aggregate(source)) = spec.aggregates.first() else {
+        return false;
+    };
+    if source.is_distinct()
+        || source.filter.is_some()
+        || !source.order_bys.is_empty()
+        || spec.aggregate_filters.first() != Some(&None)
+        || !spec
+            .aggregate_orders
+            .first()
+            .is_some_and(|orders| orders.is_empty())
+        || source.function.destructor.is_some()
+        || !source.function.state_is_trivially_copyable()
+        || source.function.simple_update.is_none()
+        || source.function.state_filter.is_none()
+        || source.function.direct_state_filter.is_none()
+        || source.function.direct_update.is_none()
+    {
+        return false;
+    }
+    let Some(inputs) = spec.aggregate_inputs.first() else {
+        return false;
+    };
+    if inputs.len() != source.function.arguments.len() {
+        return false;
+    }
+    if !inputs.iter().enumerate().all(|(argument_idx, &input)| {
+        let Some(expected) = source.function.arguments.get(argument_idx) else {
+            return false;
+        };
+        spec.payload_types.get(input) == Some(expected)
+            && matches!(
+                source.children.get(argument_idx),
+                Some(Expression::Reference(reference))
+                    if reference.index == input && &reference.return_type == expected
+            )
+    }) {
+        return false;
+    }
+    let Ok(objects) = aggregate_objects(spec) else {
+        return false;
+    };
+    let Ok(layout) = AggregateStateLayout::new(&objects) else {
+        return false;
+    };
+    let program = compile_direct_update_program(
+        &objects,
+        &spec
+            .aggregate_inputs
+            .iter()
+            .map(|inputs| inputs.to_vec())
+            .collect::<Vec<_>>(),
+        &layout,
+    );
+    program.supports_direct_combine() && program.supports_trivial_state_copy()
 }

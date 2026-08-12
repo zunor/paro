@@ -319,9 +319,13 @@ impl LogicalPlanDeepCopy {
                 let mut group_index = a.group_index;
                 let mut aggregate_index = a.aggregate_index;
                 let mut groupings_index = a.groupings_index;
+                let mut post_reduction = a.post_reduction.clone();
                 self.remap_table_index(bind_shared, &mut group_index);
                 self.remap_table_index(bind_shared, &mut aggregate_index);
                 self.remap_table_index(bind_shared, &mut groupings_index);
+                if let Some(reduction) = &mut post_reduction {
+                    self.remap_table_index(bind_shared, &mut reduction.reduction_index);
+                }
                 LogicalOperator::Aggregate(AggNode {
                     group_index,
                     aggregate_index,
@@ -330,6 +334,7 @@ impl LogicalPlanDeepCopy {
                     groups: a.groups.clone(),
                     grouping_sets: a.grouping_sets.clone(),
                     aggregates: a.aggregates.clone(),
+                    post_reduction,
                     group_stats: a.group_stats.clone(),
                     group_dependencies: a.group_dependencies.clone(),
                     returned_types: a.returned_types.clone(),
@@ -809,9 +814,17 @@ mod tests {
     use super::{deep_copy_plan, duplicate_plan_preserving_indices};
     use crate::binder::context::BindContext;
     use crate::binder::ir::CTEMaterialize;
-    use crate::expression::{ColumnRefExpression, Expression};
-    use crate::operator::{CTERef, ExpressionGet, LogicalOperator, MaterializedCTE, Projection};
+    use crate::expression::{
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
+        ReferenceExpression,
+    };
+    use crate::operator::{
+        Aggregate, CTERef, ColumnBinding, ExpressionGet, LogicalOperator, MaterializedCTE,
+        PostAggregateReduction, Projection,
+    };
     use crate::plan::{CardinalityEstimate, LogicalPlan, NodeStats, PlanNodeId};
+    use paro_function::aggregate::distributive::count::get_count_star_function;
+    use paro_function::aggregate::distributive::minmax::get_max_function;
 
     fn expression_get(table_index: usize) -> LogicalOperator {
         LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -941,5 +954,89 @@ mod tests {
         };
         assert_eq!(copy.table_index, 11);
         assert_eq!(copy_child.table_index, 7);
+    }
+
+    #[test]
+    fn deep_copy_remaps_hidden_post_reduction_binding_and_sources() {
+        let bind_context = BindContext::new();
+        let count = Expression::Aggregate(AggregateExpression::new(
+            get_count_star_function(),
+            Vec::new(),
+            LogicalType::BigInt,
+        ));
+        let (max, _) = get_max_function()
+            .bind(&[LogicalType::BigInt])
+            .expect("bind max(bigint)");
+        let reducer = Expression::Aggregate(AggregateExpression::new(
+            max,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 0),
+                LogicalType::BigInt,
+            ))],
+            LogicalType::BigInt,
+        ));
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 0),
+                LogicalType::BigInt,
+            )),
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(14, 0),
+                LogicalType::BigInt,
+            )),
+        ));
+        let aggregate = Aggregate::new(
+            11,
+            12,
+            13,
+            LogicalPlan::new(&bind_context, expression_get(7)),
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(7, 0),
+                LogicalType::Integer,
+            ))],
+            Vec::new(),
+            vec![count],
+            Vec::new(),
+        )
+        .with_post_reduction(PostAggregateReduction {
+            reduction_index: 14,
+            reducers: vec![reducer],
+            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::BigInt,
+            ))],
+            predicate,
+        });
+        let original = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+
+        let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
+        let LogicalOperator::Aggregate(copy) = copy.operator else {
+            panic!("expected aggregate");
+        };
+        let reduction = copy.post_reduction.as_ref().expect("reduction");
+        assert_ne!(copy.aggregate_index, 12);
+        assert_ne!(reduction.reduction_index, 14);
+        let Expression::Aggregate(reducer) = &reduction.reducers[0] else {
+            panic!("expected reducer");
+        };
+        let Expression::ColumnRef(reducer_source) = &reducer.children[0] else {
+            panic!("expected reducer source");
+        };
+        assert_eq!(reducer_source.binding.table_index, copy.aggregate_index);
+        let Expression::Comparison(predicate) = &reduction.predicate else {
+            panic!("expected predicate");
+        };
+        assert!(matches!(
+            predicate.left.as_ref(),
+            Expression::ColumnRef(column) if column.binding.table_index == copy.aggregate_index
+        ));
+        assert!(matches!(
+            predicate.right.as_ref(),
+            Expression::ColumnRef(column)
+                if column.binding.table_index == reduction.reduction_index
+        ));
+        copy.verify_post_reduction()
+            .expect("copied reduction domains remain valid");
     }
 }

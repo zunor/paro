@@ -15,6 +15,7 @@ use paro_storage::row::RowSpillReader;
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::group_key_codec::{decode_group_columns, has_encoded_group_keys};
 use crate::operators::aggregate::output_filter::copy_selected_rows;
+use crate::operators::aggregate::post_reduction::PostAggregateFilterLocal;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
     AggregateHTScanPosition, AggregateHashTable,
 };
@@ -55,10 +56,30 @@ impl HashAggregateEmitSourceExec {
     pub(crate) fn create_local(
         &self,
         ctx: &mut PipelineInitContext,
-        _global: &SourceGlobal,
+        global: &SourceGlobal,
     ) -> Result<SourceLocal> {
         let mut local = HashAggregateEmitSourceLocal::default();
-        if !self.spec.having_filter.is_empty() {
+        if let Some(post) = &self.spec.post_reduction {
+            let SourceGlobal::HashAggregateEmit(global) = global else {
+                return Err(paro_error::internal(
+                    "hash aggregate emit source global state mismatch",
+                ));
+            };
+            local.post_filter = Some(PostAggregateFilterLocal::new(
+                post,
+                &self.spec.having_filter,
+                global.handle.post_reduction_values()?,
+                ctx.query,
+            )?);
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            local.having_columns = (self.spec.grouping_key_count
+                ..self.spec.grouping_key_count + self.spec.aggregates.len())
+                .collect();
+        } else if !self.spec.having_filter.is_empty() {
             if self.spec.having_filter.len() != 1 {
                 return Err(paro_error::internal(
                     "aggregate HAVING lowering requires one normalized predicate",
@@ -138,6 +159,7 @@ impl HashAggregateEmitSourceExec {
                             scratch,
                             local.having_executor.as_mut(),
                             local.having_selection.as_mut(),
+                            local.post_filter.as_mut(),
                             ctx.query,
                         )?;
                         if produced && encoded_groups {
@@ -153,6 +175,7 @@ impl HashAggregateEmitSourceExec {
                             output,
                             local.having_executor.as_mut(),
                             local.having_selection.as_mut(),
+                            local.post_filter.as_mut(),
                             ctx.query,
                         )?
                     };
@@ -170,10 +193,7 @@ impl HashAggregateEmitSourceExec {
                         .get_or_insert(Chunk::try_new(output.allocator().clone())?);
                     let scanned = reader.read_next(scratch)?;
                     if scanned > 0 {
-                        if let (Some(executor), Some(selection)) = (
-                            local.having_executor.as_mut(),
-                            local.having_selection.as_mut(),
-                        ) {
+                        if let Some(selection) = local.having_selection.as_mut() {
                             let aggregate_types = self
                                 .spec
                                 .aggregates
@@ -185,16 +205,24 @@ impl HashAggregateEmitSourceExec {
                                 scratch.allocator().clone(),
                             )?;
                             aggregate_view.reference_columns(scratch, &local.having_columns);
-                            let selected_count = executor.select_kernel(
-                                0,
-                                VectorKernelInput::from_eval_input(ExpressionEvalInput {
-                                    params: ctx.query.params.as_ref(),
-                                    columns: &aggregate_view,
-                                })
-                                .with_count(scanned),
-                                ctx.query,
-                                selection,
-                            )?;
+                            let selected_count = if let Some(filter) = local.post_filter.as_mut() {
+                                filter.select(&aggregate_view, scanned, ctx.query, selection)?
+                            } else if let Some(executor) = local.having_executor.as_mut() {
+                                executor.select_kernel(
+                                    0,
+                                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                                        params: ctx.query.params.as_ref(),
+                                        columns: &aggregate_view,
+                                    })
+                                    .with_count(scanned),
+                                    ctx.query,
+                                    selection,
+                                )?
+                            } else {
+                                return Err(paro_error::internal(
+                                    "aggregate output selection has no predicate executor",
+                                ));
+                            };
                             if selected_count == 0 {
                                 continue;
                             }
@@ -284,10 +312,17 @@ fn scan_table_batch(
     output: &mut Chunk,
     having_executor: Option<&mut ExpressionExecutor>,
     having_selection: Option<&mut SelectionVector>,
+    post_filter: Option<&mut PostAggregateFilterLocal>,
     query: &QueryRuntimeContext,
 ) -> Result<bool> {
-    match (having_executor, having_selection) {
-        (Some(executor), Some(selection)) => table.scan_with_aggregate_filter(
+    match (having_executor, having_selection, post_filter) {
+        (None, Some(selection), Some(filter)) => table.scan_with_aggregate_filter(
+            position,
+            output,
+            selection,
+            |aggregates, count, selection| filter.select(aggregates, count, query, selection),
+        ),
+        (Some(executor), Some(selection), None) => table.scan_with_aggregate_filter(
             position,
             output,
             selection,
@@ -304,9 +339,9 @@ fn scan_table_batch(
                 )
             },
         ),
-        (None, None) => table.scan(position, output),
+        (None, None, None) => table.scan(position, output),
         _ => Err(paro_error::internal(
-            "aggregate HAVING executor and selection state disagree",
+            "aggregate output predicate executor and selection state disagree",
         )),
     }
 }

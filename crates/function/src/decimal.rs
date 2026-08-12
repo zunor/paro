@@ -108,6 +108,73 @@ pub(crate) fn rescale_checked<T: DecimalInteger>(
     round_divide_checked(value, pow10_checked(from_scale - to_scale)?)
 }
 
+/// Apply the exact DECIMAL-to-DECIMAL value conversion shared by scalar casts
+/// and aggregate finalized-state projections.
+///
+/// Keeping scale rounding and declared-precision validation here prevents a
+/// state predicate from becoming a subtly different implementation of the
+/// bound SQL cast that it replaces.
+pub(crate) fn cast_i128_decimal(
+    value: i128,
+    from_scale: u8,
+    target_precision: u8,
+    target_scale: u8,
+) -> Result<i128> {
+    PreparedI128DecimalCast::new(from_scale, target_precision, target_scale)?.cast(value)
+}
+
+/// Bound scalar DECIMAL conversion with every type-derived constant computed
+/// once. Aggregate-state predicates and vector casts share this kernel so the
+/// optimized row loop cannot drift from SQL CAST semantics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedI128DecimalCast {
+    scale: PreparedI128DecimalScale,
+    precision: I128DecimalPrecision,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreparedI128DecimalScale {
+    Identity,
+    Multiply(i128),
+    Divide(i128),
+}
+
+impl PreparedI128DecimalCast {
+    pub(crate) fn new(source_scale: u8, target_precision: u8, target_scale: u8) -> Result<Self> {
+        let scale = if source_scale == target_scale {
+            PreparedI128DecimalScale::Identity
+        } else if source_scale < target_scale {
+            PreparedI128DecimalScale::Multiply(
+                pow10_i128(target_scale - source_scale)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            )
+        } else {
+            PreparedI128DecimalScale::Divide(
+                pow10_i128(source_scale - target_scale)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            )
+        };
+        Ok(Self {
+            scale,
+            precision: I128DecimalPrecision::new(target_precision)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn cast(self, value: i128) -> Result<i128> {
+        let value = match self.scale {
+            PreparedI128DecimalScale::Identity => value,
+            PreparedI128DecimalScale::Multiply(factor) => value
+                .checked_mul(factor)
+                .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            PreparedI128DecimalScale::Divide(divisor) => round_divide_checked(value, divisor)
+                .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+        };
+        self.precision.check(value)?;
+        Ok(value)
+    }
+}
+
 pub(crate) fn round_divide_checked<T: DecimalInteger>(value: T, divisor: T) -> Option<T> {
     let (quotient, remainder) = value.checked_div_rem(divisor)?;
     if remainder == T::ZERO {

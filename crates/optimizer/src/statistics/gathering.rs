@@ -110,11 +110,28 @@ impl StatisticsGathering {
                 if !saw_known {
                     expected = expected.min(child.expected.max(1));
                 }
-                Some(CardinalityEstimate {
+                let groups = CardinalityEstimate {
                     min: expected.saturating_div(2).max(1).min(expected),
                     expected: expected.max(1).min(child.expected.max(1)),
                     max: expected.saturating_mul(2).min(child.max.max(1)),
-                })
+                };
+                if let Some(reduction) = &agg.post_reduction {
+                    // The post-reduction predicate is an aggregate-owned
+                    // HAVING filter. Its hidden scalar has no catalog column
+                    // statistics, but the cost model still supplies the same
+                    // comparison fallback that an explicit Filter used before
+                    // the topology-preserving rewrite. Do not expose the full
+                    // pre-predicate group count to later join/order costing.
+                    let selectivity = ctx
+                        .cost_model
+                        .estimate_selectivity(&reduction.predicate, &ctx.column_stats);
+                    Some(
+                        ctx.cost_model
+                            .apply_selectivity_to_cardinality(groups, selectivity),
+                    )
+                } else {
+                    Some(groups)
+                }
             }
             LogicalOperator::Join(join) => self.estimate_join_cardinality(join, ctx),
             LogicalOperator::DependentJoin(join) => {

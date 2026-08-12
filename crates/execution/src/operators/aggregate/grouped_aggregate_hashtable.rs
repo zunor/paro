@@ -919,6 +919,36 @@ impl GroupedAggregateHashTable {
         Ok(false)
     }
 
+    /// Visit every finalized aggregate-value batch without consuming the
+    /// table's scan cursor or releasing its lookup storage.
+    ///
+    /// Post-aggregate reductions need a first pass over finalized group
+    /// values before the ordinary emit pass can apply a predicate derived
+    /// from that reduction. Keeping this traversal aggregate-only avoids
+    /// deserializing group keys that the reducer cannot observe. Aggregate
+    /// finalizers are required to preserve their input state, so the normal
+    /// output scan may finalize the same rows again afterwards.
+    pub(crate) fn visit_finalized_aggregates(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+        mut visit: impl FnMut(&Chunk) -> Result<()>,
+    ) -> Result<()> {
+        if capacity == 0 {
+            return Err(paro_error::internal(
+                "aggregate finalized-value visitor requires non-zero capacity",
+            ));
+        }
+        let mut offset = 0usize;
+        while offset < self.count {
+            let count = (self.count - offset).min(capacity);
+            let aggregates = self.finalize_aggregate_range(offset, count, allocator.clone())?;
+            visit(&aggregates)?;
+            offset += count;
+        }
+        Ok(())
+    }
+
     fn finalize_aggregate_range(
         &mut self,
         start: usize,

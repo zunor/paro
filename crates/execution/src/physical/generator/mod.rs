@@ -50,9 +50,10 @@ use super::specs::{
     HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
     HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
     MaterializedCteSpec, NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind,
-    ProjectSpec, RecursiveCteSpec, RowsetColumnProjection, RowsetScanAccessPolicy, RowsetScanSpec,
-    SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
-    TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    PostAggregateReductionSpec, ProjectSpec, RecursiveCteSpec, RowsetColumnProjection,
+    RowsetScanAccessPolicy, RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec,
+    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec,
+    UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;
@@ -246,5 +247,7 @@ impl PhysicalPlanGenerator {
     }
 }
 
+#[cfg(test)]
+mod post_reduction_tests;
 #[cfg(test)]
 mod tests;

@@ -182,6 +182,7 @@ impl Verifier {
                 )?;
             }
             LogicalOperator::Aggregate(agg) => {
+                agg.verify_post_reduction()?;
                 let expected =
                     agg.groups.len() + agg.aggregates.len() + agg.grouping_functions.len();
                 if agg.returned_types.len() != expected {
@@ -481,6 +482,15 @@ impl Verifier {
                 }
                 for expr in &agg.aggregates {
                     self.verify_expression(expr)?;
+                }
+                if let Some(reduction) = &agg.post_reduction {
+                    for reducer in &reduction.reducers {
+                        self.verify_expression(reducer)?;
+                    }
+                    for scalar in &reduction.scalar_expressions {
+                        self.verify_expression(scalar)?;
+                    }
+                    self.verify_expression(&reduction.predicate)?;
                 }
             }
             LogicalOperator::Join(join) => match join {

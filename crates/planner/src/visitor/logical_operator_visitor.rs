@@ -203,6 +203,15 @@ where
             for expr in &mut agg.aggregates {
                 callback(expr);
             }
+            if let Some(reduction) = &mut agg.post_reduction {
+                for reducer in &mut reduction.reducers {
+                    callback(reducer);
+                }
+                for scalar in &mut reduction.scalar_expressions {
+                    callback(scalar);
+                }
+                callback(&mut reduction.predicate);
+            }
         }
         LogicalOperator::Insert(_insert) => {
             // Insert doesn't have expressions to enumerate

@@ -63,11 +63,21 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             }
         }
         LogicalOperator::Aggregate(agg) => {
+            agg.verify_post_reduction()?;
             for expr in &agg.groups {
                 verify_expression(expr)?;
             }
             for expr in &agg.aggregates {
                 verify_expression(expr)?;
+            }
+            if let Some(reduction) = &agg.post_reduction {
+                for reducer in &reduction.reducers {
+                    verify_expression(reducer)?;
+                }
+                for scalar in &reduction.scalar_expressions {
+                    verify_expression(scalar)?;
+                }
+                verify_expression(&reduction.predicate)?;
             }
         }
         LogicalOperator::Update(update) => {

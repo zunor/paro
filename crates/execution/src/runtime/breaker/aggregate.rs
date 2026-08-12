@@ -36,6 +36,7 @@ use crate::operators::aggregate::payload_spill::{
 use crate::operators::aggregate::perfect_aggregate_hashtable::{
     FinalizedPerfectAggregateTable, PerfectAggregateHashTable,
 };
+use crate::operators::aggregate::post_reduction::PostAggregateInputRollup;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::runtime::context::OperatorCleanupContext;
@@ -52,6 +53,7 @@ pub struct AggregateHandle {
     finalized: AtomicBool,
     reclaim_enabled: AtomicBool,
     reclaim_in_progress: AtomicBool,
+    post_reduction_values: OnceLock<Box<[Arc<Vector>]>>,
     cleanup: CleanupState,
 }
 
@@ -63,6 +65,7 @@ impl AggregateHandle {
             finalized: AtomicBool::new(false),
             reclaim_enabled: AtomicBool::new(false),
             reclaim_in_progress: AtomicBool::new(false),
+            post_reduction_values: OnceLock::new(),
             cleanup: CleanupState::default(),
         }
     }
@@ -104,6 +107,25 @@ impl AggregateHandle {
             paro_error::internal("aggregate handle has no initialized runtime state")
         })?;
         Ok(state.lock().take())
+    }
+
+    /// Publish immutable scalar values derived from the finalized group set.
+    pub fn set_post_reduction_values(&self, values: Box<[Arc<Vector>]>) -> Result<()> {
+        self.post_reduction_values.set(values).map_err(|_| {
+            paro_error::internal("aggregate post-reduction result was published more than once")
+        })
+    }
+
+    /// Read the post-reduction result after the build handle is finalized.
+    pub fn post_reduction_values(&self) -> Result<&[Arc<Vector>]> {
+        self.post_reduction_values
+            .get()
+            .map(Box::as_ref)
+            .ok_or_else(|| paro_error::internal("aggregate post-reduction result is not available"))
+    }
+
+    pub fn post_reduction_values_if_ready(&self) -> Option<&[Arc<Vector>]> {
+        self.post_reduction_values.get().map(Box::as_ref)
     }
 
     #[inline]
@@ -889,6 +911,7 @@ pub struct PerfectHashAggregateRuntimeState {
     pub(crate) build_table: Option<PerfectAggregateHashTable>,
     pub(crate) finalized_table: Option<FinalizedPerfectAggregateTable>,
     pub(crate) pending_tables: Vec<PerfectAggregateHashTable>,
+    pub(crate) input_rollup: Option<PostAggregateInputRollup>,
 }
 
 impl PerfectHashAggregateRuntimeState {

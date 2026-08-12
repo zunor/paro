@@ -237,6 +237,17 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
     fn visit_operator(&mut self, op: &mut LogicalOperator) {
         match op {
             LogicalOperator::Aggregate(agg) => {
+                // Post-reduction values are hidden from the aggregate's public
+                // schema, so their dependencies cannot arrive from a parent
+                // operator. Register the reducer and predicate references
+                // before pruning; the existing replacement map will then keep
+                // their aggregate ordinals synchronized with compacted output.
+                if let Some(reduction) = &mut agg.post_reduction {
+                    for reducer in &mut reduction.reducers {
+                        self.visit_expression(reducer);
+                    }
+                    self.visit_expression(&mut reduction.predicate);
+                }
                 // - Only aggregates are pruned
                 if !self.everything_referenced {
                     // Clear unused aggregate expressions
@@ -904,11 +915,16 @@ mod tests {
     use super::RemoveUnusedColumns;
     use paro_common::types::LogicalType;
     use paro_context::test_support::TestStatementContextBuilder;
+    use paro_function::aggregate::distributive::count::get_count_star_function;
+    use paro_function::aggregate::distributive::minmax::get_max_function;
     use paro_planner::binder::Binder;
-    use paro_planner::expression::{ColumnRefExpression, Expression};
+    use paro_planner::expression::{
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
+        ReferenceExpression,
+    };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
-        JoinType, LogicalOperator, Projection,
+        Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType,
+        JoinCondition, JoinType, LogicalOperator, PostAggregateReduction, Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -924,6 +940,99 @@ mod tests {
             panic!("expected column reference");
         };
         column.binding
+    }
+
+    #[test]
+    fn post_reduction_keeps_hidden_source_aggregate_and_tracks_its_new_ordinal() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let values = LogicalPlan::new(
+            ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["key".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let count = || {
+            Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))
+        };
+        let (max, _) = get_max_function()
+            .bind(&[LogicalType::BigInt])
+            .expect("bind max(bigint)");
+        let reducer = Expression::Aggregate(AggregateExpression::new(
+            max,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 1),
+                LogicalType::BigInt,
+            ))],
+            LogicalType::BigInt,
+        ));
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 1),
+                LogicalType::BigInt,
+            )),
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(14, 0),
+                LogicalType::BigInt,
+            )),
+        ));
+        let aggregate = Aggregate::new(
+            11,
+            12,
+            13,
+            values,
+            vec![int_column(10, 0)],
+            Vec::new(),
+            vec![count(), count()],
+            Vec::new(),
+        )
+        .with_post_reduction(PostAggregateReduction {
+            reduction_index: 14,
+            reducers: vec![reducer],
+            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::BigInt,
+            ))],
+            predicate,
+        });
+        let aggregate = LogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+        // The public projection observes only the group key. Aggregate #1 is
+        // nevertheless required exclusively by the hidden reduction.
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, aggregate, vec![int_column(11, 0)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(project) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Aggregate(aggregate) = &project.child.operator else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(aggregate.aggregates.len(), 1);
+        let reduction = aggregate.post_reduction.as_ref().expect("reduction");
+        let Expression::Aggregate(reducer) = &reduction.reducers[0] else {
+            panic!("expected reducer");
+        };
+        assert_eq!(binding(&reducer.children[0]), ColumnBinding::new(12, 0));
+        let Expression::Comparison(predicate) = &reduction.predicate else {
+            panic!("expected predicate");
+        };
+        assert_eq!(binding(predicate.left.as_ref()), ColumnBinding::new(12, 0));
+        aggregate
+            .verify_post_reduction()
+            .expect("pruned annotation stays valid");
     }
 
     #[test]

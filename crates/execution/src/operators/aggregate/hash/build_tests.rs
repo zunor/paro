@@ -43,6 +43,7 @@ fn grouped_count_spec() -> AggregateSpec {
         aggregate_inputs: Box::new([Box::new([])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "count".to_string()]),
@@ -72,6 +73,7 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "items".to_string()]),
@@ -211,6 +213,7 @@ fn mixed_spilled_payload_and_global_state_writes_bounded_output() {
         &mut state,
         &spilled_payloads,
         &[],
+        None,
     )
     .expect("spill mixed replay output");
     assert!(spilled_bytes > 0);
@@ -339,6 +342,7 @@ fn mixed_spilled_payload_and_serialized_string_state_writes_bounded_output() {
         &mut state,
         &spilled_payloads,
         &[],
+        None,
     )
     .expect("spill mixed replay output");
     assert!(spilled_bytes > 0);

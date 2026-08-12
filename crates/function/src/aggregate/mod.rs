@@ -18,12 +18,17 @@ use paro_common::vector::{SelectionRef, SelectionVector, Vector};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::scalar::function_data_equals;
+
+mod direct_state_filter;
 mod direct_update;
 pub mod distributive;
 
+pub use direct_state_filter::{
+    prepare_direct_state_predicate, PreparedDirectAggregateStatePredicate,
+};
 pub use direct_update::{
-    prepare_direct_state_predicate, DirectGroupSlotSource, DirectGroupedAggregateProgram,
-    DirectGroupedAggregateScratch, PreparedDirectAggregateStatePredicate,
+    DirectGroupSlotSource, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
     PreparedDirectGroupedAggregateInput, ValidatedDirectGroupSlots,
 };
 
@@ -74,6 +79,16 @@ pub type AggregateInitializeFn = unsafe fn(state: *mut u8);
 /// same physical function: for example, `COUNT` returns BIGINT while
 /// `SUM(BIGINT)` returns HUGEINT.
 pub type AggregatePartialMergeFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
+
+/// Factory for an aggregate over the original input rows whose finalized
+/// result is equivalent to reducing the finalized per-group results.
+///
+/// This is stronger than [`AggregateAlgebra`]. It is a correctness-bearing
+/// capability used to maintain a rollup state alongside grouped states. The
+/// grouped states must still be finalized (or otherwise validated) so an
+/// error in an individual group is not hidden by cancellation in the rollup.
+/// Implementations must preserve empty-input, NULL, and overflow semantics.
+pub type AggregateInputRollupFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
 
 /// Whether `combine` may destructively modify the source state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -234,6 +249,12 @@ pub type AggregateCombineFn =
 
 /// Function to finalize the state into a result.
 ///
+/// Finalization is observational: it may validate the state and write the
+/// result, but it must not mutate, move from, or destroy aggregate-owned
+/// state. The engine may finalize the same state more than once (for example,
+/// once for a post-aggregate reduction and again for output). Destruction is
+/// exclusively the responsibility of [`AggregateDestructorFn`].
+///
 /// # Arguments
 /// * `states`: Vector containing pointers to states.
 /// * `result`: Result vector to write to.
@@ -255,15 +276,49 @@ pub enum AggregateComparison {
     GreaterThanOrEqual,
 }
 
+/// A correctness-proven scalar projection applied to one finalized aggregate
+/// value before comparing it with a runtime constant.
+///
+/// The projection is part of the state-filter identity: merge-time
+/// preselection and emit-time filtering must use exactly the same SQL value
+/// transformation. New variants require a function-specific implementation
+/// that preserves finalize errors, cast errors, TRY_CAST nullification, and
+/// declared logical types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateFinalizeProjection {
+    Identity,
+    DecimalCast {
+        target_precision: u8,
+        target_scale: u8,
+        try_cast: bool,
+    },
+}
+
+/// Prepare a scalar predicate that finalizes, projects, and compares one
+/// aggregate state without materializing an intermediate vector.
+///
+/// This capability is deliberately separate from [`AggregateStateFilterFn`]:
+/// the vector filter is sufficient for emit-time evaluation, while a direct
+/// predicate is also a proof that perfect-table sealing can validate every
+/// visited state before discarding a non-matching slot.
+pub type AggregateDirectStateFilterFn = fn(
+    function: &AggregateFunction,
+    projection: &AggregateFinalizeProjection,
+    comparison: AggregateComparison,
+    constant: &Value,
+)
+    -> Result<Option<PreparedDirectAggregateStatePredicate>>;
+
 /// Evaluate a bound comparison directly against aggregate states.
 ///
 /// Implementations must preserve finalize-time validation (including overflow)
 /// and append matching logical row indices to `selection`. `constant` has the
-/// aggregate function's exact return type; callers must decline the state fast
-/// path rather than coerce a different type here.
+/// projection's exact output type; the implementation must finalize and
+/// validate the source value before applying that projection.
 pub type AggregateStateFilterFn = unsafe fn(
     states: &AggregateStateInput,
     input_data: &AggregateInputData,
+    projection: &AggregateFinalizeProjection,
     comparison: AggregateComparison,
     constant: &Value,
     selection: &mut SelectionVector,
@@ -361,6 +416,10 @@ pub struct AggregateFunction {
     /// Optional aggregate over finalized partial results.
     partial_merge: Option<AggregatePartialMergeFn>,
 
+    /// Optional aggregate over the original input rows that is equivalent to
+    /// applying `partial_merge` to every finalized group.
+    input_rollup: Option<AggregateInputRollupFn>,
+
     state_ownership: AggregateStateOwnership,
 
     /// Size of the state in bytes.
@@ -380,6 +439,9 @@ pub struct AggregateFunction {
 
     /// Optional finalized-value comparison implemented on raw state.
     pub state_filter: Option<AggregateStateFilterFn>,
+
+    /// Optional prepared single-state form of [`Self::state_filter`].
+    pub direct_state_filter: Option<AggregateDirectStateFilterFn>,
 
     /// Simple update (for ungrouped aggregation optimization).
     /// If None, the execution engine must use `update` with a vector of identical pointers.
@@ -417,6 +479,7 @@ impl fmt::Debug for AggregateFunction {
             .field("return_type", &self.return_type)
             .field("state_size", &self.state_size)
             .field("has_partial_merge", &self.partial_merge.is_some())
+            .field("has_input_rollup", &self.input_rollup.is_some())
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
             .finish()
@@ -442,6 +505,7 @@ impl AggregateFunction {
             return_type,
             algebra: None,
             partial_merge: None,
+            input_rollup: None,
             state_ownership: AggregateStateOwnership::Opaque,
             state_size,
             initialize,
@@ -449,6 +513,7 @@ impl AggregateFunction {
             combine,
             finalize,
             state_filter: None,
+            direct_state_filter: None,
             simple_update,
             distinct_run_update: None,
             direct_update: None,
@@ -465,6 +530,11 @@ impl AggregateFunction {
         self
     }
 
+    pub fn with_direct_state_filter(mut self, filter: AggregateDirectStateFilterFn) -> Self {
+        self.direct_state_filter = Some(filter);
+        self
+    }
+
     pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
         self.algebra = Some(algebra);
         self
@@ -477,6 +547,59 @@ impl AggregateFunction {
 
     pub fn partial_merge_function(&self) -> Option<AggregateFunction> {
         (self.partial_merge?)(self)
+    }
+
+    /// Attach the proof and factory for an original-input rollup.
+    pub fn with_input_rollup(mut self, factory: AggregateInputRollupFn) -> Self {
+        self.input_rollup = Some(factory);
+        self
+    }
+
+    /// Build the canonical original-input aggregate certified by this bound
+    /// function. `None` means execution must reduce finalized group results.
+    pub fn input_rollup_function(&self) -> Option<AggregateFunction> {
+        (self.input_rollup?)(self)
+    }
+
+    /// Compare the complete bound execution contract of two aggregate
+    /// functions.
+    ///
+    /// Display names are deliberately excluded: aliases may share execution
+    /// semantics. Types, state layout, executable hooks, bind data, and every
+    /// correctness-bearing capability are included. Physical-plan validators
+    /// should use this method instead of reconstructing this identity ad hoc.
+    pub fn execution_semantics_equal(&self, other: &Self) -> bool {
+        macro_rules! optional_fn_equal {
+            ($left:expr, $right:expr) => {
+                match ($left, $right) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+                    _ => false,
+                }
+            };
+        }
+
+        self.arguments == other.arguments
+            && self.return_type == other.return_type
+            && self.algebra == other.algebra
+            && optional_fn_equal!(self.partial_merge, other.partial_merge)
+            && optional_fn_equal!(self.input_rollup, other.input_rollup)
+            && self.state_ownership == other.state_ownership
+            && self.state_size == other.state_size
+            && std::ptr::fn_addr_eq(self.initialize, other.initialize)
+            && std::ptr::fn_addr_eq(self.update, other.update)
+            && std::ptr::fn_addr_eq(self.combine, other.combine)
+            && std::ptr::fn_addr_eq(self.finalize, other.finalize)
+            && optional_fn_equal!(self.state_filter, other.state_filter)
+            && optional_fn_equal!(self.direct_state_filter, other.direct_state_filter)
+            && optional_fn_equal!(self.simple_update, other.simple_update)
+            && optional_fn_equal!(self.distinct_run_update, other.distinct_run_update)
+            && self.direct_update == other.direct_update
+            && optional_fn_equal!(self.destructor, other.destructor)
+            && optional_fn_equal!(self.state_serialize, other.state_serialize)
+            && optional_fn_equal!(self.state_deserialize, other.state_deserialize)
+            && self.varargs == other.varargs
+            && function_data_equals(self.bind_data.as_ref(), other.bind_data.as_ref())
     }
 
     /// Declare that an initialized state is a self-contained, trivially

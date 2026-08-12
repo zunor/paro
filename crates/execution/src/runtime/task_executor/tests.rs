@@ -13,6 +13,8 @@ use paro_context::{
     TestStatementContextBuilder,
 };
 use paro_function::aggregate::distributive::count::{get_count_function, get_count_star_function};
+use paro_function::aggregate::distributive::minmax::get_max_function;
+use paro_function::aggregate::distributive::sum::get_sum_function;
 use paro_function::table::{
     LocalTableFunctionState, TableFunction, TableFunctionInitInput, TableFunctionInput,
     TableFunctionResult,
@@ -31,8 +33,8 @@ use crate::physical::properties::{MemoryClass, PipelineProperties, PropertyRepai
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ChunkScanSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, FilterSpec,
-    LimitSpec, PerfectHashAggregatePlan, ProjectSpec, TableFunctionScanSpec, TopNSpec, ValuesSpec,
-    WindowSpec,
+    LimitSpec, PerfectHashAggregatePlan, PostAggregateReductionSpec, ProjectSpec,
+    TableFunctionScanSpec, TopNSpec, ValuesSpec, WindowSpec,
 };
 use crate::pipeline::graph::{
     ClientResultSpec, CrossProductBuildSinkSpec, CrossProductProbeSpec, CteMaterializeSinkSpec,
@@ -179,6 +181,24 @@ fn int_constant(value: i32) -> Expression {
     ))
 }
 
+fn bigint_constant(value: i64) -> Expression {
+    Expression::Constant(ConstantExpression::new(
+        Value::BigInt(value),
+        LogicalType::BigInt,
+    ))
+}
+
+fn varchar_constant(value: &str) -> Expression {
+    Expression::Constant(ConstantExpression::new(
+        Value::Varchar(value.to_string()),
+        LogicalType::Varchar,
+    ))
+}
+
+fn null_constant(ty: LogicalType) -> Expression {
+    Expression::Constant(ConstantExpression::new(Value::Null(ty.clone()), ty))
+}
+
 fn bool_constant(value: bool) -> Expression {
     Expression::Constant(ConstantExpression::new(
         Value::Boolean(value),
@@ -239,10 +259,69 @@ fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> Aggrega
         aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         aggregate_filters: vec![None].into_boxed_slice(),
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash,
         output_names: vec!["k".to_string(), "count".to_string()].into_boxed_slice(),
         output_types: vec![LogicalType::Integer, LogicalType::BigInt].into_boxed_slice(),
+    }
+}
+
+/// Physical grouped SUM followed by a hidden MAX reduction over every
+/// finalized group. The dynamic equality predicate retains all ties for the
+/// global maximum without adding the reduced scalar to the public row type.
+fn grouped_sum_post_max_spec(
+    key_type: LogicalType,
+    perfect_hash: Option<PerfectHashAggregatePlan>,
+    having_filter: Box<[Expression]>,
+) -> AggregateSpec {
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind sum(integer)");
+    assert_eq!(sum.return_type, LogicalType::BigInt);
+    let (max, _) = get_max_function()
+        .bind(&[LogicalType::BigInt])
+        .expect("bind max(bigint)");
+    let post_reduction = PostAggregateReductionSpec {
+        aggregate_types: Box::new([LogicalType::BigInt]),
+        reducers: Box::new([Expression::Aggregate(AggregateExpression::new(
+            max,
+            vec![reference(0, LogicalType::BigInt)],
+            LogicalType::BigInt,
+        ))]),
+        reducer_types: Box::new([LogicalType::BigInt]),
+        scalar_expressions: Box::new([reference(0, LogicalType::BigInt)]),
+        scalar_types: Box::new([LogicalType::BigInt]),
+        predicate: Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            reference(0, LogicalType::BigInt),
+            reference(1, LogicalType::BigInt),
+        )),
+        input_rollup_sources: None,
+    };
+    AggregateSpec {
+        grouping_key_count: 1,
+        state_output_projection: Box::new([]),
+        estimated_input_rows: None,
+        projection_exprs: Box::new([]),
+        payload_types: Box::new([key_type.clone(), LogicalType::Integer]),
+        groups: Box::new([reference(0, key_type.clone())]),
+        group_key_encodings: Box::new([crate::physical::specs::GroupKeyEncoding::Identity]),
+        grouping_sets: Box::new([]),
+        aggregates: Box::new([Expression::Aggregate(AggregateExpression::new(
+            sum,
+            vec![reference(1, LogicalType::Integer)],
+            LogicalType::BigInt,
+        ))]),
+        grouping_functions: Box::new([]),
+        aggregate_inputs: Box::new([Box::new([1])]),
+        aggregate_filters: Box::new([None]),
+        aggregate_orders: Box::new([Box::new([])]),
+        post_reduction: Some(post_reduction),
+        having_filter,
+        perfect_hash,
+        output_names: Box::new(["k".to_string(), "sum".to_string()]),
+        output_types: Box::new([key_type, LogicalType::BigInt]),
     }
 }
 
@@ -261,6 +340,7 @@ fn ungrouped_count_spec() -> AggregateSpec {
         aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
         aggregate_filters: vec![None].into_boxed_slice(),
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
@@ -294,6 +374,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         aggregate_inputs: vec![vec![0].into_boxed_slice()].into_boxed_slice(),
         aggregate_filters: vec![None].into_boxed_slice(),
         aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash: None,
         output_names: vec!["count".to_string()].into_boxed_slice(),
@@ -326,6 +407,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         aggregate_inputs: Box::new([Box::new([1])]),
         aggregate_filters: Box::new([None]),
         aggregate_orders: Box::new([Box::new([])]),
+        post_reduction: None,
         having_filter: Box::new([]),
         perfect_hash: None,
         output_names: Box::new(["k".to_string(), "count".to_string()]),
@@ -391,6 +473,8 @@ mod completion_tests;
 mod hash_join_spill_tests;
 #[path = "join_tests.rs"]
 mod join_tests;
+#[path = "post_rollup_tests.rs"]
+mod post_rollup_tests;
 #[path = "running_tests.rs"]
 mod running_tests;
 

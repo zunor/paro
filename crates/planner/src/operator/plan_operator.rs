@@ -858,6 +858,9 @@ impl LogicalOperator {
                 if !agg.grouping_functions.is_empty() {
                     indices.push(agg.groupings_index);
                 }
+                if let Some(reduction) = &agg.post_reduction {
+                    indices.push(reduction.reduction_index);
+                }
                 indices
             }
             LogicalOperator::Window(window) => vec![window.window_index],

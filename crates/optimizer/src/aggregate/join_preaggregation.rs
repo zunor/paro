@@ -60,7 +60,8 @@ impl JoinPreaggregation {
     const MIN_REDUCTION_DENOMINATOR: u64 = 2;
 
     fn candidate_right_key(aggregate: &Aggregate) -> Option<ColumnBinding> {
-        if aggregate.groups.len() != 1
+        if aggregate.post_reduction.is_some()
+            || aggregate.groups.len() != 1
             || aggregate.aggregates.is_empty()
             || !aggregate.grouping_sets.is_empty()
             || !aggregate.grouping_functions.is_empty()
@@ -265,7 +266,7 @@ mod tests {
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
     use paro_planner::operator::{
         Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinCondition, JoinType,
-        LogicalOperator,
+        LogicalOperator, PostAggregateReduction,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -354,6 +355,23 @@ mod tests {
             unreachable!()
         };
         aggregate.aggregates = vec![count(column(1, 0))];
+
+        assert!(!JoinPreaggregation::rewrite(aggregate, &bind_context));
+    }
+
+    #[test]
+    fn rewrite_declines_an_annotated_aggregate() {
+        let bind_context = BindContext::new();
+        let mut plan = candidate(&bind_context);
+        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+            panic!("aggregate root")
+        };
+        aggregate.post_reduction = Some(PostAggregateReduction {
+            reduction_index: 99,
+            reducers: vec![count(column(4, 0))],
+            scalar_expressions: vec![column(99, 0)],
+            predicate: column(99, 0),
+        });
 
         assert!(!JoinPreaggregation::rewrite(aggregate, &bind_context));
     }

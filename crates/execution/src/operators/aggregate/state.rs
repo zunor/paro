@@ -29,6 +29,8 @@ use super::perfect_aggregate_hashtable::{
     FinalizedPerfectAggregateTable, PerfectAggregateHashTable, PerfectAggregateScanScratch,
     PerfectAggregateStateFilter, PerfectHTScanPosition,
 };
+use super::post_reduction::PostAggregateFilterLocal;
+use super::post_reduction::PostAggregateInputRollup;
 use super::radix_partitioned_aggregate_hashtable::{AggregateHTScanPosition, AggregateHashTable};
 use super::row_format::AggregateGroupFormat;
 
@@ -41,6 +43,7 @@ pub struct HashAggregateEmitSourceLocal {
     pub having_executor: Option<ExpressionExecutor>,
     pub having_selection: Option<SelectionVector>,
     pub having_columns: Box<[usize]>,
+    pub(crate) post_filter: Option<PostAggregateFilterLocal>,
 }
 
 #[derive(Debug)]
@@ -88,6 +91,7 @@ pub struct PerfectHashAggregateEmitSourceLocal {
     pub(crate) state_filter: Option<PerfectAggregateStateFilter>,
     pub having_executor: Option<ExpressionExecutor>,
     pub having_selection: Option<SelectionVector>,
+    pub(crate) post_filter: Option<PostAggregateFilterLocal>,
 }
 
 impl Drop for HashAggregateEmitWork {
@@ -155,6 +159,7 @@ pub struct PerfectHashAggregateSinkLocal {
     pub addresses: Vector,
     pub new_groups: SelectionVector,
     pub table: Option<PerfectAggregateHashTable>,
+    pub(crate) input_rollup: Option<PostAggregateInputRollup>,
 }
 
 impl Drop for HashAggregateBuildSinkLocal {

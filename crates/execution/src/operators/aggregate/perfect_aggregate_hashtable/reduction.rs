@@ -136,6 +136,12 @@ impl ParallelPerfectAggregateMerge {
         let state_layout = target.state_layout.clone();
         let aggregate_objects: Arc<[AggregateObject]> =
             Arc::from(target.aggregate_objects.clone().into_boxed_slice());
+        // Preselection is lossy: rejected groups skip generic finalization.
+        // Decline it unless the predicate covers every fallible finalizer in
+        // the aggregate row. Emit retains the original HAVING/post predicate
+        // and will use its generic finalize-then-filter path instead.
+        let state_filter = state_filter
+            .filter(|filter| filter.has_complete_finalize_coverage(aggregate_objects.len()));
         let direct_combine_program = target
             .direct_update_program
             .as_ref()
@@ -157,6 +163,7 @@ impl ParallelPerfectAggregateMerge {
                 })?;
                 prepare_direct_state_predicate(
                     &object.function,
+                    &filter.projection,
                     filter.comparison,
                     &filter.constant,
                 )?
@@ -666,6 +673,60 @@ mod tests {
     }
 
     #[test]
+    fn parallel_merge_declines_lossy_filter_for_multiple_aggregate_states() {
+        const SLOTS: usize = 2 * 64 * 1024;
+        let input_type = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let (function, targets) = get_sum_function()
+            .bind(std::slice::from_ref(&input_type))
+            .unwrap();
+        assert_eq!(targets.as_slice(), std::slice::from_ref(&input_type));
+        let object = AggregateObject {
+            bind_info: function.bind_data.clone(),
+            return_type: function.return_type.clone(),
+            payload_size: function.state_size,
+            function,
+            child_count: 1,
+            aggr_type: AggregateType::NonDistinct,
+            filter: None,
+            order_bys: Vec::new(),
+        };
+        let make_table = || {
+            PerfectAggregateHashTable::new(
+                vec![LogicalType::Integer],
+                vec![object.clone(), object.clone()],
+                vec![vec![0], vec![1]],
+                vec![0],
+                vec![SLOTS],
+                paro_common::test_utils::test_allocator(),
+            )
+            .unwrap()
+        };
+        let filter = PerfectAggregateStateFilter {
+            aggregate_index: 0,
+            projection: paro_function::aggregate::AggregateFinalizeProjection::Identity,
+            comparison: AggregateComparison::GreaterThan,
+            constant: Value::Decimal(30_000, 38, 2),
+        };
+
+        let merge = ParallelPerfectAggregateMerge::try_new(
+            vec![make_table(), make_table()],
+            2,
+            Some(filter),
+            paro_common::memory::MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::HashTable,
+                paro_common::memory::MemoryAccountingClass::Revocable,
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(merge.state_filter.is_none());
+        assert!(merge.direct_state_predicate.is_none());
+    }
+
+    #[test]
     fn selective_merge_copies_only_qualifying_unique_owners() {
         const SLOTS: usize = 2 * 64 * 1024;
         let input_type = LogicalType::Decimal {
@@ -728,11 +789,13 @@ mod tests {
 
         let filter = PerfectAggregateStateFilter {
             aggregate_index: 0,
+            projection: paro_function::aggregate::AggregateFinalizeProjection::Identity,
             comparison: AggregateComparison::GreaterThan,
             constant: Value::Decimal(30_000, 38, 2),
         };
         let predicate = prepare_direct_state_predicate(
             &source.aggregate_objects[0].function,
+            &filter.projection,
             filter.comparison,
             &filter.constant,
         )

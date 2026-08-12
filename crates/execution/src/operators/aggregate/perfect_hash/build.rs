@@ -18,6 +18,7 @@ use crate::operators::aggregate::build_helpers::{
     query_perfect_hash_memory, update_perfect_aggregate_table,
 };
 use crate::operators::aggregate::perfect_hash::finalize::prepare_parallel_perfect_merge;
+use crate::operators::aggregate::post_reduction::{PostAggregateInputRollup, PostAggregateReducer};
 use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
@@ -40,12 +41,14 @@ pub struct PerfectHashAggregateSinkExec {
 
 impl PerfectHashAggregateSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
+        self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
         handle.initialize(AggregateRuntimeState::Perfect(
             PerfectHashAggregateRuntimeState {
                 build_table: None,
                 finalized_table: None,
                 pending_tables: Vec::new(),
+                input_rollup: PostAggregateInputRollup::try_new(&self.spec, ctx.query)?,
             },
         ))?;
         ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
@@ -100,6 +103,7 @@ impl PerfectHashAggregateSinkExec {
                     ctx.query.allocator(MemoryTag::HashTable),
                     query_perfect_hash_memory(ctx.query),
                 )?),
+                input_rollup: PostAggregateInputRollup::try_new(&self.spec, ctx.query)?,
             },
         ))
     }
@@ -134,6 +138,9 @@ impl PerfectHashAggregateSinkExec {
         let table = local.table.as_mut().ok_or_else(|| {
             paro_error::internal("perfect aggregate local table was already merged")
         })?;
+        if let Some(rollup) = local.input_rollup.as_mut() {
+            rollup.update(payload)?;
+        }
         update_perfect_aggregate_table(
             &self.spec,
             &local.group_refs,
@@ -164,6 +171,7 @@ impl PerfectHashAggregateSinkExec {
         let Some(local_table) = local.table.take() else {
             return Ok(MergePoll::Done);
         };
+        let mut local_rollup = local.input_rollup.take();
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Perfect(global) = state else {
                 return Err(paro_error::internal(
@@ -174,6 +182,15 @@ impl PerfectHashAggregateSinkExec {
                 return Err(paro_error::internal(
                     "perfect aggregate local table merged after finalization",
                 ));
+            }
+            match (global.input_rollup.as_mut(), local_rollup.as_mut()) {
+                (Some(target), Some(source)) => target.combine_from(source)?,
+                (None, None) => {}
+                _ => {
+                    return Err(paro_error::internal(
+                        "perfect aggregate input-rollup local/global state mismatch",
+                    ));
+                }
             }
             if global.build_table.is_none() {
                 global.build_table = Some(local_table);
@@ -187,9 +204,27 @@ impl PerfectHashAggregateSinkExec {
 
     pub(crate) fn prepare_finish(
         &self,
-        _ctx: &mut OperatorFinishContext,
-        _global: &SinkGlobal,
+        ctx: &mut OperatorFinishContext,
+        global: &SinkGlobal,
     ) -> Result<PrepareFinishPoll> {
+        let SinkGlobal::PerfectHashAggregate(global) = global else {
+            return Err(paro_error::internal(
+                "perfect aggregate sink global state mismatch",
+            ));
+        };
+        let rollup = global.handle.with_state_mut(|state| {
+            let AggregateRuntimeState::Perfect(state) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain perfect aggregate state",
+                ));
+            };
+            Ok(state.input_rollup.take())
+        })?;
+        if let Some(rollup) = rollup {
+            global
+                .handle
+                .set_post_reduction_values(rollup.finish(ctx.query)?)?;
+        }
         Ok(PrepareFinishPoll::Done)
     }
 
@@ -203,10 +238,28 @@ impl PerfectHashAggregateSinkExec {
                 "perfect aggregate sink global state mismatch",
             ));
         };
+        let post_state_filter = self
+            .spec
+            .post_reduction
+            .as_ref()
+            .and_then(|_| global.handle.post_reduction_values_if_ready())
+            .map(|values| super::emit::compile_post_state_filter(&self.spec, values))
+            .transpose()?
+            .flatten();
         prepare_parallel_perfect_merge(
             global.handle.clone(),
             ctx.query.session.number_of_threads().max(1),
-            super::emit::compile_state_filter(&self.spec)?,
+            if post_state_filter.is_some() {
+                post_state_filter
+            } else if self.spec.post_reduction.is_some() {
+                // The reduction must observe every finalized group. A perfect
+                // state preselection can omit non-matching source-only slots
+                // during parallel merge, so it belongs exclusively to the
+                // later emit pass when a post reduction is present.
+                None
+            } else {
+                super::emit::compile_state_filter(&self.spec)?
+            },
             query_perfect_hash_memory(ctx.query),
         )
     }
@@ -221,6 +274,17 @@ impl PerfectHashAggregateSinkExec {
                 "perfect aggregate sink global state mismatch",
             ));
         };
+        let values_ready = global.handle.post_reduction_values_if_ready().is_some();
+        let mut post_reducer = if values_ready {
+            None
+        } else {
+            self.spec
+                .post_reduction
+                .as_ref()
+                .map(|spec| PostAggregateReducer::try_new(spec, ctx.query))
+                .transpose()?
+        };
+        let mut scanned_reduction = false;
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Perfect(global) = state else {
                 return Err(paro_error::internal(
@@ -253,8 +317,32 @@ impl PerfectHashAggregateSinkExec {
                     "perfect aggregate finish retained a mutable table after finalization",
                 ));
             }
+            if let Some(reducer) = post_reducer.as_mut() {
+                let table = global.finalized_table.as_mut().ok_or_else(|| {
+                    paro_error::internal("post reduction has no finalized perfect aggregate table")
+                })?;
+                let mut scratch =
+                    crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateScanScratch::try_new(
+                        &self.spec.output_types[self.spec.grouping_key_count
+                            ..self.spec.grouping_key_count + self.spec.aggregates.len()],
+                        VECTOR_SIZE,
+                        ctx.query.allocator(MemoryTag::BaseTable),
+                    )?;
+                table.visit_all_finalized_aggregates(&mut scratch, |aggregates| {
+                    reducer.consume(aggregates)
+                })?;
+                scanned_reduction = true;
+            }
             Ok(())
         })?;
+        if scanned_reduction {
+            let values = post_reducer
+                .expect("scanned post reduction owns its reducer")
+                .finish(ctx.query)?;
+            if !values_ready {
+                global.handle.set_post_reduction_values(values)?;
+            }
+        }
         global.handle.mark_finalized();
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)

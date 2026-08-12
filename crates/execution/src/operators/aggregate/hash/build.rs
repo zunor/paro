@@ -45,6 +45,7 @@ use crate::operators::aggregate::ordered_helpers::{
 use crate::operators::aggregate::payload_spill::{
     AggregatePayloadSpillBuffer, AggregateStateEncoding, AggregateStateSpillBuffer,
 };
+use crate::operators::aggregate::post_reduction::PostAggregateReducer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::operators::sort::build::query_has_temporary_directory;
@@ -78,6 +79,7 @@ pub struct HashAggregateBuildSinkExec {
 
 impl HashAggregateBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
+        self.spec.verify_post_reduction()?;
         let handle = ctx.handles.get(self.handle)?;
         if hash_aggregate_external_payload_spill_requested(ctx.query, &self.spec)
             && !query_has_temporary_directory(ctx.query)
@@ -489,6 +491,12 @@ impl HashAggregateBuildSinkExec {
                 "hash aggregate sink global state mismatch",
             ));
         };
+        let mut post_reducer = self
+            .spec
+            .post_reduction
+            .as_ref()
+            .map(|spec| PostAggregateReducer::try_new(spec, ctx.query))
+            .transpose()?;
         global.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
                 return Err(paro_error::internal(
@@ -517,6 +525,7 @@ impl HashAggregateBuildSinkExec {
                 &group_refs,
                 &grouping_sets,
                 global,
+                post_reducer.as_mut(),
             )?;
             if global.spilled_outputs.is_some() {
                 return Ok(());
@@ -539,8 +548,23 @@ impl HashAggregateBuildSinkExec {
                 &query_modifier_memory(ctx.query),
                 &mut global.ordered_collectors,
                 &mut global.tables,
-            )
+            )?;
+            if let Some(reducer) = post_reducer.as_mut() {
+                for table in &mut global.tables {
+                    table.visit_finalized_aggregates(
+                        VECTOR_SIZE,
+                        ctx.query.allocator(MemoryTag::HashTable),
+                        |aggregates| reducer.consume(aggregates),
+                    )?;
+                }
+            }
+            Ok(())
         })?;
+        if let Some(reducer) = post_reducer {
+            global
+                .handle
+                .set_post_reduction_values(reducer.finish(ctx.query)?)?;
+        }
         global.handle.mark_finalized();
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
@@ -922,6 +946,7 @@ fn replay_spilled_payloads(
     group_refs: &[usize],
     grouping_sets: &[Box<[usize]>],
     state: &mut HashAggregateRuntimeState,
+    post_reducer: Option<&mut PostAggregateReducer>,
 ) -> Result<()> {
     if state.spilled_payloads.is_empty() {
         return Ok(());
@@ -948,6 +973,7 @@ fn replay_spilled_payloads(
         state,
         &spilled_payloads,
         &spilled_states,
+        post_reducer,
     )?;
     let spilled_bytes = payload_spilled_bytes
         .saturating_add(state_spilled_bytes)
@@ -974,6 +1000,7 @@ fn spill_payload_partitions_to_outputs(
     state: &mut HashAggregateRuntimeState,
     spilled_payloads: &[crate::operators::aggregate::payload_spill::AggregateSpilledPayload],
     spilled_states: &[crate::operators::aggregate::payload_spill::AggregateSpilledState],
+    mut post_reducer: Option<&mut PostAggregateReducer>,
 ) -> Result<usize> {
     let Some(first_payload) = spilled_payloads.first() else {
         return Ok(0);
@@ -1110,6 +1137,7 @@ fn spill_payload_partitions_to_outputs(
             &mut partition_tables,
             ctx.query.session.buffer_pool().clone(),
             query_hash_table_memory(ctx.query),
+            post_reducer.as_deref_mut(),
         )?;
     }
 
@@ -1246,6 +1274,7 @@ fn append_partition_tables_to_output_writers(
     tables: &mut [AggregateHashTable],
     buffer_pool: Arc<BufferPool>,
     memory: MemoryAccountingContext,
+    mut post_reducer: Option<&mut PostAggregateReducer>,
 ) -> Result<()> {
     if writers.is_none() {
         *writers = Some(
@@ -1283,6 +1312,16 @@ fn append_partition_tables_to_output_writers(
         let mut chunk = Chunk::try_initialize(&output_types, VECTOR_SIZE, table.allocator())?;
         let mut position = Default::default();
         while table.scan(&mut position, &mut chunk)? {
+            if let Some(reducer) = post_reducer.as_deref_mut() {
+                let aggregate_count = table.aggregate_count();
+                let group_count = chunk.column_count().saturating_sub(aggregate_count);
+                let mut aggregates = Chunk::from_arc_vectors(
+                    chunk.data[group_count..].to_vec(),
+                    chunk.allocator().clone(),
+                );
+                aggregates.try_set_cardinality(chunk.size())?;
+                reducer.consume(&aggregates)?;
+            }
             let writer = writers
                 .get_mut(table_idx)
                 .and_then(Option::as_mut)

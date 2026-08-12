@@ -217,6 +217,34 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             }
 
             // =========================================================================
+            // Special case: Aggregate with an optional post-reduction domain
+            //
+            // Ordinary GROUP BY and aggregate inputs are evaluated against the
+            // child and therefore resolve normally. Post-reduction reducers and
+            // their predicate intentionally retain logical bindings to finalized
+            // aggregate outputs; the physical aggregate generator validates and
+            // rebases those independent local domains after this resolver runs.
+            // =========================================================================
+            LogicalOperator::Aggregate(aggregate) => {
+                self.visit_logical_plan(aggregate.child.as_mut());
+                self.scope = "Aggregate input expression".to_string();
+                for expression in &mut aggregate.groups {
+                    self.visit_expression(expression);
+                }
+                for expression in &mut aggregate.aggregates {
+                    self.visit_expression(expression);
+                }
+                if self.error.is_none() {
+                    if let Err(error) = aggregate.verify_post_reduction() {
+                        self.error = Some(error);
+                    }
+                }
+
+                self.bindings = op.get_column_bindings();
+                self.types = op.types();
+            }
+
+            // =========================================================================
             // Special case: Create Index
             // Add the columns of the table with table index 0 to the binding set,
             // then bind the expressions of the CREATE INDEX statement

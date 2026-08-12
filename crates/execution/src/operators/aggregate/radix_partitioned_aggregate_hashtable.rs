@@ -194,6 +194,29 @@ impl AggregateHashTable {
         }
     }
 
+    /// Visit finalized aggregate columns across every physical partition
+    /// while retaining the table for the later output scan.
+    pub(crate) fn visit_finalized_aggregates(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+        mut visit: impl FnMut(&Chunk) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Flat(table) => table.visit_finalized_aggregates(capacity, allocator, &mut visit),
+            Self::Radix(table) => {
+                for partition in &mut table.partitions {
+                    partition.visit_finalized_aggregates(
+                        capacity,
+                        allocator.clone(),
+                        &mut visit,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn new_flat(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
