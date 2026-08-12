@@ -4,6 +4,8 @@
 use paro_common::allocator::MemoryTag;
 use paro_function::scalar::FunctionExecContext;
 
+use crate::explain::profiler::{OperatorProfilePhase, ProfileMorselRange};
+
 use super::helpers::finish_context;
 use super::parallel_finish::run_parallel_finish_tasks;
 use super::*;
@@ -216,7 +218,7 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
-        ctx.profiler.start_operator(sink_node_id);
+        let phase_timer = ctx.profiler.start_phase();
         let poll = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -231,7 +233,15 @@ impl PipelineTaskExecutor {
                 .exec
                 .prepare_finish(&mut finish_ctx, &self.runtime.sink_global)
         };
-        ctx.profiler.cancel_operator(sink_node_id);
+        if poll.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerPrepareFinish,
+                phase_timer,
+                0,
+                None,
+            );
+        }
         let poll = poll?;
 
         match poll {
@@ -300,7 +310,7 @@ impl PipelineTaskExecutor {
 
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
-        ctx.profiler.start_operator(sink_node_id);
+        let phase_timer = ctx.profiler.start_phase();
         let work = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -315,7 +325,15 @@ impl PipelineTaskExecutor {
                 .exec
                 .finish_work(&mut finish_ctx, &self.runtime.sink_global)
         };
-        ctx.profiler.cancel_operator(sink_node_id);
+        if work.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishWork,
+                phase_timer,
+                0,
+                None,
+            );
+        }
         let work = work?;
 
         match work {
@@ -415,6 +433,8 @@ impl PipelineTaskExecutor {
         group: &FinishTaskGroup,
         task_id: FinishTaskId,
     ) -> Result<TaskStepResult> {
+        let sink_node_id = self.runtime.program.sink.operator_id.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
         let task_result = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -425,6 +445,19 @@ impl PipelineTaskExecutor {
             );
             group.driver.run_task(task_id, &mut finish_ctx)
         };
+        if task_result.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishTask,
+                phase_timer,
+                0,
+                Some(ProfileMorselRange::new(
+                    "finish_task",
+                    u64::from(task_id.0),
+                    u64::from(task_id.0) + 1,
+                )),
+            );
+        }
         let poll = match task_result {
             Ok(poll) => poll,
             Err(error) => {
@@ -505,6 +538,8 @@ impl PipelineTaskExecutor {
             group.clone(),
             task_ids,
             ctx.query.allocator(MemoryTag::Allocator),
+            ctx.profiler,
+            self.runtime.program.sink.operator_id.index() as u64,
         );
         if let Err(error) = result {
             self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
@@ -520,6 +555,8 @@ impl PipelineTaskExecutor {
         ctx: &mut PipelineTaskStepContext<'_>,
         group: &FinishTaskGroup,
     ) -> Result<()> {
+        let sink_node_id = self.runtime.program.sink.operator_id.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
         let mut finish_ctx = finish_context(
             ctx,
             self.runtime.program.id,
@@ -527,7 +564,17 @@ impl PipelineTaskExecutor {
             None,
             &self.task,
         );
-        if let Err(error) = group.driver.finish_group(&mut finish_ctx) {
+        let result = group.driver.finish_group(&mut finish_ctx);
+        if result.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishGroup,
+                phase_timer,
+                0,
+                None,
+            );
+        }
+        if let Err(error) = result {
             self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
             return Err(error);
         }
@@ -561,6 +608,7 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
         ctx.profiler.start_operator(sink_node_id);
         let poll = {
             let mut finish_ctx = finish_context(
@@ -580,6 +628,15 @@ impl PipelineTaskExecutor {
             Ok(FinishPoll::DoneWithResult(chunk)) => chunk.size() as u64,
             _ => 0,
         };
+        if poll.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinish,
+                phase_timer,
+                output_rows,
+                None,
+            );
+        }
         if output_rows == 0 {
             ctx.profiler.cancel_operator(sink_node_id);
         } else {

@@ -5,13 +5,9 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::{Allocator, MemoryTag};
+use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 
-use crate::memory_runtime::{
-    LocalMemoryGrant, OperatorMemoryAccount, DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
-};
 use crate::pipeline::graph::SinkSharing;
 use crate::pipeline::handles::BreakerHandleCatalog;
 use crate::pipeline::program::PipelineProgram;
@@ -172,15 +168,7 @@ impl PipelineRuntime {
         };
 
         let scratch = self.program.scratch.create_scratch(allocator.clone())?;
-        let account = Arc::new(OperatorMemoryAccount::new(query.memory.clone()));
-        let owner: Arc<dyn MemoryOwner> = account;
-        let memory = TaskMemoryGrants::new(LocalMemoryGrant::new(
-            owner,
-            DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
-            MemoryTag::Allocator,
-            MemoryAccountingClass::NonRevocable,
-            allocator.clone(),
-        )?);
+        let memory = TaskMemoryGrants::query_accounted(query.memory.clone(), allocator.clone())?;
 
         Ok(PipelineTaskState {
             source,

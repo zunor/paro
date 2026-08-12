@@ -166,6 +166,7 @@ pub use scheduling_policy::{
     FairnessPolicy, PipelineReadyEvent, PipelineReadyPriority, PipelineSchedulingPolicy,
     ReadyEntry, ReadyQueuePolicy, WakeStormPolicy,
 };
+pub(crate) use scratch::FinishTaskState;
 pub use scratch::{
     ChunkLayout, ChunkLayoutKind, ChunkLease, ExpressionScratchArena, ExpressionScratchLease,
     PendingChunkState, PipelineScratch, PipelineScratchLayout, PipelineTaskState, SinkResumeState,

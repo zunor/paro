@@ -8,11 +8,14 @@ use std::sync::Arc;
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
-use paro_common::memory::MemoryAccountingClass;
+use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 
-use crate::memory_runtime::{LocalMemoryGrant, OperatorMemoryScope};
+use crate::memory_runtime::{
+    LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope, QueryMemoryPool,
+    DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+};
 
 use super::context::RetainedMemorySnapshot;
 use super::state::{SinkLocal, SourceLocal, TransformLocal};
@@ -327,9 +330,52 @@ impl TaskMemoryGrants {
         Self { operator }
     }
 
+    /// Create a task-local grant owned by the query memory hierarchy.
+    pub(crate) fn query_accounted(
+        query_memory: Arc<QueryMemoryPool>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let account = Arc::new(OperatorMemoryAccount::new(query_memory));
+        let owner: Arc<dyn MemoryOwner> = account;
+        Ok(Self::new(LocalMemoryGrant::new(
+            owner,
+            DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+            MemoryTag::Allocator,
+            MemoryAccountingClass::NonRevocable,
+            allocator,
+        )?))
+    }
+
     #[inline]
     pub fn call_scope(&self) -> OperatorMemoryScope<'_> {
         OperatorMemoryScope::new(&self.operator)
+    }
+}
+
+/// State owned by a scheduler-dispatched finish sub-task.
+///
+/// Finish tasks operate only on pipeline-global state. Keeping their state
+/// separate from [`PipelineTaskState`] makes it impossible to accidentally
+/// construct source/transform/sink locals or vector scratch for completion
+/// work, while retaining the same query-owned memory grant contract.
+#[derive(Debug)]
+pub(crate) struct FinishTaskState {
+    memory: TaskMemoryGrants,
+}
+
+impl FinishTaskState {
+    pub(crate) fn try_new(
+        query_memory: Arc<QueryMemoryPool>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            memory: TaskMemoryGrants::query_accounted(query_memory, allocator)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn call_scope(&self) -> OperatorMemoryScope<'_> {
+        self.memory.call_scope()
     }
 }
 

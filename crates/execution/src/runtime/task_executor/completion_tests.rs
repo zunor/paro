@@ -2,7 +2,118 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::pipeline::program::{PipelineProgram, SinkSlot, SourceSlot};
 use crate::runtime::FinishCoordinatorParticipation;
+use crate::runtime::{
+    ChunkLayout, ClientResultSinkExec, DynGlobalState, DynLocalState, DynSourceExec,
+    DynStateTypeId, OperatorCallContext, OperatorRole, PipelineInitContext, PipelineScratchLayout,
+    RuntimeOperatorId, RuntimeOperatorOrigin, RuntimeRoleOrdinal, SinkExec, SourceExec,
+    SourceGlobal, SourceLocal, SourcePoll,
+};
+
+#[derive(Debug)]
+struct CountingSourceState;
+
+impl DynGlobalState for CountingSourceState {
+    fn state_type(&self) -> DynStateTypeId {
+        DynStateTypeId("counting_source")
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send + Sync) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send + Sync) {
+        self
+    }
+}
+
+impl DynLocalState for CountingSourceState {
+    fn state_type(&self) -> DynStateTypeId {
+        DynStateTypeId("counting_source")
+    }
+
+    fn as_any(&self) -> &(dyn std::any::Any + Send) {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut (dyn std::any::Any + Send) {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct CountingSourceExec {
+    local_creations: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DynSourceExec for CountingSourceExec {
+    fn create_global(&self, _ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
+        Ok(SourceGlobal::Dyn(Box::new(CountingSourceState)))
+    }
+
+    fn create_local(
+        &self,
+        _ctx: &mut PipelineInitContext,
+        _global: &SourceGlobal,
+    ) -> Result<SourceLocal> {
+        self.local_creations
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(SourceLocal::Dyn(Box::new(CountingSourceState)))
+    }
+
+    fn poll_next(
+        &self,
+        _ctx: &mut OperatorCallContext,
+        _global: &SourceGlobal,
+        _local: &mut SourceLocal,
+        _output: &mut Chunk,
+    ) -> Result<SourcePoll> {
+        Ok(SourcePoll::Finished)
+    }
+}
+
+fn counting_local_runtime(
+    query: &QueryRuntimeContext,
+    local_creations: Arc<std::sync::atomic::AtomicUsize>,
+) -> Arc<PipelineRuntime> {
+    let pipeline = PipelineId::new(0);
+    let program = Arc::new(PipelineProgram {
+        id: pipeline,
+        source: SourceSlot {
+            operator_id: RuntimeOperatorId::new(0),
+            origin: RuntimeOperatorOrigin::new(
+                pipeline,
+                OperatorRole::Source,
+                RuntimeRoleOrdinal::new(0),
+            ),
+            exec: SourceExec::Dyn(Box::new(CountingSourceExec { local_creations })),
+        },
+        transforms: Box::new([]),
+        sink: SinkSlot {
+            operator_id: RuntimeOperatorId::new(1),
+            origin: RuntimeOperatorOrigin::new(
+                pipeline,
+                OperatorRole::Sink,
+                RuntimeRoleOrdinal::new(0),
+            ),
+            exec: SinkExec::ClientResult(ClientResultSinkExec {
+                spec: ClientResultSpec::default(),
+            }),
+        },
+        sink_sharing: SinkSharing::Exclusive,
+        scratch: PipelineScratchLayout::new(
+            ChunkLayout::new(Vec::<LogicalType>::new(), VECTOR_SIZE),
+            Vec::new(),
+            VECTOR_SIZE,
+        ),
+        properties: PipelineProperties::default(),
+    });
+    Arc::new(
+        PipelineRuntime::from_catalog(program, &Default::default(), query.params.clone(), query)
+            .expect("counting runtime"),
+    )
+}
 
 #[test]
 fn client_result_sink_backpressure_retains_sink_input_without_clone() {
@@ -116,6 +227,41 @@ fn client_result_sink_repeated_backpressure_writes_pending_chunk_once() {
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(7));
     assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(8));
     assert!(output.pop_front().is_none());
+}
+
+#[test]
+fn successful_zero_row_completion_records_every_breaker_finish_boundary() {
+    let shared_profile = ExplainProfiler::new();
+    let query = query_context(QueryOutputPort::unbounded());
+    let runtime = empty_runtime(&query);
+    let task = runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("task state");
+    let mut executor = PipelineTaskExecutor::new(runtime, task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(20),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::new(shared_profile.clone());
+
+    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+    profiler.flush();
+
+    let snapshot = shared_profile.snapshot();
+    for phase in [
+        "breaker_prepare_finish",
+        "breaker_finish_work",
+        "breaker_finish",
+    ] {
+        let event = snapshot
+            .events
+            .iter()
+            .find(|event| event.phase == phase)
+            .unwrap_or_else(|| panic!("missing successful {phase} phase"));
+        assert_eq!(event.rows, 0);
+        assert!(event.end_time_ms >= event.start_time_ms);
+    }
 }
 
 #[test]
@@ -293,6 +439,7 @@ struct ConcurrentFinishDriver {
     max_running: Arc<std::sync::atomic::AtomicUsize>,
     completed: Arc<std::sync::atomic::AtomicUsize>,
     group_finished: Arc<std::sync::atomic::AtomicUsize>,
+    all_tasks_query_accounted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl ConcurrentFinishDriver {
@@ -301,6 +448,7 @@ impl ConcurrentFinishDriver {
         max_running: Arc<std::sync::atomic::AtomicUsize>,
         completed: Arc<std::sync::atomic::AtomicUsize>,
         group_finished: Arc<std::sync::atomic::AtomicUsize>,
+        all_tasks_query_accounted: Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             task_count,
@@ -309,6 +457,7 @@ impl ConcurrentFinishDriver {
             max_running,
             completed,
             group_finished,
+            all_tasks_query_accounted,
         }
     }
 }
@@ -327,8 +476,17 @@ impl ParallelFinishDriver for ConcurrentFinishDriver {
     fn run_task(
         &self,
         _task: FinishTaskId,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
     ) -> Result<FinishTaskPoll> {
+        if ctx
+            .memory
+            .local_grant()
+            .and_then(|grant| grant.grant().owner())
+            .is_none()
+        {
+            self.all_tasks_query_accounted
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
         let now = self
             .running
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
@@ -399,12 +557,20 @@ fn finish_task_error_cancels_group_as_operator_error() {
 
 #[test]
 fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
-    let query = query_context(QueryOutputPort::unbounded());
+    let shared_profile = ExplainProfiler::new();
+    let query =
+        query_context(QueryOutputPort::unbounded()).with_explain_profiler(shared_profile.clone());
     query.session.scheduler().set_threads(4).expect("threads");
-    let runtime = empty_runtime(&query);
+    let local_creations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = counting_local_runtime(&query, local_creations.clone());
     let task = runtime
         .create_task_state(&query, paro_common::test_utils::test_allocator())
         .expect("task state");
+    assert_eq!(
+        local_creations.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the pipeline worker creates one source local"
+    );
     let mut executor = PipelineTaskExecutor::new(runtime, task);
     executor.phase = PipelineTaskPhase::Merging;
     executor.completion_stage = PipelineCompletionStage::FinishWork;
@@ -412,6 +578,7 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
     let max_running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let group_finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let all_tasks_query_accounted = Arc::new(std::sync::atomic::AtomicBool::new(true));
     executor.finish_group = Some(FinishTaskGroup {
         task_count: 4,
         driver: Arc::new(ConcurrentFinishDriver::new(
@@ -419,6 +586,7 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
             max_running.clone(),
             completed.clone(),
             group_finished.clone(),
+            all_tasks_query_accounted.clone(),
         )),
         memory_class: MemoryClass::Blocking,
         coordinator_participation: FinishCoordinatorParticipation::SingleTask,
@@ -429,9 +597,19 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
         task_id: PipelineTaskId(19),
         generation: WakeGeneration(0),
     };
-    let mut profiler = OperatorProfiler::disabled();
+    let mut profiler = OperatorProfiler::new(shared_profile.clone());
 
     run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
+    profiler.flush();
+    assert_eq!(
+        local_creations.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "parallel finish workers must not construct operator locals"
+    );
+    assert!(
+        all_tasks_query_accounted.load(std::sync::atomic::Ordering::Acquire),
+        "parallel finish workers must use owner-backed query memory grants"
+    );
 
     assert_eq!(
         completed.load(std::sync::atomic::Ordering::Acquire),
@@ -447,6 +625,27 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
         1,
         "the runtime should publish one completed finish group"
     );
+    let snapshot = shared_profile.snapshot();
+    let finish_tasks = snapshot
+        .events
+        .iter()
+        .filter(|event| event.phase == "breaker_finish_task")
+        .collect::<Vec<_>>();
+    assert_eq!(finish_tasks.len(), 4);
+    let mut task_ranges = finish_tasks
+        .iter()
+        .map(|event| event.morsel_range.expect("finish task range").start)
+        .collect::<Vec<_>>();
+    task_ranges.sort_unstable();
+    assert_eq!(task_ranges, vec![0, 1, 2, 3]);
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|event| event.phase == "breaker_finish_group"));
+    assert!(snapshot
+        .events
+        .iter()
+        .any(|event| event.phase == "breaker_finish" && event.rows == 0));
 }
 
 #[test]
