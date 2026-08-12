@@ -25,7 +25,6 @@ struct PerfectAggregateMergeDriver {
     handle: Arc<AggregateHandle>,
     merge: ParallelPerfectAggregateMerge,
     next_task: AtomicUsize,
-    remaining: AtomicUsize,
 }
 
 impl PerfectAggregateMergeDriver {
@@ -35,31 +34,18 @@ impl PerfectAggregateMergeDriver {
     ) -> FinishTaskGroup {
         let task_count = merge.task_count();
         FinishTaskGroup {
-            task_count_hint: task_count,
+            task_count,
             driver: Arc::new(Self {
                 handle,
                 merge,
                 next_task: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
             coordinator_participation: FinishCoordinatorParticipation::SingleTask,
         }
     }
 
-    fn complete_task(&self) -> Result<()> {
-        let remaining = self
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .map_err(|_| {
-                paro_error::internal("perfect aggregate merge completed more tasks than scheduled")
-            })?;
-        if remaining != 1 {
-            return Ok(());
-        }
-
+    fn publish_result(&self) -> Result<()> {
         let table = self.merge.finish()?;
         self.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Perfect(global) = state else {
@@ -102,8 +88,11 @@ impl ParallelFinishDriver for PerfectAggregateMergeDriver {
     ) -> Result<FinishTaskPoll> {
         ctx.cancel.check()?;
         self.merge.combine_task(task.0 as usize)?;
-        self.complete_task()?;
         Ok(FinishTaskPoll::Done)
+    }
+
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        self.publish_result()
     }
 }
 

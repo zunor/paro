@@ -35,7 +35,8 @@ pub struct HashJoinProbeTransformExec {
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
     pub key_conditions: Box<[JoinCondition]>,
-    pub residual_conditions: Box<[JoinCondition]>,
+    pub build_residual_conditions: Box<[JoinCondition]>,
+    pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
     pub output_types: Box<[LogicalType]>,
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
@@ -55,23 +56,17 @@ impl HashJoinProbeTransformExec {
         ctx: &mut PipelineInitContext,
         _global: &TransformGlobal,
     ) -> Result<TransformLocal> {
-        let mut reduction_channel_map = vec![0_u8; 256];
-        if let Some(grouped) = self
+        let probe_residual_conditions = self
+            .build_residual_conditions
+            .get(..self.probe_residual_count)
+            .ok_or_else(|| {
+                paro_error::internal("hash join probe residual prefix exceeds build layout")
+            })?;
+        let reduction_channel_map = self
             .reduction_cascade
             .as_ref()
             .and_then(|cascade| cascade.grouped_extrema.as_ref())
-        {
-            for source_mask in 0_u8..=u8::MAX {
-                let mut channel_mask = 0_u8;
-                for (channel_idx, channel) in grouped.channels.iter().enumerate() {
-                    if source_mask & channel.source_predicate_mask == channel.source_predicate_mask
-                    {
-                        channel_mask |= 1_u8 << channel_idx;
-                    }
-                }
-                reduction_channel_map[source_mask as usize] = channel_mask;
-            }
-        }
+            .map(|grouped| Arc::clone(&grouped.channel_map));
         Ok(TransformLocal::HashJoinProbe(HashJoinProbeTransformLocal {
             scan_structure: None,
             probe_keys: None,
@@ -88,7 +83,7 @@ impl HashJoinProbeTransformExec {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             residual: HashJoinResidualProbeState::new(
-                &self.residual_conditions,
+                probe_residual_conditions,
                 ctx.query.session.as_ref(),
             ),
             reduction_residuals: self
@@ -99,15 +94,24 @@ impl HashJoinProbeTransformExec {
                         .predicates
                         .iter()
                         .map(|predicate| {
-                            HashJoinResidualProbeState::new_at_offset(
-                                std::slice::from_ref(&predicate.condition),
+                            let condition = self
+                                .build_residual_conditions
+                                .get(predicate.build_residual_offset)
+                                .ok_or_else(|| {
+                                    paro_error::internal(
+                                        "reduction residual offset exceeds build layout",
+                                    )
+                                })?;
+                            Ok(HashJoinResidualProbeState::new_at_offset(
+                                std::slice::from_ref(condition),
                                 predicate.build_residual_offset,
                                 ctx.query.session.as_ref(),
-                            )
+                            ))
                         })
-                        .collect::<Vec<_>>()
-                        .into_boxed_slice()
+                        .collect::<Result<Vec<_>>>()
+                        .map(Vec::into_boxed_slice)
                 })
+                .transpose()?
                 .unwrap_or_default(),
             reduction_source_predicates: self
                 .reduction_cascade
@@ -352,7 +356,11 @@ impl HashJoinProbeTransformExec {
                             };
                             let source_mask = local.reduction_source_masks[value_idx];
                             let eligible_channels =
-                                local.reduction_channel_map[source_mask as usize];
+                                local.reduction_channel_map.as_ref().ok_or_else(|| {
+                                    paro_error::internal(
+                                        "grouped reduction is missing its channel map",
+                                    )
+                                })?[source_mask as usize];
                             let mut remaining = eligible_channels;
                             while remaining != 0 {
                                 let channel_idx = remaining.trailing_zeros() as usize;

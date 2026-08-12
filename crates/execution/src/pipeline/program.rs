@@ -1,8 +1,6 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable runtime program image compiled from a lowered pipeline graph.
-
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
@@ -368,7 +366,7 @@ impl OperatorRuntimeRegistry {
                 right_handle: HandleRef::new(spec.right_handle),
                 join_type: spec.spec.join_type,
                 conditions: spec.spec.conditions.clone(),
-                mark_null_condition_start: spec.spec.mark_null_condition_start,
+                mark_semantics: spec.spec.mark_semantics,
                 left_projection: spec.spec.left_projection.clone(),
                 right_projection: spec.spec.right_projection.clone(),
                 right_output_types: spec.spec.right_output_types.clone(),
@@ -387,7 +385,8 @@ impl OperatorRuntimeRegistry {
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
                     key_conditions: spec.key_conditions.clone(),
-                    residual_conditions: spec.residual_conditions.clone(),
+                    build_residual_conditions: spec.build_residual_conditions.clone(),
+                    probe_residual_count: spec.probe_residual_count,
                     probe_types: spec.probe_types.clone(),
                     build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
@@ -476,7 +475,8 @@ impl OperatorRuntimeRegistry {
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
                     key_conditions: spec.key_conditions.clone(),
-                    residual_conditions: spec.residual_conditions.clone(),
+                    build_residual_conditions: spec.build_residual_conditions.clone(),
+                    probe_residual_count: spec.probe_residual_count,
                     left_projection: spec.left_projection.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
@@ -487,7 +487,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     conditions: spec.conditions.clone(),
-                    mark_null_condition_start: spec.mark_null_condition_start,
+                    mark_semantics: spec.mark_semantics,
                     arbitrary_condition: spec.arbitrary_condition.clone(),
                     left_projection: spec.left_projection.clone(),
                     right_projection: spec.right_projection.clone(),
@@ -500,7 +500,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     conditions: spec.conditions.clone(),
-                    mark_null_condition_start: spec.mark_null_condition_start,
+                    mark_semantics: spec.mark_semantics,
                     left_projection: spec.left_projection.clone(),
                     right_projection: spec.right_projection.clone(),
                     right_output_types: spec.right_output_types.clone(),
@@ -852,7 +852,8 @@ mod tests {
 
     use super::*;
     use crate::pipeline::graph::{
-        ClientResultSpec, ControlRegion, PipelineGraph, PipelineRoot, PipelineSpec,
+        ClientResultSpec, ControlRegion, HashJoinBuildSinkSpec, HashJoinProbeSpec,
+        HashJoinSpillReplaySourceSpec, PipelineGraph, PipelineRoot, PipelineSpec,
         RecursiveCteDedup, RecursiveCteRegion, RecursiveTermination, SinkSharing,
     };
     use crate::pipeline::handles::{
@@ -1336,36 +1337,34 @@ mod tests {
             pipelines: vec![
                 PipelineSpec {
                     id: PipelineId::new(0),
-                    source: SourceSpec::HashJoinSpillReplay(
-                        super::super::graph::HashJoinSpillReplaySourceSpec {
-                            handle: join,
-                            join_type: JoinType::Inner,
-                            anti_join_mode: AntiJoinMode::Regular,
-                            key_conditions: Box::new([join_condition()]),
-                            residual_conditions: Box::default(),
-                            probe_types: Box::new([LogicalType::Integer]),
-                            build_payload_types: Box::new([LogicalType::Integer]),
-                            build_output_count: 1,
-                            left_projection: Box::new([0]),
-                            output_names: Box::new(["l".to_string(), "r".to_string()]),
-                            output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
-                            reduction_cascade: None,
-                        },
-                    ),
-                    transforms: vec![TransformSpec::HashJoinProbe(
-                        super::super::graph::HashJoinProbeSpec {
-                            handle: join,
-                            join_type: JoinType::Inner,
-                            anti_join_mode: AntiJoinMode::Regular,
-                            key_conditions: Box::new([join_condition()]),
-                            residual_conditions: Box::default(),
-                            left_projection: Box::new([0]),
-                            output_names: Box::new(["l".to_string(), "r".to_string()]),
-                            output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
-                            reduction_cascade: None,
-                        },
-                    )],
-                    sink: SinkSpec::HashJoinBuild(super::super::graph::HashJoinBuildSinkSpec {
+                    source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
+                        handle: join,
+                        join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: Box::new([join_condition()]),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
+                        probe_types: Box::new([LogicalType::Integer]),
+                        build_payload_types: Box::new([LogicalType::Integer]),
+                        build_output_count: 1,
+                        left_projection: Box::new([0]),
+                        output_names: Box::new(["l".to_string(), "r".to_string()]),
+                        output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                        reduction_cascade: None,
+                    }),
+                    transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                        handle: join,
+                        join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: Box::new([join_condition()]),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
+                        left_projection: Box::new([0]),
+                        output_names: Box::new(["l".to_string(), "r".to_string()]),
+                        output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                        reduction_cascade: None,
+                    })],
+                    sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                         handle: join,
                         join_type: JoinType::Inner,
                         key_conditions: Box::new([join_condition()]),

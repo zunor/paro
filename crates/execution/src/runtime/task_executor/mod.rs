@@ -95,6 +95,7 @@ pub struct PipelineTaskExecutor {
     output_more_continuations: VecDeque<usize>,
     finish_group: Option<FinishTaskGroup>,
     active_finish_task: Option<super::context::FinishTaskId>,
+    finish_tasks_completed: usize,
     defer_shared_producer_merge: bool,
     call_context: OperatorCallContextCell,
 }
@@ -112,6 +113,7 @@ impl PipelineTaskExecutor {
             output_more_continuations: VecDeque::new(),
             finish_group: None,
             active_finish_task: None,
+            finish_tasks_completed: 0,
             defer_shared_producer_merge: false,
             call_context,
         }

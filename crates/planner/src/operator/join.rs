@@ -293,6 +293,28 @@ impl JoinSide {
     }
 }
 
+/// Truth-value contract for a comparison MARK join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkJoinSemantics {
+    /// The operator does not expose a marker.
+    NotMark,
+    /// EXISTS-style marker: only TRUE/FALSE are observable.
+    TwoValued,
+    /// IN/ANY-style marker: NULL results from this condition onward contribute
+    /// SQL UNKNOWN; preceding correlation conditions only select RHS rows.
+    ThreeValuedFrom(usize),
+}
+
+impl MarkJoinSemantics {
+    pub fn for_join_type(join_type: JoinType) -> Self {
+        if join_type == JoinType::Mark {
+            Self::ThreeValuedFrom(0)
+        } else {
+            Self::NotMark
+        }
+    }
+}
+
 /// ComparisonJoin represents a join with comparison conditions.
 /// This is the most common type of join (e.g., a.id = b.id).
 #[derive(Debug)]
@@ -309,13 +331,8 @@ pub struct ComparisonJoin {
     pub conditions: Vec<JoinCondition>,
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
-    /// First condition whose NULL result contributes UNKNOWN to a MARK join.
-    ///
-    /// Correlated MARK joins evaluate correlation predicates before the actual
-    /// ANY/IN payload comparison. NULL in those correlation predicates means
-    /// the RHS row is not part of this outer row's subquery result, while NULL
-    /// in the payload comparison preserves SQL UNKNOWN semantics.
-    pub mark_null_condition_start: Option<usize>,
+    /// Explicit truth-value semantics for MARK output.
+    pub mark_semantics: MarkJoinSemantics,
     /// Columns that are duplicate-eliminated and pushed into the RHS.
     pub duplicate_eliminated_columns: Vec<Expression>,
     /// Whether the delim join has been flipped to de-duplicating the RHS instead.
@@ -349,7 +366,7 @@ impl ComparisonJoin {
             right: Box::new(right),
             conditions,
             mark_index: None,
-            mark_null_condition_start: matches!(join_type, JoinType::Mark).then_some(0),
+            mark_semantics: MarkJoinSemantics::for_join_type(join_type),
             duplicate_eliminated_columns: vec![],
             delim_flipped: false,
             left_projection_map,
@@ -362,7 +379,7 @@ impl ComparisonJoin {
         self.join_type = JoinType::Anti;
         self.anti_join_mode = AntiJoinMode::NullAware;
         self.mark_index = None;
-        self.mark_null_condition_start = None;
+        self.mark_semantics = MarkJoinSemantics::NotMark;
     }
 
     /// Check if this join has at least one equality condition.

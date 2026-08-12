@@ -772,7 +772,8 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
-                    residual_conditions: Box::default(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
@@ -1025,7 +1026,8 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     join_type: JoinType::Left,
                     anti_join_mode: AntiJoinMode::Regular,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
-                    residual_conditions: Box::default(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]

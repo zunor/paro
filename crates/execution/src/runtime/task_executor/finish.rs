@@ -324,6 +324,12 @@ impl PipelineTaskExecutor {
                 Ok(TaskStepResult::Continue)
             }
             FinishWork::Parallel(group) => {
+                if group.task_count == 0 {
+                    return Err(paro_common::error::internal(
+                        "finish group must declare at least one task",
+                    ));
+                }
+                self.finish_tasks_completed = 0;
                 self.finish_group = Some(group);
                 self.drive_parallel_finish(ctx)
             }
@@ -339,7 +345,7 @@ impl PipelineTaskExecutor {
             .take()
             .expect("finish group must exist while driving parallel finish");
 
-        if group.task_count_hint > 1 && self.active_finish_task.is_none() {
+        if group.task_count > 1 && self.active_finish_task.is_none() {
             let result = self.drive_parallel_finish_group(ctx, &group);
             if matches!(result, Ok(TaskStepResult::Blocked(_))) {
                 self.finish_group = Some(group);
@@ -386,6 +392,13 @@ impl PipelineTaskExecutor {
                 result
             }
             NextFinishTask::Drained => {
+                if self.finish_tasks_completed != group.task_count {
+                    return Err(paro_common::error::internal(format!(
+                        "finish group task count mismatch: declared={}, completed={}",
+                        group.task_count, self.finish_tasks_completed
+                    )));
+                }
+                self.finish_parallel_group(ctx, &group)?;
                 self.completion_stage = PipelineCompletionStage::Finish;
                 Ok(TaskStepResult::Continue)
             }
@@ -427,6 +440,10 @@ impl PipelineTaskExecutor {
         match poll {
             FinishTaskPoll::Done => {
                 self.active_finish_task = None;
+                self.finish_tasks_completed = self
+                    .finish_tasks_completed
+                    .checked_add(1)
+                    .ok_or_else(|| paro_common::error::internal("finish task count overflow"))?;
                 Ok(TaskStepResult::Continue)
             }
             FinishTaskPoll::Pending(blocker) => Ok(self.block(PipelineTaskPhase::Merging, blocker)),
@@ -438,7 +455,7 @@ impl PipelineTaskExecutor {
         ctx: &mut PipelineTaskStepContext<'_>,
         group: &FinishTaskGroup,
     ) -> Result<TaskStepResult> {
-        let mut task_ids = Vec::with_capacity(group.task_count_hint);
+        let mut task_ids = Vec::with_capacity(group.task_count);
         loop {
             let next = {
                 let mut finish_ctx = finish_context(
@@ -470,8 +487,16 @@ impl PipelineTaskExecutor {
         }
 
         if task_ids.is_empty() {
-            self.completion_stage = PipelineCompletionStage::Finish;
-            return Ok(TaskStepResult::Continue);
+            return Err(paro_common::error::internal(
+                "parallel finish group issued no tasks",
+            ));
+        }
+        if task_ids.len() != group.task_count {
+            return Err(paro_common::error::internal(format!(
+                "parallel finish group task count mismatch: declared={}, issued={}",
+                group.task_count,
+                task_ids.len()
+            )));
         }
 
         let result = run_parallel_finish_tasks(
@@ -485,8 +510,28 @@ impl PipelineTaskExecutor {
             self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
             return Err(error);
         }
+        self.finish_parallel_group(ctx, group)?;
         self.completion_stage = PipelineCompletionStage::Finish;
         Ok(TaskStepResult::Continue)
+    }
+
+    fn finish_parallel_group(
+        &mut self,
+        ctx: &mut PipelineTaskStepContext<'_>,
+        group: &FinishTaskGroup,
+    ) -> Result<()> {
+        let mut finish_ctx = finish_context(
+            ctx,
+            self.runtime.program.id,
+            self.runtime.program.sink.operator_id,
+            None,
+            &self.task,
+        );
+        if let Err(error) = group.driver.finish_group(&mut finish_ctx) {
+            self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn cancel_finish_group(

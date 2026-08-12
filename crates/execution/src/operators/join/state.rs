@@ -28,7 +28,7 @@ pub struct HashJoinProbeTransformLocal {
     pub reduction_residuals: Box<[Option<HashJoinResidualProbeState>]>,
     pub reduction_source_predicates: Box<[ReductionSourcePredicateState]>,
     pub reduction_source_masks: Vec<u8>,
-    pub reduction_channel_map: Vec<u8>,
+    pub reduction_channel_map: Option<Arc<[u8; 256]>>,
     pub reduction_selection: Option<SelectionVector>,
     pub(crate) reduction_mode: ReductionProbeMode,
     pub reduction_group_slots: Vec<usize>,

@@ -82,7 +82,7 @@ pub use graph_scan::GraphScan;
 pub use insert::{Insert, InsertOnConflict, InsertOnConflictAction};
 pub use join::{
     AntiJoinMode, AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition,
-    JoinSide, JoinType,
+    JoinSide, JoinType, MarkJoinSemantics,
 };
 pub use limit::Limit;
 pub use operator_type::LogicalOperatorType;

@@ -315,20 +315,15 @@ impl HashJoinBuildSinkExec {
                     handle.as_ref(),
                 ));
             if !handle.completion.is_complete() && !handle.is_external() {
-                let runtime_filter_installed = publish_runtime_filter(ctx, handle.as_ref())?;
                 let table = handle.require_table()?;
                 if let Some(build) = table.prepare_parallel_direct_integer_index()? {
                     return Ok(FinishWork::Parallel(
                         ParallelDirectJoinFinalizeDriver::group(
                             handle,
                             build,
-                            runtime_filter_installed,
                             ctx.query.session.number_of_threads().max(1),
                         ),
                     ));
-                }
-                if runtime_filter_installed {
-                    record_runtime_filter_installed(ctx);
                 }
             }
         }
@@ -411,53 +406,28 @@ fn finalize_in_memory_hash_join(
 struct ParallelDirectJoinFinalizeDriver {
     handle: Arc<JoinBuildHandle>,
     build: ParallelDirectIntegerIndexBuild,
-    runtime_filter_installed: bool,
     worker_count: usize,
     next_task: AtomicUsize,
-    remaining: AtomicUsize,
 }
 
 impl ParallelDirectJoinFinalizeDriver {
     fn group(
         handle: Arc<JoinBuildHandle>,
         build: ParallelDirectIntegerIndexBuild,
-        runtime_filter_installed: bool,
         max_workers: usize,
     ) -> FinishTaskGroup {
         let task_count = build.block_count().min(max_workers).max(1);
         FinishTaskGroup {
-            task_count_hint: task_count,
+            task_count,
             driver: Arc::new(Self {
                 handle,
                 build,
-                runtime_filter_installed,
                 worker_count: task_count,
                 next_task: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
             coordinator_participation: FinishCoordinatorParticipation::SingleTask,
         }
-    }
-
-    fn complete_task(&self, ctx: &mut OperatorFinishContext) -> Result<()> {
-        let remaining = self
-            .remaining
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
-                remaining.checked_sub(1)
-            })
-            .map_err(|_| {
-                paro_error::internal("direct join index completed more tasks than scheduled")
-            })?;
-        if remaining != 1 {
-            return Ok(());
-        }
-        self.build.complete()?;
-        self.handle.completion.mark_complete();
-        if self.runtime_filter_installed {
-            record_runtime_filter_installed(ctx);
-        }
-        Ok(())
     }
 }
 
@@ -484,8 +454,17 @@ impl ParallelFinishDriver for ParallelDirectJoinFinalizeDriver {
             ctx.cancel.check()?;
             self.build.build_block(block_idx)?;
         }
-        self.complete_task(ctx)?;
         Ok(FinishTaskPoll::Done)
+    }
+
+    fn finish_group(&self, ctx: &mut OperatorFinishContext) -> Result<()> {
+        self.build.complete()?;
+        let runtime_filter_installed = publish_runtime_filter(ctx, self.handle.as_ref())?;
+        self.handle.completion.mark_complete();
+        if runtime_filter_installed {
+            record_runtime_filter_installed(ctx);
+        }
+        Ok(())
     }
 
     fn cancel_group(&self, ctx: &mut OperatorCleanupContext, _reason: CancelReason) -> Result<()> {

@@ -14,6 +14,11 @@ use super::super::integer_index::{
 };
 use super::{IntegerIndexBuildStats, JoinHashTable};
 
+pub(super) struct BuiltIntegerIndex {
+    pub(super) index: ExactIntegerJoinIndex,
+    pub(super) has_long_chains: bool,
+}
+
 /// Scheduler-facing direct-index build prepared after all build stores have
 /// been merged. A bounded set of scheduler workers dynamically claims
 /// immutable row slabs; the final successful worker publishes the index
@@ -59,25 +64,11 @@ impl ParallelDirectIntegerIndexBuild {
             .as_ref()
             .cloned()
             .ok_or_else(|| paro_error::internal("direct join index was already completed"))?;
-        for row_idx in 0..block.row_count() {
-            // SAFETY: build completion freezes the store, `table` retains its
-            // slabs, and this task stays within its assigned block.
-            let row_ptr = unsafe { block.row_ptr(row_idx) };
-            let ordinal = self
-                .kind
-                .row_ordinal(self.table.build_row_layout.base(), row_ptr as *const u8, 0)
-                .ok_or_else(|| {
-                    paro_error::internal(format!(
-                        "integer join build key does not match declared type {:?}",
-                        self.table.equality_types[0]
-                    ))
-                })?;
-            if let Some(previous) = builder.insert(ordinal, row_ptr)? {
-                self.table
-                    .build_row_layout
-                    .set_next(row_ptr as *mut u8, previous as *const u8);
-                self.has_long_chains.store(true, Ordering::Relaxed);
-            }
+        if self
+            .table
+            .build_direct_integer_block(self.kind, builder.as_ref(), block)?
+        {
+            self.has_long_chains.store(true, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -89,12 +80,10 @@ impl ParallelDirectIntegerIndexBuild {
             })?;
         let builder = Arc::try_unwrap(builder)
             .map_err(|_| paro_error::internal("direct join index retained a task reference"))?;
-        self.table.chains_longer_than_one.store(
-            self.has_long_chains.load(Ordering::Relaxed),
-            Ordering::Relaxed,
-        );
-        self.table
-            .install_finalized_integer_index(builder.finish()?)
+        self.table.publish_integer_index(BuiltIntegerIndex {
+            index: builder.finish()?,
+            has_long_chains: self.has_long_chains.load(Ordering::Relaxed),
+        })
     }
 }
 
@@ -159,40 +148,24 @@ impl JoinHashTable {
         }))
     }
 
-    pub(super) fn try_build_direct_integer_index(&self) -> Result<Option<ExactIntegerJoinIndex>> {
+    pub(super) fn try_build_direct_integer_index(&self) -> Result<Option<BuiltIntegerIndex>> {
         let Some((kind, builder, blocks)) = self.prepare_direct_integer_index_builder()? else {
             return Ok(None);
         };
-        let has_long_chains = AtomicBool::new(false);
+        let mut has_long_chains = false;
         for block in &blocks {
-            for row_idx in 0..block.row_count() {
-                // SAFETY: the build store is immutable throughout finalization.
-                let row_ptr = unsafe { block.row_ptr(row_idx) };
-                let ordinal = kind
-                    .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
-                    .ok_or_else(|| {
-                        paro_error::internal(format!(
-                            "integer join build key does not match declared type {:?}",
-                            self.equality_types[0]
-                        ))
-                    })?;
-                if let Some(previous) = builder.insert(ordinal, row_ptr)? {
-                    self.build_row_layout
-                        .set_next(row_ptr as *mut u8, previous as *const u8);
-                    has_long_chains.store(true, Ordering::Relaxed);
-                }
-            }
+            has_long_chains |= self.build_direct_integer_block(kind, builder.as_ref(), *block)?;
         }
         let builder = Arc::try_unwrap(builder).map_err(|_| {
             paro_error::internal("direct join index retained a temporary reference")
         })?;
-        let index = builder.finish()?;
-        self.chains_longer_than_one
-            .store(has_long_chains.load(Ordering::Relaxed), Ordering::Relaxed);
-        Ok(Some(index))
+        Ok(Some(BuiltIntegerIndex {
+            index: builder.finish()?,
+            has_long_chains,
+        }))
     }
 
-    pub(super) fn try_build_ranked_integer_index(&self) -> Result<Option<ExactIntegerJoinIndex>> {
+    pub(super) fn try_build_ranked_integer_index(&self) -> Result<Option<BuiltIntegerIndex>> {
         let IntegerIndexBuildStats::Bounded {
             kind,
             minimum: min_ordinal,
@@ -223,18 +196,9 @@ impl JoinHashTable {
         let blocks = store.block_ranges();
         let mut builder = builder;
         for block in &blocks {
-            for row_idx in 0..block.row_count() {
-                let row_ptr = unsafe { block.row_ptr(row_idx) };
-                let ordinal = kind
-                    .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
-                    .ok_or_else(|| {
-                        paro_error::internal(format!(
-                            "integer join build key does not match declared type {:?}",
-                            self.equality_types[0]
-                        ))
-                    })?;
-                builder.record_at(block.row_offset() + row_idx, ordinal)?;
-            }
+            self.visit_integer_build_block(kind, *block, |row_idx, _, ordinal| {
+                builder.record_at(row_idx, ordinal)
+            })?;
         }
         let mut scatter = builder.prepare_scatter()?;
         let mut has_long_chains = false;
@@ -249,9 +213,50 @@ impl JoinHashTable {
             }
         }
         drop(store);
-        let index = scatter.finish()?;
-        self.chains_longer_than_one
-            .store(has_long_chains, Ordering::Relaxed);
-        Ok(Some(index))
+        Ok(Some(BuiltIntegerIndex {
+            index: scatter.finish()?,
+            has_long_chains,
+        }))
+    }
+
+    fn build_direct_integer_block(
+        &self,
+        kind: super::super::integer_index::IntegerKeyKind,
+        builder: &ConcurrentDirectIntegerIndexBuilder,
+        block: BuildBlockRange,
+    ) -> Result<bool> {
+        let mut has_long_chains = false;
+        self.visit_integer_build_block(kind, block, |_, row_ptr, ordinal| {
+            if let Some(previous) = builder.insert(ordinal, row_ptr)? {
+                self.build_row_layout
+                    .set_next(row_ptr as *mut u8, previous as *const u8);
+                has_long_chains = true;
+            }
+            Ok(())
+        })?;
+        Ok(has_long_chains)
+    }
+
+    fn visit_integer_build_block(
+        &self,
+        kind: super::super::integer_index::IntegerKeyKind,
+        block: BuildBlockRange,
+        mut visit: impl FnMut(usize, usize, u128) -> Result<()>,
+    ) -> Result<()> {
+        for row_idx in 0..block.row_count() {
+            // SAFETY: finalization seals build reclaim before retaining block
+            // ranges, so the table owns this immutable slab for the visit.
+            let row_ptr = unsafe { block.row_ptr(row_idx) };
+            let ordinal = kind
+                .row_ordinal(self.build_row_layout.base(), row_ptr as *const u8, 0)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "integer join build key does not match declared type {:?}",
+                        self.equality_types[0]
+                    ))
+                })?;
+            visit(block.row_offset() + row_idx, row_ptr, ordinal)?;
+        }
+        Ok(())
     }
 }

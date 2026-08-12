@@ -22,7 +22,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{Vector, VECTOR_SIZE};
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::operator::join::{
+    JoinComparisonType, JoinCondition, JoinType, MarkJoinSemantics,
+};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::operators::join::nested_loop::runtime::compare_with_nulls;
@@ -44,7 +46,7 @@ pub struct SortRangeJoinProbeTransformExec {
     pub handle: HandleRef<MaterializedHandle>,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,
@@ -57,7 +59,7 @@ pub struct ClassicIeJoinSourceExec {
     pub right_handle: HandleRef<MaterializedHandle>,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,
@@ -710,11 +712,11 @@ impl SortRangeJoinProbeTransformExec {
     }
 
     fn mark_condition_null_is_unknown(&self, condition_idx: usize) -> bool {
-        if self.join_type != JoinType::Mark {
-            return true;
+        match self.mark_semantics {
+            MarkJoinSemantics::ThreeValuedFrom(start) => condition_idx >= start,
+            MarkJoinSemantics::TwoValued => false,
+            MarkJoinSemantics::NotMark => true,
         }
-        self.mark_null_condition_start
-            .is_some_and(|start| condition_idx >= start)
     }
 
     fn emit_empty_build_result(&self, input: &Chunk, output: &mut Chunk) -> Result<()> {
@@ -2865,7 +2867,7 @@ mod tests {
                 classic_condition(1, 1, JoinComparisonType::GreaterThan),
             ]
             .into_boxed_slice(),
-            mark_null_condition_start: None,
+            mark_semantics: MarkJoinSemantics::NotMark,
             left_projection: vec![0, 1].into_boxed_slice(),
             right_projection: vec![0, 1].into_boxed_slice(),
             right_output_types: vec![LogicalType::Integer, LogicalType::Integer].into_boxed_slice(),

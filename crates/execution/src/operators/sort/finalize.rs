@@ -32,20 +32,18 @@ struct SortMaterializeFinalizeDriver {
     build: SortMaterializationBuild,
     partitions: Mutex<Vec<Option<Vec<Chunk>>>>,
     next_task: AtomicUsize,
-    remaining: AtomicUsize,
 }
 
 impl SortMaterializeFinalizeDriver {
     fn group(handle: Arc<SortHandle>, build: SortMaterializationBuild) -> FinishTaskGroup {
         let task_count = build.task_count;
         FinishTaskGroup {
-            task_count_hint: task_count,
+            task_count,
             driver: Arc::new(Self {
                 handle,
                 build,
                 partitions: Mutex::new((0..task_count).map(|_| None).collect()),
                 next_task: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
             coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
@@ -65,18 +63,10 @@ impl SortMaterializeFinalizeDriver {
                 "materialized sort partition was installed twice: index={partition_idx}"
             )));
         }
-        drop(partitions);
+        Ok(())
+    }
 
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel);
-        if remaining == 0 {
-            return Err(paro_error::internal(
-                "materialized sort completed more tasks than it scheduled",
-            ));
-        }
-        if remaining != 1 {
-            return Ok(());
-        }
-
+    fn publish_result(&self) -> Result<()> {
         let chunks = {
             let mut slots = self.partitions.lock();
             let mut chunks = Vec::new();
@@ -137,6 +127,10 @@ impl ParallelFinishDriver for SortMaterializeFinalizeDriver {
                 .materialize_range(start, end, &self.build.output_types, allocator)?;
         self.install_partition(partition_idx, partition)?;
         Ok(FinishTaskPoll::Done)
+    }
+
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        self.publish_result()
     }
 }
 

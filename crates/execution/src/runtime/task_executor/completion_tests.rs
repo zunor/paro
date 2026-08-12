@@ -292,6 +292,7 @@ struct ConcurrentFinishDriver {
     running: std::sync::atomic::AtomicUsize,
     max_running: Arc<std::sync::atomic::AtomicUsize>,
     completed: Arc<std::sync::atomic::AtomicUsize>,
+    group_finished: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ConcurrentFinishDriver {
@@ -299,6 +300,7 @@ impl ConcurrentFinishDriver {
         task_count: usize,
         max_running: Arc<std::sync::atomic::AtomicUsize>,
         completed: Arc<std::sync::atomic::AtomicUsize>,
+        group_finished: Arc<std::sync::atomic::AtomicUsize>,
     ) -> Self {
         Self {
             task_count,
@@ -306,6 +308,7 @@ impl ConcurrentFinishDriver {
             running: std::sync::atomic::AtomicUsize::new(0),
             max_running,
             completed,
+            group_finished,
         }
     }
 }
@@ -342,6 +345,16 @@ impl ParallelFinishDriver for ConcurrentFinishDriver {
             .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         Ok(FinishTaskPoll::Done)
     }
+
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        assert_eq!(
+            self.completed.load(std::sync::atomic::Ordering::Acquire),
+            self.task_count
+        );
+        self.group_finished
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
 }
 
 #[test]
@@ -357,7 +370,7 @@ fn finish_task_error_cancels_group_as_operator_error() {
 
     let cancel_reason = Arc::new(Mutex::new(None));
     executor.finish_group = Some(FinishTaskGroup {
-        task_count_hint: 1,
+        task_count: 1,
         driver: Arc::new(FailingFinishDriver {
             cancel_reason: cancel_reason.clone(),
         }),
@@ -398,12 +411,14 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
 
     let max_running = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let group_finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     executor.finish_group = Some(FinishTaskGroup {
-        task_count_hint: 4,
+        task_count: 4,
         driver: Arc::new(ConcurrentFinishDriver::new(
             4,
             max_running.clone(),
             completed.clone(),
+            group_finished.clone(),
         )),
         memory_class: MemoryClass::Blocking,
         coordinator_participation: FinishCoordinatorParticipation::SingleTask,
@@ -427,6 +442,11 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
         max_running.load(std::sync::atomic::Ordering::Acquire) > 1,
         "finish subtasks should overlap on scheduler workers"
     );
+    assert_eq!(
+        group_finished.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "the runtime should publish one completed finish group"
+    );
 }
 
 #[test]
@@ -442,7 +462,7 @@ fn finish_task_discovery_error_cancels_group_as_operator_error() {
 
     let cancel_reason = Arc::new(Mutex::new(None));
     executor.finish_group = Some(FinishTaskGroup {
-        task_count_hint: 1,
+        task_count: 1,
         driver: Arc::new(FailingNextTaskDriver {
             cancel_reason: cancel_reason.clone(),
         }),
@@ -484,7 +504,7 @@ fn cancellation_cleans_pending_finish_group_without_recording_operator_error() {
 
     let cancel_reason = Arc::new(Mutex::new(None));
     executor.finish_group = Some(FinishTaskGroup {
-        task_count_hint: 1,
+        task_count: 1,
         driver: Arc::new(PendingFinishDriver {
             reason: BlockReason::ExternalRuntime,
             source: WakeSource::ExternalRuntime,
@@ -545,7 +565,7 @@ fn finish_group_pending_blockers_keep_wake_registration() {
         executor.phase = PipelineTaskPhase::Merging;
         executor.completion_stage = PipelineCompletionStage::FinishWork;
         executor.finish_group = Some(FinishTaskGroup {
-            task_count_hint: 1,
+            task_count: 1,
             driver: Arc::new(PendingFinishDriver {
                 reason: reason.clone(),
                 source,

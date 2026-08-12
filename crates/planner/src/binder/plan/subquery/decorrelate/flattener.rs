@@ -14,7 +14,7 @@ use crate::operator::Window;
 use crate::operator::{
     ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, DependentJoin, DependentJoinKind,
     DistinctType, Filter, Join, JoinComparisonType, JoinCondition, JoinSide, JoinType,
-    LogicalOperator, MarkSubqueryKind, Projection,
+    LogicalOperator, MarkJoinSemantics, MarkSubqueryKind, Projection,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -267,7 +267,7 @@ impl DependentJoinFlattener {
 
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
-        mark_join.mark_null_condition_start = None;
+        mark_join.mark_semantics = MarkJoinSemantics::TwoValued;
         mark_join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
 
         let join_op = LogicalOperator::Join(Join::Comparison(mark_join));
@@ -329,7 +329,7 @@ impl DependentJoinFlattener {
 
         let mut mark_join = ComparisonJoin::new(JoinType::Mark, left, right, conditions);
         mark_join.mark_index = Some(mark_index);
-        mark_join.mark_null_condition_start = Some(payload_condition_start);
+        mark_join.mark_semantics = MarkJoinSemantics::ThreeValuedFrom(payload_condition_start);
         mark_join.duplicate_eliminated_columns = self.duplicate_eliminated_columns();
 
         Ok(LogicalOperator::Join(Join::Comparison(mark_join)))

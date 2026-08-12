@@ -16,6 +16,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::join::{
     AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
+    MarkJoinSemantics,
 };
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, CTERef as LogicalCteRef, CopyTo as LogicalCopyTo,

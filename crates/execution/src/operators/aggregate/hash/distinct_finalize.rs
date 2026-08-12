@@ -48,7 +48,6 @@ struct DistinctFinalizeDriver {
     result: ConcurrentRadixAggregateBuild,
     work: Mutex<Vec<Option<DistinctFinalizePartition>>>,
     next_task: AtomicUsize,
-    remaining: AtomicUsize,
 }
 
 impl DistinctFinalizeDriver {
@@ -62,7 +61,7 @@ impl DistinctFinalizeDriver {
     ) -> FinishTaskGroup {
         let task_count = work.len();
         FinishTaskGroup {
-            task_count_hint: task_count,
+            task_count,
             driver: Arc::new(Self {
                 handle,
                 spec,
@@ -71,25 +70,18 @@ impl DistinctFinalizeDriver {
                 result,
                 work: Mutex::new(work.into_iter().map(Some).collect()),
                 next_task: AtomicUsize::new(0),
-                remaining: AtomicUsize::new(task_count),
             }),
             memory_class: MemoryClass::Blocking,
             coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
         }
     }
 
-    fn complete_task(&self, partition_idx: usize, local: AggregateHashTable) -> Result<()> {
+    fn install_partition(&self, partition_idx: usize, local: AggregateHashTable) -> Result<()> {
         self.result.install(partition_idx, local)?;
-        let remaining = self.remaining.fetch_sub(1, Ordering::AcqRel);
-        if remaining == 0 {
-            return Err(paro_error::internal(
-                "parallel DISTINCT finalize completed more tasks than it scheduled",
-            ));
-        }
-        if remaining != 1 {
-            return Ok(());
-        }
+        Ok(())
+    }
 
+    fn publish_result(&self) -> Result<()> {
         let table = self.result.finish()?;
         self.handle.with_state_mut(|state| {
             let AggregateRuntimeState::Hash(global) = state else {
@@ -163,8 +155,12 @@ impl ParallelFinishDriver for DistinctFinalizeDriver {
                 &mut local,
             )?;
         }
-        self.complete_task(partition_idx, local)?;
+        self.install_partition(partition_idx, local)?;
         Ok(FinishTaskPoll::Done)
+    }
+
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        self.publish_result()
     }
 }
 

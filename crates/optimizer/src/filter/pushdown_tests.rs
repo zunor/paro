@@ -16,6 +16,7 @@ use paro_planner::expression::{
 };
 use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, ComparisonJoin, DelimGet, Get, JoinComparisonType, JoinCondition,
+    MarkJoinSemantics,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -549,7 +550,7 @@ fn positive_mark_filter_lowers_mark_join_to_semi_join() {
     };
     assert_eq!(join.join_type, JoinType::Semi);
     assert_eq!(join.mark_index, None);
-    assert_eq!(join.mark_null_condition_start, None);
+    assert_eq!(join.mark_semantics, MarkJoinSemantics::NotMark);
     assert!(matches!(join.left.operator, LogicalOperator::Filter(_)));
 }
 
@@ -590,7 +591,30 @@ fn negative_scalar_mark_filter_lowers_to_null_aware_anti_join() {
     assert_eq!(join.join_type, JoinType::Anti);
     assert_eq!(join.anti_join_mode, AntiJoinMode::NullAware);
     assert_eq!(join.mark_index, None);
-    assert_eq!(join.mark_null_condition_start, None);
+    assert_eq!(join.mark_semantics, MarkJoinSemantics::NotMark);
+}
+
+#[test]
+fn negative_two_valued_marker_becomes_an_explicit_non_mark_anti_join() {
+    let ctx = BindContext::new();
+    let mut join = ComparisonJoin::new(
+        JoinType::Mark,
+        plan(&ctx, make_get(0)),
+        plan(&ctx, make_get(1)),
+        vec![JoinCondition::new(
+            make_column_ref(0, 0),
+            make_column_ref(1, 0),
+            JoinComparisonType::Equal,
+        )],
+    );
+    join.mark_index = Some(90);
+    join.mark_semantics = MarkJoinSemantics::TwoValued;
+
+    assert!(lower_mark_join_for_truth(&mut join, false));
+    assert_eq!(join.join_type, JoinType::Anti);
+    assert_eq!(join.anti_join_mode, AntiJoinMode::Regular);
+    assert_eq!(join.mark_index, None);
+    assert_eq!(join.mark_semantics, MarkJoinSemantics::NotMark);
 }
 
 #[test]

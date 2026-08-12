@@ -599,11 +599,13 @@ impl FilterPushdown {
     /// top-level truth test.
     ///
     /// EXISTS is intrinsically two-valued, unlike IN/ANY. The dependent-join
-    /// flattener records that distinction as `mark_null_condition_start =
-    /// None`, so both positive and negative consumers can become ordinary
+    /// flattener records that distinction as `MarkJoinSemantics::TwoValued`,
+    /// so both positive and negative consumers can become ordinary
     /// SEMI/ANTI joins without retaining a materialized marker column.
     fn lower_consumed_exists_marker(&mut self, join: &mut ComparisonJoin) {
-        if join.join_type != JoinType::Mark || join.mark_null_condition_start.is_some() {
+        if join.join_type != JoinType::Mark
+            || join.mark_semantics != paro_planner::operator::MarkJoinSemantics::TwoValued
+        {
             return;
         }
         let Some((filter_index, expected)) = self.consumed_marker_truth_filter(join) else {
@@ -1053,17 +1055,18 @@ fn lower_mark_join_for_truth(join: &mut ComparisonJoin, expected: bool) -> bool 
     if expected {
         join.join_type = JoinType::Semi;
         join.mark_index = None;
-        join.mark_null_condition_start = None;
+        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
         return true;
     }
-    if join.mark_null_condition_start.is_none() {
+    if join.mark_semantics == paro_planner::operator::MarkJoinSemantics::TwoValued {
         // EXISTS is two-valued, so its negative truth test is an ordinary anti
         // join.
         join.join_type = JoinType::Anti;
         join.mark_index = None;
+        join.mark_semantics = paro_planner::operator::MarkJoinSemantics::NotMark;
         return true;
     }
-    if join.mark_null_condition_start == Some(0)
+    if join.mark_semantics == paro_planner::operator::MarkJoinSemantics::ThreeValuedFrom(0)
         && join.conditions.len() == 1
         && join.conditions[0].comparison == JoinComparisonType::Equal
     {

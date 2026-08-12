@@ -53,6 +53,7 @@ impl PipelineTaskExecutor {
             return;
         };
         self.active_finish_task = None;
+        self.finish_tasks_completed = 0;
         self.cancel_finish_group(ctx, &group, reason);
     }
 }

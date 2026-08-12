@@ -2,8 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use paro_planner::operator::JoinCondition;
-
 pub(crate) fn is_streaming_window_supported(spec: &WindowSpec) -> bool {
     spec.expressions.iter().all(|expr| {
         expr.function.function_type == WindowFunctionType::RowNumber
@@ -66,31 +64,19 @@ pub(crate) fn hash_join_probe_transform(
     handle: BreakerHandleId,
     spec: &HashJoinSpec,
 ) -> TransformSpec {
+    debug_assert!(spec.probe_residual_count <= spec.build_residual_conditions.len());
     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
         handle,
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
         key_conditions: spec.key_conditions.clone(),
-        residual_conditions: spec.residual_conditions.clone(),
+        build_residual_conditions: spec.build_residual_conditions.clone(),
+        probe_residual_count: spec.probe_residual_count,
         left_projection: spec.left_projection.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
         reduction_cascade: spec.reduction_cascade.clone(),
     })
-}
-
-pub(crate) fn hash_join_build_residual_conditions(spec: &HashJoinSpec) -> Box<[JoinCondition]> {
-    spec.residual_conditions
-        .iter()
-        .chain(
-            spec.reduction_cascade
-                .iter()
-                .flat_map(|cascade| cascade.predicates.iter())
-                .map(|predicate| &predicate.condition),
-        )
-        .cloned()
-        .collect::<Vec<_>>()
-        .into_boxed_slice()
 }
 
 pub(crate) fn cross_product_probe_transform(
@@ -113,7 +99,7 @@ pub(crate) fn nlj_probe_transform(
         handle,
         join_type: spec.join_type,
         conditions: spec.conditions.clone(),
-        mark_null_condition_start: spec.mark_null_condition_start,
+        mark_semantics: spec.mark_semantics,
         arbitrary_condition: spec.arbitrary_condition.clone(),
         left_projection: spec.left_projection.clone(),
         right_projection: spec.right_projection.clone(),
@@ -131,7 +117,7 @@ pub(crate) fn sort_range_probe_transform(
         handle,
         join_type: spec.join_type,
         conditions: spec.conditions.clone(),
-        mark_null_condition_start: spec.mark_null_condition_start,
+        mark_semantics: spec.mark_semantics,
         left_projection: spec.left_projection.clone(),
         right_projection: spec.right_projection.clone(),
         right_output_types: spec.right_output_types.clone(),

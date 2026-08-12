@@ -40,7 +40,8 @@ pub struct HashJoinSpillReplaySourceExec {
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
     pub key_conditions: Box<[JoinCondition]>,
-    pub residual_conditions: Box<[JoinCondition]>,
+    pub build_residual_conditions: Box<[JoinCondition]>,
+    pub probe_residual_count: usize,
     pub probe_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub build_payload_types: Box<[LogicalType]>,
@@ -63,6 +64,12 @@ impl HashJoinSpillReplaySourceExec {
         ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
+        let probe_residual_conditions = self
+            .build_residual_conditions
+            .get(..self.probe_residual_count)
+            .ok_or_else(|| {
+                paro_error::internal("hash join replay residual prefix exceeds build layout")
+            })?;
         Ok(SourceLocal::HashJoinSpillReplay(
             HashJoinSpillReplaySourceLocal {
                 probe_key_types: join_key_types(&self.key_conditions, JoinKeySide::Probe),
@@ -78,7 +85,7 @@ impl HashJoinSpillReplaySourceExec {
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
                 residual: HashJoinResidualProbeState::new(
-                    &self.residual_conditions,
+                    probe_residual_conditions,
                     ctx.query.session.as_ref(),
                 ),
                 reduction_residuals: self
@@ -89,15 +96,24 @@ impl HashJoinSpillReplaySourceExec {
                             .predicates
                             .iter()
                             .map(|predicate| {
-                                HashJoinResidualProbeState::new_at_offset(
-                                    std::slice::from_ref(&predicate.condition),
+                                let condition = self
+                                    .build_residual_conditions
+                                    .get(predicate.build_residual_offset)
+                                    .ok_or_else(|| {
+                                        paro_error::internal(
+                                            "reduction replay residual offset exceeds build layout",
+                                        )
+                                    })?;
+                                Ok(HashJoinResidualProbeState::new_at_offset(
+                                    std::slice::from_ref(condition),
                                     predicate.build_residual_offset,
                                     ctx.query.session.as_ref(),
-                                )
+                                ))
                             })
-                            .collect::<Vec<_>>()
-                            .into_boxed_slice()
+                            .collect::<Result<Vec<_>>>()
+                            .map(Vec::into_boxed_slice)
                     })
+                    .transpose()?
                     .unwrap_or_default(),
                 reduction_source_predicates: self
                     .reduction_cascade

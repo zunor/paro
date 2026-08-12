@@ -80,7 +80,7 @@ impl JoinHashTable {
             .lock()
             .unwrap()
             .as_ref()
-            .and_then(|index| index.ranked_group_count());
+            .map(|index| index.group_slot_count());
         let Some(group_count) = group_count else {
             *state = GroupedReductionExtremaState::Unavailable { channel_count };
             return Ok(());

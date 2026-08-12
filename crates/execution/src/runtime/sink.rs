@@ -342,7 +342,8 @@ pub enum FinishWork {
 
 #[derive(Debug, Clone)]
 pub struct FinishTaskGroup {
-    pub task_count_hint: usize,
+    /// Exact number of tasks the driver will issue before returning Drained.
+    pub task_count: usize,
     pub driver: Arc<dyn ParallelFinishDriver>,
     pub memory_class: MemoryClass,
     pub coordinator_participation: FinishCoordinatorParticipation,
@@ -395,6 +396,14 @@ pub trait ParallelFinishDriver: Send + Sync + std::fmt::Debug {
         ctx: &mut OperatorFinishContext,
     ) -> Result<FinishTaskPoll>;
 
+    /// Publish the completed group's result after every issued task succeeds.
+    /// The runtime calls this exactly once and never calls it after task error
+    /// or cancellation, so drivers do not reconstruct group completion from
+    /// worker-local counters.
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        Ok(())
+    }
+
     fn cancel_group(&self, _ctx: &mut OperatorCleanupContext, _reason: CancelReason) -> Result<()> {
         Ok(())
     }
@@ -420,7 +429,7 @@ impl FinishTaskGroupRunner {
         run: impl for<'a> Fn(&mut OperatorFinishContext<'a>) -> Result<()> + Send + Sync + 'static,
     ) -> FinishTaskGroup {
         FinishTaskGroup {
-            task_count_hint: 1,
+            task_count: 1,
             driver: Arc::new(Self {
                 label,
                 issued: AtomicBool::new(false),

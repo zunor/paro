@@ -618,16 +618,16 @@ impl ExactIntegerJoinIndex {
         }
     }
 
-    pub(super) fn ranked_group_count(&self) -> Option<usize> {
+    /// Number of stable slots available to grouped reduction summaries.
+    /// Direct indexes use domain offsets; ranked indexes use compact ranks.
+    pub(super) fn group_slot_count(&self) -> usize {
         match &self.storage {
-            IntegerJoinStorage::Ranked { count, .. } => Some(*count),
-            IntegerJoinStorage::Direct { .. } => None,
+            IntegerJoinStorage::Ranked { count, .. } => *count,
+            IntegerJoinStorage::Direct { .. } => self.domain.len,
         }
     }
 
-    /// Resolve every non-NULL `BIGINT` probe row to its compact ranked slot.
-    /// Returns `false` when this index representation cannot provide compact
-    /// group slots, allowing callers to retain their generic hash-chain path.
+    /// Resolve every non-NULL `BIGINT` probe row to a stable group slot.
     pub(super) fn lookup_i64_group_slots(
         &self,
         vector: &Vector,
@@ -637,67 +637,90 @@ impl ExactIntegerJoinIndex {
         if self.domain.kind != IntegerKeyKind::BigInt || output_slots.len() < vector_count {
             return Ok(false);
         }
-        let IntegerJoinStorage::Ranked { bits, ranks, .. } = &self.storage else {
-            return Ok(false);
-        };
-        let words =
-            unsafe { grant_slice::<u64>(bits, self.domain.len.div_ceil(u64::BITS as usize)) };
-        let rank_values = unsafe { grant_slice::<u32>(ranks, words.len()) };
         output_slots[..vector_count].fill(usize::MAX);
         let view = vector.try_to_view(vector_count)?;
-        if let Some(data) = view.get_data::<i64>() {
-            for (row_idx, output) in output_slots[..vector_count].iter_mut().enumerate() {
-                if !view.is_valid(row_idx) {
-                    continue;
-                }
-                let value = unsafe { *data.add(view.physical_index(row_idx)) };
-                *output = self
-                    .ranked_group_slot_for_ordinal_in(
-                        words,
-                        rank_values,
-                        signed_ordinal(value as i128),
-                    )
-                    .unwrap_or(usize::MAX);
-            }
-        } else {
-            for (row_idx, output) in output_slots[..vector_count].iter_mut().enumerate() {
-                if !view.is_valid(row_idx) {
-                    continue;
-                }
-                *output = self
-                    .ranked_group_slot_for_ordinal_in(
-                        words,
-                        rank_values,
-                        signed_ordinal(view.get_i64(row_idx) as i128),
-                    )
-                    .unwrap_or(usize::MAX);
+        match &self.storage {
+            IntegerJoinStorage::Direct { pointers } => self.lookup_i64_group_slots_with(
+                &view,
+                &mut output_slots[..vector_count],
+                |ordinal| {
+                    let slot = self.domain.index_for_ordinal(ordinal)?;
+                    let pointer = unsafe {
+                        // SAFETY: `slot` is bounded by the immutable direct domain.
+                        std::ptr::read(pointers.as_ptr().cast::<usize>().add(slot))
+                    };
+                    (pointer != 0).then_some(slot)
+                },
+            ),
+            IntegerJoinStorage::Ranked { bits, ranks, .. } => {
+                let words = unsafe {
+                    grant_slice::<u64>(bits, self.domain.len.div_ceil(u64::BITS as usize))
+                };
+                let rank_values = unsafe { grant_slice::<u32>(ranks, words.len()) };
+                self.lookup_i64_group_slots_with(
+                    &view,
+                    &mut output_slots[..vector_count],
+                    |ordinal| self.ranked_group_slot_for_ordinal_in(words, rank_values, ordinal),
+                )
             }
         }
         Ok(true)
     }
 
-    /// Return the compact group slot recorded for one row in build-store order.
-    ///
-    /// Staged ranked construction visits the immutable build store in this
-    /// exact order, so the mapping is valid for the index's complete lifetime.
-    #[inline]
-    pub(super) fn ranked_group_slot_for_build_row(&self, build_row: usize) -> Option<usize> {
-        let IntegerJoinStorage::Ranked {
-            build_group_slots,
-            build_row_count,
-            ..
-        } = &self.storage
-        else {
-            return None;
-        };
-        if build_row >= *build_row_count {
-            return None;
+    fn lookup_i64_group_slots_with(
+        &self,
+        view: &VectorView<'_>,
+        output_slots: &mut [usize],
+        lookup: impl Fn(u128) -> Option<usize>,
+    ) {
+        if let Some(data) = view.get_data::<i64>() {
+            for (row_idx, output) in output_slots.iter_mut().enumerate() {
+                if !view.is_valid(row_idx) {
+                    continue;
+                }
+                let value = unsafe { *data.add(view.physical_index(row_idx)) };
+                *output = lookup(signed_ordinal(value as i128)).unwrap_or(usize::MAX);
+            }
+        } else {
+            for (row_idx, output) in output_slots.iter_mut().enumerate() {
+                if !view.is_valid(row_idx) {
+                    continue;
+                }
+                *output =
+                    lookup(signed_ordinal(view.get_i64(row_idx) as i128)).unwrap_or(usize::MAX);
+            }
         }
-        Some(unsafe {
-            // SAFETY: every build-row slot is initialized during scatter and
-            // `build_row` is bounded by the retained stream's element count.
-            std::ptr::read(build_group_slots.as_ptr().cast::<u32>().add(build_row)) as usize
-        })
+    }
+
+    /// Return the stable group slot for one retained build row.
+    #[inline]
+    pub(super) fn group_slot_for_build_row(
+        &self,
+        build_row: usize,
+        row_ptr: *const u8,
+        layout: &RowLayout,
+    ) -> Option<usize> {
+        match &self.storage {
+            IntegerJoinStorage::Direct { .. } => self
+                .domain
+                .kind
+                .row_ordinal(layout, row_ptr, 0)
+                .and_then(|ordinal| self.domain.index_for_ordinal(ordinal)),
+            IntegerJoinStorage::Ranked {
+                build_group_slots,
+                build_row_count,
+                ..
+            } => {
+                if build_row >= *build_row_count {
+                    return None;
+                }
+                Some(unsafe {
+                    // SAFETY: every build-row slot is initialized during
+                    // scatter and `build_row` is bounded by the row count.
+                    std::ptr::read(build_group_slots.as_ptr().cast::<u32>().add(build_row)) as usize
+                })
+            }
+        }
     }
 
     #[inline]
@@ -897,6 +920,7 @@ mod tests {
     use paro_common::allocator::MemoryTag;
     use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
     use paro_common::runtime_value::Value;
+    use paro_storage::row::RowLayout;
 
     use super::{
         ConcurrentDirectIntegerIndexBuilder, IntegerKeyKind, StagedRankedIntegerIndexBuilder,
@@ -947,6 +971,39 @@ mod tests {
         assert_eq!(builder.insert(key, 100).unwrap(), None);
         assert_eq!(builder.insert(key, 200).unwrap(), Some(100));
         builder.finish().expect("complete direct index");
+    }
+
+    #[test]
+    fn direct_index_exposes_domain_slots_for_grouped_reduction() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let kind = IntegerKeyKind::BigInt;
+        let minimum = kind.value_ordinal(&Value::BigInt(10)).unwrap();
+        let maximum = kind.value_ordinal(&Value::BigInt(20)).unwrap();
+        let builder = ConcurrentDirectIntegerIndexBuilder::try_new(
+            kind,
+            minimum,
+            maximum,
+            2,
+            allocator.clone(),
+            &memory(),
+        )
+        .unwrap()
+        .unwrap();
+        builder
+            .insert(kind.value_ordinal(&Value::BigInt(12)).unwrap(), 120)
+            .unwrap();
+        builder
+            .insert(kind.value_ordinal(&Value::BigInt(18)).unwrap(), 180)
+            .unwrap();
+        let index = builder.finish().unwrap();
+        let vector =
+            paro_common::test_utils::test_i64_vector_with_allocator(&[12, 15, 18], allocator);
+        let mut slots = [usize::MAX; 3];
+        assert!(index
+            .lookup_i64_group_slots(&vector, 3, &mut slots)
+            .unwrap());
+        assert_eq!(slots, [2, usize::MAX, 8]);
+        assert_eq!(index.group_slot_count(), 11);
     }
 
     #[test]
@@ -1007,10 +1064,23 @@ mod tests {
         assert_eq!(&matched[..count], &[0, 1]);
         assert_eq!(pointers[0], 120);
         assert_eq!(pointers[1], 451);
-        assert_eq!(index.ranked_group_slot_for_build_row(0), Some(1));
-        assert_eq!(index.ranked_group_slot_for_build_row(1), Some(0));
-        assert_eq!(index.ranked_group_slot_for_build_row(2), Some(1));
-        assert_eq!(index.ranked_group_slot_for_build_row(3), None);
+        let unused_layout = RowLayout::new();
+        assert_eq!(
+            index.group_slot_for_build_row(0, std::ptr::null(), &unused_layout),
+            Some(1)
+        );
+        assert_eq!(
+            index.group_slot_for_build_row(1, std::ptr::null(), &unused_layout),
+            Some(0)
+        );
+        assert_eq!(
+            index.group_slot_for_build_row(2, std::ptr::null(), &unused_layout),
+            Some(1)
+        );
+        assert_eq!(
+            index.group_slot_for_build_row(3, std::ptr::null(), &unused_layout),
+            None
+        );
     }
 
     #[test]

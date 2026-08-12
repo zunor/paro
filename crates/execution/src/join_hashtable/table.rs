@@ -45,6 +45,7 @@ use super::scan_structure::ScanStructure;
 
 #[path = "integer_finalize.rs"]
 mod integer_finalize;
+use integer_finalize::BuiltIntegerIndex;
 pub(crate) use integer_finalize::ParallelDirectIntegerIndexBuild;
 #[path = "table_grouped_reduction.rs"]
 mod table_grouped_reduction;
@@ -908,12 +909,14 @@ impl JoinHashTable {
         }
     }
 
-    fn ranked_group_slot_for_build_row(&self, build_row: usize) -> Option<usize> {
+    fn group_slot_for_build_row(&self, build_row: usize, row_ptr: *const u8) -> Option<usize> {
         let index_ptr = self.probe_integer_index.load(Ordering::Acquire);
         if index_ptr.is_null() {
             return None;
         }
-        unsafe { (&*index_ptr).ranked_group_slot_for_build_row(build_row) }
+        unsafe {
+            (&*index_ptr).group_slot_for_build_row(build_row, row_ptr, self.build_row_layout.base())
+        }
     }
 
     pub fn reset_data_collection(&self) {
@@ -1082,7 +1085,7 @@ impl JoinHashTable {
             None => self.try_build_ranked_integer_index()?,
         };
         if let Some(index) = integer_index {
-            self.install_finalized_integer_index(index)?;
+            self.publish_integer_index(index)?;
             return Ok(());
         }
 
@@ -1112,8 +1115,10 @@ impl JoinHashTable {
         Ok(())
     }
 
-    fn install_finalized_integer_index(&self, index: ExactIntegerJoinIndex) -> Result<()> {
-        let index = Box::new(index);
+    fn publish_integer_index(&self, built: BuiltIntegerIndex) -> Result<()> {
+        self.chains_longer_than_one
+            .store(built.has_long_chains, Ordering::Relaxed);
+        let index = Box::new(built.index);
         let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut ExactIntegerJoinIndex;
         *self.integer_index.lock().unwrap() = Some(index);
         self.probe_integer_index.store(index_ptr, Ordering::Release);
@@ -1398,7 +1403,7 @@ impl JoinHashTable {
             self.build_output_types(),
             result,
             |build_row, row_ptr| {
-                let group_slot = self.ranked_group_slot_for_build_row(build_row);
+                let group_slot = self.group_slot_for_build_row(build_row, row_ptr);
                 let build_value =
                     unsafe { self.read_build_payload_fixed::<i64>(row_ptr as usize, build_idx) };
                 let mut match_mask = 0u8;

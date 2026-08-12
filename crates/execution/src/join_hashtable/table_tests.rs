@@ -111,11 +111,13 @@ fn grouped_reduction_mode_is_fixed_when_the_key_index_is_finalized() {
 }
 
 #[test]
-fn grouped_reduction_unavailability_is_also_a_stable_finalized_mode() {
+fn generic_hash_grouped_reduction_unavailability_is_a_stable_finalized_mode() {
+    let mut condition = bigint_equality_condition();
+    condition.comparison = JoinComparisonType::NotDistinctFrom;
     let table = JoinHashTable::new(
         create_test_buffer_pool(),
         paro_common::test_utils::test_allocator(),
-        vec![bigint_equality_condition()],
+        vec![condition],
         vec![LogicalType::Integer],
         JoinType::Inner,
         JoinHashTableConfig::default(),

@@ -38,7 +38,7 @@ pub enum OrderByColumnType {
 }
 
 /// Options for reordering segments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SegmentOrderOptions {
     /// The index of the column to order by.
     pub column_idx: usize,
@@ -72,6 +72,36 @@ impl SegmentOrderOptions {
             row_limit,
             row_offset,
         }
+    }
+
+    /// Whether two scan-order requests can share one physical scan.
+    ///
+    /// Destructuring every field intentionally makes additions to this type
+    /// update the fusion contract instead of inheriting structural equality by
+    /// accident.
+    pub fn is_fusion_compatible(&self, other: &Self) -> bool {
+        let Self {
+            column_idx,
+            order_by,
+            order_type,
+            column_type,
+            row_limit,
+            row_offset,
+        } = self;
+        let Self {
+            column_idx: other_column_idx,
+            order_by: other_order_by,
+            order_type: other_order_type,
+            column_type: other_column_type,
+            row_limit: other_row_limit,
+            row_offset: other_row_offset,
+        } = other;
+        column_idx == other_column_idx
+            && order_by == other_order_by
+            && order_type == other_order_type
+            && column_type == other_column_type
+            && row_limit == other_row_limit
+            && row_offset == other_row_offset
     }
 }
 

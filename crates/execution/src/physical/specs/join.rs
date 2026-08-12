@@ -3,7 +3,8 @@
 
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
+use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct HashJoinSpec {
@@ -11,8 +12,13 @@ pub struct HashJoinSpec {
     pub anti_join_mode: AntiJoinMode,
     /// Equality predicates used to locate a candidate hash chain.
     pub key_conditions: Box<[JoinCondition]>,
-    /// Remaining predicates evaluated vectorially against candidate rows.
-    pub residual_conditions: Box<[JoinCondition]>,
+    /// Canonical ordered list of RHS expressions materialized after the visible
+    /// build payload. Reduction predicates refer to this list by offset.
+    pub build_residual_conditions: Box<[JoinCondition]>,
+    /// Prefix of `build_residual_conditions` evaluated by the ordinary probe.
+    /// Reduction-only joins keep their predicates out of the ordinary probe
+    /// while sharing the same physical build layout.
+    pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
     /// Columns copied from the build input into the hash-table payload.
     /// Once materialized, the payload is already dense and is never projected
@@ -52,6 +58,10 @@ pub struct HashReductionGroupedExtremaSpec {
     pub source_value_index: usize,
     pub build_residual_offset: usize,
     pub channels: Box<[HashReductionExtremaChannelSpec]>,
+    /// Maps an evaluated source-predicate mask to eligible extrema channels.
+    /// This immutable table belongs to the physical plan and is shared by all
+    /// workers instead of being reconstructed in every local operator state.
+    pub channel_map: Arc<[u8; 256]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -72,7 +82,6 @@ pub struct HashReductionStepSpec {
 
 #[derive(Debug, Clone)]
 pub struct HashReductionPredicateSpec {
-    pub condition: JoinCondition,
     /// Offset of this predicate's RHS value in the hidden build payload suffix.
     pub build_residual_offset: usize,
     pub predicate_mask: u8,
@@ -88,7 +97,7 @@ pub struct HashReductionSourcePredicateSpec {
 pub struct NestedLoopJoinSpec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: MarkJoinSemantics,
     pub arbitrary_condition: Option<Expression>,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
@@ -102,7 +111,7 @@ pub struct NestedLoopJoinSpec {
 pub struct SortRangeJoinSpec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub left_output_types: Box<[LogicalType]>,
@@ -115,7 +124,7 @@ pub struct SortRangeJoinSpec {
 pub struct ClassicIeJoinSpec {
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub left_output_types: Box<[LogicalType]>,
