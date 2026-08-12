@@ -20,7 +20,7 @@ use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType,
     JoinCondition, JoinType, LogicalOperator,
 };
-use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 use crate::cost_model::CostModel as LogicalCostModel;
@@ -670,6 +670,7 @@ impl JoinOrderOptimizer {
                         )));
                         plan.stats.estimated_cardinality =
                             Some(Self::join_cardinality_estimate(node.cardinality));
+                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
                         plan
                     }
                 } else {
@@ -711,12 +712,14 @@ impl JoinOrderOptimizer {
                         )));
                         plan.stats.estimated_cardinality =
                             Some(Self::join_cardinality_estimate(node.cardinality));
+                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
                         plan
                     } else {
                         let mut plan =
                             LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
                         plan.stats.estimated_cardinality =
                             Some(Self::join_cardinality_estimate(node.cardinality));
+                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
                         plan
                     }
                 }
@@ -728,6 +731,7 @@ impl JoinOrderOptimizer {
                     })));
                 plan.stats.estimated_cardinality =
                     Some(Self::join_cardinality_estimate(node.cardinality));
+                plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
                 plan
             };
 
@@ -814,6 +818,7 @@ impl JoinOrderOptimizer {
         });
         result = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(result, expressions)));
         result.stats.estimated_cardinality = estimated_cardinality;
+        result.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
         result
     }
 
@@ -1047,6 +1052,7 @@ mod tests {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
+                ..NodeStats::default()
             },
             operator: LogicalOperator::ExpressionGet(ExpressionGet::new(
                 input_table_index,
@@ -1060,6 +1066,7 @@ mod tests {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(rows)),
+                ..NodeStats::default()
             },
             operator: LogicalOperator::Projection(Projection::new(
                 output_table_index,
@@ -1247,7 +1254,7 @@ mod tests {
             "composite_key".to_string(),
             columns,
         )
-        .with_constraints(vec![Constraint::primary_key(vec![0, 2])]);
+        .with_constraints(vec![Constraint::unique(vec![0, 2])]);
         let entry = TableCatalogEntry::from_info(
             info,
             Arc::new(
@@ -1282,6 +1289,7 @@ mod tests {
             id: bind_context.next_plan_id(),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(100)),
+                ..NodeStats::default()
             },
             operator: LogicalOperator::Get(get),
         };

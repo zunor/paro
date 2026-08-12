@@ -42,10 +42,24 @@ impl CardinalityEstimate {
     }
 }
 
+/// Provenance controls which optimizer phase owns a cardinality annotation.
+///
+/// Tree-local statistics can always be recomputed after a rewrite. A join
+/// graph estimate, however, accounts for equality classes and joint domains
+/// across the whole associative region; reconstructing it from one physical
+/// tree cut loses that information.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CardinalityProvenance {
+    #[default]
+    Statistics,
+    JoinGraph,
+}
+
 /// Statistics attached to a logical plan node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeStats {
     pub estimated_cardinality: Option<CardinalityEstimate>,
+    pub cardinality_provenance: CardinalityProvenance,
 }
 
 /// Logical plan wrapper that owns plan-node identity and node-local metadata.

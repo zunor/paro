@@ -158,9 +158,9 @@ struct DistinctDomainEstimate {
     has_hll: bool,
 }
 
-/// Deterministic Prim frontier ordered by parent relation, child relation,
-/// filter, edge, then child vertex.
-type EqualityTreeFrontierEntry = Reverse<(usize, usize, usize, usize, usize)>;
+/// Deterministic maximum-overlap Prim frontier. The first tuple field is an
+/// inverted edge weight, followed by stable topology identifiers.
+type EqualityTreeFrontierEntry = Reverse<(usize, usize, usize, usize, usize, usize)>;
 
 #[derive(Debug, Default)]
 struct EqualityDenominatorScratch {
@@ -245,6 +245,7 @@ impl Default for EqualityPairDomain {
 
 fn push_tree_frontier(
     graph: &EqualityClassGraph,
+    pair_class_frequency: &HashMap<(usize, usize), usize>,
     active: &[bool],
     tree_visited: &[bool],
     tree_frontier: &mut BinaryHeap<EqualityTreeFrontierEntry>,
@@ -261,13 +262,26 @@ fn push_tree_frontier(
         if !active[child] || tree_visited[child] {
             continue;
         }
+        let parent_relation = graph.vertices[parent].relation;
+        let child_relation = graph.vertices[child].relation;
+        let pair = ordered_relation_pair(parent_relation, child_relation);
+        let overlap_priority = usize::MAX - pair_class_frequency.get(&pair).copied().unwrap_or(1);
         tree_frontier.push(Reverse((
-            graph.vertices[parent].relation,
-            graph.vertices[child].relation,
+            overlap_priority,
+            parent_relation,
+            child_relation,
             edge.filter_index,
             *edge_index,
             child,
         )));
+    }
+}
+
+fn ordered_relation_pair(left: usize, right: usize) -> (usize, usize) {
+    if left <= right {
+        (left, right)
+    } else {
+        (right, left)
     }
 }
 
@@ -316,6 +330,10 @@ pub struct CardinalityEstimator {
     relation_set_stats: Vec<RelationsSetToStats>,
     /// Equality-class topology compiled once before DP subset enumeration.
     equality_graphs: Vec<EqualityClassGraph>,
+    /// Number of equality classes that constrain each relation pair. The
+    /// spanning forests use this to align composite-key factors even when
+    /// transitive equality inference adds alternate paths.
+    equality_pair_class_frequency: HashMap<(usize, usize), usize>,
     /// Statistics initialization can reorder equality classes. Recompile the
     /// compact topology lazily after the last mutation.
     equality_graphs_dirty: bool,
@@ -447,6 +465,19 @@ impl CardinalityEstimator {
     fn ensure_equality_graphs(&mut self) {
         if self.equality_graphs_dirty {
             self.equality_graphs = EqualityClassGraph::build_all(&self.relation_set_stats);
+            self.equality_pair_class_frequency.clear();
+            for graph in &self.equality_graphs {
+                let mut graph_pairs = HashSet::new();
+                for edge in &graph.edges {
+                    graph_pairs.insert(ordered_relation_pair(
+                        graph.vertices[edge.left].relation,
+                        graph.vertices[edge.right].relation,
+                    ));
+                }
+                for pair in graph_pairs {
+                    *self.equality_pair_class_frequency.entry(pair).or_default() += 1;
+                }
+            }
             self.equality_graphs_dirty = false;
         }
     }
@@ -668,6 +699,7 @@ impl CardinalityEstimator {
         let Self {
             relation_set_stats,
             equality_graphs,
+            equality_pair_class_frequency,
             binding_stats,
             relation_unique_keys,
             relation_cardinalities,
@@ -765,6 +797,7 @@ impl CardinalityEstimator {
                 equality_scratch.tree_frontier.clear();
                 push_tree_frontier(
                     graph,
+                    equality_pair_class_frequency,
                     &equality_scratch.active,
                     &equality_scratch.tree_visited,
                     &mut equality_scratch.tree_frontier,
@@ -772,7 +805,7 @@ impl CardinalityEstimator {
                 );
                 let mut remaining = vertices.saturating_sub(1);
                 while remaining > 0 {
-                    let Some(Reverse((_, _, _, edge_index, child))) =
+                    let Some(Reverse((_, _, _, _, edge_index, child))) =
                         equality_scratch.tree_frontier.pop()
                     else {
                         debug_assert!(false, "equality component must have a spanning tree");
@@ -785,6 +818,7 @@ impl CardinalityEstimator {
                     equality_scratch.owned_edges[child] = Some(edge_index);
                     push_tree_frontier(
                         graph,
+                        equality_pair_class_frequency,
                         &equality_scratch.active,
                         &equality_scratch.tree_visited,
                         &mut equality_scratch.tree_frontier,
@@ -824,11 +858,7 @@ impl CardinalityEstimator {
                 let edge = &graph.edges[*edge_index];
                 let left_relation = graph.vertices[edge.left].relation;
                 let right_relation = graph.vertices[edge.right].relation;
-                let pair = if left_relation < right_relation {
-                    (left_relation, right_relation)
-                } else {
-                    (right_relation, left_relation)
-                };
+                let pair = ordered_relation_pair(left_relation, right_relation);
                 let domain = equality_scratch.vertex_domains[child]
                     .expect("owned equality vertex must have a domain")
                     .value() as f64;
@@ -1699,6 +1729,141 @@ mod tests {
 
         let join = set_manager.get_relation_from_vec(vec![0, 1, 2]);
         assert_eq!(estimator.estimate_cardinality(&join), 18_003_645.0);
+    }
+
+    #[test]
+    fn filtered_dimension_and_composite_key_keep_fact_join_cardinality() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 2, 0, 0),
+            create_equality_filter(&mut set_manager, 1, 0, 2, 0, 1),
+            create_equality_filter(&mut set_manager, 1, 1, 2, 1, 2),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let part = set_manager.get_relation(0);
+        let mut part_stats = RelationStats::with_cardinality(10_000);
+        part_stats.column_distinct_count =
+            column_distinct_counts(0, [DistinctCount::new(10_000, true)]);
+        estimator.init_cardinality_estimator_props(&part, &part_stats);
+
+        let lineitem = set_manager.get_relation(1);
+        let mut lineitem_stats = RelationStats::with_cardinality(6_001_215);
+        lineitem_stats.column_distinct_count = column_distinct_counts(
+            1,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        estimator.init_cardinality_estimator_props(&lineitem, &lineitem_stats);
+
+        let partsupp = set_manager.get_relation(2);
+        let mut partsupp_stats = RelationStats::with_cardinality(800_000);
+        partsupp_stats.column_distinct_count = column_distinct_counts(
+            2,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        partsupp_stats.unique_keys = vec![vec![ColumnBinding::new(2, 0), ColumnBinding::new(2, 1)]];
+        estimator.init_cardinality_estimator_props(&partsupp, &partsupp_stats);
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1, 2]);
+        assert_eq!(estimator.estimate_cardinality(&join), 300_060.75);
+    }
+
+    #[test]
+    fn composite_fact_join_stays_large_across_transitive_dimensions() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            create_equality_filter(&mut set_manager, 0, 0, 2, 0, 0),
+            create_equality_filter(&mut set_manager, 1, 0, 2, 1, 1),
+            create_equality_filter(&mut set_manager, 2, 0, 3, 0, 2),
+            create_equality_filter(&mut set_manager, 2, 1, 3, 1, 3),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let relation_stats = [
+            (10_000, vec![DistinctCount::new(10_000, true)]),
+            (10_000, vec![DistinctCount::new(9_955, true)]),
+            (
+                6_001_215,
+                vec![
+                    DistinctCount::new(207_507, true),
+                    DistinctCount::new(9_955, true),
+                ],
+            ),
+            (
+                800_000,
+                vec![
+                    DistinctCount::new(207_507, true),
+                    DistinctCount::new(9_955, true),
+                ],
+            ),
+        ];
+        for (relation, (cardinality, distinct)) in relation_stats.into_iter().enumerate() {
+            let set = set_manager.get_relation(relation);
+            let mut stats = RelationStats::with_cardinality(cardinality);
+            stats.column_distinct_count = column_distinct_counts(relation, distinct);
+            estimator.init_cardinality_estimator_props(&set, &stats);
+        }
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1, 2, 3]);
+        let estimate = estimator.estimate_cardinality(&join);
+        assert!(estimate > 100_000.0, "unexpected estimate {estimate}");
+    }
+
+    #[test]
+    fn transitive_triangles_align_composite_key_domains() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut estimator = CardinalityEstimator::new();
+        let filters = vec![
+            // part_key equivalence class. The dimension-to-partsupp edge is
+            // inferred transitively and creates a triangle.
+            create_equality_filter(&mut set_manager, 0, 0, 2, 0, 0),
+            create_equality_filter(&mut set_manager, 0, 0, 3, 0, 1),
+            create_equality_filter(&mut set_manager, 2, 0, 3, 0, 2),
+            // supp_key equivalence class with the same inferred shape.
+            create_equality_filter(&mut set_manager, 1, 0, 2, 1, 3),
+            create_equality_filter(&mut set_manager, 1, 0, 3, 1, 4),
+            create_equality_filter(&mut set_manager, 2, 1, 3, 1, 5),
+        ];
+        estimator.init_equivalent_relations(&filters);
+
+        let relation_stats = [
+            (10_000, vec![DistinctCount::new(10_000, true)]),
+            (10_000, vec![DistinctCount::new(9_955, true)]),
+            (
+                6_001_215,
+                vec![
+                    DistinctCount::new(207_507, true),
+                    DistinctCount::new(9_955, true),
+                ],
+            ),
+            (
+                800_000,
+                vec![
+                    DistinctCount::new(207_507, true),
+                    DistinctCount::new(9_955, true),
+                ],
+            ),
+        ];
+        for (relation, (cardinality, distinct)) in relation_stats.into_iter().enumerate() {
+            let set = set_manager.get_relation(relation);
+            let mut stats = RelationStats::with_cardinality(cardinality);
+            stats.column_distinct_count = column_distinct_counts(relation, distinct);
+            if relation == 3 {
+                stats.unique_keys = vec![vec![ColumnBinding::new(3, 0), ColumnBinding::new(3, 1)]];
+            }
+            estimator.init_cardinality_estimator_props(&set, &stats);
+        }
+
+        let join = set_manager.get_relation_from_vec(vec![0, 1, 2, 3]);
+        assert_eq!(estimator.estimate_cardinality(&join), 290_512.73168791726);
     }
 
     #[test]

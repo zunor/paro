@@ -7,7 +7,8 @@ use crate::binder::Binder;
 use paro_catalog::entry::{ColumnDefinition, Constraint};
 use paro_common::error::Result;
 use paro_parser::ast::{
-    ConstraintType as AstConstraintType, CreateOption, CreateTableSource, CreateTableStmt, TypeName,
+    ConstraintType as AstConstraintType, CreateOption, CreateTableSource, CreateTableStmt,
+    Identifier, TypeName,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -38,6 +39,34 @@ fn bind_column_type_with_nullability(
             Ok((logical_type, false))
         }
     }
+}
+
+fn bind_constraint_columns(
+    kind: &str,
+    identifiers: &[Identifier],
+    column_name_to_index: &HashMap<String, usize>,
+) -> Result<Vec<usize>> {
+    if identifiers.is_empty() {
+        return Err(paro_common::error::catalog(format!(
+            "{kind} must reference at least one column"
+        )));
+    }
+
+    let mut indices = Vec::with_capacity(identifiers.len());
+    let mut seen = HashSet::new();
+    for identifier in identifiers {
+        let column_name = &identifier.name;
+        let column_idx = *column_name_to_index.get(column_name).ok_or_else(|| {
+            paro_common::error::catalog(format!("{kind} column '{column_name}' does not exist"))
+        })?;
+        if !seen.insert(column_idx) {
+            return Err(paro_common::error::catalog(format!(
+                "Duplicate column '{column_name}' in {kind}"
+            )));
+        }
+        indices.push(column_idx);
+    }
+    Ok(indices)
 }
 
 pub fn bind_create_table(
@@ -144,34 +173,12 @@ pub fn bind_create_table(
                                             .to_string(),
                                     ));
                                 }
-                                if primary_columns.is_empty() {
-                                    return Err(paro_common::error::catalog(
-                                        "PRIMARY KEY must reference at least one column"
-                                            .to_string(),
-                                    ));
-                                }
-
-                                let mut pk_indices = Vec::with_capacity(primary_columns.len());
-                                let mut seen = HashSet::new();
-                                for column in primary_columns {
-                                    let column_name = &column.name;
-                                    let column_idx = *column_name_to_index
-                                        .get(column_name)
-                                        .ok_or_else(|| {
-                                            paro_common::error::catalog(format!(
-                                                "PRIMARY KEY column '{}' does not exist",
-                                                column_name
-                                            ))
-                                        })?;
-
-                                    if !seen.insert(column_idx) {
-                                        return Err(paro_common::error::catalog(format!(
-                                            "Duplicate column '{}' in PRIMARY KEY",
-                                            column_name
-                                        )));
-                                    }
-
-                                    pk_indices.push(column_idx);
+                                let pk_indices = bind_constraint_columns(
+                                    "PRIMARY KEY",
+                                    primary_columns,
+                                    &column_name_to_index,
+                                )?;
+                                for &column_idx in &pk_indices {
                                     not_null_columns.insert(column_idx);
                                     if let Some(column_def) = columns.get_mut(column_idx) {
                                         column_def.not_null = true;
@@ -180,6 +187,14 @@ pub fn bind_create_table(
 
                                 constraints.push(Constraint::primary_key(pk_indices));
                                 has_primary_key = true;
+                            }
+                            AstConstraintType::UniqueNotEnforced(unique_columns) => {
+                                let unique_indices = bind_constraint_columns(
+                                    "UNIQUE NOT ENFORCED",
+                                    unique_columns,
+                                    &column_name_to_index,
+                                )?;
+                                constraints.push(Constraint::unique(unique_indices));
                             }
                         }
                     }

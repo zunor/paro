@@ -828,6 +828,7 @@ mod tests {
             id: PlanNodeId(99),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(123)),
+                ..NodeStats::default()
             },
             operator: LogicalOperator::Projection(
                 Projection::new(
@@ -912,6 +913,7 @@ mod tests {
             id: PlanNodeId(99),
             stats: NodeStats {
                 estimated_cardinality: Some(CardinalityEstimate::exact(123)),
+                ..NodeStats::default()
             },
             operator: LogicalOperator::Projection(Projection::new(
                 11,

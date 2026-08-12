@@ -19,6 +19,9 @@ use crate::ast::Identifier;
 pub enum ConstraintType {
     Check(Expr),
     PrimaryKey(Vec<Identifier>),
+    /// A declarative uniqueness guarantee used for optimization without
+    /// requiring a physical enforcement index.
+    UniqueNotEnforced(Vec<Identifier>),
 }
 
 impl Display for ConstraintType {
@@ -31,6 +34,11 @@ impl Display for ConstraintType {
                 write!(f, "PRIMARY KEY (")?;
                 write_comma_separated_list(f, columns)?;
                 write!(f, ")")
+            }
+            ConstraintType::UniqueNotEnforced(columns) => {
+                write!(f, "UNIQUE (")?;
+                write_comma_separated_list(f, columns)?;
+                write!(f, ") NOT ENFORCED")
             }
         }
     }

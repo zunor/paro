@@ -15,7 +15,7 @@ use paro_planner::operator::{
     ColumnBinding, Filter, FullTextFilterScan, Get, GraphExpand, GraphScan, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, SearchScan, SetOpType,
 };
-use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
 use paro_storage::index::graph::GraphStatsProvider;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
 
@@ -39,7 +39,10 @@ impl StatisticsGathering {
         ctx: &mut OptimizationContext,
     ) -> Result<LogicalPlan> {
         let mut plan = plan.try_map_children(|child| self.gather(child, ctx))?;
-        plan.stats.estimated_cardinality = self.estimate_plan_cardinality(&plan, ctx);
+        if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+            plan.stats.estimated_cardinality = self.estimate_plan_cardinality(&plan, ctx);
+            plan.stats.cardinality_provenance = CardinalityProvenance::Statistics;
+        }
         self.update_output_column_stats(&plan, ctx);
         Ok(plan)
     }
@@ -280,12 +283,14 @@ impl StatisticsGathering {
             Join::Comparison(cmp) => {
                 let left = cmp.left.stats.estimated_cardinality?;
                 let right = cmp.right.stats.estimated_cardinality?;
-                let selectivity = cmp
-                    .conditions
-                    .iter()
-                    .map(|condition| estimate_join_condition_selectivity(condition, ctx))
-                    .product::<f64>()
-                    .clamp(0.0, 1.0);
+                let left_bindings = cmp.left.get_column_bindings();
+                let right_bindings = cmp.right.get_column_bindings();
+                let selectivity = estimate_comparison_join_selectivity(
+                    &cmp.conditions,
+                    &left_bindings,
+                    &right_bindings,
+                    ctx,
+                );
                 Some(adjust_join_estimate(
                     apply_selectivity(product_estimate(left, right), selectivity),
                     left,
@@ -495,6 +500,92 @@ impl StatisticsGathering {
             .and_then(|table| table.get_storage())
             .map(|storage| storage.total_rows().max(1))
             .unwrap_or_else(|| default_table_cardinality(ctx))
+    }
+}
+
+/// Estimate a comparison join without manufacturing independence between
+/// marginal statistics of one composite relation pair.
+///
+/// Two equality keys between the same aliases are commonly a composite key.
+/// Multiplying their individual NDV selectivities can underestimate the join
+/// by orders of magnitude unless joint-domain statistics prove independence.
+/// Keep the strongest equality domain for each concrete alias pair, while
+/// conditions connecting different pairs and non-equality residuals remain
+/// independent factors. This matches the correlation contract used by the
+/// join-order estimator and keeps post-reorder statistics from reversing a
+/// sound build/probe decision.
+fn estimate_comparison_join_selectivity(
+    conditions: &[JoinCondition],
+    left_bindings: &[ColumnBinding],
+    right_bindings: &[ColumnBinding],
+    ctx: &OptimizationContext,
+) -> f64 {
+    correlate_join_condition_selectivities(conditions.iter().map(|condition| {
+        (
+            equality_relation_pair(condition, left_bindings, right_bindings),
+            estimate_join_condition_selectivity(condition, left_bindings, right_bindings, ctx),
+        )
+    }))
+}
+
+fn correlate_join_condition_selectivities(
+    conditions: impl IntoIterator<Item = (Option<(usize, usize)>, f64)>,
+) -> f64 {
+    let mut equality_by_relation_pair = HashMap::<(usize, usize), f64>::new();
+    let mut independent_selectivity = 1.0;
+
+    for (relation_pair, selectivity) in conditions {
+        if let Some(pair) = relation_pair {
+            equality_by_relation_pair
+                .entry(pair)
+                .and_modify(|strongest| *strongest = strongest.min(selectivity))
+                .or_insert(selectivity);
+        } else {
+            independent_selectivity *= selectivity;
+        }
+    }
+
+    equality_by_relation_pair
+        .values()
+        .fold(independent_selectivity, |product, selectivity| {
+            product * selectivity
+        })
+        .clamp(0.0, 1.0)
+}
+
+fn equality_relation_pair(
+    condition: &JoinCondition,
+    left_bindings: &[ColumnBinding],
+    right_bindings: &[ColumnBinding],
+) -> Option<(usize, usize)> {
+    if !matches!(
+        condition.comparison,
+        JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+    ) {
+        return None;
+    }
+    let left = expression_binding(&condition.left, left_bindings)?;
+    let right = expression_binding(&condition.right, right_bindings)?;
+    let pair = (left.table_index, right.table_index);
+    Some(if pair.0 <= pair.1 {
+        pair
+    } else {
+        (pair.1, pair.0)
+    })
+}
+
+fn expression_binding(
+    expression: &Expression,
+    positional_bindings: &[ColumnBinding],
+) -> Option<ColumnBinding> {
+    match expression {
+        Expression::ColumnRef(column) => Some(column.binding),
+        Expression::Reference(reference) => positional_bindings.get(reference.index).copied(),
+        // A cast preserves column lineage for correlation purposes. It changes
+        // the comparison domain, whose selectivity is still estimated by the
+        // ordinary expression model, but not which aliases form the pair.
+        Expression::Cast(cast) => expression_binding(cast.child.as_ref(), positional_bindings),
+        _ => None,
     }
 }
 
@@ -717,21 +808,24 @@ fn adjust_join_estimate(
 
 fn estimate_join_condition_selectivity(
     condition: &JoinCondition,
+    left_bindings: &[ColumnBinding],
+    right_bindings: &[ColumnBinding],
     ctx: &OptimizationContext,
 ) -> f64 {
     match condition.comparison {
         JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom => {
-            if let (Expression::ColumnRef(left), Expression::ColumnRef(right)) =
-                (&condition.left, &condition.right)
-            {
+            if let (Some(left), Some(right)) = (
+                expression_binding(&condition.left, left_bindings),
+                expression_binding(&condition.right, right_bindings),
+            ) {
                 let left_distinct = ctx
                     .column_stats
-                    .get(&left.binding)
+                    .get(&left)
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 let right_distinct = ctx
                     .column_stats
-                    .get(&right.binding)
+                    .get(&right)
                     .map(|stats| stats.get_distinct_count())
                     .unwrap_or(0);
                 if left_distinct > 0 && right_distinct > 0 {
@@ -886,6 +980,45 @@ mod tests {
         TestStatementContextBuilder::minimal().build()
     }
 
+    fn column_ref(table_index: usize, column_index: usize) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression {
+            binding: ColumnBinding::new(table_index, column_index),
+            depth: 0,
+            return_type: LogicalType::BigInt,
+        })
+    }
+
+    fn equality(
+        left_table: usize,
+        left_column: usize,
+        right_table: usize,
+        right_column: usize,
+    ) -> JoinCondition {
+        JoinCondition::new(
+            column_ref(left_table, left_column),
+            column_ref(right_table, right_column),
+            JoinComparisonType::Equal,
+        )
+    }
+
+    fn values_relation(bind_context: &BindContext, table_index: usize, rows: usize) -> LogicalPlan {
+        LogicalPlan::new(
+            bind_context,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                vec![
+                    vec![Expression::Constant(ConstantExpression::new(
+                        Value::BigInt(1),
+                        LogicalType::BigInt,
+                    ))];
+                    rows
+                ],
+                vec!["v".to_string()],
+                vec![LogicalType::BigInt],
+            )),
+        )
+    }
+
     #[test]
     fn statistics_gathering_sets_expression_get_and_limit_cardinality() {
         let bind_context = BindContext::new();
@@ -947,5 +1080,83 @@ mod tests {
             Some(CardinalityEstimate::exact(10))
         );
         assert!(ctx.column_stats.contains_key(&ColumnBinding::new(2, 0)));
+    }
+
+    #[test]
+    fn statistics_gathering_preserves_join_graph_cardinality_provenance() {
+        let bind_context = BindContext::new();
+        let session = make_test_session();
+        let mut ctx = OptimizationContext::new(session, bind_context.clone());
+        let join = paro_planner::operator::ComparisonJoin::new(
+            JoinType::Inner,
+            values_relation(&bind_context, 1, 10),
+            values_relation(&bind_context, 2, 20),
+            vec![equality(1, 0, 2, 0)],
+        );
+        let mut plan =
+            LogicalPlan::new(&bind_context, LogicalOperator::Join(Join::Comparison(join)));
+        plan.stats.estimated_cardinality = Some(CardinalityEstimate::exact(73));
+        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+
+        let gathered = StatisticsGathering::new()
+            .gather(plan, &mut ctx)
+            .expect("gather should succeed");
+
+        assert_eq!(
+            gathered.stats.estimated_cardinality,
+            Some(CardinalityEstimate::exact(73))
+        );
+        assert_eq!(
+            gathered.stats.cardinality_provenance,
+            CardinalityProvenance::JoinGraph
+        );
+    }
+
+    #[test]
+    fn composite_equalities_share_one_marginal_domain_per_relation_pair() {
+        let conditions = [equality(0, 0, 1, 0), equality(0, 1, 1, 1)];
+        let pair = equality_relation_pair(&conditions[0], &[], &[]);
+        assert_eq!(pair, equality_relation_pair(&conditions[1], &[], &[]));
+        let selectivity = correlate_join_condition_selectivities([
+            (pair, 1.0 / 200_000.0),
+            (pair, 1.0 / 10_000.0),
+        ]);
+        assert_eq!(selectivity, 1.0 / 200_000.0);
+    }
+
+    #[test]
+    fn equalities_between_different_relation_pairs_remain_independent() {
+        let first_pair = equality_relation_pair(&equality(0, 0, 1, 0), &[], &[]);
+        let second_pair = equality_relation_pair(&equality(2, 0, 3, 0), &[], &[]);
+        assert_ne!(first_pair, second_pair);
+        let selectivity = correlate_join_condition_selectivities([
+            (first_pair, 1.0 / 200_000.0),
+            (first_pair, 1.0 / 10_000.0),
+            (second_pair, 1.0 / 25.0),
+        ]);
+        assert_eq!(selectivity, 1.0 / 200_000.0 / 25.0);
+    }
+
+    #[test]
+    fn physical_references_recover_their_relation_pair_from_join_inputs() {
+        let condition = JoinCondition::new(
+            Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                1,
+                LogicalType::BigInt,
+            )),
+            Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                0,
+                LogicalType::BigInt,
+            )),
+            JoinComparisonType::Equal,
+        );
+        assert_eq!(
+            equality_relation_pair(
+                &condition,
+                &[ColumnBinding::new(4, 0), ColumnBinding::new(2, 1)],
+                &[ColumnBinding::new(7, 3)]
+            ),
+            Some((2, 7))
+        );
     }
 }

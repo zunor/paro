@@ -41,6 +41,7 @@ fn test_statement_roundtrip() {
     let cases = &[
         r#"WITH t AS (SELECT 1 AS a) SELECT * FROM t WHERE a > 0"#,
         r#"CREATE TABLE IF NOT EXISTS a.b (c INTEGER NOT NULL DEFAULT 1, b VARCHAR)"#,
+        r#"CREATE TABLE fact (a BIGINT, b BIGINT, UNIQUE (a, b) NOT ENFORCED)"#,
         r#"ALTER TABLE t ADD COLUMN a FLOAT DEFAULT 1.1 COMMENT 'hello' FIRST"#,
         r#"CREATE VIEW v1(c1) AS SELECT number % 3 AS a FROM numbers(1000)"#,
         r#"CREATE INDEX idx_orders_customer_id ON orders (customer_id)"#,

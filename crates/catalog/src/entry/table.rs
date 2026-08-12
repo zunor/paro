@@ -86,6 +86,9 @@ impl Constraint {
     }
 
     pub fn unique(columns: Vec<usize>) -> Self {
+        // UNIQUE constraints are declarative optimizer guarantees. Unlike a
+        // PRIMARY KEY they do not make columns storage keys or allocate an
+        // enforcement index; SQL exposes them only as UNIQUE NOT ENFORCED.
         Self {
             constraint_type: ConstraintType::Unique,
             columns,

@@ -14,21 +14,23 @@ SET threads = ${thread_count};
 SET memory_limit = '${memory_limit}';
 SET rowset_scan_pushdown = ${rowset_scan_pushdown};
 
--- Keep every table uniformly heap-backed. In Paro a PRIMARY KEY also builds a
--- physical unique index; declaring it on only selected tables changes both
--- optimizer metadata and resident memory, while declaring every TPC-H key
--- makes the 6M-row lineitem index dominate this analytical benchmark.
+-- TPC-H declares logical keys, but an analytical baseline must not pay for
+-- OLTP enforcement indexes. UNIQUE NOT ENFORCED records the data generator's
+-- guarantee for join cardinality and elimination while keeping every table
+-- uniformly heap-backed.
 CREATE TABLE region (
     r_regionkey INTEGER,
     r_name VARCHAR,
-    r_comment VARCHAR
+    r_comment VARCHAR,
+    UNIQUE (r_regionkey) NOT ENFORCED
 );
 
 CREATE TABLE nation (
     n_nationkey INTEGER,
     n_name VARCHAR,
     n_regionkey INTEGER,
-    n_comment VARCHAR
+    n_comment VARCHAR,
+    UNIQUE (n_nationkey) NOT ENFORCED
 );
 
 CREATE TABLE supplier (
@@ -38,7 +40,8 @@ CREATE TABLE supplier (
     s_nationkey INTEGER,
     s_phone VARCHAR,
     s_acctbal DECIMAL(15, 2),
-    s_comment VARCHAR
+    s_comment VARCHAR,
+    UNIQUE (s_suppkey) NOT ENFORCED
 );
 
 CREATE TABLE customer (
@@ -49,7 +52,8 @@ CREATE TABLE customer (
     c_phone VARCHAR,
     c_acctbal DECIMAL(15, 2),
     c_mktsegment VARCHAR,
-    c_comment VARCHAR
+    c_comment VARCHAR,
+    UNIQUE (c_custkey) NOT ENFORCED
 );
 
 CREATE TABLE part (
@@ -61,7 +65,8 @@ CREATE TABLE part (
     p_size INTEGER,
     p_container VARCHAR,
     p_retailprice DECIMAL(15, 2),
-    p_comment VARCHAR
+    p_comment VARCHAR,
+    UNIQUE (p_partkey) NOT ENFORCED
 );
 
 CREATE TABLE partsupp (
@@ -69,7 +74,8 @@ CREATE TABLE partsupp (
     ps_suppkey BIGINT,
     ps_availqty BIGINT,
     ps_supplycost DECIMAL(15, 2),
-    ps_comment VARCHAR
+    ps_comment VARCHAR,
+    UNIQUE (ps_partkey, ps_suppkey) NOT ENFORCED
 );
 
 CREATE TABLE orders (
@@ -81,7 +87,8 @@ CREATE TABLE orders (
     o_orderpriority VARCHAR,
     o_clerk VARCHAR,
     o_shippriority INTEGER,
-    o_comment VARCHAR
+    o_comment VARCHAR,
+    UNIQUE (o_orderkey) NOT ENFORCED
 );
 
 CREATE TABLE lineitem (
@@ -100,7 +107,8 @@ CREATE TABLE lineitem (
     l_receiptdate DATE,
     l_shipinstruct VARCHAR,
     l_shipmode VARCHAR,
-    l_comment VARCHAR
+    l_comment VARCHAR,
+    UNIQUE (l_orderkey, l_linenumber) NOT ENFORCED
 );
 
 COPY region FROM '${data_dir}/region.tbl' WITH (FORMAT csv, DELIMITER '|');
