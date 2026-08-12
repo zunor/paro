@@ -7,7 +7,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
 use crate::physical::properties::{PipelineProperties, RequiredProperties};
 use crate::physical::row_type::RowType;
@@ -501,6 +501,9 @@ impl SourceSpec {
                 for filter in &source.dynamic_runtime_filters {
                     visit(filter.handle, BreakerHandleKind::HashJoinBuild)?;
                 }
+                for filter in &source.dynamic_scalar_filters {
+                    visit(filter.handle, BreakerHandleKind::Materialized)?;
+                }
             }
             Self::Materialized(source) => {
                 visit(source.handle, BreakerHandleKind::Materialized)?;
@@ -561,6 +564,7 @@ impl SourceSpec {
 pub struct RowsetSourceSpec {
     pub scan: RowsetScanSpec,
     pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterSpec]>,
+    pub dynamic_scalar_filters: Box<[RowsetDynamicScalarFilterSpec]>,
 }
 
 impl RowsetSourceSpec {
@@ -568,6 +572,7 @@ impl RowsetSourceSpec {
         Self {
             scan,
             dynamic_runtime_filters: Vec::new().into_boxed_slice(),
+            dynamic_scalar_filters: Vec::new().into_boxed_slice(),
         }
     }
 
@@ -579,6 +584,15 @@ impl RowsetSourceSpec {
         filters.push(filter);
         self.dynamic_runtime_filters = filters.into_boxed_slice();
     }
+
+    pub fn add_dynamic_scalar_filter(&mut self, filter: RowsetDynamicScalarFilterSpec) {
+        let mut filters = self.dynamic_scalar_filters.to_vec();
+        if filters.iter().any(|existing| existing == &filter) {
+            return;
+        }
+        filters.push(filter);
+        self.dynamic_scalar_filters = filters.into_boxed_slice();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +600,19 @@ pub struct RowsetDynamicRuntimeFilterSpec {
     pub handle: BreakerHandleId,
     pub build_key_index: usize,
     pub probe_column_id: u32,
+}
+
+/// Conservative scan pruning derived from a materialized single-row join
+/// input. The nested-loop predicate remains in the pipeline as the semantic
+/// authority; this descriptor only moves an outward-rounded bound into the
+/// source after its producer has sealed the scalar value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowsetDynamicScalarFilterSpec {
+    pub handle: BreakerHandleId,
+    pub build_column_index: usize,
+    pub probe_column_id: u32,
+    pub probe_type: LogicalType,
+    pub comparison: JoinComparisonType,
 }
 
 #[derive(Debug, Clone)]

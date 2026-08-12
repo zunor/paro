@@ -154,6 +154,7 @@ impl<'a> PipelineLowerer<'a> {
 
         let (source, mut transforms, pending_builds) =
             self.collect_probe_roles(*left, pipelines, dependencies)?;
+        let source = self.attach_nlj_scalar_runtime_filter(source, &transforms, handle, spec);
         let source_handles = source.clone();
         transforms.push(nlj_probe_transform(handle, spec));
         transforms.extend(consumer_transforms.iter().cloned());
@@ -759,6 +760,8 @@ impl<'a> PipelineLowerer<'a> {
 
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
+                let source =
+                    self.attach_nlj_scalar_runtime_filter(source, &transforms, handle, &spec);
                 transforms.push(nlj_probe_transform(handle, &spec));
                 pending_builds.push(PendingProbeBuild { producer, handle });
                 Ok((source, transforms, pending_builds))

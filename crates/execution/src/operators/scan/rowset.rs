@@ -8,10 +8,13 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
 
-use paro_storage::index::{collect_predicate_columns, PredicateTree};
+use paro_planner::operator::JoinComparisonType;
+use paro_storage::index::{collect_predicate_columns, Predicate, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};
 use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
@@ -19,7 +22,7 @@ use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
 use crate::physical::specs::{RowsetColumnProjection, RowsetScanSpec};
 use crate::pipeline::graph::RowsetSourceSpec;
-use crate::runtime::breaker::{HandleRef, JoinBuildHandle};
+use crate::runtime::breaker::{HandleRef, JoinBuildHandle, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
@@ -51,6 +54,7 @@ pub struct RowsetSourceDesc {
     pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
     pub scan_order: Option<SegmentOrderOptions>,
     pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterDesc]>,
+    pub dynamic_scalar_filters: Box<[RowsetDynamicScalarFilterDesc]>,
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +62,15 @@ pub struct RowsetDynamicRuntimeFilterDesc {
     pub handle: HandleRef<JoinBuildHandle>,
     pub build_key_index: usize,
     pub probe_column_id: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct RowsetDynamicScalarFilterDesc {
+    pub handle: HandleRef<MaterializedHandle>,
+    pub build_column_index: usize,
+    pub probe_column_id: u32,
+    pub probe_type: LogicalType,
+    pub comparison: JoinComparisonType,
 }
 
 impl RowsetSourceDesc {
@@ -73,6 +86,7 @@ impl RowsetSourceDesc {
             scan_access_cost: spec.scan_access_cost,
             scan_order: spec.scan_order.clone(),
             dynamic_runtime_filters: Vec::new().into_boxed_slice(),
+            dynamic_scalar_filters: Vec::new().into_boxed_slice(),
         }
     }
 
@@ -85,6 +99,18 @@ impl RowsetSourceDesc {
                 handle: HandleRef::new(filter.handle),
                 build_key_index: filter.build_key_index,
                 probe_column_id: filter.probe_column_id,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        desc.dynamic_scalar_filters = spec
+            .dynamic_scalar_filters
+            .iter()
+            .map(|filter| RowsetDynamicScalarFilterDesc {
+                handle: HandleRef::new(filter.handle),
+                build_column_index: filter.build_column_index,
+                probe_column_id: filter.probe_column_id,
+                probe_type: filter.probe_type.clone(),
+                comparison: filter.comparison,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -239,7 +265,161 @@ impl RowsetSourceExec {
                 predicates.push(predicate);
             }
         }
+        for filter in &self.desc.dynamic_scalar_filters {
+            let handle = ctx.handles.get(filter.handle)?;
+            let reader = MaterializedReader::new(handle, "rowset scalar runtime filter");
+            let chunks = reader.sealed_chunks()?;
+            match materialized_scalar_value(chunks, filter.build_column_index)? {
+                MaterializedScalarValue::Multiple => {}
+                MaterializedScalarValue::Empty => {
+                    predicates.push(empty_predicate(filter.probe_column_id))
+                }
+                MaterializedScalarValue::One(value) => {
+                    if let Some(predicate) = scalar_runtime_predicate(filter, value) {
+                        predicates.push(predicate);
+                    }
+                }
+            }
+        }
         Ok(combine_predicates(predicates))
+    }
+}
+
+enum MaterializedScalarValue {
+    Empty,
+    One(Value),
+    Multiple,
+}
+
+fn materialized_scalar_value(
+    chunks: &[Chunk],
+    column_index: usize,
+) -> Result<MaterializedScalarValue> {
+    let mut value = None;
+    for chunk in chunks {
+        for row_idx in 0..chunk.size() {
+            if value.is_some() {
+                return Ok(MaterializedScalarValue::Multiple);
+            }
+            value = Some(chunk.get_value(column_index, row_idx).ok_or_else(|| {
+                paro_error::internal("materialized scalar filter column is missing")
+            })?);
+        }
+    }
+    Ok(value.map_or(MaterializedScalarValue::Empty, MaterializedScalarValue::One))
+}
+
+fn empty_predicate(column_id: u32) -> PredicateTree {
+    PredicateTree::leaf(Predicate::In {
+        column_id,
+        values: Vec::new(),
+    })
+}
+
+fn scalar_runtime_predicate(
+    filter: &RowsetDynamicScalarFilterDesc,
+    value: Value,
+) -> Option<PredicateTree> {
+    if matches!(value, Value::Null(_)) {
+        return Some(empty_predicate(filter.probe_column_id));
+    }
+    let bound = match (&filter.probe_type, value) {
+        (LogicalType::Decimal { precision, scale }, Value::Decimal(value, _, value_scale)) => {
+            let rounding = match filter.comparison {
+                JoinComparisonType::Equal => DecimalBoundaryRounding::Exact,
+                JoinComparisonType::GreaterThan | JoinComparisonType::GreaterThanOrEqual => {
+                    DecimalBoundaryRounding::Floor
+                }
+                JoinComparisonType::LessThan | JoinComparisonType::LessThanOrEqual => {
+                    DecimalBoundaryRounding::Ceil
+                }
+                _ => return None,
+            };
+            match rescale_decimal_boundary(value, value_scale, *precision, *scale, rounding) {
+                DecimalBoundary::Value(value) => Value::Decimal(value, *precision, *scale),
+                DecimalBoundary::NoExactValue => {
+                    return Some(empty_predicate(filter.probe_column_id));
+                }
+                DecimalBoundary::OutOfDomain => return None,
+            }
+        }
+        (probe_type, value) if value.logical_type() == *probe_type => value,
+        _ => return None,
+    };
+    let predicate = match filter.comparison {
+        JoinComparisonType::Equal => Predicate::Eq {
+            column_id: filter.probe_column_id,
+            value: bound,
+        },
+        JoinComparisonType::GreaterThan | JoinComparisonType::GreaterThanOrEqual => Predicate::Ge {
+            column_id: filter.probe_column_id,
+            value: bound,
+        },
+        JoinComparisonType::LessThan | JoinComparisonType::LessThanOrEqual => Predicate::Le {
+            column_id: filter.probe_column_id,
+            value: bound,
+        },
+        _ => return None,
+    };
+    Some(PredicateTree::leaf(predicate))
+}
+
+#[derive(Clone, Copy)]
+enum DecimalBoundaryRounding {
+    Exact,
+    Floor,
+    Ceil,
+}
+
+enum DecimalBoundary {
+    Value(i128),
+    NoExactValue,
+    OutOfDomain,
+}
+
+fn rescale_decimal_boundary(
+    value: i128,
+    value_scale: u8,
+    precision: u8,
+    target_scale: u8,
+    rounding: DecimalBoundaryRounding,
+) -> DecimalBoundary {
+    let (scaled, exact) = if value_scale <= target_scale {
+        let Some(factor) = 10_i128.checked_pow(u32::from(target_scale - value_scale)) else {
+            return DecimalBoundary::OutOfDomain;
+        };
+        let Some(scaled) = value.checked_mul(factor) else {
+            return DecimalBoundary::OutOfDomain;
+        };
+        (scaled, true)
+    } else {
+        let Some(divisor) = 10_i128.checked_pow(u32::from(value_scale - target_scale)) else {
+            return DecimalBoundary::OutOfDomain;
+        };
+        let quotient = value / divisor;
+        let remainder = value % divisor;
+        let scaled = match rounding {
+            DecimalBoundaryRounding::Exact | DecimalBoundaryRounding::Floor if remainder < 0 => {
+                quotient.checked_sub(1)
+            }
+            DecimalBoundaryRounding::Ceil if remainder > 0 => quotient.checked_add(1),
+            _ => Some(quotient),
+        };
+        let Some(scaled) = scaled else {
+            return DecimalBoundary::OutOfDomain;
+        };
+        (scaled, remainder == 0)
+    };
+    if matches!(rounding, DecimalBoundaryRounding::Exact) && !exact {
+        return DecimalBoundary::NoExactValue;
+    }
+    let Some(limit) = 10_i128.checked_pow(u32::from(precision)) else {
+        return DecimalBoundary::OutOfDomain;
+    };
+    if scaled <= -limit || scaled >= limit {
+        DecimalBoundary::OutOfDomain
+    } else {
+        DecimalBoundary::Value(scaled)
     }
 }
 
@@ -288,6 +468,19 @@ fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
 mod tests {
     use super::*;
 
+    fn scalar_filter(comparison: JoinComparisonType) -> RowsetDynamicScalarFilterDesc {
+        RowsetDynamicScalarFilterDesc {
+            handle: HandleRef::new(crate::pipeline::handles::BreakerHandleId::new(0)),
+            build_column_index: 0,
+            probe_column_id: 7,
+            probe_type: LogicalType::Decimal {
+                precision: 5,
+                scale: 2,
+            },
+            comparison,
+        }
+    }
+
     #[test]
     fn morsels_expose_workers_without_fragmenting_large_scans() {
         assert_eq!(rowset_morsel_rows(25, 4), MIN_ROWSET_MORSEL_ROWS);
@@ -306,6 +499,57 @@ mod tests {
             rowset_morsel_rows(u64::MAX, usize::MAX),
             MIN_ROWSET_MORSEL_ROWS
         );
+    }
+
+    #[test]
+    fn decimal_runtime_bound_rounds_outward_for_negative_values() {
+        assert!(matches!(
+            rescale_decimal_boundary(-123, 2, 5, 1, DecimalBoundaryRounding::Floor),
+            DecimalBoundary::Value(-13)
+        ));
+        assert!(matches!(
+            rescale_decimal_boundary(-123, 2, 5, 1, DecimalBoundaryRounding::Ceil),
+            DecimalBoundary::Value(-12)
+        ));
+        assert!(matches!(
+            rescale_decimal_boundary(-120, 2, 5, 1, DecimalBoundaryRounding::Exact),
+            DecimalBoundary::Value(-12)
+        ));
+        assert!(matches!(
+            rescale_decimal_boundary(-123, 2, 5, 1, DecimalBoundaryRounding::Exact),
+            DecimalBoundary::NoExactValue
+        ));
+    }
+
+    #[test]
+    fn inexact_scalar_equality_proves_an_empty_scan() {
+        let predicate = scalar_runtime_predicate(
+            &scalar_filter(JoinComparisonType::Equal),
+            Value::Decimal(12_345, 8, 3),
+        )
+        .expect("decimal equality should compile");
+
+        assert!(matches!(
+            predicate,
+            PredicateTree::Leaf(Predicate::In { column_id: 7, values }) if values.is_empty()
+        ));
+    }
+
+    #[test]
+    fn scalar_range_uses_a_conservative_storage_bound() {
+        let predicate = scalar_runtime_predicate(
+            &scalar_filter(JoinComparisonType::GreaterThan),
+            Value::Decimal(12_345, 8, 3),
+        )
+        .expect("decimal range should compile");
+
+        assert!(matches!(
+            predicate,
+            PredicateTree::Leaf(Predicate::Ge {
+                column_id: 7,
+                value: Value::Decimal(1_234, 5, 2),
+            })
+        ));
     }
 }
 

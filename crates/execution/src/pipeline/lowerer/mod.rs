@@ -37,11 +37,12 @@ use super::graph::{
     PerfectHashAggregateEmitSourceSpec, PerfectHashAggregateSinkSpec, PipelineDependency,
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
-    RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetSourceSpec,
-    SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId, SinkSharing, SinkSpec,
-    SortBuildSinkSpec, SortEmitSourceSpec, SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec,
-    TopNEmitSourceSpec, TransformSpec, UngroupedAggregateEmitSourceSpec,
-    UngroupedAggregateSinkSpec, UpdateSinkSpec, WindowBuildSinkSpec, WindowEmitSourceSpec,
+    RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetDynamicScalarFilterSpec,
+    RowsetSourceSpec, SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId,
+    SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec, SortRangeJoinProbeSpec,
+    SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
+    UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
+    WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
 use super::properties::{repair_transform, PipelinePropertyAccumulator};

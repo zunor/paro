@@ -46,6 +46,63 @@ impl PipelineLowerer<'_> {
         source
     }
 
+    pub(crate) fn attach_nlj_scalar_runtime_filter(
+        &self,
+        mut source: SourceSpec,
+        transforms: &[TransformSpec],
+        handle: BreakerHandleId,
+        spec: &NestedLoopJoinSpec,
+    ) -> SourceSpec {
+        if spec.join_type != JoinType::Inner {
+            return source;
+        }
+        let [condition] = spec.conditions.as_ref() else {
+            return source;
+        };
+        if !matches!(
+            condition.comparison,
+            JoinComparisonType::Equal
+                | JoinComparisonType::LessThan
+                | JoinComparisonType::LessThanOrEqual
+                | JoinComparisonType::GreaterThan
+                | JoinComparisonType::GreaterThanOrEqual
+        ) {
+            return source;
+        }
+        let Some((reference_index, probe_type)) = exact_monotonic_probe_reference(&condition.left)
+        else {
+            return source;
+        };
+        let Expression::Reference(build_reference) = &condition.right else {
+            return source;
+        };
+        if spec.right_output_types.get(build_reference.index) != Some(&build_reference.return_type)
+        {
+            return source;
+        }
+        let Some(source_index) = trace_probe_reference_to_source(reference_index, transforms)
+        else {
+            return source;
+        };
+        let SourceSpec::Rowset(rowset) = &mut source else {
+            return source;
+        };
+        let Some(probe_column_id) = rowset.scan.column_projection.column_id(source_index) else {
+            return source;
+        };
+        let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
+            return source;
+        };
+        rowset.add_dynamic_scalar_filter(RowsetDynamicScalarFilterSpec {
+            handle,
+            build_column_index: build_reference.index,
+            probe_column_id,
+            probe_type,
+            comparison: condition.comparison,
+        });
+        source
+    }
+
     pub(crate) fn collect_probe_roles_source_fallback(
         &mut self,
         root: PhysicalPlanNodeId,
@@ -79,6 +136,47 @@ impl PipelineLowerer<'_> {
     }
 }
 
+/// Return the source reference under an exact, monotonic representation cast.
+/// Runtime scalar bounds may cross such a cast because outward rounding on the
+/// original type cannot remove a true match. Narrowing, TRY_CAST, and all
+/// non-decimal conversions remain execution-only predicates.
+fn exact_monotonic_probe_reference(expression: &Expression) -> Option<(usize, LogicalType)> {
+    match expression {
+        Expression::Reference(reference) => Some((reference.index, reference.return_type.clone())),
+        Expression::Cast(cast) if !cast.try_cast => {
+            let Expression::Reference(reference) = cast.child.as_ref() else {
+                return None;
+            };
+            exact_decimal_widening(&reference.return_type, &cast.target_type)
+                .then(|| (reference.index, reference.return_type.clone()))
+        }
+        _ => None,
+    }
+}
+
+fn exact_decimal_widening(source: &LogicalType, target: &LogicalType) -> bool {
+    let (
+        LogicalType::Decimal {
+            precision: source_precision,
+            scale: source_scale,
+        },
+        LogicalType::Decimal {
+            precision: target_precision,
+            scale: target_scale,
+        },
+    ) = (source, target)
+    else {
+        return false;
+    };
+    let Some(source_integer_digits) = source_precision.checked_sub(*source_scale) else {
+        return false;
+    };
+    let Some(target_integer_digits) = target_precision.checked_sub(*target_scale) else {
+        return false;
+    };
+    *target_scale >= *source_scale && target_integer_digits >= source_integer_digits
+}
+
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {
     matches!(
         join_type,
@@ -107,4 +205,43 @@ fn trace_probe_reference_to_source(
         reference_index = *probe.left_projection.get(reference_index)?;
     }
     Some(reference_index)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scalar_filter_lineage_crosses_only_exact_decimal_widening() {
+        assert!(exact_decimal_widening(
+            &LogicalType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+            &LogicalType::Decimal {
+                precision: 19,
+                scale: 6,
+            },
+        ));
+        assert!(!exact_decimal_widening(
+            &LogicalType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+            &LogicalType::Decimal {
+                precision: 14,
+                scale: 2,
+            },
+        ));
+        assert!(!exact_decimal_widening(
+            &LogicalType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+            &LogicalType::Decimal {
+                precision: 15,
+                scale: 1,
+            },
+        ));
+    }
 }
