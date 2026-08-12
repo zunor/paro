@@ -38,6 +38,30 @@ struct LiteralSearcher {
     shifts: Option<Box<[usize; 256]>>,
 }
 
+/// A literal that every match of a prepared `LIKE` pattern must contain.
+///
+/// Storage kernels use this opaque view to search a contiguous page once and
+/// only run the complete matcher for rows containing the anchor. The anchor is
+/// a necessary condition, never a sufficient one: callers must still verify a
+/// candidate with [`PreparedLikePattern::matches_bytes`].
+#[derive(Clone, Copy)]
+pub struct PreparedLikeSearchAnchor<'a> {
+    searcher: &'a LiteralSearcher,
+    case_insensitive: bool,
+}
+
+impl PreparedLikeSearchAnchor<'_> {
+    #[inline]
+    pub fn literal(&self) -> &[u8] {
+        self.searcher.as_bytes()
+    }
+
+    #[inline]
+    pub fn find_in(&self, haystack: &[u8]) -> Option<usize> {
+        self.searcher.find_in(haystack, self.case_insensitive)
+    }
+}
+
 impl LiteralSearcher {
     const SKIP_SEARCH_MIN_LENGTH: usize = 4;
 
@@ -206,6 +230,37 @@ impl PreparedLikePattern {
                 self.case_insensitive,
             ),
         }
+    }
+
+    /// Return the longest literal segment that is present in every match.
+    ///
+    /// Exact/prefix/suffix patterns already have cheaper row kernels. Contains
+    /// and ordered patterns benefit from using this literal as a page-level
+    /// candidate generator. Choosing the longest segment minimizes false
+    /// positives without changing SQL semantics.
+    pub fn search_anchor(&self) -> Option<PreparedLikeSearchAnchor<'_>> {
+        // Case-insensitive `matches(&str)` follows Unicode lowercase rules for
+        // non-ASCII values. A normalized ASCII pattern literal is therefore
+        // not a necessary byte substring (for example `k` matches `K`). Only
+        // an explicit ASCII-domain proof could make such an anchor sound.
+        if self.case_insensitive {
+            return None;
+        }
+        let searcher = match &self.strategy {
+            LikeStrategy::Contains(searcher) => searcher,
+            LikeStrategy::Ordered { segments, .. } => segments
+                .iter()
+                .filter(|segment| !segment.as_bytes().is_empty())
+                .max_by_key(|segment| segment.as_bytes().len())?,
+            LikeStrategy::Any
+            | LikeStrategy::Exact(_)
+            | LikeStrategy::Prefix(_)
+            | LikeStrategy::Suffix(_) => return None,
+        };
+        Some(PreparedLikeSearchAnchor {
+            searcher,
+            case_insensitive: self.case_insensitive,
+        })
     }
 }
 
@@ -426,6 +481,24 @@ mod tests {
                 prepared.matches(value)
             );
         }
+    }
+
+    #[test]
+    fn prepared_like_exposes_the_longest_necessary_search_anchor() {
+        let prepared = PreparedLikePattern::try_new("%special%long requests%", false).unwrap();
+        let anchor = prepared.search_anchor().expect("ordered LIKE anchor");
+
+        assert_eq!(anchor.literal(), b"long requests");
+        assert_eq!(anchor.find_in(b"prefix long requests suffix"), Some(7));
+        assert!(prepared.matches_bytes(b"special long requests"));
+        assert!(!prepared.matches_bytes(b"long requests before special"));
+
+        let prefix = PreparedLikePattern::try_new("PROMO%", false).unwrap();
+        assert!(prefix.search_anchor().is_none());
+
+        let case_insensitive = PreparedLikePattern::try_new("%k%", true).unwrap();
+        assert!(case_insensitive.matches("K"));
+        assert!(case_insensitive.search_anchor().is_none());
     }
 
     #[test]

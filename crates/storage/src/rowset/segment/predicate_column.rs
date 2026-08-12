@@ -10,6 +10,7 @@ use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use std::ops::Range;
 
 use crate::codec::vector_decoder;
 use crate::rowset::column::ColumnBatch;
@@ -188,7 +189,7 @@ impl RawVarlenPredicateBatch {
     }
 
     #[inline]
-    fn is_null(&self, row_idx: usize) -> bool {
+    pub(super) fn is_null(&self, row_idx: usize) -> bool {
         self.nulls.as_ref().is_some_and(|nulls| nulls[row_idx] != 0)
     }
 
@@ -197,8 +198,19 @@ impl RawVarlenPredicateBatch {
         if self.is_null(row_idx) {
             return None;
         }
+        self.stored_row_value(row_idx)
+    }
+
+    /// Return the encoded row bytes even when SQL validity marks the row NULL.
+    /// Page-level searches still need the physical boundary to prevent a
+    /// literal match from leaking into the following row.
+    #[inline]
+    pub(super) fn stored_row_value(&self, row_idx: usize) -> Option<&[u8]> {
         match &self.source {
             RawVarlenSource::LengthPrefixed { data, row_ends } => {
+                if row_idx >= row_ends.len() {
+                    return None;
+                }
                 let row_start = if row_idx == 0 {
                     0
                 } else {
@@ -209,6 +221,22 @@ impl RawVarlenPredicateBatch {
                 Some(&data[value_start..row_end])
             }
             RawVarlenSource::BinaryPlain(storage) => storage.row_value_ref(row_idx),
+        }
+    }
+
+    /// Return the contiguous value payload when the storage encoding keeps
+    /// row bytes adjacent without length prefixes between them.
+    pub(super) fn contiguous_payload(&self) -> Option<&[u8]> {
+        match &self.source {
+            RawVarlenSource::BinaryPlain(storage) => storage.payload_ref(),
+            RawVarlenSource::LengthPrefixed { .. } => None,
+        }
+    }
+
+    pub(super) fn contiguous_row_range(&self, row_idx: usize) -> Option<Range<usize>> {
+        match &self.source {
+            RawVarlenSource::BinaryPlain(storage) => storage.payload_row_range(row_idx),
+            RawVarlenSource::LengthPrefixed { .. } => None,
         }
     }
 

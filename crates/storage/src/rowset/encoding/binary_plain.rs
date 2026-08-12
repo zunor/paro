@@ -26,6 +26,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::Result;
+use std::ops::Range;
 
 /// Builder for binary plain-encoded pages (variable-length strings).
 pub struct BinaryPlainPageBuilder {
@@ -244,6 +245,18 @@ pub(crate) struct BinaryPlainPageSlice {
 
 impl BinaryPlainPageSlice {
     #[inline]
+    fn offset_at(&self, index: usize) -> Option<usize> {
+        if index == self.page_rows {
+            return Some(self.offsets_pos);
+        }
+        if index > self.page_rows {
+            return None;
+        }
+        let pos = self.offsets_pos.checked_add(index.checked_mul(4)?)?;
+        Some(u32::from_le_bytes(self.data.get(pos..pos + 4)?.try_into().ok()?) as usize)
+    }
+
+    #[inline]
     pub(crate) fn row_value(&self, row_idx: usize) -> Option<Bytes> {
         let value = self.row_value_ref(row_idx)?;
         let offset = value.as_ptr() as usize - self.data.as_ptr() as usize;
@@ -256,14 +269,33 @@ impl BinaryPlainPageSlice {
             return None;
         }
         let index = self.first_row + row_idx;
-        let offset_at = |idx: usize| -> Option<usize> {
-            if idx == self.page_rows {
-                return Some(self.offsets_pos);
-            }
-            let pos = self.offsets_pos.checked_add(idx.checked_mul(4)?)?;
-            Some(u32::from_le_bytes(self.data.get(pos..pos + 4)?.try_into().ok()?) as usize)
-        };
-        self.data.get(offset_at(index)?..offset_at(index + 1)?)
+        self.data
+            .get(self.offset_at(index)?..self.offset_at(index + 1)?)
+    }
+
+    /// Contiguous payload bytes covered by this logical row range.
+    ///
+    /// Row boundaries remain available through [`Self::row_value_ref`]. A
+    /// page-level predicate may search this slice once, but must reject
+    /// matches that cross one of those boundaries.
+    pub(crate) fn payload_ref(&self) -> Option<&[u8]> {
+        let start = self.offset_at(self.first_row)?;
+        let end = self.offset_at(self.first_row.checked_add(self.rows)?)?;
+        self.data.get(start..end)
+    }
+
+    /// Byte range of one logical row within [`Self::payload_ref`].
+    pub(crate) fn payload_row_range(&self, row_idx: usize) -> Option<Range<usize>> {
+        if row_idx >= self.rows {
+            return None;
+        }
+        let payload_start = self.offset_at(self.first_row)?;
+        let page_row = self.first_row.checked_add(row_idx)?;
+        let start = self.offset_at(page_row)?.checked_sub(payload_start)?;
+        let end = self
+            .offset_at(page_row.checked_add(1)?)?
+            .checked_sub(payload_start)?;
+        (start <= end).then_some(start..end)
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -561,6 +593,24 @@ mod tests {
             (0, 2, 2)
         );
         assert_eq!(encoded.data.as_ptr(), page_ptr);
+    }
+
+    #[test]
+    fn encoded_batch_exposes_payload_relative_row_ranges() {
+        let mut builder = BinaryPlainPageBuilder::new(256);
+        for value in [b"skip".as_slice(), b"", b"middle", b"tail"] {
+            builder.add_slice(value);
+        }
+        let mut decoder = BinaryPlainPageDecoder::new(builder.finish().unwrap());
+        decoder.init().unwrap();
+        decoder.seek_to_position(1).unwrap();
+
+        let encoded = decoder.next_encoded_batch(2).unwrap();
+
+        assert_eq!(encoded.payload_ref().unwrap(), b"middle");
+        assert_eq!(encoded.payload_row_range(0), Some(0..0));
+        assert_eq!(encoded.payload_row_range(1), Some(0..6));
+        assert_eq!(encoded.payload_row_range(2), None);
     }
 
     #[test]

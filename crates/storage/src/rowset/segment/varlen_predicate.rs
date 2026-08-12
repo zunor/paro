@@ -4,10 +4,11 @@
 //! Allocation-free row verification for binary-comparable varlen predicates.
 
 use std::cell::RefCell;
+use std::ops::Range;
 
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::string_pattern::PreparedLikePattern;
+use paro_common::string_pattern::{PreparedLikePattern, PreparedLikeSearchAnchor};
 
 use crate::index::{FixedMembershipBuildPolicy, FixedMembershipSet};
 
@@ -189,6 +190,13 @@ impl VarlenMatcher {
                 seed,
             );
             return Ok(());
+        }
+        if let VarlenMatchStrategy::Like { pattern, negated } = &self.strategy {
+            if let Some(batch) = batch.raw_varlen() {
+                if filter_raw_like_with_anchor(batch, rows, selection, seed, pattern, *negated) {
+                    return Ok(());
+                }
+            }
         }
         filter_varlen_batch(batch, rows, selection, seed, |value| self.matches(value))
     }
@@ -648,9 +656,160 @@ fn filter_varlen_batch(
     Ok(())
 }
 
+/// Search a contiguous BinaryPlain payload once, then verify only rows that
+/// contain the compiled necessary literal. A hit spanning two adjacent values
+/// is deliberately discarded before the complete LIKE matcher runs.
+fn filter_raw_like_with_anchor(
+    batch: &super::predicate_column::RawVarlenPredicateBatch,
+    rows: usize,
+    selection: &mut Vec<usize>,
+    seed: bool,
+    pattern: &PreparedLikePattern,
+    negated: bool,
+) -> bool {
+    if rows == 0 || (!seed && selection.is_empty()) {
+        return true;
+    }
+    let Some(anchor) = pattern.search_anchor() else {
+        return false;
+    };
+    let Some(payload) = batch.contiguous_payload() else {
+        return false;
+    };
+    let Some(scan_range) = anchor_scan_range(batch, payload.len(), rows, selection, seed) else {
+        return false;
+    };
+    let literal_len = anchor.literal().len();
+    if literal_len == 0 {
+        return false;
+    }
+
+    let mut next_hit = anchor_hit_from(anchor, payload, scan_range.start, scan_range.end);
+    let mut row_matches = |row_idx: usize| {
+        let Some(value) = batch.stored_row_value(row_idx) else {
+            return false;
+        };
+        let Some(row_range) = batch.contiguous_row_range(row_idx) else {
+            return false;
+        };
+        if row_range.end > payload.len() || row_range.len() != value.len() {
+            return false;
+        }
+        if batch.is_null(row_idx) {
+            return false;
+        }
+        if row_range.len() < literal_len {
+            // A necessary literal cannot fit in this value. Preserve the
+            // existing page cursor; the next sufficiently wide row will jump
+            // straight to its own boundary.
+            return negated;
+        }
+
+        if next_hit.is_some_and(|hit| hit < row_range.start) {
+            // All earlier hits belong to already processed rows or an
+            // unselected gap. Jump directly to this row instead of enumerating
+            // overlapping matches one byte at a time.
+            next_hit = anchor_hit_from(anchor, payload, row_range.start, scan_range.end);
+        }
+        let mut candidate = false;
+        if let Some(hit) = next_hit {
+            if hit < row_range.end {
+                if hit
+                    .checked_add(literal_len)
+                    .is_some_and(|hit_end| hit_end <= row_range.end)
+                {
+                    candidate = true;
+                } else {
+                    // The anchor crosses this row boundary. It is a page-level
+                    // false positive. Resume exactly at the next row boundary
+                    // so an overlapping match beginning there remains visible.
+                    next_hit = anchor_hit_from(anchor, payload, row_range.end, scan_range.end);
+                }
+            }
+        }
+        let like_matches = candidate && pattern.matches_bytes(value);
+        like_matches != negated
+    };
+
+    if seed {
+        selection.extend((0..rows).filter(|row_idx| row_matches(*row_idx)));
+    } else {
+        selection.retain(|row_idx| row_matches(*row_idx));
+    }
+    true
+}
+
+/// Restrict a retained-selection scan to the selected row span and avoid
+/// reading a large unselected gap merely to save a few matcher invocations.
+fn anchor_scan_range(
+    batch: &super::predicate_column::RawVarlenPredicateBatch,
+    payload_len: usize,
+    rows: usize,
+    selection: &[usize],
+    seed: bool,
+) -> Option<Range<usize>> {
+    const MAX_SCAN_AMPLIFICATION: usize = 4;
+    if seed {
+        return Some(0..payload_len);
+    }
+    if !selection.windows(2).all(|rows| rows[0] < rows[1]) {
+        return None;
+    }
+    let first = batch.contiguous_row_range(*selection.first()?)?;
+    let last = batch.contiguous_row_range(*selection.last()?)?;
+    if *selection.last()? >= rows || first.start > last.end || last.end > payload_len {
+        return None;
+    }
+    let selected_bytes = selection.iter().try_fold(0usize, |bytes, &row_idx| {
+        if row_idx >= rows {
+            return None;
+        }
+        bytes.checked_add(batch.contiguous_row_range(row_idx)?.len())
+    })?;
+    let span = first.start..last.end;
+    (span.len() <= selected_bytes.saturating_mul(MAX_SCAN_AMPLIFICATION)).then_some(span)
+}
+
+#[inline]
+fn anchor_hit_from(
+    anchor: PreparedLikeSearchAnchor<'_>,
+    payload: &[u8],
+    start: usize,
+    limit: usize,
+) -> Option<usize> {
+    payload
+        .get(start..limit)
+        .and_then(|suffix| anchor.find_in(suffix))
+        .and_then(|relative| start.checked_add(relative))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rowset::column::ColumnBatch;
+    use crate::rowset::encoding::{BinaryPlainPageBuilder, BinaryPlainPageDecoder};
+    use paro_common::allocator::{default_allocator, Allocator};
+    use paro_common::types::LogicalType;
+    use std::sync::Arc;
+
+    fn binary_plain_batch(values: &[&str], nulls: Option<&'static [u8]>) -> PredicateColumnBatch {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        for value in values {
+            assert!(builder.add_slice(value.as_bytes()));
+        }
+        let mut decoder = BinaryPlainPageDecoder::new(builder.finish().unwrap());
+        decoder.init().unwrap();
+        let encoded = decoder.next_encoded_batch(values.len()).unwrap();
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        PredicateColumnBatch::prepare(
+            &LogicalType::Varchar,
+            super::super::predicate_column::PredicateColumnAccess::Typed { raw_width: None },
+            ColumnBatch::with_storage_binary_plain(encoded, nulls.map(bytes::Bytes::from_static)),
+            values.len(),
+            allocator,
+        )
+        .unwrap()
+    }
 
     #[test]
     fn conjunction_normalizes_bounds_membership_and_exclusions() {
@@ -721,5 +880,117 @@ mod tests {
         assert!(!excluded.matches(b"special pending requests"));
         assert!(excluded.matches(b"requests before special"));
         assert!(VarlenMatcher::like("A_B", false).is_none());
+    }
+
+    #[test]
+    fn page_anchor_filters_candidates_without_crossing_row_boundaries() {
+        let batch = binary_plain_batch(
+            &[
+                "special pending requests",
+                "spec",
+                "ial requests",
+                "ordinary request",
+                "requests before special",
+            ],
+            None,
+        );
+        let matcher = VarlenMatcher::like("%special%requests%", false).unwrap();
+        let mut selection = Vec::new();
+
+        matcher
+            .filter_batch(&batch, 5, &mut selection, true)
+            .unwrap();
+
+        assert_eq!(selection, [0]);
+    }
+
+    #[test]
+    fn page_anchor_preserves_match_overlapping_a_previous_row_hit() {
+        let batch = binary_plain_batch(&["aa", "aaa"], None);
+        let matcher = VarlenMatcher::like("%aaa%", false).unwrap();
+        let mut selection = Vec::new();
+
+        matcher
+            .filter_batch(&batch, 2, &mut selection, true)
+            .unwrap();
+
+        assert_eq!(selection, [1]);
+    }
+
+    #[test]
+    fn page_anchor_skips_rows_shorter_than_its_necessary_literal() {
+        let batch = binary_plain_batch(&["a", "a", "aaaa", "a"], None);
+        let positive = VarlenMatcher::like("%aaaa%", false).unwrap();
+        let negative = VarlenMatcher::like("%aaaa%", true).unwrap();
+        let mut matches = Vec::new();
+        let mut non_matches = Vec::new();
+
+        positive
+            .filter_batch(&batch, 4, &mut matches, true)
+            .unwrap();
+        negative
+            .filter_batch(&batch, 4, &mut non_matches, true)
+            .unwrap();
+
+        assert_eq!(matches, [2]);
+        assert_eq!(non_matches, [0, 1, 3]);
+    }
+
+    #[test]
+    fn negated_page_anchor_keeps_non_candidates_and_rejects_nulls() {
+        let batch = binary_plain_batch(
+            &[
+                "special requests",
+                "plain",
+                "special later requests",
+                "plain",
+            ],
+            Some(&[0, 0, 0, 1]),
+        );
+        let matcher = VarlenMatcher::like("%special%requests%", true).unwrap();
+        let mut selection = vec![0, 1, 3];
+
+        matcher
+            .filter_batch(&batch, 4, &mut selection, false)
+            .unwrap();
+
+        assert_eq!(selection, [1]);
+    }
+
+    #[test]
+    fn retained_anchor_scan_declines_sparse_wide_spans() {
+        let batch = binary_plain_batch(
+            &[
+                "a",
+                "this unselected row occupies a much wider payload range",
+                "b",
+            ],
+            None,
+        );
+        let payload_len = batch
+            .raw_varlen()
+            .unwrap()
+            .contiguous_payload()
+            .unwrap()
+            .len();
+
+        assert!(
+            anchor_scan_range(batch.raw_varlen().unwrap(), payload_len, 3, &[0, 2], false,)
+                .is_none()
+        );
+        assert!(
+            anchor_scan_range(batch.raw_varlen().unwrap(), payload_len, 3, &[2, 0], false,)
+                .is_none()
+        );
+        assert_eq!(
+            anchor_scan_range(
+                batch.raw_varlen().unwrap(),
+                payload_len,
+                3,
+                &[0, 1, 2],
+                false,
+            ),
+            Some(0..payload_len)
+        );
     }
 }
