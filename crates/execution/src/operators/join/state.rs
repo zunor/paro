@@ -30,13 +30,20 @@ pub struct HashJoinProbeTransformLocal {
     pub reduction_source_masks: Vec<u8>,
     pub reduction_channel_map: Vec<u8>,
     pub reduction_selection: Option<SelectionVector>,
-    pub(crate) reduction_extrema: Option<Arc<GroupedReductionExtrema>>,
-    pub reduction_extrema_unavailable: bool,
+    pub(crate) reduction_mode: ReductionProbeMode,
     pub reduction_group_slots: Vec<usize>,
     pub probe_hashes: Option<Vector>,
     pub probe_spill_chunk: Option<Chunk>,
     pub probe_spill_buffer: Option<JoinProbeSpillBuffer>,
     pub probe_in_progress: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) enum ReductionProbeMode {
+    #[default]
+    Uninitialized,
+    MatchMask,
+    GroupedExtrema(Arc<GroupedReductionExtrema>),
 }
 
 #[derive(Debug, Default)]

@@ -41,6 +41,14 @@ pub const HASH_JOIN_SPILL_TARGET_PARTITION_BYTES: usize = 64 * 1024 * 1024;
 
 static NEXT_HASH_JOIN_LOCAL_BUILD_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum BuildReclaimState {
+    Disabled = 0,
+    Enabled = 1,
+    Sealed = 2,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JoinBuildId(pub u32);
 
@@ -56,8 +64,8 @@ pub struct JoinBuildHandle {
     runtime_filter_builder: Mutex<Option<JoinRuntimeFilterBuilder>>,
     runtime_filter: OnceLock<JoinRuntimeFilter>,
     mode: AtomicU8,
-    reclaim_enabled: AtomicBool,
-    spill_in_progress: AtomicBool,
+    build_reclaim_state: AtomicU8,
+    build_spill_gate: Mutex<()>,
     spill_radix_bits: OnceLock<usize>,
     external: OnceLock<JoinExternalModeConfig>,
     cleanup: CleanupState,
@@ -77,8 +85,8 @@ impl JoinBuildHandle {
             runtime_filter_builder: Mutex::new(None),
             runtime_filter: OnceLock::new(),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
-            reclaim_enabled: AtomicBool::new(false),
-            spill_in_progress: AtomicBool::new(false),
+            build_reclaim_state: AtomicU8::new(BuildReclaimState::Disabled as u8),
+            build_spill_gate: Mutex::new(()),
             spill_radix_bits: OnceLock::new(),
             external: OnceLock::new(),
             cleanup: CleanupState::default(),
@@ -279,16 +287,35 @@ impl JoinBuildHandle {
 
     pub fn enable_build_reclaim(&self) {
         if !self.completion.is_complete() && !self.is_external() {
-            self.reclaim_enabled.store(true, Ordering::Release);
+            let _ = self.build_reclaim_state.compare_exchange(
+                BuildReclaimState::Disabled as u8,
+                BuildReclaimState::Enabled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
     pub fn disable_build_reclaim(&self) {
-        self.reclaim_enabled.store(false, Ordering::Release);
+        let _ =
+            self.build_reclaim_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state != BuildReclaimState::Sealed as u8)
+                        .then_some(BuildReclaimState::Disabled as u8)
+                });
+    }
+
+    /// Permanently closes the build-reclaim window and waits for a reclaimer
+    /// that already entered the spill gate. After this returns, an in-memory
+    /// finalizer may treat the build store as immutable.
+    pub fn seal_build_reclaim(&self) {
+        self.build_reclaim_state
+            .store(BuildReclaimState::Sealed as u8, Ordering::Release);
+        let _spill_guard = self.build_spill_gate.lock();
     }
 
     pub fn build_reclaim_enabled(&self) -> bool {
-        self.reclaim_enabled.load(Ordering::Acquire)
+        self.build_reclaim_state.load(Ordering::Acquire) == BuildReclaimState::Enabled as u8
     }
 
     pub fn has_build_spill(&self) -> bool {
@@ -301,26 +328,44 @@ impl JoinBuildHandle {
             .get_or_init(|| choose_hash_join_radix_bits(build_bytes, query_memory_cap))
     }
 
-    pub fn spill_build_for_reclaim(
+    pub fn reclaim_build(
         &self,
         target_bytes: usize,
         query_memory_cap: usize,
         memory: MemoryAccountingContext,
     ) -> MemoryResult<ReclaimStats> {
-        if target_bytes == 0 || self.completion.is_complete() || self.is_external() {
+        if target_bytes == 0 {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        if self.spill_in_progress.swap(true, Ordering::AcqRel) {
+        let _spill_guard = self.build_spill_gate.lock();
+        if !self.build_reclaim_enabled() || self.completion.is_complete() || self.is_external() {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        struct SpillGuard<'a>(&'a AtomicBool);
-        impl Drop for SpillGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _spill_guard = SpillGuard(&self.spill_in_progress);
+        self.spill_build_locked(target_bytes, query_memory_cap, memory)
+    }
 
+    pub fn spill_build_for_external(
+        &self,
+        target_bytes: usize,
+        query_memory_cap: usize,
+        memory: MemoryAccountingContext,
+    ) -> MemoryResult<ReclaimStats> {
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let _spill_guard = self.build_spill_gate.lock();
+        if self.completion.is_complete() || self.is_external() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        self.spill_build_locked(target_bytes, query_memory_cap, memory)
+    }
+
+    fn spill_build_locked(
+        &self,
+        target_bytes: usize,
+        query_memory_cap: usize,
+        memory: MemoryAccountingContext,
+    ) -> MemoryResult<ReclaimStats> {
         let Some(table) = self.table() else {
             return Ok(ReclaimStats::empty(target_bytes));
         };
@@ -428,11 +473,8 @@ impl Reclaimer for HashJoinBuildSpillReclaimer {
         if !self.handle.build_reclaim_enabled() {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        self.handle.spill_build_for_reclaim(
-            target_bytes,
-            self.query_memory_cap,
-            self.memory.clone(),
-        )
+        self.handle
+            .reclaim_build(target_bytes, self.query_memory_cap, self.memory.clone())
     }
 
     fn spill_cost(&self) -> SpillCost {

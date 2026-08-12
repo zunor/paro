@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub(crate) mod build;
+mod comparison;
 pub(crate) mod hashing;
 pub(crate) mod keys;
 pub(crate) mod memory;

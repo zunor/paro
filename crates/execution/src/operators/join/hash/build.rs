@@ -4,6 +4,7 @@
 //! Hash join build-side sink operator — accumulates the build relation into a
 //! shared join hash table, optionally spilling to disk for external joins.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_common::allocator::MemoryTag;
@@ -15,6 +16,7 @@ use paro_planner::operator::join::{JoinCondition, JoinType};
 
 use crate::explain::types::ExplainRuntimeStats;
 use crate::expression_executor::executor::ExpressionExecutor;
+use crate::join_hashtable::table::ParallelDirectIntegerIndexBuild;
 use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
 use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
 use crate::operators::join::hash::memory::{
@@ -29,9 +31,14 @@ use crate::runtime::breaker::{
     HandleRef, HashJoinBuildSpillReclaimer, HashJoinLocalBuildSpillReclaimer, JoinBuildHandle,
     JoinRuntimeFilterBuilder,
 };
-use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
+use crate::runtime::context::{
+    FinishTaskId, OperatorCallContext, OperatorCleanupContext, OperatorFinishContext,
+    PipelineInitContext,
+};
 use crate::runtime::sink::{
-    FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
+    CancelReason, FinishCoordinatorParticipation, FinishPoll, FinishTaskGroup,
+    FinishTaskGroupRunner, FinishTaskPoll, FinishWork, MergePoll, NextFinishTask,
+    ParallelFinishDriver, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, HashJoinBuildSinkLocal, SinkGlobal, SinkLocal};
 
@@ -43,6 +50,7 @@ pub struct HashJoinBuildSinkExec {
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_output_count: usize,
+    pub grouped_reduction_channels: Option<usize>,
     pub build_payload_types: Box<[LogicalType]>,
     pub required: RequiredProperties,
     pub force_external: bool,
@@ -51,7 +59,7 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        handle.initialize_table_with_output_count(
+        let table = handle.initialize_table_with_output_count(
             ctx.query.session.buffer_pool().clone(),
             ctx.query.allocator(MemoryTag::HashTable),
             self.key_conditions.to_vec(),
@@ -60,6 +68,9 @@ impl HashJoinBuildSinkExec {
             self.join_type,
             hash_join_memory_context(ctx.query),
         )?;
+        if let Some(channel_count) = self.grouped_reduction_channels {
+            table.configure_grouped_reduction_extrema(channel_count)?;
+        }
         ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
             HashJoinBuildSpillReclaimer::new(
                 handle.clone(),
@@ -278,7 +289,7 @@ impl HashJoinBuildSinkExec {
 
     pub(crate) fn finish_work(
         &self,
-        _ctx: &mut OperatorFinishContext,
+        ctx: &mut OperatorFinishContext,
         global: &SinkGlobal,
     ) -> Result<FinishWork> {
         let SinkGlobal::HashJoinBuild(global) = global else {
@@ -293,6 +304,34 @@ impl HashJoinBuildSinkExec {
         } else {
             MemoryClass::Blocking
         };
+        if !force_external
+            && !should_use_memory_triggered_external_join(ctx, handle.as_ref())
+            && !handle.completion.is_complete()
+        {
+            handle.seal_build_reclaim();
+            ctx.query
+                .memory
+                .unregister_reclaimer_by_name(&HashJoinBuildSpillReclaimer::name_for(
+                    handle.as_ref(),
+                ));
+            if !handle.completion.is_complete() && !handle.is_external() {
+                let runtime_filter_installed = publish_runtime_filter(ctx, handle.as_ref())?;
+                let table = handle.require_table()?;
+                if let Some(build) = table.prepare_parallel_direct_integer_index()? {
+                    return Ok(FinishWork::Parallel(
+                        ParallelDirectJoinFinalizeDriver::group(
+                            handle,
+                            build,
+                            runtime_filter_installed,
+                            ctx.query.session.number_of_threads().max(1),
+                        ),
+                    ));
+                }
+                if runtime_filter_installed {
+                    record_runtime_filter_installed(ctx);
+                }
+            }
+        }
         Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "hash_join_finalize",
             memory_class,
@@ -360,12 +399,104 @@ fn finalize_in_memory_hash_join(
 ) -> Result<()> {
     let table = handle.require_table()?;
     let published = publish_runtime_filter(ctx, handle)?;
-    table.finalize_with_parallelism(ctx.query.session.number_of_threads().max(1))?;
+    table.finalize()?;
     handle.completion.mark_complete();
     if published {
         record_runtime_filter_installed(ctx);
     }
     Ok(())
+}
+
+#[derive(Debug)]
+struct ParallelDirectJoinFinalizeDriver {
+    handle: Arc<JoinBuildHandle>,
+    build: ParallelDirectIntegerIndexBuild,
+    runtime_filter_installed: bool,
+    worker_count: usize,
+    next_task: AtomicUsize,
+    remaining: AtomicUsize,
+}
+
+impl ParallelDirectJoinFinalizeDriver {
+    fn group(
+        handle: Arc<JoinBuildHandle>,
+        build: ParallelDirectIntegerIndexBuild,
+        runtime_filter_installed: bool,
+        max_workers: usize,
+    ) -> FinishTaskGroup {
+        let task_count = build.block_count().min(max_workers).max(1);
+        FinishTaskGroup {
+            task_count_hint: task_count,
+            driver: Arc::new(Self {
+                handle,
+                build,
+                runtime_filter_installed,
+                worker_count: task_count,
+                next_task: AtomicUsize::new(0),
+                remaining: AtomicUsize::new(task_count),
+            }),
+            memory_class: MemoryClass::Blocking,
+            coordinator_participation: FinishCoordinatorParticipation::SingleTask,
+        }
+    }
+
+    fn complete_task(&self, ctx: &mut OperatorFinishContext) -> Result<()> {
+        let remaining = self
+            .remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .map_err(|_| {
+                paro_error::internal("direct join index completed more tasks than scheduled")
+            })?;
+        if remaining != 1 {
+            return Ok(());
+        }
+        self.build.complete()?;
+        self.handle.completion.mark_complete();
+        if self.runtime_filter_installed {
+            record_runtime_filter_installed(ctx);
+        }
+        Ok(())
+    }
+}
+
+impl ParallelFinishDriver for ParallelDirectJoinFinalizeDriver {
+    fn next_task(&self, _ctx: &mut OperatorFinishContext) -> Result<NextFinishTask> {
+        let task_idx = self.next_task.fetch_add(1, Ordering::AcqRel);
+        if task_idx >= self.worker_count {
+            return Ok(NextFinishTask::Drained);
+        }
+        let task_id = u32::try_from(task_idx).map_err(|_| {
+            paro_error::internal(format!(
+                "direct join index task exceeds runtime id range: {task_idx}"
+            ))
+        })?;
+        Ok(NextFinishTask::Task(FinishTaskId(task_id)))
+    }
+
+    fn run_task(
+        &self,
+        _task: FinishTaskId,
+        ctx: &mut OperatorFinishContext,
+    ) -> Result<FinishTaskPoll> {
+        while let Some(block_idx) = self.build.claim_block() {
+            ctx.cancel.check()?;
+            self.build.build_block(block_idx)?;
+        }
+        self.complete_task(ctx)?;
+        Ok(FinishTaskPoll::Done)
+    }
+
+    fn cancel_group(&self, ctx: &mut OperatorCleanupContext, _reason: CancelReason) -> Result<()> {
+        self.handle.disable_build_reclaim();
+        ctx.query
+            .memory
+            .unregister_reclaimer_by_name(&HashJoinBuildSpillReclaimer::name_for(
+                self.handle.as_ref(),
+            ));
+        Ok(())
+    }
 }
 
 fn ensure_build_selection(
@@ -398,7 +529,7 @@ fn finish_external_hash_join(
         return Ok(());
     }
     let was_ready = handle.runtime_filter_ready();
-    handle.spill_build_for_reclaim(
+    handle.spill_build_for_external(
         usize::MAX,
         ctx.query.memory.capacity_bytes(),
         hash_join_memory_context(ctx.query),

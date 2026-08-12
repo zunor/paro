@@ -39,8 +39,10 @@ pub struct Get {
     pub table: Option<Arc<TableCatalogEntry>>,
     /// Optional scan order for segments.
     pub scan_order: Option<SegmentOrderOptions>,
-    /// Runtime filters injected by optimizer (e.g. join-derived min/max).
-    /// Expressions are bound against this Get's output layout.
+    /// Semantically redundant runtime filters injected by the optimizer (for
+    /// example join-derived min/max bounds). Expressions are bound against
+    /// this Get's output layout and may be discarded by rewrites that cannot
+    /// preserve a hint without changing its scope.
     pub runtime_filter_expressions: Vec<Expression>,
 }
 

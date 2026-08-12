@@ -8,17 +8,19 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::{LogicalType, PhysicalType};
+use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionExpression, ConjunctionType, Expression,
-    ReferenceExpression,
+    ComparisonExpression, ConjunctionExpression, ConjunctionType, Expression, ReferenceExpression,
 };
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition};
+use paro_planner::operator::join::JoinCondition;
 
 use crate::expression_executor::executor::ExpressionExecutor;
 use crate::join_hashtable::JoinHashTable;
+use crate::operators::join::hash::comparison::{
+    expression_comparison, fixed_comparison_matches, FixedComparison, FixedKind,
+};
 use crate::operators::join::hash::keys::{evaluate_join_keys_into, join_key_types, JoinKeySide};
 use crate::runtime::context::{OperatorCallContext, QueryRuntimeContext};
 
@@ -36,16 +38,10 @@ pub struct HashJoinResidualProbeState {
 
 #[derive(Debug)]
 enum ResidualPredicate {
-    I8(JoinComparisonType),
-    I16(JoinComparisonType),
-    I32(JoinComparisonType),
-    I64(JoinComparisonType),
-    I128(JoinComparisonType),
-    U8(JoinComparisonType),
-    U16(JoinComparisonType),
-    U32(JoinComparisonType),
-    U64(JoinComparisonType),
-    U128(JoinComparisonType),
+    Fixed {
+        kind: FixedKind,
+        comparison: FixedComparison,
+    },
     Generic(ExpressionExecutor),
 }
 
@@ -126,125 +122,35 @@ impl HashJoinResidualProbeState {
             ));
         }
         match &mut self.predicate {
-            ResidualPredicate::I8(comparison) => {
-                return select_fixed_matches::<i8>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::I16(comparison) => {
-                return select_fixed_matches::<i16>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::I32(comparison) => {
-                return select_fixed_matches::<i32>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::I64(comparison) => {
-                return select_fixed_matches::<i64>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::I128(comparison) => {
-                return select_fixed_matches::<i128>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::U8(comparison) => {
-                return select_fixed_matches::<u8>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::U16(comparison) => {
-                return select_fixed_matches::<u16>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::U32(comparison) => {
-                return select_fixed_matches::<u32>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::U64(comparison) => {
-                return select_fixed_matches::<u64>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
-            }
-            ResidualPredicate::U128(comparison) => {
-                return select_fixed_matches::<u128>(
-                    left_values,
-                    hash_table,
-                    *comparison,
-                    lhs_sel,
-                    rhs_pointers,
-                    match_count,
-                    output,
-                    self.build_residual_offset,
-                );
+            ResidualPredicate::Fixed { kind, comparison } => {
+                macro_rules! select {
+                    ($ty:ty) => {
+                        return select_fixed_matches::<$ty>(
+                            left_values,
+                            hash_table,
+                            *comparison,
+                            lhs_sel,
+                            rhs_pointers,
+                            match_count,
+                            output,
+                            self.build_residual_offset,
+                        )
+                    };
+                }
+                match kind {
+                    FixedKind::I8 => select!(i8),
+                    FixedKind::I16 => select!(i16),
+                    FixedKind::I32 => select!(i32),
+                    FixedKind::I64 => select!(i64),
+                    FixedKind::I128 => select!(i128),
+                    FixedKind::U8 => select!(u8),
+                    FixedKind::U16 => select!(u16),
+                    FixedKind::U32 => select!(u32),
+                    FixedKind::U64 => select!(u64),
+                    FixedKind::U128 => select!(u128),
+                    FixedKind::F32 => select!(f32),
+                    FixedKind::F64 => select!(f64),
+                }
             }
             ResidualPredicate::Generic(_) => {}
         }
@@ -307,33 +213,14 @@ fn compile_residual_predicate(
         if condition.left.return_type().physical_type()
             == condition.right.return_type().physical_type()
         {
-            let comparison = condition.comparison;
-            return match condition.left.return_type().physical_type() {
-                PhysicalType::Int8 => ResidualPredicate::I8(comparison),
-                PhysicalType::Int16 => ResidualPredicate::I16(comparison),
-                PhysicalType::Int32 => ResidualPredicate::I32(comparison),
-                PhysicalType::Int64 => ResidualPredicate::I64(comparison),
-                PhysicalType::Int128 => ResidualPredicate::I128(comparison),
-                PhysicalType::UInt8 => ResidualPredicate::U8(comparison),
-                PhysicalType::UInt16 => ResidualPredicate::U16(comparison),
-                PhysicalType::UInt32 => ResidualPredicate::U32(comparison),
-                PhysicalType::UInt64 => ResidualPredicate::U64(comparison),
-                PhysicalType::UInt128 => ResidualPredicate::U128(comparison),
-                PhysicalType::Bool
-                | PhysicalType::Float
-                | PhysicalType::Double
-                | PhysicalType::Varchar
-                | PhysicalType::Bit
-                | PhysicalType::List
-                | PhysicalType::Struct
-                | PhysicalType::Array => {
-                    let predicate = residual_predicate(conditions);
-                    ResidualPredicate::Generic(ExpressionExecutor::with_expressions_for_session(
-                        std::slice::from_ref(&predicate),
-                        session,
-                    ))
+            if let Some(kind) =
+                FixedKind::from_physical_type(condition.left.return_type().physical_type())
+            {
+                let comparison = FixedComparison::from(condition.comparison);
+                if kind.supports(comparison) {
+                    return ResidualPredicate::Fixed { kind, comparison };
                 }
-            };
+            }
         }
     }
     let predicate = residual_predicate(conditions);
@@ -346,7 +233,7 @@ fn compile_residual_predicate(
 fn select_fixed_matches<T>(
     left_values: &Chunk,
     hash_table: &JoinHashTable,
-    comparison: JoinComparisonType,
+    comparison: FixedComparison,
     lhs_sel: &SelectionVector,
     rhs_pointers: &[usize],
     match_count: usize,
@@ -387,39 +274,6 @@ where
     Ok(accepted)
 }
 
-#[inline]
-fn fixed_comparison_matches<T>(
-    left: Option<T>,
-    right: Option<T>,
-    comparison: JoinComparisonType,
-) -> bool
-where
-    T: PartialEq + PartialOrd,
-{
-    match comparison {
-        JoinComparisonType::DistinctFrom => left != right,
-        JoinComparisonType::NotDistinctFrom => left == right,
-        JoinComparisonType::Equal => {
-            matches!((left, right), (Some(left), Some(right)) if left == right)
-        }
-        JoinComparisonType::NotEqual => {
-            matches!((left, right), (Some(left), Some(right)) if left != right)
-        }
-        JoinComparisonType::LessThan => {
-            matches!((left, right), (Some(left), Some(right)) if left < right)
-        }
-        JoinComparisonType::LessThanOrEqual => {
-            matches!((left, right), (Some(left), Some(right)) if left <= right)
-        }
-        JoinComparisonType::GreaterThan => {
-            matches!((left, right), (Some(left), Some(right)) if left > right)
-        }
-        JoinComparisonType::GreaterThanOrEqual => {
-            matches!((left, right), (Some(left), Some(right)) if left >= right)
-        }
-    }
-}
-
 fn residual_predicate(conditions: &[JoinCondition]) -> Expression {
     let count = conditions.len();
     let mut comparisons = conditions
@@ -427,7 +281,7 @@ fn residual_predicate(conditions: &[JoinCondition]) -> Expression {
         .enumerate()
         .map(|(idx, condition)| {
             Expression::Comparison(ComparisonExpression::new(
-                comparison_type(condition.comparison),
+                expression_comparison(condition.comparison),
                 Expression::Reference(ReferenceExpression::new(idx, condition.left.return_type())),
                 Expression::Reference(ReferenceExpression::new(
                     count + idx,
@@ -443,18 +297,5 @@ fn residual_predicate(conditions: &[JoinCondition]) -> Expression {
             ConjunctionType::And,
             comparisons,
         ))
-    }
-}
-
-fn comparison_type(comparison: JoinComparisonType) -> ComparisonType {
-    match comparison {
-        JoinComparisonType::Equal => ComparisonType::Equal,
-        JoinComparisonType::NotEqual => ComparisonType::NotEqual,
-        JoinComparisonType::LessThan => ComparisonType::LessThan,
-        JoinComparisonType::LessThanOrEqual => ComparisonType::LessThanOrEqual,
-        JoinComparisonType::GreaterThan => ComparisonType::GreaterThan,
-        JoinComparisonType::GreaterThanOrEqual => ComparisonType::GreaterThanOrEqual,
-        JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
-        JoinComparisonType::NotDistinctFrom => ComparisonType::NotDistinctFrom,
     }
 }

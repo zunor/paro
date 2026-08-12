@@ -12,7 +12,6 @@ use crate::physical::plan::PhysicalPlan;
 use crate::physical::row_type::RowType;
 use crate::physical::specs::UtilitySpec;
 use crate::runtime::context::UtilityContext;
-use crate::runtime::HandleRef;
 use crate::runtime::{
     AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, ClientResultSinkExec,
     CopyToFileSinkExec, CrossProductProbeTransformExec, CteMaterializeSinkExec, CteScanSourceExec,
@@ -34,17 +33,13 @@ use crate::runtime::{
     UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
     VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
-use crate::runtime::{ChunkLayout, PipelineScratchLayout, RuntimeOperatorId};
+use crate::runtime::{ChunkLayout, HandleRef, PipelineScratchLayout, RuntimeOperatorId};
 
 use super::graph::{
     ControlRegion, ControlRegionId, PipelineGraph, PipelineId, PipelineRoot, PipelineSpec,
     SinkSharing, SinkSpec, SourceSpec, TransformSpec,
 };
 use super::handles::{BreakerHandleCatalog, BreakerHandleKind};
-
-#[path = "program_join_conditions.rs"]
-mod join_conditions;
-use join_conditions::{hash_key_conditions, hash_residual_conditions};
 
 #[derive(Debug, Clone)]
 pub enum StatementProgram {
@@ -391,8 +386,8 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
-                    key_conditions: hash_key_conditions(&spec.conditions),
-                    residual_conditions: hash_residual_conditions(&spec.conditions),
+                    key_conditions: spec.key_conditions.clone(),
+                    residual_conditions: spec.residual_conditions.clone(),
                     probe_types: spec.probe_types.clone(),
                     build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
@@ -480,8 +475,8 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     anti_join_mode: spec.anti_join_mode,
-                    key_conditions: hash_key_conditions(&spec.conditions),
-                    residual_conditions: hash_residual_conditions(&spec.conditions),
+                    key_conditions: spec.key_conditions.clone(),
+                    residual_conditions: spec.residual_conditions.clone(),
                     left_projection: spec.left_projection.clone(),
                     output_types: spec.output_types.clone(),
                     reduction_cascade: spec.reduction_cascade.clone(),
@@ -574,10 +569,11 @@ impl OperatorRuntimeRegistry {
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 join_type: spec.join_type,
-                key_conditions: hash_key_conditions(&spec.conditions),
-                residual_conditions: hash_residual_conditions(&spec.conditions),
+                key_conditions: spec.key_conditions.clone(),
+                residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),
                 build_output_count: spec.build_output_count,
+                grouped_reduction_channels: spec.grouped_reduction_channels,
                 build_payload_types: spec.build_payload_types.clone(),
                 required: spec.required.clone(),
                 force_external: spec.force_external,
@@ -1345,7 +1341,8 @@ mod tests {
                             handle: join,
                             join_type: JoinType::Inner,
                             anti_join_mode: AntiJoinMode::Regular,
-                            conditions: Box::new([join_condition()]),
+                            key_conditions: Box::new([join_condition()]),
+                            residual_conditions: Box::default(),
                             probe_types: Box::new([LogicalType::Integer]),
                             build_payload_types: Box::new([LogicalType::Integer]),
                             build_output_count: 1,
@@ -1360,7 +1357,8 @@ mod tests {
                             handle: join,
                             join_type: JoinType::Inner,
                             anti_join_mode: AntiJoinMode::Regular,
-                            conditions: Box::new([join_condition()]),
+                            key_conditions: Box::new([join_condition()]),
+                            residual_conditions: Box::default(),
                             left_projection: Box::new([0]),
                             output_names: Box::new(["l".to_string(), "r".to_string()]),
                             output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
@@ -1370,7 +1368,9 @@ mod tests {
                     sink: SinkSpec::HashJoinBuild(super::super::graph::HashJoinBuildSinkSpec {
                         handle: join,
                         join_type: JoinType::Inner,
-                        conditions: Box::new([join_condition()]),
+                        key_conditions: Box::new([join_condition()]),
+                        residual_conditions: Box::default(),
+                        grouped_reduction_channels: None,
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,

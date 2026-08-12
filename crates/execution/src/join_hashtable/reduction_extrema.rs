@@ -100,7 +100,7 @@ impl GroupedReductionExtrema {
                 .fetch_min(minimum, Ordering::Relaxed);
             (&*self.maxima.as_ptr().cast::<AtomicU64>().add(cell))
                 .fetch_max(maximum, Ordering::Relaxed);
-            (&*self.seen.as_ptr().cast::<AtomicU8>().add(cell)).store(1, Ordering::Release);
+            (&*self.seen.as_ptr().cast::<AtomicU8>().add(cell)).store(1, Ordering::Relaxed);
         }
         Ok(())
     }
@@ -114,9 +114,11 @@ impl GroupedReductionExtrema {
     ) -> Result<bool> {
         let cell = self.cell(slot, channel)?;
         let seen = unsafe {
-            // SAFETY: `cell` is within the seen array. Acquire pairs with the
-            // publishing store so extrema writes are visible before reading.
-            (&*self.seen.as_ptr().cast::<AtomicU8>().add(cell)).load(Ordering::Acquire)
+            // SAFETY: `cell` is within the seen array. The source pipeline's
+            // completion barrier joins every writer before the unmatched-build
+            // pipeline reads these relaxed atomics; `seen` is only an occupancy
+            // flag and is not itself the publication mechanism.
+            (&*self.seen.as_ptr().cast::<AtomicU8>().add(cell)).load(Ordering::Relaxed)
         };
         if seen == 0 {
             return Ok(false);

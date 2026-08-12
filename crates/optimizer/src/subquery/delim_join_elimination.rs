@@ -3,6 +3,8 @@
 
 //! Eliminate redundant joins against `DelimGet`.
 
+use std::collections::HashSet;
+
 use paro_common::types::LogicalType;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
@@ -118,44 +120,61 @@ impl DelimJoinElimination {
         let LogicalOperator::Filter(filter) = &filter_plan.operator else {
             return false;
         };
-        let (delim, join_conditions_supported) = match &filter.child.operator {
+        let (delim, base, correlated_join_conditions) = match &filter.child.operator {
             LogicalOperator::Join(Join::Cross(cross)) => {
-                let delim = match (&cross.left.operator, &cross.right.operator) {
-                    (LogicalOperator::DelimGet(delim), _) => delim,
-                    (_, LogicalOperator::DelimGet(delim)) => delim,
+                match (&cross.left.operator, &cross.right.operator) {
+                    (LogicalOperator::DelimGet(delim), _) => (delim, cross.right.as_ref(), None),
+                    (_, LogicalOperator::DelimGet(delim)) => (delim, cross.left.as_ref(), None),
                     _ => return false,
-                };
-                (delim, true)
+                }
             }
             LogicalOperator::Join(Join::Comparison(correlated_join))
                 if correlated_join.join_type == JoinType::Inner
                     && correlated_join.duplicate_eliminated_columns.is_empty() =>
             {
-                let delim = match (
+                match (
                     &correlated_join.left.operator,
                     &correlated_join.right.operator,
                 ) {
-                    (LogicalOperator::DelimGet(delim), _) => delim,
-                    (_, LogicalOperator::DelimGet(delim)) => delim,
+                    (LogicalOperator::DelimGet(delim), _) => (
+                        delim,
+                        correlated_join.right.as_ref(),
+                        Some(correlated_join.conditions.as_slice()),
+                    ),
+                    (_, LogicalOperator::DelimGet(delim)) => (
+                        delim,
+                        correlated_join.left.as_ref(),
+                        Some(correlated_join.conditions.as_slice()),
+                    ),
                     _ => return false,
-                };
-                let supported = correlated_join.conditions.iter().all(|condition| {
-                    correlated_condition_from_parts(
-                        condition.left.clone(),
-                        condition.right.clone(),
-                        join_to_expression_comparison(condition.comparison),
-                        delim.table_index,
-                        &join.duplicate_eliminated_columns,
-                    )
-                    .is_some()
-                });
-                (delim, supported)
+                }
             }
             _ => return false,
         };
         if delim.chunk_types.len() != join.duplicate_eliminated_columns.len() {
             return false;
         }
+        if !outer_conditions_bind_exact_delim_columns(join, delim.table_index) {
+            return false;
+        }
+        let base_bindings = base
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let join_conditions_supported = correlated_join_conditions.is_none_or(|conditions| {
+            conditions.iter().all(|condition| {
+                correlated_condition_from_parts(
+                    condition.left.clone(),
+                    condition.right.clone(),
+                    join_to_expression_comparison(condition.comparison),
+                    delim.table_index,
+                    &join.duplicate_eliminated_columns,
+                )
+                .is_some_and(|condition| {
+                    expression_references_only_bindings(&condition.right, &base_bindings)
+                })
+            })
+        });
 
         let filters_supported =
             filter
@@ -168,7 +187,11 @@ impl DelimJoinElimination {
                         delim.table_index,
                         &join.duplicate_eliminated_columns,
                     )
-                    .is_some()
+                    .is_some_and(|condition| {
+                        expression_references_only_bindings(&condition.right, &base_bindings)
+                    }) || (!expression_references_table(expression, delim.table_index)
+                        && expression_references_only_bindings(expression, &base_bindings)
+                        && !expression.evaluation_properties().is_reorder_fence())
                 });
         filters_supported && join_conditions_supported
     }
@@ -240,18 +263,24 @@ impl DelimJoinElimination {
             }
             _ => unreachable!("validated correlated existence join"),
         };
+        let mut local_filters = Vec::new();
         for expression in filter.expressions {
             for term in into_conjunction_terms(expression) {
-                conditions.push(
-                    correlated_join_condition(
-                        term,
-                        delim_table_index,
-                        &join.duplicate_eliminated_columns,
-                    )
-                    .expect("validated correlated existence condition"),
-                );
+                match correlated_join_condition(
+                    term.clone(),
+                    delim_table_index,
+                    &join.duplicate_eliminated_columns,
+                ) {
+                    Some(condition) => conditions.push(condition),
+                    None => local_filters.push(term),
+                }
             }
         }
+        let base = if local_filters.is_empty() {
+            base
+        } else {
+            LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(base, local_filters)))
+        };
 
         let mut direct = ComparisonJoin::new(join.join_type, *join.left, base, conditions);
         direct.anti_join_mode = join.anti_join_mode;
@@ -545,6 +574,67 @@ fn passive_projection_child(mut plan: &LogicalPlan) -> Option<&LogicalPlan> {
     Some(plan)
 }
 
+/// Verify that the delimiter join's outer equality conditions are the exact
+/// identity map installed by dependent-join flattening. Merely checking their
+/// count and comparison kind is insufficient: a business predicate with the
+/// same arity must never authorize removal of the delimiter.
+fn outer_conditions_bind_exact_delim_columns(
+    join: &ComparisonJoin,
+    delim_table_index: usize,
+) -> bool {
+    let mut seen = vec![false; join.duplicate_eliminated_columns.len()];
+    for condition in &join.conditions {
+        let left_delim = resolve_projected_delim_column(
+            join.right.as_ref(),
+            condition.left.clone(),
+            delim_table_index,
+        );
+        let right_delim = resolve_projected_delim_column(
+            join.right.as_ref(),
+            condition.right.clone(),
+            delim_table_index,
+        );
+        let (delim_column, outer_expression) = match (left_delim, right_delim) {
+            (Some(column), None) => (column, &condition.right),
+            (None, Some(column)) => (column, &condition.left),
+            _ => return false,
+        };
+        let Some(expected_outer) = join.duplicate_eliminated_columns.get(delim_column) else {
+            return false;
+        };
+        if seen[delim_column] || !outer_expression.equals(expected_outer) {
+            return false;
+        }
+        seen[delim_column] = true;
+    }
+    seen.into_iter().all(|matched| matched)
+}
+
+fn resolve_projected_delim_column(
+    mut plan: &LogicalPlan,
+    mut expression: Expression,
+    delim_table_index: usize,
+) -> Option<usize> {
+    while let LogicalOperator::Projection(projection) = &plan.operator {
+        let Expression::ColumnRef(column) = &expression else {
+            return None;
+        };
+        if column.depth != 0 || column.binding.table_index != projection.table_index {
+            return None;
+        }
+        expression = projection
+            .expressions
+            .get(column.binding.column_index)?
+            .clone();
+        plan = projection.child.as_ref();
+    }
+    let Expression::ColumnRef(column) = expression else {
+        return None;
+    };
+    (column.depth == 0 && column.binding.table_index == delim_table_index)
+        .then_some(column.binding.column_index)
+}
+
 fn into_conjunction_terms(expression: Expression) -> Vec<Expression> {
     match expression {
         Expression::Conjunction(conjunction)
@@ -595,6 +685,22 @@ fn expression_references_table(expression: &Expression, table_index: usize) -> b
         }
     });
     found
+}
+
+fn expression_references_only_bindings(
+    expression: &Expression,
+    bindings: &HashSet<paro_planner::operator::ColumnBinding>,
+) -> bool {
+    match expression {
+        Expression::ColumnRef(column) => column.depth == 0 && bindings.contains(&column.binding),
+        _ => {
+            let mut valid = true;
+            ExpressionIterator::enumerate_children(expression, |child| {
+                valid &= expression_references_only_bindings(child, bindings);
+            });
+            valid
+        }
+    }
 }
 
 fn correlated_join_condition(
@@ -694,11 +800,14 @@ fn join_to_expression_comparison(comparison: JoinComparisonType) -> ComparisonTy
 #[cfg(test)]
 mod tests {
     use super::DelimJoinElimination;
+    use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ColumnRefExpression, Expression};
+    use paro_planner::expression::{
+        ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
+    };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, DelimGet, ExpressionGet, Join, JoinComparisonType,
-        JoinCondition, JoinType, LogicalOperator,
+        ColumnBinding, ComparisonJoin, CrossProduct, DelimGet, ExpressionGet, Filter, Join,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -712,6 +821,102 @@ mod tests {
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         )))
+    }
+
+    fn column(table_index: usize) -> Expression {
+        Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(table_index, 0),
+            LogicalType::Integer,
+        ))
+    }
+
+    fn comparison(
+        comparison_type: ComparisonType,
+        left: Expression,
+        right: Expression,
+    ) -> Expression {
+        Expression::Comparison(ComparisonExpression::new(comparison_type, left, right))
+    }
+
+    fn correlated_existence_join(project_delim_column: bool) -> ComparisonJoin {
+        let outer = expression_get(0);
+        let base = expression_get(1);
+        let delim = LogicalPlan::synthetic(LogicalOperator::DelimGet(DelimGet::new(
+            99,
+            vec![LogicalType::Integer],
+        )));
+        let cross = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+            base, delim,
+        ))));
+        let correlated = comparison(ComparisonType::Equal, column(1), column(99));
+        let local = comparison(
+            ComparisonType::GreaterThan,
+            column(1),
+            Expression::Constant(ConstantExpression::new(
+                Value::Integer(5),
+                LogicalType::Integer,
+            )),
+        );
+        let filtered = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            cross,
+            vec![correlated, local],
+        )));
+        let projected = LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+            2,
+            filtered,
+            vec![if project_delim_column {
+                column(99)
+            } else {
+                column(1)
+            }],
+        )));
+        let mut join = ComparisonJoin::new(
+            JoinType::Semi,
+            outer,
+            projected,
+            vec![JoinCondition::new(
+                column(0),
+                column(2),
+                JoinComparisonType::NotDistinctFrom,
+            )],
+        );
+        join.duplicate_eliminated_columns = vec![column(0)];
+        join
+    }
+
+    #[test]
+    fn decorrelates_existence_and_preserves_base_local_filters() {
+        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+            LogicalOperator::Join(Join::Comparison(correlated_existence_join(true))),
+        ));
+        let LogicalOperator::Join(Join::Comparison(join)) = result.operator else {
+            panic!("expected direct existence join");
+        };
+        assert!(join.duplicate_eliminated_columns.is_empty());
+        assert_eq!(join.conditions.len(), 1);
+        let LogicalOperator::Filter(filter) = join.right.operator else {
+            panic!("base-local predicate must remain on the direct build side");
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::ExpressionGet(_)
+        ));
+    }
+
+    #[test]
+    fn does_not_decorrelate_when_outer_join_does_not_bind_delim_output() {
+        let result = DelimJoinElimination::new().optimize_plan(LogicalPlan::synthetic(
+            LogicalOperator::Join(Join::Comparison(correlated_existence_join(false))),
+        ));
+        let LogicalOperator::Join(Join::Comparison(join)) = result.operator else {
+            panic!("expected delimiter join to remain");
+        };
+        assert!(!join.duplicate_eliminated_columns.is_empty());
+        assert!(matches!(
+            join.right.operator,
+            LogicalOperator::Projection(_)
+        ));
     }
 
     #[test]

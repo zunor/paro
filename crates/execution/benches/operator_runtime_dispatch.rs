@@ -689,11 +689,13 @@ impl HashJoinBuildFinishBench {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
-                    conditions: vec![JoinCondition::equality(
+                    key_conditions: vec![JoinCondition::equality(
                         reference(0, LogicalType::Integer),
                         reference(0, LogicalType::Integer),
                     )]
                     .into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,

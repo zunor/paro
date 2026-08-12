@@ -17,6 +17,7 @@ use crate::operators::join::hash::probe_output::{
 use crate::operators::join::hash::residual::HashJoinResidualProbeState;
 use crate::operators::join::hash::source_predicate::ReductionSourcePredicateState;
 use crate::operators::join::hash::spill::build_probe_spill_chunk_into;
+use crate::operators::join::state::ReductionProbeMode;
 use crate::operators::output::ensure_transform_output;
 use crate::physical::specs::HashReductionCascadeSpec;
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle, JoinProbeSpillBuffer};
@@ -129,8 +130,7 @@ impl HashJoinProbeTransformExec {
             reduction_source_masks: Vec::new(),
             reduction_channel_map,
             reduction_selection: None,
-            reduction_extrema: None,
-            reduction_extrema_unavailable: false,
+            reduction_mode: ReductionProbeMode::Uninitialized,
             reduction_group_slots: Vec::new(),
             probe_hashes: None,
             probe_spill_chunk: None,
@@ -260,10 +260,15 @@ impl HashJoinProbeTransformExec {
                 JoinKeySide::Probe,
                 &mut local.probe_keys,
             )?;
-            if local.reduction_selection.is_none() {
+            let selection_capacity = input.size().max(VECTOR_SIZE);
+            if local
+                .reduction_selection
+                .as_ref()
+                .is_none_or(|selection| selection.capacity() < selection_capacity)
+            {
                 local.reduction_selection =
                     Some(paro_common::vector::SelectionVector::try_with_capacity(
-                        VECTOR_SIZE,
+                        selection_capacity,
                         input.allocator().clone(),
                     )?);
             }
@@ -282,13 +287,13 @@ impl HashJoinProbeTransformExec {
                 )?;
             }
             if let Some(grouped) = &cascade.grouped_extrema {
-                if local.reduction_extrema.is_none() && !local.reduction_extrema_unavailable {
-                    match hash_table.ensure_grouped_reduction_extrema(grouped.channels.len())? {
-                        Some(extrema) => local.reduction_extrema = Some(extrema),
-                        None => local.reduction_extrema_unavailable = true,
-                    }
+                if matches!(local.reduction_mode, ReductionProbeMode::Uninitialized) {
+                    local.reduction_mode = hash_table.grouped_reduction_extrema().map_or(
+                        ReductionProbeMode::MatchMask,
+                        ReductionProbeMode::GroupedExtrema,
+                    );
                 }
-                if let Some(extrema) = &local.reduction_extrema {
+                if let ReductionProbeMode::GroupedExtrema(extrema) = &local.reduction_mode {
                     let values = input.column(grouped.source_value_index).ok_or_else(|| {
                         paro_error::internal("reduction extrema source column missing")
                     })?;
@@ -307,69 +312,69 @@ impl HashJoinProbeTransformExec {
                     let key = probe_keys.column(0).ok_or_else(|| {
                         paro_error::internal("grouped reduction equality key missing")
                     })?;
-                    if hash_table.lookup_i64_group_slots(
+                    if !hash_table.lookup_i64_group_slots(
                         key,
                         probe_keys.size(),
                         &mut local.reduction_group_slots,
                     )? {
-                        let mut row_idx = 0usize;
-                        while row_idx < input.size() {
-                            let slot = local.reduction_group_slots[row_idx];
-                            if slot == usize::MAX {
-                                row_idx += 1;
+                        return Err(paro_error::internal(
+                            "grouped reduction mode lost its finalized ranked key index",
+                        ));
+                    }
+                    let mut row_idx = 0usize;
+                    while row_idx < input.size() {
+                        let slot = local.reduction_group_slots[row_idx];
+                        if slot == usize::MAX {
+                            row_idx += 1;
+                            continue;
+                        }
+                        let run_start = row_idx;
+                        while row_idx < input.size() && local.reduction_group_slots[row_idx] == slot
+                        {
+                            row_idx += 1;
+                        }
+                        let mut minima = [0_i64; u8::BITS as usize];
+                        let mut maxima = [0_i64; u8::BITS as usize];
+                        minima[..grouped.channels.len()].fill(i64::MAX);
+                        maxima[..grouped.channels.len()].fill(i64::MIN);
+                        let mut seen_channels = 0u8;
+                        for value_idx in run_start..row_idx {
+                            if !values_view.is_valid(value_idx) {
                                 continue;
                             }
-                            let run_start = row_idx;
-                            while row_idx < input.size()
-                                && local.reduction_group_slots[row_idx] == slot
-                            {
-                                row_idx += 1;
+                            let value = match values_data {
+                                Some(data) => unsafe {
+                                    // SAFETY: the BIGINT vector view validates
+                                    // its storage and `value_idx` is in-batch.
+                                    *data.add(values_view.physical_index(value_idx))
+                                },
+                                None => values_view.get_i64(value_idx),
+                            };
+                            let source_mask = local.reduction_source_masks[value_idx];
+                            let eligible_channels =
+                                local.reduction_channel_map[source_mask as usize];
+                            let mut remaining = eligible_channels;
+                            while remaining != 0 {
+                                let channel_idx = remaining.trailing_zeros() as usize;
+                                minima[channel_idx] = minima[channel_idx].min(value);
+                                maxima[channel_idx] = maxima[channel_idx].max(value);
+                                remaining &= remaining - 1;
                             }
-                            let mut minima = [0_i64; u8::BITS as usize];
-                            let mut maxima = [0_i64; u8::BITS as usize];
-                            minima[..grouped.channels.len()].fill(i64::MAX);
-                            maxima[..grouped.channels.len()].fill(i64::MIN);
-                            let mut seen_channels = 0u8;
-                            for value_idx in run_start..row_idx {
-                                if !values_view.is_valid(value_idx) {
-                                    continue;
-                                }
-                                let value = match values_data {
-                                    Some(data) => unsafe {
-                                        // SAFETY: the BIGINT vector view validates
-                                        // its storage and `value_idx` is in-batch.
-                                        *data.add(values_view.physical_index(value_idx))
-                                    },
-                                    None => values_view.get_i64(value_idx),
-                                };
-                                let source_mask = local.reduction_source_masks[value_idx];
-                                let eligible_channels =
-                                    local.reduction_channel_map[source_mask as usize];
-                                let mut remaining = eligible_channels;
-                                while remaining != 0 {
-                                    let channel_idx = remaining.trailing_zeros() as usize;
-                                    minima[channel_idx] = minima[channel_idx].min(value);
-                                    maxima[channel_idx] = maxima[channel_idx].max(value);
-                                    remaining &= remaining - 1;
-                                }
-                                seen_channels |= eligible_channels;
-                            }
-                            for channel_idx in 0..grouped.channels.len() {
-                                if seen_channels & (1u8 << channel_idx) != 0 {
-                                    extrema.update_i64_range(
-                                        slot,
-                                        channel_idx,
-                                        minima[channel_idx],
-                                        maxima[channel_idx],
-                                    )?;
-                                }
+                            seen_channels |= eligible_channels;
+                        }
+                        for channel_idx in 0..grouped.channels.len() {
+                            if seen_channels & (1u8 << channel_idx) != 0 {
+                                extrema.update_i64_range(
+                                    slot,
+                                    channel_idx,
+                                    minima[channel_idx],
+                                    maxima[channel_idx],
+                                )?;
                             }
                         }
-                        output.try_set_cardinality(0)?;
-                        return Ok(TransformPoll::NeedMoreInput);
                     }
-                    local.reduction_extrema = None;
-                    local.reduction_extrema_unavailable = true;
+                    output.try_set_cardinality(0)?;
+                    return Ok(TransformPoll::NeedMoreInput);
                 }
             }
             for residual in local.reduction_residuals.iter_mut().flatten() {

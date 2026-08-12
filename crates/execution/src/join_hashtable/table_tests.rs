@@ -90,6 +90,48 @@ fn chunk_from_optional_i64_columns(columns: &[&[Option<i64>]]) -> Chunk {
 }
 
 #[test]
+fn grouped_reduction_mode_is_fixed_when_the_key_index_is_finalized() {
+    let table = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![bigint_equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    table.configure_grouped_reduction_extrema(2).unwrap();
+    let keys = chunk_from_optional_i64_columns(&[&[Some(0), Some(100)]]);
+    let payload = chunk_from_optional_i32(&[Some(1), Some(2)]);
+    table.build(&keys, &payload).unwrap();
+    table.finalize().unwrap();
+
+    assert!(table.grouped_reduction_extrema().is_some());
+    assert!(table.configure_grouped_reduction_extrema(2).is_ok());
+    assert!(table.configure_grouped_reduction_extrema(1).is_err());
+}
+
+#[test]
+fn grouped_reduction_unavailability_is_also_a_stable_finalized_mode() {
+    let table = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![bigint_equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    table.configure_grouped_reduction_extrema(2).unwrap();
+    let keys = chunk_from_optional_i64_columns(&[&[Some(0), Some(1)]]);
+    let payload = chunk_from_optional_i32(&[Some(1), Some(2)]);
+    table.build(&keys, &payload).unwrap();
+    table.finalize().unwrap();
+
+    assert!(table.grouped_reduction_extrema().is_none());
+    assert!(table.configure_grouped_reduction_extrema(2).is_ok());
+    assert!(table.configure_grouped_reduction_extrema(1).is_err());
+}
+
+#[test]
 fn nullable_i64_pair_fast_matcher_rejects_null_build_key() {
     let table = JoinHashTable::new(
         create_test_buffer_pool(),

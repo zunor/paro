@@ -23,9 +23,6 @@ impl PhysicalPlanGenerator {
         join: &ComparisonJoin,
         join_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
-        if let Some(cascade) = self.try_lower_reduction_cascade(join)? {
-            return Ok(cascade);
-        }
         if join.anti_join_mode == AntiJoinMode::NullAware
             && (join.join_type != JoinType::Anti
                 || join.conditions.len() != 1
@@ -44,6 +41,9 @@ impl PhysicalPlanGenerator {
         }
         if !join.duplicate_eliminated_columns.is_empty() || join.delim_flipped {
             return self.lower_comparison_delim_join(join);
+        }
+        if let Some(cascade) = self.try_lower_reduction_cascade(join)? {
+            return Ok(cascade);
         }
         let has_hash_key = join
             .conditions
@@ -313,7 +313,13 @@ impl PhysicalPlanGenerator {
         loop {
             if !matches!(current.join_type, JoinType::RightSemi | JoinType::RightAnti)
                 || current.anti_join_mode != AntiJoinMode::Regular
+                || !current.duplicate_eliminated_columns.is_empty()
+                || current.delim_flipped
                 || !current.left_projection_map.is_none()
+                || current
+                    .conditions
+                    .iter()
+                    .any(|condition| !reduction_condition_can_share_evaluation(condition))
             {
                 return Ok(None);
             }
@@ -396,29 +402,41 @@ impl PhysicalPlanGenerator {
             .map(|&column_id| first_table.columns[column_id].logical_type.clone())
             .collect();
         merged_get.returned_types = merged_get.column_types.clone();
-        let Some(runtime_filter_expressions) = branches
-            .iter()
-            .flat_map(|branch| {
-                branch
-                    .get
-                    .runtime_filter_expressions
-                    .iter()
-                    .map(move |expression| (branch, expression))
-            })
-            .map(|(branch, expression)| {
-                remap_reduction_expression(
-                    expression,
-                    branch_column_ids(branch.get),
-                    branch.get.table_index,
-                    &merged_column_ids,
-                    merged_get.table_index,
-                )
-            })
-            .collect::<Option<Vec<_>>>()
-        else {
+        if branches.iter().skip(1).any(|branch| {
+            !same_scan_order(
+                branches[0].get.scan_order.as_ref(),
+                branch.get.scan_order.as_ref(),
+            )
+        }) {
             return Ok(None);
-        };
-        merged_get.runtime_filter_expressions = runtime_filter_expressions;
+        }
+        let mut branch_runtime_filters = Vec::with_capacity(branches.len());
+        for branch in &branches {
+            let remapped = branch
+                .get
+                .runtime_filter_expressions
+                .iter()
+                .map(|expression| {
+                    remap_reduction_expression(
+                        expression,
+                        branch_column_ids(branch.get),
+                        branch.get.table_index,
+                        &merged_column_ids,
+                        merged_get.table_index,
+                    )
+                })
+                .collect::<Option<Vec<_>>>();
+            branch_runtime_filters.push(remapped);
+        }
+        // Runtime filters are optimizer-derived, semantically redundant scan
+        // hints. The shared scan supplies the union of every alias's candidate
+        // stream, so branch conjunctions combine with OR—not by flattening
+        // them into the Get's implicit AND. If one branch is unrestricted or
+        // cannot be remapped, no scan filter can safely represent that union.
+        merged_get.runtime_filter_expressions =
+            merge_reduction_runtime_filters(branch_runtime_filters)
+                .into_iter()
+                .collect();
 
         let mut common_keys: Option<Vec<JoinCondition>> = None;
         let mut reduction_steps = Vec::with_capacity(joins.len());
@@ -427,6 +445,7 @@ impl PhysicalPlanGenerator {
         let mut build_residual_types = Vec::new();
         let mut required_mask = 0u8;
         let mut forbidden_mask = 0u8;
+        let mut predicate_bits = ReductionPredicateBits::default();
 
         for (step_idx, (join, branch)) in joins.iter().zip(&branches).enumerate() {
             let mut keys = Vec::new();
@@ -439,6 +458,10 @@ impl PhysicalPlanGenerator {
                     &merged_column_ids,
                     merged_get.table_index,
                 ) else {
+                    return Ok(None);
+                };
+                let Some(left) = bind_reduction_source_expression(left, merged_get.table_index)
+                else {
                     return Ok(None);
                 };
                 let condition =
@@ -466,29 +489,25 @@ impl PhysicalPlanGenerator {
             }
             let mut predicate_mask = 0u8;
             for residual in residuals {
-                let predicate_idx = if let Some(predicate_idx) = reduction_predicates
+                let predicate_bit = if let Some(existing) = reduction_predicates
                     .iter()
-                    .position(|existing| same_reduction_condition(&existing.condition, &residual))
+                    .find(|existing| same_reduction_condition(&existing.condition, &residual))
                 {
-                    predicate_idx
+                    existing.predicate_mask
                 } else {
-                    let predicate_idx = reduction_predicates.len();
-                    if predicate_idx >= u8::BITS as usize {
+                    let Some(predicate_bit) = predicate_bits.allocate() else {
                         return Ok(None);
-                    }
-                    let predicate_bit = 1u8 << predicate_idx;
+                    };
+                    let build_residual_offset = reduction_predicates.len();
                     build_residual_types.push(residual.right.return_type());
                     reduction_predicates.push(HashReductionPredicateSpec {
                         condition: residual,
-                        build_residual_offset: predicate_idx,
+                        build_residual_offset,
                         predicate_mask: predicate_bit,
                     });
-                    predicate_idx
+                    predicate_bit
                 };
-                if predicate_idx >= u8::BITS as usize {
-                    return Ok(None);
-                }
-                predicate_mask |= 1u8 << predicate_idx;
+                predicate_mask |= predicate_bit;
             }
             for filter in &branch.filters {
                 let Some(expression) = remap_reduction_expression(
@@ -500,15 +519,26 @@ impl PhysicalPlanGenerator {
                 ) else {
                     return Ok(None);
                 };
-                let predicate_idx = reduction_predicates.len() + reduction_source_predicates.len();
-                if predicate_idx >= u8::BITS as usize {
+                let Some(expression) =
+                    bind_reduction_source_expression(expression, merged_get.table_index)
+                else {
                     return Ok(None);
-                }
-                let source_mask = 1u8 << predicate_idx;
-                reduction_source_predicates.push(HashReductionSourcePredicateSpec {
-                    expression,
-                    predicate_mask: source_mask,
-                });
+                };
+                let source_mask = if let Some(existing) = reduction_source_predicates
+                    .iter()
+                    .find(|existing| existing.expression.equals(&expression))
+                {
+                    existing.predicate_mask
+                } else {
+                    let Some(source_mask) = predicate_bits.allocate() else {
+                        return Ok(None);
+                    };
+                    reduction_source_predicates.push(HashReductionSourcePredicateSpec {
+                        expression,
+                        predicate_mask: source_mask,
+                    });
+                    source_mask
+                };
                 predicate_mask |= source_mask;
             }
             reduction_steps.push(HashReductionStepSpec {
@@ -800,11 +830,10 @@ fn plan_grouped_extrema_reduction(
     {
         return None;
     }
-    let source_value_index = match &predicate.condition.left {
-        Expression::Reference(reference) => reference.index,
-        Expression::ColumnRef(column) => column.binding.column_index,
-        _ => return None,
+    let Expression::Reference(source_value) = &predicate.condition.left else {
+        return None;
     };
+    let source_value_index = source_value.index;
 
     let source_bits = source_predicates
         .iter()
@@ -894,7 +923,7 @@ fn remap_reduction_expression(
     ) -> bool {
         match expression {
             Expression::ColumnRef(column) => {
-                if column.binding.table_index != source_table_index {
+                if column.depth != 0 || column.binding.table_index != source_table_index {
                     return false;
                 }
                 let Some(column_id) = source_column_ids.get(column.binding.column_index) else {
@@ -952,6 +981,97 @@ fn remap_reduction_expression(
     .then_some(expression)
 }
 
+/// Bind a merged scan expression to its physical chunk layout. Reduction
+/// predicates cross the logical/physical boundary here, so execution never
+/// has to reinterpret a logical table binding as a vector position.
+fn bind_reduction_source_expression(
+    mut expression: Expression,
+    source_table_index: usize,
+) -> Option<Expression> {
+    fn bind(expression: &mut Expression, source_table_index: usize) -> bool {
+        match expression {
+            Expression::ColumnRef(column) => {
+                if column.depth != 0 || column.binding.table_index != source_table_index {
+                    return false;
+                }
+                *expression = Expression::Reference(ReferenceExpression::new(
+                    column.binding.column_index,
+                    column.return_type.clone(),
+                ));
+                true
+            }
+            Expression::Reference(_) => true,
+            _ => {
+                let mut valid = true;
+                ExpressionIterator::enumerate_children_mut(expression, |child| {
+                    valid &= bind(child, source_table_index);
+                });
+                valid
+            }
+        }
+    }
+
+    bind(&mut expression, source_table_index).then_some(expression)
+}
+
+fn same_scan_order(
+    left: Option<&paro_storage::table::segment_reorderer::SegmentOrderOptions>,
+    right: Option<&paro_storage::table::segment_reorderer::SegmentOrderOptions>,
+) -> bool {
+    left == right
+}
+
+fn merge_reduction_runtime_filters(branches: Vec<Option<Vec<Expression>>>) -> Option<Expression> {
+    let mut branch_predicates = Vec::with_capacity(branches.len());
+    for branch in branches {
+        let predicates = branch?;
+        let predicate = combine_boolean_terms(ConjunctionType::And, predicates)?;
+        branch_predicates.push(predicate);
+    }
+    if let Some(first) = branch_predicates.first() {
+        if branch_predicates
+            .iter()
+            .skip(1)
+            .all(|predicate| predicate.equals(first))
+        {
+            return Some(first.clone());
+        }
+    }
+    combine_boolean_terms(ConjunctionType::Or, branch_predicates)
+}
+
+fn combine_boolean_terms(
+    conjunction_type: ConjunctionType,
+    mut expressions: Vec<Expression>,
+) -> Option<Expression> {
+    match expressions.len() {
+        0 => None,
+        1 => expressions.pop(),
+        _ => Some(Expression::Conjunction(ConjunctionExpression::new(
+            conjunction_type,
+            expressions,
+        ))),
+    }
+}
+
+/// One namespace for both build-residual and source-local predicate bits.
+/// Build payload offsets deliberately remain a separate dense sequence.
+#[derive(Debug, Default)]
+struct ReductionPredicateBits {
+    next: usize,
+}
+
+impl ReductionPredicateBits {
+    fn allocate(&mut self) -> Option<u8> {
+        if self.next >= u8::BITS as usize {
+            return None;
+        }
+        let bit = 1u8 << self.next;
+        self.next += 1;
+        Some(bit)
+    }
+}
+
 fn same_reduction_keys(left: &[JoinCondition], right: &[JoinCondition]) -> bool {
     left.len() == right.len()
         && left.iter().zip(right).all(|(left, right)| {
@@ -965,6 +1085,17 @@ fn same_reduction_condition(left: &JoinCondition, right: &JoinCondition) -> bool
     left.comparison == right.comparison
         && same_reduction_predicate_expression(&left.left, &right.left)
         && same_reduction_predicate_expression(&left.right, &right.right)
+}
+
+fn reduction_condition_can_share_evaluation(condition: &JoinCondition) -> bool {
+    condition
+        .left
+        .evaluation_properties()
+        .can_share_evaluation()
+        && condition
+            .right
+            .evaluation_properties()
+            .can_share_evaluation()
 }
 
 fn same_reduction_predicate_expression(left: &Expression, right: &Expression) -> bool {
@@ -985,7 +1116,8 @@ fn same_reduction_key_expression(left: &Expression, right: &Expression) -> bool 
             left.index == right.index && left.return_type == right.return_type
         }
         (Expression::ColumnRef(left), Expression::ColumnRef(right)) => {
-            left.binding.column_index == right.binding.column_index
+            left.binding == right.binding
+                && left.depth == right.depth
                 && left.return_type == right.return_type
         }
         _ => false,
@@ -1002,4 +1134,83 @@ fn partition_hash_join_conditions(
         .partition(|condition| is_hash_join_comparison(condition.comparison));
     debug_assert!(!keys.is_empty(), "hash join requires an equality key");
     (keys.into_boxed_slice(), residuals.into_boxed_slice())
+}
+
+#[cfg(test)]
+mod reduction_cascade_tests {
+    use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
+    use paro_planner::expression::{
+        ComparisonExpression, ComparisonType, ConjunctionType, ConstantExpression, Expression,
+        ReferenceExpression,
+    };
+
+    use super::{
+        merge_reduction_runtime_filters, remap_reduction_expression, ReductionPredicateBits,
+    };
+
+    #[test]
+    fn build_and_source_predicates_share_one_collision_free_namespace() {
+        let mut bits = ReductionPredicateBits::default();
+        let build_residual = bits.allocate().unwrap();
+        // A duplicate build residual reuses its existing bit and therefore
+        // does not consume the allocator. The next source predicate must still
+        // receive a distinct bit.
+        let duplicate_build_residual = build_residual;
+        let source_predicate = bits.allocate().unwrap();
+
+        assert_eq!(duplicate_build_residual, build_residual);
+        assert_ne!(source_predicate, build_residual);
+        assert_eq!(source_predicate, 0b10);
+        for _ in 2..u8::BITS {
+            assert!(bits.allocate().is_some());
+        }
+        assert_eq!(bits.allocate(), None);
+    }
+
+    #[test]
+    fn branch_runtime_filters_form_a_union_of_candidate_streams() {
+        fn bound(index: usize, value: i64) -> Expression {
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::GreaterThanOrEqual,
+                Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(value),
+                    LogicalType::BigInt,
+                )),
+            ))
+        }
+        let merged = merge_reduction_runtime_filters(vec![
+            Some(vec![bound(0, 10), bound(1, 11)]),
+            Some(vec![bound(0, 20), bound(1, 21)]),
+        ])
+        .unwrap();
+        assert!(matches!(
+            merged,
+            Expression::Conjunction(ref conjunction)
+                if conjunction.conjunction_type == ConjunctionType::Or
+                    && conjunction.children.len() == 2
+                    && conjunction.children.iter().all(|child| matches!(
+                        child,
+                        Expression::Conjunction(branch)
+                            if branch.conjunction_type == ConjunctionType::And
+                                && branch.children.len() == 2
+                    ))
+        ));
+        assert!(
+            merge_reduction_runtime_filters(vec![Some(vec![bound(0, 10)]), Some(Vec::new()),])
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn reduction_remap_rejects_correlated_source_bindings() {
+        let expression =
+            Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::with_depth(
+                paro_planner::operator::ColumnBinding::new(7, 0),
+                LogicalType::BigInt,
+                1,
+            ));
+        assert!(remap_reduction_expression(&expression, &[3], 7, &[3], 9).is_none());
+    }
 }

@@ -505,10 +505,16 @@ impl<'a> PipelineLowerer<'a> {
             SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                 handle,
                 join_type: spec.join_type,
-                conditions: all_hash_join_conditions(spec),
+                key_conditions: spec.key_conditions.clone(),
+                residual_conditions: hash_join_build_residual_conditions(spec),
                 build_projection: spec.build_input_projection.clone(),
                 build_payload_types: spec.build_payload_types.clone(),
                 build_output_count: spec.build_output_count,
+                grouped_reduction_channels: spec
+                    .reduction_cascade
+                    .as_ref()
+                    .and_then(|cascade| cascade.grouped_extrema.as_ref())
+                    .map(|grouped| grouped.channels.len()),
                 required: Default::default(),
                 force_external: spec.force_external,
             }),
@@ -564,7 +570,8 @@ impl<'a> PipelineLowerer<'a> {
             handle,
             join_type: spec.join_type,
             anti_join_mode: spec.anti_join_mode,
-            conditions: all_hash_join_conditions(spec),
+            key_conditions: spec.key_conditions.clone(),
+            residual_conditions: spec.residual_conditions.clone(),
             probe_types: self.plan.node(*left).output.types.clone(),
             build_payload_types: spec.build_payload_types.clone(),
             build_output_count: spec.build_output_count,
@@ -704,10 +711,16 @@ impl<'a> PipelineLowerer<'a> {
                     SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                         handle,
                         join_type: spec.join_type,
-                        conditions: all_hash_join_conditions(&spec),
+                        key_conditions: spec.key_conditions.clone(),
+                        residual_conditions: hash_join_build_residual_conditions(&spec),
                         build_projection: spec.build_input_projection.clone(),
                         build_payload_types: spec.build_payload_types.clone(),
                         build_output_count: spec.build_output_count,
+                        grouped_reduction_channels: spec
+                            .reduction_cascade
+                            .as_ref()
+                            .and_then(|cascade| cascade.grouped_extrema.as_ref())
+                            .map(|grouped| grouped.channels.len()),
                         required: Default::default(),
                         force_external: false,
                     }),

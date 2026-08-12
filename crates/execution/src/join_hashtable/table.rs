@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
-use paro_common::error::{self as paro_error, ErrorClass, Result};
+use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -41,11 +41,14 @@ use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
 use super::hash_kernel::{JoinKeyLayout, PreparedProbeKeys};
 use super::ht_entry::HtEntry;
 use super::integer_index::{ExactIntegerJoinIndex, IntegerKeyKind};
-use super::reduction_extrema::GroupedReductionExtrema;
 use super::scan_structure::ScanStructure;
 
 #[path = "integer_finalize.rs"]
 mod integer_finalize;
+pub(crate) use integer_finalize::ParallelDirectIntegerIndexBuild;
+#[path = "table_grouped_reduction.rs"]
+mod table_grouped_reduction;
+use table_grouped_reduction::GroupedReductionExtremaState;
 
 #[derive(Debug, Default)]
 struct HtEntryTable {
@@ -226,12 +229,6 @@ pub struct JoinHashTable {
 
     /// Row count.
     count: AtomicUsize,
-}
-
-enum GroupedReductionExtremaState {
-    Uninitialized,
-    Unavailable,
-    Ready(Arc<GroupedReductionExtrema>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -503,7 +500,7 @@ impl JoinHashTable {
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
             integer_index: Mutex::new(None),
-            grouped_reduction_extrema: Mutex::new(GroupedReductionExtremaState::Uninitialized),
+            grouped_reduction_extrema: Mutex::new(GroupedReductionExtremaState::Unconfigured),
             integer_index_build_stats: Mutex::new(integer_index_build_stats),
             integer_key_kind,
             deferred_hashes: AtomicBool::new(false),
@@ -888,63 +885,10 @@ impl JoinHashTable {
             .store(ptr::null_mut(), Ordering::Release);
         *self.entries.lock().unwrap() = HtEntryTable::default();
         *self.integer_index.lock().unwrap() = None;
-        *self.grouped_reduction_extrema.lock().unwrap() =
-            GroupedReductionExtremaState::Uninitialized;
+        self.reset_grouped_reduction_extrema();
         self.capacity.store(0, Ordering::Relaxed);
         self.bitmask.store(0, Ordering::Relaxed);
         self.chains_longer_than_one.store(false, Ordering::Relaxed);
-    }
-
-    pub(crate) fn ensure_grouped_reduction_extrema(
-        &self,
-        channel_count: usize,
-    ) -> Result<Option<Arc<GroupedReductionExtrema>>> {
-        let mut state = self.grouped_reduction_extrema.lock().unwrap();
-        match &*state {
-            GroupedReductionExtremaState::Ready(extrema) => {
-                if extrema.channel_count() != channel_count {
-                    return Err(paro_error::internal(
-                        "grouped reduction extrema channel count changed after initialization",
-                    ));
-                }
-                return Ok(Some(Arc::clone(extrema)));
-            }
-            GroupedReductionExtremaState::Unavailable => return Ok(None),
-            GroupedReductionExtremaState::Uninitialized => {}
-        }
-        let group_count = self
-            .integer_index
-            .lock()
-            .unwrap()
-            .as_ref()
-            .and_then(|index| index.ranked_group_count());
-        let Some(group_count) = group_count else {
-            *state = GroupedReductionExtremaState::Unavailable;
-            return Ok(None);
-        };
-        let extrema = match GroupedReductionExtrema::try_new(
-            group_count,
-            channel_count,
-            self.allocator.clone(),
-            &self.pointer_memory,
-        ) {
-            Ok(extrema) => Arc::new(extrema),
-            Err(error) if error.error_class() == ErrorClass::Resource => {
-                *state = GroupedReductionExtremaState::Unavailable;
-                return Ok(None);
-            }
-            Err(error) => return Err(error),
-        };
-        *state = GroupedReductionExtremaState::Ready(Arc::clone(&extrema));
-        Ok(Some(extrema))
-    }
-
-    pub(crate) fn grouped_reduction_extrema(&self) -> Option<Arc<GroupedReductionExtrema>> {
-        match &*self.grouped_reduction_extrema.lock().unwrap() {
-            GroupedReductionExtremaState::Ready(extrema) => Some(Arc::clone(extrema)),
-            GroupedReductionExtremaState::Uninitialized
-            | GroupedReductionExtremaState::Unavailable => None,
-        }
     }
 
     pub(crate) fn lookup_i64_group_slots(
@@ -1121,36 +1065,24 @@ impl JoinHashTable {
     ///
     /// This constructs the pointer table from the stored rows.
     pub fn finalize(&self) -> Result<()> {
-        self.finalize_with_parallelism(1)
-    }
-
-    pub fn finalize_with_parallelism(&self, parallelism: usize) -> Result<()> {
         if self.finalized.load(Ordering::Acquire) {
             return Ok(());
         }
 
         if self.count() == 0 {
+            self.finalize_grouped_reduction_extrema()?;
             self.probe_entries.store(ptr::null_mut(), Ordering::Release);
             self.finalized.store(true, Ordering::Release);
             return Ok(());
         }
 
-        let index_parallelism = if parallelism > 1 && self.count() >= 64 * 1024 {
-            parallelism
-        } else {
-            1
-        };
-        let direct_index = self.try_build_direct_integer_index_parallel(index_parallelism)?;
+        let direct_index = self.try_build_direct_integer_index()?;
         let integer_index = match direct_index {
             Some(index) => Some(index),
             None => self.try_build_ranked_integer_index()?,
         };
         if let Some(index) = integer_index {
-            let index = Box::new(index);
-            let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut ExactIntegerJoinIndex;
-            *self.integer_index.lock().unwrap() = Some(index);
-            self.probe_integer_index.store(index_ptr, Ordering::Release);
-            self.finalized.store(true, Ordering::Release);
+            self.install_finalized_integer_index(index)?;
             return Ok(());
         }
 
@@ -1175,6 +1107,17 @@ impl JoinHashTable {
             .store(has_long_chains, Ordering::Relaxed);
 
         self.probe_entries.store(entries_ptr, Ordering::Release);
+        self.finalize_grouped_reduction_extrema()?;
+        self.finalized.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn install_finalized_integer_index(&self, index: ExactIntegerJoinIndex) -> Result<()> {
+        let index = Box::new(index);
+        let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut ExactIntegerJoinIndex;
+        *self.integer_index.lock().unwrap() = Some(index);
+        self.probe_integer_index.store(index_ptr, Ordering::Release);
+        self.finalize_grouped_reduction_extrema()?;
         self.finalized.store(true, Ordering::Release);
         Ok(())
     }

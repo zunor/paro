@@ -239,9 +239,14 @@ impl HashJoinSpillReplaySourceExec {
             for residual in local.reduction_residuals.iter_mut().flatten() {
                 residual.evaluate_probe(ctx, replay_input)?;
             }
-            if local.reduction_selection.is_none() {
+            let selection_capacity = replay_input.size().max(VECTOR_SIZE);
+            if local
+                .reduction_selection
+                .as_ref()
+                .is_none_or(|selection| selection.capacity() < selection_capacity)
+            {
                 local.reduction_selection = Some(SelectionVector::try_with_capacity(
-                    VECTOR_SIZE,
+                    selection_capacity,
                     output.allocator().clone(),
                 )?);
             }

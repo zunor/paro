@@ -745,7 +745,9 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
@@ -769,7 +771,8 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     handle,
                     join_type: JoinType::Inner,
                     anti_join_mode: AntiJoinMode::Regular,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
@@ -992,7 +995,9 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Left,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
@@ -1019,7 +1024,8 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     handle,
                     join_type: JoinType::Left,
                     anti_join_mode: AntiJoinMode::Regular,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
                     left_projection: vec![1].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]

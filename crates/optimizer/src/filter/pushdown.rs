@@ -366,52 +366,11 @@ impl FilterPushdown {
         left_bindings: HashSet<usize>,
         right_bindings: HashSet<usize>,
     ) -> LogicalOperator {
-        let Some(mark_index) = join.mark_index else {
+        let Some((marker_filter_index, expected)) = self.consumed_marker_truth_filter(&join) else {
             return self.pushdown_left_join(join, left_bindings, right_bindings);
         };
-        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
-        let positive_marker = self.filters.iter().position(|filter| {
-            matches!(
-                &filter.filter,
-                Expression::ColumnRef(column)
-                    if column.depth == 0 && column.binding == mark_binding
-            )
-        });
-        let negative_marker = self.filters.iter().position(|filter| {
-            matches!(
-                &filter.filter,
-                Expression::Operator(operator)
-                    if operator.operator_type == OperatorType::Not
-                        && matches!(
-                            operator.children.as_slice(),
-                            [Expression::ColumnRef(column)]
-                                if column.depth == 0 && column.binding == mark_binding
-                        )
-            )
-        });
-        let marker_reference_count = self
-            .filters
-            .iter()
-            .filter(|filter| filter.bindings.contains(&mark_index))
-            .count();
-
-        if let Some(marker_index) = positive_marker.filter(|_| marker_reference_count == 1) {
-            self.filters.remove(marker_index);
-            join.join_type = JoinType::Semi;
-            join.mark_index = None;
-            join.mark_null_condition_start = None;
-            self.pushdown_semi_anti_join(join)
-        } else if let Some(marker_index) = negative_marker.filter(|_| {
-            marker_reference_count == 1
-                && join.mark_null_condition_start == Some(0)
-                && join.conditions.len() == 1
-                && join.conditions[0].comparison == JoinComparisonType::Equal
-        }) {
-            // A scalar NOT IN marker is observable only through this top-level
-            // filter. Preserve its UNKNOWN cases directly in a null-aware anti
-            // join instead of materializing a boolean column and filtering it.
-            self.filters.remove(marker_index);
-            join.make_null_aware_anti();
+        if lower_mark_join_for_truth(&mut join, expected) {
+            self.filters.remove(marker_filter_index);
             self.pushdown_semi_anti_join(join)
         } else {
             // MARK outputs the left schema plus one marker. Predicates over
@@ -647,31 +606,32 @@ impl FilterPushdown {
         if join.join_type != JoinType::Mark || join.mark_null_condition_start.is_some() {
             return;
         }
-        let Some(mark_index) = join.mark_index else {
-            return;
-        };
-        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
-        let marker_filters = self
-            .filters
-            .iter()
-            .enumerate()
-            .filter(|(_, filter)| filter.bindings.contains(&mark_index))
-            .collect::<Vec<_>>();
-        let [(filter_index, filter)] = marker_filters.as_slice() else {
-            return;
-        };
-        let Some(expected) = marker_truth_test(&filter.filter, mark_binding) else {
+        let Some((filter_index, expected)) = self.consumed_marker_truth_filter(join) else {
             return;
         };
 
-        self.filters.remove(*filter_index);
-        join.join_type = if expected {
-            JoinType::Semi
-        } else {
-            JoinType::Anti
-        };
-        join.mark_index = None;
-        join.mark_null_condition_start = None;
+        if lower_mark_join_for_truth(join, expected) {
+            self.filters.remove(filter_index);
+        }
+    }
+
+    /// Return the sole top-level truth test that consumes a MARK result.
+    ///
+    /// The caller decides whether the marker's nullable semantics can be
+    /// represented by a semi/anti join before removing the returned filter.
+    fn consumed_marker_truth_filter(&self, join: &ComparisonJoin) -> Option<(usize, bool)> {
+        let mark_index = join.mark_index?;
+        let mark_binding = paro_planner::operator::ColumnBinding::new(mark_index, 0);
+        let mut marker_filters = self
+            .filters
+            .iter()
+            .enumerate()
+            .filter(|(_, filter)| filter.bindings.contains(&mark_index));
+        let (filter_index, filter) = marker_filters.next()?;
+        if marker_filters.next().is_some() {
+            return None;
+        }
+        marker_truth_test(&filter.filter, mark_binding).map(|expected| (filter_index, expected))
     }
 
     /// Push down through a semi/anti join.
@@ -1084,6 +1044,35 @@ fn marker_truth_test(
         }
         _ => None,
     }
+}
+
+/// Replace an unobservable MARK result with its relational representation.
+/// Returns `false` when nullable marker semantics cannot be represented by the
+/// available semi/anti join modes.
+fn lower_mark_join_for_truth(join: &mut ComparisonJoin, expected: bool) -> bool {
+    if expected {
+        join.join_type = JoinType::Semi;
+        join.mark_index = None;
+        join.mark_null_condition_start = None;
+        return true;
+    }
+    if join.mark_null_condition_start.is_none() {
+        // EXISTS is two-valued, so its negative truth test is an ordinary anti
+        // join.
+        join.join_type = JoinType::Anti;
+        join.mark_index = None;
+        return true;
+    }
+    if join.mark_null_condition_start == Some(0)
+        && join.conditions.len() == 1
+        && join.conditions[0].comparison == JoinComparisonType::Equal
+    {
+        // A scalar NOT IN marker is observable only through this top-level
+        // filter. Preserve UNKNOWN directly in a null-aware anti join.
+        join.make_null_aware_anti();
+        return true;
+    }
+    false
 }
 
 #[cfg(test)]

@@ -38,7 +38,7 @@ pub enum OrderByColumnType {
 }
 
 /// Options for reordering segments.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SegmentOrderOptions {
     /// The index of the column to order by.
     pub column_idx: usize,

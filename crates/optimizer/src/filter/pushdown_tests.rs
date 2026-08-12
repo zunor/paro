@@ -635,7 +635,7 @@ fn negative_marker_with_null_safe_condition_remains_mark_join() {
 }
 
 #[test]
-fn compound_mark_filter_preserves_three_valued_mark_semantics() {
+fn marker_equals_true_lowers_mark_join_to_semi_join() {
     let ctx = BindContext::new();
     let mut join = ComparisonJoin::new(
         JoinType::Mark,
@@ -668,13 +668,11 @@ fn compound_mark_filter_preserves_three_valued_mark_semantics() {
 
     let result = FilterPushdown::new().rewrite(LogicalOperator::Filter(filter));
 
-    let LogicalOperator::Filter(filter) = result else {
-        panic!("compound marker predicate must remain above the MARK join");
+    let LogicalOperator::Join(Join::Comparison(join)) = result else {
+        panic!("marker truth test should become a SEMI join");
     };
-    let LogicalOperator::Join(Join::Comparison(join)) = filter.child.operator else {
-        panic!("expected MARK join below marker filter");
-    };
-    assert_eq!(join.join_type, JoinType::Mark);
+    assert_eq!(join.join_type, JoinType::Semi);
+    assert_eq!(join.mark_index, None);
 }
 
 #[test]

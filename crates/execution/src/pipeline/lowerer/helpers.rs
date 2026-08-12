@@ -70,7 +70,8 @@ pub(crate) fn hash_join_probe_transform(
         handle,
         join_type: spec.join_type,
         anti_join_mode: spec.anti_join_mode,
-        conditions: all_hash_join_conditions(spec),
+        key_conditions: spec.key_conditions.clone(),
+        residual_conditions: spec.residual_conditions.clone(),
         left_projection: spec.left_projection.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
@@ -78,10 +79,9 @@ pub(crate) fn hash_join_probe_transform(
     })
 }
 
-pub(crate) fn all_hash_join_conditions(spec: &HashJoinSpec) -> Box<[JoinCondition]> {
-    spec.key_conditions
+pub(crate) fn hash_join_build_residual_conditions(spec: &HashJoinSpec) -> Box<[JoinCondition]> {
+    spec.residual_conditions
         .iter()
-        .chain(spec.residual_conditions.iter())
         .chain(
             spec.reduction_cascade
                 .iter()

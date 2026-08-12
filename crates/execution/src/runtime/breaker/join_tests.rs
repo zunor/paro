@@ -181,6 +181,19 @@ fn join_build_mode_uses_atomic_discriminant_and_once_external_config() {
 }
 
 #[test]
+fn sealed_build_reclaim_cannot_be_reopened() {
+    let handle = JoinBuildHandle::new(metadata());
+    handle.enable_build_reclaim();
+    assert!(handle.build_reclaim_enabled());
+
+    handle.seal_build_reclaim();
+    assert!(!handle.build_reclaim_enabled());
+
+    handle.enable_build_reclaim();
+    assert!(!handle.build_reclaim_enabled());
+}
+
+#[test]
 fn join_build_finalize_publishes_exact_runtime_filter() {
     let allocator = test_allocator();
     let handle = JoinBuildHandle::new(metadata());
@@ -409,7 +422,7 @@ fn hash_join_local_build_spill_reclaimer_buffers_unmerged_build_rows() {
     assert_eq!(handle.spill.partition_counts().0, 2);
 
     handle
-        .spill_build_for_reclaim(usize::MAX, 16 * 1024 * 1024, memory)
+        .spill_build_for_external(usize::MAX, 16 * 1024 * 1024, memory)
         .expect("finish external hash join from local spill");
     assert!(handle.is_external());
     assert!(handle.completion.is_complete());

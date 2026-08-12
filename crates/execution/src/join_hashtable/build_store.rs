@@ -268,6 +268,7 @@ impl BuildRowLayout {
 struct BuildBlock {
     data: paro_common::memory::GrantBuffer,
     row_width: usize,
+    row_offset: usize,
     row_count: usize,
     max_rows: usize,
     used_bytes: usize,
@@ -421,6 +422,7 @@ impl BuildBlock {
         memory: MemoryAccountingContext,
         max_rows: usize,
         row_width: usize,
+        row_offset: usize,
     ) -> Result<Self> {
         let allocated_bytes = max_rows.saturating_mul(row_width);
         // Row slots have no implicit zero state. PreparedRowScatter initializes
@@ -432,6 +434,7 @@ impl BuildBlock {
         Ok(Self {
             data,
             row_width,
+            row_offset,
             row_count: 0,
             max_rows,
             used_bytes: 0,
@@ -509,6 +512,7 @@ impl BuildBlock {
 impl std::fmt::Debug for BuildBlock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BuildBlock")
+            .field("row_offset", &self.row_offset)
             .field("row_count", &self.row_count)
             .field("max_rows", &self.max_rows)
             .field("used_bytes", &self.used_bytes)
@@ -649,9 +653,17 @@ impl HashBuildStore {
             ));
         }
 
-        self.count = self.count.saturating_add(other.count);
+        let incoming_row_offset = self.count as usize;
+        self.count = self
+            .count
+            .checked_add(other.count)
+            .ok_or_else(|| paro_error::out_of_range("hash build row count exceeds u32"))?;
         let mut other_blocks = other.blocks;
-        for block in other_blocks.drain() {
+        for mut block in other_blocks.drain() {
+            block.row_offset = block
+                .row_offset
+                .checked_add(incoming_row_offset)
+                .ok_or_else(|| paro_error::out_of_range("hash build row offset overflow"))?;
             self.blocks.try_push(block)?;
         }
         self.heap_buffers.append(&mut other.heap_buffers);
@@ -930,7 +942,12 @@ impl HashBuildStore {
         if let Some(release) = value_release {
             self.value_releases.push(RetainedMemory(release));
         }
-        self.count = self.count.saturating_add(output_count as u32);
+        let appended = u32::try_from(output_count)
+            .map_err(|_| paro_error::out_of_range("hash build batch exceeds u32 rows"))?;
+        self.count = self
+            .count
+            .checked_add(appended)
+            .ok_or_else(|| paro_error::out_of_range("hash build row count exceeds u32"))?;
         Ok(output_count)
     }
 
@@ -941,6 +958,17 @@ impl HashBuildStore {
             .map(|block| !block.can_accept())
             .unwrap_or(true)
         {
+            let row_offset = self
+                .blocks
+                .last()
+                .map(|block| {
+                    block
+                        .row_offset
+                        .checked_add(block.row_count)
+                        .ok_or_else(|| paro_error::out_of_range("hash build row offset overflow"))
+                })
+                .transpose()?
+                .unwrap_or(0);
             let rows_per_block =
                 (DEFAULT_BLOCK_ALLOC_SIZE / self.layout.build_row_width().max(1)).max(1);
             let block = BuildBlock::new(
@@ -948,6 +976,7 @@ impl HashBuildStore {
                 self.memory.clone(),
                 rows_per_block,
                 self.layout.build_row_width(),
+                row_offset,
             )?;
             self.blocks.try_push(block)?;
         }
@@ -1134,10 +1163,9 @@ impl HashBuildStore {
 
     pub(super) fn block_row_offset(&self, block_idx: usize) -> usize {
         self.blocks
-            .iter()
-            .take(block_idx)
-            .map(BuildBlock::row_count)
-            .sum()
+            .get(block_idx)
+            .expect("build block index must be valid")
+            .row_offset
     }
 
     pub fn all_row_ptrs(&self) -> Vec<usize> {
@@ -1153,18 +1181,13 @@ impl HashBuildStore {
     /// through Rust lifetimes. Callers must keep this store alive and prevent
     /// mutation until every consumer has completed.
     pub(super) fn block_ranges(&self) -> Vec<BuildBlockRange> {
-        let mut row_offset = 0usize;
         self.blocks
             .iter()
-            .map(|block| {
-                let range = BuildBlockRange {
-                    base: block.data.as_ptr() as usize,
-                    row_width: block.row_width,
-                    row_count: block.row_count,
-                    row_offset,
-                };
-                row_offset += block.row_count;
-                range
+            .map(|block| BuildBlockRange {
+                base: block.data.as_ptr() as usize,
+                row_width: block.row_width,
+                row_count: block.row_count,
+                row_offset: block.row_offset,
             })
             .collect()
     }
@@ -1283,6 +1306,50 @@ mod tests {
         assert_eq!(row_ptrs.len(), 3);
         assert_eq!(row_ptrs[1] - row_ptrs[0], store.layout().build_row_width());
         assert_eq!(row_ptrs[2] - row_ptrs[1], store.layout().build_row_width());
+    }
+
+    #[test]
+    fn merged_blocks_rebase_their_global_row_offsets() {
+        fn one_row(value: i32) -> Chunk {
+            let mut key = paro_common::test_utils::test_vector(LogicalType::Integer);
+            key.set_i32(0, value);
+            key.set_count(1);
+            let mut payload = paro_common::test_utils::test_vector(LogicalType::Integer);
+            payload.set_i32(0, value * 10);
+            payload.set_count(1);
+            let mut hash = paro_common::test_utils::test_vector(LogicalType::UBigInt);
+            hash.set_u64(0, value as u64);
+            hash.set_count(1);
+            Chunk::from_arc_vectors(
+                vec![Arc::new(key), Arc::new(payload), Arc::new(hash)],
+                paro_common::test_utils::test_allocator(),
+            )
+        }
+
+        let mut left = create_test_store(
+            vec![LogicalType::Integer],
+            vec![LogicalType::Integer],
+            false,
+        );
+        let mut right = create_test_store(
+            vec![LogicalType::Integer],
+            vec![LogicalType::Integer],
+            false,
+        );
+        left.append_chunk(&one_row(1)).unwrap();
+        right.append_chunk(&one_row(2)).unwrap();
+        left.merge(right).unwrap();
+
+        assert_eq!(left.block_count(), 2);
+        assert_eq!(left.block_row_offset(0), 0);
+        assert_eq!(left.block_row_offset(1), 1);
+        assert_eq!(
+            left.block_ranges()
+                .iter()
+                .map(|range| range.row_offset())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
     }
 
     #[test]
