@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{InlineString, LogicalType, PhysicalType};
 use paro_common::vector::{SelectionVector, Vector, VectorOperations};
 use paro_function::scalar::executor::binary::BinaryExecutor;
 use paro_function::scalar::operators::comparison::{
@@ -67,6 +67,25 @@ define_fixed_width_comparison!(
     GreaterThanEqualsOperator
 );
 
+define_fixed_width_comparison!(compare_i8_eq, select_i8_eq, i8, EqualsOperator);
+define_fixed_width_comparison!(compare_i8_ne, select_i8_ne, i8, NotEqualsOperator);
+define_fixed_width_comparison!(compare_i8_lt, select_i8_lt, i8, LessThanOperator);
+define_fixed_width_comparison!(compare_i8_le, select_i8_le, i8, LessThanEqualsOperator);
+define_fixed_width_comparison!(compare_i8_gt, select_i8_gt, i8, GreaterThanOperator);
+define_fixed_width_comparison!(compare_i8_ge, select_i8_ge, i8, GreaterThanEqualsOperator);
+
+define_fixed_width_comparison!(compare_i16_eq, select_i16_eq, i16, EqualsOperator);
+define_fixed_width_comparison!(compare_i16_ne, select_i16_ne, i16, NotEqualsOperator);
+define_fixed_width_comparison!(compare_i16_lt, select_i16_lt, i16, LessThanOperator);
+define_fixed_width_comparison!(compare_i16_le, select_i16_le, i16, LessThanEqualsOperator);
+define_fixed_width_comparison!(compare_i16_gt, select_i16_gt, i16, GreaterThanOperator);
+define_fixed_width_comparison!(
+    compare_i16_ge,
+    select_i16_ge,
+    i16,
+    GreaterThanEqualsOperator
+);
+
 define_fixed_width_comparison!(compare_i64_eq, select_i64_eq, i64, EqualsOperator);
 define_fixed_width_comparison!(compare_i64_ne, select_i64_ne, i64, NotEqualsOperator);
 define_fixed_width_comparison!(compare_i64_lt, select_i64_lt, i64, LessThanOperator);
@@ -88,6 +107,37 @@ define_fixed_width_comparison!(
     compare_u64_ge,
     select_u64_ge,
     u64,
+    GreaterThanEqualsOperator
+);
+
+define_fixed_width_comparison!(compare_u8_eq, select_u8_eq, u8, EqualsOperator);
+define_fixed_width_comparison!(compare_u8_ne, select_u8_ne, u8, NotEqualsOperator);
+define_fixed_width_comparison!(compare_u8_lt, select_u8_lt, u8, LessThanOperator);
+define_fixed_width_comparison!(compare_u8_le, select_u8_le, u8, LessThanEqualsOperator);
+define_fixed_width_comparison!(compare_u8_gt, select_u8_gt, u8, GreaterThanOperator);
+define_fixed_width_comparison!(compare_u8_ge, select_u8_ge, u8, GreaterThanEqualsOperator);
+
+define_fixed_width_comparison!(compare_u16_eq, select_u16_eq, u16, EqualsOperator);
+define_fixed_width_comparison!(compare_u16_ne, select_u16_ne, u16, NotEqualsOperator);
+define_fixed_width_comparison!(compare_u16_lt, select_u16_lt, u16, LessThanOperator);
+define_fixed_width_comparison!(compare_u16_le, select_u16_le, u16, LessThanEqualsOperator);
+define_fixed_width_comparison!(compare_u16_gt, select_u16_gt, u16, GreaterThanOperator);
+define_fixed_width_comparison!(
+    compare_u16_ge,
+    select_u16_ge,
+    u16,
+    GreaterThanEqualsOperator
+);
+
+define_fixed_width_comparison!(compare_u32_eq, select_u32_eq, u32, EqualsOperator);
+define_fixed_width_comparison!(compare_u32_ne, select_u32_ne, u32, NotEqualsOperator);
+define_fixed_width_comparison!(compare_u32_lt, select_u32_lt, u32, LessThanOperator);
+define_fixed_width_comparison!(compare_u32_le, select_u32_le, u32, LessThanEqualsOperator);
+define_fixed_width_comparison!(compare_u32_gt, select_u32_gt, u32, GreaterThanOperator);
+define_fixed_width_comparison!(
+    compare_u32_ge,
+    select_u32_ge,
+    u32,
     GreaterThanEqualsOperator
 );
 
@@ -169,6 +219,23 @@ define_fixed_width_comparison!(
     compare_i128_ge,
     select_i128_ge,
     i128,
+    GreaterThanEqualsOperator
+);
+
+define_fixed_width_comparison!(compare_u128_eq, select_u128_eq, u128, EqualsOperator);
+define_fixed_width_comparison!(compare_u128_ne, select_u128_ne, u128, NotEqualsOperator);
+define_fixed_width_comparison!(compare_u128_lt, select_u128_lt, u128, LessThanOperator);
+define_fixed_width_comparison!(
+    compare_u128_le,
+    select_u128_le,
+    u128,
+    LessThanEqualsOperator
+);
+define_fixed_width_comparison!(compare_u128_gt, select_u128_gt, u128, GreaterThanOperator);
+define_fixed_width_comparison!(
+    compare_u128_ge,
+    select_u128_ge,
+    u128,
     GreaterThanEqualsOperator
 );
 
@@ -349,9 +416,15 @@ fn compare_not_distinct_from(
 
 #[derive(Clone, Copy)]
 enum ComparisonClass {
+    I8,
+    I16,
     I32,
     I64,
+    U8,
+    U16,
+    U32,
     U64,
+    U128,
     F32,
     F64,
     Bool,
@@ -362,20 +435,27 @@ enum ComparisonClass {
 }
 
 fn comparison_class(logical_type: &LogicalType) -> ComparisonClass {
-    match logical_type {
-        LogicalType::Integer | LogicalType::Date => ComparisonClass::I32,
-        LogicalType::BigInt
-        | LogicalType::Timestamp
-        | LogicalType::TimestampTz
-        | LogicalType::Time => ComparisonClass::I64,
-        LogicalType::UBigInt => ComparisonClass::U64,
-        LogicalType::Float => ComparisonClass::F32,
-        LogicalType::Double => ComparisonClass::F64,
-        LogicalType::Boolean => ComparisonClass::Bool,
-        LogicalType::Varchar => ComparisonClass::Varchar,
-        LogicalType::Interval | LogicalType::Uuid => ComparisonClass::I128,
-        LogicalType::Array(_, _) => ComparisonClass::Array,
-        _ => ComparisonClass::Generic,
+    match logical_type.physical_type() {
+        PhysicalType::Int8 => ComparisonClass::I8,
+        PhysicalType::Int16 => ComparisonClass::I16,
+        PhysicalType::Int32 => ComparisonClass::I32,
+        PhysicalType::Int64 => ComparisonClass::I64,
+        PhysicalType::Int128 => ComparisonClass::I128,
+        PhysicalType::UInt8 => ComparisonClass::U8,
+        PhysicalType::UInt16 => ComparisonClass::U16,
+        PhysicalType::UInt32 => ComparisonClass::U32,
+        PhysicalType::UInt64 => ComparisonClass::U64,
+        PhysicalType::UInt128 => ComparisonClass::U128,
+        PhysicalType::Float => ComparisonClass::F32,
+        PhysicalType::Double => ComparisonClass::F64,
+        PhysicalType::Bool => ComparisonClass::Bool,
+        PhysicalType::Varchar if matches!(logical_type, LogicalType::Varchar) => {
+            ComparisonClass::Varchar
+        }
+        PhysicalType::Array => ComparisonClass::Array,
+        PhysicalType::Varchar | PhysicalType::Bit | PhysicalType::List | PhysicalType::Struct => {
+            ComparisonClass::Generic
+        }
     }
 }
 
@@ -462,6 +542,36 @@ pub fn compile_comparison_dispatch(
             select: None,
         },
         _ => match comparison_class(logical_type) {
+            ComparisonClass::I8 => ordered_dispatch(
+                comparison_type,
+                compare_i8_eq,
+                select_i8_eq,
+                compare_i8_ne,
+                select_i8_ne,
+                compare_i8_lt,
+                select_i8_lt,
+                compare_i8_le,
+                select_i8_le,
+                compare_i8_gt,
+                select_i8_gt,
+                compare_i8_ge,
+                select_i8_ge,
+            ),
+            ComparisonClass::I16 => ordered_dispatch(
+                comparison_type,
+                compare_i16_eq,
+                select_i16_eq,
+                compare_i16_ne,
+                select_i16_ne,
+                compare_i16_lt,
+                select_i16_lt,
+                compare_i16_le,
+                select_i16_le,
+                compare_i16_gt,
+                select_i16_gt,
+                compare_i16_ge,
+                select_i16_ge,
+            ),
             ComparisonClass::I32 => ordered_dispatch(
                 comparison_type,
                 compare_i32_eq,
@@ -506,6 +616,66 @@ pub fn compile_comparison_dispatch(
                 select_u64_gt,
                 compare_u64_ge,
                 select_u64_ge,
+            ),
+            ComparisonClass::U8 => ordered_dispatch(
+                comparison_type,
+                compare_u8_eq,
+                select_u8_eq,
+                compare_u8_ne,
+                select_u8_ne,
+                compare_u8_lt,
+                select_u8_lt,
+                compare_u8_le,
+                select_u8_le,
+                compare_u8_gt,
+                select_u8_gt,
+                compare_u8_ge,
+                select_u8_ge,
+            ),
+            ComparisonClass::U16 => ordered_dispatch(
+                comparison_type,
+                compare_u16_eq,
+                select_u16_eq,
+                compare_u16_ne,
+                select_u16_ne,
+                compare_u16_lt,
+                select_u16_lt,
+                compare_u16_le,
+                select_u16_le,
+                compare_u16_gt,
+                select_u16_gt,
+                compare_u16_ge,
+                select_u16_ge,
+            ),
+            ComparisonClass::U32 => ordered_dispatch(
+                comparison_type,
+                compare_u32_eq,
+                select_u32_eq,
+                compare_u32_ne,
+                select_u32_ne,
+                compare_u32_lt,
+                select_u32_lt,
+                compare_u32_le,
+                select_u32_le,
+                compare_u32_gt,
+                select_u32_gt,
+                compare_u32_ge,
+                select_u32_ge,
+            ),
+            ComparisonClass::U128 => ordered_dispatch(
+                comparison_type,
+                compare_u128_eq,
+                select_u128_eq,
+                compare_u128_ne,
+                select_u128_ne,
+                compare_u128_lt,
+                select_u128_lt,
+                compare_u128_le,
+                select_u128_le,
+                compare_u128_gt,
+                select_u128_gt,
+                compare_u128_ge,
+                select_u128_ge,
             ),
             ComparisonClass::F32 => ordered_dispatch(
                 comparison_type,
@@ -592,5 +762,65 @@ fn dispatch_with_select(compare: ComparisonFn, select: ComparisonSelectFn) -> Co
     ComparisonDispatch {
         compare,
         select: Some(select),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::runtime_value::Value;
+    use paro_common::vector::{SelectionVector, Vector};
+
+    use super::*;
+
+    fn assert_decimal_greater_than(
+        precision: u8,
+        values: &[Option<i128>],
+        threshold: i128,
+        expected: &[u32],
+    ) {
+        let allocator = paro_common::test_utils::test_allocator();
+        let logical_type = LogicalType::Decimal {
+            precision,
+            scale: 2,
+        };
+        let mut left =
+            Vector::try_new(logical_type.clone(), values.len(), allocator.clone()).unwrap();
+        left.set_count(values.len());
+        for (row, value) in values.iter().enumerate() {
+            match value {
+                Some(value) => left.set_value(row, &Value::Decimal(*value, precision, 2)),
+                None => left.set_value(row, &Value::Null(logical_type.clone())),
+            }
+        }
+        let right = Vector::try_constant_from_value(
+            logical_type.clone(),
+            Value::Decimal(threshold, precision, 2),
+            values.len(),
+            allocator.clone(),
+        )
+        .unwrap();
+        let mut selection = SelectionVector::try_with_capacity(values.len(), allocator).unwrap();
+        let dispatch = compile_comparison_dispatch(&logical_type, ComparisonType::GreaterThan);
+
+        let selected =
+            dispatch.select.unwrap()(&left, &right, None, values.len(), &mut selection).unwrap();
+
+        assert_eq!(selected, expected.len());
+        assert_eq!(selection.as_slice(), expected);
+    }
+
+    #[test]
+    fn decimal_comparison_selection_uses_its_physical_width() {
+        assert_decimal_greater_than(15, &[Some(100), Some(250), None, Some(200)], 200, &[1]);
+        assert_decimal_greater_than(
+            38,
+            &[
+                Some(10_000_000_000_000_000_000),
+                Some(30_000_000_000_000_000_000),
+                None,
+            ],
+            20_000_000_000_000_000_000,
+            &[1],
+        );
     }
 }

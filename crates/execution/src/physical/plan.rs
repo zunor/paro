@@ -88,6 +88,26 @@ impl PhysicalPlan {
         children.as_slice(&self.children)
     }
 
+    /// Return a structural one-row guarantee, independent of optimizer
+    /// cardinality estimates. Consumers may use this as a semantic proof.
+    pub fn guarantees_exactly_one_row(&self, id: PhysicalPlanNodeId) -> bool {
+        let node = self.node(id);
+        match &node.kind {
+            PhysicalNodeKind::Aggregate(spec) => {
+                spec.grouping_key_count == 0
+                    && spec.grouping_sets.len() <= 1
+                    && spec.having_filter.is_empty()
+            }
+            PhysicalNodeKind::Project(_) | PhysicalNodeKind::Sort(_) => {
+                let [child] = self.child_ids(&node.children) else {
+                    return false;
+                };
+                self.guarantees_exactly_one_row(*child)
+            }
+            _ => false,
+        }
+    }
+
     pub fn format_tree(&self) -> String {
         let mut out = String::new();
         self.format_node(self.root, 0, &mut out);

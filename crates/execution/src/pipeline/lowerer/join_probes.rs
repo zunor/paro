@@ -154,17 +154,38 @@ impl<'a> PipelineLowerer<'a> {
 
         let (source, mut transforms, pending_builds) =
             self.collect_probe_roles(*left, pipelines, dependencies)?;
-        let source = self.attach_nlj_scalar_runtime_filter(source, &transforms, handle, spec);
+        let exact_single_row = nlj_scalar_filter_can_replace_probe(
+            self.plan,
+            *left,
+            *right,
+            spec,
+            &consumer_transforms,
+            &sink,
+        );
+        let (source, scalar_filter_replaces_probe) = self.attach_nlj_scalar_runtime_filter(
+            source,
+            &transforms,
+            handle,
+            spec,
+            exact_single_row,
+        );
         let source_handles = source.clone();
-        transforms.push(nlj_probe_transform(handle, spec));
+        if !scalar_filter_replaces_probe {
+            transforms.push(nlj_probe_transform(handle, spec));
+        }
         transforms.extend(consumer_transforms.iter().cloned());
 
+        let pipeline_output = if scalar_filter_replaces_probe {
+            self.plan.node(*left).output.clone()
+        } else {
+            output.clone()
+        };
         let pushed = self.push_pipeline(
             source,
             transforms,
             sink.clone(),
             branch_sharing,
-            output.clone(),
+            pipeline_output,
             pipelines,
             dependencies,
         )?;
@@ -760,9 +781,17 @@ impl<'a> PipelineLowerer<'a> {
 
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
-                let source =
-                    self.attach_nlj_scalar_runtime_filter(source, &transforms, handle, &spec);
-                transforms.push(nlj_probe_transform(handle, &spec));
+                let (source, scalar_filter_replaces_probe) = self.attach_nlj_scalar_runtime_filter(
+                    source,
+                    &transforms,
+                    handle,
+                    &spec,
+                    false,
+                );
+                debug_assert!(!scalar_filter_replaces_probe);
+                if !scalar_filter_replaces_probe {
+                    transforms.push(nlj_probe_transform(handle, &spec));
+                }
                 pending_builds.push(PendingProbeBuild { producer, handle });
                 Ok((source, transforms, pending_builds))
             }
@@ -846,6 +875,66 @@ impl<'a> PipelineLowerer<'a> {
             }
         }
     }
+}
+
+fn nlj_scalar_filter_can_replace_probe(
+    plan: &crate::physical::PhysicalPlan,
+    left: PhysicalPlanNodeId,
+    right: PhysicalPlanNodeId,
+    spec: &NestedLoopJoinSpec,
+    consumer_transforms: &[TransformSpec],
+    sink: &SinkSpec,
+) -> bool {
+    let left_output = &plan.node(left).output;
+    spec.join_type == JoinType::Inner
+        && spec.arbitrary_condition.is_none()
+        && spec.left_projection.len() == left_output.column_count()
+        && spec
+            .left_projection
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(output_idx, input_idx)| output_idx == input_idx)
+        && plan.guarantees_exactly_one_row(right)
+        && consumer_transforms.is_empty()
+        && sink_consumes_only_prefix(sink, left_output.column_count())
+}
+
+fn sink_consumes_only_prefix(sink: &SinkSpec, prefix_columns: usize) -> bool {
+    let SinkSpec::HashJoinBuild(spec) = sink else {
+        return false;
+    };
+    spec.build_projection
+        .iter()
+        .all(|column_idx| *column_idx < prefix_columns)
+        && spec
+            .key_conditions
+            .iter()
+            .all(|condition| expression_references_only_prefix(&condition.right, prefix_columns))
+        && spec
+            .residual_conditions
+            .iter()
+            .all(|condition| expression_references_only_prefix(&condition.right, prefix_columns))
+}
+
+fn expression_references_only_prefix(expression: &Expression, prefix_columns: usize) -> bool {
+    use paro_planner::expression::{ExpressionIterator, ExpressionVisitDecision};
+
+    let mut within_prefix = true;
+    ExpressionIterator::visit(expression, &mut |child| match child {
+        Expression::Reference(reference) if reference.index >= prefix_columns => {
+            within_prefix = false;
+            ExpressionVisitDecision::SkipChildren
+        }
+        // Column references must have been resolved before pipeline lowering.
+        // Treat an unresolved binding as an unsafe dependency, never as proof.
+        Expression::ColumnRef(_) | Expression::Subquery(_) => {
+            within_prefix = false;
+            ExpressionVisitDecision::SkipChildren
+        }
+        _ => ExpressionVisitDecision::Descend,
+    });
+    within_prefix
 }
 
 fn hash_join_requires_merge_barrier(transforms: &[TransformSpec]) -> bool {

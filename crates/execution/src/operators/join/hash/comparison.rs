@@ -89,30 +89,12 @@ impl From<ComparisonType> for FixedComparison {
 
 impl From<JoinComparisonType> for FixedComparison {
     fn from(comparison: JoinComparisonType) -> Self {
-        match comparison {
-            JoinComparisonType::Equal => Self::Equal,
-            JoinComparisonType::NotEqual => Self::NotEqual,
-            JoinComparisonType::LessThan => Self::LessThan,
-            JoinComparisonType::LessThanOrEqual => Self::LessThanOrEqual,
-            JoinComparisonType::GreaterThan => Self::GreaterThan,
-            JoinComparisonType::GreaterThanOrEqual => Self::GreaterThanOrEqual,
-            JoinComparisonType::DistinctFrom => Self::DistinctFrom,
-            JoinComparisonType::NotDistinctFrom => Self::NotDistinctFrom,
-        }
+        ComparisonType::from(comparison).into()
     }
 }
 
 pub(super) fn expression_comparison(comparison: JoinComparisonType) -> ComparisonType {
-    match comparison {
-        JoinComparisonType::Equal => ComparisonType::Equal,
-        JoinComparisonType::NotEqual => ComparisonType::NotEqual,
-        JoinComparisonType::LessThan => ComparisonType::LessThan,
-        JoinComparisonType::LessThanOrEqual => ComparisonType::LessThanOrEqual,
-        JoinComparisonType::GreaterThan => ComparisonType::GreaterThan,
-        JoinComparisonType::GreaterThanOrEqual => ComparisonType::GreaterThanOrEqual,
-        JoinComparisonType::DistinctFrom => ComparisonType::DistinctFrom,
-        JoinComparisonType::NotDistinctFrom => ComparisonType::NotDistinctFrom,
-    }
+    comparison.into()
 }
 
 #[inline]

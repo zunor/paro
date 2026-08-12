@@ -18,16 +18,19 @@
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{Vector, VectorSelection, VECTOR_SIZE};
+use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{
     JoinComparisonType, JoinCondition, JoinType, MarkJoinSemantics,
 };
 
+use crate::expression_executor::compile_comparison_dispatch;
 use crate::expression_executor::executor::ExpressionExecutor;
 
 use crate::operators::output::ensure_source_output;
@@ -167,6 +170,12 @@ impl NestedLoopJoinProbeTransformExec {
             });
         }
 
+        if let Some(poll) =
+            self.try_singleton_inner_join(ctx, input, build_chunks.as_ref(), local, output)?
+        {
+            return Ok(poll);
+        }
+
         if !local.probe_in_progress {
             global.ensure_found_bits(build_chunks.as_ref());
             local.probe_row = 0;
@@ -217,6 +226,112 @@ impl NestedLoopJoinProbeTransformExec {
             self.join_type,
             JoinType::Right | JoinType::Outer | JoinType::RightSemi | JoinType::RightAnti
         )
+    }
+
+    /// Execute a one-row comparison build as a vector predicate plus a
+    /// broadcast projection. Scalar subqueries commonly produce this shape;
+    /// treating them as a general pair-at-a-time nested loop needlessly boxes
+    /// every probe value and copies every surviving row.
+    fn try_singleton_inner_join(
+        &self,
+        ctx: &mut OperatorCallContext,
+        input: &Chunk,
+        build_chunks: &[Chunk],
+        local: &mut NestedLoopJoinProbeTransformLocal,
+        output: &mut Chunk,
+    ) -> Result<Option<TransformPoll>> {
+        if self.join_type != JoinType::Inner
+            || self.arbitrary_condition.is_some()
+            || self.conditions.len() != 1
+            || local.probe_in_progress
+        {
+            return Ok(None);
+        }
+        let mut singleton = None;
+        for (chunk_idx, chunk) in build_chunks.iter().enumerate() {
+            for row_idx in 0..chunk.size() {
+                if singleton.replace((chunk_idx, row_idx)).is_some() {
+                    return Ok(None);
+                }
+            }
+        }
+        let Some((build_chunk_idx, build_row)) = singleton else {
+            return Ok(None);
+        };
+
+        self.evaluate_left_conditions(ctx, input, local)?;
+        self.ensure_right_condition_cache(
+            build_chunk_idx,
+            &build_chunks[build_chunk_idx],
+            ctx,
+            local,
+        )?;
+        let left = local.left_condition_results.first().ok_or_else(|| {
+            paro_error::internal("singleton NLJ left condition was not evaluated")
+        })?;
+        let right = local.right_condition_cache.first().ok_or_else(|| {
+            paro_error::internal("singleton NLJ right condition was not evaluated")
+        })?;
+        if left.logical_type() != right.logical_type() {
+            return Ok(None);
+        }
+        let dispatch =
+            compile_comparison_dispatch(left.logical_type(), self.conditions[0].comparison.into());
+        let Some(select) = dispatch.select else {
+            return Ok(None);
+        };
+        let right_constant = Vector::try_constant_from_value(
+            right.logical_type().clone(),
+            right.get_value(build_row),
+            input.size(),
+            input.allocator().clone(),
+        )?;
+        let mut scratch = ctx.scratch.expr();
+        let selection =
+            scratch.selection(input.size(), ctx.query.allocator(MemoryTag::BaseTable))?;
+        let selected_count = select(left, &right_constant, None, input.size(), selection)?;
+        if selected_count == 0 {
+            output.try_set_cardinality(0)?;
+            return Ok(Some(TransformPoll::NeedMoreInput));
+        }
+
+        let selected = VectorSelection::from(&*selection);
+        let mut columns =
+            Vec::with_capacity(self.left_projection.len() + self.right_projection.len());
+        for &column_idx in &self.left_projection {
+            let column = input.data.get(column_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "singleton NLJ left projection is out of bounds: column={column_idx} count={}",
+                    input.column_count()
+                ))
+            })?;
+            columns.push(Arc::new(Vector::try_gather_ref(
+                Arc::clone(column),
+                selected.clone(),
+            )?));
+        }
+        let build = &build_chunks[build_chunk_idx];
+        for &column_idx in &self.right_projection {
+            let column = build.data.get(column_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "singleton NLJ right projection is out of bounds: column={column_idx} count={}",
+                    build.column_count()
+                ))
+            })?;
+            columns.push(Arc::new(Vector::try_constant_from_value(
+                column.logical_type().clone(),
+                column.get_value(build_row),
+                selected_count,
+                input.allocator().clone(),
+            )?));
+        }
+        *output = Chunk::try_from_arc_vectors_with_cardinality(
+            columns,
+            selected_count,
+            input.allocator().clone(),
+        )?;
+        debug_assert_eq!(output.types(), self.output_types.as_ref());
+        Ok(Some(TransformPoll::Output))
     }
 
     fn evaluate_left_conditions(

@@ -602,10 +602,7 @@ pub struct RowsetDynamicRuntimeFilterSpec {
     pub probe_column_id: u32,
 }
 
-/// Conservative scan pruning derived from a materialized single-row join
-/// input. The nested-loop predicate remains in the pipeline as the semantic
-/// authority; this descriptor only moves an outward-rounded bound into the
-/// source after its producer has sealed the scalar value.
+/// Scan predicate derived from a materialized scalar join input.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowsetDynamicScalarFilterSpec {
     pub handle: BreakerHandleId,
@@ -613,6 +610,18 @@ pub struct RowsetDynamicScalarFilterSpec {
     pub probe_column_id: u32,
     pub probe_type: LogicalType,
     pub comparison: JoinComparisonType,
+    pub semantics: ScalarFilterSemantics,
+}
+
+/// Whether a scalar scan predicate is merely a pruning hint or is the
+/// relational predicate's semantic authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFilterSemantics {
+    /// The bound is rounded outward and the nested-loop join rechecks it.
+    Conservative,
+    /// The build subtree is structurally guaranteed to emit one row and the
+    /// storage predicate exactly implements the join comparison.
+    ExactSingleRow,
 }
 
 #[derive(Debug, Clone)]

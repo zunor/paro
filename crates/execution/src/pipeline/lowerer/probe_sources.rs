@@ -52,12 +52,13 @@ impl PipelineLowerer<'_> {
         transforms: &[TransformSpec],
         handle: BreakerHandleId,
         spec: &NestedLoopJoinSpec,
-    ) -> SourceSpec {
+        exact_single_row: bool,
+    ) -> (SourceSpec, bool) {
         if spec.join_type != JoinType::Inner {
-            return source;
+            return (source, false);
         }
         let [condition] = spec.conditions.as_ref() else {
-            return source;
+            return (source, false);
         };
         if !matches!(
             condition.comparison,
@@ -67,40 +68,54 @@ impl PipelineLowerer<'_> {
                 | JoinComparisonType::GreaterThan
                 | JoinComparisonType::GreaterThanOrEqual
         ) {
-            return source;
+            return (source, false);
         }
         let Some((reference_index, probe_type)) = exact_monotonic_probe_reference(&condition.left)
         else {
-            return source;
+            return (source, false);
         };
         let Expression::Reference(build_reference) = &condition.right else {
-            return source;
+            return (source, false);
         };
         if spec.right_output_types.get(build_reference.index) != Some(&build_reference.return_type)
         {
-            return source;
+            return (source, false);
         }
         let Some(source_index) = trace_probe_reference_to_source(reference_index, transforms)
         else {
-            return source;
+            return (source, false);
         };
         let SourceSpec::Rowset(rowset) = &mut source else {
-            return source;
+            return (source, false);
         };
         let Some(probe_column_id) = rowset.scan.column_projection.column_id(source_index) else {
-            return source;
+            return (source, false);
         };
         let Ok(probe_column_id) = u32::try_from(probe_column_id) else {
-            return source;
+            return (source, false);
         };
+        let semantic_exact = exact_single_row
+            && exact_decimal_scalar_filter(&probe_type, &build_reference.return_type);
+        if semantic_exact {
+            // The dynamic comparison is the relational predicate itself, not
+            // a best-effort runtime hint. Include it in the access strategy:
+            // predicate columns are read first and non-predicate payload is
+            // gathered only for surviving rows.
+            rowset.scan.late_materialize = true;
+        }
         rowset.add_dynamic_scalar_filter(RowsetDynamicScalarFilterSpec {
             handle,
             build_column_index: build_reference.index,
             probe_column_id,
             probe_type,
             comparison: condition.comparison,
+            semantics: if semantic_exact {
+                ScalarFilterSemantics::ExactSingleRow
+            } else {
+                ScalarFilterSemantics::Conservative
+            },
         });
-        source
+        (source, semantic_exact)
     }
 
     pub(crate) fn collect_probe_roles_source_fallback(
@@ -175,6 +190,22 @@ fn exact_decimal_widening(source: &LogicalType, target: &LogicalType) -> bool {
         return false;
     };
     *target_scale >= *source_scale && target_integer_digits >= source_integer_digits
+}
+
+fn exact_decimal_scalar_filter(probe: &LogicalType, build: &LogicalType) -> bool {
+    matches!(
+        (probe, build),
+        (
+            LogicalType::Decimal {
+                scale: probe_scale,
+                ..
+            },
+            LogicalType::Decimal {
+                scale: build_scale,
+                ..
+            }
+        ) if build_scale >= probe_scale
+    )
 }
 
 fn can_push_hash_join_runtime_filter(join_type: JoinType) -> bool {

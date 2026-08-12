@@ -19,3 +19,5 @@ pub mod physical {
     };
 }
 pub mod state;
+
+pub(crate) use comparison::compile_comparison_dispatch;

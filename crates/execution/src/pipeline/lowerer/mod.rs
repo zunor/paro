@@ -38,9 +38,9 @@ use super::graph::{
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
     RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetDynamicScalarFilterSpec,
-    RowsetSourceSpec, SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId,
-    SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec, SortRangeJoinProbeSpec,
-    SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
+    RowsetSourceSpec, ScalarFilterSemantics, SetOperationEmitSourceSpec, SetOperationInputSinkSpec,
+    SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
+    SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
     UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
     WindowBuildSinkSpec, WindowEmitSourceSpec,
 };

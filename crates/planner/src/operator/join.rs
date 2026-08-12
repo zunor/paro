@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 
 use super::{ColumnBinding, ProjectionMap};
-use crate::expression::Expression;
+use crate::expression::{ComparisonType, Expression};
 use crate::plan::LogicalPlan;
 use paro_common::types::LogicalType;
 
@@ -213,6 +213,21 @@ impl JoinComparisonType {
             JoinComparisonType::GreaterThanOrEqual => JoinComparisonType::LessThanOrEqual,
             JoinComparisonType::NotDistinctFrom => JoinComparisonType::NotDistinctFrom,
             JoinComparisonType::DistinctFrom => JoinComparisonType::DistinctFrom,
+        }
+    }
+}
+
+impl From<JoinComparisonType> for ComparisonType {
+    fn from(comparison: JoinComparisonType) -> Self {
+        match comparison {
+            JoinComparisonType::Equal => Self::Equal,
+            JoinComparisonType::NotEqual => Self::NotEqual,
+            JoinComparisonType::LessThan => Self::LessThan,
+            JoinComparisonType::LessThanOrEqual => Self::LessThanOrEqual,
+            JoinComparisonType::GreaterThan => Self::GreaterThan,
+            JoinComparisonType::GreaterThanOrEqual => Self::GreaterThanOrEqual,
+            JoinComparisonType::DistinctFrom => Self::DistinctFrom,
+            JoinComparisonType::NotDistinctFrom => Self::NotDistinctFrom,
         }
     }
 }

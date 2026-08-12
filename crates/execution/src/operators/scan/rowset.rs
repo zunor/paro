@@ -21,7 +21,7 @@ use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
 use crate::physical::specs::{RowsetColumnProjection, RowsetScanSpec};
-use crate::pipeline::graph::RowsetSourceSpec;
+use crate::pipeline::graph::{RowsetSourceSpec, ScalarFilterSemantics};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -71,6 +71,7 @@ pub struct RowsetDynamicScalarFilterDesc {
     pub probe_column_id: u32,
     pub probe_type: LogicalType,
     pub comparison: JoinComparisonType,
+    pub semantics: ScalarFilterSemantics,
 }
 
 impl RowsetSourceDesc {
@@ -111,6 +112,7 @@ impl RowsetSourceDesc {
                 probe_column_id: filter.probe_column_id,
                 probe_type: filter.probe_type.clone(),
                 comparison: filter.comparison,
+                semantics: filter.semantics,
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -270,12 +272,36 @@ impl RowsetSourceExec {
             let reader = MaterializedReader::new(handle, "rowset scalar runtime filter");
             let chunks = reader.sealed_chunks()?;
             match materialized_scalar_value(chunks, filter.build_column_index)? {
+                MaterializedScalarValue::Multiple
+                    if filter.semantics == ScalarFilterSemantics::ExactSingleRow =>
+                {
+                    return Err(paro_error::internal(
+                        "exact scalar runtime filter build emitted multiple rows",
+                    ));
+                }
                 MaterializedScalarValue::Multiple => {}
+                MaterializedScalarValue::Empty
+                    if filter.semantics == ScalarFilterSemantics::ExactSingleRow =>
+                {
+                    return Err(paro_error::internal(
+                        "exact scalar runtime filter build emitted no rows",
+                    ));
+                }
                 MaterializedScalarValue::Empty => {
                     predicates.push(empty_predicate(filter.probe_column_id))
                 }
                 MaterializedScalarValue::One(value) => {
-                    if let Some(predicate) = scalar_runtime_predicate(filter, value) {
+                    if filter.semantics == ScalarFilterSemantics::ExactSingleRow {
+                        match exact_scalar_runtime_predicate(filter, value)? {
+                            ExactScalarPredicate::AllRows => {}
+                            ExactScalarPredicate::NoRows => {
+                                predicates.push(empty_predicate(filter.probe_column_id));
+                            }
+                            ExactScalarPredicate::Predicate(predicate) => {
+                                predicates.push(predicate);
+                            }
+                        }
+                    } else if let Some(predicate) = scalar_runtime_predicate(filter, value) {
                         predicates.push(predicate);
                     }
                 }
@@ -313,6 +339,134 @@ fn empty_predicate(column_id: u32) -> PredicateTree {
     PredicateTree::leaf(Predicate::In {
         column_id,
         values: Vec::new(),
+    })
+}
+
+enum ExactScalarPredicate {
+    AllRows,
+    NoRows,
+    Predicate(PredicateTree),
+}
+
+/// Compile a widened decimal comparison onto the discrete probe domain.
+///
+/// Unlike the conservative pruning path below, this preserves strictness. A
+/// value at probe scale is an integer lattice point, so `probe > 12.345` is
+/// exactly `probe > 12.34`, while `probe >= 12.345` is exactly
+/// `probe >= 12.35`. Bounds outside the declared domain become constant true
+/// or false instead of disabling the filter.
+fn exact_scalar_runtime_predicate(
+    filter: &RowsetDynamicScalarFilterDesc,
+    value: Value,
+) -> Result<ExactScalarPredicate> {
+    if matches!(value, Value::Null(_)) {
+        return Ok(ExactScalarPredicate::NoRows);
+    }
+    let (LogicalType::Decimal { precision, scale }, Value::Decimal(value, _, value_scale)) =
+        (&filter.probe_type, value)
+    else {
+        return Err(paro_error::internal(
+            "exact scalar runtime filter received a non-decimal bound",
+        ));
+    };
+    if value_scale < *scale {
+        return Err(paro_error::internal(
+            "exact scalar runtime filter requires a non-narrowing decimal scale",
+        ));
+    }
+    let divisor = 10_i128
+        .checked_pow(u32::from(value_scale - *scale))
+        .ok_or_else(|| paro_error::internal("decimal scalar-filter scale exceeds i128"))?;
+    let truncated = value / divisor;
+    let remainder = value % divisor;
+    let floor = if remainder < 0 {
+        truncated
+            .checked_sub(1)
+            .ok_or_else(|| paro_error::internal("decimal scalar-filter floor overflow"))?
+    } else {
+        truncated
+    };
+    let ceil = if remainder > 0 {
+        truncated
+            .checked_add(1)
+            .ok_or_else(|| paro_error::internal("decimal scalar-filter ceil overflow"))?
+    } else {
+        truncated
+    };
+    let limit = 10_i128
+        .checked_pow(u32::from(*precision))
+        .ok_or_else(|| paro_error::internal("decimal probe precision exceeds i128"))?;
+    let minimum = -limit + 1;
+    let maximum = limit - 1;
+    let decimal = |bound| Value::Decimal(bound, *precision, *scale);
+    let leaf = |predicate| ExactScalarPredicate::Predicate(PredicateTree::leaf(predicate));
+
+    Ok(match filter.comparison {
+        JoinComparisonType::Equal => {
+            if remainder != 0 || truncated < minimum || truncated > maximum {
+                ExactScalarPredicate::NoRows
+            } else {
+                leaf(Predicate::Eq {
+                    column_id: filter.probe_column_id,
+                    value: decimal(truncated),
+                })
+            }
+        }
+        JoinComparisonType::GreaterThan => {
+            if floor < minimum {
+                ExactScalarPredicate::AllRows
+            } else if floor >= maximum {
+                ExactScalarPredicate::NoRows
+            } else {
+                leaf(Predicate::Gt {
+                    column_id: filter.probe_column_id,
+                    value: decimal(floor),
+                })
+            }
+        }
+        JoinComparisonType::GreaterThanOrEqual => {
+            if ceil <= minimum {
+                ExactScalarPredicate::AllRows
+            } else if ceil > maximum {
+                ExactScalarPredicate::NoRows
+            } else {
+                leaf(Predicate::Ge {
+                    column_id: filter.probe_column_id,
+                    value: decimal(ceil),
+                })
+            }
+        }
+        JoinComparisonType::LessThan => {
+            if ceil <= minimum {
+                ExactScalarPredicate::NoRows
+            } else if ceil > maximum {
+                ExactScalarPredicate::AllRows
+            } else {
+                leaf(Predicate::Lt {
+                    column_id: filter.probe_column_id,
+                    value: decimal(ceil),
+                })
+            }
+        }
+        JoinComparisonType::LessThanOrEqual => {
+            if floor < minimum {
+                ExactScalarPredicate::NoRows
+            } else if floor >= maximum {
+                ExactScalarPredicate::AllRows
+            } else {
+                leaf(Predicate::Le {
+                    column_id: filter.probe_column_id,
+                    value: decimal(floor),
+                })
+            }
+        }
+        JoinComparisonType::NotEqual
+        | JoinComparisonType::NotDistinctFrom
+        | JoinComparisonType::DistinctFrom => {
+            return Err(paro_error::internal(
+                "unsupported exact scalar runtime comparison",
+            ));
+        }
     })
 }
 
@@ -478,6 +632,7 @@ mod tests {
                 scale: 2,
             },
             comparison,
+            semantics: ScalarFilterSemantics::Conservative,
         }
     }
 
@@ -549,6 +704,45 @@ mod tests {
                 column_id: 7,
                 value: Value::Decimal(1_234, 5, 2),
             })
+        ));
+    }
+
+    #[test]
+    fn exact_decimal_scalar_filter_preserves_strict_lattice_boundaries() {
+        let filter = scalar_filter(JoinComparisonType::GreaterThan);
+        let predicate = exact_scalar_runtime_predicate(&filter, Value::Decimal(12_345, 8, 3))
+            .expect("exact decimal range should compile");
+
+        assert!(matches!(
+            predicate,
+            ExactScalarPredicate::Predicate(PredicateTree::Leaf(Predicate::Gt {
+                column_id: 7,
+                value: Value::Decimal(1_234, 5, 2),
+            }))
+        ));
+
+        let filter = scalar_filter(JoinComparisonType::GreaterThanOrEqual);
+        let predicate = exact_scalar_runtime_predicate(&filter, Value::Decimal(12_345, 8, 3))
+            .expect("exact decimal range should compile");
+        assert!(matches!(
+            predicate,
+            ExactScalarPredicate::Predicate(PredicateTree::Leaf(Predicate::Ge {
+                column_id: 7,
+                value: Value::Decimal(1_235, 5, 2),
+            }))
+        ));
+    }
+
+    #[test]
+    fn exact_decimal_scalar_filter_proves_out_of_domain_results() {
+        let filter = scalar_filter(JoinComparisonType::GreaterThan);
+        assert!(matches!(
+            exact_scalar_runtime_predicate(&filter, Value::Decimal(-1_000_000, 8, 2)).unwrap(),
+            ExactScalarPredicate::AllRows
+        ));
+        assert!(matches!(
+            exact_scalar_runtime_predicate(&filter, Value::Decimal(1_000_000, 8, 2)).unwrap(),
+            ExactScalarPredicate::NoRows
         ));
     }
 }
