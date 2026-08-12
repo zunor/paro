@@ -41,12 +41,14 @@ pub enum AggregateHashTable {
     Radix(RadixPartitionedAggregateHashTable),
 }
 
-/// Concurrent assembly target for independently built radix partitions.
+/// Concurrent ownership target for independently processed radix partitions.
 ///
 /// DISTINCT finalization routes source keys by their output-group hash. Each
 /// task therefore owns one complete output partition and can install its flat
 /// table directly instead of re-routing and copying every row through another
-/// radix table. The coordinator calls [`Self::finish`] after all installations.
+/// radix table. Ordinary aggregate merge also uses this container to hand a
+/// populated target partition to exactly one task. The coordinator calls
+/// [`Self::finish`] after all installations.
 #[derive(Debug)]
 pub(crate) struct ConcurrentRadixAggregateBuild {
     group_types: Vec<LogicalType>,
@@ -69,11 +71,6 @@ impl ConcurrentRadixAggregateBuild {
             ..
         } = table;
         validate_radix_partition_count(partition_bits, partitions.len())?;
-        if partitions.iter().any(|partition| partition.count() != 0) {
-            return Err(paro_error::internal(
-                "direct radix aggregate assembly requires empty target partitions",
-            ));
-        }
         let scan_output_types = partitions
             .first()
             .map(GroupedAggregateHashTable::scan_output_types)
@@ -97,8 +94,7 @@ impl ConcurrentRadixAggregateBuild {
         })
     }
 
-    /// Transfer exclusive ownership of one empty target partition to its
-    /// finalization task.
+    /// Transfer exclusive ownership of one target partition to its task.
     pub(crate) fn take_partition(&self, partition_idx: usize) -> Result<AggregateHashTable> {
         let partition = self.partitions.get(partition_idx).ok_or_else(|| {
             paro_error::internal(format!(
@@ -111,12 +107,6 @@ impl ConcurrentRadixAggregateBuild {
                 "radix aggregate partition was already claimed: index={partition_idx}"
             ))
         })?;
-        if table.count() != 0 {
-            return Err(paro_error::internal(format!(
-                "radix aggregate claimed a non-empty partition: index={partition_idx}, rows={}",
-                table.count()
-            )));
-        }
         Ok(AggregateHashTable::Flat(table))
     }
 
@@ -1550,8 +1540,8 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_radix_build_installs_owned_flat_partitions() {
-        let target = AggregateHashTable::new_radix(
+    fn concurrent_radix_build_merges_into_owned_populated_partitions() {
+        let mut target = AggregateHashTable::new_radix(
             vec![LogicalType::Integer],
             Vec::new(),
             Vec::new(),
@@ -1559,6 +1549,7 @@ mod tests {
             test_allocator(),
         )
         .expect("target table");
+        insert_integer_groups(&mut target, &[10, 11]);
 
         let build = Arc::new(
             ConcurrentRadixAggregateBuild::try_new(target).expect("concurrent build target"),
@@ -1587,7 +1578,7 @@ mod tests {
         });
 
         let mut table = build.finish().expect("finish concurrent build");
-        assert_eq!(drain_integer_group_table(&mut table), 4);
+        assert_eq!(drain_integer_group_table(&mut table), 6);
     }
 
     #[test]

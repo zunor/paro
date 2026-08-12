@@ -716,6 +716,10 @@ impl AggregateRuntimeState {
 #[derive(Debug)]
 pub struct HashAggregateRuntimeState {
     pub tables: Vec<AggregateHashTable>,
+    /// Completed local radix tables awaiting partition-parallel merge. Keeping
+    /// ownership here makes the merge phase visible to query memory reclaimers
+    /// without serializing every local through the pipeline coordinator.
+    pub(crate) pending_radix_merges: Vec<Vec<AggregateHashTable>>,
     pub(crate) distinct: DistinctAggregateState,
     pub(crate) spilled_payloads: Vec<AggregateSpilledPayload>,
     pub(crate) spilled_states: Vec<AggregateSpilledState>,
@@ -728,6 +732,11 @@ impl HashAggregateRuntimeState {
         for table in &mut self.tables {
             table.destroy()?;
         }
+        for local in &mut self.pending_radix_merges {
+            for table in local {
+                table.destroy()?;
+            }
+        }
         Ok(())
     }
 
@@ -735,6 +744,12 @@ impl HashAggregateRuntimeState {
         self.tables
             .iter()
             .map(AggregateHashTable::reclaimable_finalized_memory)
+            .chain(
+                self.pending_radix_merges
+                    .iter()
+                    .flatten()
+                    .map(AggregateHashTable::reclaimable_finalized_memory),
+            )
             .sum()
     }
 
@@ -742,6 +757,12 @@ impl HashAggregateRuntimeState {
         self.tables
             .iter()
             .map(AggregateHashTable::reclaimable_build_memory)
+            .chain(
+                self.pending_radix_merges
+                    .iter()
+                    .flatten()
+                    .map(AggregateHashTable::reclaimable_build_memory),
+            )
             .sum()
     }
 
@@ -751,6 +772,13 @@ impl HashAggregateRuntimeState {
         }
         let mut reclaimed = 0usize;
         for table in &mut self.tables {
+            if reclaimed >= target_bytes {
+                break;
+            }
+            reclaimed =
+                reclaimed.saturating_add(table.reclaim_build_memory(target_bytes - reclaimed));
+        }
+        for table in self.pending_radix_merges.iter_mut().flatten() {
             if reclaimed >= target_bytes {
                 break;
             }
@@ -984,6 +1012,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
                 distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
@@ -1240,6 +1269,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
                 distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
@@ -1314,6 +1344,7 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
                 distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),

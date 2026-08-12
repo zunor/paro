@@ -4,6 +4,7 @@
 pub(crate) mod build;
 mod distinct_finalize;
 pub(crate) mod emit;
+mod merge_finalize;
 
 #[cfg(test)]
 mod tests;

@@ -63,6 +63,7 @@ use crate::runtime::state::{
 };
 
 use super::distinct_finalize::prepare_parallel_distinct_finalize;
+use super::merge_finalize::prepare_parallel_radix_merge;
 
 const HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD: usize =
     paro_storage::buffer::DEFAULT_BLOCK_ALLOC_SIZE * 4;
@@ -91,6 +92,7 @@ impl HashAggregateBuildSinkExec {
             // adopted as the global table during merge, avoiding an O(groups)
             // copy into a separately allocated empty table.
             tables: Vec::new(),
+            pending_radix_merges: Vec::new(),
             distinct: DistinctAggregateState::new(aggregate_objects(&self.spec)?.len()),
             spilled_payloads: Vec::new(),
             spilled_states: Vec::new(),
@@ -400,7 +402,14 @@ impl HashAggregateBuildSinkExec {
                 )?;
                 return Ok(());
             }
-            merge_local_tables(&mut global.tables, &mut local_tables)?;
+            if local_tables.len() == 1 && local_tables[0].radix_partition_count().is_some() {
+                global
+                    .pending_radix_merges
+                    .push(std::mem::take(&mut *local_tables));
+            } else {
+                merge_pending_radix_tables(global)?;
+                merge_local_tables(&mut global.tables, &mut local_tables)?;
+            }
             if let Some(spill) = local.payload_spill.take() {
                 global.spilled_payloads.push(spill.seal());
             }
@@ -420,8 +429,24 @@ impl HashAggregateBuildSinkExec {
     pub(crate) fn prepare_finish(
         &self,
         _ctx: &mut OperatorFinishContext,
-        _global: &SinkGlobal,
+        global: &SinkGlobal,
     ) -> Result<PrepareFinishPoll> {
+        let SinkGlobal::HashAggregateBuild(global) = global else {
+            return Err(paro_error::internal(
+                "hash aggregate sink global state mismatch",
+            ));
+        };
+        global.handle.with_state_mut(|state| {
+            let AggregateRuntimeState::Hash(global) = state else {
+                return Err(paro_error::internal(
+                    "aggregate handle does not contain hash aggregate state",
+                ));
+            };
+            if !global.spilled_payloads.is_empty() || !global.spilled_states.is_empty() {
+                merge_pending_radix_tables(global)?;
+            }
+            Ok(())
+        })?;
         Ok(PrepareFinishPoll::Done)
     }
 
@@ -443,6 +468,9 @@ impl HashAggregateBuildSinkExec {
             };
             ensure_modifier_target_tables(ctx.query, &self.spec, global)
         })?;
+        if let Some(group) = prepare_parallel_radix_merge(global.handle.clone(), &self.spec)? {
+            return Ok(FinishWork::Parallel(group));
+        }
         Ok(
             match prepare_parallel_distinct_finalize(global.handle.clone(), &self.spec)? {
                 Some(group) => FinishWork::Parallel(group),
@@ -467,6 +495,12 @@ impl HashAggregateBuildSinkExec {
                     "aggregate handle does not contain hash aggregate state",
                 ));
             };
+            if !global.pending_radix_merges.is_empty() {
+                return Err(paro_error::internal(format!(
+                    "hash aggregate finish has {} unmerged radix locals",
+                    global.pending_radix_merges.len()
+                )));
+            }
             let aggregate_objects = aggregate_objects(&self.spec)?;
             let group_refs = group_payload_refs(&self.spec)?;
             let grouping_sets = normalized_grouping_sets(&self.spec)?
@@ -547,6 +581,13 @@ fn merge_local_tables(
     }
     for (global_table, local_table) in global.iter_mut().zip(local.iter_mut()) {
         global_table.combine(local_table)?;
+    }
+    Ok(())
+}
+
+fn merge_pending_radix_tables(state: &mut HashAggregateRuntimeState) -> Result<()> {
+    for mut local in std::mem::take(&mut state.pending_radix_merges) {
+        merge_local_tables(&mut state.tables, &mut local)?;
     }
     Ok(())
 }

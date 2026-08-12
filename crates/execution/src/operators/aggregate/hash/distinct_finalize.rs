@@ -34,17 +34,55 @@ struct DistinctFinalizePartition {
 }
 
 #[derive(Debug)]
-struct DistinctAggregatePartition {
+pub(super) struct DistinctAggregatePartition {
     aggregate_idx: usize,
     fragments: Vec<DistinctKeyTable>,
+}
+
+/// Immutable execution context shared by partition finalization tasks.
+///
+/// Keeping the DISTINCT work independent from its driver lets ordinary radix
+/// merge and DISTINCT finalization share one ownership pass over every target
+/// partition. A sink has one parallel finish stage, so composability here is a
+/// correctness-preserving performance contract rather than an optimization
+/// detail.
+#[derive(Debug)]
+pub(super) struct PartitionedDistinctFinalize {
+    spec: AggregateSpec,
+    aggregate_objects: Arc<[AggregateObject]>,
+    group_refs: Arc<[usize]>,
+}
+
+impl PartitionedDistinctFinalize {
+    pub(super) fn finalize_partition(
+        &self,
+        aggregates: Vec<DistinctAggregatePartition>,
+        ctx: &mut OperatorFinishContext,
+        target: &mut AggregateHashTable,
+    ) -> Result<()> {
+        let modifier_memory = query_hash_table_memory(ctx.query);
+        for aggregate in aggregates {
+            if aggregate.fragments.iter().all(|keys| keys.count() == 0) {
+                continue;
+            }
+            finalize_distinct_fragments_into_table(
+                &self.spec,
+                &self.aggregate_objects,
+                &self.group_refs,
+                aggregate.aggregate_idx,
+                &aggregate.fragments,
+                &modifier_memory,
+                target,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
 struct DistinctFinalizeDriver {
     handle: Arc<AggregateHandle>,
-    spec: AggregateSpec,
-    aggregate_objects: Arc<[AggregateObject]>,
-    group_refs: Arc<[usize]>,
+    distinct: PartitionedDistinctFinalize,
     result: ConcurrentRadixAggregateBuild,
     work: Mutex<Vec<Option<DistinctFinalizePartition>>>,
     next_task: AtomicUsize,
@@ -53,9 +91,7 @@ struct DistinctFinalizeDriver {
 impl DistinctFinalizeDriver {
     fn group(
         handle: Arc<AggregateHandle>,
-        spec: AggregateSpec,
-        aggregate_objects: Arc<[AggregateObject]>,
-        group_refs: Arc<[usize]>,
+        distinct: PartitionedDistinctFinalize,
         result: ConcurrentRadixAggregateBuild,
         work: Vec<DistinctFinalizePartition>,
     ) -> FinishTaskGroup {
@@ -64,9 +100,7 @@ impl DistinctFinalizeDriver {
             task_count,
             driver: Arc::new(Self {
                 handle,
-                spec,
-                aggregate_objects,
-                group_refs,
+                distinct,
                 result,
                 work: Mutex::new(work.into_iter().map(Some).collect()),
                 next_task: AtomicUsize::new(0),
@@ -138,23 +172,9 @@ impl ParallelFinishDriver for DistinctFinalizeDriver {
                 ))
             })?;
         let partition_idx = work.partition_idx;
-        let modifier_memory = query_hash_table_memory(ctx.query);
         let mut local = self.result.take_partition(partition_idx)?;
-        for aggregate in work.aggregates {
-            let aggregate_idx = aggregate.aggregate_idx;
-            if aggregate.fragments.iter().all(|keys| keys.count() == 0) {
-                continue;
-            }
-            finalize_distinct_fragments_into_table(
-                &self.spec,
-                &self.aggregate_objects,
-                &self.group_refs,
-                aggregate_idx,
-                &aggregate.fragments,
-                &modifier_memory,
-                &mut local,
-            )?;
-        }
+        self.distinct
+            .finalize_partition(work.aggregates, ctx, &mut local)?;
         self.install_partition(partition_idx, local)?;
         Ok(FinishTaskPoll::Done)
     }
@@ -168,18 +188,9 @@ pub(super) fn prepare_parallel_distinct_finalize(
     handle: Arc<AggregateHandle>,
     spec: &AggregateSpec,
 ) -> Result<Option<FinishTaskGroup>> {
-    let grouping_sets = normalized_grouping_sets(spec)?;
-    if grouping_sets.len() != 1
-        || grouping_sets[0].as_slice() != (0..spec.grouping_key_count).collect::<Vec<_>>()
-    {
-        return Ok(None);
-    }
-
-    let aggregate_objects: Arc<[AggregateObject]> =
-        Arc::from(aggregate_objects(spec)?.into_boxed_slice());
-    let group_refs: Arc<[usize]> = Arc::from(group_payload_refs(spec)?.into_boxed_slice());
     let mut work = Vec::new();
     let mut result_table = None;
+    let mut distinct = None;
     handle.with_state_mut(|state| {
         let AggregateRuntimeState::Hash(global) = state else {
             return Err(paro_error::internal(
@@ -192,40 +203,23 @@ pub(super) fn prepare_parallel_distinct_finalize(
         let Some(partition_count) = global.tables[0].radix_partition_count() else {
             return Ok(());
         };
-        let mut partitions = (0..partition_count)
-            .map(|partition_idx| DistinctFinalizePartition {
-                partition_idx,
-                aggregates: Vec::new(),
-            })
-            .collect::<Vec<_>>();
-        for (aggregate_idx, object) in aggregate_objects.iter().enumerate() {
-            if !object.is_distinct() || !object.order_bys.is_empty() {
-                continue;
-            }
-            let partition_groups = global.distinct.take_partition_groups(aggregate_idx)?;
-            if partition_groups.len() != partition_count {
-                return Err(paro_error::internal(format!(
-                    "DISTINCT/output radix partition count mismatch at aggregate {aggregate_idx}: distinct={}, output={partition_count}",
-                    partition_groups.len()
-                )));
-            }
-            for (partition_idx, fragments) in partition_groups.into_iter().enumerate() {
-                if fragments.iter().any(|table| table.count() > 0) {
-                    partitions[partition_idx]
-                        .aggregates
-                        .push(DistinctAggregatePartition {
-                        aggregate_idx,
-                        fragments,
-                    });
-                }
-            }
-        }
+        let Some((prepared, partitions)) =
+            take_partitioned_distinct_work(spec, global, partition_count)?
+        else {
+            return Ok(());
+        };
         work = partitions
             .into_iter()
-            .filter(|partition| !partition.aggregates.is_empty())
+            .enumerate()
+            .filter(|(_, aggregates)| !aggregates.is_empty())
+            .map(|(partition_idx, aggregates)| DistinctFinalizePartition {
+                partition_idx,
+                aggregates,
+            })
             .collect();
         if !work.is_empty() {
             result_table = global.tables.pop();
+            distinct = Some(prepared);
         }
         Ok(())
     })?;
@@ -237,10 +231,64 @@ pub(super) fn prepare_parallel_distinct_finalize(
     })?)?;
     Ok(Some(DistinctFinalizeDriver::group(
         handle,
-        spec.clone(),
-        aggregate_objects,
-        group_refs,
+        distinct.ok_or_else(|| {
+            paro_error::internal("parallel DISTINCT finalize lost its execution context")
+        })?,
         result,
         work,
+    )))
+}
+
+pub(super) fn take_partitioned_distinct_work(
+    spec: &AggregateSpec,
+    global: &mut crate::runtime::breaker::HashAggregateRuntimeState,
+    partition_count: usize,
+) -> Result<
+    Option<(
+        PartitionedDistinctFinalize,
+        Vec<Vec<DistinctAggregatePartition>>,
+    )>,
+> {
+    let grouping_sets = normalized_grouping_sets(spec)?;
+    if grouping_sets.len() != 1
+        || grouping_sets[0].as_slice() != (0..spec.grouping_key_count).collect::<Vec<_>>()
+    {
+        return Ok(None);
+    }
+
+    let aggregate_objects: Arc<[AggregateObject]> =
+        Arc::from(aggregate_objects(spec)?.into_boxed_slice());
+    let group_refs: Arc<[usize]> = Arc::from(group_payload_refs(spec)?.into_boxed_slice());
+    let mut partitions = (0..partition_count).map(|_| Vec::new()).collect::<Vec<_>>();
+    for (aggregate_idx, object) in aggregate_objects.iter().enumerate() {
+        if !object.is_distinct() || !object.order_bys.is_empty() {
+            continue;
+        }
+        let partition_groups = global.distinct.take_partition_groups(aggregate_idx)?;
+        if partition_groups.len() != partition_count {
+            return Err(paro_error::internal(format!(
+                "DISTINCT/output radix partition count mismatch at aggregate {aggregate_idx}: distinct={}, output={partition_count}",
+                partition_groups.len()
+            )));
+        }
+        for (partition_idx, fragments) in partition_groups.into_iter().enumerate() {
+            if fragments.iter().any(|table| table.count() > 0) {
+                partitions[partition_idx].push(DistinctAggregatePartition {
+                    aggregate_idx,
+                    fragments,
+                });
+            }
+        }
+    }
+    if partitions.iter().all(Vec::is_empty) {
+        return Ok(None);
+    }
+    Ok(Some((
+        PartitionedDistinctFinalize {
+            spec: spec.clone(),
+            aggregate_objects,
+            group_refs,
+        },
+        partitions,
     )))
 }

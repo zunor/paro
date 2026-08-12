@@ -195,6 +195,7 @@ fn mixed_spilled_payload_and_global_state_writes_bounded_output() {
 
     let mut state = HashAggregateRuntimeState {
         tables,
+        pending_radix_merges: Vec::new(),
         distinct: Default::default(),
         spilled_payloads: Vec::new(),
         spilled_states: Vec::new(),
@@ -322,6 +323,7 @@ fn mixed_spilled_payload_and_serialized_string_state_writes_bounded_output() {
 
     let mut state = HashAggregateRuntimeState {
         tables,
+        pending_radix_merges: Vec::new(),
         distinct: Default::default(),
         spilled_payloads: Vec::new(),
         spilled_states: Vec::new(),
