@@ -356,6 +356,30 @@ impl PageDecoderImpl {
         }
     }
 
+    fn supports_addressable_varlen(&self) -> bool {
+        matches!(
+            self,
+            PageDecoderImpl::BinaryPlain(_)
+                | PageDecoderImpl::Dictionary {
+                    value_width: None,
+                    ..
+                }
+        )
+    }
+
+    fn addressable_varlen_value_at(&self, idx: u32) -> Result<Option<Bytes>> {
+        match self {
+            PageDecoderImpl::BinaryPlain(decoder) => Ok(decoder.string_at(idx)),
+            PageDecoderImpl::Dictionary {
+                decoder,
+                value_width: None,
+            } => decoder.value_at(idx),
+            _ => Err(paro_error::internal(
+                "page decoder does not expose addressable variable-length values",
+            )),
+        }
+    }
+
     fn next_batch(&mut self, n: usize) -> Result<(usize, Bytes)> {
         match self {
             PageDecoderImpl::Plain(d) => d.next_batch(n),
@@ -455,8 +479,8 @@ pub struct ScalarColumnIterator<R: Read + Seek> {
     ordinal_index: OrdinalIndexReader,
     /// ZoneMap index (optional)
     zonemap_index: Option<ZoneMapIndexReader>,
-    /// Dictionary data (for dict encoding)
-    dict_data: Option<Bytes>,
+    /// Column-global dictionary whose offsets were validated by the reader.
+    dictionary: Option<BinaryPlainPageDecoder>,
     /// Current page index
     current_page_idx: Option<usize>,
     /// Current page decoder
@@ -484,7 +508,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         file_path: Option<PathBuf>,
         ordinal_index: OrdinalIndexReader,
         zonemap_index: Option<ZoneMapIndexReader>,
-        dict_data: Option<Bytes>,
+        dictionary: Option<BinaryPlainPageDecoder>,
     ) -> Result<Self> {
         Ok(ScalarColumnIterator {
             meta,
@@ -495,7 +519,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             file_path,
             ordinal_index,
             zonemap_index,
-            dict_data,
+            dictionary,
             current_page_idx: None,
             current_decoder: None,
             current_null_decoder: None,
@@ -704,8 +728,8 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 } else {
                     BinaryDictPageDecoder::new(data, expected_num_elements)
                 };
-                if let Some(ref dict_data) = self.dict_data {
-                    decoder.set_dict_decoder(dict_data.clone())?;
+                if let Some(dictionary) = &self.dictionary {
+                    decoder.set_prepared_dictionary(dictionary.clone())?;
                 }
                 PageDecoderImpl::Dictionary {
                     decoder,
@@ -845,7 +869,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         })
     }
 
-    fn plain_varlen_row_ranges(
+    fn plain_varlen_value_ranges(
         batch: &ColumnBatch,
         row_count: usize,
     ) -> Result<Vec<(usize, usize)>> {
@@ -880,7 +904,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                 return Err(paro_error::data_corrupted("varlen row extends past batch"));
             }
 
-            ranges.push((len_start, value_end));
+            ranges.push((len_end, value_end));
             offset = value_end;
         }
 
@@ -1033,7 +1057,12 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
             return Ok(None);
         }
 
-        let Some(dictionary) = self.dict_data.clone() else {
+        let Some(dictionary) = self
+            .dictionary
+            .as_ref()
+            .map(BinaryPlainPageDecoder::encoded_data)
+            .cloned()
+        else {
             return Ok(None);
         };
 
@@ -1133,7 +1162,12 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         rowids: &S,
         total_rows: usize,
     ) -> Result<Option<ColumnBatch>> {
-        let Some(dictionary) = self.dict_data.clone() else {
+        let Some(dictionary) = self
+            .dictionary
+            .as_ref()
+            .map(BinaryPlainPageDecoder::encoded_data)
+            .cloned()
+        else {
             return Ok(None);
         };
 
@@ -1254,12 +1288,100 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         }))
     }
 
+    /// Gather selected values directly from an addressable variable-length page.
+    ///
+    /// BinaryPlain persists an offset for every logical row. BinaryDict either
+    /// has the same plain layout or a fixed-width code stream. Sparse reads can
+    /// therefore address each requested value without decoding and copying the
+    /// entire span between the first and last selected row. Other encodings
+    /// return `false` and retain the sequential-span fallback below.
+    fn try_gather_addressable_varlen_page_run<S: RowIdSequence + ?Sized>(
+        &mut self,
+        rowids: &S,
+        row_run: RowIdPageRun,
+        values: &mut [Bytes],
+        nulls_out: &mut Option<Vec<u8>>,
+    ) -> Result<bool> {
+        let Some(decoder) = self.current_decoder.as_ref() else {
+            return Ok(false);
+        };
+        if !decoder.supports_addressable_varlen() {
+            return Ok(false);
+        }
+        let page_start = self.current_page_first_ordinal;
+        let page_end_offset = u32::try_from(row_run.span_end - page_start)
+            .map_err(|_| paro_error::data_corrupted("varlen page row offset overflow"))?;
+        if page_end_offset >= decoder.count() {
+            return Err(paro_error::data_corrupted(format!(
+                "varlen row span exceeds page: end={page_end_offset}, count={}",
+                decoder.count()
+            )));
+        }
+
+        // Null flags are compact and may use a different physical encoding.
+        // Advance that decoder over the page-local span once, then gather the
+        // requested flags alongside the directly-addressed values.
+        let span_nulls = if let Some(null_decoder) = &mut self.current_null_decoder {
+            let (count, nulls) = null_decoder.next_batch(row_run.span_len)?;
+            if count != row_run.span_len {
+                return Err(paro_error::data_corrupted(
+                    "Null map count mismatch with sparse varlen row lookup",
+                ));
+            }
+            Some(nulls)
+        } else {
+            None
+        };
+
+        let decoder = self
+            .current_decoder
+            .as_ref()
+            .expect("addressable varlen decoder was established above");
+        for run_idx in row_run.run_start..row_run.run_end {
+            let (output_idx, rowid) = rowids.pair(run_idx);
+            let page_row = u32::try_from(rowid - page_start)
+                .map_err(|_| paro_error::data_corrupted("varlen row offset overflow"))?;
+            let value = decoder
+                .addressable_varlen_value_at(page_row)?
+                .ok_or_else(|| {
+                    paro_error::out_of_range(format!("varlen row {page_row} out of range"))
+                })?;
+            let output = values.get_mut(output_idx).ok_or_else(|| {
+                paro_error::data_corrupted("varlen gather destination out of range")
+            })?;
+            *output = value;
+
+            if let Some(nulls) = nulls_out {
+                let span_idx = usize::try_from(rowid - row_run.span_start)
+                    .map_err(|_| paro_error::data_corrupted("varlen null offset overflow"))?;
+                nulls[output_idx] = span_nulls
+                    .as_ref()
+                    .and_then(|flags| flags.get(span_idx))
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+
+        let next_ordinal = row_run
+            .span_end
+            .checked_add(1)
+            .ok_or_else(|| paro_error::data_corrupted("varlen row ordinal overflow"))?;
+        let next_page_row = u32::try_from(next_ordinal - page_start)
+            .map_err(|_| paro_error::data_corrupted("varlen page cursor overflow"))?;
+        self.current_decoder
+            .as_mut()
+            .expect("addressable varlen decoder was established above")
+            .seek_to_position(next_page_row)?;
+        self.current_ordinal = next_ordinal;
+        Ok(true)
+    }
+
     fn read_plain_varlen_by_rowids<S: RowIdSequence + ?Sized>(
         &mut self,
         rowids: &S,
         total_rows: usize,
     ) -> Result<ColumnBatch> {
-        let mut values: Vec<Vec<u8>> = vec![Vec::new(); total_rows];
+        let mut values = vec![Bytes::new(); total_rows];
         let mut nulls_out: Option<Vec<u8>> = if self.column_may_have_nulls() {
             Some(vec![0u8; total_rows])
         } else {
@@ -1274,6 +1396,21 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
 
             self.seek_internal(row_run.span_start)?;
             page_run_seeks += 1;
+            if !self.ensure_page_loaded(DecodedPageAccess::SparseGather)? {
+                return Err(paro_error::out_of_range(format!(
+                    "rowid {} not found",
+                    row_run.span_start
+                )));
+            }
+            utf8_verified &= self.current_page_utf8_verified;
+            if self.try_gather_addressable_varlen_page_run(
+                rowids,
+                row_run,
+                &mut values,
+                &mut nulls_out,
+            )? {
+                continue;
+            }
             let (count, batch) = self.next_batch_within_current_page(row_run.span_len)?;
             utf8_verified &= batch.has_verified_utf8();
             if count != row_run.span_len {
@@ -1282,7 +1419,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                     row_run.span_end
                 )));
             }
-            let row_ranges = Self::plain_varlen_row_ranges(&batch, count)?;
+            let row_ranges = Self::plain_varlen_value_ranges(&batch, count)?;
 
             for run_idx in row_run.run_start..row_run.run_end {
                 let (orig_idx, rowid) = rowids.pair(run_idx);
@@ -1294,7 +1431,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                         row_idx
                     )));
                 };
-                values[orig_idx].extend_from_slice(&batch.data[row_start..row_end]);
+                values[orig_idx] = batch.data.slice(row_start..row_end);
                 if let Some(ref mut nulls) = nulls_out {
                     let is_null = batch
                         .nulls
@@ -1308,10 +1445,19 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         }
         storage_metrics().add_column_read_by_rowids_page_run_seeks(page_run_seeks);
 
-        let total_len: usize = values.iter().map(|v| v.len()).sum();
+        let prefix_bytes = total_rows
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("varlen gather prefix size overflow"))?;
+        let total_len = values
+            .iter()
+            .try_fold(prefix_bytes, |total, value| total.checked_add(value.len()))
+            .ok_or_else(|| paro_error::data_corrupted("varlen gather result size overflow"))?;
         let mut result = Vec::with_capacity(total_len);
-        for v in values {
-            result.extend_from_slice(&v);
+        for value in values {
+            let length = u32::try_from(value.len())
+                .map_err(|_| paro_error::data_corrupted("varlen value length exceeds u32"))?;
+            result.extend_from_slice(&length.to_le_bytes());
+            result.extend_from_slice(&value);
         }
         let batch = ColumnBatch::new(Bytes::from(result), nulls_out.map(Bytes::from))
             .with_page_run_seeks(page_run_seeks);

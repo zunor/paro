@@ -28,7 +28,7 @@
 //! ```
 
 use crate::buffer::Prefetcher;
-use crate::rowset::encoding::FieldType;
+use crate::rowset::encoding::{BinaryPlainPageDecoder, FieldType};
 use crate::rowset::page::{CompressionType, EncodingType, PagePointer, PageReadOptions};
 use crate::rowset::page_reader::PageReader;
 use bytes::{Buf, Bytes};
@@ -395,8 +395,12 @@ pub struct ColumnReader<R: Read + Seek> {
     ordinal_index: Option<OrdinalIndexReader>,
     /// ZoneMap index (loaded lazily)
     zonemap_index: Option<ZoneMapIndexReader>,
-    /// Dictionary data (loaded lazily, for dict encoding)
-    dict_data: Option<Bytes>,
+    /// Parsed dictionary page (loaded lazily, for dict encoding).
+    ///
+    /// The offset table is validated once here and the immutable decoder is
+    /// cloned into iterators. Data pages must not re-parse a column-global
+    /// dictionary for every page or scan morsel.
+    dictionary: Option<BinaryPlainPageDecoder>,
 }
 
 impl<R: Read + Seek> ColumnReader<R> {
@@ -418,7 +422,7 @@ impl<R: Read + Seek> ColumnReader<R> {
             file_path,
             ordinal_index: None,
             zonemap_index: None,
-            dict_data: None,
+            dictionary: None,
         })
     }
 
@@ -472,7 +476,7 @@ impl<R: Read + Seek> ColumnReader<R> {
 
     /// Load the dictionary page (for dictionary encoding).
     fn load_dictionary(&mut self) -> Result<()> {
-        if self.dict_data.is_some() {
+        if self.dictionary.is_some() {
             return Ok(());
         }
 
@@ -482,7 +486,9 @@ impl<R: Read + Seek> ColumnReader<R> {
                 .with_codec(self.opts.compression);
 
             let (body, _footer, _) = self.page_reader.read_page(&mut self.reader, &opts)?;
-            self.dict_data = Some(body);
+            let mut dictionary = BinaryPlainPageDecoder::new(body);
+            dictionary.init()?;
+            self.dictionary = Some(dictionary);
         }
 
         Ok(())
@@ -509,12 +515,6 @@ impl<R: Read + Seek> ColumnReader<R> {
         self.load_zonemap_index()?;
         Ok(self.zonemap_index.as_ref().unwrap())
     }
-
-    /// Get dictionary data (loads if needed).
-    pub fn dict_data(&mut self) -> Result<Option<&Bytes>> {
-        self.load_dictionary()?;
-        Ok(self.dict_data.as_ref())
-    }
 }
 
 impl<R: Read + Seek + Clone + Send + Sync + 'static> ColumnReader<R> {
@@ -527,7 +527,7 @@ impl<R: Read + Seek + Clone + Send + Sync + 'static> ColumnReader<R> {
 
         let ordinal_index = self.ordinal_index.clone().unwrap();
         let zonemap_index = self.zonemap_index.clone();
-        let dict_data = self.dict_data.clone();
+        let dictionary = self.dictionary.clone();
 
         let iter = ScalarColumnIterator::new(
             self.meta.clone(),
@@ -538,7 +538,7 @@ impl<R: Read + Seek + Clone + Send + Sync + 'static> ColumnReader<R> {
             self.file_path.clone(),
             ordinal_index,
             zonemap_index,
-            dict_data,
+            dictionary,
         )?;
 
         Ok(Box::new(iter))
@@ -552,7 +552,7 @@ impl<R: Read + Seek + Clone + Send + Sync + 'static> ColumnReader<R> {
             page_reader: self.page_reader,
             ordinal_index: self.ordinal_index,
             zonemap_index: self.zonemap_index,
-            dict_data: self.dict_data,
+            dictionary: self.dictionary,
             _phantom: std::marker::PhantomData,
         })
     }
@@ -565,7 +565,7 @@ pub struct SharedColumnReader<R: Read + Seek> {
     page_reader: PageReader,
     ordinal_index: Option<OrdinalIndexReader>,
     zonemap_index: Option<ZoneMapIndexReader>,
-    dict_data: Option<Bytes>,
+    dictionary: Option<BinaryPlainPageDecoder>,
     _phantom: std::marker::PhantomData<R>,
 }
 
@@ -591,7 +591,7 @@ impl<R: Read + Seek + Clone + Send + Sync + 'static> SharedColumnReader<R> {
             file_path,
             ordinal_index,
             self.zonemap_index.clone(),
-            self.dict_data.clone(),
+            self.dictionary.clone(),
         )?;
 
         Ok(Box::new(iter))

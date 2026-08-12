@@ -323,6 +323,19 @@ impl BinaryDictPageDecoder {
         Ok(())
     }
 
+    /// Install a dictionary whose offset table was already validated by the
+    /// owning column reader. Cloning the decoder only clones the immutable
+    /// page owner and parsed metadata; no dictionary-sized validation loop is
+    /// repeated per data page or scan morsel.
+    pub(crate) fn set_prepared_dictionary(
+        &mut self,
+        mut decoder: BinaryPlainPageDecoder,
+    ) -> Result<()> {
+        decoder.seek_to_position(0)?;
+        self.dict_decoder = Some(decoder);
+        Ok(())
+    }
+
     /// Initialize the decoder.
     pub fn init(&mut self) -> Result<()> {
         if self.parsed {
@@ -501,6 +514,43 @@ impl BinaryDictPageDecoder {
         self.encoding_type == EncodingMode::Dict
     }
 
+    /// Borrow one logical value without advancing the page cursor.
+    ///
+    /// Both physical modes are addressable: plain pages carry a validated
+    /// offset table, while dictionary pages expose a fixed-width code at each
+    /// row. Sparse column gathers use this API to avoid decoding the span
+    /// between selected rows.
+    pub(crate) fn value_at(&self, idx: u32) -> Result<Option<Bytes>> {
+        if !self.parsed || idx >= self.count() {
+            return Ok(None);
+        }
+        match self.encoding_type {
+            EncodingMode::Plain => Ok(self
+                .plain_decoder
+                .as_ref()
+                .and_then(|decoder| decoder.string_at(idx))),
+            EncodingMode::Dict => {
+                let decoder = self
+                    .code_decoder
+                    .as_ref()
+                    .ok_or_else(|| paro_common::error::internal("no code decoder"))?;
+                let mut encoded = [0_u8; std::mem::size_of::<u32>()];
+                decoder.copy_value_at(idx, &mut encoded)?;
+                let code = u32::from_le_bytes(encoded);
+                let dictionary = self
+                    .dict_decoder
+                    .as_ref()
+                    .ok_or_else(|| paro_common::error::internal("dictionary not set"))?;
+                dictionary.string_at(code).map(Some).ok_or_else(|| {
+                    paro_common::error::data_corrupted(format!(
+                        "dictionary code {code} exceeds dictionary size {}",
+                        dictionary.count()
+                    ))
+                })
+            }
+        }
+    }
+
     pub(crate) fn code_decoder_mut(&mut self) -> Option<&mut BitShufflePageDecoder> {
         self.code_decoder.as_mut()
     }
@@ -604,6 +654,50 @@ mod tests {
         assert_eq!(strings[0].as_ref(), b"c");
         assert_eq!(strings[1].as_ref(), b"d");
         assert_eq!(strings[2].as_ref(), b"e");
+    }
+
+    #[test]
+    fn addressable_values_preserve_dict_and_plain_page_cursors() {
+        let mut dict_builder = BinaryDictPageBuilder::new(256 * 1024);
+        for value in [b"zero".as_slice(), b"one", b"two", b"one"] {
+            assert!(dict_builder.add_slice(value));
+        }
+        let dictionary = dict_builder.get_dictionary_page().unwrap();
+        let dict_page = dict_builder.finish().unwrap();
+        let mut dict_decoder = BinaryDictPageDecoder::new(dict_page, 4);
+        dict_decoder.set_dict_decoder(dictionary).unwrap();
+        dict_decoder.init().unwrap();
+        dict_decoder.seek_to_position(1).unwrap();
+        assert_eq!(
+            dict_decoder.value_at(3).unwrap().as_deref(),
+            Some(b"one".as_slice())
+        );
+        assert_eq!(
+            dict_decoder.value_at(0).unwrap().as_deref(),
+            Some(b"zero".as_slice())
+        );
+        assert_eq!(dict_decoder.current_index(), 1);
+
+        let mut plain_builder = BinaryDictPageBuilder::new(256 * 1024).with_dict_page_size(13);
+        assert!(plain_builder.add_slice(b"alpha"));
+        assert!(!plain_builder.add_slice(b"bravo"));
+        let _ = plain_builder.finish().unwrap();
+        plain_builder.reset();
+        assert!(plain_builder.add_slice(b"bravo"));
+        assert!(plain_builder.add_slice(b"charlie"));
+        let plain_page = plain_builder.finish().unwrap();
+        let mut plain_decoder = BinaryDictPageDecoder::new(plain_page, 2);
+        plain_decoder.init().unwrap();
+        plain_decoder.seek_to_position(1).unwrap();
+        assert_eq!(
+            plain_decoder.value_at(0).unwrap().as_deref(),
+            Some(b"bravo".as_slice())
+        );
+        assert_eq!(
+            plain_decoder.value_at(1).unwrap().as_deref(),
+            Some(b"charlie".as_slice())
+        );
+        assert_eq!(plain_decoder.current_index(), 1);
     }
 
     #[test]

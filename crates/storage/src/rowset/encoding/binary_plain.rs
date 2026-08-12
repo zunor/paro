@@ -216,6 +216,7 @@ impl BinaryPlainPageBuilder {
 }
 
 /// Decoder for binary plain-encoded pages.
+#[derive(Clone)]
 pub struct BinaryPlainPageDecoder {
     /// Page data
     data: Bytes,
@@ -313,6 +314,15 @@ impl BinaryPlainPageDecoder {
             cur_index: 0,
             parsed: false,
         }
+    }
+
+    /// Immutable encoded page backing this validated decoder.
+    ///
+    /// A prepared dictionary decoder can be cloned into many data-page
+    /// decoders without revalidating the global offset table. Exposing the
+    /// owner also lets storage-aware batches retain dictionary encoding.
+    pub(crate) fn encoded_data(&self) -> &Bytes {
+        &self.data
     }
 
     /// Initialize the decoder.
