@@ -67,6 +67,14 @@ enum AggregateStateOwnership {
 /// read. Struct padding does not need to be initialized.
 pub type AggregateInitializeFn = unsafe fn(state: *mut u8);
 
+/// Factory for an aggregate that merges finalized partial results while
+/// preserving the original aggregate's return type and empty-input semantics.
+///
+/// This capability is explicit because SQL `SUM(result)` is not generally the
+/// same physical function: for example, `COUNT` returns BIGINT while
+/// `SUM(BIGINT)` returns HUGEINT.
+pub type AggregatePartialMergeFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
+
 /// Whether `combine` may destructively modify the source state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateCombineType {
@@ -350,6 +358,9 @@ pub struct AggregateFunction {
     /// Algebraic identity available to logical aggregate rewrites.
     pub algebra: Option<AggregateAlgebra>,
 
+    /// Optional aggregate over finalized partial results.
+    partial_merge: Option<AggregatePartialMergeFn>,
+
     state_ownership: AggregateStateOwnership,
 
     /// Size of the state in bytes.
@@ -405,6 +416,7 @@ impl fmt::Debug for AggregateFunction {
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
             .field("state_size", &self.state_size)
+            .field("has_partial_merge", &self.partial_merge.is_some())
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
             .finish()
@@ -429,6 +441,7 @@ impl AggregateFunction {
             arguments,
             return_type,
             algebra: None,
+            partial_merge: None,
             state_ownership: AggregateStateOwnership::Opaque,
             state_size,
             initialize,
@@ -455,6 +468,15 @@ impl AggregateFunction {
     pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
         self.algebra = Some(algebra);
         self
+    }
+
+    pub fn with_partial_merge(mut self, merge: AggregatePartialMergeFn) -> Self {
+        self.partial_merge = Some(merge);
+        self
+    }
+
+    pub fn partial_merge_function(&self) -> Option<AggregateFunction> {
+        (self.partial_merge?)(self)
     }
 
     /// Declare that an initialized state is a self-contained, trivially

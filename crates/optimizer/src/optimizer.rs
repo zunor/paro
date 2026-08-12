@@ -19,13 +19,14 @@ use crate::context::OptimizationContext;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
-    AggregateJoinSubsumptionPass, BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass,
-    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
-    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
-    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass,
-    ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
-    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, BuildProbeSidePass,
+    ColumnLifetimePass, CommonAggregatePass, CteFilterPusherPass, CteInliningPass,
+    DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass, FilterPullupPass,
+    FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
+    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
+    JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass, ReorderFilterPass,
+    SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass,
+    TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -188,6 +189,9 @@ impl Optimizer {
             Box::new(StatisticsGatheringPass),
             Box::new(ReorderFilterPass),
             Box::new(JoinEliminationPass),
+            // Bound a multiplicative nullable side to one row per equality key
+            // before join ordering costs the resulting graph.
+            Box::new(AggregateJoinPreaggregationPass),
             // Remove redundant detail scans while their semantic join edge is
             // still explicit, before cost-based ordering sees the graph.
             Box::new(AggregateJoinSubsumptionPass),

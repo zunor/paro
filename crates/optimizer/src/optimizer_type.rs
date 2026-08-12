@@ -29,6 +29,8 @@ pub enum OptimizerType {
     JoinOrder,
     /// Reuses grouped aggregates across redundant detail joins.
     AggregateJoinSubsumption,
+    /// Pre-aggregates multiplicative nullable join sides by their join key.
+    AggregateJoinPreaggregation,
     /// Eliminates redundant joins introduced by `DelimGet`.
     DelimJoinElimination,
     /// Rewrites UNNEST operations.
@@ -91,7 +93,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 39] = [
+    pub const ALL: [OptimizerType; 40] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -101,6 +103,7 @@ impl OptimizerType {
         OptimizerType::InClause,
         OptimizerType::JoinOrder,
         OptimizerType::AggregateJoinSubsumption,
+        OptimizerType::AggregateJoinPreaggregation,
         OptimizerType::DelimJoinElimination,
         OptimizerType::UnnestRewriter,
         OptimizerType::UnusedColumns,
@@ -148,6 +151,7 @@ impl OptimizerType {
             OptimizerType::InClause => "in_clause",
             OptimizerType::JoinOrder => "join_order",
             OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
+            OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
             OptimizerType::DelimJoinElimination => "delim_join_elimination",
             OptimizerType::UnnestRewriter => "unnest_rewriter",
             OptimizerType::UnusedColumns => "unused_columns",
@@ -202,6 +206,7 @@ impl FromStr for OptimizerType {
             "in_clause" => Ok(OptimizerType::InClause),
             "join_order" => Ok(OptimizerType::JoinOrder),
             "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
+            "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
             "delim_join_elimination" => Ok(OptimizerType::DelimJoinElimination),
             "unnest_rewriter" => Ok(OptimizerType::UnnestRewriter),
             "unused_columns" => Ok(OptimizerType::UnusedColumns),
