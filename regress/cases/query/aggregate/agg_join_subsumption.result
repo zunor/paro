@@ -49,15 +49,15 @@ WHERE p.order_key IN (
 GROUP BY p.order_key, p.label
 ORDER BY p.order_key;
 QUERY PLAN
-ORDER_BY  (rows=5)
+ORDER_BY  (rows=4)
   Sort Key: #0 ASC NULLS LAST
-  ->  PROJECTION  (rows=5)
+  ->  PROJECTION  (rows=4)
     Output: p.order_key, p.label, total_quantity
-    ->  AGGREGATE  (rows=5)
+    ->  AGGREGATE  (rows=4)
       Group Key: #0, #1
       Aggregates: sum(#2)
       Output: aggr_0, aggr_1, aggr_2
-      ->  HASH_JOIN  (rows=5)
+      ->  HASH_JOIN  (rows=4)
         Join Type: INNER
         Join Condition: #0 = #0
         ->  ROWSET_SCAN on public.agg_sub_preserved p  (rows=6)

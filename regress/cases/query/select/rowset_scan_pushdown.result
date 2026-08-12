@@ -148,7 +148,7 @@ PROJECTION  (rows=1)
     ->  HASH_JOIN  (rows=19)
       Join Type: INNER
       Join Condition: #0 = #0
-      Cardinality: [10, 19, 29]
+      Cardinality: [19, 19, 19]
       Output Schema: (none)
       ->  ROWSET_SCAN on public.rowset_pushdown_case c
         Columns: k

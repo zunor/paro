@@ -62,9 +62,9 @@ SET
 
 EXPLAIN SELECT * FROM spill_h_join_l l SEMI JOIN spill_h_join_r r ON l.id = r.id;
 QUERY PLAN
-PROJECTION  (rows=978)
+PROJECTION  (rows=1000)
   Output: l.id
-  ->  HASH_JOIN  (rows=978)
+  ->  HASH_JOIN  (rows=1000)
     Join Type: SEMI
     Join Condition: #0 = #0
     ->  ROWSET_SCAN on public.spill_h_join_l l  (rows=1000)
