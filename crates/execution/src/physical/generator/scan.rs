@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
-use paro_storage::index::{collect_predicate_columns, PredicateTree};
-use paro_storage::rowset::scan_cost::ScanAccessCostModel;
+use paro_storage::index::PredicateTree;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_get(
@@ -63,14 +61,6 @@ impl PhysicalPlanGenerator {
         }
 
         let column_projection = RowsetColumnProjection::new(column_ids);
-        let late_materialize = self.ctx.rowset_scan_pushdown
-            && should_late_materialize(
-                &predicate,
-                &column_projection,
-                &table,
-                estimated_selectivity,
-                self.ctx.scan_access_cost,
-            );
 
         Ok(RowsetScanSpec {
             table_index: get.table_index,
@@ -82,8 +72,11 @@ impl PhysicalPlanGenerator {
             emit_row_id,
             column_types: get.column_types.clone().into_boxed_slice(),
             table,
-            late_materialize,
-            scan_access_cost: self.ctx.scan_access_cost,
+            access_policy: RowsetScanAccessPolicy::new(
+                self.ctx.rowset_scan_pushdown,
+                estimated_selectivity,
+                self.ctx.scan_access_cost,
+            ),
             predicate,
             residual_predicates: residual_predicates.into_boxed_slice(),
             scan_order: self
@@ -263,7 +256,7 @@ impl PhysicalPlanGenerator {
 
         if residual.is_empty() {
             let projection = filter.projection_map.to_indices(filter.child.types().len());
-            project_rowset_scan_spec(&mut scan_spec, get, &projection, estimated_selectivity)?;
+            project_rowset_scan_spec(&mut scan_spec, get, &projection)?;
             return Ok((PhysicalNodeKind::RowsetScan(scan_spec), Vec::new()));
         }
 
@@ -590,7 +583,6 @@ fn project_rowset_scan_spec(
     spec: &mut RowsetScanSpec,
     get: &Get,
     projection_map: &[usize],
-    estimated_selectivity: Option<f64>,
 ) -> Result<()> {
     let table_column_count = spec.table.columns.len();
     let mut output_names = Vec::with_capacity(projection_map.len());
@@ -644,13 +636,6 @@ fn project_rowset_scan_spec(
     spec.column_projection = RowsetColumnProjection::new(column_ids);
     spec.column_types = column_types.into_boxed_slice();
     spec.emit_row_id = emit_row_id;
-    spec.late_materialize = should_late_materialize(
-        &spec.predicate,
-        &spec.column_projection,
-        &spec.table,
-        estimated_selectivity,
-        spec.scan_access_cost,
-    );
     Ok(())
 }
 
@@ -664,59 +649,4 @@ fn estimated_filter_selectivity(
         return Some(0.0);
     }
     Some((output as f64 / input as f64).clamp(0.0, 1.0))
-}
-
-/// Choose between eager sequential decoding and late row-id gathering.
-///
-/// The model compares bytes touched rather than query shapes. Sequential input
-/// costs one unit per byte, while sparse gathers carry an additional access
-/// penalty because every selected value performs row lookup and scatter work.
-/// Unknown selectivity deliberately favors late materialization, which bounds
-/// work for selective runtime filters without specializing for any workload.
-fn should_late_materialize(
-    predicate: &Option<PredicateTree>,
-    projection: &RowsetColumnProjection,
-    table: &TableCatalogEntry,
-    estimated_selectivity: Option<f64>,
-    access_cost: ScanAccessCostModel,
-) -> bool {
-    let Some(predicate) = predicate else {
-        return false;
-    };
-    let predicate_columns = collect_predicate_columns(predicate);
-    if predicate_columns.is_empty() {
-        return false;
-    }
-
-    let output_columns = projection.columns().iter().copied().collect::<HashSet<_>>();
-    let deferred_width = output_columns
-        .iter()
-        .filter(|column_id| !predicate_columns.contains(&(**column_id as u32)))
-        .filter_map(|column_id| table.columns.get(*column_id))
-        .map(|column| access_cost.estimated_width(&column.logical_type))
-        .sum::<usize>();
-    if deferred_width == 0 {
-        return false;
-    }
-
-    let predicate_width = predicate_columns
-        .iter()
-        .filter_map(|column_id| table.columns.get(*column_id as usize))
-        .map(|column| access_cost.estimated_width(&column.logical_type))
-        .sum::<usize>();
-    let predicate_column_ids = predicate_columns
-        .iter()
-        .map(|column_id| *column_id as usize)
-        .collect::<HashSet<_>>();
-    let eager_width = output_columns
-        .union(&predicate_column_ids)
-        .filter_map(|column_id| table.columns.get(*column_id))
-        .map(|column| access_cost.estimated_width(&column.logical_type))
-        .sum::<usize>();
-    access_cost.late_materialization_is_cheaper(
-        predicate_width,
-        deferred_width,
-        eager_width,
-        estimated_selectivity,
-    )
 }

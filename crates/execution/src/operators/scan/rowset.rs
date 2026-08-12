@@ -20,13 +20,14 @@ use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptio
 use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
-use crate::physical::specs::{RowsetColumnProjection, RowsetScanSpec};
+use crate::physical::specs::{RowsetColumnProjection, RowsetScanAccessPolicy, RowsetScanSpec};
 use crate::pipeline::graph::{RowsetSourceSpec, ScalarFilterSemantics};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
-    RowsetScanMorsel, RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal, SourceLocal,
+    PreparedRowsetPredicate, RowsetScanMorsel, RowsetSourceGlobal, RowsetSourceLocal, SourceGlobal,
+    SourceLocal,
 };
 
 /// Bounds for scheduler-aware scan morsels.
@@ -50,8 +51,7 @@ pub struct RowsetSourceDesc {
     pub emit_row_id: bool,
     pub returned_types: Box<[paro_common::types::LogicalType]>,
     pub predicate: Option<PredicateTree>,
-    pub late_materialize: bool,
-    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+    pub access_policy: RowsetScanAccessPolicy,
     pub scan_order: Option<SegmentOrderOptions>,
     pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterDesc]>,
     pub dynamic_scalar_filters: Box<[RowsetDynamicScalarFilterDesc]>,
@@ -83,8 +83,7 @@ impl RowsetSourceDesc {
             emit_row_id: spec.emit_row_id,
             returned_types: spec.returned_types.clone(),
             predicate: spec.predicate.clone(),
-            late_materialize: spec.late_materialize,
-            scan_access_cost: spec.scan_access_cost,
+            access_policy: spec.access_policy,
             scan_order: spec.scan_order.clone(),
             dynamic_runtime_filters: Vec::new().into_boxed_slice(),
             dynamic_scalar_filters: Vec::new().into_boxed_slice(),
@@ -136,7 +135,7 @@ impl RowsetSourceExec {
         let segment_options = SegmentOptions::default()
             .with_page_cache(ctx.query.session.page_cache().clone())
             .with_cache_decoded(true)
-            .with_scan_access_cost(self.desc.scan_access_cost);
+            .with_scan_access_cost(self.desc.access_policy.cost_model());
         let mut segments = storage_snapshot.segments_with_options(segment_options.clone())?;
         if let Some(overlay) = &overlay {
             let visible_rowsets = segments
@@ -156,12 +155,12 @@ impl RowsetSourceExec {
         let overlay_delete_vectors = overlay.as_ref().and_then(TxnOverlayReader::delete_vectors);
         let column_projection =
             ColumnProjection::new(self.desc.column_projection.columns().to_vec());
-        let predicate = self.effective_predicate(ctx)?;
-        let predicate_columns = predicate
-            .as_ref()
-            .map(collect_predicate_columns)
-            .unwrap_or_default()
-            .into_boxed_slice();
+        let prepared_predicate = prepare_effective_predicate(
+            self.effective_predicate(ctx)?,
+            self.desc.access_policy,
+            &self.desc.column_projection,
+            &self.desc.table.columns,
+        );
         let morsels = build_scan_morsels(&segments, ctx.query.session.number_of_threads().max(1));
 
         Ok(SourceGlobal::Rowset(Arc::new(RowsetSourceGlobal {
@@ -173,8 +172,7 @@ impl RowsetSourceExec {
             next_morsel: Default::default(),
             column_projection,
             overlay_delete_vectors,
-            predicate,
-            predicate_columns,
+            prepared_predicate,
         })))
     }
 
@@ -215,10 +213,10 @@ impl RowsetSourceExec {
                         .with_emit_row_id(self.desc.emit_row_id)
                         .with_segment_handle(Arc::clone(segment))
                         .with_segment_ordinal_range(morsel.start_ordinal, morsel.end_ordinal);
-                if let Some(predicate) = &global.predicate {
-                    params = params.with_predicates(predicate.clone());
-                    if self.desc.late_materialize && !global.predicate_columns.is_empty() {
-                        params = params.with_late_materialize(global.predicate_columns.to_vec());
+                if let Some(predicate) = &global.prepared_predicate {
+                    params = params.with_predicates(predicate.tree.clone());
+                    if predicate.materialization.is_late() && !predicate.columns.is_empty() {
+                        params = params.with_late_materialize(predicate.columns.to_vec());
                     }
                 }
                 if let Some(delete_vectors) = &global.overlay_delete_vectors {
@@ -247,8 +245,9 @@ impl RowsetSourceExec {
         }
     }
 
-    fn effective_predicate(&self, ctx: &PipelineInitContext<'_>) -> Result<Option<PredicateTree>> {
+    fn effective_predicate(&self, ctx: &PipelineInitContext<'_>) -> Result<EffectivePredicate> {
         let mut predicates = Vec::new();
+        let mut has_runtime_conjunct = false;
         if let Some(predicate) = &self.desc.predicate {
             predicates.push(predicate.clone());
         }
@@ -265,6 +264,7 @@ impl RowsetSourceExec {
                 handle.runtime_filter_predicate(filter.build_key_index, filter.probe_column_id)
             {
                 predicates.push(predicate);
+                has_runtime_conjunct = true;
             }
         }
         for filter in &self.desc.dynamic_scalar_filters {
@@ -288,7 +288,8 @@ impl RowsetSourceExec {
                     ));
                 }
                 MaterializedScalarValue::Empty => {
-                    predicates.push(empty_predicate(filter.probe_column_id))
+                    predicates.push(empty_predicate(filter.probe_column_id));
+                    has_runtime_conjunct = true;
                 }
                 MaterializedScalarValue::One(value) => {
                     if filter.semantics == ScalarFilterSemantics::ExactSingleRow {
@@ -296,19 +297,56 @@ impl RowsetSourceExec {
                             ExactScalarPredicate::AllRows => {}
                             ExactScalarPredicate::NoRows => {
                                 predicates.push(empty_predicate(filter.probe_column_id));
+                                has_runtime_conjunct = true;
                             }
                             ExactScalarPredicate::Predicate(predicate) => {
                                 predicates.push(predicate);
+                                has_runtime_conjunct = true;
                             }
                         }
                     } else if let Some(predicate) = scalar_runtime_predicate(filter, value) {
                         predicates.push(predicate);
+                        has_runtime_conjunct = true;
                     }
                 }
             }
         }
-        Ok(combine_predicates(predicates))
+        Ok(EffectivePredicate {
+            tree: combine_predicates(predicates),
+            has_runtime_conjunct,
+        })
     }
+}
+
+struct EffectivePredicate {
+    tree: Option<PredicateTree>,
+    has_runtime_conjunct: bool,
+}
+
+fn prepare_effective_predicate(
+    effective: EffectivePredicate,
+    access_policy: RowsetScanAccessPolicy,
+    projection: &RowsetColumnProjection,
+    table_columns: &[paro_catalog::entry::ColumnDefinition],
+) -> Option<PreparedRowsetPredicate> {
+    let EffectivePredicate {
+        tree,
+        has_runtime_conjunct,
+    } = effective;
+    tree.map(|tree| {
+        let columns = collect_predicate_columns(&tree).into_boxed_slice();
+        let materialization = access_policy.initial_materialization(
+            &columns,
+            projection,
+            table_columns,
+            has_runtime_conjunct,
+        );
+        PreparedRowsetPredicate {
+            tree,
+            columns,
+            materialization,
+        }
+    })
 }
 
 enum MaterializedScalarValue {
@@ -621,6 +659,7 @@ fn rowset_morsel_rows(total_rows: u64, parallelism: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_catalog::entry::ColumnDefinition;
 
     fn scalar_filter(comparison: JoinComparisonType) -> RowsetDynamicScalarFilterDesc {
         RowsetDynamicScalarFilterDesc {
@@ -634,6 +673,84 @@ mod tests {
             comparison,
             semantics: ScalarFilterSemantics::Conservative,
         }
+    }
+
+    fn access_test_columns() -> Vec<ColumnDefinition> {
+        vec![
+            ColumnDefinition::new("key".to_string(), LogicalType::BigInt),
+            ColumnDefinition::new("payload".to_string(), LogicalType::Varchar),
+        ]
+    }
+
+    fn effective_key_predicate(has_runtime_conjunct: bool) -> EffectivePredicate {
+        EffectivePredicate {
+            tree: Some(PredicateTree::leaf(Predicate::Eq {
+                column_id: 0,
+                value: Value::BigInt(7),
+            })),
+            has_runtime_conjunct,
+        }
+    }
+
+    #[test]
+    fn runtime_predicate_rebinds_initial_scan_materialization() {
+        let policy = RowsetScanAccessPolicy::new(true, Some(0.9), Default::default());
+        let projection = RowsetColumnProjection::new(vec![0, 1]);
+        let columns = access_test_columns();
+
+        let planned = prepare_effective_predicate(
+            effective_key_predicate(false),
+            policy,
+            &projection,
+            &columns,
+        )
+        .expect("static predicate should be prepared");
+        assert!(!planned.materialization.is_late());
+
+        let rebound = prepare_effective_predicate(
+            effective_key_predicate(true),
+            policy,
+            &projection,
+            &columns,
+        )
+        .expect("runtime predicate should be prepared");
+        assert!(rebound.materialization.is_late());
+        assert_eq!(rebound.columns.as_ref(), &[0]);
+    }
+
+    #[test]
+    fn runtime_policy_requires_deferred_payload_and_an_enabled_gate() {
+        let columns = access_test_columns();
+        let enabled = RowsetScanAccessPolicy::new(true, None, Default::default());
+        let wide_projection = RowsetColumnProjection::new(vec![0, 1]);
+        let dynamic_only = prepare_effective_predicate(
+            effective_key_predicate(true),
+            enabled,
+            &wide_projection,
+            &columns,
+        )
+        .expect("runtime predicate should be prepared");
+        assert!(dynamic_only.materialization.is_late());
+
+        let key_only = RowsetColumnProjection::new(vec![0]);
+        let no_payload = prepare_effective_predicate(
+            effective_key_predicate(true),
+            enabled,
+            &key_only,
+            &columns,
+        )
+        .expect("runtime predicate should be prepared");
+        assert!(!no_payload.materialization.is_late());
+
+        let disabled = RowsetScanAccessPolicy::new(false, None, Default::default());
+        let gated = prepare_effective_predicate(
+            effective_key_predicate(true),
+            disabled,
+            &wide_projection,
+            &columns,
+        )
+        .expect("runtime predicate should be prepared");
+        assert!(!gated.materialization.is_late());
     }
 
     #[test]

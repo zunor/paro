@@ -61,6 +61,10 @@ impl ScanAccessCostModel {
         }
     }
 
+    pub fn unknown_selectivity(self) -> f64 {
+        self.unknown_selectivity
+    }
+
     pub fn late_materialization_is_cheaper(
         self,
         predicate_width: usize,

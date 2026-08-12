@@ -1191,8 +1191,11 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         table,
         predicate: None,
         residual_predicates: Vec::new().into_boxed_slice(),
-        late_materialize: false,
-        scan_access_cost: Default::default(),
+        access_policy: crate::physical::specs::RowsetScanAccessPolicy::new(
+            true,
+            None,
+            Default::default(),
+        ),
         scan_order: None,
         runtime_filter_expressions: Vec::new().into_boxed_slice(),
     }

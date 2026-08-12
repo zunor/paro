@@ -1,14 +1,16 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use paro_catalog::entry::TableCatalogEntry;
+use paro_catalog::entry::{ColumnDefinition, TableCatalogEntry};
 use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_function::table::{BoundTableFunctionData, TableFunction};
 use paro_planner::expression::Expression;
-use paro_storage::index::PredicateTree;
+use paro_storage::index::{collect_predicate_columns, ColumnId, PredicateTree};
+use paro_storage::rowset::scan_cost::ScanAccessCostModel;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
 
 #[derive(Debug, Clone)]
@@ -24,10 +26,134 @@ pub struct RowsetScanSpec {
     pub table: Arc<TableCatalogEntry>,
     pub predicate: Option<PredicateTree>,
     pub residual_predicates: Box<[Expression]>,
-    pub late_materialize: bool,
-    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+    pub access_policy: RowsetScanAccessPolicy,
     pub scan_order: Option<SegmentOrderOptions>,
     pub runtime_filter_expressions: Box<[Expression]>,
+}
+
+impl RowsetScanSpec {
+    /// Access mode selected from predicates that are known while planning.
+    ///
+    /// Pipeline lowering may attach build-dependent predicates later. Runtime
+    /// initialization resolves the policy again from that final predicate.
+    pub fn planned_materialization(&self) -> RowsetScanMaterialization {
+        let predicate_columns = self
+            .predicate
+            .as_ref()
+            .map(collect_predicate_columns)
+            .unwrap_or_default();
+        self.access_policy.initial_materialization(
+            &predicate_columns,
+            &self.column_projection,
+            &self.table.columns,
+            false,
+        )
+    }
+}
+
+/// Compiled access policy for a rowset scan.
+///
+/// The policy deliberately stores inputs rather than a materialization choice:
+/// hash-build and scalar bounds only exist when a pipeline starts, so the
+/// final choice belongs to execution binding rather than physical planning.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowsetScanAccessPolicy {
+    enabled: bool,
+    static_selectivity: Option<f64>,
+    cost_model: ScanAccessCostModel,
+}
+
+impl RowsetScanAccessPolicy {
+    pub fn new(
+        enabled: bool,
+        static_selectivity: Option<f64>,
+        cost_model: ScanAccessCostModel,
+    ) -> Self {
+        let static_selectivity = static_selectivity
+            .filter(|selectivity| selectivity.is_finite())
+            .map(|selectivity| selectivity.clamp(0.0, 1.0));
+        Self {
+            enabled,
+            static_selectivity,
+            cost_model,
+        }
+    }
+
+    pub fn cost_model(self) -> ScanAccessCostModel {
+        self.cost_model
+    }
+
+    /// Resolve the initial access mode from the effective execution predicate.
+    ///
+    /// Until runtime filters expose their own density estimates, the smaller
+    /// of the static estimate and the model's unknown-selectivity hint is used
+    /// as a stable starting heuristic for a conjunction. Segment readers then
+    /// adapt in both directions from observed batch density.
+    pub fn initial_materialization(
+        self,
+        predicate_columns: &[ColumnId],
+        projection: &RowsetColumnProjection,
+        table_columns: &[ColumnDefinition],
+        has_runtime_conjunct: bool,
+    ) -> RowsetScanMaterialization {
+        if !self.enabled || predicate_columns.is_empty() {
+            return RowsetScanMaterialization::Eager;
+        }
+
+        let predicate_column_ids = predicate_columns
+            .iter()
+            .map(|column_id| *column_id as usize)
+            .collect::<HashSet<_>>();
+        let output_columns = projection.columns().iter().copied().collect::<HashSet<_>>();
+        let deferred_width = output_columns
+            .iter()
+            .filter(|column_id| !predicate_column_ids.contains(column_id))
+            .filter_map(|column_id| table_columns.get(*column_id))
+            .map(|column| self.cost_model.estimated_width(&column.logical_type))
+            .sum::<usize>();
+        if deferred_width == 0 {
+            return RowsetScanMaterialization::Eager;
+        }
+
+        let predicate_width = predicate_column_ids
+            .iter()
+            .filter_map(|column_id| table_columns.get(*column_id))
+            .map(|column| self.cost_model.estimated_width(&column.logical_type))
+            .sum::<usize>();
+        let eager_width = output_columns
+            .union(&predicate_column_ids)
+            .filter_map(|column_id| table_columns.get(*column_id))
+            .map(|column| self.cost_model.estimated_width(&column.logical_type))
+            .sum::<usize>();
+        let selectivity = if has_runtime_conjunct {
+            self.static_selectivity
+                .map(|selectivity| selectivity.min(self.cost_model.unknown_selectivity()))
+        } else {
+            self.static_selectivity
+        };
+        if self.cost_model.late_materialization_is_cheaper(
+            predicate_width,
+            deferred_width,
+            eager_width,
+            selectivity,
+        ) {
+            RowsetScanMaterialization::Late
+        } else {
+            RowsetScanMaterialization::Eager
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsetScanMaterialization {
+    Eager,
+    Late,
+}
+
+impl RowsetScanMaterialization {
+    pub fn is_late(self) -> bool {
+        self == Self::Late
+    }
 }
 
 /// Exact physical base-table projection.

@@ -614,7 +614,7 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     };
     assert_eq!(spec.column_projection.columns(), [0].as_slice());
     assert!(spec.residual_predicates.is_empty());
-    assert!(!spec.late_materialize);
+    assert!(!spec.planned_materialization().is_late());
     let Some(PredicateTree::And(children)) = spec.predicate.as_ref() else {
         panic!("expected conjunctive storage predicate");
     };
@@ -648,7 +648,7 @@ fn zero_column_rowset_projection_never_enables_late_materialization() {
     };
 
     assert!(spec.column_projection.columns().is_empty());
-    assert!(!spec.late_materialize);
+    assert!(!spec.planned_materialization().is_late());
 }
 
 #[test]
@@ -676,7 +676,7 @@ fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
         let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
             panic!("fully pushed filter should lower to rowset scan");
         };
-        spec.late_materialize
+        spec.planned_materialization().is_late()
     };
 
     assert!(!build_scan(990_000));
@@ -713,7 +713,7 @@ fn arena_generator_can_disable_rowset_scan_pushdown() {
         panic!("filter child should be rowset scan");
     };
     assert!(scan.predicate.is_none());
-    assert!(!scan.late_materialize);
+    assert!(!scan.planned_materialization().is_late());
 }
 
 #[test]

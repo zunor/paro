@@ -96,13 +96,6 @@ impl PipelineLowerer<'_> {
         };
         let semantic_exact = exact_single_row
             && exact_decimal_scalar_filter(&probe_type, &build_reference.return_type);
-        if semantic_exact {
-            // The dynamic comparison is the relational predicate itself, not
-            // a best-effort runtime hint. Include it in the access strategy:
-            // predicate columns are read first and non-predicate payload is
-            // gathered only for surviving rows.
-            rowset.scan.late_materialize = true;
-        }
         rowset.add_dynamic_scalar_filter(RowsetDynamicScalarFilterSpec {
             handle,
             build_column_index: build_reference.index,

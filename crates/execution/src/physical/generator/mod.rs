@@ -50,9 +50,9 @@ use super::specs::{
     HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
     HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
     MaterializedCteSpec, NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind,
-    ProjectSpec, RecursiveCteSpec, RowsetColumnProjection, RowsetScanSpec, SearchSourceSpec,
-    SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec,
-    UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    ProjectSpec, RecursiveCteSpec, RowsetColumnProjection, RowsetScanAccessPolicy, RowsetScanSpec,
+    SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
+    TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;

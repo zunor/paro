@@ -48,9 +48,9 @@ pub use crate::operators::join::state::{
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
-    ExpressionSourceGlobal, ExpressionSourceLocal, RowsetScanMorsel, RowsetSourceGlobal,
-    RowsetSourceLocal, TableFunctionSourceGlobal, TableFunctionSourceLocal, ValuesSourceGlobal,
-    ValuesSourceLocal,
+    ExpressionSourceGlobal, ExpressionSourceLocal, PreparedRowsetPredicate, RowsetScanMorsel,
+    RowsetSourceGlobal, RowsetSourceLocal, TableFunctionSourceGlobal, TableFunctionSourceLocal,
+    ValuesSourceGlobal, ValuesSourceLocal,
 };
 pub use crate::operators::search::state::{SearchSourceGlobal, SearchSourceLocal};
 pub use crate::operators::set::state::{

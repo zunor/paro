@@ -244,7 +244,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             if let Some(predicate) = &spec.predicate {
                 push_string_property(&mut properties, "Pushed Predicate", predicate.to_string());
             }
-            if spec.late_materialize {
+            if spec.planned_materialization().is_late() {
                 push_string_property(&mut properties, "Late Materialize", "auto".to_string());
             }
             if !spec.residual_predicates.is_empty() {

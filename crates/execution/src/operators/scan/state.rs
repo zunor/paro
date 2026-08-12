@@ -14,6 +14,8 @@ use paro_storage::table::StorageSnapshot;
 use paro_storage::tablet::{ColumnProjection, TabletReader};
 use paro_storage::transaction::overlay_reader::OverlayDeleteVectorMap;
 
+use crate::physical::specs::RowsetScanMaterialization;
+
 use super::table_function::TableFunctionBindDataWrapper;
 
 #[derive(Debug)]
@@ -26,8 +28,18 @@ pub struct RowsetSourceGlobal {
     pub next_morsel: AtomicUsize,
     pub column_projection: ColumnProjection,
     pub overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
-    pub predicate: Option<PredicateTree>,
-    pub predicate_columns: Box<[ColumnId]>,
+    pub prepared_predicate: Option<PreparedRowsetPredicate>,
+}
+
+/// Execution-bound predicate and its matching initial access mode.
+///
+/// These fields are prepared together after all build-dependent predicates
+/// are published, then shared immutably by every scan worker.
+#[derive(Debug)]
+pub struct PreparedRowsetPredicate {
+    pub tree: PredicateTree,
+    pub columns: Box<[ColumnId]>,
+    pub materialization: RowsetScanMaterialization,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
