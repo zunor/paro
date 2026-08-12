@@ -33,6 +33,8 @@ pub enum OptimizerType {
     AggregateJoinPreaggregation,
     /// Derives scalar reductions from finalized alpha-equivalent grouped aggregates.
     AggregatePostReduction,
+    /// Reuses a key-preserving detail stream for a correlated partition aggregate.
+    CorrelatedPartitionAggregate,
     /// Eliminates redundant joins introduced by `DelimGet`.
     DelimJoinElimination,
     /// Rewrites UNNEST operations.
@@ -95,7 +97,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 41] = [
+    pub const ALL: [OptimizerType; 42] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -107,6 +109,7 @@ impl OptimizerType {
         OptimizerType::AggregateJoinSubsumption,
         OptimizerType::AggregateJoinPreaggregation,
         OptimizerType::AggregatePostReduction,
+        OptimizerType::CorrelatedPartitionAggregate,
         OptimizerType::DelimJoinElimination,
         OptimizerType::UnnestRewriter,
         OptimizerType::UnusedColumns,
@@ -156,6 +159,7 @@ impl OptimizerType {
             OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
             OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
             OptimizerType::AggregatePostReduction => "aggregate_post_reduction",
+            OptimizerType::CorrelatedPartitionAggregate => "correlated_partition_aggregate",
             OptimizerType::DelimJoinElimination => "delim_join_elimination",
             OptimizerType::UnnestRewriter => "unnest_rewriter",
             OptimizerType::UnusedColumns => "unused_columns",
@@ -212,6 +216,7 @@ impl FromStr for OptimizerType {
             "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
             "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
             "aggregate_post_reduction" => Ok(OptimizerType::AggregatePostReduction),
+            "correlated_partition_aggregate" => Ok(OptimizerType::CorrelatedPartitionAggregate),
             "delim_join_elimination" => Ok(OptimizerType::DelimJoinElimination),
             "unnest_rewriter" => Ok(OptimizerType::UnnestRewriter),
             "unused_columns" => Ok(OptimizerType::UnusedColumns),

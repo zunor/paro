@@ -386,21 +386,20 @@ mod tests {
 
     #[test]
     fn get_expression_side_visits_window_frame_offsets() {
-        let expression = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let expression = Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
 
         assert_eq!(
             get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),

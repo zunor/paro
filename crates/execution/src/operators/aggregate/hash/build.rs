@@ -43,7 +43,8 @@ use crate::operators::aggregate::ordered_helpers::{
     merge_ordered_collectors,
 };
 use crate::operators::aggregate::payload_spill::{
-    AggregatePayloadSpillBuffer, AggregateStateEncoding, AggregateStateSpillBuffer,
+    aggregate_spill_radix_bits, AggregatePayloadSpillBuffer, AggregateStateEncoding,
+    AggregateStateSpillBuffer,
 };
 use crate::operators::aggregate::post_reduction::PostAggregateReducer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
@@ -192,9 +193,7 @@ impl HashAggregateBuildSinkExec {
                             group_types(&self.spec)?,
                             state_width,
                             state_encoding,
-                            aggregate_payload_spill_radix_bits(
-                                ctx.query.session.number_of_threads(),
-                            ),
+                            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
                             query_hash_table_memory(ctx.query),
                         ),
                     ));
@@ -679,10 +678,6 @@ fn hash_aggregate_preemptive_payload_spill_enabled(
     capacity <= threshold
 }
 
-fn aggregate_payload_spill_radix_bits(parallelism: usize) -> usize {
-    parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
-}
-
 fn append_payload_to_local_spill(
     ctx: &mut OperatorCallContext,
     payload: &Chunk,
@@ -694,7 +689,7 @@ fn append_payload_to_local_spill(
         *payload_spill = Some(AggregatePayloadSpillBuffer::new(
             ctx.query.session.buffer_pool().clone(),
             payload.types(),
-            aggregate_payload_spill_radix_bits(ctx.query.session.number_of_threads()),
+            aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
             query_hash_table_memory(ctx.query),
         )?);
     }
@@ -1186,7 +1181,7 @@ fn spill_in_memory_tables_to_state_partitions(
         group_types(spec)?,
         state_width,
         hash_aggregate_state_spill_encoding(aggregate_objects),
-        aggregate_payload_spill_radix_bits(ctx.query.session.number_of_threads()),
+        aggregate_spill_radix_bits(ctx.query.session.number_of_threads()),
         query_hash_table_memory(ctx.query),
     )?;
     for table in tables.iter() {

@@ -301,6 +301,124 @@ fn integer_value_as_i128(value: &paro_common::runtime_value::Value) -> Option<i1
     }
 }
 
+/// Aggregate expressions rebased onto a compact payload projection.
+///
+/// Grouped aggregates and full-partition aggregate windows consume the same
+/// aggregate ABI. Keeping extraction here gives both physical operators one
+/// definition of argument, FILTER, and ordered-input column domains.
+pub(crate) struct AggregatePayloadPlan {
+    pub(crate) projection_exprs: Vec<Expression>,
+    pub(crate) payload_types: Vec<LogicalType>,
+    pub(crate) groups: Vec<Expression>,
+    pub(crate) aggregates: Vec<Expression>,
+    pub(crate) aggregate_inputs: Vec<Box<[usize]>>,
+    pub(crate) aggregate_filters: Vec<Option<usize>>,
+    pub(crate) aggregate_orders: Vec<Box<[usize]>>,
+}
+
+pub(crate) fn plan_aggregate_payload(
+    group_expressions: Vec<Expression>,
+    aggregate_expressions: Vec<Expression>,
+) -> Result<AggregatePayloadPlan> {
+    plan_aggregate_payload_with_prefix(Vec::new(), group_expressions, aggregate_expressions)
+}
+
+/// Plan an aggregate payload whose leading columns have a stable physical
+/// meaning outside the aggregate itself.
+///
+/// Full-partition windows use the input row as this prefix. The same projected
+/// payload can then be retained columnarly or externalized as raw aggregate
+/// input without keeping a second copy of the detail row. Ordinary grouped
+/// aggregates pass an empty prefix and retain their compact payload.
+pub(crate) fn plan_aggregate_payload_with_prefix(
+    payload_prefix: Vec<Expression>,
+    group_expressions: Vec<Expression>,
+    aggregate_expressions: Vec<Expression>,
+) -> Result<AggregatePayloadPlan> {
+    let mut projection_exprs = Vec::with_capacity(payload_prefix.len());
+    let mut payload_types = Vec::with_capacity(payload_prefix.len());
+    for expression in payload_prefix {
+        payload_types.push(expression.return_type());
+        projection_exprs.push(expression);
+    }
+    let groups = group_expressions
+        .into_iter()
+        .map(|expression| {
+            extract_payload_expression(expression, &mut projection_exprs, &mut payload_types)
+        })
+        .collect::<Vec<_>>();
+    let mut aggregate_inputs = Vec::with_capacity(aggregate_expressions.len());
+    let mut aggregate_filters = Vec::with_capacity(aggregate_expressions.len());
+    let mut aggregate_orders = Vec::with_capacity(aggregate_expressions.len());
+    let mut aggregates = Vec::with_capacity(aggregate_expressions.len());
+
+    for (aggregate_idx, aggregate_expr) in aggregate_expressions.into_iter().enumerate() {
+        let Expression::Aggregate(mut bound) = aggregate_expr else {
+            return Err(paro_error::internal(format!(
+                "aggregate payload expression {aggregate_idx} is not an aggregate"
+            )));
+        };
+
+        let mut inputs = Vec::with_capacity(bound.children.len());
+        let mut children = Vec::with_capacity(bound.children.len());
+        for child_expr in std::mem::take(&mut bound.children) {
+            let reference =
+                extract_payload_expression(child_expr, &mut projection_exprs, &mut payload_types);
+            let Expression::Reference(reference_expr) = &reference else {
+                unreachable!("extract_payload_expression returns a reference");
+            };
+            inputs.push(reference_expr.index);
+            children.push(reference);
+        }
+        bound.children = children;
+
+        let filter_index = if let Some(filter) = bound.filter.take() {
+            let reference =
+                extract_payload_expression(*filter, &mut projection_exprs, &mut payload_types);
+            let Expression::Reference(reference_expr) = &reference else {
+                unreachable!("extract_payload_expression returns a reference");
+            };
+            let index = reference_expr.index;
+            bound.filter = Some(Box::new(reference));
+            Some(index)
+        } else {
+            None
+        };
+
+        let mut order_inputs = Vec::with_capacity(bound.order_bys.len());
+        let mut order_bys = Vec::with_capacity(bound.order_bys.len());
+        for mut order in std::mem::take(&mut bound.order_bys) {
+            let reference = extract_payload_expression(
+                order.expression,
+                &mut projection_exprs,
+                &mut payload_types,
+            );
+            let Expression::Reference(reference_expr) = &reference else {
+                unreachable!("extract_payload_expression returns a reference");
+            };
+            order_inputs.push(reference_expr.index);
+            order.expression = reference;
+            order_bys.push(order);
+        }
+        bound.order_bys = order_bys;
+
+        aggregate_inputs.push(inputs.into_boxed_slice());
+        aggregate_filters.push(filter_index);
+        aggregate_orders.push(order_inputs.into_boxed_slice());
+        aggregates.push(Expression::Aggregate(bound));
+    }
+
+    Ok(AggregatePayloadPlan {
+        projection_exprs,
+        payload_types,
+        groups,
+        aggregates,
+        aggregate_inputs,
+        aggregate_filters,
+        aggregate_orders,
+    })
+}
+
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_aggregate(
         &mut self,
@@ -322,17 +440,10 @@ impl PhysicalPlanGenerator {
             .map(|layout| layout.lookup_groups.clone())
             .unwrap_or_else(|| (0..aggregate.groups.len()).collect());
 
-        let mut projection_exprs = Vec::new();
-        let mut payload_types = Vec::new();
-        let groups = group_indices
+        let group_expressions = group_indices
             .iter()
             .map(|&group_idx| aggregate.groups[group_idx].clone())
-            .map(|expr| extract_payload_expression(expr, &mut projection_exprs, &mut payload_types))
             .collect::<Vec<_>>();
-        let mut aggregate_inputs = Vec::with_capacity(aggregate.aggregates.len());
-        let mut aggregate_filters = Vec::with_capacity(aggregate.aggregates.len());
-        let mut aggregate_orders = Vec::with_capacity(aggregate.aggregates.len());
-        let mut aggregates = Vec::with_capacity(aggregate.aggregates.len());
 
         let mut aggregate_expressions = aggregate.aggregates.clone();
         if let Some(layout) = &dependent_layout {
@@ -352,66 +463,15 @@ impl PhysicalPlanGenerator {
                 ));
             }
         }
-
-        for aggregate_expr in aggregate_expressions {
-            let Expression::Aggregate(mut bound) = aggregate_expr else {
-                return Ok((
-                    self.unsupported("AGGREGATE", "non-aggregate expression in aggregate list"),
-                    vec![child],
-                ));
-            };
-
-            let mut inputs = Vec::with_capacity(bound.children.len());
-            let mut children = Vec::with_capacity(bound.children.len());
-            for child_expr in std::mem::take(&mut bound.children) {
-                let reference = extract_payload_expression(
-                    child_expr,
-                    &mut projection_exprs,
-                    &mut payload_types,
-                );
-                let Expression::Reference(reference_expr) = &reference else {
-                    unreachable!("extract_payload_expression returns a reference");
-                };
-                inputs.push(reference_expr.index);
-                children.push(reference);
-            }
-            bound.children = children;
-
-            let filter_index = if let Some(filter) = bound.filter.take() {
-                let reference =
-                    extract_payload_expression(*filter, &mut projection_exprs, &mut payload_types);
-                let Expression::Reference(reference_expr) = &reference else {
-                    unreachable!("extract_payload_expression returns a reference");
-                };
-                let index = reference_expr.index;
-                bound.filter = Some(Box::new(reference));
-                Some(index)
-            } else {
-                None
-            };
-
-            let mut order_inputs = Vec::with_capacity(bound.order_bys.len());
-            let mut order_bys = Vec::with_capacity(bound.order_bys.len());
-            for mut order in std::mem::take(&mut bound.order_bys) {
-                let reference = extract_payload_expression(
-                    order.expression,
-                    &mut projection_exprs,
-                    &mut payload_types,
-                );
-                let Expression::Reference(reference_expr) = &reference else {
-                    unreachable!("extract_payload_expression returns a reference");
-                };
-                order_inputs.push(reference_expr.index);
-                order.expression = reference;
-                order_bys.push(order);
-            }
-            bound.order_bys = order_bys;
-
-            aggregate_inputs.push(inputs.into_boxed_slice());
-            aggregate_filters.push(filter_index);
-            aggregate_orders.push(order_inputs.into_boxed_slice());
-            aggregates.push(Expression::Aggregate(bound));
-        }
+        let AggregatePayloadPlan {
+            projection_exprs,
+            payload_types,
+            groups,
+            aggregates,
+            aggregate_inputs,
+            aggregate_filters,
+            aggregate_orders,
+        } = plan_aggregate_payload(group_expressions, aggregate_expressions)?;
 
         // Perfect hash is a fixed-size, planner-admitted representation rather
         // than a spillable hash table. `force_external` must not change the

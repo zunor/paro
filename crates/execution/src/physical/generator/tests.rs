@@ -7,12 +7,13 @@ use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry, Ve
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_function::aggregate::distributive::sum::get_sum_function;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     AggregateExpression, ComparisonExpression, ComparisonType, ConjunctionExpression,
     ConjunctionType, ConstantExpression, Expression, OperatorExpression, OperatorType,
-    ReferenceExpression, WindowExpression, WindowFrame,
+    OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
@@ -1058,15 +1059,14 @@ fn arena_generator_names_hidden_window_child_columns() {
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
-            vec![WindowExpression {
-                function: row_number.clone(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::get_default_frame(&row_number),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+            vec![WindowExpression::native(
+                row_number.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                WindowFrame::get_default_frame(&row_number),
+                false,
+            )],
             project,
         )),
     );
@@ -1086,6 +1086,164 @@ fn arena_generator_names_hidden_window_child_columns() {
     };
     assert_eq!(spec.input_width, 3);
     assert_eq!(spec.output_names.len(), spec.output_types.len());
+}
+
+#[test]
+fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["grp".to_string(), "value".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let (sum, target_types) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind integer sum");
+    assert_eq!(target_types, vec![LogicalType::Integer]);
+    let return_type = sum.return_type.clone();
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![Expression::Reference(ReferenceExpression::new(
+            1,
+            LogicalType::Integer,
+        ))],
+        return_type,
+    );
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower whole-partition aggregate window");
+    let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
+        panic!("expected sort-free partition aggregate window");
+    };
+    assert_eq!(spec.detail_columns.as_ref(), [0, 1]);
+    assert_eq!(spec.aggregate.grouping_key_count, 1);
+    assert_eq!(spec.aggregate.aggregates.len(), 1);
+    assert_eq!(spec.output_types.len(), 3);
+    spec.verify().expect("partition aggregate spec");
+}
+
+#[test]
+fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["partkey".to_string(), "value".to_string()],
+            vec![LogicalType::BigInt, LogicalType::Integer],
+        )),
+    );
+    let aggregate =
+        AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::BigInt,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower BIGINT partition aggregate window");
+    let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
+        panic!("expected typed BIGINT partition aggregate window");
+    };
+    assert_eq!(spec.aggregate.groups[0].return_type(), LogicalType::BigInt);
+    spec.verify().expect("BIGINT partition aggregate spec");
+}
+
+#[test]
+fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["grp".to_string(), "value".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind integer sum");
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![Expression::Reference(ReferenceExpression::new(
+            1,
+            LogicalType::Integer,
+        ))],
+        LogicalType::BigInt,
+    );
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                vec![OrderByExpression {
+                    expression: Expression::Reference(ReferenceExpression::new(
+                        1,
+                        LogicalType::Integer,
+                    )),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: paro_planner::expression::WindowFrameType::Rows,
+                    start_bound: paro_planner::expression::WindowFrameBound::Unbounded,
+                    start_is_preceding: true,
+                    end_bound: paro_planner::expression::WindowFrameBound::Unbounded,
+                    end_is_preceding: false,
+                },
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower ordered aggregate window");
+    assert!(matches!(
+        plan.node(plan.root).kind,
+        PhysicalNodeKind::Window(_)
+    ));
 }
 
 #[test]

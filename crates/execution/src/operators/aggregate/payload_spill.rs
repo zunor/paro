@@ -14,6 +14,7 @@ use std::sync::Arc;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::MemoryAccountingContext;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -44,6 +45,15 @@ pub(crate) enum AggregateStateEncoding {
     FunctionSerialized,
 }
 
+/// Shared external-aggregate partitioning policy.
+///
+/// The upper bound matches the aggregate table's radix implementation. A
+/// consumer can repartition a pathological partition later without changing
+/// the raw-payload format.
+pub(crate) fn aggregate_spill_radix_bits(parallelism: usize) -> usize {
+    parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
+}
+
 impl AggregatePayloadSpillBuffer {
     pub(crate) fn new(
         buffer_pool: Arc<BufferPool>,
@@ -51,6 +61,7 @@ impl AggregatePayloadSpillBuffer {
         radix_bits: usize,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         let format = AggregatePayloadFormat::new(payload_types);
         let layout = Arc::new(RowLayout::from_types(
             format.logical_types().to_vec(),
@@ -102,7 +113,6 @@ impl AggregatePayloadSpillBuffer {
         self.builder.append(&spill_chunk)
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.builder.size_in_bytes()
@@ -131,6 +141,7 @@ impl AggregateStateSpillBuffer {
         radix_bits: usize,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         let format = AggregateStateFormat::new(group_types, state_width);
         let layout = Arc::new(RowLayout::from_types(
             format.logical_types().to_vec(),
@@ -221,6 +232,17 @@ impl AggregateSpilledPayload {
     #[inline]
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.rows.size_in_bytes()
+    }
+
+    /// Increase the radix fan-out while preserving the original grouping
+    /// hash. Consumers use this when one replay partition still exceeds its
+    /// bounded working-memory grant. Consuming `self` keeps the transition
+    /// atomic: a failed repartition leaves no second live directory published.
+    pub(crate) fn into_repartitioned(self, radix_bits: usize) -> Result<Self> {
+        Ok(Self {
+            format: self.format,
+            rows: self.rows.into_repartitioned(radix_bits)?,
+        })
     }
 
     pub(crate) fn replay_partition_payloads(

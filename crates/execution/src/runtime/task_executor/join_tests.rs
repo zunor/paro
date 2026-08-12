@@ -1463,15 +1463,14 @@ fn topn_and_window_stream_through_typed_transforms() {
         )),
         transforms: vec![TransformSpec::StreamingWindow(WindowSpec {
             window_index: 0,
-            expressions: vec![WindowExpression {
-                function: row_number.clone(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::get_default_frame(&row_number),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }]
+            expressions: vec![WindowExpression::native(
+                row_number.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                WindowFrame::get_default_frame(&row_number),
+                false,
+            )]
             .into_boxed_slice(),
             input_width: 1,
             output_names: vec!["v".to_string(), "rn".to_string()].into_boxed_slice(),

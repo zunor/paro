@@ -28,6 +28,44 @@ pub struct DictionaryInfo {
     pub source: DictionarySource,
 }
 
+/// Opaque ownership token whose lifetime follows a shallow vector reference.
+///
+/// Vectors normally own their allocations through buffers and heaps. Blocking
+/// operators may also retain allocations owned by another subsystem (for
+/// example a page-cache pin or query accounting lease). Attaching that owner
+/// to the vector makes zero-copy handoff explicit: clones and dictionary
+/// children keep the token alive until the last data reference disappears.
+pub trait VectorLifetimeOwner: std::fmt::Debug + Send + Sync {}
+
+impl<T> VectorLifetimeOwner for T where T: std::fmt::Debug + Send + Sync {}
+
+#[derive(Debug)]
+pub(super) struct VectorLifetimeOwners {
+    owners: Box<[Arc<dyn VectorLifetimeOwner>]>,
+}
+
+impl VectorLifetimeOwners {
+    fn with_added(existing: Option<&Arc<Self>>, owner: Arc<dyn VectorLifetimeOwner>) -> Arc<Self> {
+        if let Some(existing) = existing {
+            if existing
+                .owners
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &owner))
+            {
+                return Arc::clone(existing);
+            }
+        }
+        let mut owners = Vec::with_capacity(existing.map_or(1, |set| set.owners.len() + 1));
+        if let Some(existing) = existing {
+            owners.extend(existing.owners.iter().cloned());
+        }
+        owners.push(owner);
+        Arc::new(Self {
+            owners: owners.into_boxed_slice(),
+        })
+    }
+}
+
 /// A columnar vector handle.
 ///
 /// Refactored to be a lightweight handle pointing to shared data (Zero-copy).
@@ -69,6 +107,10 @@ pub struct Vector {
     pub(super) string_heap: Option<Arc<StringHeap>>,
     /// Optional provenance for dictionary overlays.
     pub(super) dictionary_info: Option<DictionaryInfo>,
+    /// Non-allocation owners required by the referenced vector storage.
+    /// Allocated only for the uncommon zero-copy handoff that needs an
+    /// ownership token beyond the vector's ordinary buffers and heaps.
+    pub(super) lifetime_owners: Option<Arc<VectorLifetimeOwners>>,
 }
 
 pub(crate) struct VectorResetState {
@@ -118,6 +160,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
 
         // Initialize child vectors for nested types
@@ -183,6 +226,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -308,6 +352,34 @@ impl Vector {
     /// Create a shallow reference to this vector (Zero-copy).
     pub fn reference(&self) -> Self {
         self.clone()
+    }
+
+    /// Create a zero-copy reference that retains an additional opaque owner.
+    ///
+    /// The owner is attached recursively to nested children so extracting a
+    /// list/struct/dictionary child cannot outlive the lease that protects its
+    /// shared allocation.
+    pub fn reference_with_lifetime_owner(&self, owner: Arc<dyn VectorLifetimeOwner>) -> Self {
+        let mut vector = self.reference();
+        vector.attach_lifetime_owner(owner);
+        vector
+    }
+
+    fn attach_lifetime_owner(&mut self, owner: Arc<dyn VectorLifetimeOwner>) {
+        self.lifetime_owners = Some(VectorLifetimeOwners::with_added(
+            self.lifetime_owners.as_ref(),
+            Arc::clone(&owner),
+        ));
+        if let Some(child) = &mut self.child {
+            let mut referenced = child.reference();
+            referenced.attach_lifetime_owner(Arc::clone(&owner));
+            *child = Arc::new(referenced);
+        }
+        for child in &mut self.children {
+            let mut referenced = child.reference();
+            referenced.attach_lifetime_owner(Arc::clone(&owner));
+            *child = Arc::new(referenced);
+        }
     }
 
     /// Create a shallow reference while presenting a different logical type.

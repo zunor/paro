@@ -12,7 +12,7 @@ use paro_context::StatementContext;
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
     ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-    WindowExpression,
+    WindowExpression, WindowInvocation,
 };
 use paro_planner::operator::{
     aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Filter, Join,
@@ -33,7 +33,10 @@ fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
 
     // Only publish bounds guaranteed by function semantics. Node cardinalities are estimates, not
     // correctness bounds, so they must never become window min/max values used for filter pruning.
-    match (expression.function.function_type, &return_type) {
+    let WindowInvocation::Native { function, .. } = &expression.invocation else {
+        return statistics;
+    };
+    match (function.function_type, &return_type) {
         (
             WindowFunctionType::RowNumber
             | WindowFunctionType::Rank
@@ -60,8 +63,7 @@ fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
             | WindowFunctionType::Lag
             | WindowFunctionType::FirstValue
             | WindowFunctionType::LastValue
-            | WindowFunctionType::NthValue
-            | WindowFunctionType::Aggregate,
+            | WindowFunctionType::NthValue,
             _,
         ) => {}
     }
@@ -1155,18 +1157,17 @@ mod tests {
             &bind_context,
             LogicalOperator::Window(Window::new(
                 20,
-                vec![WindowExpression {
-                    frame: WindowFrame::get_default_frame(&function),
-                    function,
-                    children: Vec::new(),
-                    partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+                vec![WindowExpression::native(
+                    function.clone(),
+                    Vec::new(),
+                    vec![Expression::ColumnRef(ColumnRefExpression::new(
                         ColumnBinding::new(7, 0),
                         LogicalType::Integer,
                     ))],
-                    orders: Vec::new(),
-                    ignore_nulls: false,
-                    return_type: LogicalType::BigInt,
-                }],
+                    Vec::new(),
+                    WindowFrame::get_default_frame(&function),
+                    false,
+                )],
                 input,
             )),
         );
@@ -1246,33 +1247,31 @@ mod tests {
     #[test]
     fn window_statistics_only_publish_function_intrinsic_facts() {
         let cume_dist = WindowFunction::cume_dist();
-        let cume_dist = WindowExpression {
-            frame: WindowFrame::get_default_frame(&cume_dist),
-            return_type: cume_dist.return_type.clone(),
-            function: cume_dist,
-            children: Vec::new(),
-            partitions: Vec::new(),
-            orders: Vec::new(),
-            ignore_nulls: false,
-        };
+        let cume_dist = WindowExpression::native(
+            cume_dist.clone(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            WindowFrame::get_default_frame(&cume_dist),
+            false,
+        );
         let cume_dist_stats = window_output_statistics(&cume_dist);
         assert!(!cume_dist_stats.can_have_null());
         assert_eq!(cume_dist_stats.min_value(), Some(Value::Double(0.0)));
         assert_eq!(cume_dist_stats.max_value(), Some(Value::Double(1.0)));
 
         let ntile = WindowFunction::ntile();
-        let ntile = WindowExpression {
-            frame: WindowFrame::get_default_frame(&ntile),
-            return_type: ntile.return_type.clone(),
-            function: ntile,
-            children: vec![Expression::Constant(ConstantExpression::new(
+        let ntile = WindowExpression::native(
+            ntile.clone(),
+            vec![Expression::Constant(ConstantExpression::new(
                 Value::BigInt(4),
                 LogicalType::BigInt,
             ))],
-            partitions: Vec::new(),
-            orders: Vec::new(),
-            ignore_nulls: false,
-        };
+            Vec::new(),
+            Vec::new(),
+            WindowFrame::get_default_frame(&ntile),
+            false,
+        );
         let ntile_stats = window_output_statistics(&ntile);
         assert!(ntile_stats.can_have_null());
         assert!(ntile_stats.can_have_no_null());

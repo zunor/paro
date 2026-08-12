@@ -20,6 +20,7 @@ use crate::runtime::{
     HashJoinBuildSinkExec, HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec,
     HashJoinUnmatchedSourceExec, InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec,
     NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec, OperatorRole,
+    PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
     PerfectHashAggregateEmitSourceExec, PerfectHashAggregateSinkExec, ProjectTransformExec,
     PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
     RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
@@ -431,6 +432,12 @@ impl OperatorRuntimeRegistry {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
             }),
+            SourceSpec::PartitionAggregateWindowEmit(spec) => {
+                SourceExec::PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceExec {
+                    handle: HandleRef::new(spec.handle),
+                    spec: spec.spec.clone(),
+                })
+            }
             SourceSpec::SetOperationEmit(spec) => {
                 SourceExec::SetOperationEmit(SetOperationEmitSourceExec {
                     handle: HandleRef::new(spec.handle),
@@ -618,6 +625,13 @@ impl OperatorRuntimeRegistry {
                 spec: spec.spec.clone(),
                 required: spec.required.clone(),
             }),
+            SinkSpec::PartitionAggregateWindowBuild(spec) => {
+                SinkExec::PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkExec {
+                    handle: HandleRef::new(spec.handle),
+                    spec: spec.spec.clone(),
+                    required: spec.required.clone(),
+                })
+            }
             SinkSpec::SetOperationInput(spec) => {
                 SinkExec::SetOperationInput(SetOperationInputSinkExec {
                     handle: HandleRef::new(spec.handle),
@@ -832,10 +846,7 @@ mod tests {
     };
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_function::window::WindowFunction;
-    use paro_planner::expression::{
-        ConstantExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
-    };
+    use paro_planner::expression::{ConstantExpression, Expression, ReferenceExpression};
     use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
     use crate::physical::properties::{
@@ -845,7 +856,7 @@ mod tests {
     use crate::physical::row_type::RowType;
     use crate::physical::specs::{
         AggregateSpec, DeleteSpec, DummyScanSpec, FilterSpec, GraphExpandSpec, GraphScanSpec,
-        LimitSpec, ProjectSpec, ValuesSpec, WindowSpec,
+        LimitSpec, ProjectSpec, ValuesSpec,
     };
     use crate::runtime::{OperatorRole, RuntimeRoleOrdinal};
 
@@ -858,6 +869,8 @@ mod tests {
     use crate::pipeline::handles::{
         BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind,
     };
+
+    use crate::pipeline::program_test_window::window_spec;
 
     fn row_type(names: &[&str], types: &[LogicalType]) -> RowType {
         RowType::new(
@@ -945,25 +958,6 @@ mod tests {
             hnsw_ef_hint: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
-        }
-    }
-
-    fn window_spec() -> WindowSpec {
-        WindowSpec {
-            window_index: 1,
-            expressions: vec![WindowExpression {
-                function: WindowFunction::row_number(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::default(),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }]
-            .into_boxed_slice(),
-            input_width: 1,
-            output_names: Box::new(["a".to_string(), "rn".to_string()]),
-            output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
         }
     }
 

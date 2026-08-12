@@ -1010,19 +1010,18 @@ mod tests {
         let row_number_function = WindowFunction::row_number();
         let window = LogicalOperator::Window(Window::new(
             341,
-            vec![WindowExpression {
-                function: row_number_function.clone(),
-                children: vec![],
-                partitions: vec![],
-                orders: vec![OrderByExpression {
+            vec![WindowExpression::native(
+                row_number_function.clone(),
+                vec![],
+                vec![],
+                vec![OrderByExpression {
                     expression: int_col(342, 0),
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::get_default_frame(&row_number_function),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::get_default_frame(&row_number_function),
+                false,
+            )],
             wrapped(&binder, expression_get(342, vec![LogicalType::Integer])),
         ));
         let dependent_join = DependentJoin::lateral(
@@ -1207,11 +1206,11 @@ mod tests {
         let row_number_function = WindowFunction::row_number();
         let window = LogicalOperator::Window(Window::new(
             375,
-            vec![WindowExpression {
-                function: row_number_function.clone(),
-                children: vec![],
-                partitions: vec![],
-                orders: vec![OrderByExpression {
+            vec![WindowExpression::native(
+                row_number_function.clone(),
+                vec![],
+                vec![],
+                vec![OrderByExpression {
                     expression: Expression::ColumnRef(ColumnRefExpression::new(
                         ColumnBinding::new(371, 0),
                         LogicalType::Integer,
@@ -1219,10 +1218,9 @@ mod tests {
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::get_default_frame(&row_number_function),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::get_default_frame(&row_number_function),
+                false,
+            )],
             wrapped(&binder, LogicalOperator::Aggregate(aggregate)),
         ));
         let dependent_join = DependentJoin::lateral(

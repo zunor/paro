@@ -106,8 +106,10 @@ impl StreamingWindowTransformExec {
 
 fn ensure_streaming_window_supported(spec: &WindowSpec) -> Result<()> {
     let supported = spec.expressions.iter().all(|expr| {
-        expr.function.function_type == WindowFunctionType::RowNumber
-            && expr.children.is_empty()
+        expr.native_invocation()
+            .is_some_and(|(function, arguments)| {
+                function.function_type == WindowFunctionType::RowNumber && arguments.is_empty()
+            })
             && expr.partitions.is_empty()
             && expr.orders.is_empty()
     });

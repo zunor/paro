@@ -974,18 +974,17 @@ mod tests {
     use paro_function::window::WindowFunction;
 
     fn row_number(partition_column: usize) -> Expression {
-        Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+        Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            vec![],
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(10, partition_column),
                 LogicalType::Integer,
             ))],
-            orders: vec![],
-            frame: WindowFrame::default(),
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        })
+            vec![],
+            WindowFrame::default(),
+            false,
+        ))
     }
 
     fn random_call() -> Expression {

@@ -40,9 +40,26 @@ impl<'a> AggregateBinder<'a> {
     /// - Disabling aggregate functions (to prevent nesting)
     /// - Disabling window functions
     pub fn new(binder: &'a mut crate::binder::Binder) -> Self {
+        Self::with_query_aggregates(binder, false)
+    }
+
+    /// Bind the arguments of an aggregate used as a window invocation.
+    ///
+    /// Query-level aggregates are legal inputs to a window aggregate (for
+    /// example `sum(sum(x)) OVER (...)`). They are hoisted below the Window by
+    /// SELECT planning. A nested aggregate inside that query-level aggregate
+    /// is still rejected by the ordinary [`Self::new`] path used when binding
+    /// the inner call. Window calls remain forbidden at every depth.
+    pub fn for_window(binder: &'a mut crate::binder::Binder) -> Self {
+        Self::with_query_aggregates(binder, true)
+    }
+
+    fn with_query_aggregates(
+        binder: &'a mut crate::binder::Binder,
+        allow_query_aggregates: bool,
+    ) -> Self {
         let mut base = ExpressionBinder::new(binder);
-        // Prevent nested aggregates
-        base.allow_aggregates = false;
+        base.allow_aggregates = allow_query_aggregates;
         // Prevent window functions inside aggregates
         base.allow_window = false;
 

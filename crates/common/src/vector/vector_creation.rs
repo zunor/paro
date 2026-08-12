@@ -222,6 +222,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -253,6 +254,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -275,6 +277,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
         vec.validity.set_null(0);
         Ok(vec)
@@ -308,6 +311,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -346,6 +350,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: Some(dictionary_info),
+            lifetime_owners: None,
         })
     }
 
@@ -517,6 +522,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
         // Set child count to match array_size * count
         if let Some(child_arc) = &mut vec.child {
@@ -559,6 +565,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 

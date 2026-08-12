@@ -6,7 +6,7 @@
 use paro_function::scalar::cast::{BoundCastInfo, CastDispatch};
 use paro_function::scalar::{BoundScalarFunction, ScalarDispatch};
 
-pub(super) fn scalar_kernels_equal(
+pub(crate) fn scalar_kernels_equal(
     left: &BoundScalarFunction,
     right: &BoundScalarFunction,
 ) -> bool {
@@ -33,7 +33,7 @@ pub(super) fn scalar_kernels_equal(
         }
 }
 
-pub(super) fn scalar_dispatch_equal(left: ScalarDispatch, right: ScalarDispatch) -> bool {
+pub(crate) fn scalar_dispatch_equal(left: ScalarDispatch, right: ScalarDispatch) -> bool {
     match (left, right) {
         (ScalarDispatch::Direct(left), ScalarDispatch::Direct(right))
         | (ScalarDispatch::Variadic(left), ScalarDispatch::Variadic(right)) => {
@@ -43,7 +43,7 @@ pub(super) fn scalar_dispatch_equal(left: ScalarDispatch, right: ScalarDispatch)
     }
 }
 
-pub(super) fn cast_kernels_equal(left: &BoundCastInfo, right: &BoundCastInfo) -> bool {
+pub(crate) fn cast_kernels_equal(left: &BoundCastInfo, right: &BoundCastInfo) -> bool {
     left.type_contract() == right.type_contract()
         && left.context_dependency() == right.context_dependency()
         && cast_dispatch_equal(left.dispatch, right.dispatch)
@@ -57,7 +57,7 @@ pub(super) fn cast_kernels_equal(left: &BoundCastInfo, right: &BoundCastInfo) ->
         }
 }
 
-pub(super) fn cast_dispatch_equal(left: CastDispatch, right: CastDispatch) -> bool {
+pub(crate) fn cast_dispatch_equal(left: CastDispatch, right: CastDispatch) -> bool {
     match (left, right) {
         (CastDispatch::Fixed(left), CastDispatch::Fixed(right)) => {
             std::ptr::fn_addr_eq(left, right)

@@ -83,21 +83,20 @@ fn volatile_call() -> Expression {
 }
 
 fn window_with_start_offset(offset: Expression) -> Expression {
-    Expression::Window(WindowExpression {
-        function: paro_function::window::WindowFunction::row_number(),
-        children: vec![],
-        partitions: vec![],
-        orders: vec![],
-        frame: WindowFrame {
+    Expression::Window(WindowExpression::native(
+        paro_function::window::WindowFunction::row_number(),
+        vec![],
+        vec![],
+        vec![],
+        WindowFrame {
             frame_type: WindowFrameType::Rows,
             start_bound: WindowFrameBound::Offset(Box::new(offset)),
             start_is_preceding: true,
             end_bound: WindowFrameBound::CurrentRow,
             end_is_preceding: false,
         },
-        ignore_nulls: false,
-        return_type: LogicalType::BigInt,
-    })
+        false,
+    ))
 }
 
 fn make_comparison(comp_type: ComparisonType, left: Expression, right: Expression) -> Expression {

@@ -632,21 +632,20 @@ mod tests {
     fn test_extract_bindings_visits_window_frame_offsets() {
         let mut manager = RelationManager::new();
         manager.add_relation(create_test_get(7), None, RelationStats::new());
-        let expression = Expression::Window(WindowExpression {
-            function: paro_function::window::WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let expression = Expression::Window(WindowExpression::native(
+            paro_function::window::WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(create_column_ref(7, 0))),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
         let mut bindings = HashSet::new();
 
         assert!(manager.extract_bindings(&expression, &mut bindings));

@@ -942,17 +942,17 @@ fn expression_output_name(
             format!("ref_{}", reference.index + 1)
         }
         crate::expression::Expression::Aggregate(aggregate) => aggregate.function.name.clone(),
-        crate::expression::Expression::Window(window) => window.function.name.clone(),
+        crate::expression::Expression::Window(window) => window.function_name().to_string(),
         crate::expression::Expression::Function(function) => function.function.name.clone(),
         _ => format!("{fallback_prefix}_{}", idx + 1),
     }
 }
 
 fn window_output_name(expr: &crate::expression::WindowExpression, idx: usize) -> String {
-    if expr.function.name.is_empty() {
+    if expr.function_name().is_empty() {
         format!("window_{}", idx + 1)
     } else {
-        expr.function.name.clone()
+        expr.function_name().to_string()
     }
 }
 
@@ -1545,15 +1545,14 @@ mod tests {
         let function = WindowFunction::row_number();
         let window = Window::new(
             77,
-            vec![WindowExpression {
-                frame: WindowFrame::get_default_frame(&function),
-                function,
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+            vec![WindowExpression::native(
+                function.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                WindowFrame::get_default_frame(&function),
+                false,
+            )],
             lp(expression_get(
                 10,
                 vec![LogicalType::Integer, LogicalType::Boolean],

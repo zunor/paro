@@ -406,6 +406,17 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 push_list_property(&mut properties, "Output", &spec.output_names);
             }
         }
+        PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+            push_aggregate_properties(&mut properties, &spec.aggregate);
+            push_string_property(
+                &mut properties,
+                "Retained Detail Columns",
+                spec.detail_columns.len().to_string(),
+            );
+            if !spec.output_names.is_empty() {
+                push_list_property(&mut properties, "Output", &spec.output_names);
+            }
+        }
         PhysicalNodeKind::MaterializedCte(spec) => {
             push_string_property(&mut properties, "CTE Name", spec.cte_name.clone());
             push_string_property(

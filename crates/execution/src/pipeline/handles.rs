@@ -38,6 +38,7 @@ pub enum BreakerHandleKind {
     HashJoinBuild,
     Aggregate,
     Window,
+    PartitionAggregateWindow,
     SetOperation,
     Cte,
     Delim,

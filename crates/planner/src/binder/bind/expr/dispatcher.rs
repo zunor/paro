@@ -294,6 +294,7 @@ impl<'a> ExpressionBinder<'a> {
                 if let Some(over) = window {
                     bind::bind_window_expression(
                         self.binder,
+                        None,
                         "count_star",
                         vec![],
                         false,
@@ -635,6 +636,7 @@ impl<'a> ExpressionBinder<'a> {
             let ignore_nulls = over.ignore_nulls.unwrap_or(false);
             return bind::bind_window_expression(
                 self.binder,
+                schema_name.as_deref(),
                 &name,
                 args,
                 distinct,

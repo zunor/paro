@@ -140,10 +140,10 @@ impl<'a> PipelineScheduler<'a> {
                 candidates.push((entry, self.create_runtime(pipeline)?));
             }
 
-            let source_capable = candidates
-                .iter()
-                .filter(|(_, runtime)| has_schedulable_source_work(runtime))
-                .count();
+            let mut source_capable = 0usize;
+            for (_, runtime) in &candidates {
+                source_capable += usize::from(has_schedulable_source_work(runtime)?);
+            }
             if source_capable < 2 {
                 let (_, runtime) = candidates.remove(0);
                 for (entry, _) in candidates {
@@ -156,7 +156,7 @@ impl<'a> PipelineScheduler<'a> {
 
             let mut wave = Vec::with_capacity(source_capable);
             for (entry, runtime) in candidates {
-                if has_schedulable_source_work(&runtime) {
+                if has_schedulable_source_work(&runtime)? {
                     wave.push((entry.payload, runtime));
                 } else {
                     self.ready.push(entry);
@@ -283,7 +283,7 @@ pub(crate) fn run_bound_pipeline_runtime(
     query: Arc<QueryRuntimeContext>,
     allocator: Arc<dyn Allocator>,
 ) -> Result<()> {
-    let Some(source_work) = source_work(&runtime.source_global) else {
+    let Some(source_work) = source_work(&runtime.source_global)? else {
         return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
     };
     let work_unit_count = source_work.work_unit_count();
@@ -489,7 +489,7 @@ fn schedule_pipeline_data_tasks(
     query: Arc<QueryRuntimeContext>,
     allocator: Arc<dyn Allocator>,
 ) -> Result<ScheduledPipelineExecution> {
-    let work = source_work(&runtime.source_global)
+    let work = source_work(&runtime.source_global)?
         .filter(|work| work.work_unit_count() > 0)
         .ok_or_else(|| paro_error::internal("pipeline wave requires source work"))?;
     let total_threads = pipeline_thread_count(parallelism, work.work_unit_count(), query.as_ref());
@@ -546,6 +546,7 @@ enum SharedSourceWorker {
     HashAggregateEmit,
     HashJoinUnmatched,
     SortEmit,
+    PartitionAggregateWindowEmit,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1229,8 +1230,8 @@ fn as_scheduler_task(task: PipelineWorkerTask) -> Arc<ParkingMutex<dyn Task>> {
     Arc::new(ParkingMutex::new(task))
 }
 
-fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
-    match source {
+fn source_work(source: &SourceGlobal) -> Result<Option<SourceWork>> {
+    Ok(match source {
         SourceGlobal::Rowset(global) => Some(SourceWork::RowsetScan {
             count: global.morsels.len(),
         }),
@@ -1253,12 +1254,18 @@ fn source_work(source: &SourceGlobal) -> Option<SourceWork> {
             count: 1,
             worker: SharedSourceWorker::SortEmit,
         }),
+        SourceGlobal::PartitionAggregateWindowEmit(global) if global.work_count()? > 1 => {
+            Some(SourceWork::SharedWorkers {
+                count: global.work_count()?,
+                worker: SharedSourceWorker::PartitionAggregateWindowEmit,
+            })
+        }
         _ => None,
-    }
+    })
 }
 
-fn has_schedulable_source_work(runtime: &PipelineRuntime) -> bool {
-    source_work(&runtime.source_global).is_some_and(|work| work.work_unit_count() > 0)
+fn has_schedulable_source_work(runtime: &PipelineRuntime) -> Result<bool> {
+    Ok(source_work(&runtime.source_global)?.is_some_and(|work| work.work_unit_count() > 0))
 }
 
 fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignment) -> Result<()> {
@@ -1282,6 +1289,10 @@ fn prepare_source_task(source: &mut SourceLocal, assignment: SourceTaskAssignmen
         | (
             SourceLocal::SortEmit(_),
             SourceTaskAssignment::SharedWorker(SharedSourceWorker::SortEmit),
+        )
+        | (
+            SourceLocal::PartitionAggregateWindowEmit(_),
+            SourceTaskAssignment::SharedWorker(SharedSourceWorker::PartitionAggregateWindowEmit),
         ) => Ok(()),
         (source, assignment) => Err(paro_error::internal(format!(
             "source local {} cannot accept scheduler assignment {:?}",

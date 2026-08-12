@@ -413,12 +413,12 @@ mod tests {
     #[test]
     fn extract_column_bindings_visits_window_frame_offsets() {
         let expected = ColumnBinding::new(7, 3);
-        let expression = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let expression = Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(Expression::ColumnRef(
                     ColumnRefExpression::new(expected, LogicalType::Integer),
@@ -427,9 +427,8 @@ mod tests {
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
         let mut bindings = Vec::new();
 
         ColumnLifetimeAnalyzer::extract_column_bindings(&expression, &mut bindings);

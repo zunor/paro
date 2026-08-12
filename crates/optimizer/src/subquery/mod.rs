@@ -5,3 +5,7 @@
 
 pub mod delim_join_elimination;
 pub mod empty_result;
+pub mod partition_aggregate;
+
+#[cfg(test)]
+mod partition_aggregate_tests;

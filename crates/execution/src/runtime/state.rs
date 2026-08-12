@@ -72,6 +72,7 @@ pub use crate::operators::window::state::{
     StreamingWindowTransformGlobal, StreamingWindowTransformLocal, WindowBuildSinkLocal,
     WindowEmitSourceLocal,
 };
+pub use crate::operators::window::{PartitionAggregateEmitGlobal, PartitionAggregateEmitLocal};
 
 pub type DynGlobalStateBox = Box<dyn DynGlobalState>;
 pub type DynLocalStateBox = Box<dyn DynLocalState>;
@@ -143,6 +144,7 @@ pub enum SourceGlobal {
     SortEmit(Arc<BreakerHandleGlobal<SortHandle>>),
     TopNEmit(Arc<BreakerHandleGlobal<TopNHandle>>),
     WindowEmit(Arc<BreakerHandleGlobal<WindowHandle>>),
+    PartitionAggregateWindowEmit(Arc<PartitionAggregateEmitGlobal>),
     SetOperationEmit(Arc<BreakerHandleGlobal<SetOperationHandle>>),
     CteScan(Arc<BreakerHandleGlobal<CteHandle>>),
     DelimScan(Arc<BreakerHandleGlobal<DelimHandle>>),
@@ -230,6 +232,7 @@ impl SourceGlobal {
             Self::SortEmit(_) => "SortEmit",
             Self::TopNEmit(_) => "TopNEmit",
             Self::WindowEmit(_) => "WindowEmit",
+            Self::PartitionAggregateWindowEmit(_) => "PartitionAggregateWindowEmit",
             Self::SetOperationEmit(_) => "SetOperationEmit",
             Self::CteScan(_) => "CteScan",
             Self::DelimScan(_) => "DelimScan",
@@ -262,6 +265,7 @@ pub enum SourceLocal {
     SortEmit(SortEmitSourceLocal),
     TopNEmit(TopNEmitSourceLocal),
     WindowEmit(WindowEmitSourceLocal),
+    PartitionAggregateWindowEmit(PartitionAggregateEmitLocal),
     SetOperationEmit(SetOperationEmitSourceLocal),
     CteScan(CteScanSourceLocal),
     DelimScan(DelimScanSourceLocal),
@@ -309,6 +313,7 @@ impl SourceLocal {
             Self::SortEmit(_) => "SortEmit",
             Self::TopNEmit(_) => "TopNEmit",
             Self::WindowEmit(_) => "WindowEmit",
+            Self::PartitionAggregateWindowEmit(_) => "PartitionAggregateWindowEmit",
             Self::SetOperationEmit(_) => "SetOperationEmit",
             Self::CteScan(_) => "CteScan",
             Self::DelimScan(_) => "DelimScan",

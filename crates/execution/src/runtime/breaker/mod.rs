@@ -11,6 +11,7 @@ pub mod delim;
 pub mod external_table;
 pub mod join;
 pub mod materialized;
+pub mod partition_aggregate_window;
 pub mod recursive;
 pub mod registry;
 pub mod set_operation;
@@ -39,6 +40,9 @@ pub use join::{
     JoinProbeSpillBuffer, JoinRuntimeFilterBuilder, JoinSpillState, JoinSpillStats, ProbeSpillSet,
 };
 pub use materialized::{FoundBits, MaterializedHandle, MaterializedReader};
+pub use partition_aggregate_window::{
+    PartitionAggregatePendingSpillReclaimer, PartitionAggregateWindowHandle,
+};
 pub use recursive::{RecursiveDedupSet, RecursiveTableHandle};
 pub use registry::{
     BreakerHandleMetadata, BreakerHandleRegistry, HandleRef, RuntimeBreakerHandle,

@@ -11,6 +11,7 @@ pub(crate) enum BreakerDispatch {
     Aggregate(AggregateSpec),
     SetOperation(SetOperationSpec),
     Window(WindowSpec),
+    PartitionAggregateWindow(PartitionAggregateWindowSpec),
     HashJoin(HashJoinSpec),
     NestedLoopJoin(NestedLoopJoinSpec),
     SortRangeJoin(SortRangeJoinSpec),
@@ -33,6 +34,9 @@ impl<'a> PipelineLowerer<'a> {
             }
             PhysicalNodeKind::Window(spec) if !is_streaming_window_supported(spec) => {
                 Some(BreakerDispatch::Window(spec.clone()))
+            }
+            PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+                Some(BreakerDispatch::PartitionAggregateWindow(spec.clone()))
             }
             PhysicalNodeKind::HashJoin(spec) => Some(BreakerDispatch::HashJoin(spec.clone())),
             PhysicalNodeKind::NestedLoopJoin(spec) => {
@@ -64,6 +68,9 @@ impl<'a> PipelineLowerer<'a> {
             PhysicalNodeKind::Aggregate(spec) => Ok(BreakerDispatch::Aggregate(spec.clone())),
             PhysicalNodeKind::SetOperation(spec) => Ok(BreakerDispatch::SetOperation(spec.clone())),
             PhysicalNodeKind::Window(spec) => Ok(BreakerDispatch::Window(spec.clone())),
+            PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+                Ok(BreakerDispatch::PartitionAggregateWindow(spec.clone()))
+            }
             PhysicalNodeKind::HashJoin(spec) => Ok(BreakerDispatch::HashJoin(spec.clone())),
             PhysicalNodeKind::NestedLoopJoin(spec) => {
                 Ok(BreakerDispatch::NestedLoopJoin(spec.clone()))
@@ -99,6 +106,7 @@ impl<'a> PipelineLowerer<'a> {
             | PhysicalNodeKind::RecursiveCte(_) => true,
             PhysicalNodeKind::Aggregate(_) => true,
             PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
+            PhysicalNodeKind::PartitionAggregateWindow(_) => true,
             _ => false,
         }
     }
@@ -166,6 +174,17 @@ impl<'a> PipelineLowerer<'a> {
                 pipelines,
                 dependencies,
             ),
+            BreakerDispatch::PartitionAggregateWindow(spec) => self
+                .lower_partition_aggregate_window_to_sink(
+                    root,
+                    &spec,
+                    transforms,
+                    sink,
+                    sink_sharing,
+                    output,
+                    pipelines,
+                    dependencies,
+                ),
             BreakerDispatch::HashJoin(spec) => self.lower_hash_join_to_sink(
                 root,
                 &spec,

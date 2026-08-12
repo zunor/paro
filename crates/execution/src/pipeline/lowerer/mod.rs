@@ -22,8 +22,8 @@ use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
     DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec,
-    SortSpec, TopNSpec, WindowSpec,
+    PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide,
+    SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
@@ -34,6 +34,7 @@ use super::graph::{
     HashAggregateBuildSinkSpec, HashAggregateEmitSourceSpec, HashJoinBuildSinkSpec,
     HashJoinProbeSpec, HashJoinSpillReplaySourceSpec, HashJoinUnmatchedSourceSpec, InsertSinkSpec,
     MaterializeSinkSpec, MaterializedSourceSpec, NestedLoopJoinProbeSpec,
+    PartitionAggregateWindowBuildSinkSpec, PartitionAggregateWindowEmitSourceSpec,
     PerfectHashAggregateEmitSourceSpec, PerfectHashAggregateSinkSpec, PipelineDependency,
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,

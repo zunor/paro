@@ -7,8 +7,11 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::memory::{
     AccountedVec, AllocationLedger, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
-    MemoryResult,
+    MemoryReleaseHandle, MemoryResult,
 };
+use std::sync::Arc;
+
+use super::RetainedMemoryHandle;
 
 #[derive(Debug)]
 pub struct RetainedChunkVec {
@@ -91,6 +94,36 @@ impl RetainedChunkVec {
         }
         self.retained_bytes = 0;
         drained
+    }
+
+    /// Transfer retained allocation accounting together with the chunks.
+    ///
+    /// This is the publication boundary used by blocking operators: query
+    /// capacity was admitted while chunks were appended, and remains charged
+    /// continuously while an immutable runtime handle owns the drained data.
+    /// The returned handle must be retained for at least as long as the chunks.
+    pub fn drain_chunks_with_handle(&mut self) -> (Vec<Chunk>, Arc<RetainedMemoryHandle>) {
+        let mut drained = self.chunks.drain().collect::<Vec<_>>();
+        let retained_bytes = self.ledger.clear();
+        debug_assert_eq!(retained_bytes, self.retained_bytes);
+        self.retained_bytes = 0;
+        let release = MemoryReleaseHandle::new(
+            self.memory.owner(),
+            self.memory.domain(),
+            self.memory.tag(),
+            self.memory.accounting_class(),
+            retained_bytes,
+        );
+        let retained = Arc::new(RetainedMemoryHandle::new(release));
+        if retained_bytes > 0 {
+            for chunk in &mut drained {
+                for column in &mut chunk.data {
+                    let referenced = column.reference_with_lifetime_owner(retained.clone());
+                    *column = Arc::new(referenced);
+                }
+            }
+        }
+        (drained, retained)
     }
 
     pub fn as_slice(&self) -> &[Chunk] {
@@ -203,4 +236,70 @@ impl Drop for RetainedChunkVec {
 
 fn grant_for_context(memory: &MemoryAccountingContext) -> MemoryGrant {
     memory.grant().expect("zero-byte retained grant should fit")
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::allocator::MemoryTag;
+    use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, MemoryDomain};
+    use paro_common::test_utils::{test_chunk_from_vectors, test_i32_vector};
+
+    use crate::memory_runtime::QueryMemoryPool;
+
+    use super::RetainedChunkVec;
+
+    #[test]
+    fn publication_transfer_keeps_external_bytes_continuously_accounted() {
+        let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+        let memory = MemoryAccountingContext::from_owner(
+            pool.clone(),
+            MemoryDomain::Host,
+            MemoryTag::Window,
+            MemoryAccountingClass::NonRevocable,
+        );
+        let mut retained = RetainedChunkVec::new(memory);
+        retained
+            .push(test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]))
+            .expect("retain chunk");
+        let external_bytes = retained.retained_bytes();
+        assert!(external_bytes > 0);
+
+        let (chunks, handle) = retained.drain_chunks_with_handle();
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(handle.bytes(), external_bytes);
+        assert!(pool.issued_bytes() >= external_bytes);
+        drop(retained);
+        assert_eq!(pool.issued_bytes(), external_bytes);
+        drop(chunks);
+        assert_eq!(pool.issued_bytes(), external_bytes);
+        drop(handle);
+        assert_eq!(pool.issued_bytes(), 0);
+    }
+
+    #[test]
+    fn publication_lease_follows_escaping_vector_references() {
+        let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+        let memory = MemoryAccountingContext::from_owner(
+            pool.clone(),
+            MemoryDomain::Host,
+            MemoryTag::Window,
+            MemoryAccountingClass::NonRevocable,
+        );
+        let mut retained = RetainedChunkVec::new(memory);
+        retained
+            .push(test_chunk_from_vectors(vec![test_i32_vector(&[1, 2, 3])]))
+            .expect("retain chunk");
+        let external_bytes = retained.retained_bytes();
+        let (chunks, handle) = retained.drain_chunks_with_handle();
+        let escaped = Arc::clone(chunks[0].column(0).expect("retained column"));
+        drop(retained);
+
+        drop(chunks);
+        drop(handle);
+        assert_eq!(pool.issued_bytes(), external_bytes);
+        drop(escaped);
+        assert_eq!(pool.issued_bytes(), 0);
+    }
 }

@@ -33,15 +33,16 @@ use crate::physical::properties::{MemoryClass, PipelineProperties, PropertyRepai
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ChunkScanSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, FilterSpec,
-    LimitSpec, PerfectHashAggregatePlan, PostAggregateReductionSpec, ProjectSpec,
-    TableFunctionScanSpec, TopNSpec, ValuesSpec, WindowSpec,
+    LimitSpec, PartitionAggregateWindowSpec, PerfectHashAggregatePlan, PostAggregateReductionSpec,
+    ProjectSpec, TableFunctionScanSpec, TopNSpec, ValuesSpec, WindowSpec,
 };
 use crate::pipeline::graph::{
     ClientResultSpec, CrossProductBuildSinkSpec, CrossProductProbeSpec, CteMaterializeSinkSpec,
     CteScanSourceSpec, DelimCaptureSinkSpec, DelimScanSourceSpec, DependencyKind,
     HashAggregateBuildSinkSpec, HashAggregateEmitSourceSpec, HashJoinBuildSinkSpec,
     HashJoinProbeSpec, HashJoinSpillReplaySourceSpec, HashJoinUnmatchedSourceSpec,
-    MaterializeSinkSpec, MaterializedSourceSpec, PerfectHashAggregateEmitSourceSpec,
+    MaterializeSinkSpec, MaterializedSourceSpec, PartitionAggregateWindowBuildSinkSpec,
+    PartitionAggregateWindowEmitSourceSpec, PerfectHashAggregateEmitSourceSpec,
     PerfectHashAggregateSinkSpec, PipelineDependency, PipelineGraph, PipelineId, PipelineRoot,
     PipelineSpec, PropertyRepairSpec, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
     SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
@@ -473,6 +474,8 @@ mod completion_tests;
 mod hash_join_spill_tests;
 #[path = "join_tests.rs"]
 mod join_tests;
+#[path = "partition_aggregate_tests.rs"]
+mod partition_aggregate_tests;
 #[path = "post_rollup_tests.rs"]
 mod post_rollup_tests;
 #[path = "running_tests.rs"]

@@ -1279,6 +1279,7 @@ fn test_try_copy_selection_deep_dictionary_composition_materializes_fallibly() {
             provenance_id: None,
             source: DictionarySource::GenericSelection,
         }),
+        lifetime_owners: None,
     };
     let outer_selection = crate::test_utils::test_selection(vec![1, 3, 0]);
     let dictionary = Vector {
@@ -1296,6 +1297,7 @@ fn test_try_copy_selection_deep_dictionary_composition_materializes_fallibly() {
             provenance_id: None,
             source: DictionarySource::GenericSelection,
         }),
+        lifetime_owners: None,
     };
     let overlay = crate::test_utils::test_selection(vec![2, 0]);
     let mut selected = crate::test_utils::test_vector_with_capacity(LogicalType::Integer, 2);
@@ -1896,4 +1898,37 @@ fn test_try_set_len_rejects_flat_capacity_overflow() {
 
     assert!(error.to_string().contains("vector length exceeds capacity"));
     assert_eq!(vector.len(), 0);
+}
+
+#[derive(Debug)]
+struct LifetimeDropFlag(Arc<AtomicBool>);
+
+impl Drop for LifetimeDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn shallow_and_dictionary_references_retain_opaque_lifetime_owner() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let owner: Arc<dyn VectorLifetimeOwner> = Arc::new(LifetimeDropFlag(Arc::clone(&dropped)));
+    let source = crate::test_utils::test_i32_vector(&[10, 20, 30]);
+    let retained = source.reference_with_lifetime_owner(Arc::clone(&owner));
+    let inner = Vector::try_dictionary(
+        Arc::new(retained),
+        crate::test_utils::test_selection(vec![2, 0, 1]),
+    )
+    .expect("inner dictionary");
+    let outer = Vector::try_dictionary(
+        Arc::new(inner),
+        crate::test_utils::test_selection(vec![1, 0]),
+    )
+    .expect("canonicalized dictionary");
+    drop(owner);
+
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert_eq!(outer.get_i32(0), Some(10));
+    drop(outer);
+    assert!(dropped.load(Ordering::SeqCst));
 }

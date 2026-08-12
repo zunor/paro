@@ -16,7 +16,9 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::{Vector, VECTOR_SIZE};
 use paro_function::window::WindowFunctionType;
-use paro_planner::expression::{Expression, OrderByExpression, WindowExpression, WindowFrameBound};
+use paro_planner::expression::{
+    Expression, OrderByExpression, WindowExpression, WindowFrameBound, WindowInvocation,
+};
 
 use crate::physical::specs::WindowSpec;
 
@@ -186,14 +188,23 @@ fn validate_window_spec(spec: &WindowSpec) -> Result<()> {
 }
 
 fn validate_window_expression(expr: &WindowExpression) -> Result<()> {
+    expr.verify_bound_contract()?;
     for partition in &expr.partitions {
         validate_direct_value_expression(partition, "window partition")?;
     }
     for order in &expr.orders {
         validate_direct_value_expression(&order.expression, "window order")?;
     }
-    for child in &expr.children {
+    for child in expr.arguments() {
         validate_direct_value_expression(child, "window function argument")?;
+    }
+    if let WindowInvocation::Aggregate(aggregate) = &expr.invocation {
+        if let Some(filter) = &aggregate.filter {
+            validate_direct_value_expression(filter, "aggregate window filter")?;
+        }
+        for order in &aggregate.order_bys {
+            validate_direct_value_expression(&order.expression, "aggregate argument order")?;
+        }
     }
     if let WindowFrameBound::Offset(offset) = &expr.frame.start_bound {
         validate_direct_value_expression(offset, "window frame start")?;
@@ -393,7 +404,10 @@ fn write_partition_expression_results(
     output: &mut WindowOutputBuilder,
 ) -> Result<()> {
     let partition_size = partition.end - partition.start;
-    match expr.function.function_type {
+    let Some((function, _)) = expr.native_invocation() else {
+        return write_aggregate_results(chunks, sorted_keys, partition, expr_idx, expr, output);
+    };
+    match function.function_type {
         WindowFunctionType::RowNumber => {
             for absolute_idx in partition.start..partition.end {
                 let idx = absolute_idx - partition.start;
@@ -473,7 +487,7 @@ fn write_partition_expression_results(
         WindowFunctionType::Ntile => {
             let Some(bucket_count) = ntile_bucket_count(chunks, sorted_keys, partition, expr)?
             else {
-                let null = Value::Null(expr.return_type.clone());
+                let null = Value::Null(expr.return_type());
                 for absolute_idx in partition.start..partition.end {
                     output.set_window_value(expr_idx, absolute_idx, &null);
                 }
@@ -496,9 +510,6 @@ fn write_partition_expression_results(
         | WindowFunctionType::NthValue => {
             write_frame_value_results(chunks, sorted_keys, partition, expr_idx, expr, output)?;
         }
-        WindowFunctionType::Aggregate => {
-            write_aggregate_results(chunks, sorted_keys, partition, expr_idx, expr, output)?;
-        }
     }
     Ok(())
 }
@@ -511,21 +522,23 @@ fn write_lead_lag(
     expr: &WindowExpression,
     output: &mut WindowOutputBuilder,
 ) -> Result<()> {
-    let is_lead = expr.function.function_type == WindowFunctionType::Lead;
+    let is_lead = expr
+        .native_invocation()
+        .is_some_and(|(function, _)| function.function_type == WindowFunctionType::Lead);
     let values = frame::WindowValueIndex::build(chunks, sorted_keys, partition, expr)?;
 
     for absolute_idx in partition.start..partition.end {
-        let offset = if let Some(offset) = expr.children.get(1) {
+        let offset = if let Some(offset) = expr.arguments().get(1) {
             let value = value_from_expr(chunks, &sorted_keys[absolute_idx], offset);
             if value.is_null() {
-                let null = Value::Null(expr.return_type.clone());
+                let null = Value::Null(expr.return_type());
                 output.set_window_value(expr_idx, absolute_idx, &null);
                 continue;
             }
             value_to_i64(&value).ok_or_else(|| {
                 paro_error::invalid_input(format!(
                     "offset argument of {} must be an integer",
-                    expr.function.name
+                    expr.function_name()
                 ))
             })?
         } else {
@@ -537,10 +550,10 @@ fn write_lead_lag(
             value_argument(chunks, &sorted_keys[partition.start + target], expr)
         } else {
             let default = expr
-                .children
+                .arguments()
                 .get(2)
                 .map(|child| value_from_expr(chunks, &sorted_keys[absolute_idx], child))
-                .unwrap_or_else(|| Value::Null(expr.return_type.clone()));
+                .unwrap_or_else(|| Value::Null(expr.return_type()));
             default
         };
         output.set_window_value(expr_idx, absolute_idx, &value);
@@ -562,6 +575,7 @@ fn write_aggregate_results(
             sorted_keys,
             partition.start..partition.end,
             expr,
+            output.allocator.clone(),
         )?;
         for absolute_idx in partition.start..partition.end {
             output.set_window_value(expr_idx, absolute_idx, &value);
@@ -569,22 +583,19 @@ fn write_aggregate_results(
         return Ok(());
     }
 
+    // The generic sorted-window fallback deliberately favors one bound
+    // aggregate ABI over function-name-specific kernels. It recomputes each
+    // frame today; incremental state is a separate aggregate capability, not
+    // something the planner may infer from a display name.
     let frames = frame::WindowFrameIndex::build(chunks, sorted_keys, partition, expr)?;
-    if let Some(values) =
-        frame::try_aggregate_partition_fast(chunks, sorted_keys, partition, expr, &frames)?
-    {
-        for (row_offset, value) in values.iter().enumerate() {
-            output.set_window_value(expr_idx, partition.start + row_offset, value);
-        }
-        return Ok(());
-    }
-
     for absolute_idx in partition.start..partition.end {
+        let relative = frames.relative_range(absolute_idx);
         let value = frame::aggregate_window_value(
             chunks,
             sorted_keys,
-            frames.absolute_range(absolute_idx),
+            (partition.start + relative.start)..(partition.start + relative.end),
             expr,
+            output.allocator.clone(),
         )?;
         output.set_window_value(expr_idx, absolute_idx, &value);
     }
@@ -621,7 +632,7 @@ fn ntile_bucket_count(
     expr: &WindowExpression,
 ) -> Result<Option<usize>> {
     let argument = expr
-        .children
+        .arguments()
         .first()
         .ok_or_else(|| paro_error::internal("NTILE requires a bucket-count argument"))?;
     let value = value_from_expr(chunks, &sorted_keys[partition.start], argument);
@@ -663,10 +674,10 @@ fn ntile_bucket(row: usize, row_count: usize, bucket_count: usize) -> usize {
 }
 
 fn value_argument(chunks: &[Chunk], key: &WindowRowKey, expr: &WindowExpression) -> Value {
-    expr.children
+    expr.arguments()
         .first()
         .map(|child| value_from_expr(chunks, key, child))
-        .unwrap_or_else(|| Value::Null(expr.return_type.clone()))
+        .unwrap_or_else(|| Value::Null(expr.return_type()))
 }
 
 fn value_to_i64(value: &Value) -> Option<i64> {

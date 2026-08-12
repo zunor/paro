@@ -120,6 +120,7 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
         LogicalOperator::Window(window) => {
             let mut result = Ok(());
             for expression in &window.expressions {
+                expression.verify_bound_contract()?;
                 ExpressionIterator::enumerate_window_children(expression, |child| {
                     if result.is_ok() {
                         result = verify_expression(child);
@@ -177,6 +178,9 @@ fn verify_expression(expr: &Expression) -> Result<()> {
 }
 
 fn verify_expression_node(expr: &Expression, root: &Expression) -> Result<()> {
+    if let Expression::Window(window) = expr {
+        window.verify_bound_contract()?;
+    }
     if let Expression::Subquery(subquery) = expr {
         return Err(paro_error::internal(format!(
             "Planner verify failed: Expression::Subquery remained after flattening (state={:?}) in {root:?}",
@@ -208,9 +212,9 @@ mod tests {
 
     use crate::binder::context::BindContext;
     use crate::expression::{
-        ColumnRefExpression, ComparisonType, ConstantExpression, Expression, SubqueryExpression,
-        SubqueryPlanningState, SubqueryType, WindowExpression, WindowFrame, WindowFrameBound,
-        WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ComparisonType, ConstantExpression, Expression,
+        SubqueryExpression, SubqueryPlanningState, SubqueryType, WindowExpression, WindowFrame,
+        WindowFrameBound, WindowFrameType,
     };
     use crate::operator::projection::Projection;
     use crate::operator::{ColumnBinding, DependentJoin, ExpressionGet, LogicalOperator};
@@ -218,6 +222,7 @@ mod tests {
     use crate::plan::PlannedStatement;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
+    use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::window::WindowFunction;
 
     fn expression_get(table_index: usize) -> LogicalOperator {
@@ -283,25 +288,42 @@ mod tests {
     fn verify_rejects_subquery_in_window_frame_offset() {
         let ctx = BindContext::new();
         let child = wrap(&ctx, expression_get(0));
-        let window = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let window = Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(dummy_subquery_expr())),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
         let plan = LogicalOperator::Projection(Projection::new(42, child, vec![window]));
 
         let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
         assert!(err.to_string().contains("Expression::Subquery"));
+    }
+
+    #[test]
+    fn verify_rejects_aggregate_window_kernel_type_drift() {
+        let ctx = BindContext::new();
+        let child = wrap(&ctx, expression_get(0));
+        let aggregate =
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::Integer);
+        let window = Expression::Window(WindowExpression::aggregate(
+            aggregate,
+            vec![],
+            vec![],
+            WindowFrame::default(),
+        ));
+        let plan = LogicalOperator::Projection(Projection::new(42, child, vec![window]));
+
+        let err = verify_physical_planner_invariants(&plan).expect_err("verify should fail");
+        assert!(err.to_string().contains("return type mismatch"), "{err}");
     }
 
     #[test]

@@ -24,7 +24,9 @@
 //! ## Window Function Types
 //! - Ranking: ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST
 //! - Value: LEAD, LAG, FIRST_VALUE, LAST_VALUE, NTH_VALUE
-//! - Aggregate: SUM() OVER, AVG() OVER, COUNT() OVER, etc.
+//!
+//! Aggregate windows use the aggregate-function kernel directly and are not
+//! represented as native [`WindowFunction`] values.
 
 use std::any::Any;
 use std::fmt;
@@ -283,8 +285,6 @@ pub enum WindowFunctionType {
     LastValue,
     /// NTH_VALUE(expr, n) - nth value in frame.
     NthValue,
-    /// Aggregate function used as window function.
-    Aggregate,
 }
 
 impl fmt::Display for WindowFunctionType {
@@ -301,7 +301,6 @@ impl fmt::Display for WindowFunctionType {
             Self::FirstValue => write!(f, "FIRST_VALUE"),
             Self::LastValue => write!(f, "LAST_VALUE"),
             Self::NthValue => write!(f, "NTH_VALUE"),
-            Self::Aggregate => write!(f, "AGGREGATE"),
         }
     }
 }
@@ -330,10 +329,7 @@ impl WindowFunctionType {
 
     /// Check if this function requires frame bounds.
     pub fn needs_frame(&self) -> bool {
-        matches!(
-            self,
-            Self::FirstValue | Self::LastValue | Self::NthValue | Self::Aggregate
-        )
+        matches!(self, Self::FirstValue | Self::LastValue | Self::NthValue)
     }
 
     /// Check if this function requires peer bounds.

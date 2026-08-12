@@ -150,6 +150,11 @@ impl<'a> PipelineLowerer<'a> {
                         "aggregate must be lowered through its build/combine/emit breaker",
                     ));
                 }
+                PhysicalNodeKind::PartitionAggregateWindow(_) => {
+                    return Err(paro_error::internal(
+                        "partition aggregate window must lower through its build/finalize/emit breaker",
+                    ));
+                }
                 PhysicalNodeKind::Window(spec) => {
                     if !is_streaming_window_supported(spec) {
                         return Err(paro_error::not_implemented(

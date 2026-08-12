@@ -20,13 +20,13 @@ use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
     AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, AggregatePostReductionPass,
-    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CteFilterPusherPass,
-    CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass,
-    FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
-    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
-    JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass, ReorderFilterPass,
-    SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass,
-    TopNPass, UnusedColumnsPass,
+    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CorrelatedPartitionAggregatePass,
+    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
+    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
+    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
+    JoinFilterPushdownPass, JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass,
+    ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
+    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -184,6 +184,10 @@ impl Optimizer {
             // Canonicalize comma joins and mixed predicates before semantic
             // join rewrites and cost-based ordering inspect the graph.
             Box::new(MixedJoinPredicatePass),
+            // Reuse a detail stream for a correlated full-partition
+            // aggregate while the canonical delim shape and declared-key
+            // join graph are still explicit.
+            Box::new(CorrelatedPartitionAggregatePass),
             // Fold a scalar aggregate over a provably alpha-equivalent source
             // into the grouped aggregate before either branch receives stats.
             Box::new(AggregatePostReductionPass),

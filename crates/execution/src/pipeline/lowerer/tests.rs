@@ -1137,14 +1137,14 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             1,
-            vec![WindowExpression {
-                function: WindowFunction::rank(),
-                children: Vec::new(),
-                partitions: vec![Expression::Reference(ReferenceExpression::new(
+            vec![WindowExpression::native(
+                WindowFunction::rank(),
+                Vec::new(),
+                vec![Expression::Reference(ReferenceExpression::new(
                     0,
                     LogicalType::Integer,
                 ))],
-                orders: vec![OrderByExpression {
+                vec![OrderByExpression {
                     expression: Expression::Reference(ReferenceExpression::new(
                         1,
                         LogicalType::Integer,
@@ -1152,16 +1152,50 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::default(),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::default(),
+                false,
+            )],
             values,
         )),
     );
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
     generator.generate(&window).unwrap()
+}
+
+fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["grp".to_string(), "v".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let aggregate =
+        AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            1,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .unwrap()
 }
 
 fn rowset_spec_for_test() -> RowsetScanSpec {

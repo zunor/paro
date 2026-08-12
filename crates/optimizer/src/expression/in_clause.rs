@@ -3,7 +3,7 @@
 
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, Expression, OperatorExpression, OperatorType,
-    WindowFrameBound,
+    WindowExpression, WindowFrameBound, WindowInvocation,
 };
 use paro_planner::operator::{Filter, Join, LogicalOperator, Projection};
 use paro_planner::plan::LogicalPlan;
@@ -72,24 +72,11 @@ impl InClauseRewriter {
                 LogicalOperator::Distinct(distinct)
             }
             LogicalOperator::Window(mut window) => {
-                for expr in &mut window.expressions {
-                    expr.children = expr
-                        .children
-                        .drain(..)
-                        .map(|child| self.rewrite_expression(child))
-                        .collect();
-                    expr.partitions = expr
-                        .partitions
-                        .drain(..)
-                        .map(|child| self.rewrite_expression(child))
-                        .collect();
-                    for order in &mut expr.orders {
-                        order.expression = self.rewrite_expression(order.expression.clone());
-                    }
-                    rewrite_window_frame_bounds(expr, &mut |bound_expr| {
-                        self.rewrite_expression(bound_expr)
-                    });
-                }
+                window.expressions = window
+                    .expressions
+                    .into_iter()
+                    .map(|expression| self.rewrite_window_expression(expression))
+                    .collect();
                 LogicalOperator::Window(window)
             }
             LogicalOperator::Update(mut update) => {
@@ -245,24 +232,8 @@ impl InClauseRewriter {
                 }
                 Expression::Aggregate(aggregate)
             }
-            Expression::Window(mut window) => {
-                window.children = window
-                    .children
-                    .into_iter()
-                    .map(|child| self.rewrite_expression(child))
-                    .collect();
-                window.partitions = window
-                    .partitions
-                    .into_iter()
-                    .map(|partition| self.rewrite_expression(partition))
-                    .collect();
-                for order in &mut window.orders {
-                    order.expression = self.rewrite_expression(order.expression.clone());
-                }
-                rewrite_window_frame_bounds(&mut window, &mut |bound_expr| {
-                    self.rewrite_expression(bound_expr)
-                });
-                Expression::Window(window)
+            Expression::Window(window) => {
+                Expression::Window(self.rewrite_window_expression(window))
             }
             Expression::Subquery(mut subquery) => {
                 subquery.children = subquery
@@ -274,6 +245,41 @@ impl InClauseRewriter {
             }
             leaf => leaf,
         }
+    }
+
+    fn rewrite_window_expression(&mut self, mut window: WindowExpression) -> WindowExpression {
+        match &mut window.invocation {
+            WindowInvocation::Native { arguments, .. } => {
+                *arguments = std::mem::take(arguments)
+                    .into_iter()
+                    .map(|argument| self.rewrite_expression(argument))
+                    .collect();
+            }
+            WindowInvocation::Aggregate(aggregate) => {
+                aggregate.children = std::mem::take(&mut aggregate.children)
+                    .into_iter()
+                    .map(|child| self.rewrite_expression(child))
+                    .collect();
+                aggregate.filter = aggregate
+                    .filter
+                    .take()
+                    .map(|filter| Box::new(self.rewrite_expression(*filter)));
+                for order in &mut aggregate.order_bys {
+                    order.expression = self.rewrite_expression(order.expression.clone());
+                }
+            }
+        }
+        window.partitions = std::mem::take(&mut window.partitions)
+            .into_iter()
+            .map(|partition| self.rewrite_expression(partition))
+            .collect();
+        for order in &mut window.orders {
+            order.expression = self.rewrite_expression(order.expression.clone());
+        }
+        rewrite_window_frame_bounds(&mut window, &mut |bound_expr| {
+            self.rewrite_expression(bound_expr)
+        });
+        window
     }
 }
 

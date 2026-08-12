@@ -816,15 +816,15 @@ mod tests {
     use crate::binder::ir::CTEMaterialize;
     use crate::expression::{
         AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
-        ReferenceExpression,
+        ReferenceExpression, WindowExpression, WindowFrame,
     };
     use crate::operator::{
         Aggregate, CTERef, ColumnBinding, ExpressionGet, LogicalOperator, MaterializedCTE,
-        PostAggregateReduction, Projection,
+        PostAggregateReduction, Projection, Window,
     };
     use crate::plan::{CardinalityEstimate, LogicalPlan, NodeStats, PlanNodeId};
     use paro_function::aggregate::distributive::count::get_count_star_function;
-    use paro_function::aggregate::distributive::minmax::get_max_function;
+    use paro_function::aggregate::distributive::minmax::{get_max_function, get_min_function};
 
     fn expression_get(table_index: usize) -> LogicalOperator {
         LogicalOperator::ExpressionGet(ExpressionGet::new(
@@ -916,6 +916,62 @@ mod tests {
         assert_ne!(cte.cte_index, 4);
         assert_ne!(cte_ref.table_index, 2);
         assert_eq!(cte_ref.cte_index, cte.cte_index);
+    }
+
+    #[test]
+    fn deep_copy_remaps_aggregate_window_children_without_rebinding_kernel() {
+        let bind_context = BindContext::new();
+        let (minimum, _) = get_min_function()
+            .bind(&[LogicalType::Integer])
+            .expect("bind min(integer)");
+        let aggregate = AggregateExpression::new(
+            minimum,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(7, 0),
+                LogicalType::Integer,
+            ))],
+            LogicalType::Integer,
+        );
+        let original = LogicalPlan::new(
+            &bind_context,
+            LogicalOperator::Window(Window::new(
+                8,
+                vec![WindowExpression::aggregate(
+                    aggregate,
+                    vec![Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(7, 0),
+                        LogicalType::Integer,
+                    ))],
+                    vec![],
+                    WindowFrame::default(),
+                )],
+                LogicalPlan::new(&bind_context, expression_get(7)),
+            )),
+        );
+
+        let copy = deep_copy_plan(&original, bind_context.shared().as_ref());
+        let LogicalOperator::Window(copy) = copy.operator else {
+            panic!("expected window");
+        };
+        let LogicalOperator::ExpressionGet(child) = &copy.child.operator else {
+            panic!("expected expression get");
+        };
+        let aggregate = copy.expressions[0]
+            .aggregate_invocation()
+            .expect("aggregate invocation");
+        let Expression::ColumnRef(argument) = &aggregate.children[0] else {
+            panic!("expected aggregate argument");
+        };
+        let Expression::ColumnRef(partition) = &copy.expressions[0].partitions[0] else {
+            panic!("expected partition expression");
+        };
+        assert_ne!(copy.window_index, 8);
+        assert_eq!(argument.binding.table_index, child.table_index);
+        assert_eq!(partition.binding.table_index, child.table_index);
+        assert_eq!(aggregate.function.name, "min");
+        copy.expressions[0]
+            .verify_bound_contract()
+            .expect("copied bound contract");
     }
 
     #[test]

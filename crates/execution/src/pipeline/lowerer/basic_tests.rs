@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::physical::properties::MemoryClass;
 
 #[test]
 fn lowerer_builds_source_transform_sink_pipeline() {
@@ -115,6 +116,41 @@ fn grouped_aggregate_lowers_to_build_emit_breaker_pipelines() {
         DependencyKind::FinalizeBeforeEmit
     );
     assert_eq!(graph.handles.len(), 1);
+}
+
+#[test]
+fn partition_aggregate_window_lowers_to_build_emit_breaker_pipelines() {
+    let plan = partition_aggregate_window_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(matches!(
+        graph.pipelines[0].sink,
+        SinkSpec::PartitionAggregateWindowBuild(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[1].source,
+        SourceSpec::PartitionAggregateWindowEmit(_)
+    ));
+    assert_eq!(graph.dependencies.len(), 1);
+    assert_eq!(
+        graph.dependencies[0].kind,
+        DependencyKind::FinalizeBeforeEmit
+    );
+    assert_eq!(graph.handles.len(), 1);
+    assert_eq!(
+        graph.handles.iter().next().unwrap().kind,
+        BreakerHandleKind::PartitionAggregateWindow
+    );
+    let build = &graph.pipelines[0].properties;
+    assert_eq!(build.memory.class, MemoryClass::Blocking);
+    assert!(build.memory.revocable);
+    assert!(build.memory.spillable);
+    assert!(build.capabilities.supports_spill);
+    let emit = &graph.pipelines[1].properties;
+    assert_eq!(emit.memory.class, MemoryClass::Blocking);
+    assert!(!emit.capabilities.preserves_order);
 }
 
 #[test]

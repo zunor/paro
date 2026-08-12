@@ -12,7 +12,7 @@ use super::{
     AggregateExpression, CaseExpression, CastExpression, ColumnRefExpression, ComparisonExpression,
     ConjunctionExpression, ConstantExpression, ExpressionIterator, FunctionExpression,
     OperatorExpression, ParameterExpression, ReferenceExpression, SubqueryExpression,
-    WindowExpression, WindowFrameBound,
+    WindowExpression, WindowFrameBound, WindowInvocation,
 };
 use crate::operator::ColumnBinding;
 
@@ -242,45 +242,10 @@ impl Expression {
             (Expression::Parameter(a), Expression::Parameter(b)) => a.slot == b.slot,
             (Expression::Reference(a), Expression::Reference(b)) => a.index == b.index,
             (Expression::Aggregate(a), Expression::Aggregate(b)) => {
-                a.function.name == b.function.name
-                    && a.function.arguments == b.function.arguments
-                    && a.children.len() == b.children.len()
-                    && a.children
-                        .iter()
-                        .zip(&b.children)
-                        .all(|(ca, cb)| ca.equals(cb))
-                    && a.aggr_type == b.aggr_type
-                    && match (&a.filter, &b.filter) {
-                        (Some(af), Some(bf)) => af.equals(bf),
-                        (None, None) => true,
-                        _ => false,
-                    }
-                    && a.order_bys.len() == b.order_bys.len()
-                    && a.order_bys.iter().zip(&b.order_bys).all(|(ao, bo)| {
-                        ao.ascending == bo.ascending
-                            && ao.nulls_first == bo.nulls_first
-                            && ao.expression.equals(&bo.expression)
-                    })
-                    && match (&a.bind_info, &b.bind_info) {
-                        (Some(ad), Some(bd)) => ad.equals(&**bd),
-                        (None, None) => true,
-                        _ => false,
-                    }
-                    && match (&a.function.bind_data, &b.function.bind_data) {
-                        (Some(ad), Some(bd)) => ad.equals(&**bd),
-                        (None, None) => true,
-                        _ => false,
-                    }
+                aggregate_expressions_equal(a, b)
             }
             (Expression::Window(a), Expression::Window(b)) => {
-                a.function.name == b.function.name
-                    && a.function.function_type == b.function.function_type
-                    && a.function.arguments == b.function.arguments
-                    && a.children.len() == b.children.len()
-                    && a.children
-                        .iter()
-                        .zip(&b.children)
-                        .all(|(ca, cb)| ca.equals(cb))
+                window_invocations_equal(&a.invocation, &b.invocation)
                     && a.partitions.len() == b.partitions.len()
                     && a.partitions
                         .iter()
@@ -301,6 +266,67 @@ impl Expression {
             }
             _ => false,
         }
+    }
+}
+
+fn aggregate_expressions_equal(left: &AggregateExpression, right: &AggregateExpression) -> bool {
+    left.function.execution_semantics_equal(&right.function)
+        && left.return_type == right.return_type
+        && left.children.len() == right.children.len()
+        && left
+            .children
+            .iter()
+            .zip(&right.children)
+            .all(|(left, right)| left.equals(right))
+        && left.aggr_type == right.aggr_type
+        && match (&left.filter, &right.filter) {
+            (Some(left), Some(right)) => left.equals(right),
+            (None, None) => true,
+            _ => false,
+        }
+        && left.order_bys.len() == right.order_bys.len()
+        && left
+            .order_bys
+            .iter()
+            .zip(&right.order_bys)
+            .all(|(left, right)| {
+                left.ascending == right.ascending
+                    && left.nulls_first == right.nulls_first
+                    && left.expression.equals(&right.expression)
+            })
+        && match (&left.bind_info, &right.bind_info) {
+            (Some(left), Some(right)) => left.equals(&**right),
+            (None, None) => true,
+            _ => false,
+        }
+}
+
+fn window_invocations_equal(left: &WindowInvocation, right: &WindowInvocation) -> bool {
+    match (left, right) {
+        (
+            WindowInvocation::Native {
+                function: left_function,
+                arguments: left_arguments,
+            },
+            WindowInvocation::Native {
+                function: right_function,
+                arguments: right_arguments,
+            },
+        ) => {
+            left_function.name == right_function.name
+                && left_function.function_type == right_function.function_type
+                && left_function.arguments == right_function.arguments
+                && left_function.return_type == right_function.return_type
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments
+                    .iter()
+                    .zip(right_arguments)
+                    .all(|(left, right)| left.equals(right))
+        }
+        (WindowInvocation::Aggregate(left), WindowInvocation::Aggregate(right)) => {
+            aggregate_expressions_equal(left, right)
+        }
+        _ => false,
     }
 }
 
@@ -366,25 +392,24 @@ mod tests {
     }
 
     fn window_expression(start_bound: WindowFrameBound) -> Expression {
-        Expression::Window(WindowExpression {
-            function: WindowFunction::first_value(LogicalType::Integer),
-            children: vec![int_column(0)],
-            partitions: vec![int_column(1)],
-            orders: vec![OrderByExpression {
+        Expression::Window(WindowExpression::native(
+            WindowFunction::first_value(LogicalType::Integer),
+            vec![int_column(0)],
+            vec![int_column(1)],
+            vec![OrderByExpression {
                 expression: int_column(2),
                 ascending: true,
                 nulls_first: false,
             }],
-            frame: WindowFrame {
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound,
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::Integer,
-        })
+            false,
+        ))
     }
 
     #[test]
@@ -448,6 +473,27 @@ mod tests {
     }
 
     #[test]
+    fn extract_aggregates_preserves_window_owned_aggregate_kernel() {
+        let aggregate =
+            AggregateExpression::new(get_count_star_function(), vec![], LogicalType::BigInt);
+        let mut expression = Expression::Window(WindowExpression::aggregate(
+            aggregate,
+            vec![int_column(0)],
+            vec![],
+            WindowFrame::default(),
+        ));
+        let mut aggregates = Vec::new();
+
+        expression.extract_aggregates_in_place(&mut aggregates, 0);
+
+        assert!(aggregates.is_empty());
+        let Expression::Window(window) = expression else {
+            panic!("expected aggregate window");
+        };
+        assert!(window.aggregate_invocation().is_some());
+    }
+
+    #[test]
     fn extract_windows_reuses_semantically_equal_outputs() {
         let mut first = window_expression(WindowFrameBound::CurrentRow);
         let mut second = first.clone();
@@ -471,7 +517,7 @@ mod tests {
         let Expression::Window(window) = &mut first else {
             unreachable!();
         };
-        window.children = vec![random_call()];
+        *window.arguments_mut() = vec![random_call()];
         let mut second = first.clone();
         let mut windows = Vec::new();
 

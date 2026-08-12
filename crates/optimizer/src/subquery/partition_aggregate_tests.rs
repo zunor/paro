@@ -1,0 +1,481 @@
+use std::sync::Arc;
+
+use paro_catalog::catalog::Catalog;
+use paro_catalog::entry::{
+    AggregateFunctionCatalogEntry, ColumnDefinition, Constraint, CreateTableInfo, OnCreateConflict,
+    ScalarFunctionCatalogEntry, TableCatalogEntry,
+};
+use paro_catalog::mvcc::CatalogSnapshot;
+use paro_catalog::search_path::CatalogSearchEntry;
+use paro_common::types::LogicalType;
+use paro_context::{test_support::TestStatementContextBuilder, QueryResources};
+use paro_function::aggregate::distributive::{
+    avg::get_avg_function, minmax::get_min_function, sum::get_sum_function,
+};
+use paro_function::scalar::cast::{
+    decimal_casts, numeric_casts, BindCastInput, BoundCastInfo, CastFunctionSet,
+};
+use paro_function::scalar::ScalarFunctionSet;
+use paro_planner::expression::{ColumnRefExpression, Expression};
+use paro_planner::operator::LogicalOperator;
+use paro_planner::operator::{ColumnBinding, Projection};
+use paro_planner::planner::Planner;
+use paro_storage::table::table_factory::TableFactory;
+
+use super::partition_aggregate::CorrelatedPartitionAggregate;
+use crate::optimizer::Optimizer;
+
+#[test]
+fn tpch_q02_and_q17_reuse_the_detail_source() {
+    std::thread::Builder::new()
+        .name("tpch-correlated-partition-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(assert_tpch_rewrites)
+        .expect("spawn optimizer test")
+        .join()
+        .expect("optimizer test");
+}
+
+fn assert_tpch_rewrites() {
+    let session = setup_session();
+    for (query, sql) in [
+        (
+            "q02",
+            include_str!("../../../../benchmark/workloads/tpch/sql/q02.sql"),
+        ),
+        (
+            "q17",
+            include_str!("../../../../benchmark/workloads/tpch/sql/q17.sql"),
+        ),
+    ] {
+        let statement = paro_parser::parse_one(sql).expect("parse").stmt;
+        let mut planner = Planner::new(session.clone());
+        planner.create_plan(statement).expect("plan");
+        let planned = planner.take_plan().expect("logical plan");
+        let mut optimizer = Optimizer::new(planner.binder.clone(), session.clone());
+        let optimized = optimizer.optimize(planned).expect("optimize");
+        let inspection = inspect_plan(&optimized);
+        assert_eq!(inspection.windows, 1, "{query}: {optimized:#?}");
+        assert_eq!(inspection.delim_joins, 0, "{query}: {optimized:#?}");
+        assert_eq!(inspection.gets_named("part"), 1, "{query}: {optimized:#?}");
+        let common = if query == "q02" {
+            "partsupp"
+        } else {
+            "lineitem"
+        };
+        assert_eq!(inspection.gets_named(common), 1, "{query}: {optimized:#?}");
+    }
+}
+
+fn setup_session() -> Arc<paro_context::StatementContext> {
+    let mut session = TestStatementContextBuilder::minimal()
+        .with_current_database("paro")
+        .with_search_path(vec![
+            CatalogSearchEntry::schema_only("pg_catalog"),
+            CatalogSearchEntry::schema_only("public"),
+        ])
+        .with_visible_version(u64::MAX)
+        .build();
+    let mut casts = CastFunctionSet::new();
+    casts.register_cast(
+        LogicalType::BigInt,
+        LogicalType::Integer,
+        BoundCastInfo::fixed(numeric_casts::int64_to_int32),
+    );
+    casts.register_bind_function(decimal_casts::bind_decimal_casts);
+    casts.register_bind_function(bind_literals);
+    let context = Arc::get_mut(&mut session).expect("fresh context");
+    context.services = Arc::new(QueryResources {
+        infra: context.services.infra.clone(),
+        cast_functions: Arc::new(casts),
+        graph_index: context.services.graph_index.clone(),
+        python_runtime: context.services.python_runtime.clone(),
+        governance: context.services.governance.clone(),
+        plan_cache: context.services.plan_cache.clone(),
+        connection_info: context.services.connection_info.clone(),
+    });
+
+    let catalog = session.catalog();
+    catalog.initialize(false);
+    let transaction = CatalogSnapshot::permanent_writer(u64::MAX);
+    let schema = catalog
+        .get_schema(&transaction, "public")
+        .expect("public schema");
+    for operator in ["=", "<", "*", "/"] {
+        let mut set = ScalarFunctionSet::new(operator.to_string());
+        if matches!(operator, "*" | "/") {
+            paro_function::scalar::operators::arithmetic::register_arithmetic_functions(&mut set);
+        } else {
+            paro_function::scalar::operators::comparison::register_comparison_functions(&mut set);
+        }
+        schema
+            .create_scalar_function(
+                &transaction,
+                Arc::new(ScalarFunctionCatalogEntry::new(
+                    "paro".to_string(),
+                    "public".to_string(),
+                    set,
+                    schema.object_id_allocator().allocate(),
+                    0,
+                )),
+                OnCreateConflict::ReplaceOnConflict,
+            )
+            .expect("install scalar");
+    }
+    for function in [get_min_function(), get_avg_function(), get_sum_function()] {
+        schema
+            .create_aggregate_function(
+                &transaction,
+                Arc::new(AggregateFunctionCatalogEntry::new(
+                    "paro".to_string(),
+                    "public".to_string(),
+                    function,
+                    schema.object_id_allocator().allocate(),
+                    0,
+                )),
+                OnCreateConflict::ReplaceOnConflict,
+            )
+            .expect("install aggregate");
+    }
+
+    let decimal = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    install_table(
+        &schema,
+        &transaction,
+        "part",
+        vec![
+            ("p_partkey", LogicalType::BigInt),
+            ("p_name", LogicalType::Varchar),
+            ("p_mfgr", LogicalType::Varchar),
+            ("p_brand", LogicalType::Varchar),
+            ("p_type", LogicalType::Varchar),
+            ("p_size", LogicalType::Integer),
+            ("p_container", LogicalType::Varchar),
+            ("p_retailprice", decimal.clone()),
+            ("p_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "partsupp",
+        vec![
+            ("ps_partkey", LogicalType::BigInt),
+            ("ps_suppkey", LogicalType::BigInt),
+            ("ps_availqty", LogicalType::BigInt),
+            ("ps_supplycost", decimal.clone()),
+            ("ps_comment", LogicalType::Varchar),
+        ],
+        vec![0, 1],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "supplier",
+        vec![
+            ("s_suppkey", LogicalType::BigInt),
+            ("s_name", LogicalType::Varchar),
+            ("s_address", LogicalType::Varchar),
+            ("s_nationkey", LogicalType::Integer),
+            ("s_phone", LogicalType::Varchar),
+            ("s_acctbal", decimal.clone()),
+            ("s_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "nation",
+        vec![
+            ("n_nationkey", LogicalType::Integer),
+            ("n_name", LogicalType::Varchar),
+            ("n_regionkey", LogicalType::Integer),
+            ("n_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "region",
+        vec![
+            ("r_regionkey", LogicalType::Integer),
+            ("r_name", LogicalType::Varchar),
+            ("r_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "lineitem",
+        vec![
+            ("l_orderkey", LogicalType::BigInt),
+            ("l_partkey", LogicalType::BigInt),
+            ("l_suppkey", LogicalType::BigInt),
+            ("l_linenumber", LogicalType::BigInt),
+            ("l_quantity", decimal.clone()),
+            ("l_extendedprice", decimal.clone()),
+            ("l_discount", decimal.clone()),
+            ("l_tax", decimal.clone()),
+            ("l_returnflag", LogicalType::Varchar),
+            ("l_linestatus", LogicalType::Varchar),
+            ("l_shipdate", LogicalType::Date),
+            ("l_commitdate", LogicalType::Date),
+            ("l_receiptdate", LogicalType::Date),
+            ("l_shipinstruct", LogicalType::Varchar),
+            ("l_shipmode", LogicalType::Varchar),
+            ("l_comment", LogicalType::Varchar),
+        ],
+        vec![0, 3],
+    );
+    session
+}
+
+fn bind_literals(
+    input: &BindCastInput,
+    source: &LogicalType,
+    target: &LogicalType,
+) -> paro_common::error::Result<Option<BoundCastInfo>> {
+    match source {
+        LogicalType::IntegerLiteral(_) => input
+            .get_cast_function(&LogicalType::BigInt, target)
+            .map(Some),
+        LogicalType::StringLiteral => input
+            .get_cast_function(&LogicalType::Varchar, target)
+            .map(Some),
+        LogicalType::Null => Ok(Some(BoundCastInfo::null(target))),
+        _ => Ok(None),
+    }
+}
+
+fn install_table(
+    schema: &paro_catalog::entry::SchemaEntry,
+    transaction: &CatalogSnapshot,
+    name: &str,
+    columns: Vec<(&str, LogicalType)>,
+    unique: Vec<usize>,
+) {
+    let definitions = columns
+        .into_iter()
+        .map(|(name, ty)| ColumnDefinition::new(name.to_string(), ty))
+        .collect::<Vec<_>>();
+    let storage = Arc::new(
+        TableFactory::default()
+            .create_table(
+                &definitions
+                    .iter()
+                    .map(|c| c.logical_type.clone())
+                    .collect::<Vec<_>>(),
+            )
+            .expect("storage"),
+    );
+    let info = CreateTableInfo::new(
+        "paro".to_string(),
+        "public".to_string(),
+        name.to_string(),
+        definitions,
+    )
+    .with_constraints(vec![Constraint::unique(unique)]);
+    let table =
+        TableCatalogEntry::from_info(info, storage, schema.object_id_allocator().allocate(), 0)
+            .expect("table entry");
+    schema
+        .create_table(
+            transaction,
+            Arc::new(table),
+            OnCreateConflict::ErrorOnConflict,
+        )
+        .expect("install table");
+}
+
+#[derive(Default)]
+struct PlanInspection {
+    windows: usize,
+    delim_joins: usize,
+    gets: std::collections::HashMap<String, usize>,
+}
+
+impl PlanInspection {
+    fn gets_named(&self, name: &str) -> usize {
+        self.gets.get(name).copied().unwrap_or(0)
+    }
+}
+
+fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
+    fn visit(plan: &paro_planner::plan::LogicalPlan, result: &mut PlanInspection) {
+        match &plan.operator {
+            LogicalOperator::Window(_) => result.windows += 1,
+            LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
+                if !join.duplicate_eliminated_columns.is_empty() =>
+            {
+                result.delim_joins += 1;
+            }
+            LogicalOperator::Get(get) => {
+                if let Some(table) = &get.table {
+                    *result.gets.entry(table.base.base.name.clone()).or_default() += 1;
+                }
+            }
+            _ => {}
+        }
+        for child in plan.children() {
+            visit(child, result);
+        }
+    }
+
+    let mut result = PlanInspection::default();
+    visit(plan, &mut result);
+    result
+}
+
+#[test]
+fn unique_dimension_key_other_than_partition_key_does_not_rewrite() {
+    let session = setup_session();
+    let sql = "SELECT l.l_partkey \
+               FROM lineitem AS l, part AS p \
+               WHERE p.p_partkey = l.l_suppkey \
+                 AND p.p_brand = 'Brand#23' \
+                 AND l.l_quantity < ( \
+                     SELECT avg(i.l_quantity) \
+                     FROM lineitem AS i \
+                     WHERE i.l_partkey = l.l_partkey)";
+    let statement = paro_parser::parse_one(sql)
+        .expect("parse negative case")
+        .stmt;
+    let mut planner = Planner::new(session.clone());
+    planner.create_plan(statement).expect("plan negative case");
+    let planned = planner.take_plan().expect("logical negative plan");
+    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer.optimize(planned).expect("optimize negative case");
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(
+        inspection.windows, 0,
+        "unsafe partial partition: {optimized:#?}"
+    );
+    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+}
+
+#[test]
+fn nullable_correlation_without_keyed_dimension_does_not_rewrite() {
+    let optimized = optimize_sql(
+        "SELECT l.l_partkey \
+         FROM lineitem AS l \
+         WHERE l.l_quantity < ( \
+             SELECT avg(i.l_quantity) \
+             FROM lineitem AS i \
+             WHERE i.l_partkey = l.l_partkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(
+        inspection.windows, 0,
+        "nullable correlation: {optimized:#?}"
+    );
+    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+}
+
+#[test]
+fn extra_dimension_residual_does_not_rewrite() {
+    let optimized = optimize_sql(
+        "SELECT l.l_partkey \
+         FROM lineitem AS l, part AS p \
+         WHERE p.p_partkey = l.l_partkey \
+           AND p.p_brand IS NOT DISTINCT FROM l.l_returnflag \
+           AND l.l_quantity < ( \
+               SELECT avg(i.l_quantity) \
+               FROM lineitem AS i \
+               WHERE i.l_partkey = l.l_partkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.windows, 0, "dimension residual: {optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 2, "{optimized:#?}");
+}
+
+#[test]
+fn scalar_binding_visible_above_filter_does_not_rewrite() {
+    let session = setup_session();
+    let statement = paro_parser::parse_one(
+        "SELECT l.l_partkey \
+         FROM lineitem AS l, part AS p \
+         WHERE p.p_partkey = l.l_partkey \
+           AND p.p_brand = 'Brand#23' \
+           AND l.l_quantity < ( \
+               SELECT avg(i.l_quantity) \
+               FROM lineitem AS i \
+               WHERE i.l_partkey = l.l_partkey)",
+    )
+    .expect("parse binding escape")
+    .stmt;
+    let mut planner = Planner::new(session);
+    planner.create_plan(statement).expect("plan binding escape");
+    let mut plan = planner.take_plan().expect("logical binding escape plan");
+
+    let scalar_binding = find_single_scalar_binding(&plan).expect("correlated scalar binding");
+    let scalar_type = find_binding_type(&plan, scalar_binding).expect("scalar type");
+    let parent_index = planner.binder.bind_context.generate_table_index();
+    plan = paro_planner::plan::LogicalPlan::new(
+        &planner.binder.bind_context,
+        LogicalOperator::Projection(Projection::new(
+            parent_index,
+            plan,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                scalar_binding,
+                scalar_type,
+            ))],
+        )),
+    );
+
+    let rewritten =
+        CorrelatedPartitionAggregate::new(planner.binder.bind_context.clone()).optimize_plan(plan);
+    let inspection = inspect_plan(&rewritten);
+    assert_eq!(
+        inspection.windows, 0,
+        "escaping scalar binding: {rewritten:#?}"
+    );
+    assert_eq!(inspection.delim_joins, 1, "{rewritten:#?}");
+}
+
+fn find_single_scalar_binding(plan: &paro_planner::plan::LogicalPlan) -> Option<ColumnBinding> {
+    if let LogicalOperator::Join(paro_planner::operator::Join::Comparison(join)) = &plan.operator {
+        if join.join_type == paro_planner::operator::JoinType::Single {
+            return join.right.get_column_bindings().first().copied();
+        }
+    }
+    plan.children()
+        .into_iter()
+        .find_map(find_single_scalar_binding)
+}
+
+fn find_binding_type(
+    plan: &paro_planner::plan::LogicalPlan,
+    binding: ColumnBinding,
+) -> Option<LogicalType> {
+    plan.get_column_bindings()
+        .into_iter()
+        .zip(plan.types())
+        .find_map(|(candidate, ty)| (candidate == binding).then_some(ty))
+        .or_else(|| {
+            plan.children()
+                .into_iter()
+                .find_map(|child| find_binding_type(child, binding))
+        })
+}
+
+fn optimize_sql(sql: &str) -> paro_planner::plan::LogicalPlan {
+    let session = setup_session();
+    let statement = paro_parser::parse_one(sql)
+        .expect("parse negative case")
+        .stmt;
+    let mut planner = Planner::new(session.clone());
+    planner.create_plan(statement).expect("plan negative case");
+    let planned = planner.take_plan().expect("logical negative plan");
+    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+    optimizer.optimize(planned).expect("optimize negative case")
+}

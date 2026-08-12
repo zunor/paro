@@ -42,4 +42,5 @@ pub use reference_expression::ReferenceExpression;
 pub use subquery_expression::{SubqueryExpression, SubqueryPlanningState, SubqueryType};
 pub use window_expression::{
     OrderByExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+    WindowInvocation,
 };

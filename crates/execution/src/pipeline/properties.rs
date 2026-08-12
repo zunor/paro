@@ -68,13 +68,25 @@ impl PipelinePropertyAccumulator {
     }
 
     pub fn close_with_sink(mut self, sink: &SinkSpec) -> PipelinePropertyBuild {
-        if let SinkSpec::PerfectHashAggregate(spec) = sink {
-            if let Some(plan) = spec.spec.perfect_hash.as_ref() {
-                self.capabilities.parallelism = self
-                    .capabilities
-                    .parallelism
-                    .merge(Parallelism::bounded(plan.max_local_tables));
+        match sink {
+            SinkSpec::PerfectHashAggregate(spec) => {
+                if let Some(plan) = spec.spec.perfect_hash.as_ref() {
+                    self.capabilities.parallelism = self
+                        .capabilities
+                        .parallelism
+                        .merge(Parallelism::bounded(plan.max_local_tables));
+                }
             }
+            SinkSpec::PartitionAggregateWindowBuild(_) => {
+                // Local and merged payload/state can be atomically moved to
+                // raw radix partitions. Finalization then works one bounded
+                // partition at a time and publishes reclaiming output stores.
+                self.memory.class = self.memory.class.max(MemoryClass::Blocking);
+                self.memory.revocable = true;
+                self.memory.spillable = true;
+                self.capabilities.supports_spill = true;
+            }
+            _ => {}
         }
         let required = sink.required_properties();
         let repair =
@@ -185,6 +197,14 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
         | SourceSpec::ExternalTable(_) => {
             properties.provided.ordering = OrderingProperty::Preserved;
             properties.capabilities.parallelism = Parallelism::unbounded();
+            properties.memory.class = MemoryClass::Blocking;
+        }
+        SourceSpec::PartitionAggregateWindowEmit(_) => {
+            // Retained batches are claimed dynamically by parallel workers;
+            // the detail rows are complete but have no physical order.
+            properties.provided.ordering = OrderingProperty::Unordered;
+            properties.capabilities.parallelism = Parallelism::unbounded();
+            properties.capabilities.preserves_order = false;
             properties.memory.class = MemoryClass::Blocking;
         }
         SourceSpec::WindowEmit(_) => {

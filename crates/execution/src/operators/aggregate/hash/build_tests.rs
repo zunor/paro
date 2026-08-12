@@ -186,7 +186,7 @@ fn mixed_spilled_payload_and_global_state_writes_bounded_output() {
     let mut payload_spill = AggregatePayloadSpillBuffer::new(
         query.session.buffer_pool().clone(),
         spilled_payload.types(),
-        aggregate_payload_spill_radix_bits(1),
+        aggregate_spill_radix_bits(1),
         table_memory,
     )
     .expect("payload spill");
@@ -315,7 +315,7 @@ fn mixed_spilled_payload_and_serialized_string_state_writes_bounded_output() {
     let mut payload_spill = AggregatePayloadSpillBuffer::new(
         query.session.buffer_pool().clone(),
         spilled_payload.types(),
-        aggregate_payload_spill_radix_bits(1),
+        aggregate_spill_radix_bits(1),
         table_memory,
     )
     .expect("payload spill");

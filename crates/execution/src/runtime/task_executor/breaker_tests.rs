@@ -218,19 +218,18 @@ fn topn_breaker_graph(input_rows: Vec<Vec<Expression>>, limit: usize) -> Pipelin
 fn partitioned_window_spec() -> WindowSpec {
     WindowSpec {
         window_index: 1,
-        expressions: vec![WindowExpression {
-            function: WindowFunction::rank(),
-            children: Vec::new(),
-            partitions: vec![reference(0, LogicalType::Integer)],
-            orders: vec![OrderByExpression {
+        expressions: vec![WindowExpression::native(
+            WindowFunction::rank(),
+            Vec::new(),
+            vec![reference(0, LogicalType::Integer)],
+            vec![OrderByExpression {
                 expression: reference(1, LogicalType::Integer),
                 ascending: true,
                 nulls_first: false,
             }],
-            frame: WindowFrame::default(),
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        }]
+            WindowFrame::default(),
+            false,
+        )]
         .into_boxed_slice(),
         input_width: 2,
         output_names: Box::new(["grp".to_string(), "v".to_string(), "rank".to_string()]),
@@ -304,7 +303,7 @@ fn window_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
     }
 }
 
-fn run_two_stage_breaker(
+pub(super) fn run_two_stage_breaker(
     graph: PipelineGraph,
     query: &QueryRuntimeContext,
     thread: &ThreadContext,
@@ -330,7 +329,7 @@ fn run_two_stage_breaker(
     run_to_done(&mut emit, query, thread, wake, &mut profiler);
 }
 
-fn run_two_stage_breaker_with_profile(
+pub(super) fn run_two_stage_breaker_with_profile(
     graph: PipelineGraph,
     query: &QueryRuntimeContext,
     thread: &ThreadContext,

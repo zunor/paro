@@ -282,6 +282,61 @@ impl<'a> PipelineLowerer<'a> {
         Ok(pushed.tail)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn lower_partition_aggregate_window_to_sink(
+        &mut self,
+        root: PhysicalPlanNodeId,
+        spec: &PartitionAggregateWindowSpec,
+        consumer_transforms: Vec<TransformSpec>,
+        sink: SinkSpec,
+        sink_sharing: SinkSharing,
+        output: RowType,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<PipelineId> {
+        spec.verify()?;
+        let child = self.only_child(root)?;
+        let breaker_output = self.plan.node(root).output.clone();
+        let handle = self.handles.register(
+            BreakerHandleKind::PartitionAggregateWindow,
+            breaker_output,
+            Default::default(),
+        );
+        let producer = self.lower_subtree_to_sink(
+            child,
+            SinkSpec::PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkSpec {
+                handle,
+                spec: spec.clone(),
+                required: Default::default(),
+            }),
+            SinkSharing::Exclusive,
+            self.plan.node(child).output.clone(),
+            pipelines,
+            dependencies,
+        )?;
+        self.handles.set_producer(handle, producer)?;
+
+        let pushed = self.push_pipeline(
+            SourceSpec::PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceSpec {
+                handle,
+                spec: spec.clone(),
+            }),
+            consumer_transforms,
+            sink,
+            sink_sharing,
+            output,
+            pipelines,
+            dependencies,
+        )?;
+        self.handles.add_consumer(handle, pushed.entry)?;
+        dependencies.push(PipelineDependency {
+            producer,
+            consumer: pushed.entry,
+            kind: DependencyKind::FinalizeBeforeEmit,
+        });
+        Ok(pushed.tail)
+    }
+
     pub(crate) fn lower_terminal_sink(
         &mut self,
         child: PhysicalPlanNodeId,

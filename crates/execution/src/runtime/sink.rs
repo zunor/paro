@@ -32,7 +32,7 @@ pub use crate::operators::set::{
 };
 pub use crate::operators::sort::build::SortBuildSinkExec;
 pub use crate::operators::sort::topn_build::TopNBuildSinkExec;
-pub use crate::operators::window::build::WindowBuildSinkExec;
+pub use crate::operators::window::{PartitionAggregateWindowBuildSinkExec, WindowBuildSinkExec};
 
 #[derive(Debug)]
 pub enum SinkExec {
@@ -45,6 +45,7 @@ pub enum SinkExec {
     SortBuild(SortBuildSinkExec),
     TopNBuild(TopNBuildSinkExec),
     WindowBuild(WindowBuildSinkExec),
+    PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkExec),
     SetOperationInput(SetOperationInputSinkExec),
     CteMaterialize(CteMaterializeSinkExec),
     DelimCapture(DelimCaptureSinkExec),
@@ -69,6 +70,7 @@ impl SinkExec {
             Self::SortBuild(_) => "SORT_BUILD",
             Self::TopNBuild(_) => "TOP_N_BUILD",
             Self::WindowBuild(_) => "WINDOW_BUILD",
+            Self::PartitionAggregateWindowBuild(_) => "PARTITION_AGGREGATE_WINDOW_BUILD",
             Self::SetOperationInput(_) => "SET_OPERATION_INPUT",
             Self::CteMaterialize(_) => "CTE_MATERIALIZE",
             Self::DelimCapture(_) => "DELIM_CAPTURE",
@@ -94,6 +96,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.create_global(ctx),
             Self::TopNBuild(exec) => exec.create_global(ctx),
             Self::WindowBuild(exec) => exec.create_global(ctx),
+            Self::PartitionAggregateWindowBuild(exec) => exec.create_global(ctx),
             Self::SetOperationInput(exec) => exec.create_global(ctx),
             Self::CteMaterialize(exec) => exec.create_global(ctx),
             Self::DelimCapture(exec) => exec.create_global(ctx),
@@ -123,6 +126,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.create_local(ctx, global),
             Self::TopNBuild(exec) => exec.create_local(ctx, global),
             Self::WindowBuild(exec) => exec.create_local(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.create_local(ctx, global),
             Self::SetOperationInput(exec) => exec.create_local(ctx, global),
             Self::CteMaterialize(exec) => exec.create_local(ctx, global),
             Self::DelimCapture(exec) => exec.create_local(ctx, global),
@@ -154,6 +158,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.consume(ctx, global, local, input),
             Self::TopNBuild(exec) => exec.consume(ctx, global, local, input),
             Self::WindowBuild(exec) => exec.consume(ctx, global, local, input),
+            Self::PartitionAggregateWindowBuild(exec) => exec.consume(ctx, global, local, input),
             Self::SetOperationInput(exec) => exec.consume(ctx, global, local, input),
             Self::CteMaterialize(exec) => exec.consume(ctx, global, local, input),
             Self::DelimCapture(exec) => exec.consume(ctx, global, local, input),
@@ -184,6 +189,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.merge_local(ctx, global, local),
             Self::TopNBuild(exec) => exec.merge_local(ctx, global, local),
             Self::WindowBuild(exec) => exec.merge_local(ctx, global, local),
+            Self::PartitionAggregateWindowBuild(exec) => exec.merge_local(ctx, global, local),
             Self::SetOperationInput(exec) => exec.merge_local(ctx, global, local),
             Self::CteMaterialize(exec) => exec.merge_local(ctx, global, local),
             Self::DelimCapture(exec) => exec.merge_local(ctx, global, local),
@@ -213,6 +219,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.prepare_finish(ctx, global),
             Self::TopNBuild(exec) => exec.prepare_finish(ctx, global),
             Self::WindowBuild(exec) => exec.prepare_finish(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.prepare_finish(ctx, global),
             Self::SetOperationInput(exec) => exec.prepare_finish(ctx, global),
             Self::CteMaterialize(exec) => exec.prepare_finish(ctx, global),
             Self::DelimCapture(exec) => exec.prepare_finish(ctx, global),
@@ -242,6 +249,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.finish_work(ctx, global),
             Self::TopNBuild(exec) => exec.finish_work(ctx, global),
             Self::WindowBuild(exec) => exec.finish_work(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.finish_work(ctx, global),
             Self::SetOperationInput(exec) => exec.finish_work(ctx, global),
             Self::CteMaterialize(exec) => exec.finish_work(ctx, global),
             Self::DelimCapture(exec) => exec.finish_work(ctx, global),
@@ -271,6 +279,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.finish(ctx, global),
             Self::TopNBuild(exec) => exec.finish(ctx, global),
             Self::WindowBuild(exec) => exec.finish(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.finish(ctx, global),
             Self::SetOperationInput(exec) => exec.finish(ctx, global),
             Self::CteMaterialize(exec) => exec.finish(ctx, global),
             Self::DelimCapture(exec) => exec.finish(ctx, global),

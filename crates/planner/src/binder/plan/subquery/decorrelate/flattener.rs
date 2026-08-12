@@ -788,11 +788,11 @@ impl DependentJoinFlattener {
         let child_column_count = child.get_column_bindings().len();
 
         let row_number_function = WindowFunction::row_number();
-        let row_number = WindowExpression {
-            function: row_number_function.clone(),
-            children: vec![],
-            partitions: self.delim_column_refs(base_binding),
-            orders: orders
+        let row_number = WindowExpression::native(
+            row_number_function.clone(),
+            vec![],
+            self.delim_column_refs(base_binding),
+            orders
                 .into_iter()
                 .map(|order| OrderByExpression {
                     expression: order.expression,
@@ -800,10 +800,9 @@ impl DependentJoinFlattener {
                     nulls_first: order.nulls_first,
                 })
                 .collect(),
-            frame: WindowFrame::get_default_frame(&row_number_function),
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        };
+            WindowFrame::get_default_frame(&row_number_function),
+            false,
+        );
 
         let window_index = self.next_table_index();
         let window = LogicalOperator::Window(Window::new(window_index, vec![row_number], child));
@@ -1237,25 +1236,10 @@ impl DependentJoinFlattener {
                     lateral_depth,
                 );
                 for expr in &mut window.expressions {
-                    expr.children = expr
-                        .children
-                        .drain(..)
-                        .map(|child| rewriter.rewrite_expression(child))
-                        .collect();
-                    expr.partitions = expr
-                        .partitions
-                        .drain(..)
-                        .map(|partition| rewriter.rewrite_expression(partition))
-                        .collect();
+                    ExpressionIterator::enumerate_window_children_mut(expr, |child| {
+                        *child = rewriter.rewrite_expression(child.clone());
+                    });
                     expr.partitions.extend(self.delim_column_refs(base_binding));
-                    expr.orders = expr
-                        .orders
-                        .drain(..)
-                        .map(|mut order| {
-                            order.expression = rewriter.rewrite_expression(order.expression);
-                            order
-                        })
-                        .collect();
                 }
                 let child_output_len = child.types().len();
                 let mut visible_columns = child_visible_columns;

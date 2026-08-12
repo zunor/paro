@@ -528,6 +528,7 @@ impl Verifier {
             LogicalOperator::Window(window) => {
                 let mut result = Ok(());
                 for expression in &window.expressions {
+                    expression.verify_bound_contract()?;
                     ExpressionIterator::enumerate_window_children(expression, |child| {
                         if result.is_ok() {
                             result = self.verify_expression(child);
@@ -562,6 +563,9 @@ impl Verifier {
     }
 
     fn verify_expression(&self, expr: &Expression) -> Result<()> {
+        if let Expression::Window(window) = expr {
+            window.verify_bound_contract()?;
+        }
         if let Expression::ColumnRef(column) = expr {
             return self.verify_column_ref(column);
         }

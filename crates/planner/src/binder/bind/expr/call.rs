@@ -148,8 +148,80 @@ fn bind_aggregate_function(
     filter: Option<Expr>,
     order_bys: Vec<OrderByExpr>,
 ) -> Result<Expression> {
+    Ok(Expression::Aggregate(bind_aggregate_invocation(
+        binder, schema, name, args, distinct, filter, order_bys,
+    )?))
+}
+
+/// Bind one native aggregate call into its complete execution-bearing IR.
+///
+/// Aggregate windows use this same entry point so catalog resolution, casts,
+/// bind data, and modifier semantics cannot diverge from grouped aggregates.
+pub(crate) fn bind_aggregate_invocation(
+    binder: &mut Binder,
+    schema: Option<&str>,
+    name: &str,
+    args: Vec<Expr>,
+    distinct: bool,
+    filter: Option<Expr>,
+    order_bys: Vec<OrderByExpr>,
+) -> Result<AggregateExpression> {
+    bind_aggregate_invocation_in_context(
+        binder,
+        schema,
+        name,
+        args,
+        distinct,
+        filter,
+        order_bys,
+        AggregateInvocationContext::Grouped,
+    )
+}
+
+/// Bind an aggregate whose input is evaluated after query-level grouping and
+/// before window execution.
+pub(crate) fn bind_window_aggregate_invocation(
+    binder: &mut Binder,
+    schema: Option<&str>,
+    name: &str,
+    args: Vec<Expr>,
+    distinct: bool,
+    filter: Option<Expr>,
+    order_bys: Vec<OrderByExpr>,
+) -> Result<AggregateExpression> {
+    bind_aggregate_invocation_in_context(
+        binder,
+        schema,
+        name,
+        args,
+        distinct,
+        filter,
+        order_bys,
+        AggregateInvocationContext::Window,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum AggregateInvocationContext {
+    Grouped,
+    Window,
+}
+
+fn bind_aggregate_invocation_in_context(
+    binder: &mut Binder,
+    schema: Option<&str>,
+    name: &str,
+    args: Vec<Expr>,
+    distinct: bool,
+    filter: Option<Expr>,
+    order_bys: Vec<OrderByExpr>,
+    context: AggregateInvocationContext,
+) -> Result<AggregateExpression> {
     let cast_functions = binder.cast_functions.clone();
-    let mut aggregate_binder = AggregateBinder::new(binder);
+    let mut aggregate_binder = match context {
+        AggregateInvocationContext::Grouped => AggregateBinder::new(binder),
+        AggregateInvocationContext::Window => AggregateBinder::for_window(binder),
+    };
 
     let (mut bound_args, arg_types) = bind_arguments(args, |arg| aggregate_binder.bind(arg))?;
 
@@ -186,17 +258,15 @@ fn bind_aggregate_function(
             validate_non_literal_return_type(name, &return_type, true)?;
 
             let bind_info = agg_func.bind_data.clone();
-            Ok(Expression::Aggregate(
-                AggregateExpression::new(agg_func, bound_args, return_type)
-                    .with_aggr_type(if distinct {
-                        AggregateType::Distinct
-                    } else {
-                        AggregateType::NonDistinct
-                    })
-                    .with_filter(bound_filter)
-                    .with_order_bys(bound_order_bys)
-                    .with_bind_info(bind_info),
-            ))
+            Ok(AggregateExpression::new(agg_func, bound_args, return_type)
+                .with_aggr_type(if distinct {
+                    AggregateType::Distinct
+                } else {
+                    AggregateType::NonDistinct
+                })
+                .with_filter(bound_filter)
+                .with_order_bys(bound_order_bys)
+                .with_bind_info(bind_info))
         }
         ResolvedAggregateCallable::Routine(overload) => match overload.spec.family {
             RoutineFamily::AggregateBatch => Err(paro_error::not_implemented(format!(
@@ -255,7 +325,7 @@ where
     Ok(result)
 }
 
-fn apply_implicit_casts(
+pub(crate) fn apply_implicit_casts(
     bound_args: &mut [Expression],
     arg_types: &[LogicalType],
     target_types: &[LogicalType],

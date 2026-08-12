@@ -33,7 +33,7 @@ pub struct VectorOperations;
 pub use allocation_set::AllocationSet;
 pub use array_vector::{ArrayVector, VectorArrayBuffer};
 pub(crate) use definition::VectorResetState;
-pub use definition::{DictionaryInfo, DictionarySource, Vector};
+pub use definition::{DictionaryInfo, DictionarySource, Vector, VectorLifetimeOwner};
 pub use selection_vector::{
     reset_selection_materialization_count, selection_materialization_count, SelectionVector,
     ValidatedVectorSelection, VectorSelection,

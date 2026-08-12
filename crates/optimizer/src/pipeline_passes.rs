@@ -45,6 +45,7 @@ use crate::statistics::propagator::StatisticsPropagator;
 use crate::statistics::segment_pruner::SegmentPruner;
 use crate::subquery::delim_join_elimination::DelimJoinElimination;
 use crate::subquery::empty_result::EmptyResultPullup;
+use crate::subquery::partition_aggregate::CorrelatedPartitionAggregate;
 
 pub struct GraphStartSelectionPass;
 
@@ -220,6 +221,18 @@ impl Rewriter for EmptyResultPullupPass {
         _ctx: &mut OptimizationContext,
     ) -> Result<LogicalPlan> {
         Ok(EmptyResultPullup::new().optimize_plan(plan))
+    }
+}
+
+pub struct CorrelatedPartitionAggregatePass;
+
+impl Rewriter for CorrelatedPartitionAggregatePass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::CorrelatedPartitionAggregate
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(CorrelatedPartitionAggregate::new(ctx.bind_context.clone()).optimize_plan(plan))
     }
 }
 

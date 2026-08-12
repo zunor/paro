@@ -16,8 +16,9 @@ use crate::physical::specs::{
     DeleteSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec,
     ExternalTableSpec, FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec,
     GraphScanSpec, GraphShortestPathSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec,
-    ProjectSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
-    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    PartitionAggregateWindowSpec, ProjectSpec, RowsetScanSpec, SetOperationInputSide,
+    SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UpdateSpec,
+    ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -397,6 +398,7 @@ pub enum SourceSpec {
     SortEmit(SortEmitSourceSpec),
     TopNEmit(TopNEmitSourceSpec),
     WindowEmit(WindowEmitSourceSpec),
+    PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceSpec),
     SetOperationEmit(SetOperationEmitSourceSpec),
     CteScan(CteScanSourceSpec),
     DelimScan(DelimScanSourceSpec),
@@ -479,6 +481,10 @@ impl SourceSpec {
                 spec.spec.output_names.to_vec(),
                 spec.spec.output_types.to_vec(),
             ),
+            Self::PartitionAggregateWindowEmit(spec) => RowType::new(
+                spec.spec.output_names.to_vec(),
+                spec.spec.output_types.to_vec(),
+            ),
             Self::SetOperationEmit(spec) => RowType::new(
                 spec.spec.output_names.to_vec(),
                 spec.spec.output_types.to_vec(),
@@ -538,6 +544,9 @@ impl SourceSpec {
             }
             Self::WindowEmit(source) => {
                 visit(source.handle, BreakerHandleKind::Window)?;
+            }
+            Self::PartitionAggregateWindowEmit(source) => {
+                visit(source.handle, BreakerHandleKind::PartitionAggregateWindow)?;
             }
             Self::SetOperationEmit(source) => {
                 visit(source.handle, BreakerHandleKind::SetOperation)?;
@@ -709,6 +718,12 @@ pub struct TopNEmitSourceSpec {
 pub struct WindowEmitSourceSpec {
     pub handle: BreakerHandleId,
     pub spec: WindowSpec,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartitionAggregateWindowEmitSourceSpec {
+    pub handle: BreakerHandleId,
+    pub spec: PartitionAggregateWindowSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -892,6 +907,7 @@ pub enum SinkSpec {
     SortBuild(SortBuildSinkSpec),
     TopNBuild(TopNBuildSinkSpec),
     WindowBuild(WindowBuildSinkSpec),
+    PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkSpec),
     SetOperationInput(SetOperationInputSinkSpec),
     CteMaterialize(CteMaterializeSinkSpec),
     DelimCapture(DelimCaptureSinkSpec),
@@ -917,6 +933,7 @@ impl SinkSpec {
             Self::SortBuild(spec) => spec.required.clone(),
             Self::TopNBuild(spec) => spec.required.clone(),
             Self::WindowBuild(spec) => spec.required.clone(),
+            Self::PartitionAggregateWindowBuild(spec) => spec.required.clone(),
             Self::SetOperationInput(spec) => spec.required.clone(),
             Self::CteMaterialize(spec) => spec.required.clone(),
             Self::DelimCapture(spec) => spec.required.clone(),
@@ -961,6 +978,9 @@ impl SinkSpec {
             }
             Self::WindowBuild(sink) => {
                 visit(sink.handle, BreakerHandleKind::Window)?;
+            }
+            Self::PartitionAggregateWindowBuild(sink) => {
+                visit(sink.handle, BreakerHandleKind::PartitionAggregateWindow)?;
             }
             Self::SetOperationInput(sink) => {
                 visit(sink.handle, BreakerHandleKind::SetOperation)?;
@@ -1065,6 +1085,13 @@ pub struct TopNBuildSinkSpec {
 pub struct WindowBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: WindowSpec,
+    pub required: RequiredProperties,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartitionAggregateWindowBuildSinkSpec {
+    pub handle: BreakerHandleId,
+    pub spec: PartitionAggregateWindowSpec,
     pub required: RequiredProperties,
 }
 
