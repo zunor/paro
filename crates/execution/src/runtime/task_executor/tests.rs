@@ -226,6 +226,7 @@ fn count_star_expression() -> Expression {
 fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([]),
@@ -248,6 +249,7 @@ fn grouped_count_spec(perfect_hash: Option<PerfectHashAggregatePlan>) -> Aggrega
 fn ungrouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([]),
@@ -272,6 +274,7 @@ fn ungrouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 0,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Integer]),
@@ -304,6 +307,7 @@ fn grouped_distinct_count_spec() -> AggregateSpec {
         .expect("bind count(integer)");
     AggregateSpec {
         grouping_key_count: 1,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Integer, LogicalType::Integer]),

@@ -209,6 +209,17 @@ impl Verifier {
                         )));
                     }
                 }
+                if let Some((dependency_idx, _)) = agg
+                    .group_dependencies
+                    .iter()
+                    .enumerate()
+                    .find(|(_, dependency)| !dependency.is_valid_for(agg.groups.len()))
+                {
+                    return Err(paro_error::internal(format!(
+                        "Aggregate group dependency {dependency_idx} is invalid for {} groups",
+                        agg.groups.len()
+                    )));
+                }
                 let child_bindings = agg.child.get_column_bindings();
                 for expression in agg.groups.iter().chain(agg.aggregates.iter()) {
                     self.verify_expression_bindings(expression, &child_bindings, "Aggregate")?;

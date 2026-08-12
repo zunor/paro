@@ -418,6 +418,7 @@ mod tests {
     fn grouped_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer]),
@@ -439,6 +440,7 @@ mod tests {
     fn grouped_varchar_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Varchar]),

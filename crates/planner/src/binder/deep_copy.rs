@@ -331,6 +331,7 @@ impl LogicalPlanDeepCopy {
                     grouping_sets: a.grouping_sets.clone(),
                     aggregates: a.aggregates.clone(),
                     group_stats: a.group_stats.clone(),
+                    group_dependencies: a.group_dependencies.clone(),
                     returned_types: a.returned_types.clone(),
                     grouping_functions: a.grouping_functions.clone(),
                 })

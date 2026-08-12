@@ -12,6 +12,35 @@ use crate::plan::LogicalPlan;
 use paro_common::types::LogicalType;
 use paro_storage::statistics::BaseStatistics;
 
+/// A correctness-proven functional dependency between GROUP BY expressions.
+///
+/// Indices address [`Aggregate::groups`]. The optimizer derives these facts
+/// from declared keys and exact nullability; physical planning may use them to
+/// choose a narrower lookup representation, but never has to rediscover the
+/// underlying catalog proof.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GroupDependency {
+    pub determinants: Box<[usize]>,
+    pub dependents: Box<[usize]>,
+}
+
+impl GroupDependency {
+    /// Validate the positional proof before a physical representation relies
+    /// on it. Dependencies must be non-empty, in bounds, unique, and disjoint.
+    pub fn is_valid_for(&self, group_count: usize) -> bool {
+        if self.determinants.is_empty() || self.dependents.is_empty() {
+            return false;
+        }
+        let mut seen = std::collections::HashSet::with_capacity(
+            self.determinants.len() + self.dependents.len(),
+        );
+        self.determinants
+            .iter()
+            .chain(self.dependents.iter())
+            .all(|&index| index < group_count && seen.insert(index))
+    }
+}
+
 /// Aggregate performs groupings and aggregate function evaluations.
 #[derive(Debug)]
 pub struct Aggregate {
@@ -31,6 +60,8 @@ pub struct Aggregate {
     pub aggregates: Vec<Expression>,
     /// Optional per-group statistics populated by optimizer later.
     pub group_stats: Vec<Option<BaseStatistics>>,
+    /// Functional dependencies valid for this exact group-expression layout.
+    pub group_dependencies: Vec<GroupDependency>,
     /// Types of the output columns (groups + aggregates + grouping functions).
     pub returned_types: Vec<LogicalType>,
     /// GROUPING() function definitions, each entry is a list of group indexes.
@@ -54,6 +85,7 @@ impl Aggregate {
             groupings_index,
             child: Box::new(child),
             group_stats: vec![None; groups.len()],
+            group_dependencies: Vec::new(),
             groups,
             grouping_sets,
             aggregates,
@@ -66,6 +98,10 @@ impl Aggregate {
 
     pub fn recompute_returned_types(&mut self) {
         self.group_stats.resize(self.groups.len(), None);
+        // Callers use this method after changing group expressions. Any prior
+        // proof is positional and therefore stale until statistics propagation
+        // derives it again over the settled logical tree.
+        self.group_dependencies.clear();
         self.returned_types = self
             .groups
             .iter()

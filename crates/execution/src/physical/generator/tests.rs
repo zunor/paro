@@ -14,6 +14,7 @@ use paro_planner::expression::{
     ConjunctionType, ConstantExpression, Expression, OperatorExpression, OperatorType,
     ReferenceExpression, WindowExpression, WindowFrame,
 };
+use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
     Aggregate, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order,
@@ -378,6 +379,70 @@ fn aggregate_requires_complete_bounds_for_offset_keys() {
         lower_with_stats(incomplete, known).as_ref(),
         [GroupKeyEncoding::Identity, GroupKeyEncoding::Identity]
     );
+}
+
+#[test]
+fn aggregate_materializes_proven_dependent_groups_as_states() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string(), "name".to_string(), "comment".to_string()],
+            vec![
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::Varchar,
+            ],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![
+            ref_expr(0, LogicalType::BigInt),
+            ref_expr(1, LogicalType::Varchar),
+            ref_expr(2, LogicalType::Varchar),
+        ],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    aggregate.group_dependencies.push(GroupDependency {
+        determinants: Box::new([0]),
+        dependents: Box::new([1, 2]),
+    });
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+
+    assert_eq!(spec.grouping_key_count, 1);
+    assert_eq!(spec.groups.len(), 1);
+    assert_eq!(spec.aggregates.len(), 3);
+    assert_eq!(spec.state_output_projection.as_ref(), [0, 2, 3, 1]);
+    assert_eq!(
+        spec.output_types.as_ref(),
+        [
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+        ]
+    );
+    assert!(spec.perfect_hash.is_none());
 }
 
 #[test]

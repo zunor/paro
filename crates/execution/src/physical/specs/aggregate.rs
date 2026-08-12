@@ -25,6 +25,11 @@ pub enum GroupKeyEncoding {
 #[derive(Debug, Clone)]
 pub struct AggregateSpec {
     pub grouping_key_count: usize,
+    /// Map each SQL-visible output column to the internal finalized state
+    /// column. Empty means identity. A non-identity map lets correctness-proven
+    /// functionally dependent GROUP BY values live as `first` states instead
+    /// of participating in hash lookup, while preserving the logical schema.
+    pub state_output_projection: Box<[usize]>,
     /// Estimated rows entering the aggregate before local parallelism.
     /// Runtime hash tables treat this as a bounded capacity hint, never as a
     /// correctness constraint.

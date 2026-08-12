@@ -8,23 +8,27 @@ use crate::operators::aggregate::perfect_aggregate_hashtable::compile_direct_upd
 use crate::operators::aggregate::perfect_aggregate_hashtable::perfect_hash_occupancy_bytes;
 use crate::operators::aggregate::tuple_layout::TupleLayout;
 use crate::physical::specs::GroupKeyEncoding;
+use paro_function::aggregate::distributive::first_last::get_first_function;
+use paro_function::aggregate::AggregateFunction;
 use paro_planner::operator::DistinctType;
 use paro_storage::statistics::{NumericStats, StringStats};
 
-fn plan_group_key_encodings(aggregate: &LogicalAggregate) -> Box<[GroupKeyEncoding]> {
+fn plan_group_key_encodings(
+    aggregate: &LogicalAggregate,
+    group_indices: &[usize],
+) -> Box<[GroupKeyEncoding]> {
     let supports_physical_keys = aggregate.aggregates.iter().all(|expression| {
         matches!(expression, Expression::Aggregate(bound) if bound.order_bys.is_empty())
     });
-    let logical_types = aggregate
-        .groups
+    let logical_types = group_indices
         .iter()
+        .map(|&group_idx| &aggregate.groups[group_idx])
         .map(Expression::return_type)
         .collect::<Vec<_>>();
-    let mut encodings = aggregate
-        .groups
+    let mut encodings = group_indices
         .iter()
-        .enumerate()
-        .map(|(group_idx, expression)| {
+        .map(|&group_idx| {
+            let expression = &aggregate.groups[group_idx];
             if !supports_physical_keys {
                 return GroupKeyEncoding::Identity;
             }
@@ -56,6 +60,108 @@ fn plan_group_key_encodings(aggregate: &LogicalAggregate) -> Box<[GroupKeyEncodi
         .collect::<Vec<_>>();
     retain_row_reducing_encodings(&logical_types, &mut encodings);
     encodings.into_boxed_slice()
+}
+
+#[derive(Debug)]
+struct DependentGroupLayout {
+    lookup_groups: Vec<usize>,
+    dependent_groups: Vec<usize>,
+    dependent_functions: Vec<AggregateFunction>,
+    state_output_projection: Vec<usize>,
+}
+
+fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupLayout> {
+    if aggregate.groups.len() < 2
+        || !aggregate.grouping_functions.is_empty()
+        || !plain_grouping_set(aggregate)
+    {
+        return None;
+    }
+
+    let (dependency, dependent_functions, _) = aggregate
+        .group_dependencies
+        .iter()
+        .filter_map(|dependency| {
+            if !dependency.is_valid_for(aggregate.groups.len()) {
+                return None;
+            }
+            let functions = dependency
+                .dependents
+                .iter()
+                .map(|&group_idx| {
+                    let input_type = aggregate.groups[group_idx].return_type();
+                    let (function, targets) = get_first_function()
+                        .bind(std::slice::from_ref(&input_type))
+                        .ok()?;
+                    (targets.as_slice() == std::slice::from_ref(&input_type)
+                        && function.return_type == input_type)
+                        .then_some(function)
+                })
+                .collect::<Option<Vec<_>>>()?;
+            let removed_width =
+                dependency
+                    .dependents
+                    .iter()
+                    .try_fold(0usize, |width, &group_idx| {
+                        width.checked_add(aggregate.groups[group_idx].return_type().physical_size())
+                    })?;
+            Some((dependency, functions, removed_width))
+        })
+        .max_by_key(|(_, _, removed_width)| *removed_width)?;
+    let dependent_groups = dependency.dependents.to_vec();
+    if dependent_groups.is_empty() {
+        return None;
+    }
+    let dependent_set = dependent_groups
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<_>>();
+    let lookup_groups = (0..aggregate.groups.len())
+        .filter(|idx| !dependent_set.contains(idx))
+        .collect::<Vec<_>>();
+    if !dependency
+        .determinants
+        .iter()
+        .all(|idx| lookup_groups.contains(idx))
+    {
+        return None;
+    }
+
+    let original_aggregate_count = aggregate.aggregates.len();
+    let mut state_output_projection = Vec::with_capacity(aggregate.returned_types.len());
+    for group_idx in 0..aggregate.groups.len() {
+        if let Some(state_idx) = lookup_groups.iter().position(|idx| *idx == group_idx) {
+            state_output_projection.push(state_idx);
+        } else {
+            let dependent_idx = dependent_groups
+                .iter()
+                .position(|idx| *idx == group_idx)
+                .expect("every removed group is functionally dependent");
+            state_output_projection
+                .push(lookup_groups.len() + original_aggregate_count + dependent_idx);
+        }
+    }
+    state_output_projection
+        .extend((0..original_aggregate_count).map(|idx| lookup_groups.len() + idx));
+
+    Some(DependentGroupLayout {
+        lookup_groups,
+        dependent_groups,
+        dependent_functions,
+        state_output_projection,
+    })
+}
+
+fn plain_grouping_set(aggregate: &LogicalAggregate) -> bool {
+    aggregate.grouping_sets.is_empty()
+        || (aggregate.grouping_sets.len() == 1
+            && aggregate.grouping_sets[0].expressions.len() == aggregate.groups.len()
+            && aggregate.grouping_sets[0]
+                .expressions
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                == (0..aggregate.groups.len()).collect())
 }
 
 /// Drop physical encodings that do not reduce the aligned group-key prefix.
@@ -205,12 +311,17 @@ impl PhysicalPlanGenerator {
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.generate_node(aggregate.child.as_ref())?;
 
+        let dependent_layout = plan_dependent_groups(aggregate);
+        let group_indices = dependent_layout
+            .as_ref()
+            .map(|layout| layout.lookup_groups.clone())
+            .unwrap_or_else(|| (0..aggregate.groups.len()).collect());
+
         let mut projection_exprs = Vec::new();
         let mut payload_types = Vec::new();
-        let groups = aggregate
-            .groups
+        let groups = group_indices
             .iter()
-            .cloned()
+            .map(|&group_idx| aggregate.groups[group_idx].clone())
             .map(|expr| extract_payload_expression(expr, &mut projection_exprs, &mut payload_types))
             .collect::<Vec<_>>();
         let mut aggregate_inputs = Vec::with_capacity(aggregate.aggregates.len());
@@ -218,7 +329,26 @@ impl PhysicalPlanGenerator {
         let mut aggregate_orders = Vec::with_capacity(aggregate.aggregates.len());
         let mut aggregates = Vec::with_capacity(aggregate.aggregates.len());
 
-        for aggregate_expr in aggregate.aggregates.iter().cloned() {
+        let mut aggregate_expressions = aggregate.aggregates.clone();
+        if let Some(layout) = &dependent_layout {
+            for (&group_idx, function) in layout
+                .dependent_groups
+                .iter()
+                .zip(&layout.dependent_functions)
+            {
+                let input = aggregate.groups[group_idx].clone();
+                let input_type = input.return_type();
+                aggregate_expressions.push(Expression::Aggregate(
+                    paro_planner::expression::AggregateExpression::new(
+                        function.clone(),
+                        vec![input],
+                        input_type,
+                    ),
+                ));
+            }
+        }
+
+        for aggregate_expr in aggregate_expressions {
             let Expression::Aggregate(mut bound) = aggregate_expr else {
                 return Ok((
                     self.unsupported("AGGREGATE", "non-aggregate expression in aggregate list"),
@@ -281,17 +411,44 @@ impl PhysicalPlanGenerator {
         // Perfect hash is a fixed-size, planner-admitted representation rather
         // than a spillable hash table. `force_external` must not change the
         // physical plan; memory admission below remains the single gate.
-        let perfect_hash =
+        let perfect_hash = if dependent_layout.is_none() {
             can_use_perfect_hash_aggregate(aggregate, &groups, &aggregates).map(|info| {
                 PerfectHashAggregatePlan {
                     group_minima: info.group_minima.into_boxed_slice(),
                     group_cardinalities: info.group_cardinalities.into_boxed_slice(),
                     max_local_tables: 1,
                 }
-            });
+            })
+        } else {
+            None
+        };
 
+        let state_output_projection = dependent_layout
+            .as_ref()
+            .map(|layout| layout.state_output_projection.clone())
+            .unwrap_or_default();
+        let grouping_sets = if dependent_layout.is_some() {
+            Box::new([])
+        } else {
+            aggregate
+                .grouping_sets
+                .iter()
+                .map(|set| set.expressions.clone().into_boxed_slice())
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        };
+
+        let group_key_encodings = if dependent_layout.is_some() {
+            (0..groups.len())
+                .map(|_| GroupKeyEncoding::Identity)
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        } else {
+            plan_group_key_encodings(aggregate, &group_indices)
+        };
         let mut spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            state_output_projection: state_output_projection.into_boxed_slice(),
             estimated_input_rows: aggregate
                 .child
                 .stats
@@ -300,13 +457,8 @@ impl PhysicalPlanGenerator {
             projection_exprs: projection_exprs.into_boxed_slice(),
             payload_types: payload_types.into_boxed_slice(),
             groups: groups.into_boxed_slice(),
-            group_key_encodings: plan_group_key_encodings(aggregate),
-            grouping_sets: aggregate
-                .grouping_sets
-                .iter()
-                .map(|set| set.expressions.clone().into_boxed_slice())
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            group_key_encodings,
+            grouping_sets,
             aggregates: aggregates.into_boxed_slice(),
             grouping_functions: aggregate
                 .grouping_functions
@@ -373,6 +525,7 @@ impl PhysicalPlanGenerator {
 
         let spec = AggregateSpec {
             grouping_key_count: groups.len(),
+            state_output_projection: Box::new([]),
             estimated_input_rows: distinct
                 .child
                 .stats

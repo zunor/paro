@@ -910,6 +910,7 @@ mod tests {
     fn empty_aggregate_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 0,
+            state_output_projection: Box::new([]),
             estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([]),

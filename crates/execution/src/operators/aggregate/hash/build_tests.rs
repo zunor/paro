@@ -27,6 +27,7 @@ fn reference(index: usize, ty: LogicalType) -> Expression {
 fn grouped_count_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Integer]),
@@ -55,6 +56,7 @@ fn grouped_string_agg_spec() -> AggregateSpec {
         .expect("bind string_agg");
     AggregateSpec {
         grouping_key_count: 1,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Integer, LogicalType::Varchar]),

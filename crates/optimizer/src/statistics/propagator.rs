@@ -5,6 +5,7 @@
 
 use crate::filter::propagate_result::FilterPropagateResult;
 use crate::filter::pushdown::FilterPushdown;
+use paro_catalog::entry::ConstraintType;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
@@ -14,7 +15,8 @@ use paro_planner::expression::{
     WindowExpression,
 };
 use paro_planner::operator::{
-    empty_result::EmptyResult, ColumnBinding, Filter, Join, JoinComparisonType, LogicalOperator,
+    aggregate::GroupDependency, empty_result::EmptyResult, Aggregate, ColumnBinding, Filter, Join,
+    JoinComparisonType, LogicalOperator,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::statistics::{BaseStatistics, ColumnStatistics, NumericStats, StatsInfo};
@@ -65,6 +67,127 @@ fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
     }
 
     statistics
+}
+
+fn derive_group_dependencies(aggregate: &Aggregate) -> Vec<GroupDependency> {
+    if aggregate.groups.len() < 2
+        || !aggregate.grouping_functions.is_empty()
+        || !plain_grouping_set(aggregate)
+    {
+        return Vec::new();
+    }
+
+    let group_bindings = aggregate
+        .groups
+        .iter()
+        .map(|group| match group {
+            Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let mut dependencies = Vec::new();
+    collect_group_dependencies(
+        aggregate.child.as_ref(),
+        aggregate,
+        &group_bindings,
+        &mut dependencies,
+    );
+    dependencies
+}
+
+fn plain_grouping_set(aggregate: &Aggregate) -> bool {
+    aggregate.grouping_sets.is_empty()
+        || (aggregate.grouping_sets.len() == 1
+            && aggregate.grouping_sets[0].expressions.len() == aggregate.groups.len()
+            && aggregate.grouping_sets[0]
+                .expressions
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                == (0..aggregate.groups.len()).collect())
+}
+
+fn collect_group_dependencies(
+    plan: &LogicalPlan,
+    aggregate: &Aggregate,
+    group_bindings: &[Option<ColumnBinding>],
+    dependencies: &mut Vec<GroupDependency>,
+) {
+    if let LogicalOperator::Get(get) = &plan.operator {
+        if let Some(table) = &get.table {
+            for constraint in table.constraints().iter().filter(|constraint| {
+                matches!(
+                    constraint.constraint_type,
+                    ConstraintType::Unique | ConstraintType::PrimaryKey
+                ) && !constraint.columns.is_empty()
+            }) {
+                let Some(key_bindings) = constraint
+                    .columns
+                    .iter()
+                    .map(|column_id| {
+                        get.column_ids
+                            .iter()
+                            .position(|candidate| candidate == column_id)
+                            .map(|column_idx| ColumnBinding::new(get.table_index, column_idx))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+                let Some(determinants) = key_bindings
+                    .iter()
+                    .map(|binding| {
+                        group_bindings
+                            .iter()
+                            .position(|candidate| candidate == &Some(*binding))
+                    })
+                    .collect::<Option<Vec<_>>>()
+                else {
+                    continue;
+                };
+
+                // SQL UNIQUE permits multiple NULLs. Only a primary key or an
+                // exact no-NULL statistic is a functional determinant under
+                // GROUP BY's NULL-equality semantics.
+                if constraint.constraint_type != ConstraintType::PrimaryKey
+                    && determinants.iter().any(|&group_idx| {
+                        aggregate
+                            .group_stats
+                            .get(group_idx)
+                            .and_then(Option::as_ref)
+                            .is_none_or(|stats| stats.can_have_null())
+                    })
+                {
+                    continue;
+                }
+
+                let key_set = key_bindings
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::HashSet<_>>();
+                let dependents = group_bindings
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(group_idx, binding)| {
+                        binding
+                            .filter(|binding| {
+                                binding.table_index == get.table_index && !key_set.contains(binding)
+                            })
+                            .map(|_| group_idx)
+                    })
+                    .collect::<Vec<_>>();
+                if !dependents.is_empty() {
+                    dependencies.push(GroupDependency {
+                        determinants: determinants.into_boxed_slice(),
+                        dependents: dependents.into_boxed_slice(),
+                    });
+                }
+            }
+        }
+    }
+    for child in plan.children() {
+        collect_group_dependencies(child, aggregate, group_bindings, dependencies);
+    }
 }
 
 /// Propagates column statistics through the logical plan.
@@ -351,6 +474,8 @@ impl StatisticsPropagator {
                         self.statistics_map.insert(binding, stats);
                     }
                 }
+
+                agg.group_dependencies = derive_group_dependencies(&agg);
 
                 LogicalOperator::Aggregate(agg)
             }
@@ -883,17 +1008,95 @@ impl Default for StatisticsPropagator {
 mod tests {
     use std::sync::Arc;
 
+    use paro_catalog::entry::{
+        CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
+    };
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
+    use paro_function::aggregate::distributive::count::get_count_star_function;
     use paro_function::window::WindowFunction;
     use paro_planner::binder::context::BindContext;
-    use paro_planner::expression::{WindowExpression, WindowFrame};
-    use paro_planner::operator::{Aggregate, ExpressionGet, Projection, Window};
+    use paro_planner::expression::{AggregateExpression, WindowExpression, WindowFrame};
+    use paro_planner::operator::{Aggregate, ExpressionGet, Get, Projection, Window};
     use paro_storage::statistics::StringStats;
+    use paro_storage::table::table_factory::TableFactory;
 
     use super::*;
 
     fn make_test_session() -> Arc<StatementContext> {
         TestStatementContextBuilder::minimal().build()
+    }
+
+    fn keyed_group_aggregate(constraint: Constraint) -> Aggregate {
+        let types = vec![
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+        ];
+        let storage = Arc::new(TableFactory::default().create_table(&types).unwrap());
+        let info = CreateTableInfo::new(
+            "paro".to_string(),
+            "public".to_string(),
+            "customer".to_string(),
+            vec![
+                ColumnDefinition::new("key".to_string(), LogicalType::BigInt),
+                ColumnDefinition::new("name".to_string(), LogicalType::Varchar),
+                ColumnDefinition::new("comment".to_string(), LogicalType::Varchar),
+            ],
+        )
+        .with_constraints(vec![constraint]);
+        let table = Arc::new(
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(20_001), 0)
+                .unwrap(),
+        );
+        let child = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+            7,
+            vec!["key".to_string(), "name".to_string(), "comment".to_string()],
+            types.clone(),
+            table,
+        )));
+        let groups = types
+            .into_iter()
+            .enumerate()
+            .map(|(column_index, ty)| {
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(7, column_index),
+                    ty,
+                ))
+            })
+            .collect();
+        let count = Expression::Aggregate(AggregateExpression::new(
+            get_count_star_function(),
+            Vec::new(),
+            LogicalType::BigInt,
+        ));
+        Aggregate::new(8, 9, 10, child, groups, Vec::new(), vec![count], Vec::new())
+    }
+
+    #[test]
+    fn primary_key_proves_group_dependencies_without_runtime_statistics() {
+        let aggregate = keyed_group_aggregate(Constraint::primary_key(vec![0]));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+        let propagated = StatisticsPropagator::new().propagate(make_test_session(), plan);
+        let LogicalOperator::Aggregate(aggregate) = propagated.operator else {
+            panic!("expected aggregate root");
+        };
+        assert_eq!(
+            aggregate.group_dependencies,
+            [GroupDependency {
+                determinants: Box::new([0]),
+                dependents: Box::new([1, 2]),
+            }]
+        );
+    }
+
+    #[test]
+    fn nullable_unique_key_is_not_a_group_determinant() {
+        let mut aggregate = keyed_group_aggregate(Constraint::unique(vec![0]));
+        aggregate.group_stats[0] = Some(NumericStats::create_unknown(LogicalType::BigInt));
+        assert!(derive_group_dependencies(&aggregate).is_empty());
+
+        aggregate.group_stats[0] = Some(NumericStats::create_empty(LogicalType::BigInt));
+        assert_eq!(derive_group_dependencies(&aggregate).len(), 1);
     }
 
     #[test]

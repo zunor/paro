@@ -9,6 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::scalar::FunctionExecContext;
+use paro_planner::expression::Expression;
 use paro_storage::row::RowSpillReader;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
@@ -119,7 +120,13 @@ impl HashAggregateEmitSourceExec {
                     table,
                 } => {
                     let encoded_groups = has_encoded_group_keys(&self.spec);
-                    let produced = if encoded_groups {
+                    let projected_state = !self.spec.state_output_projection.is_empty();
+                    if encoded_groups && projected_state {
+                        return Err(paro_error::internal(
+                            "aggregate state projection cannot be combined with encoded group keys",
+                        ));
+                    }
+                    let produced = if encoded_groups || projected_state {
                         let scan_types = table.scan_output_types();
                         let scratch = local
                             .scan_chunk
@@ -133,8 +140,10 @@ impl HashAggregateEmitSourceExec {
                             local.having_selection.as_mut(),
                             ctx.query,
                         )?;
-                        if produced {
+                        if produced && encoded_groups {
                             decode_aggregate_output(&self.spec, scratch, output)?;
+                        } else if produced {
+                            project_aggregate_state_output(&self.spec, scratch, output)?;
                         }
                         produced
                     } else {
@@ -165,11 +174,14 @@ impl HashAggregateEmitSourceExec {
                             local.having_executor.as_mut(),
                             local.having_selection.as_mut(),
                         ) {
-                            let aggregate_types =
-                                &self.spec.output_types[self.spec.grouping_key_count
-                                    ..self.spec.grouping_key_count + self.spec.aggregates.len()];
+                            let aggregate_types = self
+                                .spec
+                                .aggregates
+                                .iter()
+                                .map(Expression::return_type)
+                                .collect::<Vec<_>>();
                             let mut aggregate_view = Chunk::try_init_empty(
-                                aggregate_types,
+                                &aggregate_types,
                                 scratch.allocator().clone(),
                             )?;
                             aggregate_view.reference_columns(scratch, &local.having_columns);
@@ -186,18 +198,26 @@ impl HashAggregateEmitSourceExec {
                             if selected_count == 0 {
                                 continue;
                             }
-                            if has_encoded_group_keys(&self.spec) {
+                            if has_encoded_group_keys(&self.spec)
+                                || !self.spec.state_output_projection.is_empty()
+                            {
                                 let filtered = local
                                     .scan_chunk
                                     .get_or_insert(Chunk::try_new(output.allocator().clone())?);
                                 ensure_source_output(filtered, &scratch.types(), VECTOR_SIZE)?;
                                 copy_selected_rows(scratch, filtered, selection, selected_count)?;
-                                decode_aggregate_output(&self.spec, filtered, output)?;
+                                if has_encoded_group_keys(&self.spec) {
+                                    decode_aggregate_output(&self.spec, filtered, output)?;
+                                } else {
+                                    project_aggregate_state_output(&self.spec, filtered, output)?;
+                                }
                             } else {
                                 copy_selected_rows(scratch, output, selection, selected_count)?;
                             }
                         } else if has_encoded_group_keys(&self.spec) {
                             decode_aggregate_output(&self.spec, scratch, output)?;
+                        } else if !self.spec.state_output_projection.is_empty() {
+                            project_aggregate_state_output(&self.spec, scratch, output)?;
                         } else {
                             copy_spilled_output_rows(scratch, output)?;
                         }
@@ -209,6 +229,53 @@ impl HashAggregateEmitSourceExec {
             local.work = None;
         }
     }
+}
+
+fn project_aggregate_state_output(
+    spec: &AggregateSpec,
+    source: &Chunk,
+    output: &mut Chunk,
+) -> Result<()> {
+    if spec.state_output_projection.len() != spec.output_types.len() {
+        return Err(paro_error::internal(format!(
+            "aggregate state output projection width mismatch: projection={} output={}",
+            spec.state_output_projection.len(),
+            spec.output_types.len()
+        )));
+    }
+    if source.size() > output.capacity() {
+        return Err(paro_error::internal(format!(
+            "aggregate projected output is too small: rows={} capacity={}",
+            source.size(),
+            output.capacity()
+        )));
+    }
+    for (output_idx, &source_idx) in spec.state_output_projection.iter().enumerate() {
+        let source_column = source.column(source_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "aggregate state projection source is out of bounds: output={output_idx} source={source_idx} columns={}",
+                source.column_count()
+            ))
+        })?;
+        let expected = spec
+            .output_types
+            .get(output_idx)
+            .ok_or_else(|| paro_error::internal("aggregate projected output type is missing"))?;
+        if source_column.logical_type() != expected {
+            return Err(paro_error::internal(format!(
+                "aggregate state projection type mismatch at output {output_idx}: expected={expected:?} actual={:?}",
+                source_column.logical_type()
+            )));
+        }
+        let output_column_count = output.column_count();
+        let output_column = output.data.get_mut(output_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "aggregate projected output column is missing: index={output_idx} columns={output_column_count}",
+            ))
+        })?;
+        *output_column = Arc::clone(source_column);
+    }
+    output.try_set_cardinality(source.size())
 }
 
 fn scan_table_batch(

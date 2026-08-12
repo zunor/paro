@@ -111,6 +111,7 @@ fn distinct_count_expression(input_idx: usize) -> Expression {
 fn distinct_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 0,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Integer]),
@@ -132,6 +133,7 @@ fn distinct_spec() -> AggregateSpec {
 fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 2,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([
@@ -164,6 +166,7 @@ fn grouped_distinct_grouping_set_spec() -> AggregateSpec {
 fn grouped_distinct_spec() -> AggregateSpec {
     AggregateSpec {
         grouping_key_count: 1,
+        state_output_projection: Box::new([]),
         estimated_input_rows: None,
         projection_exprs: Box::new([]),
         payload_types: Box::new([LogicalType::Varchar, LogicalType::Integer]),
