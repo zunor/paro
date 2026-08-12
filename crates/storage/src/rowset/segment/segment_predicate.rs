@@ -611,7 +611,7 @@ impl PredicateEvaluator {
                         .is_some_and(|value| comparisons.matches(value)),
                     PredicateColumnBatch::StorageDictionary(batch) => batch
                         .row_value(row_idx)
-                        .is_some_and(|value| comparisons.matches(&value)),
+                        .is_some_and(|value| comparisons.matches(value)),
                     PredicateColumnBatch::Decoded(vector) => match vector.logical_type() {
                         LogicalType::Blob => vector
                             .get_blob(row_idx)
@@ -638,7 +638,7 @@ impl PredicateEvaluator {
                         .is_some_and(|value| matcher.matches(value)),
                     PredicateColumnBatch::StorageDictionary(batch) => batch
                         .row_value(row_idx)
-                        .is_some_and(|value| matcher.matches(&value)),
+                        .is_some_and(|value| matcher.matches(value)),
                     PredicateColumnBatch::Decoded(vector) => vector
                         .get_string(row_idx)
                         .is_some_and(|value| matcher.matches(value.as_bytes())),

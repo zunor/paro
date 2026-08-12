@@ -265,7 +265,7 @@ impl StorageDictionaryPredicateBatch {
         let dictionary_len = dictionary.count() as usize;
         for code in 0..dictionary_len {
             let value = dictionary
-                .string_at(code as u32)
+                .value_ref_at(code as u32)
                 .ok_or_else(|| paro_error::data_corrupted("Storage dictionary entry is missing"))?;
             if let Some(width) = raw_width {
                 if value.len() != width {
@@ -275,7 +275,7 @@ impl StorageDictionaryPredicateBatch {
                     )));
                 }
             } else if matches!(logical_type, LogicalType::Varchar) && !source_utf8_verified {
-                std::str::from_utf8(&value).map_err(|_| {
+                std::str::from_utf8(value).map_err(|_| {
                     paro_error::data_corrupted("Storage dictionary VARCHAR is not valid UTF-8")
                 })?;
             }
@@ -335,17 +335,17 @@ impl StorageDictionaryPredicateBatch {
         self.utf8_verified
     }
 
-    pub(super) fn dictionary_value(&self, code: usize) -> Bytes {
+    pub(super) fn dictionary_value(&self, code: usize) -> &[u8] {
         self.dictionary
-            .string_at(code as u32)
+            .value_ref_at(code as u32)
             .expect("validated dictionary code")
     }
 
-    pub(super) fn row_value(&self, row_idx: usize) -> Option<Bytes> {
+    pub(super) fn row_value(&self, row_idx: usize) -> Option<&[u8]> {
         if self.is_null(row_idx) {
             return None;
         }
-        self.dictionary.string_at(self.code_at(row_idx))
+        self.dictionary.value_ref_at(self.code_at(row_idx))
     }
 
     pub(super) fn filter_codes(
@@ -515,7 +515,7 @@ impl PredicateColumnBatch {
                                 "Predicate dictionary value has an invalid fixed width",
                             ));
                         }
-                        values.extend_from_slice(&value);
+                        values.extend_from_slice(value);
                         nulls.push(0);
                     } else {
                         let end = values.len().checked_add(width).ok_or_else(|| {
@@ -549,7 +549,7 @@ impl PredicateColumnBatch {
             }
             Self::StorageDictionary(batch) => {
                 for &row_idx in rows {
-                    append_varlen_value(batch.row_value(row_idx).as_deref(), values, nulls)?;
+                    append_varlen_value(batch.row_value(row_idx), values, nulls)?;
                     row_ends.push(values.len());
                 }
                 Ok(true)

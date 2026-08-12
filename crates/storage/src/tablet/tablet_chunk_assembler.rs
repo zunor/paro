@@ -117,12 +117,14 @@ impl TabletReader {
                 let storage_provenance = col_batch.storage_dictionary.as_ref().map(|_| {
                     vector_decoder::storage_dictionary_provenance_id(rowset_id, segment_id, *col_id)
                 });
-                read_vectors.push(Arc::new(vector_decoder::decode_column_batch(
+                read_vectors.push(Arc::new(vector_decoder::decode_column_batch_cached(
                     ty,
                     col_batch,
                     physical_rows,
                     allocator.clone(),
                     storage_provenance,
+                    &self.storage_dictionary_cache,
+                    u64::from(*col_id),
                 )?));
                 continue;
             }

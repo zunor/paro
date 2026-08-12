@@ -172,7 +172,7 @@ impl VarlenMatcher {
             });
             if !cache_matches {
                 let matches = (0..batch.dictionary_len())
-                    .map(|code| self.matches(&batch.dictionary_value(code)))
+                    .map(|code| self.matches(batch.dictionary_value(code)))
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
                 *cache = Some(DictionaryPredicateCache {
@@ -557,7 +557,7 @@ impl VarlenConjunction {
             });
             if !cache_matches {
                 let matches = (0..batch.dictionary_len())
-                    .map(|code| self.matches(&batch.dictionary_value(code)))
+                    .map(|code| self.matches(batch.dictionary_value(code)))
                     .collect::<Vec<_>>()
                     .into_boxed_slice();
                 *cache = Some(DictionaryPredicateCache {

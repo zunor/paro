@@ -375,12 +375,24 @@ impl BinaryPlainPageDecoder {
 
     /// Get string at index.
     pub fn string_at(&self, idx: u32) -> Option<Bytes> {
+        let value = self.value_ref_at(idx)?;
+        let offset = value.as_ptr() as usize - self.data.as_ptr() as usize;
+        Some(self.data.slice(offset..offset + value.len()))
+    }
+
+    /// Borrow a validated value without cloning the page owner.
+    ///
+    /// The decoder owns the immutable page for the lifetime of the returned
+    /// slice. Predicate and dictionary kernels use this form in row loops so
+    /// reading a value does not perform shared-owner reference counting.
+    #[inline]
+    pub(crate) fn value_ref_at(&self, idx: u32) -> Option<&[u8]> {
         if !self.parsed || idx >= self.num_elements {
             return None;
         }
         let start = self.offset(idx) as usize;
         let end = self.offset(idx + 1) as usize;
-        Some(self.data.slice(start..end))
+        self.data.get(start..end)
     }
 
     /// Read the next batch of strings.

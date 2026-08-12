@@ -16,6 +16,7 @@ use super::schema_adapter::{build_reader_schema_adapters, RowsetSchemaAdapter};
 pub use super::tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
 use super::tablet_runtime::{TabletReadGuard, TabletRef, TabletSnapshotMaterialization};
 use super::tablet_schema::TabletSchemaRef;
+use crate::codec::vector_decoder::StorageDictionaryDecoderCache;
 use crate::primary_key::DeleteVector;
 use crate::rowset::segment::SegmentIterator;
 use crate::rowset::RowsetSharedPtr;
@@ -243,6 +244,10 @@ pub struct TabletReader {
     /// Allocator used to materialize output vectors/chunks.
     pub(super) allocator: Arc<dyn Allocator>,
 
+    /// Most recently decoded storage dictionary page per projected column.
+    /// Kept at reader scope because one physical page can feed many chunks.
+    pub(super) storage_dictionary_cache: StorageDictionaryDecoderCache,
+
     /// Snapshot guard pinned for the full reader lifetime.
     snapshot_guard: Option<TabletReadGuard>,
 
@@ -370,6 +375,7 @@ impl TabletReader {
             current_cursor: None,
             is_prepared: false,
             allocator,
+            storage_dictionary_cache: StorageDictionaryDecoderCache::default(),
             snapshot_guard: None,
             snapshot_materialization: None,
         })

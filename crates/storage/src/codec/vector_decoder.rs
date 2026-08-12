@@ -5,6 +5,7 @@ use crate::codec::{nested_payload_codec, physical_layout};
 use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
 use crate::rowset::encoding::{BinaryPlainPageDecoder, BinaryPlainPageSlice};
 use bytes::Bytes;
+use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -12,7 +13,74 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{
     DictionaryInfo, DictionarySource, SelectionVector, ValidatedVectorSelection, Vector,
 };
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// A bounded, reader-local cache for the decoded domain of storage dictionary
+/// batches. Storage scans can emit several logical batches backed by the same
+/// physical dictionary page. The code stream changes between those batches,
+/// but rebuilding the immutable dictionary child does not add information.
+///
+/// Each `(column slot, null representation)` retains only the most recently
+/// observed page, so memory is bounded by the reader projection rather than by
+/// the number of pages scanned.
+#[derive(Default)]
+pub(crate) struct StorageDictionaryDecoderCache {
+    entries: Mutex<HashMap<(u64, bool), CachedStorageDictionary>>,
+}
+
+struct CachedStorageDictionary {
+    encoded_dictionary: Bytes,
+    logical_type: LogicalType,
+    utf8_verified: bool,
+    dictionary_len: usize,
+    child: Arc<Vector>,
+}
+
+impl StorageDictionaryDecoderCache {
+    fn decoded_child(
+        &self,
+        cache_slot: u64,
+        logical_type: &LogicalType,
+        batch: &StorageDictionaryBatch,
+        has_null_slot: bool,
+        allocator: Arc<dyn Allocator>,
+        utf8_verified: bool,
+    ) -> Result<(Arc<Vector>, usize)> {
+        let key = (cache_slot, has_null_slot);
+        let mut entries = self.entries.lock();
+        if let Some(cached) = entries.get(&key) {
+            let same_allocation = cached.encoded_dictionary.as_ptr() == batch.dictionary.as_ptr()
+                && cached.encoded_dictionary.len() == batch.dictionary.len();
+            if same_allocation
+                && cached.logical_type == *logical_type
+                && cached.utf8_verified == utf8_verified
+            {
+                return Ok((Arc::clone(&cached.child), cached.dictionary_len));
+            }
+        }
+
+        let (child, dictionary_len) = decode_storage_dictionary_child(
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator,
+            utf8_verified,
+        )?;
+        let child = Arc::new(child);
+        entries.insert(
+            key,
+            CachedStorageDictionary {
+                encoded_dictionary: batch.dictionary.clone(),
+                logical_type: logical_type.clone(),
+                utf8_verified,
+                dictionary_len,
+                child: Arc::clone(&child),
+            },
+        );
+        Ok((child, dictionary_len))
+    }
+}
 
 pub(crate) fn build_vector_from_bytes(
     logical_type: &LogicalType,
@@ -126,19 +194,16 @@ pub(crate) fn storage_dictionary_provenance_id(
     mix(rowset_id) ^ mix(((segment_id as u64) << 32) | column_id as u64)
 }
 
-fn decode_storage_dictionary_batch(
+fn decode_storage_dictionary_child(
     logical_type: &LogicalType,
     batch: &StorageDictionaryBatch,
-    nulls: Option<&[u8]>,
-    rows: usize,
+    has_null_slot: bool,
     allocator: Arc<dyn Allocator>,
-    provenance_id: Option<u64>,
     utf8_verified: bool,
-) -> Result<Vector> {
+) -> Result<(Vector, usize)> {
     let mut dictionary_decoder = BinaryPlainPageDecoder::new(batch.dictionary.clone());
     dictionary_decoder.init()?;
     let dictionary_len = dictionary_decoder.count() as usize;
-    let has_null_slot = nulls.is_some();
     let unique_len = dictionary_len + usize::from(has_null_slot);
 
     let mut child = Vector::try_new(logical_type.clone(), unique_len.max(1), allocator.clone())?;
@@ -203,6 +268,40 @@ fn decode_storage_dictionary_batch(
         child.try_set_null(dictionary_len, true)?;
     }
     child.try_set_count(unique_len)?;
+    Ok((child, dictionary_len))
+}
+
+fn decode_storage_dictionary_batch(
+    logical_type: &LogicalType,
+    batch: &StorageDictionaryBatch,
+    nulls: Option<&[u8]>,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    provenance_id: Option<u64>,
+    utf8_verified: bool,
+    cache: Option<(&StorageDictionaryDecoderCache, u64)>,
+) -> Result<Vector> {
+    let has_null_slot = nulls.is_some();
+    let (child, dictionary_len) = if let Some((cache, cache_slot)) = cache {
+        cache.decoded_child(
+            cache_slot,
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator.clone(),
+            utf8_verified,
+        )?
+    } else {
+        let (child, dictionary_len) = decode_storage_dictionary_child(
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator.clone(),
+            utf8_verified,
+        )?;
+        (Arc::new(child), dictionary_len)
+    };
+    let unique_len = child.len();
 
     if batch.codes.len() % std::mem::size_of::<u32>() != 0 {
         return Err(paro_error::data_corrupted(
@@ -229,7 +328,7 @@ fn decode_storage_dictionary_batch(
             SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?;
         let selection = validate_storage_dictionary_selection(selection, child.len())?;
         return Vector::try_with_validated_dictionary(
-            Arc::new(child),
+            child,
             selection,
             DictionaryInfo {
                 unique_len,
@@ -261,7 +360,7 @@ fn decode_storage_dictionary_batch(
     let selection = SelectionVector::try_from_indices(selection, allocator)?;
     let selection = validate_storage_dictionary_selection(selection, child.len())?;
     Vector::try_with_validated_dictionary(
-        Arc::new(child),
+        child,
         selection,
         DictionaryInfo {
             unique_len,
@@ -325,6 +424,7 @@ pub(crate) fn decode_column_batch(
             allocator,
             storage_provenance_id,
             batch.has_verified_utf8(),
+            None,
         );
     }
 
@@ -355,6 +455,30 @@ pub(crate) fn decode_column_batch(
         }
     }
     Ok(vector)
+}
+
+pub(crate) fn decode_column_batch_cached(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    storage_provenance_id: Option<u64>,
+    cache: &StorageDictionaryDecoderCache,
+    cache_slot: u64,
+) -> Result<Vector> {
+    if let Some(storage_dictionary) = &batch.storage_dictionary {
+        return decode_storage_dictionary_batch(
+            logical_type,
+            storage_dictionary,
+            batch.nulls.as_deref(),
+            rows,
+            allocator,
+            storage_provenance_id,
+            batch.has_verified_utf8(),
+            Some((cache, cache_slot)),
+        );
+    }
+    decode_column_batch(logical_type, batch, rows, allocator, storage_provenance_id)
 }
 
 pub(crate) fn infer_batch_row_count(
@@ -986,6 +1110,7 @@ impl FromPrimitiveLe for f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rowset::encoding::BinaryPlainPageBuilder;
     use paro_common::allocator::default_allocator;
 
     fn encode_varlen(values: &[&[u8]]) -> Bytes {
@@ -1023,5 +1148,58 @@ mod tests {
         let blob = build_vector_from_bytes(&LogicalType::Blob, &encoded, 1, allocator)
             .expect("blob bytes need not be UTF-8");
         assert_eq!(blob.get_blob(0), Some([0xff, 0xfe].as_slice()));
+    }
+
+    #[test]
+    fn reader_cache_reuses_dictionary_child_across_code_batches() {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        assert!(builder.add_slice(b"alpha"));
+        assert!(builder.add_slice(b"beta"));
+        let dictionary = builder.finish().unwrap();
+        let make_batch = |codes: &[u32]| {
+            ColumnBatch::with_storage_dictionary(
+                dictionary.clone(),
+                Bytes::from(
+                    codes
+                        .iter()
+                        .flat_map(|code| code.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+            )
+            .with_verified_utf8()
+        };
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let cache = StorageDictionaryDecoderCache::default();
+
+        let first = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(&[0, 1, 0]),
+            3,
+            allocator.clone(),
+            Some(7),
+            &cache,
+            11,
+        )
+        .unwrap();
+        let second = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(&[1, 0]),
+            2,
+            allocator,
+            Some(7),
+            &cache,
+            11,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            first.child().expect("dictionary child"),
+            second.child().expect("dictionary child")
+        ));
+        assert_eq!(first.get_string(0), Some("alpha"));
+        assert_eq!(first.get_string(1), Some("beta"));
+        assert_eq!(second.get_string(0), Some("beta"));
+        assert_eq!(second.get_string(1), Some("alpha"));
     }
 }
