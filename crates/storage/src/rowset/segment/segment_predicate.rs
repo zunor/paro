@@ -4,7 +4,7 @@
 use super::fixed_predicate::{FixedComparisonValues, FixedConjunction};
 use super::predicate_column::{PredicateColumnAccess, PredicateColumnBatch, PredicateColumnReuse};
 use super::segment::Segment;
-use super::varlen_predicate::{VarlenConjunction, VarlenPrefixMembership};
+use super::varlen_predicate::{VarlenConjunction, VarlenMatcher};
 use crate::buffer::Prefetcher;
 use crate::index::{
     collect_predicate_columns, IndexEvaluator, Predicate, PredicateComparison, PredicateResult,
@@ -115,9 +115,9 @@ enum CompiledPredicate {
         column_idx: usize,
         comparisons: VarlenConjunction,
     },
-    VarlenPrefixIn {
+    VarlenMatch {
         column_idx: usize,
-        membership: VarlenPrefixMembership,
+        matcher: VarlenMatcher,
     },
     Generic {
         column_idx: usize,
@@ -466,7 +466,7 @@ impl PredicateEvaluator {
             CompiledPredicateTree::Leaf(
                 CompiledPredicate::FixedComparisons { .. }
                     | CompiledPredicate::VarlenComparisons { .. }
-                    | CompiledPredicate::VarlenPrefixIn { .. }
+                    | CompiledPredicate::VarlenMatch { .. }
             )
         )
     }
@@ -481,9 +481,9 @@ impl PredicateEvaluator {
                 comparisons,
                 ..
             }) => comparisons.evaluation_priority(),
-            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenPrefixIn {
-                membership, ..
-            }) => membership.evaluation_priority(),
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { matcher, .. }) => {
+                matcher.evaluation_priority()
+            }
             _ => (u8::MAX, usize::MAX),
         }
     }
@@ -501,7 +501,7 @@ impl PredicateEvaluator {
             CompiledPredicateTree::Leaf(
                 CompiledPredicate::FixedComparisons { .. }
                 | CompiledPredicate::VarlenComparisons { .. }
-                | CompiledPredicate::VarlenPrefixIn { .. },
+                | CompiledPredicate::VarlenMatch { .. },
             ) => unreachable!("constant comparisons returned above"),
         }
     }
@@ -521,7 +521,7 @@ impl PredicateEvaluator {
         let column_idx = match predicate {
             CompiledPredicate::FixedComparisons { column_idx, .. }
             | CompiledPredicate::VarlenComparisons { column_idx, .. }
-            | CompiledPredicate::VarlenPrefixIn { column_idx, .. } => *column_idx,
+            | CompiledPredicate::VarlenMatch { column_idx, .. } => *column_idx,
             CompiledPredicate::Generic { .. } | CompiledPredicate::FixedColumnComparison { .. } => {
                 return Err(paro_error::internal(
                     "Typed predicate batch path received a non-constant comparison",
@@ -540,8 +540,8 @@ impl PredicateEvaluator {
             CompiledPredicate::VarlenComparisons { comparisons, .. } => {
                 comparisons.filter_batch(batch, rows, selection, seed)
             }
-            CompiledPredicate::VarlenPrefixIn { membership, .. } => {
-                membership.filter_batch(batch, rows, selection, seed)
+            CompiledPredicate::VarlenMatch { matcher, .. } => {
+                matcher.filter_batch(batch, rows, selection, seed)
             }
             CompiledPredicate::Generic { .. } | CompiledPredicate::FixedColumnComparison { .. } => {
                 unreachable!("validated constant comparison above")
@@ -624,9 +624,9 @@ impl PredicateEvaluator {
                 };
                 Some(matches)
             }
-            CompiledPredicate::VarlenPrefixIn {
+            CompiledPredicate::VarlenMatch {
                 column_idx,
-                membership,
+                matcher,
             } => {
                 let batch = batches_by_col.get(*column_idx)?;
                 if batch.is_null(row_idx) {
@@ -635,13 +635,13 @@ impl PredicateEvaluator {
                 let matches = match batch {
                     PredicateColumnBatch::RawVarlen(batch) => batch
                         .row_value(row_idx)
-                        .is_some_and(|value| membership.matches(value)),
+                        .is_some_and(|value| matcher.matches(value)),
                     PredicateColumnBatch::StorageDictionary(batch) => batch
                         .row_value(row_idx)
-                        .is_some_and(|value| membership.matches(&value)),
+                        .is_some_and(|value| matcher.matches(&value)),
                     PredicateColumnBatch::Decoded(vector) => vector
                         .get_string(row_idx)
-                        .is_some_and(|value| membership.matches(value.as_bytes())),
+                        .is_some_and(|value| matcher.matches(value.as_bytes())),
                     PredicateColumnBatch::Raw(_) => false,
                 };
                 Some(matches)
@@ -716,7 +716,7 @@ impl PredicateEvaluator {
         match predicate {
             CompiledPredicate::FixedComparisons { .. }
             | CompiledPredicate::VarlenComparisons { .. }
-            | CompiledPredicate::VarlenPrefixIn { .. }
+            | CompiledPredicate::VarlenMatch { .. }
             | CompiledPredicate::FixedColumnComparison { .. } => Ok(
                 Self::evaluate_typed_comparison(predicate, batches_by_col, row_idx)
                     .unwrap_or(false),
@@ -785,6 +785,13 @@ impl PredicateEvaluator {
             Predicate::StringPrefixIn { prefixes, .. } => Ok(vector
                 .and_then(|vector| vector.get_string(row_idx))
                 .is_some_and(|value| prefixes.iter().any(|prefix| value.starts_with(prefix)))),
+            Predicate::StringLike {
+                pattern, negated, ..
+            } => Ok(vector
+                .and_then(|vector| vector.get_string(row_idx))
+                .is_some_and(|value| {
+                    paro_common::string_pattern::sql_like(value, pattern, false) != *negated
+                })),
             Predicate::ColumnComparison { .. } => Err(paro_error::internal(
                 "Column comparison was not compiled to its fixed-width evaluator",
             )),
@@ -931,9 +938,7 @@ impl PredicateEvaluator {
             }) => {
                 access[*column_idx].require_typed(None)?;
             }
-            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenPrefixIn {
-                column_idx, ..
-            }) => {
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { column_idx, .. }) => {
                 access[*column_idx].require_typed(None)?;
             }
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
@@ -985,9 +990,9 @@ impl PredicateEvaluator {
         }
         if let Predicate::StringPrefixIn { prefixes, .. } = predicate {
             return if matches!(logical_type, LogicalType::Varchar) {
-                CompiledPredicate::VarlenPrefixIn {
+                CompiledPredicate::VarlenMatch {
                     column_idx,
-                    membership: VarlenPrefixMembership::new(
+                    matcher: VarlenMatcher::prefix_membership(
                         prefixes
                             .iter()
                             .map(|prefix| Box::<[u8]>::from(prefix.as_bytes())),
@@ -998,6 +1003,24 @@ impl PredicateEvaluator {
                     column_idx,
                     predicate: predicate.clone(),
                 }
+            };
+        }
+        if let Predicate::StringLike {
+            pattern, negated, ..
+        } = predicate
+        {
+            return match (
+                matches!(logical_type, LogicalType::Varchar),
+                VarlenMatcher::like(pattern, *negated),
+            ) {
+                (true, Some(matcher)) => CompiledPredicate::VarlenMatch {
+                    column_idx,
+                    matcher,
+                },
+                _ => CompiledPredicate::Generic {
+                    column_idx,
+                    predicate: predicate.clone(),
+                },
             };
         }
         if let Predicate::FixedIn { values, .. } = predicate {
@@ -1290,6 +1313,7 @@ impl PredicateVerificationExt for Predicate {
                 | Predicate::Range { .. }
                 | Predicate::StringPrefix { .. }
                 | Predicate::StringPrefixIn { .. }
+                | Predicate::StringLike { .. }
                 | Predicate::ColumnComparison { .. }
         )
     }

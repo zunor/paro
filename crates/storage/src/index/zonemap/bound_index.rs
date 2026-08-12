@@ -201,6 +201,7 @@ fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPr
         Predicate::FixedIn { .. }
         | Predicate::StringPrefix { .. }
         | Predicate::StringPrefixIn { .. }
+        | Predicate::StringLike { .. }
         | Predicate::ColumnComparison { .. } => None,
     }
 }

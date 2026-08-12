@@ -92,6 +92,13 @@ pub enum Predicate {
         column_id: ColumnId,
         prefixes: Vec<String>,
     },
+    /// Constant ASCII SQL LIKE pattern compiled by the scan reader. Patterns
+    /// containing `_` remain on the general expression path.
+    StringLike {
+        column_id: ColumnId,
+        pattern: String,
+        negated: bool,
+    },
     /// left_column op right_column. This cannot be answered by a single-column
     /// index and is always verified against rows selected by other predicates.
     ColumnComparison {
@@ -118,7 +125,8 @@ impl Predicate {
             | Predicate::IsNull { column_id }
             | Predicate::IsNotNull { column_id }
             | Predicate::StringPrefix { column_id, .. }
-            | Predicate::StringPrefixIn { column_id, .. } => Some(*column_id),
+            | Predicate::StringPrefixIn { column_id, .. }
+            | Predicate::StringLike { column_id, .. } => Some(*column_id),
             Predicate::ColumnComparison { .. } => None,
         }
     }
@@ -171,6 +179,15 @@ impl fmt::Display for Predicate {
                     .map(|prefix| format!("{prefix:?}"))
                     .collect::<Vec<_>>()
                     .join(", ")
+            ),
+            Predicate::StringLike {
+                column_id,
+                pattern,
+                negated,
+            } => write!(
+                f,
+                "col#{column_id} {} {pattern:?}",
+                if *negated { "NOT LIKE" } else { "LIKE" }
             ),
             Predicate::ColumnComparison {
                 left_column_id,

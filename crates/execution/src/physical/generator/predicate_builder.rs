@@ -10,6 +10,7 @@ use std::sync::Arc;
 use paro_common::allocator::default_allocator;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
+use paro_common::string_pattern::PreparedLikePattern;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
@@ -292,7 +293,7 @@ fn build_operator_predicate(
     get: &Get,
 ) -> Result<Option<PredicateTree>> {
     match op.operator_type {
-        OperatorType::Like => build_like_prefix_predicate(op, get, false),
+        OperatorType::Like => build_like_predicate(op, get, false),
         OperatorType::Not => {
             let Some(Expression::Operator(child)) = op.children.first() else {
                 return Ok(None);
@@ -300,7 +301,7 @@ fn build_operator_predicate(
             if child.operator_type != OperatorType::Like || op.children.len() != 1 {
                 return Ok(None);
             }
-            build_like_prefix_predicate(child, get, true)
+            build_like_predicate(child, get, true)
         }
         OperatorType::IsNull | OperatorType::IsNotNull => {
             let child = match op.children.get(0) {
@@ -412,7 +413,7 @@ fn build_projected_prefix_membership(
     })))
 }
 
-fn build_like_prefix_predicate(
+fn build_like_predicate(
     op: &paro_planner::expression::OperatorExpression,
     get: &Get,
     negated: bool,
@@ -429,15 +430,23 @@ fn build_like_prefix_predicate(
     let Some(Value::Varchar(pattern)) = evaluate_bound_constant(pattern)? else {
         return Ok(None);
     };
-    let Some(prefix) = extract_like_prefix(&pattern) else {
-        return Ok(None);
-    };
     let Some(column_id) = get.column_ids.get(col_idx) else {
         return Ok(None);
     };
-    Ok(Some(PredicateTree::leaf(Predicate::StringPrefix {
-        column_id: *column_id as u32,
-        prefix,
+    let column_id = *column_id as u32;
+    if let Some(prefix) = extract_like_prefix(&pattern) {
+        return Ok(Some(PredicateTree::leaf(Predicate::StringPrefix {
+            column_id,
+            prefix,
+            negated,
+        })));
+    }
+    if PreparedLikePattern::try_new(&pattern, false).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PredicateTree::leaf(Predicate::StringLike {
+        column_id,
+        pattern,
         negated,
     })))
 }
@@ -783,15 +792,31 @@ mod tests {
     }
 
     #[test]
-    fn non_prefix_like_remains_an_execution_predicate() {
+    fn constant_ascii_like_is_pushed_with_compiled_pattern_semantics() {
         let get = Get::new_without_table(7, vec!["type".to_string()], vec![LogicalType::Varchar]);
 
         assert_eq!(
             build_predicate(&like_expression("MEDIUM%POLISHED%", false), &get).unwrap(),
-            None
+            Some(PredicateTree::leaf(Predicate::StringLike {
+                column_id: 0,
+                pattern: "MEDIUM%POLISHED%".to_string(),
+                negated: false,
+            }))
+        );
+        assert_eq!(
+            build_predicate(&like_expression("%special%requests%", true), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringLike {
+                column_id: 0,
+                pattern: "%special%requests%".to_string(),
+                negated: true,
+            }))
         );
         assert_eq!(
             build_predicate(&like_expression("MEDIUM_POLISHED%", false), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&like_expression("%绿色%", false), &get).unwrap(),
             None
         );
     }

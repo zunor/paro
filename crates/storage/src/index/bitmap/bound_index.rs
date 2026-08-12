@@ -429,6 +429,7 @@ impl BoundIndex for BitmapIndex {
             Predicate::FixedIn { .. }
             | Predicate::StringPrefix { .. }
             | Predicate::StringPrefixIn { .. }
+            | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }

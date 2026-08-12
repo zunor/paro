@@ -44,6 +44,7 @@ pub mod logging;
 pub mod memory;
 pub mod runtime_value;
 pub mod sort_key;
+pub mod string_pattern;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 pub mod typed_parameters;

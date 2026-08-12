@@ -7,6 +7,7 @@ use std::cell::RefCell;
 
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::string_pattern::PreparedLikePattern;
 
 use crate::index::{FixedMembershipBuildPolicy, FixedMembershipSet};
 
@@ -32,11 +33,25 @@ struct DictionaryPredicateCache {
 /// leading bytes. Mixed-width domains retain general `starts_with` semantics.
 /// Redundant prefixes are removed once during compilation.
 #[derive(Debug)]
-pub(super) struct VarlenPrefixMembership {
+pub(super) struct VarlenMatcher {
+    strategy: VarlenMatchStrategy,
+    dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
+}
+
+#[derive(Debug)]
+enum VarlenMatchStrategy {
+    PrefixMembership(PrefixMembership),
+    Like {
+        pattern: PreparedLikePattern,
+        negated: bool,
+    },
+}
+
+#[derive(Debug)]
+struct PrefixMembership {
     prefixes: Vec<Box<[u8]>>,
     uniform_width: Option<usize>,
     packed: Option<PackedPrefixMembership>,
-    dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
 }
 
 #[derive(Debug)]
@@ -83,8 +98,8 @@ impl PackedPrefixMembership {
     }
 }
 
-impl VarlenPrefixMembership {
-    pub(super) fn new(prefixes: impl IntoIterator<Item = Box<[u8]>>) -> Self {
+impl VarlenMatcher {
+    pub(super) fn prefix_membership(prefixes: impl IntoIterator<Item = Box<[u8]>>) -> Self {
         let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
         prefixes.sort_unstable();
         prefixes.dedup();
@@ -105,37 +120,40 @@ impl VarlenPrefixMembership {
             .filter(|width| (1..=8).contains(width))
             .map(|width| PackedPrefixMembership::new(width, &normalized));
         Self {
-            prefixes: normalized,
-            uniform_width,
-            packed,
+            strategy: VarlenMatchStrategy::PrefixMembership(PrefixMembership {
+                prefixes: normalized,
+                uniform_width,
+                packed,
+            }),
             dictionary_cache: RefCell::new(None),
         }
     }
 
+    pub(super) fn like(pattern: &str, negated: bool) -> Option<Self> {
+        Some(Self {
+            strategy: VarlenMatchStrategy::Like {
+                pattern: PreparedLikePattern::try_new(pattern, false)?,
+                negated,
+            },
+            dictionary_cache: RefCell::new(None),
+        })
+    }
+
     #[inline]
     pub(super) fn matches(&self, value: &[u8]) -> bool {
-        if let (Some(width), Some(packed)) = (self.uniform_width, &self.packed) {
-            let Some(prefix) = value.get(..width) else {
-                return false;
-            };
-            return packed.contains(prefix);
+        match &self.strategy {
+            VarlenMatchStrategy::PrefixMembership(membership) => membership.matches(value),
+            VarlenMatchStrategy::Like { pattern, negated } => {
+                pattern.matches_bytes(value) != *negated
+            }
         }
-        if let Some(width) = self.uniform_width {
-            let Some(value_prefix) = value.get(..width) else {
-                return false;
-            };
-            return self
-                .prefixes
-                .binary_search_by(|prefix| prefix.as_ref().cmp(value_prefix))
-                .is_ok();
-        }
-        self.prefixes
-            .iter()
-            .any(|prefix| value.starts_with(prefix.as_ref()))
     }
 
     pub(super) fn evaluation_priority(&self) -> (u8, usize) {
-        (2, self.prefixes.len())
+        match &self.strategy {
+            VarlenMatchStrategy::PrefixMembership(membership) => (2, membership.prefixes.len()),
+            VarlenMatchStrategy::Like { .. } => (4, 1),
+        }
     }
 
     pub(super) fn filter_batch(
@@ -173,6 +191,30 @@ impl VarlenPrefixMembership {
             return Ok(());
         }
         filter_varlen_batch(batch, rows, selection, seed, |value| self.matches(value))
+    }
+}
+
+impl PrefixMembership {
+    #[inline]
+    fn matches(&self, value: &[u8]) -> bool {
+        if let (Some(width), Some(packed)) = (self.uniform_width, &self.packed) {
+            let Some(prefix) = value.get(..width) else {
+                return false;
+            };
+            return packed.contains(prefix);
+        }
+        if let Some(width) = self.uniform_width {
+            let Some(value_prefix) = value.get(..width) else {
+                return false;
+            };
+            return self
+                .prefixes
+                .binary_search_by(|prefix| prefix.as_ref().cmp(value_prefix))
+                .is_ok();
+        }
+        self.prefixes
+            .iter()
+            .any(|prefix| value.starts_with(prefix.as_ref()))
     }
 }
 
@@ -649,19 +691,35 @@ mod tests {
 
     #[test]
     fn short_uniform_prefixes_compile_to_fixed_membership() {
-        let prefixes = VarlenPrefixMembership::new(
+        let prefixes = VarlenMatcher::prefix_membership(
             [b"13".as_slice(), b"31".as_slice(), b"18".as_slice()]
                 .into_iter()
                 .map(Box::<[u8]>::from),
         );
 
         assert!(matches!(
-            prefixes.packed,
-            Some(PackedPrefixMembership::I32(_))
+            &prefixes.strategy,
+            VarlenMatchStrategy::PrefixMembership(PrefixMembership {
+                packed: Some(PackedPrefixMembership::I32(_)),
+                ..
+            })
         ));
         assert!(prefixes.matches(b"13-555-1234"));
         assert!(prefixes.matches(b"31"));
         assert!(!prefixes.matches(b"3"));
         assert!(!prefixes.matches(b"99-555-1234"));
+    }
+
+    #[test]
+    fn compiled_like_supports_suffix_contains_order_and_negation() {
+        let suffix = VarlenMatcher::like("%BRASS", false).unwrap();
+        let contains = VarlenMatcher::like("%green%", false).unwrap();
+        let excluded = VarlenMatcher::like("%special%requests%", true).unwrap();
+
+        assert!(suffix.matches(b"ECONOMY ANODIZED BRASS"));
+        assert!(contains.matches(b"forest green part"));
+        assert!(!excluded.matches(b"special pending requests"));
+        assert!(excluded.matches(b"requests before special"));
+        assert!(VarlenMatcher::like("A_B", false).is_none());
     }
 }
