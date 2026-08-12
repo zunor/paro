@@ -1118,7 +1118,12 @@ impl GroupedAggregateHashTable {
     }
 
     pub fn destroy(&mut self) -> Result<()> {
-        if self.count > 0 {
+        if self.count > 0
+            && self
+                .aggregate_objects
+                .iter()
+                .any(|object| object.function.destructor.is_some())
+        {
             let mut addresses = Vector::try_new(LogicalType::BigInt, self.count, self.allocator())?;
             addresses.try_set_count(self.count)?;
             unsafe {

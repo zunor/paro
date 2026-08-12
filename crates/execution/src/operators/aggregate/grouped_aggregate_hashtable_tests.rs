@@ -8,11 +8,17 @@ use std::mem::size_of;
 use std::thread_local;
 
 use paro_common::runtime_value::Value;
+use paro_common::{
+    allocator::DefaultAllocator,
+    memory::{MemoryDomain, MemoryOwner, MemoryOwnerAllocator},
+};
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::aggregate::AggregateFunction;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, Expression, ReferenceExpression,
 };
+
+use crate::memory_runtime::QueryMemoryPool;
 
 thread_local! {
     static DESTRUCTOR_CALLS: Cell<usize> = const { Cell::new(0) };
@@ -956,4 +962,58 @@ fn grouped_hash_table_destroy_calls_destructor() {
     assert_eq!(table.count(), 0);
     assert_eq!(destructor_calls(), 3);
     assert!(table.memory_usage() <= before_destroy);
+}
+
+#[test]
+fn destructor_free_grouped_hash_table_destroy_needs_no_scratch_quota() {
+    let pool = Arc::new(QueryMemoryPool::new(1 << 20));
+    let owner: Arc<dyn MemoryOwner> = pool.clone();
+    let allocator = Arc::new(MemoryOwnerAllocator::new(
+        Arc::new(DefaultAllocator::new()),
+        Arc::clone(&owner),
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    ));
+    let memory = MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut table = GroupedAggregateHashTable::new_with_memory(
+        vec![LogicalType::Integer],
+        vec![make_count_star_object()],
+        vec![Vec::new()],
+        allocator,
+        memory,
+    )
+    .expect("create destructor-free grouped hash table");
+
+    let groups = Chunk::from_vectors(
+        vec![paro_common::test_utils::test_i32_vector_with_allocator(
+            &[1, 2, 3],
+            paro_common::test_utils::test_allocator(),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let hashes = table.hash_groups(&groups).expect("hash groups");
+    let mut addresses =
+        paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, groups.size());
+    let mut new_groups = paro_common::test_utils::test_selection_with_capacity(groups.size());
+    table
+        .find_or_create_groups(&groups, &hashes, &mut addresses, &mut new_groups)
+        .expect("find/create groups");
+
+    // Hold the quota exactly at the table's live allocation. Any destroy-time
+    // address vector would now fail even though COUNT owns no destructor state.
+    let table_memory_before_destroy = table.memory_usage();
+    let issued_before_destroy = pool.issued_bytes();
+    pool.set_capacity_bytes(issued_before_destroy);
+    table
+        .destroy()
+        .expect("destructor-free cleanup must not allocate scratch state");
+
+    assert_eq!(table.count(), 0);
+    assert!(table.memory_usage() < table_memory_before_destroy);
 }
