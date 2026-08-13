@@ -4,6 +4,7 @@
 use super::predicate_column::PredicateColumnReuse;
 use super::segment::{Segment, SegmentOptions};
 use super::segment_predicate::PredicateEvaluator;
+use super::segment_predicate_program::PredicateStageReadStats;
 use crate::buffer::{BufferPool, Prefetcher};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
@@ -76,6 +77,7 @@ pub struct SegmentIterator {
     selection_tracker: ColumnDataBytesTracker,
     rowid_tracker: ColumnDataBytesTracker,
     prefetcher: Option<Arc<Prefetcher>>,
+    predicate_stage_read_stats: PredicateStageReadStats,
 }
 
 pub struct SegmentBatch {
@@ -460,6 +462,7 @@ impl SegmentIterator {
             selection_tracker: ColumnDataBytesTracker::new(buffer_pool.clone()),
             rowid_tracker: ColumnDataBytesTracker::new(buffer_pool),
             prefetcher,
+            predicate_stage_read_stats: PredicateStageReadStats::default(),
         })
     }
 
@@ -562,6 +565,11 @@ impl SegmentIterator {
     #[cfg(test)]
     pub(crate) fn uses_late_materialize(&self) -> bool {
         self.late_materialization.is_some()
+    }
+
+    #[cfg(test)]
+    pub(super) fn predicate_stage_read_stats(&self) -> PredicateStageReadStats {
+        self.predicate_stage_read_stats.clone()
     }
 
     pub fn segment_id(&self) -> u32 {
@@ -1111,12 +1119,34 @@ impl SegmentIterator {
                 predicate_proof_span(&self.predicate_guaranteed, start_ordinal, max_rowid);
             let remaining = (proof_end - start_ordinal) as usize;
             let to_read = batch_size.min(remaining);
+            let staged_program = !predicate_guaranteed
+                && self
+                    .predicate_evaluator
+                    .as_ref()
+                    .expect("late materialization requires predicate evaluator")
+                    .has_staged_program();
+            let mut staged_matches = None;
             let (rows_read, predicate_batches) = if predicate_guaranteed {
                 self.predicate_evaluator
                     .as_mut()
                     .expect("late materialization requires predicate evaluator")
                     .seek_to_ordinal(start_ordinal + to_read as u64)?;
                 (to_read, Vec::new())
+            } else if staged_program {
+                let mut matches = Vec::new();
+                let rows_read = self
+                    .predicate_evaluator
+                    .as_mut()
+                    .expect("late materialization requires predicate evaluator")
+                    .evaluate_staged_batch(
+                        start_ordinal,
+                        to_read,
+                        self.options.scan_access_cost,
+                        &mut matches,
+                        &mut self.predicate_stage_read_stats,
+                    )?;
+                staged_matches = Some(matches);
+                (rows_read, Vec::new())
             } else {
                 self.predicate_evaluator
                     .as_mut()
@@ -1136,6 +1166,8 @@ impl SegmentIterator {
                 if predicate_guaranteed {
                     state.predicate_matches.clear();
                     state.predicate_matches.extend(0..rows_read);
+                } else if let Some(matches) = staged_matches.take() {
+                    state.predicate_matches = matches;
                 } else {
                     self.predicate_evaluator
                         .as_ref()

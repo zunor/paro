@@ -46,6 +46,7 @@ mod segment_indexes;
 mod segment_iterator;
 mod segment_loader;
 mod segment_predicate;
+mod segment_predicate_program;
 mod segment_search;
 #[cfg(test)]
 mod segment_tests;

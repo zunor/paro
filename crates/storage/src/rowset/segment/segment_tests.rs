@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::index::{Predicate, PredicateResult, PredicateTree};
+use crate::index::{
+    FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateResult, PredicateTree,
+};
 use crate::rowset::page::CompressionType;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
@@ -292,6 +294,378 @@ fn late_materialization_adapts_to_observed_batch_density() {
         i32::from_le_bytes(sparse_batch.columns[0].1.data[..4].try_into().unwrap()),
         107
     );
+}
+
+#[test]
+fn staged_and_gathers_later_predicate_columns_and_preserves_order() {
+    const ROWS: usize = 5000;
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("staged-predicate.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::new(0, "size", LogicalType::Integer).with_nullable(true),
+                TabletColumn::new(1, "partkey", LogicalType::Integer),
+                TabletColumn::new(2, "type", LogicalType::Varchar).with_nullable(true),
+                TabletColumn::new(3, "payload", LogicalType::Integer),
+            ],
+            KeysType::DuplicateKeys,
+        )
+        .unwrap(),
+    );
+    let opts = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_page_size(1024);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, opts).unwrap();
+
+    let sizes = (0..ROWS)
+        .map(|row| if row % 50 == 0 { 15_i32 } else { 7_i32 })
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut size_nulls = vec![0_u8; ROWS.div_ceil(8)];
+    // A null in the equality column must never survive, including across a
+    // physical page boundary.
+    size_nulls[1000 / 8] |= 1 << (1000 % 8);
+    size_nulls[1024 / 8] |= 1 << (1024 % 8);
+    let partkeys = (0..ROWS as i32)
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut types = Vec::new();
+    for row in 0..ROWS {
+        let value = if row % 100 == 0 {
+            "POLISHED BRASS"
+        } else {
+            "STEEL"
+        };
+        types.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        types.extend_from_slice(value.as_bytes());
+    }
+    let mut type_nulls = vec![0_u8; ROWS.div_ceil(8)];
+    type_nulls[200 / 8] |= 1 << (200 % 8);
+    let payload = (10_000_i32..10_000 + ROWS as i32)
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[
+            ColumnData::with_nulls(sizes, size_nulls, ROWS as u32),
+            ColumnData::new(partkeys, ROWS as u32),
+            ColumnData::with_nulls(types, type_nulls, ROWS as u32),
+            ColumnData::new(payload, ROWS as u32),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+    let membership = (0_i32..ROWS as i32).step_by(100).collect::<Vec<_>>();
+    let predicate = PredicateTree::And(vec![
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(15),
+        }),
+        PredicateTree::leaf(Predicate::FixedIn {
+            column_id: 1,
+            values: FixedMembership::i32_with_policy(
+                membership,
+                FixedMembershipBuildPolicy::new(1 << 20, 256),
+            ),
+        }),
+        PredicateTree::leaf(Predicate::StringLike {
+            column_id: 2,
+            pattern: "%BRASS".to_string(),
+            negated: false,
+        }),
+    ]);
+    let mut iter =
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2],
+            None,
+            Some(predicate),
+            None,
+        )
+        .unwrap();
+
+    let mut rowids = Vec::new();
+    let mut projected_sizes = Vec::new();
+    let mut projected_keys = Vec::new();
+    let mut payloads = Vec::new();
+    while iter.has_next() {
+        let (batch_rowids, columns) = iter.next_batch(777).unwrap();
+        if batch_rowids.is_empty() {
+            break;
+        }
+        projected_sizes.extend(
+            columns[0]
+                .1
+                .data
+                .chunks_exact(4)
+                .map(|value| i32::from_le_bytes(value.try_into().unwrap())),
+        );
+        projected_keys.extend(
+            columns[1]
+                .1
+                .data
+                .chunks_exact(4)
+                .map(|value| i32::from_le_bytes(value.try_into().unwrap())),
+        );
+        rowids.extend(batch_rowids);
+        payloads.extend(
+            columns[3]
+                .1
+                .data
+                .chunks_exact(4)
+                .map(|value| i32::from_le_bytes(value.try_into().unwrap())),
+        );
+    }
+
+    let expected = (0_u32..ROWS as u32)
+        .step_by(100)
+        .filter(|row| *row != 200 && *row != 1000)
+        .collect::<Vec<_>>();
+    assert_eq!(rowids, expected);
+    assert_eq!(projected_sizes, vec![15; rowids.len()]);
+    assert_eq!(
+        projected_keys,
+        rowids.iter().map(|row| *row as i32).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        payloads,
+        rowids
+            .iter()
+            .map(|row| 10_000 + *row as i32)
+            .collect::<Vec<_>>()
+    );
+    let stats = iter.predicate_stage_read_stats();
+    assert_eq!(stats.stages.len(), 3);
+    assert_eq!(stats.stages[0].sequential_rows, ROWS as u64);
+    assert_eq!(stats.stages[1].sequential_rows, 0);
+    assert!(stats.stages[1].gathered_rows <= (ROWS / 50 + 1) as u64);
+    assert_eq!(stats.stages[2].sequential_rows, 0);
+    assert!(stats.stages[2].gathered_rows <= (ROWS / 100 + 1) as u64);
+}
+
+#[test]
+fn staged_and_switches_access_modes_groups_same_column_and_accepts_sorted_membership() {
+    const ROWS: usize = 32;
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("staged-access-switch.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::new(0, "gate", LogicalType::Integer),
+                TabletColumn::new(1, "key", LogicalType::Integer),
+                TabletColumn::new(2, "label", LogicalType::Varchar).with_nullable(true),
+                TabletColumn::new(3, "payload", LogicalType::Integer),
+            ],
+            KeysType::DuplicateKeys,
+        )
+        .unwrap(),
+    );
+    let mut writer = SegmentWriter::create(
+        schema.clone(),
+        &file_path,
+        SegmentWriterOptions::new(0)
+            .with_compression(CompressionType::None)
+            .with_page_size(64),
+    )
+    .unwrap();
+    let gate_matches = |row: usize| {
+        let offset = row % 8;
+        if row / 8 % 2 == 0 {
+            offset < 6
+        } else {
+            offset == 0 || offset == 7
+        }
+    };
+    let gates = (0..ROWS)
+        .map(|row| if gate_matches(row) { 7_i32 } else { 0_i32 })
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let keys = (0..ROWS as i32)
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    let mut labels = Vec::new();
+    for row in 0..ROWS {
+        let value = if row % 3 == 0 { "ABZ" } else { "ABX" };
+        labels.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        labels.extend_from_slice(value.as_bytes());
+    }
+    let mut label_nulls = vec![0_u8; ROWS.div_ceil(8)];
+    label_nulls[15 / 8] |= 1 << (15 % 8);
+    let payload = (100_i32..100 + ROWS as i32)
+        .flat_map(i32::to_le_bytes)
+        .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[
+            ColumnData::new(gates, ROWS as u32),
+            ColumnData::new(keys, ROWS as u32),
+            ColumnData::with_nulls(labels, label_nulls, ROWS as u32),
+            ColumnData::new(payload, ROWS as u32),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+    let membership = (0..ROWS)
+        .filter(|row| gate_matches(*row))
+        .map(|row| row as i32)
+        .collect::<Vec<_>>();
+    let predicate = PredicateTree::And(vec![
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(7),
+        }),
+        PredicateTree::leaf(Predicate::FixedIn {
+            column_id: 1,
+            // A zero dense budget deliberately retains the sorted runtime
+            // representation; the other staged test covers dense membership.
+            values: FixedMembership::i32_with_policy(
+                membership,
+                FixedMembershipBuildPolicy::new(0, 0),
+            ),
+        }),
+        PredicateTree::leaf(Predicate::StringPrefix {
+            column_id: 2,
+            prefix: "A".to_string(),
+            negated: false,
+        }),
+        PredicateTree::leaf(Predicate::StringLike {
+            column_id: 2,
+            pattern: "%Z".to_string(),
+            negated: false,
+        }),
+    ]);
+    let mut iter =
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![0, 1, 2, 3],
+            vec![0, 1, 2],
+            None,
+            Some(predicate),
+            None,
+        )
+        .unwrap();
+
+    let mut rowids = Vec::new();
+    let mut payloads = Vec::new();
+    while iter.has_next() {
+        let (batch_rowids, columns) = iter.next_batch(8).unwrap();
+        if batch_rowids.is_empty() {
+            break;
+        }
+        rowids.extend(batch_rowids);
+        payloads.extend(
+            columns[3]
+                .1
+                .data
+                .chunks_exact(4)
+                .map(|value| i32::from_le_bytes(value.try_into().unwrap())),
+        );
+    }
+
+    let expected = (0_u32..ROWS as u32)
+        .filter(|row| gate_matches(*row as usize) && row % 3 == 0 && *row != 15)
+        .collect::<Vec<_>>();
+    assert_eq!(rowids, expected);
+    assert_eq!(
+        payloads,
+        rowids
+            .iter()
+            .map(|row| 100 + *row as i32)
+            .collect::<Vec<_>>()
+    );
+    let stats = iter.predicate_stage_read_stats();
+    // Prefix and suffix LIKE share one physical column stage.
+    assert_eq!(stats.stages.len(), 3);
+    for stage in &stats.stages[1..] {
+        assert!(stage.sequential_rows > 0);
+        assert!(stage.gathered_rows > 0);
+    }
+}
+
+#[test]
+fn staged_predicates_fall_back_for_or() {
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("staged-or-fallback.seg");
+    let schema = create_int_schema();
+    let mut writer = SegmentWriter::create(
+        schema.clone(),
+        &file_path,
+        SegmentWriterOptions::new(0).with_compression(CompressionType::None),
+    )
+    .unwrap();
+    writer
+        .append_chunk(&[
+            ColumnData::new(
+                (0_i32..10).flat_map(i32::to_le_bytes).collect::<Vec<_>>(),
+                10,
+            ),
+            ColumnData::new(
+                (10_i32..20).flat_map(i32::to_le_bytes).collect::<Vec<_>>(),
+                10,
+            ),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+    let segment = Arc::new(
+        Segment::open(
+            0,
+            &file_path,
+            schema,
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    );
+    let predicate = PredicateTree::Or(vec![
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(2),
+        }),
+        PredicateTree::leaf(Predicate::Eq {
+            column_id: 1,
+            value: Value::Integer(17),
+        }),
+    ]);
+    let mut iter =
+        SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            &segment,
+            vec![0],
+            vec![0, 1],
+            None,
+            Some(predicate),
+            None,
+        )
+        .unwrap();
+    assert_eq!(iter.next_batch(10).unwrap().0, [2, 7]);
+    assert!(iter.predicate_stage_read_stats().stages.is_empty());
 }
 
 #[test]
