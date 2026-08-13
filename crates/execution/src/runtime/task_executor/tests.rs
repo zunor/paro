@@ -480,6 +480,8 @@ mod partition_aggregate_tests;
 mod post_rollup_tests;
 #[path = "running_tests.rs"]
 mod running_tests;
+#[path = "streaming_tests.rs"]
+mod streaming_tests;
 
 trait QueryOutputWriteExt {
     fn assert_written(self);
