@@ -194,6 +194,11 @@ fn topn_lowers_to_build_emit_breaker_pipelines() {
         DependencyKind::FinalizeBeforeEmit
     );
     assert_eq!(graph.handles.len(), 1);
+    let build = &graph.pipelines[0].properties;
+    assert_eq!(build.memory.class, MemoryClass::Blocking);
+    assert!(!build.memory.revocable);
+    assert!(!build.memory.spillable);
+    assert!(!build.capabilities.supports_spill);
 }
 
 #[test]

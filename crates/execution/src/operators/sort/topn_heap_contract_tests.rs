@@ -1,4 +1,3 @@
-use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use paro_common::allocator::MemoryTag;
@@ -12,7 +11,7 @@ use paro_common::vector::VECTOR_SIZE;
 
 use crate::memory_runtime::{QueryMemoryPool, RetainedChunkVec};
 
-use super::{TopNEntry, TopNHeap};
+use super::{accounted_metadata_vec, CombineCandidate, TopNEntry, TopNEntryHeap, TopNHeap};
 
 fn memory_for(
     pool: &Arc<QueryMemoryPool>,
@@ -41,16 +40,16 @@ fn heap_from_chunks(
     for chunk in chunks {
         heap_data.push(chunk).expect("retain source chunk");
     }
+    let mut heap = TopNEntryHeap::new(&memory);
+    for (key, index) in entries {
+        heap.try_push(
+            TopNEntry::try_new(key.to_be_bytes().to_vec(), index, &memory)
+                .expect("retain test key"),
+        )
+        .expect("retain test heap entry");
+    }
     TopNHeap {
-        heap: BinaryHeap::from(
-            entries
-                .into_iter()
-                .map(|(key, index)| TopNEntry {
-                    sort_key: key.to_be_bytes().to_vec(),
-                    index,
-                })
-                .collect::<Vec<_>>(),
-        ),
+        heap,
         heap_data,
         memory,
         heap_size,
@@ -111,10 +110,12 @@ fn combine_second_staging_batch_quota_failure_restores_accounting_and_sources() 
     // its second vector batch to fail after the first has been admitted.
     let mut calibration = RetainedChunkVec::new(memory);
     let first_batch = (0..VECTOR_SIZE).collect::<Vec<_>>();
-    TopNHeap::for_each_gathered_chunk(
+    TopNHeap::for_each_gathered_rows(
+        &left.memory,
         &[LogicalType::Integer],
         left.heap_data.as_slice(),
-        &first_batch,
+        first_batch.len(),
+        |row| first_batch[row],
         |chunk| {
             calibration.push(chunk)?;
             Ok(())
@@ -133,13 +134,16 @@ fn combine_second_staging_batch_quota_failure_restores_accounting_and_sources() 
     assert_eq!(pool.issued_bytes(), baseline);
     assert_eq!(left.heap.len(), row_count);
     assert_eq!(right.heap.len(), 1);
+    // Extraction materializes an independently retained output and therefore
+    // needs output headroom after the combine-failure assertions are complete.
+    pool.set_capacity_bytes(usize::MAX / 4);
     assert_eq!(
         extract_i32(&mut left),
         (0..row_count as i32).collect::<Vec<_>>()
     );
     assert_eq!(extract_i32(&mut right), vec![100_000]);
     drop((left, right));
-    assert_eq!(pool.issued_bytes(), 0);
+    assert_eq!(pool.issued_bytes(), 0, "stats={:?}", pool.runtime_stats());
 }
 
 fn complex_dictionary_chunk(prefix: &str) -> Chunk {
@@ -283,4 +287,123 @@ fn combine_requires_identical_owner_domain_tag_and_class() {
     let mut right = heap_from_chunks(base, vec![], vec![], [], 0);
     left.combine(&mut right)
         .expect("identical accounting target may combine");
+}
+
+#[test]
+fn combine_metadata_admission_failure_is_atomic() {
+    let pool = Arc::new(QueryMemoryPool::unbounded());
+    let memory = memory_for(
+        &pool,
+        MemoryDomain::Host,
+        MemoryTag::OrderBy,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut left = heap_from_chunks(
+        memory.clone(),
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[10, 20])],
+        [(10, 0), (20, 1)],
+        2,
+    );
+    let mut right = heap_from_chunks(
+        memory,
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[1, 2])],
+        [(1, 0), (2, 1)],
+        2,
+    );
+    let baseline = pool.issued_bytes();
+    pool.set_capacity_bytes(baseline);
+
+    left.combine(&mut right)
+        .expect_err("candidate metadata must respect the hard query quota");
+
+    assert_eq!(pool.issued_bytes(), baseline);
+    assert_eq!(left.heap.len(), 2);
+    assert_eq!(right.heap.len(), 2);
+    pool.set_capacity_bytes(usize::MAX / 4);
+    assert_eq!(extract_i32(&mut left), vec![10, 20]);
+    assert_eq!(extract_i32(&mut right), vec![1, 2]);
+    drop((left, right));
+    assert_eq!(pool.issued_bytes(), 0);
+}
+
+#[test]
+fn combine_final_heap_admission_failure_is_atomic() {
+    let pool = Arc::new(QueryMemoryPool::unbounded());
+    let memory = memory_for(
+        &pool,
+        MemoryDomain::Host,
+        MemoryTag::OrderBy,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut left = heap_from_chunks(
+        memory.clone(),
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[10, 20])],
+        [(10, 0), (20, 1)],
+        2,
+    );
+    let mut right = heap_from_chunks(
+        memory,
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[1, 2])],
+        [(1, 0), (2, 1)],
+        2,
+    );
+    let baseline = pool.issued_bytes();
+
+    let mut calibration = accounted_metadata_vec::<CombineCandidate>(&left.memory);
+    calibration.try_reserve(4).expect("candidate calibration");
+    let candidate_bytes = pool.issued_bytes() - baseline;
+    drop(calibration);
+    assert_eq!(pool.issued_bytes(), baseline);
+    pool.set_capacity_bytes(baseline + candidate_bytes);
+
+    left.combine(&mut right)
+        .expect_err("final heap backing must be admitted before publication");
+
+    assert_eq!(pool.issued_bytes(), baseline);
+    assert_eq!(left.heap.len(), 2);
+    assert_eq!(right.heap.len(), 2);
+    pool.set_capacity_bytes(usize::MAX / 4);
+    assert_eq!(extract_i32(&mut left), vec![10, 20]);
+    assert_eq!(extract_i32(&mut right), vec![1, 2]);
+    drop((left, right));
+    assert_eq!(pool.issued_bytes(), 0);
+}
+
+#[test]
+fn successful_combine_releases_heap_keys_scratch_and_payload_accounting() {
+    let pool = Arc::new(QueryMemoryPool::unbounded());
+    let memory = memory_for(
+        &pool,
+        MemoryDomain::Host,
+        MemoryTag::OrderBy,
+        MemoryAccountingClass::Revocable,
+    );
+    let mut left = heap_from_chunks(
+        memory.clone(),
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[10, 20])],
+        [(10, 0), (20, 1)],
+        2,
+    );
+    let mut right = heap_from_chunks(
+        memory,
+        vec![LogicalType::Integer],
+        vec![int_chunk(&[1, 2])],
+        [(1, 0), (2, 1)],
+        2,
+    );
+
+    left.combine(&mut right)
+        .expect("combine owner-backed heaps");
+    assert!(pool.metadata_bytes() > 0);
+    assert_eq!(extract_i32(&mut left), vec![1, 2]);
+    drop((left, right));
+
+    assert_eq!(pool.issued_bytes(), 0);
+    assert_eq!(pool.metadata_bytes(), 0);
+    assert_eq!(pool.revocable_bytes(), 0);
 }

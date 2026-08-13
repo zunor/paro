@@ -7,7 +7,6 @@ use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::MemoryAccountingClass;
-use paro_common::memory::MemoryAccountingContext;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 use paro_function::scalar::FunctionExecContext;
@@ -17,14 +16,14 @@ use crate::operators::sort::topn_heap::{TopNBoundaryValue, TopNHeap};
 use crate::physical::properties::{MemoryClass, RequiredProperties};
 use crate::physical::specs::TopNSpec;
 use crate::runtime::breaker::{HandleRef, TopNHandle, TopNRuntimeState};
-use crate::runtime::context::{
-    OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
-};
+use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{
     FinishPoll, FinishTaskGroupRunner, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll,
 };
 use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, TopNBuildSinkLocal};
 use crate::runtime::ExpressionEvalInput;
+
+use super::topn_memory_context;
 
 // ---------------------------------------------------------------------------
 // TopN build sink
@@ -205,16 +204,6 @@ impl TopNBuildSinkExec {
 // ---------------------------------------------------------------------------
 // TopN helpers
 // ---------------------------------------------------------------------------
-
-pub(crate) fn topn_memory_context(query: &QueryRuntimeContext) -> MemoryAccountingContext {
-    let owner: Arc<dyn paro_common::memory::MemoryOwner> = query.memory.clone();
-    MemoryAccountingContext::from_owner(
-        owner,
-        paro_common::memory::MemoryDomain::Host,
-        MemoryTag::OrderBy,
-        paro_common::memory::MemoryAccountingClass::Revocable,
-    )
-}
 
 pub(crate) fn topn_order_types(spec: &TopNSpec) -> Vec<LogicalType> {
     spec.orders

@@ -4,18 +4,23 @@
 //! Heap implementation used by [`super::topn::TopN`].
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::mem::size_of;
 use std::sync::Mutex;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
-use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
+use paro_common::memory::{
+    AccountedVec, MemoryAccountingClass, MemoryAccountingContext, MemoryGrant,
+};
 use paro_common::sort_key::{compare_keys, encode_column, OrderModifiers};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 
 use crate::memory_runtime::RetainedChunkVec;
+
+#[path = "topn_entry_heap.rs"]
+mod entry_heap;
+use entry_heap::{TopNEntry, TopNEntryHeap};
 
 /// Global boundary value for TopN optimization.
 ///
@@ -80,21 +85,24 @@ impl Default for TopNBoundaryValue {
     }
 }
 
-/// Entry in the TopN heap.
-///
-/// Contains the encoded sort key and the index of the row in the heap data.
-#[derive(Debug, Clone)]
-struct TopNEntry {
-    /// Encoded sort key for comparison
-    sort_key: Vec<u8>,
-    /// Index in the heap_data chunk
-    index: usize,
-}
-
 #[derive(Debug, Clone, Copy)]
 struct HeapRowSource {
     chunk_index: usize,
     row_index: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MergeSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CombineCandidate {
+    side: MergeSide,
+    heap_position: usize,
+    old_payload_index: usize,
+    new_payload_index: usize,
 }
 
 /// Immutable directory translating heap-global row ids into chunk-local ids.
@@ -104,18 +112,24 @@ struct HeapRowSource {
 /// accidentally treating a batch of local row ids as if it came from one
 /// source chunk.
 struct HeapDataDirectory {
-    chunk_ends: Vec<usize>,
+    chunk_ends: AccountedVec<usize>,
 }
 
 impl HeapDataDirectory {
-    fn try_new(chunks: &[Chunk]) -> Result<Self> {
-        let mut chunk_ends = Vec::with_capacity(chunks.len());
+    fn try_new(chunks: &[Chunk], memory: &MemoryAccountingContext) -> Result<Self> {
+        let metadata = metadata_context(memory);
+        let mut chunk_ends = AccountedVec::new_with_accounting(
+            grant_for_metadata(&metadata),
+            paro_common::allocator::MemoryTag::Metadata,
+            MemoryAccountingClass::Metadata,
+        );
+        chunk_ends.try_reserve(chunks.len())?;
         let mut end = 0usize;
         for chunk in chunks {
             end = end
                 .checked_add(chunk.size())
                 .ok_or_else(|| paro_common::error::internal("TopN heap row directory overflow"))?;
-            chunk_ends.push(end);
+            chunk_ends.try_push(end)?;
         }
         Ok(Self { chunk_ends })
     }
@@ -140,28 +154,6 @@ impl HeapDataDirectory {
     }
 }
 
-impl PartialEq for TopNEntry {
-    fn eq(&self, other: &Self) -> bool {
-        self.sort_key == other.sort_key
-    }
-}
-
-impl Eq for TopNEntry {}
-
-impl PartialOrd for TopNEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for TopNEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // BinaryHeap is a max-heap, so we compare in reverse order
-        // to get the largest element at the top
-        self.sort_key.cmp(&other.sort_key)
-    }
-}
-
 /// TopN heap for maintaining top-K elements.
 ///
 /// Uses a max-heap to efficiently track the smallest K elements.
@@ -170,7 +162,7 @@ impl Ord for TopNEntry {
 #[derive(Debug)]
 pub struct TopNHeap {
     /// Max-heap of entries
-    heap: BinaryHeap<TopNEntry>,
+    heap: TopNEntryHeap,
     /// Materialized payload data
     heap_data: RetainedChunkVec,
     /// Memory owner for retained chunk buffers.
@@ -196,7 +188,8 @@ impl TopNHeap {
     /// * `orders` - ORDER BY specifications
     /// * `limit` - LIMIT value
     /// * `offset` - OFFSET value
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         payload_types: Vec<LogicalType>,
         orders: &[OrderByNode],
         limit: usize,
@@ -228,7 +221,7 @@ impl TopNHeap {
             .collect();
 
         Self {
-            heap: BinaryHeap::with_capacity(heap_size),
+            heap: TopNEntryHeap::new(&memory),
             heap_data: RetainedChunkVec::new(memory.clone()),
             memory,
             heap_size,
@@ -331,11 +324,16 @@ impl TopNHeap {
     /// entry index or old ownership is changed. A copy/accounting failure thus
     /// leaves both the heap and its payload address domain untouched.
     fn compact_live(&mut self) -> Result<()> {
-        let mut live_indices = self
-            .heap
-            .iter()
-            .map(|entry| entry.index)
-            .collect::<Vec<_>>();
+        let metadata = metadata_context(&self.memory);
+        let mut live_indices = AccountedVec::new_with_accounting(
+            grant_for_metadata(&metadata),
+            paro_common::allocator::MemoryTag::Metadata,
+            MemoryAccountingClass::Metadata,
+        );
+        live_indices.try_reserve(self.heap.len())?;
+        for entry in self.heap.iter() {
+            live_indices.try_push(entry.index)?;
+        }
         if live_indices.is_empty() {
             self.heap_data.clear();
             return Ok(());
@@ -347,12 +345,13 @@ impl TopNHeap {
             ));
         }
 
-        let mut remapped_entries = Vec::with_capacity(self.heap.len());
         let mut new_heap_data = RetainedChunkVec::new(self.memory.clone());
-        Self::for_each_gathered_chunk(
+        Self::for_each_gathered_rows(
+            &self.memory,
             &self.payload_types,
             self.heap_data.as_slice(),
-            &live_indices,
+            live_indices.len(),
+            |row| live_indices[row],
             |chunk| {
                 new_heap_data.push(chunk)?;
                 Ok(())
@@ -361,13 +360,12 @@ impl TopNHeap {
 
         // Copy and accounting are complete. Only now publish the new address
         // domain and remap every live entry into it.
-        remapped_entries.extend(self.heap.drain());
-        for entry in &mut remapped_entries {
+        for entry in self.heap.as_mut_slice() {
             entry.index = live_indices
                 .binary_search(&entry.index)
                 .expect("live TopN index was collected before compaction");
         }
-        self.heap = BinaryHeap::from(remapped_entries);
+        self.heap.rebuild();
         self.heap_data = new_heap_data;
 
         Ok(())
@@ -375,26 +373,35 @@ impl TopNHeap {
 
     /// Gather global row ids from any number of source chunks into vector-sized
     /// output chunks. All TopN materialization paths use this implementation.
-    fn for_each_gathered_chunk(
+    fn for_each_gathered_rows(
+        memory: &MemoryAccountingContext,
         payload_types: &[LogicalType],
         source_chunks: &[Chunk],
-        row_indices: &[usize],
+        row_count: usize,
+        mut row_index: impl FnMut(usize) -> usize,
         mut consume: impl FnMut(Chunk) -> Result<()>,
     ) -> Result<()> {
-        if row_indices.is_empty() {
+        if row_count == 0 {
             return Ok(());
         }
-        let directory = HeapDataDirectory::try_new(source_chunks)?;
-        for batch in row_indices.chunks(paro_common::vector::VECTOR_SIZE) {
-            let sources = batch
-                .iter()
-                .map(|&index| directory.resolve(index))
-                .collect::<Result<Vec<_>>>()?;
+        let directory = HeapDataDirectory::try_new(source_chunks, memory)?;
+        let empty_source = HeapRowSource {
+            chunk_index: 0,
+            row_index: 0,
+        };
+        let mut sources = [empty_source; paro_common::vector::VECTOR_SIZE];
+        let mut start = 0usize;
+        while start < row_count {
+            let batch_len = (row_count - start).min(paro_common::vector::VECTOR_SIZE);
+            for (offset, source) in sources[..batch_len].iter_mut().enumerate() {
+                *source = directory.resolve(row_index(start + offset))?;
+            }
             consume(Self::gather_row_batch(
                 payload_types,
                 source_chunks,
-                &sources,
+                &sources[..batch_len],
             )?)?;
+            start += batch_len;
         }
         Ok(())
     }
@@ -518,12 +525,13 @@ impl TopNHeap {
                 continue;
             }
 
-            let entry = TopNEntry {
-                sort_key: std::mem::take(&mut sort_key),
-                index: BASE_INDEX + row_idx,
-            };
+            let entry = TopNEntry::try_new(
+                std::mem::take(&mut sort_key),
+                BASE_INDEX + row_idx,
+                &self.memory,
+            )?;
 
-            self.add_entry_to_heap(entry);
+            self.add_entry_to_heap(entry)?;
             any_added = true;
         }
 
@@ -552,15 +560,13 @@ impl TopNHeap {
                 row_map.insert(BASE_INDEX + old_idx, base_heap_data_size + new_idx);
             }
 
-            // We need to rebuild the heap with updated indices
-            let mut entries: Vec<TopNEntry> = self.heap.drain().collect();
-            for entry in &mut entries {
+            // Reindex in place, then restore the heap invariant.
+            for entry in self.heap.as_mut_slice() {
                 if let Some(&new_index) = row_map.get(&entry.index) {
                     entry.index = new_index;
                 }
             }
-
-            self.heap = BinaryHeap::from(entries);
+            self.heap.rebuild();
             self.heap_data.push(new_chunk)?;
         }
 
@@ -588,12 +594,13 @@ impl TopNHeap {
                 continue;
             }
 
-            let entry = TopNEntry {
-                sort_key: std::mem::take(&mut sort_key),
-                index: base_index + rows_to_copy.len(),
-            };
+            let entry = TopNEntry::try_new(
+                std::mem::take(&mut sort_key),
+                base_index + rows_to_copy.len(),
+                &self.memory,
+            )?;
 
-            self.add_entry_to_heap(entry);
+            self.add_entry_to_heap(entry)?;
             rows_to_copy.push(row_idx);
         }
 
@@ -667,12 +674,12 @@ impl TopNHeap {
     }
 
     /// Add an entry to the heap, removing the max if necessary.
-    fn add_entry_to_heap(&mut self, entry: TopNEntry) {
+    fn add_entry_to_heap(&mut self, entry: TopNEntry) -> Result<()> {
         if self.heap.len() >= self.heap_size {
             // Heap is full - remove the max element
             self.heap.pop();
         }
-        self.heap.push(entry);
+        self.heap.try_push(entry)
     }
 
     /// Copy selected rows from a chunk.
@@ -733,48 +740,80 @@ impl TopNHeap {
             ));
         }
 
-        // Select the final live set without mutating either heap. Payload copy
-        // and memory admission can fail, so both ownership domains must remain
-        // valid until every selected row has been gathered.
-        let (selected_self, selected_other) = self.select_combined_rows(other)?;
-        let expected_entries = selected_self.len() + selected_other.len();
+        // One accounted candidate buffer replaces the previous left/right
+        // refs, selections, validation copies, remaps, and combined entry Vec.
+        let candidate_count = self
+            .heap
+            .len()
+            .checked_add(other.heap.len())
+            .ok_or_else(|| paro_common::error::internal("TopN candidate count overflow"))?;
+        let mut candidates = accounted_metadata_vec(&self.memory);
+        candidates.try_reserve(candidate_count)?;
+        for (heap_position, entry) in self.heap.iter().enumerate() {
+            candidates.try_push(CombineCandidate {
+                side: MergeSide::Left,
+                heap_position,
+                old_payload_index: entry.index,
+                new_payload_index: 0,
+            })?;
+        }
+        for (heap_position, entry) in other.heap.iter().enumerate() {
+            candidates.try_push(CombineCandidate {
+                side: MergeSide::Right,
+                heap_position,
+                old_payload_index: entry.index,
+                new_payload_index: 0,
+            })?;
+        }
 
-        // Prepare all fallible metadata before staging payload. Publication
-        // below must not allocate after either source heap starts to drain.
-        let mut self_remap = selected_self
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(new_index, old_index)| (old_index, new_index))
-            .collect::<Vec<_>>();
-        self_remap.sort_unstable_by_key(|&(old_index, _)| old_index);
-        let other_base = selected_self.len();
-        let mut other_remap = selected_other
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(new_index, old_index)| (old_index, other_base + new_index))
-            .collect::<Vec<_>>();
-        other_remap.sort_unstable_by_key(|&(old_index, _)| old_index);
-        let mut combined = Vec::with_capacity(expected_entries);
+        candidates.sort_unstable_by_key(|candidate| (candidate.side, candidate.old_payload_index));
+        if candidates.windows(2).any(|pair| {
+            pair[0].side == pair[1].side && pair[0].old_payload_index == pair[1].old_payload_index
+        }) {
+            return Err(paro_common::error::internal(
+                "TopN heap contains duplicate live payload indices",
+            ));
+        }
+        candidates.sort_unstable_by(|left, right| {
+            candidate_entry(left, &self.heap, &other.heap)
+                .sort_key
+                .cmp(&candidate_entry(right, &self.heap, &other.heap).sort_key)
+                .then_with(|| left.side.cmp(&right.side))
+                .then_with(|| left.old_payload_index.cmp(&right.old_payload_index))
+        });
+        candidates.truncate(self.heap_size.min(candidates.len()));
+        candidates.sort_unstable_by_key(|candidate| (candidate.side, candidate.heap_position));
+        for (new_payload_index, candidate) in candidates.iter_mut().enumerate() {
+            candidate.new_payload_index = new_payload_index;
+        }
+        let expected_entries = candidates.len();
+        let left_count = candidates.partition_point(|candidate| candidate.side == MergeSide::Left);
+
+        // The final persistent heap backing is also metadata-accounted and
+        // admitted before any source ownership is touched.
+        let mut final_heap = TopNEntryHeap::try_with_capacity(&self.memory, expected_entries)?;
 
         // Gather the complete final live set into an independent ownership
         // domain. Both old heaps stay intact until every payload allocation and
         // retention charge has succeeded, including later vector-sized batches.
         let mut staged_data = RetainedChunkVec::new(self.memory.clone());
-        Self::for_each_gathered_chunk(
+        Self::for_each_gathered_rows(
+            &self.memory,
             &self.payload_types,
             self.heap_data.as_slice(),
-            &selected_self,
+            left_count,
+            |row| candidates[row].old_payload_index,
             |chunk| {
                 staged_data.push(chunk)?;
                 Ok(())
             },
         )?;
-        Self::for_each_gathered_chunk(
+        Self::for_each_gathered_rows(
+            &self.memory,
             &self.payload_types,
             other.heap_data.as_slice(),
-            &selected_other,
+            expected_entries - left_count,
+            |row| candidates[left_count + row].old_payload_index,
             |chunk| {
                 staged_data.push(chunk)?;
                 Ok(())
@@ -783,75 +822,36 @@ impl TopNHeap {
 
         // Copy is complete. Transfer sort-key ownership and publish the new
         // entry address domain without cloning keys or allocating metadata.
-        for mut entry in self.heap.drain() {
-            let Ok(position) =
-                self_remap.binary_search_by_key(&entry.index, |&(old_index, _)| old_index)
-            else {
-                continue;
+        let mut candidate_index = 0usize;
+        for (heap_position, mut entry) in self.heap.drain().enumerate() {
+            let Some(candidate) = candidates.get(candidate_index) else {
+                break;
             };
-            entry.index = self_remap[position].1;
-            combined.push(entry);
-        }
-        for mut entry in other.heap.drain() {
-            let Ok(position) =
-                other_remap.binary_search_by_key(&entry.index, |&(old_index, _)| old_index)
-            else {
+            if candidate.side != MergeSide::Left || candidate.heap_position != heap_position {
                 continue;
-            };
-            entry.index = other_remap[position].1;
-            combined.push(entry);
+            }
+            entry.index = candidate.new_payload_index;
+            final_heap.push_prepared(entry);
+            candidate_index += 1;
         }
-        debug_assert_eq!(combined.len(), expected_entries);
-        self.heap = BinaryHeap::from(combined);
+        candidate_index = left_count;
+        for (heap_position, mut entry) in other.heap.drain().enumerate() {
+            let Some(candidate) = candidates.get(candidate_index) else {
+                break;
+            };
+            if candidate.side != MergeSide::Right || candidate.heap_position != heap_position {
+                continue;
+            }
+            entry.index = candidate.new_payload_index;
+            final_heap.push_prepared(entry);
+            candidate_index += 1;
+        }
+        debug_assert_eq!(final_heap.len(), expected_entries);
+        self.heap = final_heap;
         self.heap_data = staged_data;
+        other.heap = TopNEntryHeap::new(&other.memory);
         other.heap_data = RetainedChunkVec::new(other.memory.clone());
 
-        Ok(())
-    }
-
-    fn select_combined_rows(&self, other: &TopNHeap) -> Result<(Vec<usize>, Vec<usize>)> {
-        let mut left = self.heap.iter().collect::<Vec<_>>();
-        let mut right = other.heap.iter().collect::<Vec<_>>();
-        let order = |left: &&TopNEntry, right: &&TopNEntry| {
-            left.sort_key
-                .cmp(&right.sort_key)
-                .then_with(|| left.index.cmp(&right.index))
-        };
-        left.sort_unstable_by(order);
-        right.sort_unstable_by(order);
-        Self::validate_unique_payload_indices(&left)?;
-        Self::validate_unique_payload_indices(&right)?;
-
-        let target = self.heap_size.min(left.len().saturating_add(right.len()));
-        let mut selected_left = Vec::with_capacity(target.min(left.len()));
-        let mut selected_right = Vec::with_capacity(target.min(right.len()));
-        let (mut left_index, mut right_index) = (0usize, 0usize);
-        while selected_left.len() + selected_right.len() < target {
-            let take_left = match (left.get(left_index), right.get(right_index)) {
-                (Some(left), Some(right)) => left.sort_key <= right.sort_key,
-                (Some(_), None) => true,
-                (None, Some(_)) => false,
-                (None, None) => break,
-            };
-            if take_left {
-                selected_left.push(left[left_index].index);
-                left_index += 1;
-            } else {
-                selected_right.push(right[right_index].index);
-                right_index += 1;
-            }
-        }
-        Ok((selected_left, selected_right))
-    }
-
-    fn validate_unique_payload_indices(entries: &[&TopNEntry]) -> Result<()> {
-        let mut indices = entries.iter().map(|entry| entry.index).collect::<Vec<_>>();
-        indices.sort_unstable();
-        if indices.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(paro_common::error::internal(
-                "TopN heap contains duplicate live payload indices",
-            ));
-        }
         Ok(())
     }
 
@@ -864,34 +864,77 @@ impl TopNHeap {
     ///
     /// Returns chunks of sorted data, skipping the first `offset` rows.
     pub fn extract_results(&mut self) -> Result<Vec<Chunk>> {
-        // A heap has no stable iteration order; consume and sort exactly once.
-        let mut sorted_entries: Vec<TopNEntry> = self.heap.drain().collect();
-        sorted_entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        // A heap has no stable iteration order; sort its accounted backing in
+        // place and consume it after output materialization succeeds.
+        self.heap
+            .as_mut_slice()
+            .sort_unstable_by(|left, right| left.sort_key.cmp(&right.sort_key));
 
         // Apply offset
-        let start_idx = self.offset.min(sorted_entries.len());
-        let result_entries = &sorted_entries[start_idx..];
+        let start_idx = self.offset.min(self.heap.len());
+        let result_entries = &self.heap.as_slice()[start_idx..];
 
         if result_entries.is_empty() {
+            self.heap.clear();
             return Ok(vec![]);
         }
 
-        let row_indices = result_entries
-            .iter()
-            .map(|entry| entry.index)
-            .collect::<Vec<_>>();
-        let mut result_chunks = Vec::new();
-        Self::for_each_gathered_chunk(
+        let mut result_chunks = RetainedChunkVec::new(self.memory.clone());
+        let gather_result = Self::for_each_gathered_rows(
+            &self.memory,
             &self.payload_types,
             self.heap_data.as_slice(),
-            &row_indices,
+            result_entries.len(),
+            |row| result_entries[row].index,
             |chunk| {
-                result_chunks.push(chunk);
+                result_chunks.push(chunk)?;
                 Ok(())
             },
-        )?;
+        );
+        if let Err(error) = gather_result {
+            self.heap.rebuild();
+            return Err(error);
+        }
+        self.heap.clear();
 
+        // Output vectors may outlive this heap, its breaker state, and the
+        // query registry. Attach the retained allocation lease to every
+        // escaping vector before the temporary output store is dropped.
+        let (result_chunks, _output_lease) = result_chunks.drain_chunks_with_handle();
         Ok(result_chunks)
+    }
+}
+
+fn metadata_context(memory: &MemoryAccountingContext) -> MemoryAccountingContext {
+    memory.with_tag_and_class(
+        paro_common::allocator::MemoryTag::Metadata,
+        MemoryAccountingClass::Metadata,
+    )
+}
+
+fn grant_for_metadata(memory: &MemoryAccountingContext) -> MemoryGrant {
+    memory
+        .grant()
+        .expect("zero-byte TopN metadata grant must be constructible")
+}
+
+fn accounted_metadata_vec<T>(memory: &MemoryAccountingContext) -> AccountedVec<T> {
+    let metadata = metadata_context(memory);
+    AccountedVec::new_with_accounting(
+        grant_for_metadata(&metadata),
+        paro_common::allocator::MemoryTag::Metadata,
+        MemoryAccountingClass::Metadata,
+    )
+}
+
+fn candidate_entry<'a>(
+    candidate: &CombineCandidate,
+    left: &'a TopNEntryHeap,
+    right: &'a TopNEntryHeap,
+) -> &'a TopNEntry {
+    match candidate.side {
+        MergeSide::Left => &left.as_slice()[candidate.heap_position],
+        MergeSide::Right => &right.as_slice()[candidate.heap_position],
     }
 }
 
@@ -983,6 +1026,10 @@ mod tests {
         entries: impl IntoIterator<Item = (u32, usize)>,
         heap_size: usize,
     ) -> TopNHeap {
+        let memory = MemoryAccountingContext::detached(
+            paro_common::allocator::MemoryTag::OrderBy,
+            MemoryAccountingClass::Revocable,
+        );
         let mut heap_data = RetainedChunkVec::detached(
             paro_common::allocator::MemoryTag::OrderBy,
             MemoryAccountingClass::Revocable,
@@ -990,21 +1037,15 @@ mod tests {
         for values in chunks {
             heap_data.push(make_int_chunk(values)).unwrap();
         }
+        let mut heap = TopNEntryHeap::new(&memory);
+        for (key, index) in entries {
+            heap.try_push(TopNEntry::try_new(key.to_be_bytes().to_vec(), index, &memory).unwrap())
+                .unwrap();
+        }
         TopNHeap {
-            heap: BinaryHeap::from(
-                entries
-                    .into_iter()
-                    .map(|(key, index)| TopNEntry {
-                        sort_key: key.to_be_bytes().to_vec(),
-                        index,
-                    })
-                    .collect::<Vec<_>>(),
-            ),
+            heap,
             heap_data,
-            memory: MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::OrderBy,
-                MemoryAccountingClass::Revocable,
-            ),
+            memory,
             heap_size,
             offset: 0,
             modifiers: vec![OrderModifiers::new(true, false)],
@@ -1060,15 +1101,10 @@ mod tests {
 
     #[test]
     fn test_topn_entry_ordering() {
-        let entry1 = TopNEntry {
-            sort_key: vec![1, 2, 3],
-            index: 0,
-        };
-
-        let entry2 = TopNEntry {
-            sort_key: vec![2, 3, 4],
-            index: 1,
-        };
+        let memory =
+            MemoryAccountingContext::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        let entry1 = TopNEntry::try_new(vec![1, 2, 3], 0, &memory).unwrap();
+        let entry2 = TopNEntry::try_new(vec![2, 3, 4], 1, &memory).unwrap();
 
         // BinaryHeap is a max-heap, so larger sort_key should be "greater"
         assert!(entry2 > entry1);
@@ -1094,68 +1130,8 @@ mod tests {
 
     #[test]
     fn test_combine_sorts_other_entries_before_early_stop() {
-        let modifiers = vec![OrderModifiers::new(true, false)];
-        let mut left_data = RetainedChunkVec::detached(
-            paro_common::allocator::MemoryTag::OrderBy,
-            MemoryAccountingClass::Revocable,
-        );
-        left_data.push(make_int_chunk(&[5, 6, 7])).unwrap();
-        let mut right_data = RetainedChunkVec::detached(
-            paro_common::allocator::MemoryTag::OrderBy,
-            MemoryAccountingClass::Revocable,
-        );
-        right_data.push(make_int_chunk(&[9, 1, 2])).unwrap();
-
-        let mut left = TopNHeap {
-            heap_size: 3,
-            offset: 0,
-            heap: BinaryHeap::from(vec![
-                TopNEntry {
-                    sort_key: vec![5],
-                    index: 0,
-                },
-                TopNEntry {
-                    sort_key: vec![6],
-                    index: 1,
-                },
-                TopNEntry {
-                    sort_key: vec![7],
-                    index: 2,
-                },
-            ]),
-            heap_data: left_data,
-            memory: MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::OrderBy,
-                MemoryAccountingClass::Revocable,
-            ),
-            modifiers: modifiers.clone(),
-            payload_types: vec![LogicalType::Integer],
-        };
-        let mut right = TopNHeap {
-            heap_size: 3,
-            offset: 0,
-            heap: BinaryHeap::from(vec![
-                TopNEntry {
-                    sort_key: vec![9],
-                    index: 0,
-                },
-                TopNEntry {
-                    sort_key: vec![1],
-                    index: 1,
-                },
-                TopNEntry {
-                    sort_key: vec![2],
-                    index: 2,
-                },
-            ]),
-            heap_data: right_data,
-            memory: MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::OrderBy,
-                MemoryAccountingClass::Revocable,
-            ),
-            modifiers,
-            payload_types: vec![LogicalType::Integer],
-        };
+        let mut left = manual_heap(&[vec![5, 6, 7]], [(5, 0), (6, 1), (7, 2)], 3);
+        let mut right = manual_heap(&[vec![9, 1, 2]], [(9, 0), (1, 1), (2, 2)], 3);
 
         left.combine(&mut right).unwrap();
 
@@ -1276,15 +1252,14 @@ mod tests {
         let live = [3usize, VECTOR_SIZE + 5, 4 * VECTOR_SIZE - 1];
         let mut heap = manual_heap(&[], std::iter::empty(), live.len());
         heap.heap_data = heap_data;
-        heap.heap = BinaryHeap::from(
+        heap.heap = manual_heap(
+            &[],
             live.into_iter()
                 .enumerate()
-                .map(|(rank, index)| TopNEntry {
-                    sort_key: (rank as u32).to_be_bytes().to_vec(),
-                    index,
-                })
-                .collect::<Vec<_>>(),
-        );
+                .map(|(rank, index)| (rank as u32, index)),
+            live.len(),
+        )
+        .heap;
         let original_indices = heap
             .heap
             .iter()
@@ -1318,16 +1293,7 @@ mod tests {
                 allocator.clone() as Arc<dyn Allocator>,
             ))
             .unwrap();
-        right.heap = BinaryHeap::from(vec![
-            TopNEntry {
-                sort_key: 1u32.to_be_bytes().to_vec(),
-                index: 0,
-            },
-            TopNEntry {
-                sort_key: 2u32.to_be_bytes().to_vec(),
-                index: 1,
-            },
-        ]);
+        right.heap = manual_heap(&[], [(1, 0), (2, 1)], 2).heap;
 
         allocator.set_fail(true);
         left.combine(&mut right)

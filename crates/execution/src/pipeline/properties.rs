@@ -77,6 +77,12 @@ impl PipelinePropertyAccumulator {
                         .merge(Parallelism::bounded(plan.max_local_tables));
                 }
             }
+            SinkSpec::TopNBuild(_) => {
+                // TopN retains its heap, normalized keys, and payload until
+                // the emit boundary. It currently has neither a reclaimer nor
+                // an external path, so it is blocking but not spillable.
+                self.memory.class = self.memory.class.max(MemoryClass::Blocking);
+            }
             SinkSpec::PartitionAggregateWindowBuild(_) => {
                 // Local and merged payload/state can be atomically moved to
                 // raw radix partitions. Finalization then works one bounded
