@@ -91,6 +91,19 @@ impl MemoryAccountingContext {
         self.owner.is_some()
     }
 
+    /// Whether two long-lived structures publish allocations to exactly the
+    /// same accounting target.
+    pub fn has_same_target(&self, other: &Self) -> bool {
+        self.domain == other.domain
+            && self.tag == other.tag
+            && self.class == other.class
+            && match (&self.owner, &other.owner) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub fn retain(&self, bytes: usize) -> MemoryResult<MemoryReleaseHandle> {
         if bytes == 0 {
             return Ok(MemoryReleaseHandle::new(

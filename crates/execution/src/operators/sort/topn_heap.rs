@@ -91,6 +91,55 @@ struct TopNEntry {
     index: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HeapRowSource {
+    chunk_index: usize,
+    row_index: usize,
+}
+
+/// Immutable directory translating heap-global row ids into chunk-local ids.
+///
+/// Compaction, merge, and result extraction all consume the same address
+/// contract. Keeping the translation here prevents individual paths from
+/// accidentally treating a batch of local row ids as if it came from one
+/// source chunk.
+struct HeapDataDirectory {
+    chunk_ends: Vec<usize>,
+}
+
+impl HeapDataDirectory {
+    fn try_new(chunks: &[Chunk]) -> Result<Self> {
+        let mut chunk_ends = Vec::with_capacity(chunks.len());
+        let mut end = 0usize;
+        for chunk in chunks {
+            end = end
+                .checked_add(chunk.size())
+                .ok_or_else(|| paro_common::error::internal("TopN heap row directory overflow"))?;
+            chunk_ends.push(end);
+        }
+        Ok(Self { chunk_ends })
+    }
+
+    fn resolve(&self, global_index: usize) -> Result<HeapRowSource> {
+        let chunk_index = self
+            .chunk_ends
+            .partition_point(|&chunk_end| chunk_end <= global_index);
+        let Some(&chunk_end) = self.chunk_ends.get(chunk_index) else {
+            return Err(paro_common::error::internal(format!(
+                "TopN heap row index {global_index} is out of bounds"
+            )));
+        };
+        let chunk_start = chunk_index
+            .checked_sub(1)
+            .map_or(0, |previous| self.chunk_ends[previous]);
+        debug_assert!(global_index < chunk_end);
+        Ok(HeapRowSource {
+            chunk_index,
+            row_index: global_index - chunk_start,
+        })
+    }
+}
+
 impl PartialEq for TopNEntry {
     fn eq(&self, other: &Self) -> bool {
         self.sort_key == other.sort_key
@@ -272,92 +321,128 @@ impl TopNHeap {
             return Ok(());
         }
 
-        // We have too many values in heap_data - compact them
-        // Extract current heap entries (sorted)
-        let mut entries: Vec<TopNEntry> = self.heap.drain().collect();
-        entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        self.compact_live()
+    }
 
-        if entries.is_empty() {
+    /// Transactionally compact the payload store to the rows referenced by
+    /// the live heap entries.
+    ///
+    /// The complete replacement is copied and admitted to memory before any
+    /// entry index or old ownership is changed. A copy/accounting failure thus
+    /// leaves both the heap and its payload address domain untouched.
+    fn compact_live(&mut self) -> Result<()> {
+        let mut live_indices = self
+            .heap
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+        if live_indices.is_empty() {
+            self.heap_data.clear();
             return Ok(());
         }
+        live_indices.sort_unstable();
+        if live_indices.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(paro_common::error::internal(
+                "TopN heap contains duplicate live payload indices",
+            ));
+        }
 
-        // Build new compacted heap_data with only the entries we need
+        let mut remapped_entries = Vec::with_capacity(self.heap.len());
         let mut new_heap_data = RetainedChunkVec::new(self.memory.clone());
-        let mut current_chunk_rows = Vec::new();
+        Self::for_each_gathered_chunk(
+            &self.payload_types,
+            self.heap_data.as_slice(),
+            &live_indices,
+            |chunk| {
+                new_heap_data.push(chunk)?;
+                Ok(())
+            },
+        )?;
 
-        for (new_idx, entry) in entries.iter_mut().enumerate() {
-            // Find the row in old heap_data
-            let (chunk_idx, local_idx) =
-                self.find_row_in_chunks(self.heap_data.as_slice(), entry.index);
-            let old_chunk = &self.heap_data.as_slice()[chunk_idx];
-
-            // Collect row for new chunk
-            current_chunk_rows.push(local_idx);
-
-            // Update entry index to new position
-            entry.index = new_idx;
-
-            // Flush when we have enough rows for a chunk
-            if current_chunk_rows.len() >= paro_common::vector::VECTOR_SIZE {
-                let new_chunk = self.copy_rows(old_chunk, &current_chunk_rows)?;
-                new_heap_data.push(new_chunk)?;
-                current_chunk_rows.clear();
-            }
+        // Copy and accounting are complete. Only now publish the new address
+        // domain and remap every live entry into it.
+        remapped_entries.extend(self.heap.drain());
+        for entry in &mut remapped_entries {
+            entry.index = live_indices
+                .binary_search(&entry.index)
+                .expect("live TopN index was collected before compaction");
         }
-
-        // Flush remaining rows
-        if !current_chunk_rows.is_empty() {
-            // Need to collect from potentially multiple source chunks
-            let mut all_rows = Vec::new();
-            for entry in &entries[entries.len() - current_chunk_rows.len()..] {
-                let (chunk_idx, local_idx) =
-                    self.find_row_in_chunks(self.heap_data.as_slice(), entry.index);
-                all_rows.push((chunk_idx, local_idx));
-            }
-
-            // Build final chunk by copying from source chunks
-            let new_chunk = self.build_chunk_from_multiple_sources(&all_rows)?;
-            new_heap_data.push(new_chunk)?;
-        }
-
-        // Replace old heap_data with compacted version
+        self.heap = BinaryHeap::from(remapped_entries);
         self.heap_data = new_heap_data;
-
-        // Rebuild heap from sorted entries
-        self.heap = BinaryHeap::from(entries);
 
         Ok(())
     }
 
-    /// Build a chunk by copying rows from multiple source chunks.
-    fn build_chunk_from_multiple_sources(&self, rows: &[(usize, usize)]) -> Result<Chunk> {
+    /// Gather global row ids from any number of source chunks into vector-sized
+    /// output chunks. All TopN materialization paths use this implementation.
+    fn for_each_gathered_chunk(
+        payload_types: &[LogicalType],
+        source_chunks: &[Chunk],
+        row_indices: &[usize],
+        mut consume: impl FnMut(Chunk) -> Result<()>,
+    ) -> Result<()> {
+        if row_indices.is_empty() {
+            return Ok(());
+        }
+        let directory = HeapDataDirectory::try_new(source_chunks)?;
+        for batch in row_indices.chunks(paro_common::vector::VECTOR_SIZE) {
+            let sources = batch
+                .iter()
+                .map(|&index| directory.resolve(index))
+                .collect::<Result<Vec<_>>>()?;
+            consume(Self::gather_row_batch(
+                payload_types,
+                source_chunks,
+                &sources,
+            )?)?;
+        }
+        Ok(())
+    }
+
+    fn gather_row_batch(
+        payload_types: &[LogicalType],
+        source_chunks: &[Chunk],
+        rows: &[HeapRowSource],
+    ) -> Result<Chunk> {
         use paro_common::vector::Vector;
         use std::sync::Arc;
 
-        let mut output_vectors = Vec::with_capacity(self.payload_types.len());
+        let first = rows.first().ok_or_else(|| {
+            paro_common::error::internal("TopN gather requires at least one source row")
+        })?;
+        let allocator = source_chunks
+            .get(first.chunk_index)
+            .ok_or_else(|| paro_common::error::internal("TopN source chunk is out of bounds"))?
+            .allocator()
+            .clone();
+        let mut output_vectors = Vec::with_capacity(payload_types.len());
 
-        for (col_idx, col_type) in self.payload_types.iter().enumerate() {
-            let allocator = self.heap_data.as_slice()[rows[0].0].allocator().clone();
-            let mut dst_vec = Vector::try_new(col_type.clone(), rows.len(), allocator)?;
+        for (column_index, column_type) in payload_types.iter().enumerate() {
+            let mut destination =
+                Vector::try_new(column_type.clone(), rows.len(), allocator.clone())?;
 
-            for (dst_idx, &(chunk_idx, local_idx)) in rows.iter().enumerate() {
-                let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
+            for (destination_index, source) in rows.iter().enumerate() {
+                let source_vector = source_chunks
+                    .get(source.chunk_index)
+                    .and_then(|chunk| chunk.column(column_index))
+                    .ok_or_else(|| {
+                        paro_common::error::internal(format!(
+                            "TopN source is missing payload column {column_index}"
+                        ))
+                    })?;
 
-                if src_vec.is_null(local_idx) {
-                    dst_vec.try_set_null(dst_idx, true)?;
+                if source_vector.is_null(source.row_index) {
+                    destination.try_set_null(destination_index, true)?;
                 } else {
-                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx)?;
+                    destination.try_copy_at(destination_index, source_vector, source.row_index)?;
                 }
             }
 
-            dst_vec.try_set_count(rows.len())?;
-            output_vectors.push(Arc::new(dst_vec));
+            destination.try_set_count(rows.len())?;
+            output_vectors.push(Arc::new(destination));
         }
 
-        let mut result = Chunk::from_arc_vectors(
-            output_vectors,
-            self.heap_data.as_slice()[rows[0].0].allocator().clone(),
-        );
+        let mut result = Chunk::from_arc_vectors(output_vectors, allocator);
         result.try_set_cardinality(rows.len())?;
         Ok(result)
     }
@@ -637,65 +722,137 @@ impl TopNHeap {
     ///
     /// Used to merge results from parallel sinks.
     pub fn combine(&mut self, other: &mut TopNHeap) -> Result<()> {
-        // Drain and sort the other heap explicitly before merging.
-        // `BinaryHeap::drain()` does not yield items in heap order, so relying on
-        // `finalize()` + `drain()` can make the early-stop optimization skip better rows.
-        let mut other_entries: Vec<TopNEntry> = other.heap.drain().collect();
-        other_entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
+        if self.heap_size != other.heap_size
+            || self.offset != other.offset
+            || self.modifiers != other.modifiers
+            || self.payload_types != other.payload_types
+            || !self.memory.has_same_target(&other.memory)
+        {
+            return Err(paro_common::error::internal(
+                "cannot combine incompatible TopN heaps",
+            ));
+        }
 
-        let base_index = self.total_heap_data_size();
-        let mut rows_to_copy = Vec::new();
+        // Select the final live set without mutating either heap. Payload copy
+        // and memory admission can fail, so both ownership domains must remain
+        // valid until every selected row has been gathered.
+        let (selected_self, selected_other) = self.select_combined_rows(other)?;
+        let expected_entries = selected_self.len() + selected_other.len();
 
-        for entry in other_entries {
-            if !self.should_add_entry(&entry.sort_key) {
-                break; // Since other is sorted, we can stop here
-            }
+        // Prepare all fallible metadata before staging payload. Publication
+        // below must not allocate after either source heap starts to drain.
+        let mut self_remap = selected_self
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(new_index, old_index)| (old_index, new_index))
+            .collect::<Vec<_>>();
+        self_remap.sort_unstable_by_key(|&(old_index, _)| old_index);
+        let other_base = selected_self.len();
+        let mut other_remap = selected_other
+            .iter()
+            .copied()
+            .enumerate()
+            .map(|(new_index, old_index)| (old_index, other_base + new_index))
+            .collect::<Vec<_>>();
+        other_remap.sort_unstable_by_key(|&(old_index, _)| old_index);
+        let mut combined = Vec::with_capacity(expected_entries);
 
-            let new_entry = TopNEntry {
-                sort_key: entry.sort_key,
-                index: base_index + rows_to_copy.len(),
+        // Gather the complete final live set into an independent ownership
+        // domain. Both old heaps stay intact until every payload allocation and
+        // retention charge has succeeded, including later vector-sized batches.
+        let mut staged_data = RetainedChunkVec::new(self.memory.clone());
+        Self::for_each_gathered_chunk(
+            &self.payload_types,
+            self.heap_data.as_slice(),
+            &selected_self,
+            |chunk| {
+                staged_data.push(chunk)?;
+                Ok(())
+            },
+        )?;
+        Self::for_each_gathered_chunk(
+            &self.payload_types,
+            other.heap_data.as_slice(),
+            &selected_other,
+            |chunk| {
+                staged_data.push(chunk)?;
+                Ok(())
+            },
+        )?;
+
+        // Copy is complete. Transfer sort-key ownership and publish the new
+        // entry address domain without cloning keys or allocating metadata.
+        for mut entry in self.heap.drain() {
+            let Ok(position) =
+                self_remap.binary_search_by_key(&entry.index, |&(old_index, _)| old_index)
+            else {
+                continue;
             };
-
-            self.add_entry_to_heap(new_entry);
-            rows_to_copy.push(entry.index);
+            entry.index = self_remap[position].1;
+            combined.push(entry);
         }
-
-        if !rows_to_copy.is_empty() {
-            // Copy data from other's heap_data
-            for &row_idx in &rows_to_copy {
-                let (chunk_idx, local_idx) =
-                    self.find_row_in_chunks(other.heap_data.as_slice(), row_idx);
-                let chunk = &other.heap_data.as_slice()[chunk_idx];
-                let copied = self.copy_rows(chunk, &[local_idx])?;
-                self.heap_data.push(copied)?;
-            }
+        for mut entry in other.heap.drain() {
+            let Ok(position) =
+                other_remap.binary_search_by_key(&entry.index, |&(old_index, _)| old_index)
+            else {
+                continue;
+            };
+            entry.index = other_remap[position].1;
+            combined.push(entry);
         }
+        debug_assert_eq!(combined.len(), expected_entries);
+        self.heap = BinaryHeap::from(combined);
+        self.heap_data = staged_data;
+        other.heap_data = RetainedChunkVec::new(other.memory.clone());
 
         Ok(())
     }
 
-    /// Find which chunk and local index a global row index refers to.
-    fn find_row_in_chunks(&self, chunks: &[Chunk], global_idx: usize) -> (usize, usize) {
-        let mut offset = 0;
-        for (chunk_idx, chunk) in chunks.iter().enumerate() {
-            if global_idx < offset + chunk.size() {
-                return (chunk_idx, global_idx - offset);
+    fn select_combined_rows(&self, other: &TopNHeap) -> Result<(Vec<usize>, Vec<usize>)> {
+        let mut left = self.heap.iter().collect::<Vec<_>>();
+        let mut right = other.heap.iter().collect::<Vec<_>>();
+        let order = |left: &&TopNEntry, right: &&TopNEntry| {
+            left.sort_key
+                .cmp(&right.sort_key)
+                .then_with(|| left.index.cmp(&right.index))
+        };
+        left.sort_unstable_by(order);
+        right.sort_unstable_by(order);
+        Self::validate_unique_payload_indices(&left)?;
+        Self::validate_unique_payload_indices(&right)?;
+
+        let target = self.heap_size.min(left.len().saturating_add(right.len()));
+        let mut selected_left = Vec::with_capacity(target.min(left.len()));
+        let mut selected_right = Vec::with_capacity(target.min(right.len()));
+        let (mut left_index, mut right_index) = (0usize, 0usize);
+        while selected_left.len() + selected_right.len() < target {
+            let take_left = match (left.get(left_index), right.get(right_index)) {
+                (Some(left), Some(right)) => left.sort_key <= right.sort_key,
+                (Some(_), None) => true,
+                (None, Some(_)) => false,
+                (None, None) => break,
+            };
+            if take_left {
+                selected_left.push(left[left_index].index);
+                left_index += 1;
+            } else {
+                selected_right.push(right[right_index].index);
+                right_index += 1;
             }
-            offset += chunk.size();
         }
-        panic!("Row index {} out of bounds", global_idx);
+        Ok((selected_left, selected_right))
     }
 
-    /// Finalize the heap by sorting entries.
-    ///
-    /// After finalization, entries are in ascending order.
-    pub fn finalize(&mut self) {
-        // Convert heap to sorted vector
-        let mut entries: Vec<TopNEntry> = self.heap.drain().collect();
-        entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
-
-        // Rebuild heap from sorted entries
-        self.heap = BinaryHeap::from(entries);
+    fn validate_unique_payload_indices(entries: &[&TopNEntry]) -> Result<()> {
+        let mut indices = entries.iter().map(|entry| entry.index).collect::<Vec<_>>();
+        indices.sort_unstable();
+        if indices.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(paro_common::error::internal(
+                "TopN heap contains duplicate live payload indices",
+            ));
+        }
+        Ok(())
     }
 
     /// Get the total number of rows in heap_data.
@@ -707,10 +864,7 @@ impl TopNHeap {
     ///
     /// Returns chunks of sorted data, skipping the first `offset` rows.
     pub fn extract_results(&mut self) -> Result<Vec<Chunk>> {
-        // Finalize to ensure sorted order
-        self.finalize();
-
-        // Extract sorted entries
+        // A heap has no stable iteration order; consume and sort exactly once.
         let mut sorted_entries: Vec<TopNEntry> = self.heap.drain().collect();
         sorted_entries.sort_by(|a, b| a.sort_key.cmp(&b.sort_key));
 
@@ -722,98 +876,163 @@ impl TopNHeap {
             return Ok(vec![]);
         }
 
-        // Build result chunks
+        let row_indices = result_entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
         let mut result_chunks = Vec::new();
-        let mut current_rows = Vec::new();
-
-        for entry in result_entries {
-            current_rows.push(entry.index);
-
-            if current_rows.len() >= paro_common::vector::VECTOR_SIZE {
-                let chunk = self.build_result_chunk(&current_rows)?;
+        Self::for_each_gathered_chunk(
+            &self.payload_types,
+            self.heap_data.as_slice(),
+            &row_indices,
+            |chunk| {
                 result_chunks.push(chunk);
-                current_rows.clear();
-            }
-        }
-
-        if !current_rows.is_empty() {
-            let chunk = self.build_result_chunk(&current_rows)?;
-            result_chunks.push(chunk);
-        }
+                Ok(())
+            },
+        )?;
 
         Ok(result_chunks)
-    }
-
-    /// Build a result chunk from row indices.
-    fn build_result_chunk(&self, row_indices: &[usize]) -> Result<Chunk> {
-        use paro_common::vector::Vector;
-        use std::sync::Arc;
-
-        let mut output_vectors = Vec::with_capacity(self.payload_types.len());
-
-        for (col_idx, col_type) in self.payload_types.iter().enumerate() {
-            let allocator = self
-                .heap_data
-                .as_slice()
-                .first()
-                .map(|chunk| chunk.allocator().clone())
-                .ok_or_else(|| {
-                    paro_common::error::internal("TopN heap has no payload chunks".to_string())
-                })?;
-            let mut dst_vec = Vector::try_new(col_type.clone(), row_indices.len(), allocator)?;
-
-            for (dst_idx, &global_idx) in row_indices.iter().enumerate() {
-                let (chunk_idx, local_idx) =
-                    self.find_row_in_chunks(self.heap_data.as_slice(), global_idx);
-                let src_vec = &self.heap_data.as_slice()[chunk_idx].data[col_idx];
-
-                if src_vec.is_null(local_idx) {
-                    dst_vec.try_set_null(dst_idx, true)?;
-                } else {
-                    self.copy_value(src_vec, local_idx, &mut dst_vec, dst_idx)?;
-                }
-            }
-
-            dst_vec.try_set_count(row_indices.len())?;
-            output_vectors.push(Arc::new(dst_vec));
-        }
-
-        let allocator = self
-            .heap_data
-            .as_slice()
-            .first()
-            .map(|chunk| chunk.allocator().clone())
-            .ok_or_else(|| {
-                paro_common::error::internal("TopN heap has no payload chunks".to_string())
-            })?;
-        let mut result = Chunk::from_arc_vectors(output_vectors, allocator);
-        result.try_set_cardinality(row_indices.len())?;
-        Ok(result)
     }
 }
 
 #[cfg(test)]
+#[path = "topn_heap_contract_tests.rs"]
+mod contract_tests;
+
+#[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
-    use paro_common::allocator::MemoryTag;
+    use paro_common::allocator::{Allocator, DefaultAllocator, MemoryTag};
     use paro_common::memory::{MemoryDomain, MemoryOwner};
+    use paro_common::vector::VECTOR_SIZE;
     use paro_planner::expression::{Expression, ReferenceExpression};
 
     use crate::memory_runtime::QueryMemoryPool;
 
     use super::*;
 
-    fn make_int_chunk(values: &[i32]) -> Chunk {
-        let mut vector =
-            paro_common::test_utils::test_vector_with_capacity(LogicalType::Integer, values.len());
-        for (idx, value) in values.iter().enumerate() {
-            vector.set_i32(idx, *value);
+    #[derive(Debug)]
+    struct ToggleAllocator {
+        inner: DefaultAllocator,
+        fail: AtomicBool,
+    }
+
+    impl ToggleAllocator {
+        fn new() -> Self {
+            Self {
+                inner: DefaultAllocator::new(),
+                fail: AtomicBool::new(false),
+            }
         }
-        vector.set_count(values.len());
+
+        fn set_fail(&self, fail: bool) {
+            self.fail.store(fail, AtomicOrdering::SeqCst);
+        }
+
+        fn check(&self, bytes: usize) -> Result<()> {
+            if self.fail.load(AtomicOrdering::SeqCst) {
+                Err(paro_common::error::out_of_memory(format!(
+                    "injected TopN allocation failure: {bytes} bytes"
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl Allocator for ToggleAllocator {
+        fn allocate(&self, size: usize) -> Result<*mut u8> {
+            self.check(size)?;
+            self.inner.allocate(size)
+        }
+
+        fn allocate_zeroed(&self, size: usize) -> Result<*mut u8> {
+            self.check(size)?;
+            self.inner.allocate_zeroed(size)
+        }
+
+        fn free(&self, ptr: *mut u8, size: usize) {
+            self.inner.free(ptr, size);
+        }
+
+        fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> Result<*mut u8> {
+            self.check(new_size)?;
+            self.inner.reallocate(ptr, old_size, new_size)
+        }
+
+        fn name(&self) -> &'static str {
+            "ToggleAllocator"
+        }
+    }
+
+    fn make_int_chunk(values: &[i32]) -> Chunk {
+        make_int_chunk_with_allocator(values, paro_common::test_utils::test_allocator())
+    }
+
+    fn make_int_chunk_with_allocator(values: &[i32], allocator: Arc<dyn Allocator>) -> Chunk {
+        let vector = paro_common::test_utils::test_i32_vector_with_allocator(values, allocator);
         let mut chunk = paro_common::test_utils::test_chunk_from_vectors(vec![vector]);
         chunk.set_cardinality(values.len());
         chunk
+    }
+
+    fn manual_heap(
+        chunks: &[Vec<i32>],
+        entries: impl IntoIterator<Item = (u32, usize)>,
+        heap_size: usize,
+    ) -> TopNHeap {
+        let mut heap_data = RetainedChunkVec::detached(
+            paro_common::allocator::MemoryTag::OrderBy,
+            MemoryAccountingClass::Revocable,
+        );
+        for values in chunks {
+            heap_data.push(make_int_chunk(values)).unwrap();
+        }
+        TopNHeap {
+            heap: BinaryHeap::from(
+                entries
+                    .into_iter()
+                    .map(|(key, index)| TopNEntry {
+                        sort_key: key.to_be_bytes().to_vec(),
+                        index,
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            heap_data,
+            memory: MemoryAccountingContext::detached(
+                paro_common::allocator::MemoryTag::OrderBy,
+                MemoryAccountingClass::Revocable,
+            ),
+            heap_size,
+            offset: 0,
+            modifiers: vec![OrderModifiers::new(true, false)],
+            payload_types: vec![LogicalType::Integer],
+        }
+    }
+
+    fn sequential_chunks(chunk_count: usize) -> Vec<Vec<i32>> {
+        (0..chunk_count)
+            .map(|chunk_index| {
+                let start = chunk_index * VECTOR_SIZE;
+                (start..start + VECTOR_SIZE)
+                    .map(|value| value as i32)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn extract_ints(heap: &mut TopNHeap) -> Vec<i32> {
+        heap.extract_results()
+            .unwrap()
+            .into_iter()
+            .flat_map(|chunk| {
+                (0..chunk.size())
+                    .map(|row| chunk.column(0).unwrap().get_i32(row).unwrap())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     #[test]
@@ -947,6 +1166,176 @@ mod tests {
             .map(|idx| result_vec.get_i32(idx).unwrap())
             .collect::<Vec<_>>();
         assert_eq!(values, vec![1, 2, 5]);
+    }
+
+    #[test]
+    fn reduce_compacts_sub_vector_heap_with_holes_across_source_chunks() {
+        let chunks = sequential_chunks(5);
+        let live = [
+            1usize,
+            VECTOR_SIZE + 7,
+            2 * VECTOR_SIZE + 3,
+            4 * VECTOR_SIZE - 1,
+        ];
+        let mut heap = manual_heap(
+            &chunks,
+            live.into_iter()
+                .enumerate()
+                .map(|(rank, index)| (rank as u32, index)),
+            live.len(),
+        );
+        assert_eq!(heap.total_heap_data_size(), 5 * VECTOR_SIZE);
+
+        heap.reduce().unwrap();
+
+        assert_eq!(heap.total_heap_data_size(), live.len());
+        assert_eq!(extract_ints(&mut heap), live.map(|index| index as i32));
+    }
+
+    #[test]
+    fn reduce_compacts_more_than_one_vector_from_interleaved_source_chunks() {
+        let chunks = sequential_chunks(5);
+        let mut live = Vec::with_capacity(VECTOR_SIZE + 1);
+        for local_index in 0..VECTOR_SIZE / 2 {
+            live.push(local_index);
+            live.push(VECTOR_SIZE + local_index);
+        }
+        live.push(2 * VECTOR_SIZE + 17);
+        let mut heap = manual_heap(
+            &chunks,
+            live.iter()
+                .copied()
+                .enumerate()
+                .map(|(rank, index)| (rank as u32, index)),
+            live.len(),
+        );
+
+        heap.reduce().unwrap();
+
+        assert_eq!(heap.total_heap_data_size(), live.len());
+        assert_eq!(heap.heap_data.len(), 2);
+        assert_eq!(
+            extract_ints(&mut heap),
+            live.into_iter()
+                .map(|index| index as i32)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn combine_gathers_selected_rows_in_vector_batches_then_transfers_entries() {
+        let row_count = VECTOR_SIZE + 1;
+        let left_chunks = vec![
+            (0..VECTOR_SIZE)
+                .map(|row| (100_000 + row) as i32)
+                .collect::<Vec<_>>(),
+            vec![(100_000 + VECTOR_SIZE) as i32],
+        ];
+        let right_chunks = vec![
+            (0..VECTOR_SIZE).map(|row| row as i32).collect::<Vec<_>>(),
+            vec![VECTOR_SIZE as i32],
+        ];
+        let mut left = manual_heap(
+            &left_chunks,
+            (0..row_count).map(|index| ((100_000 + index) as u32, index)),
+            row_count,
+        );
+        let mut right = manual_heap(
+            &right_chunks,
+            (0..row_count).map(|index| (index as u32, index)),
+            row_count,
+        );
+
+        left.combine(&mut right).unwrap();
+
+        assert!(right.heap.is_empty());
+        assert!(right.heap_data.is_empty());
+        // The final live set is rebuilt into two vector-sized chunks. The
+        // previous row-at-a-time merge produced one retained chunk per row.
+        assert_eq!(left.heap_data.len(), 2);
+        assert_eq!(
+            extract_ints(&mut left),
+            (0..row_count).map(|value| value as i32).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn compact_copy_failure_preserves_heap_and_payload_address_domain() {
+        let allocator = Arc::new(ToggleAllocator::new());
+        let chunks = sequential_chunks(5);
+        let mut heap_data =
+            RetainedChunkVec::detached(MemoryTag::OrderBy, MemoryAccountingClass::Revocable);
+        for values in &chunks {
+            heap_data
+                .push(make_int_chunk_with_allocator(
+                    values,
+                    allocator.clone() as Arc<dyn Allocator>,
+                ))
+                .unwrap();
+        }
+        let live = [3usize, VECTOR_SIZE + 5, 4 * VECTOR_SIZE - 1];
+        let mut heap = manual_heap(&[], std::iter::empty(), live.len());
+        heap.heap_data = heap_data;
+        heap.heap = BinaryHeap::from(
+            live.into_iter()
+                .enumerate()
+                .map(|(rank, index)| TopNEntry {
+                    sort_key: (rank as u32).to_be_bytes().to_vec(),
+                    index,
+                })
+                .collect::<Vec<_>>(),
+        );
+        let original_indices = heap
+            .heap
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>();
+
+        allocator.set_fail(true);
+        heap.reduce().expect_err("compaction copy must fail");
+        assert_eq!(heap.total_heap_data_size(), 5 * VECTOR_SIZE);
+        assert_eq!(
+            heap.heap
+                .iter()
+                .map(|entry| entry.index)
+                .collect::<Vec<_>>(),
+            original_indices
+        );
+
+        allocator.set_fail(false);
+        assert_eq!(extract_ints(&mut heap), live.map(|index| index as i32));
+    }
+
+    #[test]
+    fn combine_copy_failure_preserves_both_heap_ownership_domains() {
+        let allocator = Arc::new(ToggleAllocator::new());
+        let mut left = manual_heap(&[vec![10, 11]], [(10, 0), (11, 1)], 2);
+        let mut right = manual_heap(&[], std::iter::empty(), 2);
+        right
+            .heap_data
+            .push(make_int_chunk_with_allocator(
+                &[1, 2],
+                allocator.clone() as Arc<dyn Allocator>,
+            ))
+            .unwrap();
+        right.heap = BinaryHeap::from(vec![
+            TopNEntry {
+                sort_key: 1u32.to_be_bytes().to_vec(),
+                index: 0,
+            },
+            TopNEntry {
+                sort_key: 2u32.to_be_bytes().to_vec(),
+                index: 1,
+            },
+        ]);
+
+        allocator.set_fail(true);
+        left.combine(&mut right)
+            .expect_err("merge gather must fail");
+        allocator.set_fail(false);
+
+        assert_eq!(extract_ints(&mut left), vec![10, 11]);
+        assert_eq!(extract_ints(&mut right), vec![1, 2]);
     }
 
     #[test]
