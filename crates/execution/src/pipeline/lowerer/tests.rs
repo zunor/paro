@@ -26,7 +26,7 @@ use paro_planner::operator::join::{
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, CTERef, DelimGet, Distinct, EmptyResult, ExpressionGet, Filter,
     Limit, LogicalOperator, MaterializedCTE, Order as LogicalOrder, Projection, RecursiveCTE,
-    TopN as LogicalTopN, Window as LogicalWindow,
+    SetOperation as LogicalSetOperation, TopN as LogicalTopN, Window as LogicalWindow,
 };
 use paro_planner::plan::{LogicalPlan, PlanNodeId};
 use paro_storage::table::table_factory::TableFactory;
@@ -280,40 +280,98 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&topn).unwrap()
 }
 
-fn topn_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
+#[derive(Clone, Copy)]
+enum SingleTaskEmitBreaker {
+    TopN,
+    Sort,
+    Window,
+    SetOperation,
+}
+
+impl SingleTaskEmitBreaker {
+    fn variants() -> [Self; 4] {
+        [Self::TopN, Self::Sort, Self::Window, Self::SetOperation]
+    }
+
+    fn matches_source(self, source: &SourceSpec) -> bool {
+        matches!(
+            (self, source),
+            (Self::TopN, SourceSpec::TopNEmit(_))
+                | (Self::Sort, SourceSpec::SortEmit(_))
+                | (Self::Window, SourceSpec::WindowEmit(_))
+                | (Self::SetOperation, SourceSpec::SetOperationEmit(_))
+        )
+    }
+}
+
+fn single_task_breaker_probe_hash_join_plan(
+    breaker: SingleTaskEmitBreaker,
+) -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
-    let values = LogicalPlan::new(
-        &ctx,
-        LogicalOperator::ExpressionGet(ExpressionGet::new(
-            0,
-            vec![],
-            vec!["k".to_string()],
-            vec![LogicalType::Integer],
-        )),
-    );
-    let order = OrderByNode {
+    let values = |table_index| {
+        LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                vec![],
+                vec!["k".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        )
+    };
+    let order = || OrderByNode {
         expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
         ascending: true,
         nulls_first: false,
     };
-    let topn = LogicalPlan::new(
-        &ctx,
-        LogicalOperator::TopN(LogicalTopN::new(values, vec![order], 2, 0)),
-    );
-    let build = LogicalPlan::new(
-        &ctx,
-        LogicalOperator::ExpressionGet(ExpressionGet::new(
-            1,
-            vec![],
-            vec!["k".to_string()],
-            vec![LogicalType::Integer],
-        )),
-    );
+    let probe = match breaker {
+        SingleTaskEmitBreaker::TopN => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::TopN(LogicalTopN::new(values(0), vec![order()], 2, 0)),
+        ),
+        SingleTaskEmitBreaker::Sort => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Order(LogicalOrder::new(values(0), vec![order()])),
+        ),
+        SingleTaskEmitBreaker::Window => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Window(LogicalWindow::new(
+                2,
+                vec![WindowExpression::native(
+                    WindowFunction::rank(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![OrderByExpression {
+                        expression: Expression::Reference(ReferenceExpression::new(
+                            0,
+                            LogicalType::Integer,
+                        )),
+                        ascending: true,
+                        nulls_first: false,
+                    }],
+                    WindowFrame::default(),
+                    false,
+                )],
+                values(0),
+            )),
+        ),
+        SingleTaskEmitBreaker::SetOperation => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::SetOperation(LogicalSetOperation::union(
+                2,
+                values(0),
+                values(1),
+                false,
+                vec![LogicalType::Integer],
+            )),
+        ),
+    };
+    let build = values(3);
     let join = LogicalPlan::new(
         &ctx,
         LogicalOperator::Join(Join::comparison(
             JoinType::Inner,
-            topn,
+            probe,
             build,
             vec![JoinCondition::equality(
                 Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),

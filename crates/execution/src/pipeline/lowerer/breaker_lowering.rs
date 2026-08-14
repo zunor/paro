@@ -20,53 +20,153 @@ pub(crate) enum BreakerDispatch {
     ExternalTable(ExternalTableSpec),
 }
 
+enum EmitBreakerBuild {
+    TopN(TopNSpec),
+    Sort(SortSpec),
+    Aggregate(AggregateSpec),
+    SetOperation(SetOperationSpec),
+    Window(WindowSpec),
+    PartitionAggregateWindow(PartitionAggregateWindowSpec),
+}
+
+impl EmitBreakerBuild {
+    /// Split an owned breaker into its build description and prospective emit
+    /// source. The source initially carries a harmless placeholder handle so
+    /// its authoritative properties can be checked before lowering mutates
+    /// the handle catalog or pipeline graph.
+    fn from_dispatch(breaker: BreakerDispatch, output: &RowType) -> Option<(Self, SourceSpec)> {
+        let placeholder = BreakerHandleId::new(0);
+        Some(match breaker {
+            BreakerDispatch::Aggregate(spec) => {
+                let source = aggregate_emit_source_spec(placeholder, spec.clone());
+                (Self::Aggregate(spec), source)
+            }
+            BreakerDispatch::TopN(spec) => {
+                let source = SourceSpec::TopNEmit(TopNEmitSourceSpec {
+                    handle: placeholder,
+                    spec: spec.clone(),
+                });
+                (Self::TopN(spec), source)
+            }
+            BreakerDispatch::Sort(spec) => {
+                let source = SourceSpec::SortEmit(SortEmitSourceSpec {
+                    handle: placeholder,
+                    ordering: ordering_spec_from_orders(&spec.orders),
+                    output_names: output.names.clone(),
+                    output_types: output.types.clone(),
+                });
+                (Self::Sort(spec), source)
+            }
+            BreakerDispatch::Window(spec) => {
+                let source = SourceSpec::WindowEmit(WindowEmitSourceSpec {
+                    handle: placeholder,
+                    spec: spec.clone(),
+                });
+                (Self::Window(spec), source)
+            }
+            BreakerDispatch::PartitionAggregateWindow(spec) => {
+                let source = SourceSpec::PartitionAggregateWindowEmit(
+                    PartitionAggregateWindowEmitSourceSpec {
+                        handle: placeholder,
+                        spec: spec.clone(),
+                    },
+                );
+                (Self::PartitionAggregateWindow(spec), source)
+            }
+            BreakerDispatch::SetOperation(spec) => {
+                let source = SourceSpec::SetOperationEmit(SetOperationEmitSourceSpec {
+                    handle: placeholder,
+                    spec: spec.clone(),
+                });
+                (Self::SetOperation(spec), source)
+            }
+            BreakerDispatch::HashJoin(_)
+            | BreakerDispatch::NestedLoopJoin(_)
+            | BreakerDispatch::SortRangeJoin(_)
+            | BreakerDispatch::ClassicIeJoin(_)
+            | BreakerDispatch::CrossProduct(_)
+            | BreakerDispatch::ExternalTable(_) => return None,
+        })
+    }
+
+    fn handle_kind(&self) -> BreakerHandleKind {
+        match self {
+            Self::TopN(_) => BreakerHandleKind::TopN,
+            Self::Sort(_) => BreakerHandleKind::Sort,
+            Self::Aggregate(_) => BreakerHandleKind::Aggregate,
+            Self::SetOperation(_) => BreakerHandleKind::SetOperation,
+            Self::Window(_) => BreakerHandleKind::Window,
+            Self::PartitionAggregateWindow(_) => BreakerHandleKind::PartitionAggregateWindow,
+        }
+    }
+}
+
+fn assign_emit_source_handle(source: &mut SourceSpec, handle: BreakerHandleId) -> Result<()> {
+    match source {
+        SourceSpec::HashAggregateEmit(spec) => spec.handle = handle,
+        SourceSpec::UngroupedAggregateEmit(spec) => spec.handle = handle,
+        SourceSpec::PerfectHashAggregateEmit(spec) => spec.handle = handle,
+        SourceSpec::TopNEmit(spec) => spec.handle = handle,
+        SourceSpec::SortEmit(spec) => spec.handle = handle,
+        SourceSpec::WindowEmit(spec) => spec.handle = handle,
+        SourceSpec::PartitionAggregateWindowEmit(spec) => spec.handle = handle,
+        SourceSpec::SetOperationEmit(spec) => spec.handle = handle,
+        _ => {
+            return Err(paro_error::internal(
+                "emit breaker produced a source without a breaker handle",
+            ))
+        }
+    }
+    Ok(())
+}
+
 impl<'a> PipelineLowerer<'a> {
-    /// Lower an emit-capable breaker into its native source without copying
-    /// the completed rows through Materialize. Join/control breakers expose
-    /// additional probe or unmatched phases and are deliberately refused.
-    pub(crate) fn lower_breaker_to_probe_source(
+    fn lower_emit_breaker_source(
         &mut self,
         root: PhysicalPlanNodeId,
         breaker: BreakerDispatch,
+        require_parallel_probe: bool,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
         let output = self.plan.node(root).output.clone();
-        let result = match breaker {
-            BreakerDispatch::Aggregate(spec) => {
+        let Some((build, mut source)) = EmitBreakerBuild::from_dispatch(breaker, &output) else {
+            return Ok(None);
+        };
+        if require_parallel_probe && !source_supports_parallel_probe_fusion(&source) {
+            return Ok(None);
+        }
+
+        let handle = self
+            .handles
+            .register(build.handle_kind(), output.clone(), Default::default());
+        assign_emit_source_handle(&mut source, handle)?;
+        let pending = match build {
+            EmitBreakerBuild::Aggregate(spec) => {
                 let child = self.only_child(root)?;
-                let handle =
-                    self.handles
-                        .register(BreakerHandleKind::Aggregate, output, Default::default());
                 let producer = self.lower_subtree_to_sink(
                     child,
-                    aggregate_build_sink_spec(handle, spec.clone()),
+                    aggregate_build_sink_spec(handle, spec),
                     SinkSharing::Exclusive,
                     self.plan.node(child).output.clone(),
                     pipelines,
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                BreakerProbeSource {
-                    source: aggregate_emit_source_spec(handle, spec),
-                    dependencies: vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                }
+                vec![PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::FinalizeBeforeEmit,
+                }]
             }
-            BreakerDispatch::TopN(spec) => {
+            EmitBreakerBuild::TopN(spec) => {
                 ensure_streaming_topn_supported(&spec)?;
                 let child = self.only_child(root)?;
-                let handle =
-                    self.handles
-                        .register(BreakerHandleKind::TopN, output, Default::default());
                 let producer = self.lower_subtree_to_sink(
                     child,
                     SinkSpec::TopNBuild(TopNBuildSinkSpec {
                         handle,
-                        spec: spec.clone(),
+                        spec,
                         required: Default::default(),
                     }),
                     SinkSharing::Exclusive,
@@ -75,23 +175,15 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                BreakerProbeSource {
-                    source: SourceSpec::TopNEmit(TopNEmitSourceSpec { handle, spec }),
-                    dependencies: vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                }
+                vec![PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::FinalizeBeforeEmit,
+                }]
             }
-            BreakerDispatch::Sort(spec) => {
+            EmitBreakerBuild::Sort(spec) => {
                 let child = self.only_child(root)?;
                 let input = self.plan.node(child).output.clone();
-                let handle = self.handles.register(
-                    BreakerHandleKind::Sort,
-                    output.clone(),
-                    Default::default(),
-                );
                 let producer = self.lower_subtree_to_sink(
                     child,
                     SinkSpec::SortBuild(SortBuildSinkSpec {
@@ -110,30 +202,19 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                BreakerProbeSource {
-                    source: SourceSpec::SortEmit(SortEmitSourceSpec {
-                        handle,
-                        ordering: ordering_spec_from_orders(&spec.orders),
-                        output_names: output.names,
-                        output_types: output.types,
-                    }),
-                    dependencies: vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                }
+                vec![PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::FinalizeBeforeEmit,
+                }]
             }
-            BreakerDispatch::Window(spec) => {
+            EmitBreakerBuild::Window(spec) => {
                 let child = self.only_child(root)?;
-                let handle =
-                    self.handles
-                        .register(BreakerHandleKind::Window, output, Default::default());
                 let producer = self.lower_subtree_to_sink(
                     child,
                     SinkSpec::WindowBuild(WindowBuildSinkSpec {
                         handle,
-                        spec: spec.clone(),
+                        spec,
                         required: Default::default(),
                     }),
                     SinkSharing::Exclusive,
@@ -142,29 +223,21 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                BreakerProbeSource {
-                    source: SourceSpec::WindowEmit(WindowEmitSourceSpec { handle, spec }),
-                    dependencies: vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                }
+                vec![PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::FinalizeBeforeEmit,
+                }]
             }
-            BreakerDispatch::PartitionAggregateWindow(spec) => {
+            EmitBreakerBuild::PartitionAggregateWindow(spec) => {
                 spec.verify()?;
                 let child = self.only_child(root)?;
-                let handle = self.handles.register(
-                    BreakerHandleKind::PartitionAggregateWindow,
-                    output,
-                    Default::default(),
-                );
                 let producer = self.lower_subtree_to_sink(
                     child,
                     SinkSpec::PartitionAggregateWindowBuild(
                         PartitionAggregateWindowBuildSinkSpec {
                             handle,
-                            spec: spec.clone(),
+                            spec,
                             required: Default::default(),
                         },
                     ),
@@ -174,18 +247,13 @@ impl<'a> PipelineLowerer<'a> {
                     dependencies,
                 )?;
                 self.handles.set_producer(handle, producer)?;
-                BreakerProbeSource {
-                    source: SourceSpec::PartitionAggregateWindowEmit(
-                        PartitionAggregateWindowEmitSourceSpec { handle, spec },
-                    ),
-                    dependencies: vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                }
+                vec![PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::FinalizeBeforeEmit,
+                }]
             }
-            BreakerDispatch::SetOperation(spec) => {
+            EmitBreakerBuild::SetOperation(spec) => {
                 let children = self.plan.child_ids(&self.plan.node(root).children);
                 let [left, right] = children else {
                     return Err(paro_error::internal(format!(
@@ -194,11 +262,6 @@ impl<'a> PipelineLowerer<'a> {
                         children.len()
                     )));
                 };
-                let handle = self.handles.register(
-                    BreakerHandleKind::SetOperation,
-                    output,
-                    Default::default(),
-                );
                 let shared = SinkSharing::Shared(self.next_shared_sink());
                 let left_producer = self.lower_set_operation_input(
                     *left,
@@ -218,29 +281,34 @@ impl<'a> PipelineLowerer<'a> {
                     pipelines,
                     dependencies,
                 )?;
-                BreakerProbeSource {
-                    source: SourceSpec::SetOperationEmit(SetOperationEmitSourceSpec {
+                [left_producer, right_producer]
+                    .into_iter()
+                    .map(|producer| PendingProbeDependency {
+                        producer,
                         handle,
-                        spec,
-                    }),
-                    dependencies: [left_producer, right_producer]
-                        .into_iter()
-                        .map(|producer| PendingProbeDependency {
-                            producer,
-                            handle,
-                            kind: DependencyKind::FinalizeBeforeEmit,
-                        })
-                        .collect(),
-                }
+                        kind: DependencyKind::FinalizeBeforeEmit,
+                    })
+                    .collect()
             }
-            BreakerDispatch::HashJoin(_)
-            | BreakerDispatch::NestedLoopJoin(_)
-            | BreakerDispatch::SortRangeJoin(_)
-            | BreakerDispatch::ClassicIeJoin(_)
-            | BreakerDispatch::CrossProduct(_)
-            | BreakerDispatch::ExternalTable(_) => return Ok(None),
         };
-        Ok(Some(result))
+        Ok(Some(BreakerProbeSource {
+            source,
+            dependencies: pending,
+        }))
+    }
+
+    /// Expose only emit sources that retain Materialized's unbounded reader
+    /// parallelism. Single-task emitters intentionally keep the materialized
+    /// boundary because its parallel readers are the scheduling adapter for
+    /// the downstream probe chain.
+    pub(crate) fn lower_breaker_to_probe_source(
+        &mut self,
+        root: PhysicalPlanNodeId,
+        breaker: BreakerDispatch,
+        pipelines: &mut Vec<PipelineSpec>,
+        dependencies: &mut Vec<PipelineDependency>,
+    ) -> Result<Option<BreakerProbeSource>> {
+        self.lower_emit_breaker_source(root, breaker, true, pipelines, dependencies)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -256,7 +324,7 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         let probe_source = self
-            .lower_breaker_to_probe_source(root, breaker, pipelines, dependencies)?
+            .lower_emit_breaker_source(root, breaker, false, pipelines, dependencies)?
             .ok_or_else(|| paro_error::internal("requested emit source for a non-emit breaker"))?;
         let pushed = self.push_pipeline(
             probe_source.source,
@@ -364,6 +432,22 @@ impl<'a> PipelineLowerer<'a> {
             PhysicalNodeKind::Aggregate(_) => true,
             PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
             PhysicalNodeKind::PartitionAggregateWindow(_) => true,
+            _ => false,
+        }
+    }
+
+    /// Breakers with a native emit source. This is a cheap discriminator used
+    /// before cloning an owned dispatch spec for probe-source consideration;
+    /// scheduling eligibility is still decided from the constructed source's
+    /// canonical pipeline properties.
+    pub(crate) fn is_emit_breaker(kind: &PhysicalNodeKind) -> bool {
+        match kind {
+            PhysicalNodeKind::TopN(_)
+            | PhysicalNodeKind::Sort(_)
+            | PhysicalNodeKind::Aggregate(_)
+            | PhysicalNodeKind::SetOperation(_)
+            | PhysicalNodeKind::PartitionAggregateWindow(_) => true,
+            PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
             _ => false,
         }
     }

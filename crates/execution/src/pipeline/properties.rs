@@ -244,6 +244,19 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
     properties
 }
 
+/// Whether replacing a Materialized probe source with this native source
+/// preserves the probe pipeline's ability to use every available worker.
+///
+/// Materialization is not merely a row-copy fallback: its readers are
+/// unbounded and can restore parallelism after a single-task breaker emit.
+/// Keep this decision next to the authoritative source property table so a
+/// source's scheduling contract cannot drift from lowering eligibility.
+pub(crate) fn source_supports_parallel_probe_fusion(source: &SourceSpec) -> bool {
+    let properties = source_properties(source);
+    properties.capabilities.parallelism == Parallelism::unbounded()
+        && properties.placement != Placement::SingleTask
+}
+
 fn ordering_spec_from_topn(orders: &[paro_planner::binder::ir::OrderByNode]) -> OrderingSpec {
     let columns = orders
         .iter()

@@ -145,6 +145,11 @@ fn aggregate_probe_fuses_emit_into_hash_join_without_row_copy() {
         .transforms
         .iter()
         .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
+    assert_eq!(
+        probe.properties.capabilities.parallelism,
+        crate::physical::properties::Parallelism::unbounded()
+    );
+    assert_eq!(probe.properties.placement, Placement::Local);
     assert!(graph
         .dependencies
         .iter()
@@ -152,31 +157,45 @@ fn aggregate_probe_fuses_emit_into_hash_join_without_row_copy() {
 }
 
 #[test]
-fn generic_breaker_probe_fuses_topn_emit_without_row_copy() {
-    let plan = topn_probe_hash_join_plan();
-    let mut lowerer = PipelineLowerer::new(&plan);
-    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+fn single_task_breaker_emit_materializes_before_parallel_probe() {
+    for breaker in SingleTaskEmitBreaker::variants() {
+        let plan = single_task_breaker_probe_hash_join_plan(breaker);
+        let mut lowerer = PipelineLowerer::new(&plan);
+        let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
 
-    assert!(!graph.pipelines.iter().any(|pipeline| matches!(
-        pipeline.source,
-        SourceSpec::Materialized(_)
-    ) || matches!(
-        pipeline.sink,
-        SinkSpec::Materialize(_)
-    )));
-    let probe = graph
-        .pipelines
-        .iter()
-        .find(|pipeline| matches!(pipeline.source, SourceSpec::TopNEmit(_)))
-        .expect("TopN emit probe pipeline");
-    assert!(probe
-        .transforms
-        .iter()
-        .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
-    assert!(graph
-        .dependencies
-        .iter()
-        .any(|dependency| dependency.kind == DependencyKind::FinalizeBeforeEmit));
+        let emit = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| breaker.matches_source(&pipeline.source))
+            .expect("single-task breaker emit pipeline");
+        assert_eq!(
+            emit.properties.capabilities.parallelism,
+            crate::physical::properties::Parallelism::single()
+        );
+        assert_eq!(emit.properties.placement, Placement::SingleTask);
+        assert!(matches!(emit.sink, SinkSpec::Materialize(_)));
+        assert!(!emit
+            .transforms
+            .iter()
+            .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
+
+        let probe = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                matches!(pipeline.source, SourceSpec::Materialized(_))
+                    && pipeline
+                        .transforms
+                        .iter()
+                        .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+            })
+            .expect("parallel materialized probe pipeline");
+        assert_eq!(
+            probe.properties.capabilities.parallelism,
+            crate::physical::properties::Parallelism::unbounded()
+        );
+        assert_eq!(probe.properties.placement, Placement::Local);
+    }
 }
 
 #[test]

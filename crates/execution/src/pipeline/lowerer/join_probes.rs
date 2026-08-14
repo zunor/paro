@@ -707,7 +707,10 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
-        if let Some(breaker) = self.breaker_dispatch_for_root(root) {
+        if Self::is_emit_breaker(&self.plan.node(root).kind) {
+            let breaker = self.breaker_dispatch_for_root(root).ok_or_else(|| {
+                paro_error::internal("emit breaker did not produce a lowering dispatch")
+            })?;
             if let Some(probe_source) =
                 self.lower_breaker_to_probe_source(root, breaker, pipelines, dependencies)?
             {
@@ -885,7 +888,7 @@ impl<'a> PipelineLowerer<'a> {
                 // a cross product) must first be completed and exposed through a
                 // materialized source.  Falling through to collect_linear_roles would
                 // otherwise try to execute the blocking operator as a transform.
-                if self.breaker_dispatch_for_root(root).is_some() {
+                if Self::is_tail_breaker(&node.kind) {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
                 }
                 if let Some(tail) = self.collect_tail_to_breaker(root, |kind| {

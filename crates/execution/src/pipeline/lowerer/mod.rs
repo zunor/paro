@@ -46,7 +46,9 @@ use super::graph::{
     WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
-use super::properties::{repair_transform, PipelinePropertyAccumulator};
+use super::properties::{
+    repair_transform, source_supports_parallel_probe_fusion, PipelinePropertyAccumulator,
+};
 
 pub struct PipelineLowerer<'a> {
     plan: &'a PhysicalPlan,

@@ -134,7 +134,7 @@ fn grouped_join_rejects_correlation_that_does_not_cover_outer_unique_key() {
 }
 
 #[test]
-fn grouped_join_does_not_hash_a_dead_middle_payload_column() {
+fn grouped_join_preserves_real_values_before_a_live_late_ordinal() {
     let optimized = optimize_sql(
         "SELECT ps.ps_comment \
          FROM partsupp AS ps \
@@ -147,10 +147,28 @@ fn grouped_join_does_not_hash_a_dead_middle_payload_column() {
     let inspection = inspect_plan(&optimized);
 
     assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
-    // partkey, suppkey, availqty and comment are live. supplycost is ordinal 3,
-    // but its later live sibling must not force it into the grouping key.
-    assert_eq!(inspection.aggregate_groups, vec![4], "{optimized:#?}");
+    // comment is ordinal 4. Reconstructing that original binding requires a
+    // real, contiguous 0..=4 prefix; no invisible slot may be replaced by a
+    // synthesized NULL.
+    assert_eq!(inspection.aggregate_groups, vec![5], "{optimized:#?}");
     assert_eq!(inspection.group_dependencies, 0, "{optimized:#?}");
+}
+
+#[test]
+fn grouped_join_with_no_visible_outer_binding_avoids_zero_width_projection() {
+    let rewritten = optimize_sql(
+        "SELECT 1 \
+         FROM partsupp AS ps \
+         WHERE ps.ps_availqty > ( \
+             SELECT sum(l.l_quantity) \
+             FROM lineitem AS l \
+             WHERE l.l_partkey = ps.ps_partkey \
+               AND l.l_suppkey = ps.ps_suppkey)",
+    );
+    let inspection = inspect_plan(&rewritten);
+
+    assert_eq!(inspection.delim_joins, 0, "{rewritten:#?}");
+    assert_eq!(inspection.zero_width_projections, 0, "{rewritten:#?}");
 }
 
 fn assert_tpch_rewrites() {
@@ -484,6 +502,7 @@ struct PlanInspection {
     delim_joins: usize,
     late_fetches: usize,
     late_fetch_sources: usize,
+    zero_width_projections: usize,
     gets: std::collections::HashMap<String, usize>,
 }
 
@@ -501,6 +520,9 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
                 result.late_fetch_sources += fetch.sources.len();
             }
             LogicalOperator::Window(_) => result.windows += 1,
+            LogicalOperator::Projection(projection) if projection.expressions.is_empty() => {
+                result.zero_width_projections += 1;
+            }
             LogicalOperator::Aggregate(aggregate) => {
                 result.aggregates += 1;
                 result.aggregate_groups.push(aggregate.groups.len());
