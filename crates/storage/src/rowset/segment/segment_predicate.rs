@@ -415,7 +415,7 @@ impl PredicateEvaluator {
         &self,
         batches_by_col: &[PredicateColumnBatch],
         rows: usize,
-        matches: &mut Vec<usize>,
+        matches: &mut Vec<u32>,
     ) -> Result<()> {
         matches.clear();
         if Self::is_typed_constant_leaf(&self.program.tree) {
@@ -443,7 +443,7 @@ impl PredicateEvaluator {
                 seeded = true;
             } else {
                 if !seeded {
-                    matches.extend(0..rows);
+                    matches.extend((0..rows).map(|row_idx| row_idx as u32));
                     seeded = true;
                 }
                 self.filter_selected_tree(predicate, batches_by_col, matches)?;
@@ -453,7 +453,7 @@ impl PredicateEvaluator {
             }
         }
         if !seeded {
-            matches.extend(0..rows);
+            matches.extend((0..rows).map(|row_idx| row_idx as u32));
         }
         Ok(())
     }
@@ -462,12 +462,12 @@ impl PredicateEvaluator {
         &self,
         predicate: &CompiledPredicateTree,
         batches_by_col: &[PredicateColumnBatch],
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
     ) -> Result<()> {
         let mut write_idx = 0;
         for read_idx in 0..selection.len() {
             let row_idx = selection[read_idx];
-            if self.evaluate_tree(predicate, batches_by_col, row_idx)? {
+            if self.evaluate_tree(predicate, batches_by_col, row_idx as usize)? {
                 selection[write_idx] = row_idx;
                 write_idx += 1;
             }
@@ -535,7 +535,7 @@ impl PredicateEvaluator {
         predicate: &CompiledPredicateTree,
         batches_by_col: &[PredicateColumnBatch],
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         let CompiledPredicateTree::Leaf(predicate) = predicate else {
@@ -578,11 +578,11 @@ impl PredicateEvaluator {
         &self,
         batches_by_col: &[PredicateColumnBatch],
         rows: usize,
-        matches: &mut Vec<usize>,
+        matches: &mut Vec<u32>,
     ) -> Result<()> {
         for row_idx in 0..rows {
             if self.evaluate_tree(&self.program.tree, batches_by_col, row_idx)? {
-                matches.push(row_idx);
+                matches.push(row_idx as u32);
             }
         }
         Ok(())

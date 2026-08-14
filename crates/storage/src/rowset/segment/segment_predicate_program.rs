@@ -73,7 +73,7 @@ struct PredicateStage {
 #[derive(Default)]
 pub(super) struct PredicateStageScratch {
     absolute_rowids: Vec<u32>,
-    candidate_rows: Vec<usize>,
+    candidate_rows: Vec<u32>,
 }
 
 impl CompiledPredicateProgram {
@@ -168,7 +168,7 @@ impl PredicateEvaluator {
         start_ordinal: u64,
         max_rows: usize,
         cost_model: ScanAccessCostModel,
-        matches: &mut Vec<usize>,
+        matches: &mut Vec<u32>,
         stats: &mut PredicateStageReadStats,
     ) -> Result<usize> {
         let mut scratch = std::mem::take(&mut self.stage_scratch);
@@ -189,7 +189,7 @@ impl PredicateEvaluator {
         start_ordinal: u64,
         max_rows: usize,
         cost_model: ScanAccessCostModel,
-        matches: &mut Vec<usize>,
+        matches: &mut Vec<u32>,
         stats: &mut PredicateStageReadStats,
         scratch: &mut PredicateStageScratch,
     ) -> Result<usize> {
@@ -236,6 +236,7 @@ impl PredicateEvaluator {
                 .checked_sub(first)
                 .and_then(|span| span.checked_add(1))
                 .ok_or_else(|| paro_error::data_corrupted("predicate selection span overflow"))?;
+            let span = span as usize;
 
             if cost_model.sequential_materialization_is_cheaper(matches.len(), span) {
                 let stage_start = start_ordinal.checked_add(first as u64).ok_or_else(|| {
@@ -328,7 +329,7 @@ impl PredicateEvaluator {
         &mut self,
         stage: PredicateStage,
         start_ordinal: u64,
-        matches: &mut Vec<usize>,
+        matches: &mut Vec<u32>,
         scratch: &mut PredicateStageScratch,
     ) -> Result<usize> {
         scratch.absolute_rowids.clear();
@@ -348,7 +349,7 @@ impl PredicateEvaluator {
         matches.clear();
         self.filter_stage(stage, &batch, candidate_count, matches, true)?;
         for candidate_idx in matches.iter_mut() {
-            *candidate_idx = scratch.candidate_rows[*candidate_idx];
+            *candidate_idx = scratch.candidate_rows[*candidate_idx as usize];
         }
         scratch.candidate_rows.clear();
         Ok(candidate_count)
@@ -410,7 +411,7 @@ impl PredicateEvaluator {
         stage: PredicateStage,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         let CompiledPredicateTree::And(children) = &self.program.tree else {
@@ -442,7 +443,7 @@ impl PredicateEvaluator {
         predicate: &CompiledPredicate,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         match predicate {

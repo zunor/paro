@@ -73,7 +73,7 @@ pub struct SegmentIterator {
     late_materialization: Option<LateMaterializationState>,
     sparse_batch_streak: u8,
     dense_batch_streak: u8,
-    eager_predicate_matches: Vec<usize>,
+    eager_predicate_matches: Vec<u32>,
     selection_tracker: ColumnDataBytesTracker,
     rowid_tracker: ColumnDataBytesTracker,
     prefetcher: Option<Arc<Prefetcher>>,
@@ -116,7 +116,7 @@ enum PredicateColumnReuseState {
 
 struct LateMaterializationState {
     rowids: Vec<u32>,
-    predicate_matches: Vec<usize>,
+    predicate_matches: Vec<u32>,
     reused_predicate_columns: Vec<ReusedPredicateColumn>,
 }
 
@@ -166,7 +166,7 @@ impl ReusedPredicateColumn {
     fn append_rows(
         &mut self,
         batch: &super::predicate_column::PredicateColumnBatch,
-        rows: &[usize],
+        rows: &[u32],
     ) -> Result<()> {
         if let Some(dictionary_batch) = batch.storage_dictionary() {
             return self.append_dictionary_rows(dictionary_batch, rows);
@@ -195,7 +195,7 @@ impl ReusedPredicateColumn {
     fn append_dictionary_rows(
         &mut self,
         batch: &super::predicate_column::StorageDictionaryPredicateBatch,
-        rows: &[usize],
+        rows: &[u32],
     ) -> Result<()> {
         let can_start_dictionary = matches!(
             &self.state,
@@ -230,6 +230,7 @@ impl ReusedPredicateColumn {
             return Ok(());
         }
         for &row_idx in rows {
+            let row_idx = row_idx as usize;
             codes.extend_from_slice(batch.encoded_code(row_idx));
             nulls.push(u8::from(batch.is_null(row_idx)));
         }
@@ -927,7 +928,8 @@ impl SegmentIterator {
 
             if predicate_guaranteed {
                 self.eager_predicate_matches.clear();
-                self.eager_predicate_matches.extend(0..rows_read);
+                self.eager_predicate_matches
+                    .extend((0..rows_read).map(|row_idx| row_idx as u32));
             } else {
                 let evaluator = self
                     .predicate_evaluator
@@ -1020,12 +1022,7 @@ impl SegmentIterator {
                 self.seek_columns_to_ordinal(self.current_ordinal)?;
                 self.sparse_batch_streak = 0;
             }
-            let selection = (!all_match).then(|| {
-                self.eager_predicate_matches
-                    .iter()
-                    .map(|&row| row as u32)
-                    .collect::<Vec<_>>()
-            });
+            let selection = (!all_match).then(|| self.eager_predicate_matches.clone());
             let rowids = if materialize_sequential_rowids {
                 self.eager_predicate_matches
                     .iter()
@@ -1171,7 +1168,9 @@ impl SegmentIterator {
                     .expect("late materialization requires selection state");
                 if predicate_guaranteed {
                     state.predicate_matches.clear();
-                    state.predicate_matches.extend(0..rows_read);
+                    state
+                        .predicate_matches
+                        .extend((0..rows_read).map(|row_idx| row_idx as u32));
                 } else if let Some(matches) = staged_matches.take() {
                     state.predicate_matches = matches;
                 } else {
@@ -1243,7 +1242,7 @@ impl SegmentIterator {
         &mut self,
         start_ordinal: u64,
         physical_rows: usize,
-        predicate_matches: &[usize],
+        predicate_matches: &[u32],
     ) -> Result<SegmentBatch> {
         let mut columns = Vec::with_capacity(self.column_iterators.len());
         for (column_id, iterator) in &mut self.column_iterators {
@@ -1260,12 +1259,8 @@ impl SegmentIterator {
         }
 
         self.rowid_tracker.reset();
-        let selection = (predicate_matches.len() != physical_rows).then(|| {
-            predicate_matches
-                .iter()
-                .map(|&row_idx| row_idx as u32)
-                .collect::<Vec<_>>()
-        });
+        let selection =
+            (predicate_matches.len() != physical_rows).then(|| predicate_matches.to_vec());
         Ok(SegmentBatch {
             rowids: Vec::new(),
             rows: predicate_matches.len(),

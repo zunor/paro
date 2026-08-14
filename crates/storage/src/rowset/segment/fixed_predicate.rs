@@ -366,7 +366,7 @@ impl FixedComparisonValues {
         &self,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         match self {
@@ -435,7 +435,7 @@ fn try_filter_seed_i64_batch(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<i64>,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
 ) -> bool {
     let PredicateColumnBatch::Raw(batch) = batch else {
@@ -484,15 +484,16 @@ unsafe fn filter_i64_range_inclusive_neon(
     lower: i64,
     upper: i64,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
     use core::arch::aarch64::{
-        vandq_u64, vcgeq_s64, vcleq_s64, vdupq_n_s64, vld1q_u8, vreinterpretq_s64_u8, vst1q_u64,
+        vandq_u64, vcgeq_s64, vcleq_s64, vdupq_n_s64, vld1q_u8, vreinterpretq_s64_u8, vshrq_n_u64,
+        vst1q_u64,
     };
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let lower_vector = unsafe { vdupq_n_s64(lower) };
     let upper_vector = unsafe { vdupq_n_s64(upper) };
     let mut row = 0usize;
@@ -502,22 +503,14 @@ unsafe fn filter_i64_range_inclusive_neon(
         let values = unsafe { vreinterpretq_s64_u8(bytes) };
         let above_lower = unsafe { vcgeq_s64(values, lower_vector) };
         let below_upper = unsafe { vcleq_s64(values, upper_vector) };
-        let matched = unsafe { vandq_u64(above_lower, below_upper) };
+        let matched = unsafe { vshrq_n_u64(vandq_u64(above_lower, below_upper), 63) };
         let mut lanes = [0u64; 2];
         unsafe { vst1q_u64(lanes.as_mut_ptr(), matched) };
-        if lanes == [u64::MAX; 2] {
+        for (lane, &matched) in lanes.iter().enumerate() {
             unsafe {
-                output.add(written).write(row);
-                output.add(written + 1).write(row + 1);
+                output.add(written).write((row + lane) as u32);
             }
-            written += 2;
-        } else {
-            for (lane, &matched) in lanes.iter().enumerate() {
-                if matched != 0 {
-                    unsafe { output.add(written).write(row + lane) };
-                    written += 1;
-                }
-            }
+            written += matched as usize;
         }
         row += 2;
     }
@@ -529,7 +522,7 @@ unsafe fn filter_i64_range_inclusive_neon(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
     }
@@ -544,7 +537,7 @@ unsafe fn filter_i64_range_inclusive_avx2(
     lower: i64,
     upper: i64,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_pd,
@@ -553,7 +546,7 @@ unsafe fn filter_i64_range_inclusive_avx2(
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let lower_vector = unsafe { _mm256_set1_epi64x(lower) };
     let upper_vector = unsafe { _mm256_set1_epi64x(upper) };
     let mut row = 0usize;
@@ -576,13 +569,13 @@ unsafe fn filter_i64_range_inclusive_avx2(
         };
         if rejected == 0 {
             for lane in 0..4 {
-                unsafe { output.add(written + lane).write(row + lane) };
+                unsafe { output.add(written + lane).write((row + lane) as u32) };
             }
             written += 4;
         } else {
             for lane in 0..4 {
                 if rejected & (1 << lane) == 0 {
-                    unsafe { output.add(written).write(row + lane) };
+                    unsafe { output.add(written).write((row + lane) as u32) };
                     written += 1;
                 }
             }
@@ -597,7 +590,7 @@ unsafe fn filter_i64_range_inclusive_avx2(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
         row += 1;
@@ -610,7 +603,7 @@ fn try_filter_seed_i32_batch(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<i32>,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
 ) -> bool {
     let PredicateColumnBatch::Raw(batch) = batch else {
@@ -730,15 +723,16 @@ unsafe fn filter_i32_range_inclusive_neon(
     lower: i32,
     upper: i32,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
     use core::arch::aarch64::{
-        vandq_u32, vcgeq_s32, vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vst1q_u32,
+        vandq_u32, vcgeq_s32, vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vshrq_n_u32,
+        vst1q_u32,
     };
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let lower_vector = unsafe { vdupq_n_s32(lower) };
     let upper_vector = unsafe { vdupq_n_s32(upper) };
     let mut row = 0usize;
@@ -748,24 +742,19 @@ unsafe fn filter_i32_range_inclusive_neon(
         let values = unsafe { vreinterpretq_s32_u8(bytes) };
         let above_lower = unsafe { vcgeq_s32(values, lower_vector) };
         let below_upper = unsafe { vcleq_s32(values, upper_vector) };
-        let matched = unsafe { vandq_u32(above_lower, below_upper) };
+        let matched = unsafe { vshrq_n_u32(vandq_u32(above_lower, below_upper), 31) };
         let mut lanes = [0u32; 4];
         unsafe { vst1q_u32(lanes.as_mut_ptr(), matched) };
-        if lanes == [u32::MAX; 4] {
+        // `written` always names the first uninitialized output slot. Writing
+        // every candidate there and advancing by the 0/1 comparison result
+        // makes selection compaction branch-free; a rejected candidate is
+        // simply overwritten by the next lane. This is valid because the
+        // vector reserved one output slot per input row up front.
+        for (lane, &matched) in lanes.iter().enumerate() {
             unsafe {
-                output.add(written).write(row);
-                output.add(written + 1).write(row + 1);
-                output.add(written + 2).write(row + 2);
-                output.add(written + 3).write(row + 3);
+                output.add(written).write((row + lane) as u32);
             }
-            written += 4;
-        } else {
-            for (lane, &matched) in lanes.iter().enumerate() {
-                if matched != 0 {
-                    unsafe { output.add(written).write(row + lane) };
-                    written += 1;
-                }
-            }
+            written += matched as usize;
         }
         row += 4;
     }
@@ -777,7 +766,7 @@ unsafe fn filter_i32_range_inclusive_neon(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
         row += 1;
@@ -791,13 +780,15 @@ unsafe fn filter_i32_upper_inclusive_neon(
     input: *const u8,
     upper: i32,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
-    use core::arch::aarch64::{vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vst1q_u32};
+    use core::arch::aarch64::{
+        vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vshrq_n_u32, vst1q_u32,
+    };
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let upper_vector = unsafe { vdupq_n_s32(upper) };
     let mut row = 0usize;
     let mut written = 0usize;
@@ -806,24 +797,14 @@ unsafe fn filter_i32_upper_inclusive_neon(
         // lane-local on the little-endian target selected by this function.
         let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i32>())) };
         let values = unsafe { vreinterpretq_s32_u8(bytes) };
-        let matched = unsafe { vcleq_s32(values, upper_vector) };
+        let matched = unsafe { vshrq_n_u32(vcleq_s32(values, upper_vector), 31) };
         let mut lanes = [0u32; 4];
         unsafe { vst1q_u32(lanes.as_mut_ptr(), matched) };
-        if lanes == [u32::MAX; 4] {
+        for (lane, &matched) in lanes.iter().enumerate() {
             unsafe {
-                output.add(written).write(row);
-                output.add(written + 1).write(row + 1);
-                output.add(written + 2).write(row + 2);
-                output.add(written + 3).write(row + 3);
+                output.add(written).write((row + lane) as u32);
             }
-            written += 4;
-        } else {
-            for (lane, &matched) in lanes.iter().enumerate() {
-                if matched != 0 {
-                    unsafe { output.add(written).write(row + lane) };
-                    written += 1;
-                }
-            }
+            written += matched as usize;
         }
         row += 4;
     }
@@ -835,7 +816,7 @@ unsafe fn filter_i32_upper_inclusive_neon(
                 .read_unaligned()
         });
         if value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
         row += 1;
@@ -850,7 +831,7 @@ unsafe fn filter_i32_upper_inclusive_avx2(
     input: *const u8,
     upper: i32,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
@@ -859,7 +840,7 @@ unsafe fn filter_i32_upper_inclusive_avx2(
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let upper_vector = unsafe { _mm256_set1_epi32(upper) };
     let mut row = 0usize;
     let mut written = 0usize;
@@ -879,13 +860,13 @@ unsafe fn filter_i32_upper_inclusive_avx2(
         };
         if rejected == 0 {
             for lane in 0..8 {
-                unsafe { output.add(written + lane).write(row + lane) };
+                unsafe { output.add(written + lane).write((row + lane) as u32) };
             }
             written += 8;
         } else {
             for lane in 0..8 {
                 if rejected & (1 << lane) == 0 {
-                    unsafe { output.add(written).write(row + lane) };
+                    unsafe { output.add(written).write((row + lane) as u32) };
                     written += 1;
                 }
             }
@@ -900,7 +881,7 @@ unsafe fn filter_i32_upper_inclusive_avx2(
                 .read_unaligned()
         });
         if value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
         row += 1;
@@ -916,7 +897,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
     lower: i32,
     upper: i32,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
 ) -> bool {
     use core::arch::x86_64::{
         __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
@@ -925,7 +906,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
 
     selection.reserve(rows);
     let start = selection.len();
-    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<u32>();
     let lower_vector = unsafe { _mm256_set1_epi32(lower) };
     let upper_vector = unsafe { _mm256_set1_epi32(upper) };
     let mut row = 0usize;
@@ -948,13 +929,13 @@ unsafe fn filter_i32_range_inclusive_avx2(
         };
         if rejected == 0 {
             for lane in 0..8 {
-                unsafe { output.add(written + lane).write(row + lane) };
+                unsafe { output.add(written + lane).write((row + lane) as u32) };
             }
             written += 8;
         } else {
             for lane in 0..8 {
                 if rejected & (1 << lane) == 0 {
-                    unsafe { output.add(written).write(row + lane) };
+                    unsafe { output.add(written).write((row + lane) as u32) };
                     written += 1;
                 }
             }
@@ -969,7 +950,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(row) };
+            unsafe { output.add(written).write(row as u32) };
             written += 1;
         }
         row += 1;
@@ -982,7 +963,7 @@ fn filter_fixed_batch<T: FixedPhysical>(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<T>,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
 ) -> Result<()> {
     match batch {
@@ -1043,7 +1024,7 @@ fn filter_fixed_batch<T: FixedPhysical>(
 fn dispatch_fixed_kernel<T, L, V>(
     kernel: &FixedConjunction<T>,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
     load: L,
     valid: V,
@@ -1120,7 +1101,7 @@ fn dispatch_fixed_kernel<T, L, V>(
 #[inline]
 fn filter_selection<T, L, V, P>(
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
     load: L,
     valid: V,
@@ -1138,7 +1119,7 @@ fn filter_selection<T, L, V, P>(
         let mut written = 0usize;
         for row_idx in 0..rows {
             if valid(row_idx) && predicate(load(row_idx)) {
-                spare[written].write(row_idx);
+                spare[written].write(row_idx as u32);
                 written += 1;
             }
         }
@@ -1150,9 +1131,9 @@ fn filter_selection<T, L, V, P>(
 
     let mut write_idx = 0;
     for read_idx in 0..selection.len() {
-        let row_idx = selection[read_idx];
+        let row_idx = selection[read_idx] as usize;
         if valid(row_idx) && predicate(load(row_idx)) {
-            selection[write_idx] = row_idx;
+            selection[write_idx] = row_idx as u32;
             write_idx += 1;
         }
     }

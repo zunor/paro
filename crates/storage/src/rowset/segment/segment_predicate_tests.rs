@@ -328,7 +328,27 @@ fn i32_range_seed_preserves_open_bounds_and_domain_edges() {
             allocator: Arc::new(default_allocator()),
             stage_scratch: PredicateStageScratch::default(),
         };
-        let values = [i32::MIN, 1, 2, 3, 4, 5, i32::MAX];
+        // The four-lane groups cover mixed, all-accepted, all-rejected, and
+        // mixed masks in sequence. This also verifies that SIMD compaction
+        // carries its output cursor across groups without gaps or reordering.
+        let values = [
+            i32::MIN,
+            2,
+            0,
+            3,
+            2,
+            3,
+            4,
+            2,
+            i32::MIN,
+            0,
+            1,
+            i32::MAX,
+            5,
+            3,
+            1,
+            i32::MAX,
+        ];
         let batch = PredicateColumnBatch::Raw(ColumnBatch::new(
             Bytes::from(
                 values
@@ -356,7 +376,7 @@ fn i32_range_seed_preserves_open_bounds_and_domain_edges() {
                 value: Value::Integer(5),
             }),
         ]),
-        [2, 3, 4]
+        [1, 3, 4, 5, 6, 7, 13]
     );
     assert!(evaluate(vec![PredicateTree::leaf(Predicate::Gt {
         column_id: 7,

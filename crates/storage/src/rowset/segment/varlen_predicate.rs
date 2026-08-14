@@ -161,7 +161,7 @@ impl VarlenMatcher {
         &self,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         if let Some(batch) = batch.storage_dictionary() {
@@ -553,7 +553,7 @@ impl VarlenConjunction {
         &self,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<usize>,
+        selection: &mut Vec<u32>,
         seed: bool,
     ) -> Result<()> {
         if let Some(batch) = batch.storage_dictionary() {
@@ -628,16 +628,20 @@ impl VarlenConjunction {
 fn filter_varlen_batch(
     batch: &PredicateColumnBatch,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
     matches: impl Fn(&[u8]) -> bool,
 ) -> Result<()> {
     if let Some(batch) = batch.raw_varlen() {
         let row_matches = |row_idx: usize| batch.row_value(row_idx).is_some_and(&matches);
         if seed {
-            selection.extend((0..rows).filter(|row_idx| row_matches(*row_idx)));
+            selection.extend(
+                (0..rows)
+                    .filter(|row_idx| row_matches(*row_idx))
+                    .map(|row_idx| row_idx as u32),
+            );
         } else {
-            selection.retain(|row_idx| row_matches(*row_idx));
+            selection.retain(|row_idx| row_matches(*row_idx as usize));
         }
         return Ok(());
     }
@@ -649,9 +653,13 @@ fn filter_varlen_batch(
         view.is_valid(row_idx) && matches(view.get_inline_string(row_idx).as_bytes())
     };
     if seed {
-        selection.extend((0..rows).filter(|row_idx| row_matches(*row_idx)));
+        selection.extend(
+            (0..rows)
+                .filter(|row_idx| row_matches(*row_idx))
+                .map(|row_idx| row_idx as u32),
+        );
     } else {
-        selection.retain(|row_idx| row_matches(*row_idx));
+        selection.retain(|row_idx| row_matches(*row_idx as usize));
     }
     Ok(())
 }
@@ -662,7 +670,7 @@ fn filter_varlen_batch(
 fn filter_raw_like_with_anchor(
     batch: &super::predicate_column::RawVarlenPredicateBatch,
     rows: usize,
-    selection: &mut Vec<usize>,
+    selection: &mut Vec<u32>,
     seed: bool,
     pattern: &PreparedLikePattern,
     negated: bool,
@@ -732,9 +740,13 @@ fn filter_raw_like_with_anchor(
     };
 
     if seed {
-        selection.extend((0..rows).filter(|row_idx| row_matches(*row_idx)));
+        selection.extend(
+            (0..rows)
+                .filter(|row_idx| row_matches(*row_idx))
+                .map(|row_idx| row_idx as u32),
+        );
     } else {
-        selection.retain(|row_idx| row_matches(*row_idx));
+        selection.retain(|row_idx| row_matches(*row_idx as usize));
     }
     true
 }
@@ -745,7 +757,7 @@ fn anchor_scan_range(
     batch: &super::predicate_column::RawVarlenPredicateBatch,
     payload_len: usize,
     rows: usize,
-    selection: &[usize],
+    selection: &[u32],
     seed: bool,
 ) -> Option<Range<usize>> {
     const MAX_SCAN_AMPLIFICATION: usize = 4;
@@ -755,12 +767,13 @@ fn anchor_scan_range(
     if !selection.windows(2).all(|rows| rows[0] < rows[1]) {
         return None;
     }
-    let first = batch.contiguous_row_range(*selection.first()?)?;
-    let last = batch.contiguous_row_range(*selection.last()?)?;
-    if *selection.last()? >= rows || first.start > last.end || last.end > payload_len {
+    let first = batch.contiguous_row_range(*selection.first()? as usize)?;
+    let last = batch.contiguous_row_range(*selection.last()? as usize)?;
+    if *selection.last()? as usize >= rows || first.start > last.end || last.end > payload_len {
         return None;
     }
     let selected_bytes = selection.iter().try_fold(0usize, |bytes, &row_idx| {
+        let row_idx = row_idx as usize;
         if row_idx >= rows {
             return None;
         }
