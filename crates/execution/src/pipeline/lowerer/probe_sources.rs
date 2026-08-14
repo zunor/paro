@@ -116,7 +116,7 @@ impl PipelineLowerer<'_> {
         root: PhysicalPlanNodeId,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeBuild>)> {
+    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
         let output = self.plan.node(root).output.clone();
         let handle = self.handles.register(
             BreakerHandleKind::Materialized,
@@ -139,7 +139,11 @@ impl PipelineLowerer<'_> {
         Ok((
             source,
             Vec::new(),
-            vec![PendingProbeBuild { producer, handle }],
+            vec![PendingProbeDependency {
+                producer,
+                handle,
+                kind: DependencyKind::MaterializeBeforeRead,
+            }],
         ))
     }
 }

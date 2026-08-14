@@ -57,7 +57,7 @@ impl<'a> PipelineLowerer<'a> {
                 .map(|pending| PipelineDependency {
                     producer: pending.producer,
                     consumer,
-                    kind: DependencyKind::BuildBeforeProbe,
+                    kind: pending.kind,
                 }),
         );
         dependencies.push(PipelineDependency {
@@ -201,7 +201,7 @@ impl<'a> PipelineLowerer<'a> {
                 .map(|pending| PipelineDependency {
                     producer: pending.producer,
                     consumer,
-                    kind: DependencyKind::BuildBeforeProbe,
+                    kind: pending.kind,
                 }),
         );
         dependencies.push(PipelineDependency {
@@ -385,7 +385,7 @@ impl<'a> PipelineLowerer<'a> {
                 .map(|pending| PipelineDependency {
                     producer: pending.producer,
                     consumer,
-                    kind: DependencyKind::BuildBeforeProbe,
+                    kind: pending.kind,
                 }),
         );
         dependencies.push(PipelineDependency {
@@ -577,7 +577,7 @@ impl<'a> PipelineLowerer<'a> {
                 .map(|pending| PipelineDependency {
                     producer: pending.producer,
                     consumer,
-                    kind: DependencyKind::BuildBeforeProbe,
+                    kind: pending.kind,
                 }),
         );
         dependencies.push(PipelineDependency {
@@ -706,9 +706,43 @@ impl<'a> PipelineLowerer<'a> {
         root: PhysicalPlanNodeId,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeBuild>)> {
+    ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
         let node = self.plan.node(root);
         match &node.kind {
+            PhysicalNodeKind::Aggregate(spec) => {
+                // A breaker emit is already a stable pipeline source.  When
+                // the aggregate feeds a probe chain, expose that source
+                // directly instead of copying its complete result through an
+                // intermediate Materialize/Materialized pair.  The explicit
+                // finalize dependency preserves the aggregate lifecycle while
+                // allowing downstream filters and join probes to fuse with
+                // emit.
+                let spec = spec.clone();
+                let child = self.only_child(root)?;
+                let handle = self.handles.register(
+                    BreakerHandleKind::Aggregate,
+                    node.output.clone(),
+                    Default::default(),
+                );
+                let producer = self.lower_subtree_to_sink(
+                    child,
+                    aggregate_build_sink_spec(handle, spec.clone()),
+                    SinkSharing::Exclusive,
+                    self.plan.node(child).output.clone(),
+                    pipelines,
+                    dependencies,
+                )?;
+                self.handles.set_producer(handle, producer)?;
+                Ok((
+                    aggregate_emit_source_spec(handle, spec),
+                    Vec::new(),
+                    vec![PendingProbeDependency {
+                        producer,
+                        handle,
+                        kind: DependencyKind::FinalizeBeforeEmit,
+                    }],
+                ))
+            }
             PhysicalNodeKind::HashJoin(spec) => {
                 if needs_hash_join_unmatched_source(spec.join_type) || spec.force_external {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);
@@ -763,7 +797,11 @@ impl<'a> PipelineLowerer<'a> {
                 let source =
                     self.attach_hash_join_runtime_filters(source, &transforms, handle, &spec);
                 transforms.push(hash_join_probe_transform(handle, &spec));
-                pending_builds.push(PendingProbeBuild { producer, handle });
+                pending_builds.push(PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::BuildBeforeProbe,
+                });
                 Ok((source, transforms, pending_builds))
             }
             PhysicalNodeKind::NestedLoopJoin(spec) => {
@@ -796,7 +834,11 @@ impl<'a> PipelineLowerer<'a> {
                 if !scalar_filter_replaces_probe {
                     transforms.push(nlj_probe_transform(handle, &spec));
                 }
-                pending_builds.push(PendingProbeBuild { producer, handle });
+                pending_builds.push(PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::BuildBeforeProbe,
+                });
                 Ok((source, transforms, pending_builds))
             }
             PhysicalNodeKind::SortRangeJoin(spec) => {
@@ -818,7 +860,11 @@ impl<'a> PipelineLowerer<'a> {
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
                 transforms.push(sort_range_probe_transform(handle, spec));
-                pending_builds.push(PendingProbeBuild { producer, handle });
+                pending_builds.push(PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::BuildBeforeProbe,
+                });
                 Ok((source, transforms, pending_builds))
             }
             PhysicalNodeKind::ClassicIeJoin(_) => {
@@ -841,7 +887,11 @@ impl<'a> PipelineLowerer<'a> {
                 let (source, mut transforms, mut pending_builds) =
                     self.collect_probe_roles(*left, pipelines, dependencies)?;
                 transforms.push(cross_product_probe_transform(handle, &spec));
-                pending_builds.push(PendingProbeBuild { producer, handle });
+                pending_builds.push(PendingProbeDependency {
+                    producer,
+                    handle,
+                    kind: DependencyKind::BuildBeforeProbe,
+                });
                 Ok((source, transforms, pending_builds))
             }
             PhysicalNodeKind::ExternalTable(_) => {

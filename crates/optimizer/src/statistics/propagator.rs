@@ -477,7 +477,12 @@ impl StatisticsPropagator {
                     }
                 }
 
-                agg.group_dependencies = derive_group_dependencies(&agg);
+                let derived = derive_group_dependencies(&agg);
+                for dependency in derived {
+                    if !agg.group_dependencies.contains(&dependency) {
+                        agg.group_dependencies.push(dependency);
+                    }
+                }
 
                 LogicalOperator::Aggregate(agg)
             }

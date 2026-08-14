@@ -794,11 +794,18 @@ fn adjust_join_estimate(
             expected: inner.expected.max(left.expected.max(right.expected)),
             max: inner.max.max(left.max.saturating_add(right.max)),
         },
-        JoinType::Semi | JoinType::Mark | JoinType::Single => CardinalityEstimate {
+        JoinType::Semi => CardinalityEstimate {
             min: 0,
             expected: inner.expected.min(left.expected),
             max: left.max,
         },
+        // MARK and SINGLE joins append one derived value to every preserved
+        // row.  Whether the right side finds zero or one match changes that
+        // value, never the number of output rows.  Treating them like SEMI
+        // joins collapses dependent-subquery cardinalities to the (often tiny)
+        // correlated aggregate branch and poisons every cost decision above
+        // the control region.
+        JoinType::Mark | JoinType::Single => left,
         JoinType::Anti => {
             let semi = inner.expected.min(left.expected);
             CardinalityEstimate {
@@ -1127,6 +1134,22 @@ mod tests {
         assert_eq!(
             gathered.stats.cardinality_provenance,
             CardinalityProvenance::JoinGraph
+        );
+    }
+
+    #[test]
+    fn mark_and_single_joins_preserve_left_cardinality() {
+        let left = CardinalityEstimate::exact(73);
+        let right = CardinalityEstimate::exact(2);
+        let inner = CardinalityEstimate::exact(1);
+
+        assert_eq!(
+            adjust_join_estimate(inner, left, right, JoinType::Mark),
+            left
+        );
+        assert_eq!(
+            adjust_join_estimate(inner, left, right, JoinType::Single),
+            left
         );
     }
 

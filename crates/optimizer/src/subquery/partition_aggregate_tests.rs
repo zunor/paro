@@ -36,6 +36,35 @@ fn tpch_q02_and_q17_reuse_the_detail_source() {
         .expect("optimizer test");
 }
 
+#[test]
+fn tpch_q20_pulls_unique_correlated_sum_into_grouped_join() {
+    std::thread::Builder::new()
+        .name("tpch-q20-grouped-correlation-test".to_string())
+        .stack_size(16 * 1024 * 1024)
+        .spawn(|| {
+            let session = setup_session();
+            let statement = paro_parser::parse_one(include_str!(
+                "../../../../benchmark/workloads/tpch/sql/q20.sql"
+            ))
+            .expect("parse q20")
+            .stmt;
+            let mut planner = Planner::new(session.clone());
+            planner.create_plan(statement).expect("plan q20");
+            let planned = planner.take_plan().expect("logical q20");
+            let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+            let optimized = optimizer.optimize(planned).expect("optimize q20");
+            let inspection = inspect_plan(&optimized);
+
+            assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+            assert_eq!(inspection.aggregates, 1, "{optimized:#?}");
+            assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
+            assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+        })
+        .expect("spawn q20 optimizer test")
+        .join()
+        .expect("q20 optimizer test");
+}
+
 fn assert_tpch_rewrites() {
     let session = setup_session();
     for (query, sql) in [
@@ -356,6 +385,7 @@ fn install_table_with_constraint(
 #[derive(Default)]
 struct PlanInspection {
     windows: usize,
+    aggregates: usize,
     delim_joins: usize,
     late_fetches: usize,
     late_fetch_sources: usize,
@@ -376,6 +406,7 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
                 result.late_fetch_sources += fetch.sources.len();
             }
             LogicalOperator::Window(_) => result.windows += 1,
+            LogicalOperator::Aggregate(_) => result.aggregates += 1,
             LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
                 if !join.duplicate_eliminated_columns.is_empty() =>
             {

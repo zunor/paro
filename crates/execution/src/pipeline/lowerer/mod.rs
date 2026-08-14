@@ -68,9 +68,10 @@ pub(crate) struct BreakerTail {
     pub(crate) output: RowType,
 }
 
-pub(crate) struct PendingProbeBuild {
+pub(crate) struct PendingProbeDependency {
     pub(crate) producer: PipelineId,
     pub(crate) handle: super::handles::BreakerHandleId,
+    pub(crate) kind: DependencyKind,
 }
 
 pub(crate) struct PipelineChain {

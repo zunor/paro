@@ -119,6 +119,39 @@ fn grouped_aggregate_lowers_to_build_emit_breaker_pipelines() {
 }
 
 #[test]
+fn aggregate_probe_fuses_emit_into_hash_join_without_row_copy() {
+    let plan = aggregate_probe_hash_join_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert!(!graph.pipelines.iter().any(|pipeline| matches!(
+        pipeline.source,
+        SourceSpec::Materialized(_)
+    ) || matches!(
+        pipeline.sink,
+        SinkSpec::Materialize(_)
+    )));
+    let probe = graph
+        .pipelines
+        .iter()
+        .find(|pipeline| {
+            matches!(
+                pipeline.source,
+                SourceSpec::HashAggregateEmit(_) | SourceSpec::PerfectHashAggregateEmit(_)
+            )
+        })
+        .expect("aggregate emit probe pipeline");
+    assert!(probe
+        .transforms
+        .iter()
+        .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
+    assert!(graph
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.kind == DependencyKind::FinalizeBeforeEmit));
+}
+
+#[test]
 fn partition_aggregate_window_lowers_to_build_emit_breaker_pipelines() {
     let plan = partition_aggregate_window_plan();
     let mut lowerer = PipelineLowerer::new(&plan);

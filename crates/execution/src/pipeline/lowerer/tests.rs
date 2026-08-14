@@ -142,6 +142,63 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&aggregate).unwrap()
 }
 
+fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let aggregate_input = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(LogicalAggregate::new(
+            1,
+            2,
+            3,
+            aggregate_input,
+            vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::Integer,
+            ))],
+            Vec::new(),
+            vec![Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))],
+            Vec::new(),
+        )),
+    );
+    let build = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            4,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            aggregate,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&join).unwrap()
+}
+
 fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(
