@@ -360,16 +360,6 @@ pub struct ColumnLifetimePass;
 
 pub struct LatePayloadFetchPass;
 
-pub struct LatePayloadUnusedColumnsPass {
-    pub binder: Binder,
-}
-
-pub struct LatePayloadStatisticsPass;
-pub struct LatePayloadJoinOrderPass;
-pub struct LatePayloadBuildProbeSidePass;
-pub struct LatePayloadJoinFilterPushdownPass;
-pub struct LatePayloadSegmentEndPass;
-
 impl Rewriter for LatePayloadFetchPass {
     fn optimizer_type(&self) -> OptimizerType {
         OptimizerType::LateMaterialization
@@ -378,93 +368,9 @@ impl Rewriter for LatePayloadFetchPass {
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
         let (plan, changed) =
             late_payload::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
-        ctx.late_materialization_dirty = changed;
-        Ok(plan)
-    }
-}
-
-impl Rewriter for LatePayloadUnusedColumnsPass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::UnusedColumns
-    }
-
-    fn rewrite(
-        &mut self,
-        mut plan: LogicalPlan,
-        ctx: &mut OptimizationContext,
-    ) -> Result<LogicalPlan> {
-        if ctx.late_materialization_dirty {
-            RemoveUnusedColumns::optimize(&mut plan, &self.binder, ctx.session.as_ref(), true);
+        if changed {
+            ctx.invalidations.mark_late_materialization();
         }
-        Ok(plan)
-    }
-}
-
-impl Rewriter for LatePayloadStatisticsPass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::StatisticsGathering
-    }
-
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        if !ctx.late_materialization_dirty {
-            return Ok(plan);
-        }
-        ctx.column_stats.clear();
-        StatisticsGathering::new().gather(plan, ctx)
-    }
-}
-
-impl Rewriter for LatePayloadJoinOrderPass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::JoinOrder
-    }
-
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        if !ctx.late_materialization_dirty {
-            return Ok(plan);
-        }
-        JoinOrderOptimizer::new().optimize_plan(
-            ctx.session.as_ref(),
-            plan,
-            &ctx.column_stats,
-            &ctx.bind_context,
-        )
-    }
-}
-
-impl Rewriter for LatePayloadBuildProbeSidePass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::BuildProbeSide
-    }
-
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        if !ctx.late_materialization_dirty {
-            return Ok(plan);
-        }
-        Ok(BuildProbeSideOptimizer::new(ctx.session.clone()).optimize_plan(plan))
-    }
-}
-
-impl Rewriter for LatePayloadJoinFilterPushdownPass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::JoinFilterPushdown
-    }
-
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        if !ctx.late_materialization_dirty {
-            return Ok(plan);
-        }
-        Ok(JoinFilterPushdown::new(ctx.session.clone()).optimize_plan(plan))
-    }
-}
-
-impl Rewriter for LatePayloadSegmentEndPass {
-    fn optimizer_type(&self) -> OptimizerType {
-        OptimizerType::LateMaterialization
-    }
-
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        ctx.late_materialization_dirty = false;
         Ok(plan)
     }
 }

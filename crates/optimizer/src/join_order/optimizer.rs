@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use paro_catalog::entry::ConstraintType;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::Result;
 use paro_context::StatementContext;
 use paro_planner::binder::context::BindContext;
 use paro_planner::binder::deep_copy::{
@@ -129,45 +129,6 @@ pub struct JoinOrderOptimizer {
     relation_plans: Vec<LogicalPlan>,
 }
 
-struct JoinOrderTraversalFrame {
-    skeleton: LogicalPlan,
-    remaining_children: std::vec::IntoIter<LogicalPlan>,
-    optimized_children: Vec<LogicalPlan>,
-    child_contains_control_region_reference: bool,
-}
-
-impl JoinOrderTraversalFrame {
-    fn detach(plan: LogicalPlan) -> Result<Self> {
-        let mut children = Vec::new();
-        let skeleton = plan.try_map_children(|child| {
-            children.push(child);
-            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
-        })?;
-        let child_count = children.len();
-        Ok(Self {
-            skeleton,
-            remaining_children: children.into_iter(),
-            optimized_children: Vec::with_capacity(child_count),
-            child_contains_control_region_reference: false,
-        })
-    }
-
-    fn rebuild(self) -> Result<(LogicalPlan, bool)> {
-        let mut children = self.optimized_children.into_iter();
-        let plan = self.skeleton.try_map_children(|_| {
-            children
-                .next()
-                .ok_or_else(|| paro_error::internal("join-order traversal lost an optimized child"))
-        })?;
-        if children.next().is_some() {
-            return Err(paro_error::internal(
-                "join-order traversal produced excess optimized children",
-            ));
-        }
-        Ok((plan, self.child_contains_control_region_reference))
-    }
-}
-
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new() -> Self {
@@ -211,41 +172,17 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
     ) -> Result<LogicalPlan> {
         self.column_stats = column_stats.clone();
-        let mut frames = vec![JoinOrderTraversalFrame::detach(plan)?];
-        loop {
-            if let Some(child) = frames
-                .last_mut()
-                .and_then(|frame| frame.remaining_children.next())
-            {
-                frames.push(JoinOrderTraversalFrame::detach(child)?);
-                continue;
-            }
-
-            let frame = frames
-                .pop()
-                .ok_or_else(|| paro_error::internal("join-order traversal stack is empty"))?;
-            let (plan, child_contains_control_region_reference) = frame.rebuild()?;
-            let contains_control_region_reference = child_contains_control_region_reference
+        plan.try_fold_post_order(|plan, child_states: Vec<bool>| {
+            let contains_control_region_reference = child_states.into_iter().any(|state| state)
                 || matches!(plan.operator, LogicalOperator::CTERef(_));
-            let (plan, contains_control_region_reference) = self.optimize_current_plan(
-                ctx,
-                bind_context,
-                plan,
-                contains_control_region_reference,
-            )?;
-
-            let Some(parent) = frames.last_mut() else {
-                return Ok(plan);
-            };
-            parent.optimized_children.push(plan);
-            parent.child_contains_control_region_reference |= contains_control_region_reference;
-        }
+            self.optimize_current_plan(ctx, bind_context, plan, contains_control_region_reference)
+        })
+        .map(|(plan, _)| plan)
     }
 
     /// Keep join-graph extraction and reconstruction isolated from the
     /// explicit traversal state. Those routines own several large planner
     /// values and should not be folded back into the post-order driver.
-    #[inline(never)]
     fn optimize_current_plan(
         &mut self,
         ctx: &StatementContext,

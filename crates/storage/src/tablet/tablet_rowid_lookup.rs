@@ -42,12 +42,13 @@ impl TabletRowIdReader {
     pub fn new(
         tablet: TabletRef,
         rowsets: Vec<RowsetSharedPtr>,
+        column_ids: &[ColumnId],
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("Tablet schema not available"))?;
-        let rowsets = pin_declared_rowset_closure(&tablet, rowsets)?;
+        let rowsets = pin_required_rowset_closure(&tablet, rowsets, column_ids)?;
         Ok(Self {
             tablet,
             schema,
@@ -144,12 +145,18 @@ fn get_by_rowids(
     )
 }
 
-/// Pin the complete, explicitly declared base-rowset closure while the query
-/// snapshot is alive. Sparse lookup never consults the tablet's mutable
-/// retained-rowset registry after this point.
-fn pin_declared_rowset_closure(
+/// Pin only ancestors needed to materialize the reader's fixed column set.
+///
+/// Full rowsets may retain deep historical lineage for GC bookkeeping, but a
+/// sparse fetch whose columns are present must not keep that lineage alive or
+/// fail because an irrelevant ancestor was already reclaimed. Partial rowsets
+/// are detected before execution and their required ancestry is pinned while
+/// the query snapshot is still valid; lookup never consults the mutable
+/// retained registry afterward.
+fn pin_required_rowset_closure(
     tablet: &TabletRef,
     mut rowsets: Vec<RowsetSharedPtr>,
+    column_ids: &[ColumnId],
 ) -> Result<Vec<RowsetSharedPtr>> {
     let mut pinned = rowsets
         .iter()
@@ -157,8 +164,12 @@ fn pin_declared_rowset_closure(
         .collect::<HashSet<_>>();
     let mut cursor = 0;
     while cursor < rowsets.len() {
+        let needs_base = rowset_needs_base_columns(&rowsets[cursor], column_ids)?;
         let source_ids = rowsets[cursor].rowset_meta().source_rowset_ids().to_vec();
         cursor += 1;
+        if !needs_base {
+            continue;
+        }
         for source_id in source_ids {
             if !pinned.insert(source_id) {
                 continue;
@@ -174,6 +185,18 @@ fn pin_declared_rowset_closure(
         }
     }
     Ok(rowsets)
+}
+
+fn rowset_needs_base_columns(rowset: &RowsetSharedPtr, column_ids: &[ColumnId]) -> Result<bool> {
+    if column_ids.is_empty() || rowset.rowset_meta().source_rowset_ids().is_empty() {
+        return Ok(false);
+    }
+    rowset.load()?;
+    Ok(rowset.segments().iter().any(|segment| {
+        column_ids
+            .iter()
+            .any(|column_id| segment.get_column_meta(*column_id).is_none())
+    }))
 }
 
 fn resolve_rowset(

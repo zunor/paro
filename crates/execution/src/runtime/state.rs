@@ -34,8 +34,8 @@ pub use crate::operators::external::state::{
 };
 pub use crate::operators::graph::state::{
     GraphExpandTransformGlobal, GraphExpandTransformLocal, GraphFilterScanState,
-    GraphScanSourceGlobal, GraphScanSourceLocal, GraphShortestPathTransformGlobal,
-    GraphShortestPathTransformLocal, RowFetchMaterializedRuntime, RowFetchProjectTransformLocal,
+    GraphProjectTransformLocal, GraphScanSourceGlobal, GraphScanSourceLocal,
+    GraphShortestPathTransformGlobal, GraphShortestPathTransformLocal, RowFetchMaterializedRuntime,
     RowFetchTablePlan,
 };
 pub use crate::operators::join::state::{
@@ -46,6 +46,7 @@ pub use crate::operators::join::state::{
     SortRangeProbeOffsets,
 };
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
+pub use crate::operators::row_fetch::{RowFetchTableState, RowFetchTransformLocal};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
     ExpressionSourceGlobal, ExpressionSourceLocal, PreparedRowsetPredicate, RowsetScanMorsel,
@@ -359,7 +360,8 @@ pub enum TransformLocal {
     CrossProductProbe(CrossProductProbeTransformLocal),
     ExternalProject(ExternalProjectTransformLocal),
     GraphExpand(GraphExpandTransformLocal),
-    RowFetchProject(RowFetchProjectTransformLocal),
+    RowFetch(RowFetchTransformLocal),
+    GraphProject(GraphProjectTransformLocal),
     GraphShortestPath(GraphShortestPathTransformLocal),
     PropertyRepair,
     Dyn(DynLocalStateBox),

@@ -15,21 +15,21 @@ use crate::runtime::{
     DeleteSinkExec, DelimCaptureSinkExec, DelimScanSourceExec, DummySourceExec, EmptySourceExec,
     ExpressionSourceExec, ExternalProjectTransformExec, ExternalTableSinkExec,
     ExternalTableSourceExec, FilterTransformExec, FullTextSearchSourceExec,
-    GraphExpandTransformExec, GraphScanSourceExec, GraphShortestPathTransformExec,
-    HashAggregateBuildSinkExec, HashAggregateEmitSourceExec, HashJoinBuildSinkExec,
-    HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec,
-    InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec, NestedLoopJoinProbeTransformExec,
-    NljUnmatchedSourceExec, OperatorRole, PartitionAggregateWindowBuildSinkExec,
-    PartitionAggregateWindowEmitSourceExec, PerfectHashAggregateEmitSourceExec,
-    PerfectHashAggregateSinkExec, ProjectTransformExec, PropertyRepairTransformExec,
-    RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec, RowFetchProjectTransformExec,
-    RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
-    SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
-    SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
-    StreamingLimitTransformExec, StreamingTopNTransformExec, StreamingWindowTransformExec,
-    TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec, TransformExec,
-    UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
-    VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
+    GraphExpandTransformExec, GraphProjectTransformExec, GraphScanSourceExec,
+    GraphShortestPathTransformExec, HashAggregateBuildSinkExec, HashAggregateEmitSourceExec,
+    HashJoinBuildSinkExec, HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec,
+    HashJoinUnmatchedSourceExec, InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec,
+    NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec, OperatorRole,
+    PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
+    PerfectHashAggregateEmitSourceExec, PerfectHashAggregateSinkExec, ProjectTransformExec,
+    PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
+    RowFetchTransformExec, RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin,
+    RuntimeRoleOrdinal, SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec,
+    SortBuildSinkExec, SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec,
+    SparseVectorSearchSourceExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
+    StreamingWindowTransformExec, TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec,
+    TransformExec, UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec,
+    ValuesSourceExec, VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
 use crate::runtime::{ChunkLayout, HandleRef, PipelineScratchLayout, RuntimeOperatorId};
 
@@ -535,8 +535,11 @@ impl OperatorRuntimeRegistry {
             TransformSpec::GraphExpand(spec) => {
                 TransformExec::GraphExpand(GraphExpandTransformExec { spec: spec.clone() })
             }
-            TransformSpec::RowFetchProject(spec) => {
-                TransformExec::RowFetchProject(RowFetchProjectTransformExec { spec: spec.clone() })
+            TransformSpec::RowFetch(spec) => {
+                TransformExec::RowFetch(RowFetchTransformExec { spec: spec.clone() })
+            }
+            TransformSpec::GraphProject(spec) => {
+                TransformExec::GraphProject(GraphProjectTransformExec { spec: spec.clone() })
             }
             TransformSpec::GraphShortestPath(spec) => {
                 TransformExec::GraphShortestPath(GraphShortestPathTransformExec {
@@ -776,9 +779,8 @@ fn transform_chunk_layout(transform: &TransformSpec, row_type: &RowType) -> Chun
         TransformSpec::Filter(_)
         | TransformSpec::Limit(_)
         | TransformSpec::Project(_)
-        | TransformSpec::RowFetchProject(_) => {
-            ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
-        }
+        | TransformSpec::RowFetch(_)
+        | TransformSpec::GraphProject(_) => ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE),
         _ => chunk_layout(row_type),
     }
 }

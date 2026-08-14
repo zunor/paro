@@ -27,21 +27,15 @@ pub fn optimize_plan(
     bind_context: &BindContext,
     cost_model: &CostModel,
 ) -> Result<(LogicalPlan, bool)> {
-    let mut changed = false;
-    let plan = plan.try_map_children(|child| {
-        let (child, child_changed) = optimize_plan(child, bind_context, cost_model)?;
-        changed |= child_changed;
-        Ok(child)
-    })?;
-    let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
-    Ok((plan, changed || node_changed))
+    plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
+        let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
+        Ok((
+            plan,
+            node_changed || child_changes.into_iter().any(|changed| changed),
+        ))
+    })
 }
 
-/// Keep the comparatively large proof witnesses out of the recursive walk's
-/// stack frame. Real plans such as TPC-H Q15 are deep enough that reserving the
-/// proof/apply frame at every ancestor can exhaust an ordinary worker stack
-/// even though the traversal itself is finite.
-#[inline(never)]
 fn rewrite_node(
     plan: LogicalPlan,
     bind_context: &BindContext,
@@ -257,8 +251,12 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
                     .estimated_cardinality
                     .map_or(carrier_rows, |estimate| estimate.expected),
             );
-            let benefit =
-                cost_model.late_row_fetch_benefit(carrier_rows, fetched_rows, payload_types, 1)?;
+            let benefit = cost_model.late_row_fetch_benefit(
+                carrier_rows,
+                fetched_rows,
+                payload_types,
+                rowid_path.stages(),
+            )?;
             Some(Candidate {
                 dependency,
                 source_table_index,
@@ -743,6 +741,14 @@ fn apply_rewrite(
                     LogicalType::BigInt,
                 )),
                 table: candidate.table,
+                needed_columns: candidate
+                    .dependent_catalog_columns
+                    .values()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
             }],
             topn_plan,
         ),
@@ -949,6 +955,15 @@ fn apply_row_preserving_rewrite(
                         LogicalType::BigInt,
                     )),
                     table: source.source.table.clone(),
+                    needed_columns: source
+                        .source
+                        .ordered_catalog_columns
+                        .values()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
                 })
         })
         .collect::<Vec<_>>();
@@ -1032,6 +1047,15 @@ fn apply_row_preserving_rewrite(
                 LogicalType::BigInt,
             )),
             table: source.source.table,
+            needed_columns: source
+                .source
+                .output_catalog_columns
+                .values()
+                .copied()
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
         });
     }
     output.child = Box::new(if output_fetch_sources.is_empty() {
@@ -1063,145 +1087,149 @@ fn append_virtual_rowid(
     virtual_column_id: usize,
     required_output_bindings: &HashSet<ColumnBinding>,
 ) -> Option<ColumnBinding> {
-    if matches!(path, RowIdPath::Get) {
-        let LogicalOperator::Get(get) = &mut plan.operator else {
-            return None;
-        };
-        if get.table_index != table_index {
-            return None;
-        }
-        if let Some(output_index) = get
-            .column_ids
-            .iter()
-            .position(|column_id| *column_id == virtual_column_id)
-        {
-            return Some(ColumnBinding::new(table_index, output_index));
-        }
-        let output_index = get.returned_types.len();
-        get.names.push("rowid".to_string());
-        get.returned_types.push(LogicalType::BigInt);
-        get.column_ids.push(virtual_column_id);
-        get.column_types.push(LogicalType::BigInt);
-        return Some(ColumnBinding::new(table_index, output_index));
-    }
-
-    if let RowIdPath::Filter(child_path) = path {
-        let LogicalOperator::Filter(filter) = &mut plan.operator else {
-            return None;
-        };
-        let binding = append_virtual_rowid(
-            &mut filter.child,
-            child_path,
-            table_index,
-            virtual_column_id,
-            required_output_bindings,
-        )?;
-        let child_index = filter
-            .child
-            .get_column_bindings()
-            .iter()
-            .position(|candidate| *candidate == binding)?;
-        filter.projection_map.include(child_index);
-        return Some(binding);
-    }
     match path {
+        RowIdPath::Get => {
+            let LogicalOperator::Get(get) = &mut plan.operator else {
+                return None;
+            };
+            if get.table_index != table_index {
+                return None;
+            }
+            if let Some(output_index) = get
+                .column_ids
+                .iter()
+                .position(|column_id| *column_id == virtual_column_id)
+            {
+                return Some(ColumnBinding::new(table_index, output_index));
+            }
+            let output_index = get.returned_types.len();
+            get.names.push("rowid".to_string());
+            get.returned_types.push(LogicalType::BigInt);
+            get.column_ids.push(virtual_column_id);
+            get.column_types.push(LogicalType::BigInt);
+            Some(ColumnBinding::new(table_index, output_index))
+        }
+        RowIdPath::Filter(child_path) => {
+            let LogicalOperator::Filter(filter) = &mut plan.operator else {
+                return None;
+            };
+            let binding = append_virtual_rowid(
+                &mut filter.child,
+                child_path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            )?;
+            let child_index = filter
+                .child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            filter.projection_map.include(child_index);
+            Some(binding)
+        }
         RowIdPath::Window(child_path) => {
             let LogicalOperator::Window(window) = &mut plan.operator else {
                 return None;
             };
-            return append_virtual_rowid(
+            append_virtual_rowid(
                 &mut window.child,
                 child_path,
                 table_index,
                 virtual_column_id,
                 required_output_bindings,
-            );
+            )
         }
         RowIdPath::Order(child_path) => {
             let LogicalOperator::Order(order) = &mut plan.operator else {
                 return None;
             };
-            return append_virtual_rowid(
+            let binding = append_virtual_rowid(
                 &mut order.child,
                 child_path,
                 table_index,
                 virtual_column_id,
                 required_output_bindings,
-            );
+            )?;
+            let child_index = order
+                .child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            order.projection_map.include(child_index);
+            Some(binding)
         }
         RowIdPath::Limit(child_path) => {
             let LogicalOperator::Limit(limit) = &mut plan.operator else {
                 return None;
             };
-            return append_virtual_rowid(
+            append_virtual_rowid(
                 &mut limit.child,
                 child_path,
                 table_index,
                 virtual_column_id,
                 required_output_bindings,
-            );
+            )
         }
         RowIdPath::EmptyResult(child_path) => {
             let LogicalOperator::EmptyResult(empty) = &mut plan.operator else {
                 return None;
             };
-            return append_virtual_rowid(
+            append_virtual_rowid(
                 &mut empty.child,
                 child_path,
                 table_index,
                 virtual_column_id,
                 required_output_bindings,
-            );
+            )
         }
-        RowIdPath::Get | RowIdPath::Filter(_) | RowIdPath::Join { .. } => {}
-    }
-    if let RowIdPath::Join { kind, side, child } = path {
-        let LogicalOperator::Join(join) = &mut plan.operator else {
-            return None;
-        };
-        return match (kind, join) {
-            (RowIdJoinKind::Comparison, Join::Comparison(join)) => append_projected_join_rowid(
-                &mut join.left,
-                &mut join.right,
-                &mut join.left_projection_map,
-                &mut join.right_projection_map,
-                *side,
-                child,
-                table_index,
-                virtual_column_id,
-                required_output_bindings,
-            ),
-            (RowIdJoinKind::Any, Join::Any(join)) => append_projected_join_rowid(
-                &mut join.left,
-                &mut join.right,
-                &mut join.left_projection_map,
-                &mut join.right_projection_map,
-                *side,
-                child,
-                table_index,
-                virtual_column_id,
-                required_output_bindings,
-            ),
-            (RowIdJoinKind::Cross, Join::Cross(join)) => match side {
-                RowIdJoinSide::Left => append_virtual_rowid(
+        RowIdPath::Join { kind, side, child } => {
+            let LogicalOperator::Join(join) = &mut plan.operator else {
+                return None;
+            };
+            match (kind, join) {
+                (RowIdJoinKind::Comparison, Join::Comparison(join)) => append_projected_join_rowid(
                     &mut join.left,
-                    child,
-                    table_index,
-                    virtual_column_id,
-                    required_output_bindings,
-                ),
-                RowIdJoinSide::Right => append_virtual_rowid(
                     &mut join.right,
+                    &mut join.left_projection_map,
+                    &mut join.right_projection_map,
+                    *side,
                     child,
                     table_index,
                     virtual_column_id,
                     required_output_bindings,
                 ),
-            },
-            _ => None,
-        };
+                (RowIdJoinKind::Any, Join::Any(join)) => append_projected_join_rowid(
+                    &mut join.left,
+                    &mut join.right,
+                    &mut join.left_projection_map,
+                    &mut join.right_projection_map,
+                    *side,
+                    child,
+                    table_index,
+                    virtual_column_id,
+                    required_output_bindings,
+                ),
+                (RowIdJoinKind::Cross, Join::Cross(join)) => match side {
+                    RowIdJoinSide::Left => append_virtual_rowid(
+                        &mut join.left,
+                        child,
+                        table_index,
+                        virtual_column_id,
+                        required_output_bindings,
+                    ),
+                    RowIdJoinSide::Right => append_virtual_rowid(
+                        &mut join.right,
+                        child,
+                        table_index,
+                        virtual_column_id,
+                        required_output_bindings,
+                    ),
+                },
+                _ => None,
+            }
+        }
     }
-    None
 }
 
 #[allow(clippy::too_many_arguments)]

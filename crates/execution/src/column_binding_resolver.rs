@@ -333,45 +333,9 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             }
 
             // =========================================================================
-            // Special case: projection fused with a RowFetch child
-            //
-            // Its rowid carriers are ordinary child expressions and resolve to
-            // physical input positions here. The visible projection expressions
-            // intentionally retain their carrier/materialized logical namespaces;
-            // RowFetchProject rebases that combined domain after fetching rows.
-            // =========================================================================
-            LogicalOperator::Projection(proj)
-                if matches!(proj.child.operator, LogicalOperator::RowFetch(_)) =>
-            {
-                let LogicalOperator::RowFetch(fetch) = &mut proj.child.operator else {
-                    unreachable!("RowFetch projection guard must match its child")
-                };
-                self.visit_logical_plan(fetch.child.as_mut());
-                self.bindings = fetch.child.get_column_bindings();
-                self.types = fetch.child.types();
-                self.scope = "row-fetch rowid carrier".to_string();
-                for source in &mut fetch.sources {
-                    self.visit_expression(&mut source.rowid);
-                }
-                if self.verify_only {
-                    self.bindings = proj.child.get_column_bindings();
-                    self.types = proj.child.types();
-                    self.scope = "row-fetch projection".to_string();
-                    for expression in &mut proj.expressions {
-                        self.visit_expression(expression);
-                    }
-                }
-                self.bindings = LogicalOperator::generate_column_bindings(
-                    proj.table_index,
-                    proj.expressions.len(),
-                );
-                self.types = proj.returned_types.clone();
-            }
-
-            // =========================================================================
             // Special case: Graph Projection
             // A Projection over a graph chain (GraphScan/GraphExpand)
-            // uses RowFetchProject which does its own late-materialization
+            // uses GraphProject which does its own late-materialization
             // column remapping. We must NOT resolve the COLUMNS expressions
             // here because the graph chain's output bindings (local_id, rowid,
             // edge_rowid, ...) don't correspond to the actual table columns

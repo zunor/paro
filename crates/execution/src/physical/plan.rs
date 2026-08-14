@@ -401,11 +401,21 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 format_hops(spec.min_hops, spec.max_hops),
             );
         }
-        PhysicalNodeKind::RowFetchProject(spec) => {
+        PhysicalNodeKind::GraphProject(spec) => {
             push_list_property(&mut properties, "Output", &spec.output_names);
             if !spec.filters.is_empty() {
                 push_string_property(&mut properties, "Filter", "<pushed down>".to_string());
             }
+        }
+        PhysicalNodeKind::RowFetch(spec) => {
+            let output_names = spec
+                .projection
+                .as_ref()
+                .map_or(spec.raw_output_names.as_ref(), |projection| {
+                    projection.output_names.as_ref()
+                });
+            push_list_property(&mut properties, "Output", output_names);
+            push_string_property(&mut properties, "Sources", spec.mappings.len().to_string());
         }
         PhysicalNodeKind::Aggregate(spec) => {
             push_aggregate_properties(&mut properties, spec);

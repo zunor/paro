@@ -215,8 +215,12 @@ impl<'a> PipelineLowerer<'a> {
                     transforms.push(TransformSpec::GraphExpand(spec.clone()));
                     current = self.only_child(current)?;
                 }
-                PhysicalNodeKind::RowFetchProject(spec) => {
-                    transforms.push(TransformSpec::RowFetchProject(spec.clone()));
+                PhysicalNodeKind::RowFetch(spec) => {
+                    transforms.push(TransformSpec::RowFetch(spec.clone()));
+                    current = self.only_child(current)?;
+                }
+                PhysicalNodeKind::GraphProject(spec) => {
+                    transforms.push(TransformSpec::GraphProject(spec.clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphShortestPath(spec) => {
@@ -268,7 +272,8 @@ impl<'a> PipelineLowerer<'a> {
             | PhysicalNodeKind::Project(_)
             | PhysicalNodeKind::Limit(_)
             | PhysicalNodeKind::GraphExpand(_)
-            | PhysicalNodeKind::RowFetchProject(_)
+            | PhysicalNodeKind::RowFetch(_)
+            | PhysicalNodeKind::GraphProject(_)
             | PhysicalNodeKind::GraphShortestPath(_)
             | PhysicalNodeKind::ExternalProject(_) => Some(self.only_child(root)?),
             PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {

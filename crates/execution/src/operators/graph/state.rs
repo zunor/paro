@@ -186,10 +186,9 @@ pub struct RowFetchMaterializedRuntime {
 }
 
 #[derive(Debug, Default)]
-pub struct RowFetchProjectTransformLocal {
+pub struct GraphProjectTransformLocal {
     pub filter_selection: Option<SelectionVector>,
     pub raw_filter_executors: Vec<ExpressionExecutor>,
     pub raw_project_executor: Option<ExpressionExecutor>,
     pub materialized: Option<RowFetchMaterializedRuntime>,
-    pub buffered_input: Option<Chunk>,
 }

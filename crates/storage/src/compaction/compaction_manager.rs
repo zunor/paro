@@ -28,13 +28,61 @@ use tracing::{debug, error, info, warn};
 
 const TABLET_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_TABLET_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const FOREGROUND_QUIESCENCE: Duration = Duration::from_secs(2);
-const FOREGROUND_MAX_DEFERRAL: Duration = Duration::from_secs(120);
+
+/// Admission policy for background compaction while foreground statements are
+/// active. Keeping the policy as data lets the instance resource governor tune
+/// the read/write tradeoff without changing scheduler code.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionAdmissionPolicy {
+    pub foreground_quiescence: Duration,
+    /// Critical debt may shorten the bounded deferral interval, but it must
+    /// not immediately steal workers from a short foreground burst.
+    pub foreground_critical_deferral: Duration,
+    pub foreground_max_deferral: Duration,
+    /// A broad backlog needs continuous relief rather than one job per maximum
+    /// deferral interval.
+    pub critical_candidate_count: usize,
+    /// A single tablet with a deep rowset stack must also trigger relief.
+    pub critical_candidate_score: f64,
+    /// Maximum jobs admitted per scheduling round while foreground work is
+    /// active and compaction debt is critical.
+    pub critical_relief_jobs: usize,
+}
+
+impl Default for CompactionAdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            foreground_quiescence: Duration::from_secs(2),
+            // Critical debt halves the ordinary starvation bound while still
+            // reserving a meaningful foreground-only interval for analytical
+            // bursts and interactive workloads.
+            foreground_critical_deferral: Duration::from_secs(60),
+            foreground_max_deferral: Duration::from_secs(120),
+            critical_candidate_count: 8,
+            critical_candidate_score: 32.0,
+            critical_relief_jobs: 1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+struct CompactionDebt {
+    candidate_count: usize,
+    max_candidate_score: f64,
+}
+
+impl CompactionDebt {
+    fn is_critical(self, policy: CompactionAdmissionPolicy) -> bool {
+        self.candidate_count >= policy.critical_candidate_count.max(1)
+            || self.max_candidate_score >= policy.critical_candidate_score.max(0.0)
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaintenanceAdmission {
     Normal,
     StarvationRelief,
+    DebtRelief,
     Deferred,
 }
 
@@ -97,6 +145,7 @@ pub struct CompactionJobObservability {
 pub struct CompactionObservability {
     pub registered_tablets: usize,
     pub queued_candidates: usize,
+    pub max_queued_candidate_score: f64,
     pub running_tablets: Vec<TabletId>,
     pub failed_tablets: Vec<(TabletId, String)>,
     pub jobs: Vec<CompactionJobObservability>,
@@ -120,6 +169,8 @@ pub struct CompactionManager {
     foreground_last_activity_ns: AtomicU64,
     foreground_deferral_since_ns: AtomicU64,
     candidate_queue_len: AtomicUsize,
+    candidate_max_score_bits: AtomicU64,
+    admission_policy: CompactionAdmissionPolicy,
     executor: Arc<CompactionExecutor>,
     compaction_allocator: Arc<dyn Allocator>,
     stop_tx: broadcast::Sender<()>,
@@ -139,6 +190,18 @@ impl CompactionManager {
     }
 
     pub fn new_with_allocator(max_concurrency: usize, allocator: Arc<dyn Allocator>) -> Self {
+        Self::new_with_allocator_and_admission_policy(
+            max_concurrency,
+            allocator,
+            CompactionAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn new_with_allocator_and_admission_policy(
+        max_concurrency: usize,
+        allocator: Arc<dyn Allocator>,
+        admission_policy: CompactionAdmissionPolicy,
+    ) -> Self {
         let (stop_tx, _) = broadcast::channel(1);
         Self {
             tablets: Arc::new(Mutex::new(HashMap::new())),
@@ -153,6 +216,8 @@ impl CompactionManager {
             foreground_last_activity_ns: AtomicU64::new(0),
             foreground_deferral_since_ns: AtomicU64::new(0),
             candidate_queue_len: AtomicUsize::new(0),
+            candidate_max_score_bits: AtomicU64::new(0.0f64.to_bits()),
+            admission_policy,
             executor: Arc::new(CompactionExecutor::new(max_concurrency)),
             compaction_allocator: allocator,
             stop_tx,
@@ -164,6 +229,20 @@ impl CompactionManager {
         allocator: Arc<dyn Allocator>,
         scheduler: Arc<TaskScheduler>,
     ) -> Self {
+        Self::new_with_allocator_scheduler_and_admission_policy(
+            max_concurrency,
+            allocator,
+            scheduler,
+            CompactionAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn new_with_allocator_scheduler_and_admission_policy(
+        max_concurrency: usize,
+        allocator: Arc<dyn Allocator>,
+        scheduler: Arc<TaskScheduler>,
+        admission_policy: CompactionAdmissionPolicy,
+    ) -> Self {
         let (stop_tx, _) = broadcast::channel(1);
         Self {
             tablets: Arc::new(Mutex::new(HashMap::new())),
@@ -178,6 +257,8 @@ impl CompactionManager {
             foreground_last_activity_ns: AtomicU64::new(0),
             foreground_deferral_since_ns: AtomicU64::new(0),
             candidate_queue_len: AtomicUsize::new(0),
+            candidate_max_score_bits: AtomicU64::new(0.0f64.to_bits()),
+            admission_policy,
             executor: Arc::new(CompactionExecutor::new_with_scheduler(
                 max_concurrency,
                 scheduler,
@@ -188,11 +269,23 @@ impl CompactionManager {
     }
 
     pub fn new_with_buffer_pool(max_concurrency: usize, buffer_pool: Arc<BufferPool>) -> Self {
+        Self::new_with_buffer_pool_and_admission_policy(
+            max_concurrency,
+            buffer_pool,
+            CompactionAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn new_with_buffer_pool_and_admission_policy(
+        max_concurrency: usize,
+        buffer_pool: Arc<BufferPool>,
+        admission_policy: CompactionAdmissionPolicy,
+    ) -> Self {
         let allocator: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
             buffer_pool as Arc<dyn CommonBufferManager>,
             MemoryTag::Compaction,
         ));
-        Self::new_with_allocator(max_concurrency, allocator)
+        Self::new_with_allocator_and_admission_policy(max_concurrency, allocator, admission_policy)
     }
 
     pub fn new_with_buffer_pool_and_scheduler(
@@ -200,11 +293,30 @@ impl CompactionManager {
         buffer_pool: Arc<BufferPool>,
         scheduler: Arc<TaskScheduler>,
     ) -> Self {
+        Self::new_with_buffer_pool_scheduler_and_admission_policy(
+            max_concurrency,
+            buffer_pool,
+            scheduler,
+            CompactionAdmissionPolicy::default(),
+        )
+    }
+
+    pub fn new_with_buffer_pool_scheduler_and_admission_policy(
+        max_concurrency: usize,
+        buffer_pool: Arc<BufferPool>,
+        scheduler: Arc<TaskScheduler>,
+        admission_policy: CompactionAdmissionPolicy,
+    ) -> Self {
         let allocator: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
             buffer_pool as Arc<dyn CommonBufferManager>,
             MemoryTag::Compaction,
         ));
-        Self::new_with_allocator_and_scheduler(max_concurrency, allocator, scheduler)
+        Self::new_with_allocator_scheduler_and_admission_policy(
+            max_concurrency,
+            allocator,
+            scheduler,
+            admission_policy,
+        )
     }
 
     pub fn register_tablet(&self, tablet: Arc<Tablet>) {
@@ -360,18 +472,35 @@ impl CompactionManager {
             .foreground_last_activity_ns
             .load(AtomicOrdering::Acquire);
         last_activity != 0
-            && now_ns.saturating_sub(last_activity) < duration_ns(FOREGROUND_QUIESCENCE)
+            && now_ns.saturating_sub(last_activity)
+                < duration_ns(self.admission_policy.foreground_quiescence)
     }
 
     fn foreground_blocks_new_work(&self) -> bool {
         self.foreground_blocks_new_work_at(self.foreground_now_ns())
     }
 
-    fn maintenance_admission(&self) -> MaintenanceAdmission {
-        self.maintenance_admission_at(self.foreground_now_ns())
+    fn publish_candidate_debt(&self, debt: CompactionDebt) {
+        self.candidate_queue_len
+            .store(debt.candidate_count, AtomicOrdering::Release);
+        self.candidate_max_score_bits
+            .store(debt.max_candidate_score.to_bits(), AtomicOrdering::Release);
     }
 
-    fn maintenance_admission_at(&self, now: u64) -> MaintenanceAdmission {
+    fn observed_candidate_debt(&self) -> CompactionDebt {
+        CompactionDebt {
+            candidate_count: self.candidate_queue_len.load(AtomicOrdering::Acquire),
+            max_candidate_score: f64::from_bits(
+                self.candidate_max_score_bits.load(AtomicOrdering::Acquire),
+            ),
+        }
+    }
+
+    fn maintenance_admission(&self, debt: CompactionDebt) -> MaintenanceAdmission {
+        self.maintenance_admission_at(self.foreground_now_ns(), debt)
+    }
+
+    fn maintenance_admission_at(&self, now: u64, debt: CompactionDebt) -> MaintenanceAdmission {
         if !self.foreground_blocks_new_work_at(now) {
             self.foreground_deferral_since_ns
                 .store(0, AtomicOrdering::Release);
@@ -393,7 +522,14 @@ impl CompactionManager {
             }
         }
 
-        if now.saturating_sub(deferred_since) >= duration_ns(FOREGROUND_MAX_DEFERRAL) {
+        let elapsed = now.saturating_sub(deferred_since);
+        if debt.is_critical(self.admission_policy)
+            && elapsed >= duration_ns(self.admission_policy.foreground_critical_deferral)
+        {
+            return MaintenanceAdmission::DebtRelief;
+        }
+
+        if elapsed >= duration_ns(self.admission_policy.foreground_max_deferral) {
             // Admit one job, then begin a fresh bounded deferral interval. This
             // prevents starvation without compaction cancel/restart livelock.
             self.foreground_deferral_since_ns
@@ -502,28 +638,17 @@ impl CompactionManager {
     pub async fn schedule(&self) {
         debug!("starting compaction scheduling round");
         if self.is_suspended() {
-            self.candidate_queue_len.store(0, AtomicOrdering::Release);
+            self.publish_candidate_debt(CompactionDebt::default());
             self.refresh_metrics();
             return;
         }
-        let admission = self.maintenance_admission();
-        let admission_budget = match admission {
-            MaintenanceAdmission::Normal => usize::MAX,
-            MaintenanceAdmission::StarvationRelief => 1,
-            MaintenanceAdmission::Deferred => {
-                self.candidate_queue_len.store(0, AtomicOrdering::Release);
-                self.refresh_metrics();
-                return;
-            }
-        };
-
         let tablets_list: Vec<Arc<Tablet>> = {
             let tablets = self.tablets.lock().unwrap();
             tablets.values().cloned().collect()
         };
 
         if tablets_list.is_empty() {
-            self.candidate_queue_len.store(0, AtomicOrdering::Release);
+            self.publish_candidate_debt(CompactionDebt::default());
             self.refresh_metrics();
             return;
         }
@@ -561,16 +686,33 @@ impl CompactionManager {
             }
         }
 
-        self.candidate_queue_len
-            .store(candidates.len(), AtomicOrdering::Release);
+        let debt = CompactionDebt {
+            candidate_count: candidates.len(),
+            max_candidate_score: candidates
+                .iter()
+                .map(|candidate| candidate.plan.score)
+                .filter(|score| score.is_finite())
+                .fold(0.0, f64::max),
+        };
+        self.publish_candidate_debt(debt);
         self.refresh_metrics();
+
+        let admission = self.maintenance_admission(debt);
+        let admission_budget = match admission {
+            MaintenanceAdmission::Normal => usize::MAX,
+            MaintenanceAdmission::StarvationRelief => 1,
+            MaintenanceAdmission::DebtRelief => self.admission_policy.critical_relief_jobs.max(1),
+            MaintenanceAdmission::Deferred => return,
+        };
 
         let mut submitted = 0usize;
         while let Some(candidate) = candidates.pop() {
             if self.is_suspended() {
+                candidates.push(candidate);
                 break;
             }
             if admission == MaintenanceAdmission::Normal && self.foreground_blocks_new_work() {
+                candidates.push(candidate);
                 break;
             }
 
@@ -581,8 +723,14 @@ impl CompactionManager {
             running.insert(candidate.tablet_id);
             drop(running);
 
-            self.candidate_queue_len
-                .store(candidates.len(), AtomicOrdering::Release);
+            self.publish_candidate_debt(CompactionDebt {
+                candidate_count: candidates.len(),
+                max_candidate_score: candidates
+                    .iter()
+                    .map(|candidate| candidate.plan.score)
+                    .filter(|score| score.is_finite())
+                    .fold(0.0, f64::max),
+            });
             self.refresh_metrics();
 
             let job_id = allocate_compaction_job_id();
@@ -681,7 +829,15 @@ impl CompactionManager {
             }
         }
 
-        self.candidate_queue_len.store(0, AtomicOrdering::Release);
+        let remaining_debt = CompactionDebt {
+            candidate_count: candidates.len(),
+            max_candidate_score: candidates
+                .iter()
+                .map(|candidate| candidate.plan.score)
+                .filter(|score| score.is_finite())
+                .fold(0.0, f64::max),
+        };
+        self.publish_candidate_debt(remaining_debt);
         self.refresh_metrics();
     }
 
@@ -712,15 +868,19 @@ impl CompactionManager {
             self.jobs.lock().unwrap().values().cloned().collect();
         jobs.sort_by_key(|job| (job.tablet_id, job.job_id));
 
+        let debt = self.observed_candidate_debt();
         CompactionObservability {
             registered_tablets: self.tablets.lock().unwrap().len(),
-            queued_candidates: self.candidate_queue_len.load(AtomicOrdering::Acquire),
+            queued_candidates: debt.candidate_count,
+            max_queued_candidate_score: debt.max_candidate_score,
             running_tablets,
             failed_tablets,
             jobs,
             suspended: self.is_suspended(),
             foreground_statements: self.foreground_statements.load(AtomicOrdering::Acquire),
-            foreground_deferred: self.foreground_blocks_new_work(),
+            foreground_deferred: debt.candidate_count > 0
+                && self.foreground_blocks_new_work()
+                && !debt.is_critical(self.admission_policy),
         }
     }
 
@@ -959,10 +1119,11 @@ mod tests {
     #[test]
     fn foreground_admission_defers_without_canceling_and_has_starvation_relief() {
         let manager = CompactionManager::new(1);
+        let no_debt = CompactionDebt::default();
 
         manager.begin_foreground_statement();
         assert_eq!(
-            manager.maintenance_admission(),
+            manager.maintenance_admission(no_debt),
             MaintenanceAdmission::Deferred
         );
         assert_eq!(
@@ -975,11 +1136,14 @@ mod tests {
             .foreground_deferral_since_ns
             .store(overdue, AtomicOrdering::Release);
         assert_eq!(
-            manager.maintenance_admission_at(duration_ns(FOREGROUND_MAX_DEFERRAL) + 2),
+            manager.maintenance_admission_at(
+                duration_ns(manager.admission_policy.foreground_max_deferral) + 2,
+                no_debt,
+            ),
             MaintenanceAdmission::StarvationRelief
         );
         assert_eq!(
-            manager.maintenance_admission(),
+            manager.maintenance_admission(no_debt),
             MaintenanceAdmission::Deferred
         );
 
@@ -992,9 +1156,88 @@ mod tests {
             .foreground_last_activity_ns
             .store(1, AtomicOrdering::Release);
         assert_eq!(
-            manager.maintenance_admission_at(duration_ns(FOREGROUND_QUIESCENCE) + 2),
+            manager.maintenance_admission_at(
+                duration_ns(manager.admission_policy.foreground_quiescence) + 2,
+                no_debt,
+            ),
             MaintenanceAdmission::Normal
         );
+    }
+
+    #[test]
+    fn critical_compaction_debt_shortens_but_does_not_remove_foreground_deferral() {
+        let manager = CompactionManager::new_with_allocator_and_admission_policy(
+            1,
+            Arc::new(default_allocator()),
+            CompactionAdmissionPolicy {
+                critical_candidate_count: 3,
+                critical_candidate_score: 20.0,
+                critical_relief_jobs: 1,
+                ..CompactionAdmissionPolicy::default()
+            },
+        );
+        manager.begin_foreground_statement();
+
+        assert_eq!(
+            manager.maintenance_admission(CompactionDebt {
+                candidate_count: 3,
+                max_candidate_score: 1.0,
+            }),
+            MaintenanceAdmission::Deferred
+        );
+        manager
+            .foreground_deferral_since_ns
+            .store(1, AtomicOrdering::Release);
+        let critical_deadline =
+            duration_ns(manager.admission_policy.foreground_critical_deferral) + 2;
+
+        assert_eq!(
+            manager.maintenance_admission_at(
+                critical_deadline,
+                CompactionDebt {
+                    candidate_count: 3,
+                    max_candidate_score: 1.0,
+                },
+            ),
+            MaintenanceAdmission::DebtRelief
+        );
+        assert_eq!(
+            manager.maintenance_admission_at(
+                critical_deadline,
+                CompactionDebt {
+                    candidate_count: 1,
+                    max_candidate_score: 20.0,
+                },
+            ),
+            MaintenanceAdmission::DebtRelief
+        );
+        assert_eq!(
+            manager.maintenance_admission_at(
+                critical_deadline,
+                CompactionDebt {
+                    candidate_count: 1,
+                    max_candidate_score: 19.0,
+                },
+            ),
+            MaintenanceAdmission::Deferred
+        );
+    }
+
+    #[test]
+    fn deferred_observability_preserves_compaction_debt() {
+        let manager = CompactionManager::new(1);
+        manager.begin_foreground_statement();
+        manager
+            .candidate_queue_len
+            .store(2, AtomicOrdering::Release);
+        manager
+            .candidate_max_score_bits
+            .store(7.5f64.to_bits(), AtomicOrdering::Release);
+
+        let observation = manager.observability();
+        assert_eq!(observation.queued_candidates, 2);
+        assert_eq!(observation.max_queued_candidate_score, 7.5);
+        assert!(observation.foreground_deferred);
     }
 
     #[test]

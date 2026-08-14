@@ -79,10 +79,33 @@ pub struct OptimizationContext {
     pub cost_model: CostModel,
     pub verify_enabled: bool,
     pub profiler: PipelineProfiler,
-    /// Set only while the explicit post-late-materialization pipeline segment
-    /// is active. This keeps structural invalidation in the pipeline driver
-    /// instead of recursively invoking unrelated passes from one rewriter.
-    pub late_materialization_dirty: bool,
+    pub invalidations: OptimizerInvalidations,
+}
+
+/// Structural invalidations consumed by explicit pipeline segments.
+///
+/// Producers only mark bits; they never clear another producer's work. The
+/// pipeline driver consumes an invalidation before its complete segment runs;
+/// a producer inside that segment can therefore mark the bit again and request
+/// another observable fixed-point round. This avoids a linear-list sentinel
+/// whose scope changes when passes move.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct OptimizerInvalidations {
+    late_materialization: bool,
+}
+
+impl OptimizerInvalidations {
+    pub fn mark_late_materialization(&mut self) {
+        self.late_materialization = true;
+    }
+
+    pub fn late_materialization_pending(self) -> bool {
+        self.late_materialization
+    }
+
+    pub fn consume_late_materialization(&mut self) {
+        self.late_materialization = false;
+    }
 }
 
 impl OptimizationContext {
@@ -98,7 +121,7 @@ impl OptimizationContext {
             cost_model: CostModel::default(),
             verify_enabled,
             profiler: PipelineProfiler::default(),
-            late_materialization_dirty: false,
+            invalidations: OptimizerInvalidations::default(),
         }
     }
 }

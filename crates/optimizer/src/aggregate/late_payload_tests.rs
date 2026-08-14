@@ -190,6 +190,7 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
         panic!("expected RowFetch below output projection")
     };
     assert_eq!(fetch.sources.len(), 1);
+    assert_eq!(fetch.sources[0].needed_columns.as_ref(), [1, 2]);
     let LogicalOperator::TopN(topn) = &fetch.child.operator else {
         panic!("expected TopN below row fetch")
     };
@@ -207,6 +208,40 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
         get.column_ids.last().copied(),
         Some(get.table.as_ref().unwrap().columns.len())
     );
+}
+
+#[test]
+fn verifier_rejects_materialized_column_type_drift() {
+    let context = BindContext::new();
+    let (mut optimized, changed) =
+        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
+    assert!(changed);
+    crate::verify::verify_logical_plan(&context, &optimized).expect("valid rewrite");
+
+    let LogicalOperator::Projection(output) = &mut optimized.operator else {
+        panic!("expected late row-fetch projection")
+    };
+    let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+        panic!("expected RowFetch below output projection")
+    };
+    let materialized = fetch.sources[0].materialized_table_index;
+    let (expression_index, expression) = output
+        .expressions
+        .iter_mut()
+        .enumerate()
+        .find_map(|(index, expression)| match expression {
+            Expression::ColumnRef(column) if column.binding.table_index == materialized => {
+                Some((index, column))
+            }
+            _ => None,
+        })
+        .expect("materialized payload reference");
+    expression.return_type = LogicalType::Integer;
+    output.returned_types[expression_index] = LogicalType::Integer;
+
+    let error = crate::verify::verify_logical_plan(&context, &optimized)
+        .expect_err("catalog type drift must be rejected");
+    assert!(error.to_string().contains("type mismatch"));
 }
 
 #[test]

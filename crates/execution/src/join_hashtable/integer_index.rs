@@ -421,6 +421,11 @@ impl ConcurrentDirectIntegerIndexBuilder {
 
 enum PlannedIntegerInsert {
     Inserted(Option<usize>),
+    // The domain was derived from mutable storage statistics embedded in a
+    // reusable plan. Drift is expected and falls back to the generic hash
+    // index. By contrast, a duplicate in the unique strategy contradicts an
+    // enforced catalog/storage invariant and is therefore a hard corruption
+    // signal rather than a recoverable plan-quality miss.
     DomainChanged,
 }
 

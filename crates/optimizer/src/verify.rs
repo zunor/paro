@@ -158,8 +158,14 @@ impl Verifier {
                     }
                 } else {
                     let child_bindings = proj.child.get_column_bindings();
+                    let child_types = proj.child.types();
                     for expression in &proj.expressions {
-                        self.verify_expression_bindings(expression, &child_bindings, "Projection")?;
+                        self.verify_expression_bindings(
+                            expression,
+                            &child_bindings,
+                            &child_types,
+                            "Projection",
+                        )?;
                     }
                 }
             }
@@ -198,22 +204,54 @@ impl Verifier {
                             "RowFetch rowid must be a direct BIGINT carrier column",
                         ));
                     }
+                    if source.needed_columns.is_empty() {
+                        return Err(paro_error::internal(format!(
+                            "RowFetch source table {} exposes no catalog columns",
+                            source.materialized_table_index
+                        )));
+                    }
+                    let mut previous = None;
+                    for &column in source.needed_columns.iter() {
+                        if column >= source.table.columns.len() {
+                            return Err(paro_error::internal(format!(
+                                "RowFetch source table {} column {} exceeds catalog width {}",
+                                source.materialized_table_index,
+                                column,
+                                source.table.columns.len()
+                            )));
+                        }
+                        if previous.is_some_and(|previous| previous >= column) {
+                            return Err(paro_error::internal(format!(
+                                "RowFetch source table {} columns must be strictly ordered and unique",
+                                source.materialized_table_index
+                            )));
+                        }
+                        previous = Some(column);
+                    }
+                    let child_types = fetch.child.types();
                     self.verify_expression_bindings(
                         &source.rowid,
                         &child_bindings,
+                        &child_types,
                         "RowFetch rowid",
                     )?;
                 }
             }
             LogicalOperator::Filter(filter) => {
                 let child_bindings = filter.child.get_column_bindings();
+                let child_types = filter.child.types();
                 Self::verify_projection_map(
                     "Filter",
                     &filter.projection_map,
                     child_bindings.len(),
                 )?;
                 for expression in &filter.expressions {
-                    self.verify_expression_bindings(expression, &child_bindings, "Filter")?;
+                    self.verify_expression_bindings(
+                        expression,
+                        &child_bindings,
+                        &child_types,
+                        "Filter",
+                    )?;
                 }
             }
             LogicalOperator::Order(order) => {
@@ -264,8 +302,14 @@ impl Verifier {
                     )));
                 }
                 let child_bindings = agg.child.get_column_bindings();
+                let child_types = agg.child.types();
                 for expression in agg.groups.iter().chain(agg.aggregates.iter()) {
-                    self.verify_expression_bindings(expression, &child_bindings, "Aggregate")?;
+                    self.verify_expression_bindings(
+                        expression,
+                        &child_bindings,
+                        &child_types,
+                        "Aggregate",
+                    )?;
                 }
             }
             LogicalOperator::Join(join) => {
@@ -301,14 +345,33 @@ impl Verifier {
         &self,
         expression: &Expression,
         available: &[ColumnBinding],
+        available_types: &[paro_common::types::LogicalType],
         scope: &str,
     ) -> Result<()> {
         if let Expression::ColumnRef(column) = expression {
-            if column.depth == 0 && !available.contains(&column.binding) {
-                return Err(paro_error::internal(format!(
-                    "{scope} expression references unavailable binding {:?}; input bindings: {available:?}",
-                    column.binding
-                )));
+            if column.depth == 0 {
+                let Some(position) = available
+                    .iter()
+                    .position(|binding| *binding == column.binding)
+                else {
+                    return Err(paro_error::internal(format!(
+                        "{scope} expression references unavailable binding {:?}; input bindings: {available:?}",
+                        column.binding
+                    )));
+                };
+                let input_type = available_types.get(position).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "{scope} input domain has {} bindings but {} types",
+                        available.len(),
+                        available_types.len()
+                    ))
+                })?;
+                if &column.return_type != input_type {
+                    return Err(paro_error::internal(format!(
+                        "{scope} binding {:?} type mismatch: expression={:?}, input={input_type:?}",
+                        column.binding, column.return_type
+                    )));
+                }
             }
             return Ok(());
         }
@@ -316,7 +379,7 @@ impl Verifier {
         let mut result = Ok(());
         ExpressionIterator::enumerate_children(expression, |child| {
             if result.is_ok() {
-                result = self.verify_expression_bindings(child, available, scope);
+                result = self.verify_expression_bindings(child, available, available_types, scope);
             }
         });
         result
@@ -361,15 +424,18 @@ impl Verifier {
                 let right_len = cj.right.types().len();
                 let left_bindings = cj.left.get_column_bindings();
                 let right_bindings = cj.right.get_column_bindings();
-                let duplicate_input = if cj.delim_flipped {
-                    right_bindings.as_slice()
+                let left_types = cj.left.types();
+                let right_types = cj.right.types();
+                let (duplicate_input, duplicate_types) = if cj.delim_flipped {
+                    (right_bindings.as_slice(), right_types.as_slice())
                 } else {
-                    left_bindings.as_slice()
+                    (left_bindings.as_slice(), left_types.as_slice())
                 };
                 for expression in &cj.duplicate_eliminated_columns {
                     self.verify_expression_bindings(
                         expression,
                         duplicate_input,
+                        duplicate_types,
                         "comparison join duplicate-eliminated key",
                     )?;
                 }
@@ -377,11 +443,13 @@ impl Verifier {
                     self.verify_expression_bindings(
                         &condition.left,
                         &left_bindings,
+                        &left_types,
                         "comparison join probe key",
                     )?;
                     self.verify_expression_bindings(
                         &condition.right,
                         &right_bindings,
+                        &right_types,
                         "comparison join build key",
                     )?;
                 }
@@ -422,9 +490,12 @@ impl Verifier {
                 let right_len = aj.right.types().len();
                 let mut input_bindings = aj.left.get_column_bindings();
                 input_bindings.extend(aj.right.get_column_bindings());
+                let mut input_types = aj.left.types();
+                input_types.extend(aj.right.types());
                 self.verify_expression_bindings(
                     &aj.condition,
                     &input_bindings,
+                    &input_types,
                     "ANY join condition",
                 )?;
                 Self::verify_projection_map(

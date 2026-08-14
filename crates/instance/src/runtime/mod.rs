@@ -151,6 +151,7 @@ impl InstanceRuntime {
     pub fn database_open_context(
         &self,
         checkpoint: crate::config::CheckpointConfigOptions,
+        compaction: crate::config::CompactionConfigOptions,
     ) -> DatabaseOpenContext {
         DatabaseOpenContext {
             buffer_pool: Arc::clone(&self.buffer_pool),
@@ -158,6 +159,7 @@ impl InstanceRuntime {
             scheduler: Arc::clone(&self.scheduler),
             commit_drain_wake_pool: Arc::clone(&self.commit_drain_wake_pool),
             checkpoint,
+            compaction,
         }
     }
 

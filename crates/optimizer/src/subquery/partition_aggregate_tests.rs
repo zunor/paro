@@ -64,21 +64,12 @@ fn assert_tpch_rewrites() {
             "lineitem"
         };
         assert_eq!(inspection.gets_named(common), 1, "{query}: {optimized:#?}");
-        assert_eq!(
-            inspection.late_fetches,
-            if query == "q02" { 2 } else { 0 },
-            "{query}: {optimized:#?}"
-        );
-        assert_eq!(
-            inspection.late_fetch_sources,
-            // Q2's costed plan fetches supplier and nation ordering payload
-            // before TopN, then supplier and part output-only payload after
-            // TopN. Reusing a source rowid across the two cardinality stages
-            // is intentional: carrying the remaining wide supplier columns
-            // through the heap is more expensive than the second sparse read.
-            if query == "q02" { 4 } else { 0 },
-            "{query}: {optimized:#?}"
-        );
+        // This structural fixture has no physical rows. Sparse fetch carries
+        // a real vector/reader startup cost, so the cost model must preserve
+        // the eager payload plan here; SF1 performance coverage separately
+        // proves that Q2's populated relation crosses the fetch frontier.
+        assert_eq!(inspection.late_fetches, 0, "{query}: {optimized:#?}");
+        assert_eq!(inspection.late_fetch_sources, 0, "{query}: {optimized:#?}");
     }
 }
 

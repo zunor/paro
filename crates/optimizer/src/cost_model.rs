@@ -232,7 +232,8 @@ impl CostModel {
         let carrier_work = carrier_rows as f64 * carrier_stages as f64;
         let eager = carrier_work * payload_width as f64;
         let late = carrier_work * rowid_width as f64
-            + fetched_rows as f64 * payload_width as f64 * self.scan_access.gather_access_penalty();
+            + fetched_rows as f64 * payload_width as f64 * self.scan_access.gather_access_penalty()
+            + self.scan_access.gather_startup_cost() as f64;
         let benefit = eager - late;
         (benefit > 0.0).then_some(benefit)
     }
@@ -1010,6 +1011,17 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn sparse_fetch_requires_enough_work_to_amortize_its_frontier() {
+        let model = CostModel::default();
+        assert!(model
+            .late_row_fetch_benefit(1, 1, [LogicalType::Varchar], 8)
+            .is_none());
+        assert!(model
+            .late_row_fetch_benefit(100_000, 100, [LogicalType::Varchar], 3)
+            .is_some());
+    }
 
     #[test]
     fn estimate_filter_cardinality_preserves_empty_predicates() {

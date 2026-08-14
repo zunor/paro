@@ -870,6 +870,7 @@ fn test_rowid_lookup_single_segment_restores_requested_order_without_flattening(
     let point_reader = crate::tablet::TabletRowIdReader::new(
         tablet.clone(),
         tablet.capture_consistent_rowsets(0).unwrap(),
+        &[2, 0],
         Arc::new(paro_common::allocator::default_allocator()),
     )
     .unwrap();

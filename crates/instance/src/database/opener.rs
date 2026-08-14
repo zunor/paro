@@ -1,12 +1,12 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::handle::{AttachOptions, DatabaseHandle, RecoveryMode};
+use super::handle::{AttachOptions, DatabaseHandle, DatabaseRuntimeOptions, RecoveryMode};
 use super::hooks::RecoveryHookResult;
 use super::storage::{DatabaseStorage, InMemoryDatabaseStorage};
 use crate::checkpoint::recovery::{CheckpointBaseState, CheckpointRecovery};
 use crate::checkpoint::RetentionCoordinator;
-use crate::config::CheckpointConfigOptions;
+use crate::config::{CheckpointConfigOptions, CompactionConfigOptions};
 use crate::metadata::instance_catalog::DatabaseRecord;
 use crate::storage_manager::StorageManager;
 use paro_catalog::catalog::Catalog;
@@ -37,6 +37,7 @@ pub struct DatabaseOpenContext {
     pub scheduler: Arc<TaskScheduler>,
     pub commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     pub checkpoint: CheckpointConfigOptions,
+    pub compaction: CompactionConfigOptions,
 }
 
 #[derive(Debug, Clone)]
@@ -240,14 +241,17 @@ impl DatabaseOpener {
             "Opening managed database"
         );
 
-        let db = Arc::new(DatabaseHandle::with_options_and_commit_drain_wake_pool(
+        let db = Arc::new(DatabaseHandle::with_runtime_options(
             record.database_id,
             record.name.clone(),
             record.storage_dir.clone(),
             context.buffer_pool.clone(),
             Arc::clone(&request.object_id_allocator),
             AttachOptions::default(),
-            Arc::clone(&context.commit_drain_wake_pool),
+            DatabaseRuntimeOptions {
+                commit_drain_wake_pool: Arc::clone(&context.commit_drain_wake_pool),
+                compaction: context.compaction,
+            },
         ));
         db.bind_task_scheduler(context.scheduler.clone());
 

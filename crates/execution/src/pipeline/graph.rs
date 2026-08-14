@@ -15,10 +15,10 @@ use crate::physical::specs::{
     AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ChunkScanSpec,
     ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
     ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
-    GraphExpandSpec, GraphScanSpec, GraphShortestPathSpec, HashReductionCascadeSpec, InsertSpec,
-    LimitSpec, PartitionAggregateWindowSpec, ProjectSpec, RowFetchProjectSpec, RowsetScanSpec,
-    SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
-    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
+    HashReductionCascadeSpec, InsertSpec, LimitSpec, PartitionAggregateWindowSpec, ProjectSpec,
+    RowFetchSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
+    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -767,7 +767,8 @@ pub enum TransformSpec {
     StreamingWindow(WindowSpec),
     ExternalProject(ExternalProjectSpec),
     GraphExpand(GraphExpandSpec),
-    RowFetchProject(RowFetchProjectSpec),
+    RowFetch(RowFetchSpec),
+    GraphProject(GraphProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
     PropertyRepair(PropertyRepairSpec),
 }
@@ -795,7 +796,21 @@ impl TransformSpec {
             Self::GraphExpand(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
-            Self::RowFetchProject(spec) => {
+            Self::RowFetch(spec) => spec.projection.as_ref().map_or_else(
+                || {
+                    RowType::new(
+                        spec.raw_output_names.to_vec(),
+                        spec.raw_output_types.to_vec(),
+                    )
+                },
+                |projection| {
+                    RowType::new(
+                        projection.output_names.to_vec(),
+                        projection.output_types.to_vec(),
+                    )
+                },
+            ),
+            Self::GraphProject(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
             Self::GraphShortestPath(spec) => {

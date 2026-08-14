@@ -5,18 +5,20 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::{LogicalType, PhysicalType};
+use paro_common::vector::VECTOR_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ScanAccessCostModel {
     unknown_selectivity: f64,
     gather_access_penalty: f64,
+    gather_startup_cost: usize,
     default_variable_width: usize,
     default_nested_width: usize,
 }
 
 impl Default for ScanAccessCostModel {
     fn default() -> Self {
-        Self::try_new(0.25, 2.0, 32, 64)
+        Self::try_new(0.25, 2.0, VECTOR_SIZE, 32, 64)
             .expect("built-in scan access costs must satisfy public validation")
     }
 }
@@ -25,6 +27,7 @@ impl ScanAccessCostModel {
     pub fn try_new(
         unknown_selectivity: f64,
         gather_access_penalty: f64,
+        gather_startup_cost: usize,
         default_variable_width: usize,
         default_nested_width: usize,
     ) -> Result<Self> {
@@ -38,6 +41,11 @@ impl ScanAccessCostModel {
                 "scan gather access penalty must be finite and positive",
             ));
         }
+        if gather_startup_cost == 0 {
+            return Err(paro_error::invalid_input(
+                "scan gather startup cost must be positive",
+            ));
+        }
         if default_variable_width == 0 || default_nested_width == 0 {
             return Err(paro_error::invalid_input(
                 "scan fallback widths must be positive",
@@ -46,6 +54,7 @@ impl ScanAccessCostModel {
         Ok(Self {
             unknown_selectivity,
             gather_access_penalty,
+            gather_startup_cost,
             default_variable_width,
             default_nested_width,
         })
@@ -67,6 +76,15 @@ impl ScanAccessCostModel {
 
     pub fn gather_access_penalty(self) -> f64 {
         self.gather_access_penalty
+    }
+
+    /// Fixed preparation cost of opening a sparse gather frontier, expressed
+    /// in the same byte-work units as width-based scan costing. The default is
+    /// one unit per vector slot, representing the fixed executor, snapshot,
+    /// and batch-frontier work without charging the full byte width of a
+    /// reusable row-id scratch vector.
+    pub fn gather_startup_cost(self) -> usize {
+        self.gather_startup_cost
     }
 
     pub fn late_materialization_is_cheaper(

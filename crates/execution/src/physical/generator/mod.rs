@@ -46,15 +46,16 @@ use super::specs::{
     CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
     DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget, DummyScanSpec,
     EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
-    GraphExpandSpec, GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, HashReductionCascadeSpec,
-    HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
-    HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
-    MaterializedCteSpec, NestedLoopJoinSpec, PartitionAggregateWindowSpec,
-    PerfectHashAggregatePlan, PhysicalNodeKind, PostAggregateReductionSpec, ProjectSpec,
-    RecursiveCteSpec, RowFetchMapping, RowFetchProjectSpec, RowsetColumnProjection,
-    RowsetScanAccessPolicy, RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec,
-    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec,
-    UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    GraphExpandSpec, GraphProjectSpec, GraphRowFetchMapping, GraphScanSpec, GraphShortestPathSpec,
+    HashJoinSpec, HashReductionCascadeSpec, HashReductionExtremaChannelSpec,
+    HashReductionGroupedExtremaSpec, HashReductionPredicateSpec, HashReductionSourcePredicateSpec,
+    HashReductionStepSpec, InsertSpec, LimitSpec, MaterializedCteSpec, NestedLoopJoinSpec,
+    PartitionAggregateWindowSpec, PerfectHashAggregatePlan, PhysicalNodeKind,
+    PostAggregateReductionSpec, ProjectSpec, RecursiveCteSpec, RelationalRowFetchMapping,
+    RowFetchProjectionSpec, RowFetchSpec, RowsetColumnProjection, RowsetScanAccessPolicy,
+    RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec,
+    TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec,
+    VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;
@@ -136,23 +137,16 @@ impl PhysicalPlanGenerator {
             LogicalOperator::Filter(filter) => {
                 self.lower_filter(filter, logical.stats.estimated_cardinality)?
             }
-            LogicalOperator::Projection(project)
-                if matches!(project.child.operator, LogicalOperator::RowFetch(_)) =>
-            {
-                let LogicalOperator::RowFetch(fetch) = &project.child.operator else {
-                    unreachable!("RowFetch projection guard must match its child")
-                };
-                self.lower_row_fetch_project(project, fetch)?
+            LogicalOperator::Projection(project) => {
+                if let LogicalOperator::RowFetch(fetch) = &project.child.operator {
+                    self.lower_row_fetch(fetch, Some(project))?
+                } else if is_graph_chain(project.child.as_ref()) {
+                    self.lower_graph_project(project)?
+                } else {
+                    self.lower_project(project)?
+                }
             }
-            LogicalOperator::Projection(project) if is_graph_chain(project.child.as_ref()) => {
-                self.lower_graph_project(project)?
-            }
-            LogicalOperator::Projection(project) => self.lower_project(project)?,
-            LogicalOperator::RowFetch(_) => {
-                return Err(paro_error::internal(
-                    "logical RowFetch must be consumed by an explicit Projection boundary",
-                ));
-            }
+            LogicalOperator::RowFetch(fetch) => self.lower_row_fetch(fetch, None)?,
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,

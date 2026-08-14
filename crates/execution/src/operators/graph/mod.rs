@@ -10,6 +10,6 @@ pub(crate) mod shortest_path;
 pub mod state;
 
 pub use expand::GraphExpandTransformExec;
-pub use project::RowFetchProjectTransformExec;
+pub use project::GraphProjectTransformExec;
 pub use scan::GraphScanSourceExec;
 pub use shortest_path::GraphShortestPathTransformExec;

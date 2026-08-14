@@ -146,15 +146,14 @@ impl PhysicalPlanGenerator {
             .iter()
             .map(Expression::return_type)
             .collect::<Vec<_>>();
-        let spec = RowFetchProjectSpec {
+        let spec = GraphProjectSpec {
             expressions: project.expressions.clone().into_boxed_slice(),
             filters: filters.into_boxed_slice(),
             carrier_table_index,
             rowid_mappings: rowid_mappings.into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
-            coalesce_input: false,
         };
-        Ok((PhysicalNodeKind::RowFetchProject(spec), vec![child]))
+        Ok((PhysicalNodeKind::GraphProject(spec), vec![child]))
     }
 }

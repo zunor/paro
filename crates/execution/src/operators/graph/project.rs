@@ -16,21 +16,21 @@ use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::physical::specs::RowFetchProjectSpec;
+use crate::physical::specs::GraphProjectSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
-    RowFetchMaterializedRuntime, RowFetchProjectTransformLocal, RowFetchTablePlan, TransformGlobal,
+    GraphProjectTransformLocal, RowFetchMaterializedRuntime, RowFetchTablePlan, TransformGlobal,
     TransformLocal,
 };
 use crate::runtime::transform::{TransformFinishPoll, TransformFlushPoll, TransformPoll};
 use crate::runtime::{read_u64_from_vector, visit_column_refs, ExpressionEvalInput};
 
 #[derive(Debug, Clone)]
-pub struct RowFetchProjectTransformExec {
-    pub spec: RowFetchProjectSpec,
+pub struct GraphProjectTransformExec {
+    pub spec: GraphProjectSpec,
 }
 
-impl RowFetchProjectTransformExec {
+impl GraphProjectTransformExec {
     pub(crate) fn create_global(&self, _ctx: &mut PipelineInitContext) -> Result<TransformGlobal> {
         Ok(TransformGlobal::Empty)
     }
@@ -58,15 +58,12 @@ impl RowFetchProjectTransformExec {
         } else {
             None
         };
-        Ok(TransformLocal::RowFetchProject(
-            RowFetchProjectTransformLocal {
-                filter_selection: None,
-                raw_filter_executors,
-                raw_project_executor,
-                materialized,
-                buffered_input: None,
-            },
-        ))
+        Ok(TransformLocal::GraphProject(GraphProjectTransformLocal {
+            filter_selection: None,
+            raw_filter_executors,
+            raw_project_executor,
+            materialized,
+        }))
     }
 
     pub(crate) fn transform(
@@ -81,43 +78,8 @@ impl RowFetchProjectTransformExec {
             *output = Chunk::try_init_empty(&self.spec.output_types, output.allocator().clone())?;
             return Ok(TransformPoll::NeedMoreInput);
         }
-        let local = row_fetch_project_local(local)?;
-        if self.spec.coalesce_input {
-            if local.buffered_input.as_ref().is_some_and(|buffered| {
-                buffered.size().saturating_add(input.size()) > paro_common::vector::VECTOR_SIZE
-            }) {
-                let buffered = local
-                    .buffered_input
-                    .take()
-                    .expect("coalesced row-fetch buffer checked above");
-                let mut projected =
-                    build_row_fetch_project_output(ctx, &self.spec, local, &buffered, output)?;
-                output.move_from(&mut projected);
-                return Ok(TransformPoll::OutputMore);
-            }
-            match &mut local.buffered_input {
-                Some(buffered) => buffered.try_append(input)?,
-                slot @ None => {
-                    *slot = Some(input.try_deep_copy(ctx.query.allocator(MemoryTag::ColumnData))?);
-                }
-            }
-            if local
-                .buffered_input
-                .as_ref()
-                .is_none_or(|buffered| buffered.size() < paro_common::vector::VECTOR_SIZE)
-            {
-                return Ok(TransformPoll::NeedMoreInput);
-            }
-            let buffered = local
-                .buffered_input
-                .take()
-                .expect("full coalesced row-fetch buffer");
-            let mut projected =
-                build_row_fetch_project_output(ctx, &self.spec, local, &buffered, output)?;
-            output.move_from(&mut projected);
-            return Ok(TransformPoll::Output);
-        }
-        let mut projected = build_row_fetch_project_output(ctx, &self.spec, local, input, output)?;
+        let local = graph_project_local(local)?;
+        let mut projected = build_graph_project_output(ctx, &self.spec, local, input, output)?;
         if projected.is_empty() {
             return Ok(TransformPoll::NeedMoreInput);
         }
@@ -127,22 +89,12 @@ impl RowFetchProjectTransformExec {
 
     pub(crate) fn flush(
         &self,
-        ctx: &mut OperatorCallContext,
+        _ctx: &mut OperatorCallContext,
         _global: &TransformGlobal,
-        local: &mut TransformLocal,
-        output: &mut Chunk,
+        _local: &mut TransformLocal,
+        _output: &mut Chunk,
     ) -> Result<TransformFlushPoll> {
-        let local = row_fetch_project_local(local)?;
-        let Some(buffered) = local.buffered_input.take() else {
-            return Ok(TransformFlushPoll::Done);
-        };
-        let mut projected =
-            build_row_fetch_project_output(ctx, &self.spec, local, &buffered, output)?;
-        if projected.is_empty() {
-            return Ok(TransformFlushPoll::Done);
-        }
-        output.move_from(&mut projected);
-        Ok(TransformFlushPoll::Output)
+        Ok(TransformFlushPoll::Done)
     }
 
     pub(crate) fn finish_global(
@@ -155,21 +107,17 @@ impl RowFetchProjectTransformExec {
 }
 
 #[inline(always)]
-fn row_fetch_project_local(
-    local: &mut TransformLocal,
-) -> Result<&mut RowFetchProjectTransformLocal> {
+fn graph_project_local(local: &mut TransformLocal) -> Result<&mut GraphProjectTransformLocal> {
     match local {
-        TransformLocal::RowFetchProject(state) => Ok(state),
-        _ => Err(paro_error::internal(
-            "row-fetch project local state mismatch",
-        )),
+        TransformLocal::GraphProject(state) => Ok(state),
+        _ => Err(paro_error::internal("graph project local state mismatch")),
     }
 }
 
-fn build_row_fetch_project_output(
+fn build_graph_project_output(
     ctx: &mut OperatorCallContext,
-    spec: &RowFetchProjectSpec,
-    local: &mut RowFetchProjectTransformLocal,
+    spec: &GraphProjectSpec,
+    local: &mut GraphProjectTransformLocal,
     input: &Chunk,
     output: &mut Chunk,
 ) -> Result<Chunk> {
@@ -279,7 +227,7 @@ fn graph_project_filter_executors(
 
 fn build_row_fetch_materialized_runtime(
     ctx: &mut PipelineInitContext,
-    spec: &RowFetchProjectSpec,
+    spec: &GraphProjectSpec,
 ) -> Result<RowFetchMaterializedRuntime> {
     let mut required_cols: HashMap<usize, Vec<usize>> = HashMap::new();
     for expr in spec.expressions.iter().chain(spec.filters.iter()) {
@@ -459,6 +407,7 @@ fn materialize_row_fetch_input(
             fetch.reader = Some(TabletRowIdReader::new(
                 fetch.storage.tablet(),
                 rowsets,
+                &fetch.column_ids,
                 ctx.query.allocator(MemoryTag::ColumnData),
             )?);
         }

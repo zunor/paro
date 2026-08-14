@@ -164,7 +164,21 @@ pub(crate) fn physical_output_row_type_for_kind(
             spec.output_names.to_vec(),
             spec.output_types.to_vec(),
         )),
-        PhysicalNodeKind::RowFetchProject(spec) => Ok(RowType::new(
+        PhysicalNodeKind::RowFetch(spec) => Ok(spec.projection.as_ref().map_or_else(
+            || {
+                RowType::new(
+                    spec.raw_output_names.to_vec(),
+                    spec.raw_output_types.to_vec(),
+                )
+            },
+            |projection| {
+                RowType::new(
+                    projection.output_names.to_vec(),
+                    projection.output_types.to_vec(),
+                )
+            },
+        )),
+        PhysicalNodeKind::GraphProject(spec) => Ok(RowType::new(
             spec.output_names.to_vec(),
             spec.output_types.to_vec(),
         )),
@@ -437,7 +451,7 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
 pub(crate) fn build_rowid_mappings_from_logical(
     plan: &LogicalPlan,
     schema_name: &str,
-) -> Result<Vec<RowFetchMapping>> {
+) -> Result<Vec<GraphRowFetchMapping>> {
     let layout = build_graph_chain_layout(plan)?;
     let mut mappings = Vec::new();
     collect_rowid_mappings_from_logical(plan, schema_name, &layout, &mut mappings)?;
@@ -448,7 +462,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
     plan: &LogicalPlan,
     schema_name: &str,
     layout: &GraphChainLayout,
-    mappings: &mut Vec<RowFetchMapping>,
+    mappings: &mut Vec<GraphRowFetchMapping>,
 ) -> Result<()> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => {
@@ -462,7 +476,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                         scan.table_index
                     ))
                 })?;
-            mappings.push(RowFetchMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: scan.table_index,
                 rowid_col_idx,
                 table_name: scan.vertex_info.table_name.clone(),
@@ -488,7 +502,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                         expand.edge_table_index
                     ))
                 })?;
-            mappings.push(RowFetchMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: expand.edge_table_index,
                 rowid_col_idx: edge_rowid_col_idx,
                 table_name: expand.edge_info.table_name.clone(),
@@ -505,7 +519,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                     expand.target_table_index
                 ))
             })?;
-            mappings.push(RowFetchMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: expand.target_table_index,
                 rowid_col_idx: target_rowid_col_idx,
                 table_name: expand.target_table_name.clone(),

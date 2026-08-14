@@ -358,13 +358,24 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
             }
             LogicalOperator::RowFetch(fetch) => {
                 // Fetched catalog namespaces are produced by this boundary, not
-                // by its carrier. Drop whole sources that no parent expression
-                // observes, then pass only carrier references into the child.
+                // by its carrier. Keep only the exact physical catalog ordinals
+                // observed above this node, then pass only carrier references
+                // into the child.
                 if !self.everything_referenced {
-                    fetch.sources.retain(|source| {
-                        self.column_references
+                    fetch.sources.retain_mut(|source| {
+                        source.needed_columns = self
+                            .column_references
                             .keys()
-                            .any(|binding| binding.table_index == source.materialized_table_index)
+                            .filter(|binding| {
+                                binding.table_index == source.materialized_table_index
+                            })
+                            .map(|binding| binding.column_index)
+                            .filter(|column| source.needed_columns.contains(column))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice();
+                        !source.needed_columns.is_empty()
                     });
                 }
 

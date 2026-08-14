@@ -24,9 +24,7 @@ use crate::pipeline_passes::{
     CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
     ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
     GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LatePayloadBuildProbeSidePass, LatePayloadFetchPass,
-    LatePayloadJoinFilterPushdownPass, LatePayloadJoinOrderPass, LatePayloadSegmentEndPass,
-    LatePayloadStatisticsPass, LatePayloadUnusedColumnsPass, LimitPushdownPass,
+    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
     MixedJoinPredicatePass, ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass,
     StatisticsGatheringPass, StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
@@ -35,10 +33,74 @@ use crate::rewriter::Rewriter;
 use crate::statistics::gathering::StatisticsGathering;
 use crate::verify::verify_logical_plan;
 
+const MAX_CONDITIONAL_SEGMENT_ROUNDS: usize = 8;
+
 pub struct Optimizer {
-    pipeline: Vec<Box<dyn Rewriter>>,
+    pipeline: Vec<PipelineStep>,
     disabled: HashSet<OptimizerType>,
     ctx: OptimizationContext,
+}
+
+enum PipelineStep {
+    Pass(Box<dyn Rewriter>),
+    Conditional(ConditionalSegment),
+}
+
+struct ConditionalSegment {
+    condition: PipelineCondition,
+    passes: Vec<Box<dyn Rewriter>>,
+}
+
+#[derive(Clone, Copy)]
+enum PipelineCondition {
+    LateMaterializationInvalidated,
+}
+
+impl PipelineCondition {
+    fn is_pending(self, ctx: &OptimizationContext) -> bool {
+        match self {
+            Self::LateMaterializationInvalidated => {
+                ctx.invalidations.late_materialization_pending()
+            }
+        }
+    }
+
+    fn consume(self, ctx: &mut OptimizationContext) {
+        match self {
+            Self::LateMaterializationInvalidated => {
+                ctx.invalidations.consume_late_materialization();
+            }
+        }
+    }
+}
+
+fn pass(rewriter: impl Rewriter + 'static) -> PipelineStep {
+    PipelineStep::Pass(Box::new(rewriter))
+}
+
+fn run_pass(
+    rewriter: &mut dyn Rewriter,
+    plan: LogicalPlan,
+    disabled: &HashSet<OptimizerType>,
+    ctx: &mut OptimizationContext,
+) -> Result<LogicalPlan> {
+    let opt_type = rewriter.optimizer_type();
+    if disabled.contains(&opt_type) {
+        return Ok(plan);
+    }
+    let started_at = Instant::now();
+    let rewrite_result = rewriter.rewrite(plan, ctx);
+    ctx.profiler.record(opt_type, started_at.elapsed());
+    let plan = rewrite_result?;
+    if ctx.verify_enabled {
+        verify_logical_plan(&ctx.bind_context, &plan).map_err(|error| {
+            paro_error::internal(format!(
+                "Logical plan invariant failed after optimizer pass {opt_type}: {}",
+                error.message()
+            ))
+        })?;
+    }
+    Ok(plan)
 }
 
 impl Optimizer {
@@ -120,24 +182,35 @@ impl Optimizer {
         }
 
         let mut current = plan;
-        for pass in &mut self.pipeline {
-            let opt_type = pass.optimizer_type();
-            if self.disabled.contains(&opt_type) {
-                continue;
-            }
-
-            let started_at = Instant::now();
-            let rewrite_result = pass.rewrite(current, &mut self.ctx);
-            self.ctx.profiler.record(opt_type, started_at.elapsed());
-            current = rewrite_result?;
-
-            if self.ctx.verify_enabled {
-                verify_logical_plan(&self.ctx.bind_context, &current).map_err(|error| {
-                    paro_error::internal(format!(
-                        "Logical plan invariant failed after optimizer pass {opt_type}: {}",
-                        error.message()
-                    ))
-                })?;
+        for step in &mut self.pipeline {
+            match step {
+                PipelineStep::Pass(rewriter) => {
+                    current = run_pass(rewriter.as_mut(), current, &self.disabled, &mut self.ctx)?;
+                }
+                PipelineStep::Conditional(segment) => {
+                    let mut rounds = 0usize;
+                    while segment.condition.is_pending(&self.ctx) {
+                        rounds += 1;
+                        if rounds > MAX_CONDITIONAL_SEGMENT_ROUNDS {
+                            return Err(paro_error::internal(
+                                "optimizer conditional segment did not reach a fixed point",
+                            ));
+                        }
+                        // Consume at segment entry. A pass in this round may
+                        // mark the same invalidation again, in which case the
+                        // driver performs another complete, observable round
+                        // instead of erasing a producer's signal at the end.
+                        segment.condition.consume(&mut self.ctx);
+                        for rewriter in &mut segment.passes {
+                            current = run_pass(
+                                rewriter.as_mut(),
+                                current,
+                                &self.disabled,
+                                &mut self.ctx,
+                            )?;
+                        }
+                    }
+                }
             }
         }
 
@@ -163,86 +236,97 @@ impl Optimizer {
     fn pipeline_types(&self) -> Vec<OptimizerType> {
         self.pipeline
             .iter()
-            .map(|pass| pass.optimizer_type())
+            .flat_map(|step| match step {
+                PipelineStep::Pass(rewriter) => vec![rewriter.optimizer_type()],
+                PipelineStep::Conditional(segment) => segment
+                    .passes
+                    .iter()
+                    .map(|rewriter| rewriter.optimizer_type())
+                    .collect(),
+            })
             .collect()
     }
 
-    fn build_pipeline(binder: Binder) -> Vec<Box<dyn Rewriter>> {
+    fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
         let late_payload_binder = binder.clone();
         vec![
-            Box::new(GraphStartSelectionPass),
-            Box::new(GraphMatchDecomposePass),
-            Box::new(GraphPredicatePushdownPass),
-            Box::new(ExpressionRewriterPass),
-            Box::new(CommonAggregatePass),
-            Box::new(CteInliningPass),
-            Box::new(FilterPullupPass),
-            Box::new(FilterPushdownPass),
-            Box::new(CteFilterPusherPass),
+            pass(GraphStartSelectionPass),
+            pass(GraphMatchDecomposePass),
+            pass(GraphPredicatePushdownPass),
+            pass(ExpressionRewriterPass),
+            pass(CommonAggregatePass),
+            pass(CteInliningPass),
+            pass(FilterPullupPass),
+            pass(FilterPushdownPass),
+            pass(CteFilterPusherPass),
             // Second inlining pass: filters were pushed into CTE bodies; inline again when beneficial.
-            Box::new(CteInliningPass),
-            Box::new(DelimJoinEliminationPass),
-            Box::new(EmptyResultPullupPass),
+            pass(CteInliningPass),
+            pass(DelimJoinEliminationPass),
+            pass(EmptyResultPullupPass),
             // Canonicalize comma joins and mixed predicates before semantic
             // join rewrites and cost-based ordering inspect the graph.
-            Box::new(MixedJoinPredicatePass),
+            pass(MixedJoinPredicatePass),
             // Reuse a detail stream for a correlated full-partition
             // aggregate while the canonical delim shape and declared-key
             // join graph are still explicit.
-            Box::new(CorrelatedPartitionAggregatePass),
+            pass(CorrelatedPartitionAggregatePass),
             // Fold a scalar aggregate over a provably alpha-equivalent source
             // into the grouped aggregate before either branch receives stats.
-            Box::new(AggregatePostReductionPass),
+            pass(AggregatePostReductionPass),
             // Planning statistics: collect base-column bounds and distinct
             // counts before join ordering consumes them as cost inputs.
-            Box::new(StatisticsGatheringPass),
-            Box::new(ReorderFilterPass),
-            Box::new(JoinEliminationPass),
+            pass(StatisticsGatheringPass),
+            pass(ReorderFilterPass),
+            pass(JoinEliminationPass),
             // Bound a multiplicative nullable side to one row per equality key
             // before join ordering costs the resulting graph.
-            Box::new(AggregateJoinPreaggregationPass),
+            pass(AggregateJoinPreaggregationPass),
             // Remove redundant detail scans while their semantic join edge is
             // still explicit, before cost-based ordering sees the graph.
-            Box::new(AggregateJoinSubsumptionPass),
+            pass(AggregateJoinSubsumptionPass),
             // The rewrite changes both row production and the
             // statistics-visible HAVING shape. Re-derive cost inputs so join
             // ordering optimizes the reduced graph rather than a stale tree.
-            Box::new(StatisticsGatheringPass),
-            Box::new(JoinOrderPass),
-            Box::new(UnusedColumnsPass {
+            pass(StatisticsGatheringPass),
+            pass(JoinOrderPass),
+            pass(UnusedColumnsPass {
                 binder: unused_columns_binder,
             }),
-            Box::new(BuildProbeSidePass),
-            Box::new(JoinFilterPushdownPass),
-            Box::new(TopNPass),
-            Box::new(LimitPushdownPass),
-            Box::new(InClausePass),
-            Box::new(SearchOptimizationPass),
-            Box::new(SegmentPrunerPass),
+            pass(BuildProbeSidePass),
+            pass(JoinFilterPushdownPass),
+            pass(TopNPass),
+            pass(LimitPushdownPass),
+            pass(InClausePass),
+            pass(SearchOptimizationPass),
+            pass(SegmentPrunerPass),
             // Final annotations: structural planning above may replace nodes
             // and preserve their old parents, so derive cardinality and output
             // statistics again over the settled tree. This is a separate
             // lifecycle phase from the cost inputs gathered before join order.
-            Box::new(StatisticsGatheringPass),
-            Box::new(StatisticsPropagationPass),
+            pass(StatisticsGatheringPass),
+            pass(StatisticsPropagationPass),
             // Replace functionally-dependent wide aggregate payload with a
             // stable rowid and fetch it only after a bounded TopN. Dependency
             // proofs are populated by statistics propagation immediately
             // above; pruning is performed atomically inside this pass.
-            Box::new(LatePayloadFetchPass),
+            pass(LatePayloadFetchPass),
             // Late payload changes scan widths, join projection maps and
             // serialized build costs. Express that invalidation as a visible,
             // conditionally executed pipeline segment so every pass retains
             // its own verification and profiling boundary.
-            Box::new(LatePayloadUnusedColumnsPass {
-                binder: late_payload_binder,
+            PipelineStep::Conditional(ConditionalSegment {
+                condition: PipelineCondition::LateMaterializationInvalidated,
+                passes: vec![
+                    Box::new(UnusedColumnsPass {
+                        binder: late_payload_binder,
+                    }),
+                    Box::new(StatisticsGatheringPass),
+                    Box::new(JoinOrderPass),
+                    Box::new(BuildProbeSidePass),
+                    Box::new(JoinFilterPushdownPass),
+                ],
             }),
-            Box::new(LatePayloadStatisticsPass),
-            Box::new(LatePayloadJoinOrderPass),
-            Box::new(LatePayloadBuildProbeSidePass),
-            Box::new(LatePayloadJoinFilterPushdownPass),
-            Box::new(LatePayloadSegmentEndPass),
             // Projection maps are positional annotations over the final logical
             // layout. Derive them only after every structural rewrite (most
             // notably build/probe-side flips) has settled that layout. This
@@ -250,7 +334,7 @@ impl Optimizer {
             // retained columns or invalidate operator/cardinality statistics:
             // statistics propagated above are operator-level, never indexed by
             // the pre-pruning output position.
-            Box::new(ColumnLifetimePass),
+            pass(ColumnLifetimePass),
         ]
     }
 }

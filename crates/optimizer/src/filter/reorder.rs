@@ -175,7 +175,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
-            late_materialization_dirty: false,
+            invalidations: crate::context::OptimizerInvalidations::default(),
         };
 
         let rewritten = ReorderFilter::new()
@@ -219,7 +219,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
-            late_materialization_dirty: false,
+            invalidations: crate::context::OptimizerInvalidations::default(),
         };
 
         let rewritten = ReorderFilter::new()

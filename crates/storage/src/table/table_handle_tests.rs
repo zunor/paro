@@ -1080,6 +1080,7 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
             .tablet()
             .capture_consistent_rowsets(table.max_version())
             .unwrap(),
+        &[0, 1, 2],
         Arc::new(paro_common::allocator::default_allocator()),
     )
     .unwrap();

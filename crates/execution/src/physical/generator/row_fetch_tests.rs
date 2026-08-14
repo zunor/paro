@@ -39,6 +39,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
                     LogicalType::BigInt,
                 )),
                 table,
+                needed_columns: vec![2].into_boxed_slice(),
             }],
             carrier,
         )),
@@ -67,16 +68,71 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         .generate(&logical)
         .expect("late row-fetch should lower");
 
-    let PhysicalNodeKind::RowFetchProject(spec) = &physical.node(physical.root).kind else {
-        panic!("expected row-fetch project root");
+    let PhysicalNodeKind::RowFetch(spec) = &physical.node(physical.root).kind else {
+        panic!("expected fused row-fetch root");
     };
-    assert_eq!(spec.carrier_table_index, CARRIER);
-    assert_eq!(spec.rowid_mappings.len(), 1);
-    assert_eq!(spec.rowid_mappings[0].table_index, MATERIALIZED);
-    assert_eq!(spec.rowid_mappings[0].rowid_col_idx, 1);
+    assert_eq!(spec.mappings.len(), 1);
+    assert_eq!(spec.mappings[0].table_index, MATERIALIZED);
+    assert_eq!(spec.mappings[0].rowid_col_idx, 1);
+    assert_eq!(spec.mappings[0].column_ids.as_ref(), [2]);
+    let projection = spec.projection.as_ref().expect("projection is fused");
     assert_eq!(
-        spec.output_types.as_ref(),
+        projection.output_types.as_ref(),
         [LogicalType::Integer, LogicalType::Varchar]
+    );
+    assert!(PhysicalPlanGenerator::ensure_fully_typed(&physical).is_ok());
+}
+
+#[test]
+fn lowers_row_fetch_without_projection_parent() {
+    const CARRIER: usize = 50;
+    const MATERIALIZED: usize = 51;
+
+    let ctx = BindContext::new();
+    let table = super::tests::test_get().table.expect("stored table");
+    let carrier = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            CARRIER,
+            Vec::new(),
+            vec!["key".into(), "rowid".into()],
+            vec![LogicalType::Integer, LogicalType::BigInt],
+        )),
+    );
+    let mut logical = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::RowFetch(RowFetch::new(
+            CARRIER,
+            vec![RowFetchSource {
+                materialized_table_index: MATERIALIZED,
+                rowid: Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(CARRIER, 1),
+                    LogicalType::BigInt,
+                )),
+                table,
+                needed_columns: vec![2].into_boxed_slice(),
+            }],
+            carrier,
+        )),
+    );
+    crate::column_binding_resolver::ColumnBindingResolver::resolve(&mut logical.operator)
+        .expect("standalone row-fetch bindings resolve");
+
+    let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&logical)
+        .expect("standalone row-fetch should lower");
+    let PhysicalNodeKind::RowFetch(spec) = &physical.node(physical.root).kind else {
+        panic!("expected standalone row-fetch root");
+    };
+    assert!(spec.projection.is_none());
+    assert_eq!(spec.mappings[0].column_ids.as_ref(), [2]);
+    assert_eq!(
+        spec.raw_output_types.as_ref(),
+        [
+            LogicalType::Integer,
+            LogicalType::BigInt,
+            LogicalType::Varchar
+        ]
     );
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&physical).is_ok());
 }

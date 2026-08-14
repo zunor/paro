@@ -901,7 +901,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
         .generate(&project)
         .expect("graph project should own graph expand filters");
 
-    let PhysicalNodeKind::RowFetchProject(project_spec) = &plan.node(plan.root).kind else {
+    let PhysicalNodeKind::GraphProject(project_spec) = &plan.node(plan.root).kind else {
         panic!("expected graph project root");
     };
     assert_eq!(project_spec.filters.len(), 2);

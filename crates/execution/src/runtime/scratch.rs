@@ -381,6 +381,13 @@ impl FinishTaskState {
 
 #[derive(Debug)]
 pub struct PipelineTaskState {
+    // Transitional scheduler boundary: data workers and the coordinator-owned
+    // global finish work still share PipelineTaskExecutor's completion state
+    // machine, but never share operator-local state. The long-term endpoint is
+    // a distinct PipelineFinishExecutor that owns only TaskMemoryGrants and
+    // global completion stages; keep every access explicit until that split so
+    // phase mistakes remain recoverable internal errors rather than hidden
+    // Deref panics.
     role: PipelineTaskRole,
     pub memory: TaskMemoryGrants,
     pub pending: PendingChunkState,

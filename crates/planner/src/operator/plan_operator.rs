@@ -692,10 +692,9 @@ impl LogicalOperator {
             LogicalOperator::RowFetch(fetch) => {
                 let mut bindings = fetch.child.get_column_bindings();
                 for source in &fetch.sources {
-                    bindings.extend(Self::generate_column_bindings(
-                        source.materialized_table_index,
-                        source.table.columns.len(),
-                    ));
+                    bindings.extend(source.needed_columns.iter().map(|&column| {
+                        ColumnBinding::new(source.materialized_table_index, column)
+                    }));
                 }
                 bindings
             }

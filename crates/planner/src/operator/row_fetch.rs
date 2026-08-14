@@ -17,6 +17,12 @@ pub struct RowFetchSource {
     pub materialized_table_index: usize,
     pub rowid: Expression,
     pub table: Arc<TableCatalogEntry>,
+    /// Physical catalog ordinals exposed by this source, in output order.
+    ///
+    /// Bindings retain the catalog ordinal instead of being renumbered, so a
+    /// parent can refer to a sparse subset without making the logical row
+    /// width pretend that every base-table column was materialized.
+    pub needed_columns: Box<[usize]>,
 }
 
 /// Row-preserving materialization boundary.
@@ -48,13 +54,13 @@ impl RowFetch {
     pub fn output_names(&self) -> Vec<String> {
         let mut names = self.child.output_names();
         for source in &self.sources {
-            names.extend(
+            names.extend(source.needed_columns.iter().filter_map(|&column| {
                 source
                     .table
                     .columns
-                    .iter()
-                    .map(|column| column.name.clone()),
-            );
+                    .get(column)
+                    .map(|column| column.name.clone())
+            }));
         }
         names
     }
@@ -62,13 +68,13 @@ impl RowFetch {
     pub fn output_types(&self) -> Vec<LogicalType> {
         let mut types = self.child.types();
         for source in &self.sources {
-            types.extend(
+            types.extend(source.needed_columns.iter().filter_map(|&column| {
                 source
                     .table
                     .columns
-                    .iter()
-                    .map(|column| column.logical_type.clone()),
-            );
+                    .get(column)
+                    .map(|column| column.logical_type.clone())
+            }));
         }
         types
     }
