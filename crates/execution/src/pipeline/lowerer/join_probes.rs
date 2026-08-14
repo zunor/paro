@@ -707,42 +707,15 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
+        if let Some(breaker) = self.breaker_dispatch_for_root(root) {
+            if let Some(probe_source) =
+                self.lower_breaker_to_probe_source(root, breaker, pipelines, dependencies)?
+            {
+                return Ok((probe_source.source, Vec::new(), probe_source.dependencies));
+            }
+        }
         let node = self.plan.node(root);
         match &node.kind {
-            PhysicalNodeKind::Aggregate(spec) => {
-                // A breaker emit is already a stable pipeline source.  When
-                // the aggregate feeds a probe chain, expose that source
-                // directly instead of copying its complete result through an
-                // intermediate Materialize/Materialized pair.  The explicit
-                // finalize dependency preserves the aggregate lifecycle while
-                // allowing downstream filters and join probes to fuse with
-                // emit.
-                let spec = spec.clone();
-                let child = self.only_child(root)?;
-                let handle = self.handles.register(
-                    BreakerHandleKind::Aggregate,
-                    node.output.clone(),
-                    Default::default(),
-                );
-                let producer = self.lower_subtree_to_sink(
-                    child,
-                    aggregate_build_sink_spec(handle, spec.clone()),
-                    SinkSharing::Exclusive,
-                    self.plan.node(child).output.clone(),
-                    pipelines,
-                    dependencies,
-                )?;
-                self.handles.set_producer(handle, producer)?;
-                Ok((
-                    aggregate_emit_source_spec(handle, spec),
-                    Vec::new(),
-                    vec![PendingProbeDependency {
-                        producer,
-                        handle,
-                        kind: DependencyKind::FinalizeBeforeEmit,
-                    }],
-                ))
-            }
             PhysicalNodeKind::HashJoin(spec) => {
                 if needs_hash_join_unmatched_source(spec.join_type) || spec.force_external {
                     return self.collect_probe_roles_source_fallback(root, pipelines, dependencies);

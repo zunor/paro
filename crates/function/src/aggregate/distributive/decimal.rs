@@ -9,9 +9,10 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector, VectorType};
 
 use crate::aggregate::{
-    AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateFinalizeProjection,
-    AggregateFunction, AggregateInputData, AggregateStateInput, DecimalDirectUpdate,
-    DirectAggregateStateCursor, FunctionData, PreparedDirectAggregateStatePredicate,
+    AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateEmptyInput,
+    AggregateFinalizeProjection, AggregateFunction, AggregateInputData, AggregateStateInput,
+    DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
+    PreparedDirectAggregateStatePredicate,
 };
 use crate::decimal::{
     cast_i128_decimal, pow10_i128, read_decimal, rescale, rescale_checked, round_divide, to_i128,
@@ -613,7 +614,8 @@ fn bind(
         finalize,
         Some(simple_update),
         None,
-    );
+    )
+    .with_empty_input(AggregateEmptyInput::Null);
     // SAFETY: every decimal aggregate state is an inline integer/word struct;
     // none owns external storage or installs a destructor.
     let function = unsafe { function.with_trivially_copyable_state() };

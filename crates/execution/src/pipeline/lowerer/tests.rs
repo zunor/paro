@@ -280,6 +280,52 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&topn).unwrap()
 }
 
+fn topn_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let order = OrderByNode {
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        ascending: true,
+        nulls_first: false,
+    };
+    let topn = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::TopN(LogicalTopN::new(values, vec![order], 2, 0)),
+    );
+    let build = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            topn,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&join).unwrap()
+}
+
 fn hash_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
     hash_join_plan_with_context(join_type, PlanBuildContext::default())
 }

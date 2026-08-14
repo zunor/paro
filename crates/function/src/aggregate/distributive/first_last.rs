@@ -11,8 +11,8 @@
 //! - `any_value(x)` / `arbitrary(x)`: Returns any value (implementation uses first)
 
 use crate::aggregate::{
-    AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateCombineType, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -487,7 +487,7 @@ pub fn get_first_function() -> AggregateFunctionSet {
         .with_state_serialization(first_string::serialize, first_string::deserialize),
     );
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the LAST aggregate function set.
@@ -537,7 +537,7 @@ pub fn get_last_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 fn alias_function_set(mut set: AggregateFunctionSet, alias_name: &str) -> AggregateFunctionSet {
@@ -607,7 +607,7 @@ pub fn get_any_value_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the ARBITRARY aggregate function set.
@@ -657,7 +657,7 @@ pub fn get_arbitrary_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

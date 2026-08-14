@@ -74,6 +74,11 @@ pub(crate) struct PendingProbeDependency {
     pub(crate) kind: DependencyKind,
 }
 
+pub(crate) struct BreakerProbeSource {
+    pub(crate) source: SourceSpec,
+    pub(crate) dependencies: Vec<PendingProbeDependency>,
+}
+
 pub(crate) struct PipelineChain {
     pub(crate) entry: PipelineId,
     pub(crate) tail: PipelineId,

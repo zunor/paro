@@ -5,7 +5,7 @@
 
 use crate::filter::propagate_result::FilterPropagateResult;
 use crate::filter::pushdown::FilterPushdown;
-use paro_catalog::entry::ConstraintType;
+use crate::statistics::unique_keys::{declared_unique_keys, KeyNullSemantics};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
@@ -116,74 +116,47 @@ fn collect_group_dependencies(
     dependencies: &mut Vec<GroupDependency>,
 ) {
     if let LogicalOperator::Get(get) = &plan.operator {
-        if let Some(table) = &get.table {
-            for constraint in table.constraints().iter().filter(|constraint| {
-                matches!(
-                    constraint.constraint_type,
-                    ConstraintType::Unique | ConstraintType::PrimaryKey
-                ) && !constraint.columns.is_empty()
+        for key in declared_unique_keys(get) {
+            let Some(determinants) = key
+                .bindings
+                .iter()
+                .map(|binding| {
+                    group_bindings
+                        .iter()
+                        .position(|candidate| candidate == &Some(*binding))
+                })
+                .collect::<Option<Vec<_>>>()
+            else {
+                continue;
+            };
+            if !key.proves_uniqueness(KeyNullSemantics::NullsEqual, |binding| {
+                group_bindings
+                    .iter()
+                    .position(|candidate| candidate == &Some(binding))
+                    .and_then(|group_idx| aggregate.group_stats.get(group_idx))
+                    .and_then(Option::as_ref)
+                    .is_some_and(|stats| !stats.can_have_null())
             }) {
-                let Some(key_bindings) = constraint
-                    .columns
-                    .iter()
-                    .map(|column_id| {
-                        get.column_ids
-                            .iter()
-                            .position(|candidate| candidate == column_id)
-                            .map(|column_idx| ColumnBinding::new(get.table_index, column_idx))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
-                let Some(determinants) = key_bindings
-                    .iter()
-                    .map(|binding| {
-                        group_bindings
-                            .iter()
-                            .position(|candidate| candidate == &Some(*binding))
-                    })
-                    .collect::<Option<Vec<_>>>()
-                else {
-                    continue;
-                };
+                continue;
+            }
 
-                // SQL UNIQUE permits multiple NULLs. Only a primary key or an
-                // exact no-NULL statistic is a functional determinant under
-                // GROUP BY's NULL-equality semantics.
-                if constraint.constraint_type != ConstraintType::PrimaryKey
-                    && determinants.iter().any(|&group_idx| {
-                        aggregate
-                            .group_stats
-                            .get(group_idx)
-                            .and_then(Option::as_ref)
-                            .is_none_or(|stats| stats.can_have_null())
-                    })
-                {
-                    continue;
-                }
-
-                let key_set = key_bindings
-                    .iter()
-                    .copied()
-                    .collect::<std::collections::HashSet<_>>();
-                let dependents = group_bindings
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(group_idx, binding)| {
-                        binding
-                            .filter(|binding| {
-                                binding.table_index == get.table_index && !key_set.contains(binding)
-                            })
-                            .map(|_| group_idx)
-                    })
-                    .collect::<Vec<_>>();
-                if !dependents.is_empty() {
-                    dependencies.push(GroupDependency {
-                        determinants: determinants.into_boxed_slice(),
-                        dependents: dependents.into_boxed_slice(),
-                    });
-                }
+            let dependents = group_bindings
+                .iter()
+                .enumerate()
+                .filter_map(|(group_idx, binding)| {
+                    binding
+                        .filter(|binding| {
+                            binding.table_index == get.table_index
+                                && !key.bindings.contains(binding)
+                        })
+                        .map(|_| group_idx)
+                })
+                .collect::<Vec<_>>();
+            if !dependents.is_empty() {
+                dependencies.push(GroupDependency {
+                    determinants: determinants.into_boxed_slice(),
+                    dependents: dependents.into_boxed_slice(),
+                });
             }
         }
     }
@@ -477,12 +450,9 @@ impl StatisticsPropagator {
                     }
                 }
 
-                let derived = derive_group_dependencies(&agg);
-                for dependency in derived {
-                    if !agg.group_dependencies.contains(&dependency) {
-                        agg.group_dependencies.push(dependency);
-                    }
-                }
+                // Dependencies are a derived annotation of the current child
+                // and current statistics, never persistent optimizer state.
+                agg.group_dependencies = derive_group_dependencies(&agg);
 
                 LogicalOperator::Aggregate(agg)
             }

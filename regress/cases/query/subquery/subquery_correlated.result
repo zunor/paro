@@ -91,3 +91,15 @@ o.id	nested_value
 4	4
 5	5
 6	6
+
+SELECT o.key_a, o.key_b, o.threshold
+FROM subquery_correlated_unique_outer AS o
+WHERE o.threshold > (
+  SELECT SUM(i.amount)
+  FROM subquery_correlated_unique_inner AS i
+  WHERE i.key_a = o.key_a
+    AND i.key_b = o.key_b
+)
+ORDER BY o.key_a, o.key_b, o.threshold;
+o.key_a	o.key_b	o.threshold
+1	1	10

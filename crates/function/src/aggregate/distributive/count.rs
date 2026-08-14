@@ -6,8 +6,8 @@
 //!
 
 use crate::aggregate::{
-    AggregateDirectUpdate, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateDirectUpdate, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -186,6 +186,7 @@ fn count_partial_merge(_source: &AggregateFunction) -> Option<AggregateFunction>
         Some(CountPartialMergeFunction::simple_update),
         None,
     )
+    .with_empty_input(AggregateEmptyInput::NonNull)
     .with_partial_merge(count_partial_merge);
     // SAFETY: partial COUNT state is one inline i64 with no external ownership.
     Some(unsafe { function.with_trivially_copyable_state() })
@@ -203,7 +204,8 @@ pub fn get_count_star_function() -> AggregateFunction {
         CountFunction::finalize,
         Some(CountFunction::simple_update_star),
         None,
-    );
+    )
+    .with_empty_input(AggregateEmptyInput::NonNull);
     // SAFETY: COUNT state is one inline i64 with no external ownership.
     unsafe { function.with_trivially_copyable_state() }
         .with_partial_merge(count_partial_merge)
@@ -235,7 +237,8 @@ pub fn get_count_function() -> AggregateFunctionSet {
             CountFunction::finalize,
             Some(CountFunction::simple_update),
             None,
-        );
+        )
+        .with_empty_input(AggregateEmptyInput::NonNull);
         // SAFETY: COUNT state is one inline i64 with no external ownership.
         let function = unsafe { function.with_trivially_copyable_state() }
             .with_partial_merge(count_partial_merge);

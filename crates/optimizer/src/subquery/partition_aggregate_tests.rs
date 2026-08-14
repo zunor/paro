@@ -10,7 +10,8 @@ use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::types::LogicalType;
 use paro_context::{test_support::TestStatementContextBuilder, QueryResources};
 use paro_function::aggregate::distributive::{
-    avg::get_avg_function, minmax::get_min_function, sum::get_sum_function,
+    avg::get_avg_function, count::get_count_function, minmax::get_min_function,
+    sum::get_sum_function,
 };
 use paro_function::scalar::cast::{
     date_casts, decimal_casts, numeric_casts, BindCastInput, BoundCastInfo, CastFunctionSet,
@@ -57,12 +58,99 @@ fn tpch_q20_pulls_unique_correlated_sum_into_grouped_join() {
 
             assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
             assert_eq!(inspection.aggregates, 1, "{optimized:#?}");
+            assert_eq!(inspection.aggregate_groups, vec![3], "{optimized:#?}");
+            assert_eq!(inspection.group_dependencies, 0, "{optimized:#?}");
             assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
             assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
         })
         .expect("spawn q20 optimizer test")
         .join()
         .expect("q20 optimizer test");
+}
+
+#[test]
+fn grouped_join_uses_empty_input_contract_instead_of_function_name() {
+    let optimized = optimize_sql(
+        "SELECT ps.ps_partkey \
+         FROM partsupp AS ps \
+         WHERE ps.ps_availqty > ( \
+             SELECT min(l.l_quantity) \
+             FROM lineitem AS l \
+             WHERE l.l_partkey = ps.ps_partkey \
+               AND l.l_suppkey = ps.ps_suppkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("partsupp"), 1, "{optimized:#?}");
+    assert_eq!(inspection.gets_named("lineitem"), 1, "{optimized:#?}");
+}
+
+#[test]
+fn grouped_join_rejects_count_empty_input_contract() {
+    let optimized = optimize_sql(
+        "SELECT ps.ps_partkey \
+         FROM partsupp AS ps \
+         WHERE ps.ps_availqty > ( \
+             SELECT count(l.l_quantity) \
+             FROM lineitem AS l \
+             WHERE l.l_partkey = ps.ps_partkey \
+               AND l.l_suppkey = ps.ps_suppkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+}
+
+#[test]
+fn grouped_join_rejects_non_null_rejecting_scalar_predicate() {
+    let optimized = optimize_sql(
+        "SELECT ps.ps_partkey \
+         FROM partsupp AS ps \
+         WHERE ps.ps_availqty IS NOT DISTINCT FROM ( \
+             SELECT sum(l.l_quantity) \
+             FROM lineitem AS l \
+             WHERE l.l_partkey = ps.ps_partkey \
+               AND l.l_suppkey = ps.ps_suppkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+}
+
+#[test]
+fn grouped_join_rejects_correlation_that_does_not_cover_outer_unique_key() {
+    let optimized = optimize_sql(
+        "SELECT l.l_orderkey \
+         FROM lineitem AS l \
+         WHERE l.l_quantity > ( \
+             SELECT sum(ps.ps_availqty) \
+             FROM partsupp AS ps \
+             WHERE ps.ps_partkey = l.l_partkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 1, "{optimized:#?}");
+}
+
+#[test]
+fn grouped_join_does_not_hash_a_dead_middle_payload_column() {
+    let optimized = optimize_sql(
+        "SELECT ps.ps_comment \
+         FROM partsupp AS ps \
+         WHERE ps.ps_availqty > ( \
+             SELECT sum(l.l_quantity) \
+             FROM lineitem AS l \
+             WHERE l.l_partkey = ps.ps_partkey \
+               AND l.l_suppkey = ps.ps_suppkey)",
+    );
+    let inspection = inspect_plan(&optimized);
+
+    assert_eq!(inspection.delim_joins, 0, "{optimized:#?}");
+    // partkey, suppkey, availqty and comment are live. supplycost is ordinal 3,
+    // but its later live sibling must not force it into the grouping key.
+    assert_eq!(inspection.aggregate_groups, vec![4], "{optimized:#?}");
+    assert_eq!(inspection.group_dependencies, 0, "{optimized:#?}");
 }
 
 fn assert_tpch_rewrites() {
@@ -161,7 +249,12 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
             )
             .expect("install scalar");
     }
-    for function in [get_min_function(), get_avg_function(), get_sum_function()] {
+    for function in [
+        get_min_function(),
+        get_avg_function(),
+        get_sum_function(),
+        get_count_function(),
+    ] {
         schema
             .create_aggregate_function(
                 &transaction,
@@ -386,6 +479,8 @@ fn install_table_with_constraint(
 struct PlanInspection {
     windows: usize,
     aggregates: usize,
+    aggregate_groups: Vec<usize>,
+    group_dependencies: usize,
     delim_joins: usize,
     late_fetches: usize,
     late_fetch_sources: usize,
@@ -406,7 +501,11 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
                 result.late_fetch_sources += fetch.sources.len();
             }
             LogicalOperator::Window(_) => result.windows += 1,
-            LogicalOperator::Aggregate(_) => result.aggregates += 1,
+            LogicalOperator::Aggregate(aggregate) => {
+                result.aggregates += 1;
+                result.aggregate_groups.push(aggregate.groups.len());
+                result.group_dependencies += aggregate.group_dependencies.len();
+            }
             LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
                 if !join.duplicate_eliminated_columns.is_empty() =>
             {
@@ -649,8 +748,9 @@ fn scalar_binding_visible_above_filter_does_not_rewrite() {
         )),
     );
 
-    let rewritten =
-        CorrelatedPartitionAggregate::new(planner.binder.bind_context.clone()).optimize_plan(plan);
+    let rewritten = CorrelatedPartitionAggregate::new(planner.binder.bind_context.clone())
+        .optimize_plan(plan)
+        .expect("rewrite binding-escape plan");
     let inspection = inspect_plan(&rewritten);
     assert_eq!(
         inspection.windows, 0,

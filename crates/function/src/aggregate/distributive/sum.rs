@@ -6,8 +6,8 @@
 //!
 
 use crate::aggregate::{
-    AggregateAlgebra, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateAlgebra, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -262,6 +262,7 @@ macro_rules! define_sum_impl {
                     Some(simple_update),
                     None,
                 )
+                .with_empty_input(AggregateEmptyInput::Null)
                 .with_algebra(AggregateAlgebra::Sum)
                 .with_partial_merge(super::sum_partial_merge);
                 let function = if supports_input_rollup {
@@ -591,6 +592,10 @@ mod tests {
         let mut without_rollup = sum.clone();
         without_rollup.input_rollup = None;
         assert!(!sum.execution_semantics_equal(&without_rollup));
+
+        let mut different_empty_input = sum.clone();
+        different_empty_input.empty_input = AggregateEmptyInput::NonNull;
+        assert!(!sum.execution_semantics_equal(&different_empty_input));
 
         let reducer = sum.partial_merge_function().unwrap();
         assert!(!sum.execution_semantics_equal(&reducer));

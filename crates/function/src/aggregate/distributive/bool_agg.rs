@@ -9,7 +9,9 @@
 //! - `bool_and(x)`: Returns TRUE if all values are TRUE, FALSE if any is FALSE, NULL if empty
 //! - `bool_or(x)`: Returns TRUE if any value is TRUE, FALSE if all are FALSE, NULL if empty
 
-use crate::aggregate::{AggregateFunction, AggregateInputData, AggregateStateInput};
+use crate::aggregate::{
+    AggregateEmptyInput, AggregateFunction, AggregateInputData, AggregateStateInput,
+};
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -233,6 +235,7 @@ pub fn get_bool_and_function() -> AggregateFunction {
         Some(bool_and_impl::simple_update),
         None,
     )
+    .with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the BOOL_OR aggregate function.
@@ -249,6 +252,7 @@ pub fn get_bool_or_function() -> AggregateFunction {
         Some(bool_or_impl::simple_update),
         None,
     )
+    .with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

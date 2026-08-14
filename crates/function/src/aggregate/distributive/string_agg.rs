@@ -11,8 +11,8 @@
 //! - NULL `expr` rows are ignored.
 
 use crate::aggregate::{
-    AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateCombineType, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -487,7 +487,7 @@ pub fn get_string_agg_function() -> AggregateFunctionSet {
         .with_state_serialization(serialize_state, deserialize_state),
     );
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

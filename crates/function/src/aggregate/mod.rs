@@ -383,6 +383,18 @@ pub enum DecimalDirectUpdate {
     AverageI128,
 }
 
+/// Result nullability of an aggregate evaluated over zero input rows.
+///
+/// This is a semantic contract used by rewrites that change outer-preserving
+/// aggregation into null-rejecting joins. It is intentionally independent of
+/// the SQL function name and of the aggregate's internal state identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateEmptyInput {
+    Unknown,
+    Null,
+    NonNull,
+}
+
 // ============================================================================
 // AggregateFunction
 // ============================================================================
@@ -409,6 +421,9 @@ pub struct AggregateFunction {
     pub name: String,
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
+
+    /// Finalized result contract for an empty input relation.
+    pub empty_input: AggregateEmptyInput,
 
     /// Algebraic identity available to logical aggregate rewrites.
     pub algebra: Option<AggregateAlgebra>,
@@ -477,6 +492,7 @@ impl fmt::Debug for AggregateFunction {
             .field("name", &self.name)
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
+            .field("empty_input", &self.empty_input)
             .field("state_size", &self.state_size)
             .field("has_partial_merge", &self.partial_merge.is_some())
             .field("has_input_rollup", &self.input_rollup.is_some())
@@ -503,6 +519,7 @@ impl AggregateFunction {
             name,
             arguments,
             return_type,
+            empty_input: AggregateEmptyInput::Unknown,
             algebra: None,
             partial_merge: None,
             input_rollup: None,
@@ -537,6 +554,11 @@ impl AggregateFunction {
 
     pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
         self.algebra = Some(algebra);
+        self
+    }
+
+    pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
+        self.empty_input = empty_input;
         self
     }
 
@@ -581,6 +603,7 @@ impl AggregateFunction {
 
         self.arguments == other.arguments
             && self.return_type == other.return_type
+            && self.empty_input == other.empty_input
             && self.algebra == other.algebra
             && optional_fn_equal!(self.partial_merge, other.partial_merge)
             && optional_fn_equal!(self.input_rollup, other.input_rollup)
@@ -710,6 +733,13 @@ impl AggregateFunctionSet {
 
     pub fn set_dynamic_bind(&mut self, bind: AggregateFunctionSetBindFn) {
         self.dynamic_bind = Some(bind);
+    }
+
+    pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
+        for function in &mut self.functions {
+            function.empty_input = empty_input;
+        }
+        self
     }
 
     /// Find the best matching function for the given arguments using cost-based implicit casting.

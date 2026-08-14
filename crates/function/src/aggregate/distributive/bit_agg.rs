@@ -12,7 +12,8 @@
 //! - Returns NULL if no non-NULL values
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateEmptyInput, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -404,7 +405,7 @@ pub fn get_bit_and_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the BIT_OR aggregate function set.
@@ -439,7 +440,7 @@ pub fn get_bit_or_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the BIT_XOR aggregate function set.
@@ -474,7 +475,7 @@ pub fn get_bit_xor_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

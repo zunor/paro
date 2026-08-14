@@ -14,20 +14,23 @@
 use std::collections::{HashMap, HashSet};
 
 use paro_catalog::entry::ConstraintType;
+use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
+use paro_function::aggregate::AggregateEmptyInput;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
-    AggregateExpression, AggregateType, ColumnRefExpression, ComparisonType, Expression,
-    ExpressionIterator, ExpressionVisitDecision, WindowExpression, WindowFrame, WindowFrameBound,
-    WindowFrameType,
+    AggregateExpression, AggregateType, ColumnRefExpression, ComparisonType, ConstantExpression,
+    Expression, ExpressionIterator, ExpressionVisitDecision, WindowExpression, WindowFrame,
+    WindowFrameBound, WindowFrameType,
 };
 use paro_planner::operator::{
-    aggregate::GroupDependency, Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Get, Join,
-    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Window,
+    Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType,
+    JoinCondition, JoinType, LogicalOperator, MarkJoinSemantics, Projection, Window,
 };
 use paro_planner::plan::LogicalPlan;
-use paro_planner::visitor::LogicalOperatorVisitor;
 
 use crate::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
+use crate::statistics::unique_keys::{declared_unique_keys, KeyNullSemantics};
 
 /// Rewrite eligible correlated scalar aggregates into partition windows or
 /// keyed grouped joins.
@@ -40,57 +43,138 @@ impl CorrelatedPartitionAggregate {
         Self { bind_context }
     }
 
-    pub fn optimize_plan(&mut self, mut plan: LogicalPlan) -> LogicalPlan {
-        let mut uses = BindingUseCounter::default();
-        uses.visit_logical_plan(&mut plan);
-        self.optimize_node(plan, false, &uses.uses)
+    pub fn optimize_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.optimize_node(plan, None)
     }
 
     fn optimize_node(
         &self,
         plan: LogicalPlan,
-        output_hidden_by_projection: bool,
-        binding_uses: &HashMap<ColumnBinding, usize>,
-    ) -> LogicalPlan {
-        let hides_child_bindings =
-            output_hidden_by_projection || matches!(&plan.operator, LogicalOperator::Projection(_));
-        let plan = plan
-            .map_children(|child| self.optimize_node(child, hides_child_bindings, binding_uses));
-        self.rewrite_filter(plan, output_hidden_by_projection, binding_uses)
+        output_contract: Option<OutputContract>,
+    ) -> Result<LogicalPlan> {
+        let child_contracts = child_output_contracts(&plan.operator, output_contract.as_ref());
+        let mut child_ordinal = 0;
+        let plan = plan.try_map_children(|child| {
+            let contract = child_contracts.get(child_ordinal).cloned().flatten();
+            child_ordinal += 1;
+            self.optimize_node(child, contract)
+        })?;
+        self.rewrite_filter(plan, output_contract.as_ref())
     }
 
     fn rewrite_filter(
         &self,
         plan: LogicalPlan,
-        output_hidden_by_projection: bool,
-        binding_uses: &HashMap<ColumnBinding, usize>,
-    ) -> LogicalPlan {
-        let fallback = paro_planner::binder::deep_copy::duplicate_plan_preserving_indices(
-            &plan,
-            self.bind_context.shared().as_ref(),
-        );
-        if let Some(rewrite) = recognize_filter(&plan, output_hidden_by_projection, binding_uses) {
-            return apply_rewrite(plan, rewrite, &self.bind_context).unwrap_or(fallback);
+        output_contract: Option<&OutputContract>,
+    ) -> Result<LogicalPlan> {
+        if let Some(rewrite) = recognize_filter(&plan, output_contract) {
+            return apply_rewrite(plan, rewrite, &self.bind_context);
         }
-        if let Some(rewrite) =
-            recognize_grouped_join_filter(&plan, output_hidden_by_projection, binding_uses)
-        {
-            return apply_grouped_join_rewrite(plan, rewrite, &self.bind_context)
-                .unwrap_or(fallback);
+        if let Some(rewrite) = recognize_grouped_join_filter(&plan, output_contract) {
+            return apply_grouped_join_rewrite(plan, rewrite, &self.bind_context);
         }
-        plan
+        Ok(plan)
     }
 }
 
-#[derive(Default)]
-struct BindingUseCounter {
-    uses: HashMap<ColumnBinding, usize>,
+/// Bindings consumed between a subtree and the projection that hides the rest
+/// of its implicit output.  The contract is propagated only across operators
+/// whose preserved child is addressed by binding; positional or implicit
+/// consumers deliberately terminate it.
+#[derive(Clone, Default)]
+struct OutputContract {
+    referenced: HashSet<ColumnBinding>,
 }
 
-impl LogicalOperatorVisitor for BindingUseCounter {
-    fn visit_replace_column_ref(&mut self, column: &mut ColumnRefExpression) -> Option<Expression> {
-        *self.uses.entry(column.binding).or_default() += 1;
-        None
+impl OutputContract {
+    fn from_expressions<'a>(expressions: impl IntoIterator<Item = &'a Expression>) -> Self {
+        let mut contract = Self::default();
+        contract.extend(expressions);
+        contract
+    }
+
+    fn extend<'a>(&mut self, expressions: impl IntoIterator<Item = &'a Expression>) {
+        for expression in expressions {
+            ExpressionIterator::visit(expression, &mut |candidate| {
+                if let Expression::ColumnRef(column) = candidate {
+                    self.referenced.insert(column.binding);
+                }
+                ExpressionVisitDecision::Descend
+            });
+        }
+    }
+
+    fn references(&self, binding: ColumnBinding) -> bool {
+        self.referenced.contains(&binding)
+    }
+}
+
+fn child_output_contracts(
+    operator: &LogicalOperator,
+    inherited: Option<&OutputContract>,
+) -> Vec<Option<OutputContract>> {
+    match operator {
+        LogicalOperator::Projection(projection) => vec![Some(OutputContract::from_expressions(
+            projection.expressions.iter(),
+        ))],
+        LogicalOperator::Aggregate(aggregate) => vec![Some(OutputContract::from_expressions(
+            aggregate.groups.iter().chain(aggregate.aggregates.iter()),
+        ))],
+        LogicalOperator::Filter(filter)
+            if inherited.is_some()
+                && filter
+                    .projection_map
+                    .is_identity(filter.child.types().len()) =>
+        {
+            let mut contract = inherited.cloned().unwrap_or_default();
+            contract.extend(filter.expressions.iter());
+            vec![Some(contract)]
+        }
+        LogicalOperator::Order(order)
+            if inherited.is_some()
+                && order.projection_map.is_identity(order.child.types().len()) =>
+        {
+            let mut contract = inherited.cloned().unwrap_or_default();
+            contract.extend(order.orders.iter().map(|order| &order.expression));
+            vec![Some(contract)]
+        }
+        LogicalOperator::Limit(limit) if inherited.is_some() => {
+            let mut contract = inherited.cloned().unwrap_or_default();
+            contract.extend(limit.limit.iter().chain(limit.offset.iter()));
+            vec![Some(contract)]
+        }
+        LogicalOperator::TopN(topn) if inherited.is_some() => {
+            let mut contract = inherited.cloned().unwrap_or_default();
+            contract.extend(topn.orders.iter().map(|order| &order.expression));
+            vec![Some(contract)]
+        }
+        LogicalOperator::Join(Join::Comparison(join)) if inherited.is_some() => {
+            let mut contract = inherited.cloned().unwrap_or_default();
+            contract.extend(
+                join.conditions
+                    .iter()
+                    .flat_map(|condition| [&condition.left, &condition.right])
+                    .chain(join.duplicate_eliminated_columns.iter()),
+            );
+            match join.join_type {
+                JoinType::Semi | JoinType::Anti
+                    if join
+                        .left_projection_map
+                        .is_identity(join.left.types().len()) =>
+                {
+                    vec![Some(contract), None]
+                }
+                JoinType::RightSemi | JoinType::RightAnti
+                    if join
+                        .right_projection_map
+                        .is_identity(join.right.types().len()) =>
+                {
+                    vec![None, Some(contract)]
+                }
+                _ => vec![None, None],
+            }
+        }
+        _ => operator.children().into_iter().map(|_| None).collect(),
     }
 }
 
@@ -167,7 +251,9 @@ struct GroupedJoinRewrite {
     inner_keys: Vec<Expression>,
     outer_bindings: Vec<ColumnBinding>,
     outer_types: Vec<paro_common::types::LogicalType>,
-    determinant_groups: Vec<usize>,
+    group_ordinals: Vec<usize>,
+    output_width: usize,
+    direct_source_side: DirectSourceSide,
 }
 
 struct ScalarBranch<'a> {
@@ -178,11 +264,24 @@ struct ScalarBranch<'a> {
     scalar_expression: &'a Expression,
 }
 
-fn recognize_filter(
-    plan: &LogicalPlan,
-    output_hidden_by_projection: bool,
-    binding_uses: &HashMap<ColumnBinding, usize>,
-) -> Option<Rewrite> {
+struct DelimShape<'a> {
+    filter: &'a paro_planner::operator::Filter,
+    join: &'a ComparisonJoin,
+    scalar: ScalarBranch<'a>,
+    delim: &'a paro_planner::operator::DelimGet,
+    correlation: Correlation,
+}
+
+#[derive(Clone, Copy)]
+enum DirectSourceSide {
+    LeftDelim,
+    RightDelim,
+}
+
+fn recognize_delim_shape<'a>(
+    plan: &'a LogicalPlan,
+    output_contract: Option<&OutputContract>,
+) -> Option<DelimShape<'a>> {
     let LogicalOperator::Filter(filter) = &plan.operator else {
         return None;
     };
@@ -201,12 +300,10 @@ fn recognize_filter(
         return None;
     }
     let scalar = peel_scalar_branch(&join.right)?;
-    // Removing the Single join removes its scalar binding. A projection above
-    // this subtree is therefore a correctness boundary, not merely a pruning
-    // opportunity: it proves that an unreferenced scalar cannot escape as an
-    // implicit output column.
-    if !output_hidden_by_projection
-        || binding_uses.get(&scalar.scalar_binding).copied() != Some(1)
+    // The nearest projection and every operator between it and this filter
+    // have explicitly enumerated their binding dependencies.  Only that
+    // binding-transparent path proves the scalar is an implementation detail.
+    if output_contract?.references(scalar.scalar_binding)
         || !filter
             .expressions
             .iter()
@@ -226,30 +323,45 @@ fn recognize_filter(
         delim.table_index,
         &join.duplicate_eliminated_columns,
     )?;
-    let inner_graph = JoinGraph::extract_correlated(&scalar.aggregate.child, delim.table_index)?;
-    let outer_graph = JoinGraph::extract(&join.left)?;
+    Some(DelimShape {
+        filter,
+        join,
+        scalar,
+        delim,
+        correlation,
+    })
+}
+
+fn recognize_filter(
+    plan: &LogicalPlan,
+    output_contract: Option<&OutputContract>,
+) -> Option<Rewrite> {
+    let shape = recognize_delim_shape(plan, output_contract)?;
+    let inner_graph =
+        JoinGraph::extract_correlated(&shape.scalar.aggregate.child, shape.delim.table_index)?;
+    let outer_graph = JoinGraph::extract(&shape.join.left)?;
     let (bindings, mapped_relations) = match_common_graph(&inner_graph, &outer_graph)?;
-    let mut partitions = Vec::with_capacity(correlation.inner_keys.len());
-    for inner_key in &correlation.inner_keys {
+    let mut partitions = Vec::with_capacity(shape.correlation.inner_keys.len());
+    for inner_key in &shape.correlation.inner_keys {
         partitions.push(rebase_expression(inner_key, &bindings)?);
     }
     prove_partition_keyed_extension(
         &outer_graph,
         &mapped_relations,
         &partitions,
-        &join.duplicate_eliminated_columns,
+        &shape.join.duplicate_eliminated_columns,
     )?;
-    let aggregate = rebase_aggregate(scalar.aggregate_expression, &bindings)?;
+    let aggregate = rebase_aggregate(shape.scalar.aggregate_expression, &bindings)?;
     Some(Rewrite {
-        scalar_binding: scalar.scalar_binding,
-        scalar_source_binding: ColumnBinding::new(scalar.aggregate.aggregate_index, 0),
-        scalar_expression: scalar.scalar_expression.clone(),
+        scalar_binding: shape.scalar.scalar_binding,
+        scalar_source_binding: ColumnBinding::new(shape.scalar.aggregate.aggregate_index, 0),
+        scalar_expression: shape.scalar.scalar_expression.clone(),
         aggregate,
         partitions,
     })
 }
 
-/// Pull a null-rejected correlated SUM into the outer detail stream.
+/// Pull a null-rejected correlated aggregate into the outer detail stream.
 ///
 /// The canonical delim plan builds the detail rows, captures their unique
 /// correlation keys, scans those keys to aggregate the inner relation, then
@@ -260,59 +372,26 @@ fn recognize_filter(
 /// hiding projection do not observe an implementation-only binding domain.
 fn recognize_grouped_join_filter(
     plan: &LogicalPlan,
-    output_hidden_by_projection: bool,
-    binding_uses: &HashMap<ColumnBinding, usize>,
+    output_contract: Option<&OutputContract>,
 ) -> Option<GroupedJoinRewrite> {
-    let LogicalOperator::Filter(filter) = &plan.operator else {
-        return None;
-    };
-    if filter.expressions.len() != 1
-        || !filter
-            .projection_map
-            .is_identity(filter.child.types().len())
-        || !filter.expressions.iter().all(is_movable)
-    {
+    let shape = recognize_delim_shape(plan, output_contract)?;
+    let output_contract = output_contract?;
+    if !filter_rejects_null_scalar(&shape.filter.expressions[0], shape.scalar.scalar_binding) {
         return None;
     }
-    let LogicalOperator::Join(Join::Comparison(join)) = &filter.child.operator else {
-        return None;
-    };
-    if !canonical_scalar_delim_join(join) {
-        return None;
-    }
-    let scalar = peel_scalar_branch(&join.right)?;
-    if !output_hidden_by_projection
-        || binding_uses.get(&scalar.scalar_binding).copied() != Some(1)
-        || !filter_rejects_null_scalar(&filter.expressions[0], scalar.scalar_binding)
-    {
+    // A strict predicate rejects the NULL produced by an empty correlated
+    // aggregate. Aggregates with a non-NULL empty-input value (COUNT) cannot
+    // replace the original outer-preserving scalar join with INNER.
+    if shape.scalar.aggregate_expression.function.empty_input != AggregateEmptyInput::Null {
         return None;
     }
-    // COUNT has a non-NULL empty-input value and therefore cannot discard an
-    // unmatched outer row by replacing the correlated left join with INNER.
-    // SUM's empty-input NULL contract makes the strict comparison proof exact.
-    if !scalar
-        .aggregate_expression
-        .function
-        .name
-        .eq_ignore_ascii_case("sum")
-    {
-        return None;
-    }
-    let delim = find_only_delim_get(&scalar.aggregate.child)?;
-    if delim.chunk_types.len() != join.duplicate_eliminated_columns.len()
-        || scalar.aggregate.groups.len() != delim.chunk_types.len()
-        || !validate_delim_binding_contract(join, &scalar, delim)
-        || !has_direct_delim_join_source(&scalar.aggregate.child, delim.table_index)
-    {
-        return None;
-    }
-    let correlation = match_correlation_keys(
-        &scalar.aggregate.child,
-        delim.table_index,
-        &join.duplicate_eliminated_columns,
+    let direct_source_side = direct_delim_join_source(
+        &shape.scalar.aggregate.child,
+        shape.delim.table_index,
+        shape.correlation.inner_keys.len(),
     )?;
-    let mut outer_bindings = join.left.get_column_bindings();
-    let mut outer_types = join.left.types();
+    let outer_bindings = shape.join.left.get_column_bindings();
+    let outer_types = shape.join.left.types();
     let first = *outer_bindings.first()?;
     if outer_bindings.len() != outer_types.len()
         || !outer_bindings.iter().enumerate().all(|(ordinal, binding)| {
@@ -321,35 +400,53 @@ fn recognize_grouped_join_filter(
     {
         return None;
     }
-    // The canonical delim join still exposes every column of its preserved
-    // input.  Carrying those implicit outputs into GROUP BY would keep dead
-    // wide scan columns alive until the unused-column pass (TPC-H partsupp's
-    // comment payload is a representative case).  A hiding projection above
-    // this node makes explicit expression references the complete liveness
-    // boundary.  Preserve the binding prefix through the last live ordinal so
-    // existing parent bindings remain positionally stable.
-    let live_width = outer_bindings
-        .iter()
-        .rposition(|binding| binding_uses.get(binding).copied().unwrap_or(0) != 0)?
-        .checked_add(1)?;
-    outer_bindings.truncate(live_width);
-    outer_types.truncate(live_width);
-    let determinant_groups = prove_preserved_unique_key(
-        &join.left,
-        &join.duplicate_eliminated_columns,
-        &outer_bindings,
+    // Prove row uniqueness before grouping only the bindings required by the
+    // filter and the explicit ancestor contract. A projection reconstructs
+    // the original binding domain after aggregation, so sparse live ordinals
+    // never force dead payload into the hash key.
+    prove_null_rejected_preserved_unique_key(
+        &shape.join.left,
+        &shape.join.duplicate_eliminated_columns,
     )?;
+    let mut grouped_bindings = output_contract.referenced.clone();
+    for expression in shape
+        .filter
+        .expressions
+        .iter()
+        .chain(shape.join.duplicate_eliminated_columns.iter())
+    {
+        ExpressionIterator::visit(expression, &mut |candidate| {
+            if let Expression::ColumnRef(column) = candidate {
+                grouped_bindings.insert(column.binding);
+            }
+            ExpressionVisitDecision::Descend
+        });
+    }
+    let group_ordinals = outer_bindings
+        .iter()
+        .enumerate()
+        .filter_map(|(ordinal, binding)| grouped_bindings.contains(binding).then_some(ordinal))
+        .collect::<Vec<_>>();
+    if group_ordinals.is_empty() {
+        return None;
+    }
+    let output_width = outer_bindings
+        .iter()
+        .rposition(|binding| output_contract.referenced.contains(binding))
+        .map_or(0, |ordinal| ordinal + 1);
     Some(GroupedJoinRewrite {
-        scalar_binding: scalar.scalar_binding,
-        scalar_source_binding: ColumnBinding::new(scalar.aggregate.aggregate_index, 0),
-        scalar_expression: scalar.scalar_expression.clone(),
-        aggregate: scalar.aggregate_expression.clone(),
-        delim_table_index: delim.table_index,
-        outer_keys: join.duplicate_eliminated_columns.clone(),
-        inner_keys: correlation.inner_keys,
+        scalar_binding: shape.scalar.scalar_binding,
+        scalar_source_binding: ColumnBinding::new(shape.scalar.aggregate.aggregate_index, 0),
+        scalar_expression: shape.scalar.scalar_expression.clone(),
+        aggregate: shape.scalar.aggregate_expression.clone(),
+        delim_table_index: shape.delim.table_index,
+        outer_keys: shape.join.duplicate_eliminated_columns.clone(),
+        inner_keys: shape.correlation.inner_keys,
         outer_bindings,
         outer_types,
-        determinant_groups,
+        group_ordinals,
+        output_width,
+        direct_source_side,
     })
 }
 
@@ -374,19 +471,32 @@ fn filter_rejects_null_scalar(expression: &Expression, scalar: ColumnBinding) ->
             if column.depth == 0 && column.binding == scalar)
 }
 
-fn has_direct_delim_join_source(plan: &LogicalPlan, delim_table_index: usize) -> bool {
+fn direct_delim_join_source(
+    plan: &LogicalPlan,
+    delim_table_index: usize,
+    correlation_key_count: usize,
+) -> Option<DirectSourceSide> {
     let LogicalOperator::Join(Join::Comparison(join)) = &plan.operator else {
-        return false;
+        return None;
     };
-    if !clean_inner_join(join) {
-        return false;
+    // Every condition is consumed when the DelimGet side is removed. Requiring
+    // exact cardinality, together with correlation matching, proves there is
+    // no residual predicate to lose.
+    if !clean_inner_join(join) || join.conditions.len() != correlation_key_count {
+        return None;
     }
     let direct = |child: &LogicalPlan| {
         matches!(&child.operator, LogicalOperator::DelimGet(delim)
             if delim.table_index == delim_table_index)
     };
-    (direct(&join.left) && !plan_references_delim(&join.right, delim_table_index))
-        || (direct(&join.right) && !plan_references_delim(&join.left, delim_table_index))
+    match (
+        direct(&join.left) && !plan_references_delim(&join.right, delim_table_index),
+        direct(&join.right) && !plan_references_delim(&join.left, delim_table_index),
+    ) {
+        (true, false) => Some(DirectSourceSide::LeftDelim),
+        (false, true) => Some(DirectSourceSide::RightDelim),
+        _ => None,
+    }
 }
 
 fn plan_references_delim(plan: &LogicalPlan, delim_table_index: usize) -> bool {
@@ -400,11 +510,7 @@ fn plan_references_delim(plan: &LogicalPlan, delim_table_index: usize) -> bool {
 
 /// Follow cardinality-preserving unary/reduction operators to the base scan
 /// that owns the complete correlation tuple and prove a declared key.
-fn prove_preserved_unique_key(
-    plan: &LogicalPlan,
-    keys: &[Expression],
-    outputs: &[ColumnBinding],
-) -> Option<Vec<usize>> {
+fn prove_null_rejected_preserved_unique_key(plan: &LogicalPlan, keys: &[Expression]) -> Option<()> {
     let key_bindings = keys
         .iter()
         .map(|key| match key {
@@ -412,34 +518,17 @@ fn prove_preserved_unique_key(
             _ => None,
         })
         .collect::<Option<Vec<_>>>()?;
-    let determinant_groups = key_bindings
-        .iter()
-        .map(|binding| outputs.iter().position(|output| output == binding))
-        .collect::<Option<Vec<_>>>()?;
-
     fn recurse(plan: &LogicalPlan, keys: &[ColumnBinding]) -> Option<()> {
         match &plan.operator {
             LogicalOperator::Get(get) => {
                 if keys.iter().any(|key| key.table_index != get.table_index) {
                     return None;
                 }
-                let physical_keys = keys
+                declared_unique_keys(get)
                     .iter()
-                    .map(|key| get.column_ids.get(key.column_index).copied())
-                    .collect::<Option<HashSet<_>>>()?;
-                get.table
-                    .as_ref()?
-                    .constraints()
-                    .iter()
-                    .any(|constraint| {
-                        matches!(
-                            constraint.constraint_type,
-                            ConstraintType::Unique | ConstraintType::PrimaryKey
-                        ) && !constraint.columns.is_empty()
-                            && constraint
-                                .columns
-                                .iter()
-                                .all(|column| physical_keys.contains(column))
+                    .any(|key| {
+                        key.is_covered_by(keys)
+                            && key.proves_uniqueness(KeyNullSemantics::NullRejected, |_| false)
                     })
                     .then_some(())
             }
@@ -456,8 +545,10 @@ fn prove_preserved_unique_key(
         }
     }
 
-    recurse(plan, &key_bindings)?;
-    Some(determinant_groups)
+    // The grouped rewrite creates Equal predicates for every key before this
+    // proof is used, so nullable UNIQUE rows never reach the aggregate. This
+    // is a row-uniqueness proof only; it must not become a GROUP BY FD.
+    recurse(plan, &key_bindings)
 }
 
 fn canonical_scalar_delim_join(join: &ComparisonJoin) -> bool {
@@ -1052,12 +1143,16 @@ fn apply_rewrite(
     plan: LogicalPlan,
     rewrite: Rewrite,
     bind_context: &BindContext,
-) -> Option<LogicalPlan> {
+) -> Result<LogicalPlan> {
     let LogicalOperator::Filter(mut filter) = plan.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "partition-aggregate witness no longer points to a Filter",
+        ));
     };
     let LogicalOperator::Join(Join::Comparison(mut join)) = filter.child.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "partition-aggregate witness no longer points to a comparison join",
+        ));
     };
     let detail = std::mem::replace(
         &mut *join.left,
@@ -1075,7 +1170,7 @@ fn apply_rewrite(
     };
     let window_expression =
         WindowExpression::aggregate(rewrite.aggregate, rewrite.partitions, Vec::new(), frame);
-    window_expression.verify_bound_contract().ok()?;
+    window_expression.verify_bound_contract()?;
     let window = LogicalPlan::new(
         bind_context,
         LogicalOperator::Window(Window::new(window_index, vec![window_expression], detail)),
@@ -1089,7 +1184,9 @@ fn apply_rewrite(
         })
     });
     if !expression_uses_only_binding(&scalar, window_binding) {
-        return None;
+        return Err(paro_error::internal(
+            "partition-aggregate scalar witness contains an unexpected binding",
+        ));
     }
     filter.expressions = filter
         .expressions
@@ -1102,7 +1199,7 @@ fn apply_rewrite(
         .collect();
     filter.child = Box::new(window);
     filter.projection_map = paro_planner::operator::ProjectionMap::all();
-    Some(LogicalPlan::new(
+    Ok(LogicalPlan::new(
         bind_context,
         LogicalOperator::Filter(filter),
     ))
@@ -1112,12 +1209,16 @@ fn apply_grouped_join_rewrite(
     plan: LogicalPlan,
     rewrite: GroupedJoinRewrite,
     bind_context: &BindContext,
-) -> Option<LogicalPlan> {
+) -> Result<LogicalPlan> {
     let LogicalOperator::Filter(mut filter) = plan.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join witness no longer points to a Filter",
+        ));
     };
     let LogicalOperator::Join(Join::Comparison(mut delim_join)) = filter.child.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join witness no longer points to a comparison join",
+        ));
     };
     let outer = std::mem::replace(
         &mut *delim_join.left,
@@ -1132,7 +1233,9 @@ fn apply_grouped_join_rewrite(
         paro_planner::binder::deep_copy::deep_copy_plan(&outer, bind_context.shared().as_ref());
     let mut copied_outer_bindings = copied_outer.get_column_bindings();
     if copied_outer_bindings.len() < rewrite.outer_bindings.len() {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join copied outer source lost witnessed bindings",
+        ));
     }
     copied_outer_bindings.truncate(rewrite.outer_bindings.len());
     let outer_binding_map = rewrite
@@ -1159,10 +1262,14 @@ fn apply_grouped_join_rewrite(
         })
         .collect::<Vec<_>>();
     let LogicalOperator::Projection(scalar_projection) = delim_join.right.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join scalar branch lost its projection",
+        ));
     };
     let LogicalOperator::Aggregate(mut scalar_aggregate) = scalar_projection.child.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join scalar branch lost its aggregate",
+        ));
     };
     let inner = take_direct_delim_join_source(
         std::mem::replace(
@@ -1170,6 +1277,7 @@ fn apply_grouped_join_rewrite(
             LogicalPlan::synthetic(LogicalOperator::DummyScan),
         ),
         rewrite.delim_table_index,
+        rewrite.direct_source_side,
     )?;
     let conditions = rewrite
         .inner_keys
@@ -1187,15 +1295,33 @@ fn apply_grouped_join_rewrite(
             conditions,
         ))),
     );
-    let groups = copied_outer_bindings
+    let groups = rewrite
+        .group_ordinals
         .iter()
-        .copied()
-        .zip(rewrite.outer_types.iter().cloned())
-        .map(|(binding, ty)| Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
-        .collect::<Vec<_>>();
-    let group_index = rewrite.outer_bindings.first()?.table_index;
+        .map(|&ordinal| {
+            let binding = copied_outer_bindings.get(ordinal).copied().ok_or_else(|| {
+                paro_error::internal("grouped-join copied outer source lost a grouped binding")
+            })?;
+            let ty = rewrite.outer_types.get(ordinal).cloned().ok_or_else(|| {
+                paro_error::internal("grouped-join witness lost a grouped binding type")
+            })?;
+            Ok(Expression::ColumnRef(ColumnRefExpression::new(binding, ty)))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let group_index = bind_context.generate_table_index();
+    let group_binding_map = rewrite
+        .group_ordinals
+        .iter()
+        .enumerate()
+        .map(|(group_ordinal, &outer_ordinal)| {
+            (
+                rewrite.outer_bindings[outer_ordinal],
+                ColumnBinding::new(group_index, group_ordinal),
+            )
+        })
+        .collect::<HashMap<_, _>>();
     let aggregate_index = scalar_aggregate.aggregate_index;
-    let mut aggregate = Aggregate::new(
+    let aggregate = Aggregate::new(
         group_index,
         aggregate_index,
         scalar_aggregate.groupings_index,
@@ -1205,20 +1331,6 @@ fn apply_grouped_join_rewrite(
         vec![Expression::Aggregate(rewrite.aggregate.clone())],
         Vec::new(),
     );
-    let determinant_set = rewrite
-        .determinant_groups
-        .iter()
-        .copied()
-        .collect::<HashSet<_>>();
-    let dependents = (0..rewrite.outer_bindings.len())
-        .filter(|index| !determinant_set.contains(index))
-        .collect::<Vec<_>>();
-    if !dependents.is_empty() {
-        aggregate.group_dependencies.push(GroupDependency {
-            determinants: rewrite.determinant_groups.into_boxed_slice(),
-            dependents: dependents.into_boxed_slice(),
-        });
-    }
     let aggregate = LogicalPlan::new(bind_context, LogicalOperator::Aggregate(aggregate));
     let aggregate_binding = ColumnBinding::new(aggregate_index, 0);
     let aggregate_type = rewrite.aggregate.return_type.clone();
@@ -1231,41 +1343,80 @@ fn apply_grouped_join_rewrite(
         })
     });
     if !expression_uses_only_binding(&scalar, aggregate_binding) {
-        return None;
+        return Err(paro_error::internal(
+            "grouped-join scalar witness contains an unexpected binding",
+        ));
     }
     filter.expressions = filter
         .expressions
         .into_iter()
         .map(|expression| {
-            expression.replace_column_ref(&|column| {
+            let expression = expression.replace_column_ref(&|column| {
                 (column.depth == 0 && column.binding == rewrite.scalar_binding)
                     .then(|| scalar.clone())
+            });
+            expression.replace_column_ref(&|column| {
+                (column.depth == 0)
+                    .then(|| group_binding_map.get(&column.binding).copied())
+                    .flatten()
+                    .map(|binding| {
+                        Expression::ColumnRef(ColumnRefExpression::new(
+                            binding,
+                            column.return_type.clone(),
+                        ))
+                    })
             })
         })
         .collect();
     filter.child = Box::new(aggregate);
-    filter.projection_map = (0..rewrite.outer_bindings.len()).collect::<Vec<_>>().into();
-    Some(LogicalPlan::new(
+    filter.projection_map = (0..rewrite.group_ordinals.len()).collect::<Vec<_>>().into();
+    let filter = LogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
+
+    let output_expressions = (0..rewrite.output_width)
+        .map(|outer_ordinal| {
+            let outer_binding = rewrite.outer_bindings[outer_ordinal];
+            let ty = rewrite.outer_types[outer_ordinal].clone();
+            match group_binding_map.get(&outer_binding).copied() {
+                Some(binding) => Expression::ColumnRef(ColumnRefExpression::new(binding, ty)),
+                None => Expression::Constant(ConstantExpression::new(Value::Null(ty.clone()), ty)),
+            }
+        })
+        .collect::<Vec<_>>();
+    let output_table_index = rewrite
+        .outer_bindings
+        .first()
+        .ok_or_else(|| paro_error::internal("grouped-join witness has no outer bindings"))?
+        .table_index;
+    Ok(LogicalPlan::new(
         bind_context,
-        LogicalOperator::Filter(filter),
+        LogicalOperator::Projection(Projection::new(
+            output_table_index,
+            filter,
+            output_expressions,
+        )),
     ))
 }
 
 fn take_direct_delim_join_source(
     plan: LogicalPlan,
     delim_table_index: usize,
-) -> Option<LogicalPlan> {
+    source_side: DirectSourceSide,
+) -> Result<LogicalPlan> {
     let LogicalOperator::Join(Join::Comparison(join)) = plan.operator else {
-        return None;
+        return Err(paro_error::internal(
+            "direct DelimGet witness no longer points to a comparison join",
+        ));
     };
     let left_is_delim = matches!(&join.left.operator, LogicalOperator::DelimGet(delim)
         if delim.table_index == delim_table_index);
     let right_is_delim = matches!(&join.right.operator, LogicalOperator::DelimGet(delim)
         if delim.table_index == delim_table_index);
-    match (left_is_delim, right_is_delim) {
-        (true, false) => Some(*join.right),
-        (false, true) => Some(*join.left),
-        _ => None,
+    match (source_side, left_is_delim, right_is_delim) {
+        (DirectSourceSide::LeftDelim, true, false) => Ok(*join.right),
+        (DirectSourceSide::RightDelim, false, true) => Ok(*join.left),
+        _ => Err(paro_error::internal(
+            "direct DelimGet source side no longer matches its witness",
+        )),
     }
 }
 
@@ -1556,4 +1707,48 @@ fn expression_uses_only_binding(expression: &Expression, binding: ColumnBinding)
 fn is_movable(expression: &Expression) -> bool {
     let properties = expression.evaluation_properties();
     properties.can_share_evaluation() && !properties.is_reorder_fence()
+}
+
+#[cfg(test)]
+mod proof_tests {
+    use paro_common::types::LogicalType;
+    use paro_planner::binder::context::BindContext;
+    use paro_planner::operator::DelimGet;
+
+    use super::*;
+
+    #[test]
+    fn direct_delim_source_rejects_unconsumed_residual_condition() {
+        let context = BindContext::new();
+        let delim_index = 10;
+        let delim = LogicalPlan::new(
+            &context,
+            LogicalOperator::DelimGet(DelimGet::new(delim_index, vec![LogicalType::BigInt])),
+        );
+        let inner = LogicalPlan::dummy_scan(&context);
+        let column = |table_index, column_index| {
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(table_index, column_index),
+                LogicalType::BigInt,
+            ))
+        };
+        let plan = LogicalPlan::new(
+            &context,
+            LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                delim,
+                inner,
+                vec![
+                    JoinCondition::new(
+                        column(delim_index, 0),
+                        column(20, 0),
+                        JoinComparisonType::Equal,
+                    ),
+                    JoinCondition::new(column(20, 0), column(20, 1), JoinComparisonType::Equal),
+                ],
+            ))),
+        );
+
+        assert!(direct_delim_join_source(&plan, delim_index, 1).is_none());
+    }
 }

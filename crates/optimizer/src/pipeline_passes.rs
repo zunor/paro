@@ -233,7 +233,7 @@ impl Rewriter for CorrelatedPartitionAggregatePass {
     }
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        Ok(CorrelatedPartitionAggregate::new(ctx.bind_context.clone()).optimize_plan(plan))
+        CorrelatedPartitionAggregate::new(ctx.bind_context.clone()).optimize_plan(plan)
     }
 }
 

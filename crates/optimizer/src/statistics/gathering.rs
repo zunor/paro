@@ -1151,6 +1151,19 @@ mod tests {
             adjust_join_estimate(inner, left, right, JoinType::Single),
             left
         );
+
+        // This is the correlated-aggregate failure shape: the dependent side
+        // currently estimates to zero, but MARK/SINGLE still emit one derived
+        // value for every preserved row.
+        let empty = CardinalityEstimate::exact(0);
+        assert_eq!(
+            adjust_join_estimate(empty, left, empty, JoinType::Mark),
+            left
+        );
+        assert_eq!(
+            adjust_join_estimate(empty, left, empty, JoinType::Single),
+            left
+        );
     }
 
     #[test]
