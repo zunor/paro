@@ -98,6 +98,7 @@ fn staged_later_short_read_falls_back_to_gather_and_realigns_iterators() {
             PredicateColumnAccess::Typed { raw_width: Some(4) },
         ],
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let mut matches = Vec::new();
     let mut stats = PredicateStageReadStats::default();
@@ -173,6 +174,51 @@ fn compile_tree_coalesces_same_column_comparisons_only_inside_and() {
 }
 
 #[test]
+fn equal_priority_fixed_ranges_read_narrower_column_first() {
+    let column_map = HashMap::from([(6, 0), (10, 1)]);
+    let column_types = [
+        LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        },
+        LogicalType::Date,
+    ];
+    let tree = PredicateEvaluator::compile_tree(
+        &PredicateTree::And(vec![
+            PredicateTree::leaf(Predicate::Range {
+                column_id: 6,
+                lower: Value::Decimal(5, 15, 2),
+                upper: Value::Decimal(7, 15, 2),
+            }),
+            PredicateTree::leaf(Predicate::Range {
+                column_id: 10,
+                lower: Value::Date(0),
+                upper: Value::Date(364),
+            }),
+        ]),
+        &column_map,
+        &column_types,
+    )
+    .unwrap();
+
+    let CompiledPredicateTree::And(children) = tree else {
+        panic!("expected compiled AND");
+    };
+    assert!(matches!(
+        children.first(),
+        Some(CompiledPredicateTree::Leaf(
+            CompiledPredicate::FixedComparisons { column_idx: 1, .. }
+        ))
+    ));
+    assert!(matches!(
+        children.get(1),
+        Some(CompiledPredicateTree::Leaf(
+            CompiledPredicate::FixedComparisons { column_idx: 0, .. }
+        ))
+    ));
+}
+
+#[test]
 fn fixed_comparisons_read_raw_column_batches() {
     let column_map = HashMap::from([(7, 0)]);
     let column_types = [LogicalType::Integer];
@@ -191,6 +237,7 @@ fn fixed_comparisons_read_raw_column_batches() {
             raw_width: Some(std::mem::size_of::<i32>()),
         }],
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let values = [5_i32, 10, 19, 20];
     let data = values
@@ -243,6 +290,7 @@ fn fixed_range_reads_raw_column_batches() {
         predicate_iterators: std::iter::once(None).collect(),
         predicate_column_access: access.to_vec(),
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let data = [9_i32, 10, 20, 21]
         .into_iter()
@@ -257,6 +305,122 @@ fn fixed_range_reads_raw_column_batches() {
     evaluator.evaluate_batch(&batches, 4, &mut matches).unwrap();
 
     assert_eq!(matches, [1, 2]);
+}
+
+#[test]
+fn i32_range_seed_preserves_open_bounds_and_domain_edges() {
+    let evaluate = |predicates: Vec<PredicateTree>| {
+        let column_map = HashMap::from([(7, 0)]);
+        let tree = PredicateEvaluator::compile_tree(
+            &PredicateTree::And(predicates),
+            &column_map,
+            &[LogicalType::Integer],
+        )
+        .unwrap();
+        let evaluator = PredicateEvaluator {
+            program: CompiledPredicateProgram::legacy(tree),
+            predicate_columns: vec![7],
+            predicate_types: vec![LogicalType::Integer],
+            predicate_iterators: std::iter::once(None).collect(),
+            predicate_column_access: vec![PredicateColumnAccess::Typed {
+                raw_width: Some(std::mem::size_of::<i32>()),
+            }],
+            allocator: Arc::new(default_allocator()),
+            stage_scratch: PredicateStageScratch::default(),
+        };
+        let values = [i32::MIN, 1, 2, 3, 4, 5, i32::MAX];
+        let batch = PredicateColumnBatch::Raw(ColumnBatch::new(
+            Bytes::from(
+                values
+                    .into_iter()
+                    .flat_map(i32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ));
+        let mut matches = Vec::new();
+        evaluator
+            .evaluate_batch(&[batch], values.len(), &mut matches)
+            .unwrap();
+        matches
+    };
+
+    assert_eq!(
+        evaluate(vec![
+            PredicateTree::leaf(Predicate::Ge {
+                column_id: 7,
+                value: Value::Integer(2),
+            }),
+            PredicateTree::leaf(Predicate::Lt {
+                column_id: 7,
+                value: Value::Integer(5),
+            }),
+        ]),
+        [2, 3, 4]
+    );
+    assert!(evaluate(vec![PredicateTree::leaf(Predicate::Gt {
+        column_id: 7,
+        value: Value::Integer(i32::MAX),
+    })])
+    .is_empty());
+}
+
+#[test]
+fn i64_range_seed_preserves_open_bounds_and_domain_edges() {
+    let evaluate = |predicates: Vec<PredicateTree>| {
+        let column_map = HashMap::from([(7, 0)]);
+        let tree = PredicateEvaluator::compile_tree(
+            &PredicateTree::And(predicates),
+            &column_map,
+            &[LogicalType::BigInt],
+        )
+        .unwrap();
+        let evaluator = PredicateEvaluator {
+            program: CompiledPredicateProgram::legacy(tree),
+            predicate_columns: vec![7],
+            predicate_types: vec![LogicalType::BigInt],
+            predicate_iterators: std::iter::once(None).collect(),
+            predicate_column_access: vec![PredicateColumnAccess::Typed {
+                raw_width: Some(std::mem::size_of::<i64>()),
+            }],
+            allocator: Arc::new(default_allocator()),
+            stage_scratch: PredicateStageScratch::default(),
+        };
+        let values = [i64::MIN, 1, 2, 3, 4, 5, i64::MAX];
+        let batch = PredicateColumnBatch::Raw(ColumnBatch::new(
+            Bytes::from(
+                values
+                    .into_iter()
+                    .flat_map(i64::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ));
+        let mut matches = Vec::new();
+        evaluator
+            .evaluate_batch(&[batch], values.len(), &mut matches)
+            .unwrap();
+        matches
+    };
+
+    assert_eq!(
+        evaluate(vec![
+            PredicateTree::leaf(Predicate::Gt {
+                column_id: 7,
+                value: Value::BigInt(1),
+            }),
+            PredicateTree::leaf(Predicate::Le {
+                column_id: 7,
+                value: Value::BigInt(4),
+            }),
+        ]),
+        [2, 3, 4]
+    );
+    assert!(evaluate(vec![PredicateTree::leaf(Predicate::Gt {
+        column_id: 7,
+        value: Value::BigInt(i64::MAX),
+    })])
+    .is_empty());
 }
 
 #[test]
@@ -291,6 +455,7 @@ fn fixed_in_set_coalesces_with_ranges_and_reads_raw_batches() {
             raw_width: Some(std::mem::size_of::<i32>()),
         }],
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let values = [5_i32, 10, 20, 30, 40];
     let data = values
@@ -342,6 +507,7 @@ fn mixed_conjunction_filters_typed_columns_before_residuals() {
         predicate_iterators: std::iter::repeat_with(|| None).take(2).collect(),
         predicate_column_access: access.to_vec(),
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let raw = [1_i32, 2, 3, 4]
         .into_iter()
@@ -393,6 +559,7 @@ fn fixed_column_comparison_reads_both_raw_batches_with_filter_null_semantics() {
         predicate_iterators: std::iter::repeat_with(|| None).take(2).collect(),
         predicate_column_access: access.to_vec(),
         allocator: Arc::new(default_allocator()),
+        stage_scratch: PredicateStageScratch::default(),
     };
     let raw_batch = |values: [i32; 4], nulls: &'static [u8]| {
         PredicateColumnBatch::Raw(ColumnBatch::new(
@@ -478,6 +645,7 @@ fn varchar_comparison_filters_raw_varlen_bytes_without_materializing_a_vector() 
         predicate_iterators: std::iter::once(None).collect(),
         predicate_column_access: vec![PredicateColumnAccess::Typed { raw_width: None }],
         allocator,
+        stage_scratch: PredicateStageScratch::default(),
     };
     let batches = [batch];
     let mut matches = Vec::new();
@@ -526,6 +694,7 @@ fn prefix_membership_filters_borrowed_binary_plain_page() {
         predicate_iterators: std::iter::once(None).collect(),
         predicate_column_access: vec![PredicateColumnAccess::Typed { raw_width: None }],
         allocator,
+        stage_scratch: PredicateStageScratch::default(),
     };
     let mut matches = Vec::new();
 

@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use super::segment::PositionedFile;
 use super::*;
 use crate::index::{
     FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateResult, PredicateTree,
@@ -20,6 +21,28 @@ fn create_int_schema() -> TabletSchemaRef {
         TabletColumn::new(1, "value", LogicalType::Integer),
     ];
     Arc::new(TabletSchema::new(1, columns, KeysType::PrimaryKeys).unwrap())
+}
+
+#[test]
+fn positioned_segment_file_cursors_do_not_share_seek_state() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(b"0123456789").unwrap();
+    let mut left = PositionedFile::new(Arc::new(file));
+    let mut right = left.clone();
+
+    left.seek(SeekFrom::Start(2)).unwrap();
+    right.seek(SeekFrom::Start(7)).unwrap();
+    let mut left_bytes = [0u8; 2];
+    let mut right_bytes = [0u8; 2];
+    left.read_exact(&mut left_bytes).unwrap();
+    right.read_exact(&mut right_bytes).unwrap();
+
+    assert_eq!(&left_bytes, b"23");
+    assert_eq!(&right_bytes, b"78");
+    assert_eq!(left.stream_position().unwrap(), 4);
+    assert_eq!(right.stream_position().unwrap(), 9);
 }
 
 #[test]

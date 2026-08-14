@@ -376,7 +376,12 @@ impl FixedComparisonValues {
                 }
                 filter_fixed_batch(batch, kernel, rows, selection, seed)
             }
-            Self::I64(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
+            Self::I64(kernel) => {
+                if try_filter_seed_i64_batch(batch, kernel, rows, selection, seed) {
+                    return Ok(());
+                }
+                filter_fixed_batch(batch, kernel, rows, selection, seed)
+            }
             Self::I128(kernel) => filter_fixed_batch(batch, kernel, rows, selection, seed),
         }
     }
@@ -390,9 +395,45 @@ impl FixedComparisonValues {
     }
 }
 
-fn try_filter_seed_i32_batch(
+fn inclusive_i64_bounds(kernel: &FixedConjunction<i64>) -> Option<Option<(i64, i64)>> {
+    match kernel.execution_shape() {
+        FixedKernelShape::Bounds {
+            lower: Some(lower),
+            upper: Some(upper),
+        } => {
+            let lower = if lower.inclusive {
+                Some(lower.value)
+            } else {
+                lower.value.checked_add(1)
+            };
+            let upper = if upper.inclusive {
+                Some(upper.value)
+            } else {
+                upper.value.checked_sub(1)
+            };
+            let (Some(lower), Some(upper)) = (lower, upper) else {
+                return Some(None);
+            };
+            Some((lower <= upper).then_some((lower, upper)))
+        }
+        FixedKernelShape::Bounds {
+            lower: None,
+            upper: Some(upper),
+        } => {
+            let upper = if upper.inclusive {
+                Some(upper.value)
+            } else {
+                upper.value.checked_sub(1)
+            };
+            Some(upper.map(|upper| (i64::MIN, upper)))
+        }
+        _ => None,
+    }
+}
+
+fn try_filter_seed_i64_batch(
     batch: &PredicateColumnBatch,
-    kernel: &FixedConjunction<i32>,
+    kernel: &FixedConjunction<i64>,
     rows: usize,
     selection: &mut Vec<usize>,
     seed: bool,
@@ -400,21 +441,21 @@ fn try_filter_seed_i32_batch(
     let PredicateColumnBatch::Raw(batch) = batch else {
         return false;
     };
-    let FixedKernelShape::Bounds {
-        lower: None,
-        upper: Some(upper_bound),
-    } = kernel.execution_shape()
-    else {
-        return false;
-    };
-    if !seed || batch.nulls.is_some() || !upper_bound.inclusive {
+    if !seed || batch.nulls.is_some() {
         return false;
     }
+    let Some(bounds) = inclusive_i64_bounds(kernel) else {
+        return false;
+    };
+    let Some((lower, upper)) = bounds else {
+        selection.clear();
+        return true;
+    };
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
     {
         unsafe {
-            filter_i32_upper_inclusive_neon(batch.data.as_ptr(), upper_bound.value, rows, selection)
+            filter_i64_range_inclusive_neon(batch.data.as_ptr(), lower, upper, rows, selection)
         }
     }
 
@@ -422,12 +463,7 @@ fn try_filter_seed_i32_batch(
     {
         if std::arch::is_x86_feature_detected!("avx2") {
             return unsafe {
-                filter_i32_upper_inclusive_avx2(
-                    batch.data.as_ptr(),
-                    upper_bound.value,
-                    rows,
-                    selection,
-                )
+                filter_i64_range_inclusive_avx2(batch.data.as_ptr(), lower, upper, rows, selection)
             };
         }
         return false;
@@ -440,6 +476,314 @@ fn try_filter_seed_i32_batch(
     {
         false
     }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn filter_i64_range_inclusive_neon(
+    input: *const u8,
+    lower: i64,
+    upper: i64,
+    rows: usize,
+    selection: &mut Vec<usize>,
+) -> bool {
+    use core::arch::aarch64::{
+        vandq_u64, vcgeq_s64, vcleq_s64, vdupq_n_s64, vld1q_u8, vreinterpretq_s64_u8, vst1q_u64,
+    };
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let lower_vector = unsafe { vdupq_n_s64(lower) };
+    let upper_vector = unsafe { vdupq_n_s64(upper) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 2 <= rows {
+        let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i64>())) };
+        let values = unsafe { vreinterpretq_s64_u8(bytes) };
+        let above_lower = unsafe { vcgeq_s64(values, lower_vector) };
+        let below_upper = unsafe { vcleq_s64(values, upper_vector) };
+        let matched = unsafe { vandq_u64(above_lower, below_upper) };
+        let mut lanes = [0u64; 2];
+        unsafe { vst1q_u64(lanes.as_mut_ptr(), matched) };
+        if lanes == [u64::MAX; 2] {
+            unsafe {
+                output.add(written).write(row);
+                output.add(written + 1).write(row + 1);
+            }
+            written += 2;
+        } else {
+            for (lane, &matched) in lanes.iter().enumerate() {
+                if matched != 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 2;
+    }
+    if row < rows {
+        let value = i64::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i64>())
+                .cast::<i64>()
+                .read_unaligned()
+        });
+        if value >= lower && value <= upper {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+    }
+    unsafe { selection.set_len(start + written) };
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_i64_range_inclusive_avx2(
+    input: *const u8,
+    lower: i64,
+    upper: i64,
+    rows: usize,
+    selection: &mut Vec<usize>,
+) -> bool {
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_pd, _mm256_cmpgt_epi64, _mm256_loadu_si256, _mm256_movemask_pd,
+        _mm256_or_si256, _mm256_set1_epi64x,
+    };
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let lower_vector = unsafe { _mm256_set1_epi64x(lower) };
+    let upper_vector = unsafe { _mm256_set1_epi64x(upper) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 4 <= rows {
+        let values = unsafe {
+            _mm256_loadu_si256(
+                input
+                    .add(row * std::mem::size_of::<i64>())
+                    .cast::<__m256i>(),
+            )
+        };
+        let below_lower = unsafe { _mm256_cmpgt_epi64(lower_vector, values) };
+        let above_upper = unsafe { _mm256_cmpgt_epi64(values, upper_vector) };
+        let rejected = unsafe {
+            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(
+                below_lower,
+                above_upper,
+            ))) as u32
+        };
+        if rejected == 0 {
+            for lane in 0..4 {
+                unsafe { output.add(written + lane).write(row + lane) };
+            }
+            written += 4;
+        } else {
+            for lane in 0..4 {
+                if rejected & (1 << lane) == 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 4;
+    }
+    while row < rows {
+        let value = i64::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i64>())
+                .cast::<i64>()
+                .read_unaligned()
+        });
+        if value >= lower && value <= upper {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
+}
+
+fn try_filter_seed_i32_batch(
+    batch: &PredicateColumnBatch,
+    kernel: &FixedConjunction<i32>,
+    rows: usize,
+    selection: &mut Vec<usize>,
+    seed: bool,
+) -> bool {
+    let PredicateColumnBatch::Raw(batch) = batch else {
+        return false;
+    };
+    if !seed || batch.nulls.is_some() {
+        return false;
+    }
+
+    let bounds = match kernel.execution_shape() {
+        FixedKernelShape::Bounds {
+            lower: Some(lower),
+            upper: Some(upper),
+        } => {
+            let lower = if lower.inclusive {
+                Some(lower.value)
+            } else {
+                lower.value.checked_add(1)
+            };
+            let upper = if upper.inclusive {
+                Some(upper.value)
+            } else {
+                upper.value.checked_sub(1)
+            };
+            let (Some(lower), Some(upper)) = (lower, upper) else {
+                selection.clear();
+                return true;
+            };
+            if lower > upper {
+                selection.clear();
+                return true;
+            }
+            Some((lower, upper))
+        }
+        FixedKernelShape::Bounds {
+            lower: None,
+            upper: Some(upper),
+        } if upper.inclusive => None,
+        _ => return false,
+    };
+
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        unsafe {
+            match bounds {
+                Some((lower, upper)) => filter_i32_range_inclusive_neon(
+                    batch.data.as_ptr(),
+                    lower,
+                    upper,
+                    rows,
+                    selection,
+                ),
+                None => {
+                    let FixedKernelShape::Bounds {
+                        lower: None,
+                        upper: Some(upper),
+                    } = kernel.execution_shape()
+                    else {
+                        unreachable!("one-sided upper bound was established above")
+                    };
+                    filter_i32_upper_inclusive_neon(
+                        batch.data.as_ptr(),
+                        upper.value,
+                        rows,
+                        selection,
+                    )
+                }
+            }
+        }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                match bounds {
+                    Some((lower, upper)) => filter_i32_range_inclusive_avx2(
+                        batch.data.as_ptr(),
+                        lower,
+                        upper,
+                        rows,
+                        selection,
+                    ),
+                    None => {
+                        let FixedKernelShape::Bounds {
+                            lower: None,
+                            upper: Some(upper),
+                        } = kernel.execution_shape()
+                        else {
+                            unreachable!("one-sided upper bound was established above")
+                        };
+                        filter_i32_upper_inclusive_avx2(
+                            batch.data.as_ptr(),
+                            upper.value,
+                            rows,
+                            selection,
+                        )
+                    }
+                }
+            };
+        }
+        return false;
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "x86_64", target_endian = "little")
+    )))]
+    {
+        false
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn filter_i32_range_inclusive_neon(
+    input: *const u8,
+    lower: i32,
+    upper: i32,
+    rows: usize,
+    selection: &mut Vec<usize>,
+) -> bool {
+    use core::arch::aarch64::{
+        vandq_u32, vcgeq_s32, vcleq_s32, vdupq_n_s32, vld1q_u8, vreinterpretq_s32_u8, vst1q_u32,
+    };
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let lower_vector = unsafe { vdupq_n_s32(lower) };
+    let upper_vector = unsafe { vdupq_n_s32(upper) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 4 <= rows {
+        let bytes = unsafe { vld1q_u8(input.add(row * std::mem::size_of::<i32>())) };
+        let values = unsafe { vreinterpretq_s32_u8(bytes) };
+        let above_lower = unsafe { vcgeq_s32(values, lower_vector) };
+        let below_upper = unsafe { vcleq_s32(values, upper_vector) };
+        let matched = unsafe { vandq_u32(above_lower, below_upper) };
+        let mut lanes = [0u32; 4];
+        unsafe { vst1q_u32(lanes.as_mut_ptr(), matched) };
+        if lanes == [u32::MAX; 4] {
+            unsafe {
+                output.add(written).write(row);
+                output.add(written + 1).write(row + 1);
+                output.add(written + 2).write(row + 2);
+                output.add(written + 3).write(row + 3);
+            }
+            written += 4;
+        } else {
+            for (lane, &matched) in lanes.iter().enumerate() {
+                if matched != 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 4;
+    }
+    while row < rows {
+        let value = i32::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i32>())
+                .cast::<i32>()
+                .read_unaligned()
+        });
+        if value >= lower && value <= upper {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
 }
 
 #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -556,6 +900,75 @@ unsafe fn filter_i32_upper_inclusive_avx2(
                 .read_unaligned()
         });
         if value <= upper {
+            unsafe { output.add(written).write(row) };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_i32_range_inclusive_avx2(
+    input: *const u8,
+    lower: i32,
+    upper: i32,
+    rows: usize,
+    selection: &mut Vec<usize>,
+) -> bool {
+    use core::arch::x86_64::{
+        __m256i, _mm256_castsi256_ps, _mm256_cmpgt_epi32, _mm256_loadu_si256, _mm256_movemask_ps,
+        _mm256_or_si256, _mm256_set1_epi32,
+    };
+
+    selection.reserve(rows);
+    let start = selection.len();
+    let output = selection.spare_capacity_mut().as_mut_ptr().cast::<usize>();
+    let lower_vector = unsafe { _mm256_set1_epi32(lower) };
+    let upper_vector = unsafe { _mm256_set1_epi32(upper) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 8 <= rows {
+        let values = unsafe {
+            _mm256_loadu_si256(
+                input
+                    .add(row * std::mem::size_of::<i32>())
+                    .cast::<__m256i>(),
+            )
+        };
+        let below_lower = unsafe { _mm256_cmpgt_epi32(lower_vector, values) };
+        let above_upper = unsafe { _mm256_cmpgt_epi32(values, upper_vector) };
+        let rejected = unsafe {
+            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
+                below_lower,
+                above_upper,
+            ))) as u32
+        };
+        if rejected == 0 {
+            for lane in 0..8 {
+                unsafe { output.add(written + lane).write(row + lane) };
+            }
+            written += 8;
+        } else {
+            for lane in 0..8 {
+                if rejected & (1 << lane) == 0 {
+                    unsafe { output.add(written).write(row + lane) };
+                    written += 1;
+                }
+            }
+        }
+        row += 8;
+    }
+    while row < rows {
+        let value = i32::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<i32>())
+                .cast::<i32>()
+                .read_unaligned()
+        });
+        if value >= lower && value <= upper {
             unsafe { output.add(written).write(row) };
             written += 1;
         }

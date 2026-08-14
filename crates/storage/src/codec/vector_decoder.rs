@@ -3,7 +3,9 @@
 
 use crate::codec::{nested_payload_codec, physical_layout};
 use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
-use crate::rowset::encoding::{BinaryPlainPageDecoder, BinaryPlainPageSlice};
+use crate::rowset::encoding::{
+    BinaryPlainPageBuilder, BinaryPlainPageDecoder, BinaryPlainPageSlice,
+};
 use bytes::Bytes;
 use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
@@ -368,6 +370,135 @@ fn decode_storage_dictionary_batch(
             source: DictionarySource::Storage,
         },
     )
+}
+
+/// Decode a sparse row-id lookup without inflating the complete storage
+/// dictionary into query-owned vector memory.
+///
+/// A dimension-table dictionary can contain thousands of unique strings while
+/// a post-TopN lookup references only tens of them. In that shape, build a
+/// batch-local dictionary from the referenced codes and preserve the outer
+/// dictionary vector representation. The localized child deliberately has no
+/// storage provenance: two row-id batches may select different dictionary
+/// entries at the same local ordinals and therefore cannot share dictionary
+/// function results by the original column identity.
+pub(crate) fn decode_sparse_column_batch(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    let Some(storage_dictionary) = &batch.storage_dictionary else {
+        return decode_column_batch(logical_type, batch, rows, allocator, None);
+    };
+    let Some(localized) =
+        localize_storage_dictionary(storage_dictionary, batch.nulls.as_deref(), rows)?
+    else {
+        return decode_storage_dictionary_batch(
+            logical_type,
+            storage_dictionary,
+            batch.nulls.as_deref(),
+            rows,
+            allocator,
+            None,
+            batch.has_verified_utf8(),
+            None,
+        );
+    };
+    decode_storage_dictionary_batch(
+        logical_type,
+        &localized,
+        batch.nulls.as_deref(),
+        rows,
+        allocator,
+        None,
+        batch.has_verified_utf8(),
+        None,
+    )
+}
+
+fn localize_storage_dictionary(
+    batch: &StorageDictionaryBatch,
+    nulls: Option<&[u8]>,
+    rows: usize,
+) -> Result<Option<StorageDictionaryBatch>> {
+    if batch.codes.len() != rows.saturating_mul(std::mem::size_of::<u32>()) {
+        return Err(paro_error::data_corrupted(
+            "Storage dictionary code count does not match sparse row count",
+        ));
+    }
+    if nulls.is_some_and(|flags| flags.len() < rows) {
+        return Err(paro_error::data_corrupted(
+            "Null map shorter than sparse dictionary row count",
+        ));
+    }
+
+    let mut dictionary = BinaryPlainPageDecoder::new(batch.dictionary.clone());
+    dictionary.init()?;
+    let dictionary_len = dictionary.count() as usize;
+    // Localization performs its own dictionary build and code remap. Require
+    // a substantial domain reduction so ordinary scans and tiny dictionaries
+    // retain the reader-local full-dictionary cache path.
+    if rows.saturating_mul(4) >= dictionary_len {
+        return Ok(None);
+    }
+
+    let mut referenced_codes = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            continue;
+        }
+        let start = row_idx * std::mem::size_of::<u32>();
+        let code = u32::from_le_bytes(
+            batch.codes[start..start + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("validated sparse dictionary code width"),
+        );
+        if code as usize >= dictionary_len {
+            return Err(paro_error::data_corrupted(format!(
+                "storage dictionary code {code} out of range {dictionary_len}"
+            )));
+        }
+        referenced_codes.push(code);
+    }
+    referenced_codes.sort_unstable();
+    referenced_codes.dedup();
+
+    let mut builder = BinaryPlainPageBuilder::new(batch.dictionary.len().max(1));
+    for &code in &referenced_codes {
+        let value = dictionary
+            .string_at(code)
+            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+        if !builder.add_slice(&value) {
+            return Err(paro_error::internal(
+                "localized dictionary unexpectedly exceeded source dictionary storage",
+            ));
+        }
+    }
+    let localized_dictionary = builder.finish()?;
+
+    let mut localized_codes = Vec::with_capacity(batch.codes.len());
+    for row_idx in 0..rows {
+        let local_code = if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            0
+        } else {
+            let start = row_idx * std::mem::size_of::<u32>();
+            let code = u32::from_le_bytes(
+                batch.codes[start..start + std::mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("validated sparse dictionary code width"),
+            );
+            u32::try_from(referenced_codes.binary_search(&code).map_err(|_| {
+                paro_error::internal("referenced dictionary code missing from localized domain")
+            })?)
+            .map_err(|_| paro_error::out_of_range("localized dictionary exceeds u32 domain"))?
+        };
+        localized_codes.extend_from_slice(&local_code.to_le_bytes());
+    }
+    Ok(Some(StorageDictionaryBatch {
+        dictionary: localized_dictionary,
+        codes: Bytes::from(localized_codes),
+    }))
 }
 
 fn decode_storage_binary_plain_batch(
@@ -1201,5 +1332,115 @@ mod tests {
         assert_eq!(first.get_string(1), Some("beta"));
         assert_eq!(second.get_string(0), Some("beta"));
         assert_eq!(second.get_string(1), Some("alpha"));
+    }
+
+    #[test]
+    fn sparse_decode_localizes_large_dictionary_domain() {
+        let mut builder = BinaryPlainPageBuilder::new(64 * 1024);
+        for index in 0..128 {
+            assert!(builder.add_slice(format!("dictionary_value_{index:03}").as_bytes()));
+        }
+        let dictionary = builder.finish().unwrap();
+        let batch = ColumnBatch::with_storage_dictionary(
+            dictionary,
+            Bytes::from(
+                [91_u32, 3, 91, 127]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("dictionary_value_091"));
+        assert_eq!(vector.get_string(1), Some("dictionary_value_003"));
+        assert_eq!(vector.get_string(2), Some("dictionary_value_091"));
+        assert_eq!(vector.get_string(3), Some("dictionary_value_127"));
+        let info = vector.dictionary_info().expect("localized dictionary");
+        assert_eq!(info.unique_len, 3);
+        assert_eq!(info.provenance_id, None);
+    }
+
+    #[test]
+    fn sparse_dictionary_localization_preserves_nulls_and_duplicate_codes() {
+        let mut builder = BinaryPlainPageBuilder::new(64 * 1024);
+        for index in 0..64 {
+            assert!(builder.add_slice(format!("entry_{index:03}_payload").as_bytes()));
+        }
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(
+                [41_u32, 7, 41, 3]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            Some(Bytes::from_static(&[0, 1, 0, 0])),
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("entry_041_payload"));
+        assert!(vector.is_null(1));
+        assert_eq!(vector.get_string(2), Some("entry_041_payload"));
+        assert_eq!(vector.get_string(3), Some("entry_003_payload"));
+        assert_eq!(
+            vector
+                .dictionary_info()
+                .expect("localized dictionary")
+                .unique_len,
+            3,
+            "two referenced values plus the canonical null slot"
+        );
+    }
+
+    #[test]
+    fn sparse_decode_keeps_small_dictionary_domain() {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        assert!(builder.add_slice(b"alpha"));
+        assert!(builder.add_slice(b"beta"));
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(
+                [1_u32, 1]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            2,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("beta"));
+        assert_eq!(vector.get_string(1), Some("beta"));
+        assert_eq!(
+            vector
+                .dictionary_info()
+                .expect("storage dictionary")
+                .unique_len,
+            2,
+            "small domains should not pay for local dictionary reconstruction"
+        );
     }
 }

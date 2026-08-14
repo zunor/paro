@@ -1073,6 +1073,22 @@ fn tablet_reader_get_by_rowids_resolves_partial_update_columns() {
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(2));
     assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(20));
     assert_eq!(chunk.column(2).unwrap().get_i32(0), Some(222));
+
+    let rowid_reader = crate::tablet::TabletRowIdReader::new(
+        table.tablet(),
+        table
+            .tablet()
+            .capture_consistent_rowsets(table.max_version())
+            .unwrap(),
+        Arc::new(paro_common::allocator::default_allocator()),
+    )
+    .unwrap();
+    let chunk = rowid_reader
+        .get_by_rowids(&[row_ids_after[&2]], &[0, 1, 2])
+        .unwrap();
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(2));
+    assert_eq!(chunk.column(1).unwrap().get_i32(0), Some(20));
+    assert_eq!(chunk.column(2).unwrap().get_i32(0), Some(222));
 }
 
 #[test]

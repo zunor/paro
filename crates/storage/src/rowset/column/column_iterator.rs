@@ -476,11 +476,11 @@ pub struct ScalarColumnIterator<R: Read + Seek> {
     /// File path for prefetch tasks
     file_path: Option<PathBuf>,
     /// Ordinal index
-    ordinal_index: OrdinalIndexReader,
+    ordinal_index: Arc<OrdinalIndexReader>,
     /// ZoneMap index (optional)
-    zonemap_index: Option<ZoneMapIndexReader>,
+    zonemap_index: Option<Arc<ZoneMapIndexReader>>,
     /// Column-global dictionary whose offsets were validated by the reader.
-    dictionary: Option<BinaryPlainPageDecoder>,
+    dictionary: Option<Arc<BinaryPlainPageDecoder>>,
     /// Current page index
     current_page_idx: Option<usize>,
     /// Current page decoder
@@ -506,9 +506,9 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         page_reader: PageReader,
         prefetcher: Option<Arc<Prefetcher>>,
         file_path: Option<PathBuf>,
-        ordinal_index: OrdinalIndexReader,
-        zonemap_index: Option<ZoneMapIndexReader>,
-        dictionary: Option<BinaryPlainPageDecoder>,
+        ordinal_index: Arc<OrdinalIndexReader>,
+        zonemap_index: Option<Arc<ZoneMapIndexReader>>,
+        dictionary: Option<Arc<BinaryPlainPageDecoder>>,
     ) -> Result<Self> {
         Ok(ScalarColumnIterator {
             meta,
@@ -729,7 +729,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                     BinaryDictPageDecoder::new(data, expected_num_elements)
                 };
                 if let Some(dictionary) = &self.dictionary {
-                    decoder.set_prepared_dictionary(dictionary.clone())?;
+                    decoder.set_prepared_dictionary(dictionary.as_ref().clone())?;
                 }
                 PageDecoderImpl::Dictionary {
                     decoder,
@@ -1060,7 +1060,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         let Some(dictionary) = self
             .dictionary
             .as_ref()
-            .map(BinaryPlainPageDecoder::encoded_data)
+            .map(|dictionary| dictionary.encoded_data())
             .cloned()
         else {
             return Ok(None);
@@ -1165,7 +1165,7 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
         let Some(dictionary) = self
             .dictionary
             .as_ref()
-            .map(BinaryPlainPageDecoder::encoded_data)
+            .map(|dictionary| dictionary.encoded_data())
             .cloned()
         else {
             return Ok(None);
@@ -1252,7 +1252,6 @@ impl<R: Read + Seek> ScalarColumnIterator<R> {
                         .try_into()
                         .expect("u32 code slice"),
                 );
-
                 if let Some(ref mut nulls) = nulls_out {
                     let is_null = span_nulls
                         .as_ref()
@@ -2119,7 +2118,7 @@ mod tests {
             create_page_reader(),
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )
@@ -2186,7 +2185,7 @@ mod tests {
             page_reader.clone(),
             None,
             None,
-            ordinal_index.clone(),
+            Arc::new(ordinal_index.clone()),
             None,
             None,
         )
@@ -2202,7 +2201,7 @@ mod tests {
             page_reader,
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )
@@ -2260,7 +2259,7 @@ mod tests {
             page_reader.clone(),
             None,
             None,
-            ordinal_index.clone(),
+            Arc::new(ordinal_index.clone()),
             None,
             None,
         )
@@ -2283,7 +2282,7 @@ mod tests {
             page_reader.clone(),
             None,
             None,
-            ordinal_index.clone(),
+            Arc::new(ordinal_index.clone()),
             None,
             None,
         )
@@ -2299,7 +2298,7 @@ mod tests {
             page_reader,
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )
@@ -2394,7 +2393,7 @@ mod tests {
             create_page_reader(),
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )
@@ -2425,7 +2424,7 @@ mod tests {
             create_page_reader(),
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )
@@ -2474,7 +2473,7 @@ mod tests {
             create_page_reader(),
             None,
             None,
-            ordinal_index,
+            Arc::new(ordinal_index),
             None,
             None,
         )

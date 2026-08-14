@@ -60,24 +60,45 @@ impl PredicateStageReadStats {
 pub(super) struct CompiledPredicateProgram {
     pub(super) tree: CompiledPredicateTree,
     stages: Option<Box<[PredicateStage]>>,
+    stage_children: Box<[usize]>,
 }
 
+#[derive(Clone, Copy)]
 struct PredicateStage {
     column_idx: usize,
-    child_indices: Vec<usize>,
+    child_start: usize,
+    child_end: usize,
+}
+
+#[derive(Default)]
+pub(super) struct PredicateStageScratch {
+    absolute_rowids: Vec<u32>,
+    candidate_rows: Vec<usize>,
 }
 
 impl CompiledPredicateProgram {
     pub(super) fn new(tree: CompiledPredicateTree, allow_staged_access: bool) -> Self {
-        let stages = allow_staged_access
+        let compiled = allow_staged_access
             .then(|| Self::compile_stages(&tree))
             .flatten();
-        Self { tree, stages }
+        let (stages, stage_children) = compiled.map_or_else(
+            || (None, Box::default()),
+            |(stages, children)| (Some(stages), children),
+        );
+        Self {
+            tree,
+            stages,
+            stage_children,
+        }
     }
 
     #[cfg(test)]
     pub(super) fn legacy(tree: CompiledPredicateTree) -> Self {
-        Self { tree, stages: None }
+        Self {
+            tree,
+            stages: None,
+            stage_children: Box::default(),
+        }
     }
 
     pub(super) fn is_staged(&self) -> bool {
@@ -88,11 +109,13 @@ impl CompiledPredicateProgram {
         self.stages.as_deref()
     }
 
-    fn compile_stages(tree: &CompiledPredicateTree) -> Option<Box<[PredicateStage]>> {
+    fn compile_stages(
+        tree: &CompiledPredicateTree,
+    ) -> Option<(Box<[PredicateStage]>, Box<[usize]>)> {
         let CompiledPredicateTree::And(children) = tree else {
             return None;
         };
-        let mut stages = Vec::<PredicateStage>::new();
+        let mut columns = Vec::<(usize, Vec<usize>)>::new();
         for (child_idx, child) in children.iter().enumerate() {
             let CompiledPredicateTree::Leaf(predicate) = child else {
                 return None;
@@ -104,19 +127,31 @@ impl CompiledPredicateProgram {
                 CompiledPredicate::Generic { .. }
                 | CompiledPredicate::FixedColumnComparison { .. } => return None,
             };
-            if let Some(stage) = stages
+            if let Some((_, children)) = columns
                 .iter_mut()
-                .find(|stage| stage.column_idx == column_idx)
+                .find(|(candidate, _)| *candidate == column_idx)
             {
-                stage.child_indices.push(child_idx);
+                children.push(child_idx);
             } else {
-                stages.push(PredicateStage {
-                    column_idx,
-                    child_indices: vec![child_idx],
-                });
+                columns.push((column_idx, vec![child_idx]));
             }
         }
-        (!stages.is_empty()).then(|| stages.into_boxed_slice())
+        if columns.is_empty() {
+            return None;
+        }
+        let child_count = columns.iter().map(|(_, children)| children.len()).sum();
+        let mut stages = Vec::with_capacity(columns.len());
+        let mut stage_children = Vec::with_capacity(child_count);
+        for (column_idx, children) in columns {
+            let child_start = stage_children.len();
+            stage_children.extend(children);
+            stages.push(PredicateStage {
+                column_idx,
+                child_start,
+                child_end: stage_children.len(),
+            });
+        }
+        Some((stages.into_boxed_slice(), stage_children.into_boxed_slice()))
     }
 }
 
@@ -136,6 +171,28 @@ impl PredicateEvaluator {
         matches: &mut Vec<usize>,
         stats: &mut PredicateStageReadStats,
     ) -> Result<usize> {
+        let mut scratch = std::mem::take(&mut self.stage_scratch);
+        let result = self.evaluate_staged_batch_inner(
+            start_ordinal,
+            max_rows,
+            cost_model,
+            matches,
+            stats,
+            &mut scratch,
+        );
+        self.stage_scratch = scratch;
+        result
+    }
+
+    fn evaluate_staged_batch_inner(
+        &mut self,
+        start_ordinal: u64,
+        max_rows: usize,
+        cost_model: ScanAccessCostModel,
+        matches: &mut Vec<usize>,
+        stats: &mut PredicateStageReadStats,
+        scratch: &mut PredicateStageScratch,
+    ) -> Result<usize> {
         let stage_count = self
             .program
             .stages()
@@ -146,29 +203,30 @@ impl PredicateEvaluator {
         let mut batch_end = start_ordinal;
 
         for stage_idx in 0..stage_count {
-            let (column_idx, child_indices) = {
-                let stage = &self
+            let stage = {
+                *self
                     .program
                     .stages()
-                    .expect("stage count was established above")[stage_idx];
-                (stage.column_idx, stage.child_indices.clone())
+                    .expect("stage count was established above")
+                    .get(stage_idx)
+                    .expect("stage count was established above")
             };
 
             if stage_idx == 0 {
                 let (rows_read, batch) =
-                    self.read_stage_sequential(column_idx, start_ordinal, max_rows)?;
+                    self.read_stage_sequential(stage.column_idx, start_ordinal, max_rows)?;
                 batch_rows = rows_read;
                 batch_end = start_ordinal.checked_add(rows_read as u64).ok_or_else(|| {
                     paro_error::data_corrupted("predicate batch ordinal overflow")
                 })?;
                 stats.add_sequential(stage_idx, rows_read);
-                self.filter_stage(&child_indices, &batch, rows_read, matches, true)?;
-                self.finish_stage_column(column_idx, batch_end)?;
+                self.filter_stage(stage, &batch, rows_read, matches, true)?;
+                self.finish_stage_column(stage.column_idx, batch_end)?;
                 continue;
             }
 
             if matches.is_empty() {
-                self.finish_stage_column(column_idx, batch_end)?;
+                self.finish_stage_column(stage.column_idx, batch_end)?;
                 continue;
             }
 
@@ -184,14 +242,16 @@ impl PredicateEvaluator {
                     paro_error::data_corrupted("predicate stage ordinal overflow")
                 })?;
                 let (rows_read, batch) =
-                    self.read_stage_sequential(column_idx, stage_start, span)?;
+                    self.read_stage_sequential(stage.column_idx, stage_start, span)?;
                 stats.add_sequential(stage_idx, rows_read);
                 if rows_read == span {
-                    let mut local_matches =
-                        matches.iter().map(|row| row - first).collect::<Vec<_>>();
-                    self.filter_stage(&child_indices, &batch, span, &mut local_matches, false)?;
-                    matches.clear();
-                    matches.extend(local_matches.into_iter().map(|row| first + row));
+                    for row in matches.iter_mut() {
+                        *row -= first;
+                    }
+                    self.filter_stage(stage, &batch, span, matches, false)?;
+                    for row in matches.iter_mut() {
+                        *row += first;
+                    }
                 } else {
                     // `ColumnIterator::next_batch` promises at most `span`
                     // rows, not an exact count. A page-aware implementation may
@@ -199,20 +259,16 @@ impl PredicateEvaluator {
                     // surviving candidates through the absolute gather API so
                     // the stage remains correct without materializing or
                     // concatenating the rest of the physical span.
-                    let gathered = self.filter_stage_gathered(
-                        column_idx,
-                        &child_indices,
-                        start_ordinal,
-                        matches,
-                    )?;
+                    let gathered =
+                        self.filter_stage_gathered(stage, start_ordinal, matches, scratch)?;
                     stats.add_gathered(stage_idx, gathered);
                 }
             } else {
                 let gathered =
-                    self.filter_stage_gathered(column_idx, &child_indices, start_ordinal, matches)?;
+                    self.filter_stage_gathered(stage, start_ordinal, matches, scratch)?;
                 stats.add_gathered(stage_idx, gathered);
             }
-            self.finish_stage_column(column_idx, batch_end)?;
+            self.finish_stage_column(stage.column_idx, batch_end)?;
         }
         Ok(batch_rows)
     }
@@ -270,40 +326,31 @@ impl PredicateEvaluator {
 
     fn filter_stage_gathered(
         &mut self,
-        column_idx: usize,
-        child_indices: &[usize],
+        stage: PredicateStage,
         start_ordinal: u64,
         matches: &mut Vec<usize>,
+        scratch: &mut PredicateStageScratch,
     ) -> Result<usize> {
-        let absolute_rowids = matches
-            .iter()
-            .map(|row| {
-                start_ordinal
-                    .checked_add(*row as u64)
-                    .and_then(|ordinal| u32::try_from(ordinal).ok())
-                    .ok_or_else(|| {
-                        paro_error::data_corrupted(
-                            "predicate gather row id exceeds the segment domain",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let batch = self.read_stage_gather(column_idx, &absolute_rowids)?;
-        let candidates = std::mem::take(matches);
-        let candidate_count = candidates.len();
-        let mut gathered_matches = Vec::new();
-        self.filter_stage(
-            child_indices,
-            &batch,
-            candidate_count,
-            &mut gathered_matches,
-            true,
-        )?;
-        matches.extend(
-            gathered_matches
-                .into_iter()
-                .map(|candidate_idx| candidates[candidate_idx]),
-        );
+        scratch.absolute_rowids.clear();
+        scratch.absolute_rowids.reserve(matches.len());
+        for row in matches.iter().copied() {
+            let absolute = start_ordinal
+                .checked_add(row as u64)
+                .and_then(|ordinal| u32::try_from(ordinal).ok())
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("predicate gather row id exceeds the segment domain")
+                })?;
+            scratch.absolute_rowids.push(absolute);
+        }
+        let batch = self.read_stage_gather(stage.column_idx, &scratch.absolute_rowids)?;
+        std::mem::swap(matches, &mut scratch.candidate_rows);
+        let candidate_count = scratch.candidate_rows.len();
+        matches.clear();
+        self.filter_stage(stage, &batch, candidate_count, matches, true)?;
+        for candidate_idx in matches.iter_mut() {
+            *candidate_idx = scratch.candidate_rows[*candidate_idx];
+        }
+        scratch.candidate_rows.clear();
         Ok(candidate_count)
     }
 
@@ -360,7 +407,7 @@ impl PredicateEvaluator {
 
     fn filter_stage(
         &self,
-        child_indices: &[usize],
+        stage: PredicateStage,
         batch: &PredicateColumnBatch,
         rows: usize,
         selection: &mut Vec<usize>,
@@ -371,6 +418,11 @@ impl PredicateEvaluator {
                 "staged predicate program is not a conjunction",
             ));
         };
+        let child_indices = self
+            .program
+            .stage_children
+            .get(stage.child_start..stage.child_end)
+            .ok_or_else(|| paro_error::internal("staged predicate child range is invalid"))?;
         for (position, child_idx) in child_indices.iter().copied().enumerate() {
             let child = children.get(child_idx).ok_or_else(|| {
                 paro_error::internal("staged predicate child index is out of bounds")

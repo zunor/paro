@@ -1133,7 +1133,13 @@ impl SegmentIterator {
                     .seek_to_ordinal(start_ordinal + to_read as u64)?;
                 (to_read, Vec::new())
             } else if staged_program {
-                let mut matches = Vec::new();
+                let mut matches = std::mem::take(
+                    &mut self
+                        .late_materialization
+                        .as_mut()
+                        .expect("late materialization requires selection state")
+                        .predicate_matches,
+                );
                 let rows_read = self
                     .predicate_evaluator
                     .as_mut()

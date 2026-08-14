@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 
 impl Segment {
     pub fn open(
@@ -129,6 +129,7 @@ impl Segment {
             meta,
             statistics,
             column_readers: RwLock::new(HashMap::new()),
+            shared_file: Mutex::new(Some(Arc::new(file))),
             short_key_index_decoder: RwLock::new(None),
             indexes: SegmentIndexes {
                 predicate: SegmentPredicateIndexes {
@@ -196,6 +197,7 @@ impl Segment {
             footer,
             meta,
             column_readers: RwLock::new(HashMap::new()),
+            shared_file: Mutex::new(None),
             short_key_index_decoder: RwLock::new(None),
             indexes: SegmentIndexes::default(),
             index_stats: SegmentIndexStats::default(),

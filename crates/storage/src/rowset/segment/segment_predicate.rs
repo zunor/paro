@@ -4,7 +4,7 @@
 use super::fixed_predicate::{FixedComparisonValues, FixedConjunction};
 use super::predicate_column::{PredicateColumnAccess, PredicateColumnBatch, PredicateColumnReuse};
 use super::segment::Segment;
-use super::segment_predicate_program::CompiledPredicateProgram;
+use super::segment_predicate_program::{CompiledPredicateProgram, PredicateStageScratch};
 use super::varlen_predicate::{VarlenConjunction, VarlenMatcher};
 use crate::buffer::Prefetcher;
 use crate::index::{
@@ -30,6 +30,7 @@ pub(super) struct PredicateEvaluator {
     pub(super) predicate_iterators: Vec<Option<Box<dyn ColumnIterator + Send + Sync>>>,
     pub(super) predicate_column_access: Vec<PredicateColumnAccess>,
     pub(super) allocator: Arc<dyn Allocator>,
+    pub(super) stage_scratch: PredicateStageScratch,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -256,6 +257,7 @@ impl PredicateEvaluator {
             predicate_iterators: iterators,
             predicate_column_access,
             allocator: Arc::new(default_allocator()),
+            stage_scratch: PredicateStageScratch::default(),
         }))
     }
 
@@ -485,33 +487,42 @@ impl PredicateEvaluator {
         )
     }
 
-    fn constant_filter_priority(predicate: &CompiledPredicateTree) -> (u8, usize) {
+    fn constant_filter_priority(predicate: &CompiledPredicateTree) -> (u8, usize, usize) {
         match predicate {
             CompiledPredicateTree::Leaf(CompiledPredicate::FixedComparisons {
                 comparisons,
                 ..
-            }) => comparisons.evaluation_priority(),
+            }) => {
+                let (class, cardinality_hint) = comparisons.evaluation_priority();
+                (class, cardinality_hint, comparisons.physical_width())
+            }
             CompiledPredicateTree::Leaf(CompiledPredicate::VarlenComparisons {
                 comparisons,
                 ..
-            }) => comparisons.evaluation_priority(),
-            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { matcher, .. }) => {
-                matcher.evaluation_priority()
+            }) => {
+                let (class, cardinality_hint) = comparisons.evaluation_priority();
+                (class, cardinality_hint, usize::MAX)
             }
-            _ => (u8::MAX, usize::MAX),
+            CompiledPredicateTree::Leaf(CompiledPredicate::VarlenMatch { matcher, .. }) => {
+                let (class, cardinality_hint) = matcher.evaluation_priority();
+                (class, cardinality_hint, usize::MAX)
+            }
+            _ => (u8::MAX, usize::MAX, usize::MAX),
         }
     }
 
-    fn conjunction_priority(predicate: &CompiledPredicateTree) -> (u8, usize) {
+    fn conjunction_priority(predicate: &CompiledPredicateTree) -> (u8, usize, usize) {
         let constant = Self::constant_filter_priority(predicate);
         if constant.0 != u8::MAX {
             return constant;
         }
         match predicate {
-            CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison { .. }) => (5, 0),
-            CompiledPredicateTree::Leaf(CompiledPredicate::Generic { .. }) => (6, 0),
-            CompiledPredicateTree::Or(_) => (7, 0),
-            CompiledPredicateTree::And(_) => (8, 0),
+            CompiledPredicateTree::Leaf(CompiledPredicate::FixedColumnComparison {
+                width, ..
+            }) => (5, 0, width.bytes()),
+            CompiledPredicateTree::Leaf(CompiledPredicate::Generic { .. }) => (6, 0, usize::MAX),
+            CompiledPredicateTree::Or(_) => (7, 0, usize::MAX),
+            CompiledPredicateTree::And(_) => (8, 0, usize::MAX),
             CompiledPredicateTree::Leaf(
                 CompiledPredicate::FixedComparisons { .. }
                 | CompiledPredicate::VarlenComparisons { .. }

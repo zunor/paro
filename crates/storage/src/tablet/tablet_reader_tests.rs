@@ -817,6 +817,80 @@ fn test_tablet_reader_emits_row_id_column() {
 }
 
 #[test]
+fn test_rowid_lookup_single_segment_restores_requested_order_without_flattening() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+    let schema = create_test_schema();
+    let rowset_dir = base.join("rowset_lookup_permutation");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment = create_segment_with_values(&schema, 0, &[10, 20, 30], &segment_path);
+    let rowset_id = 17u64;
+    let meta = RowsetMetaBuilder::with_id(rowset_id, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let mut scan = TabletReader::new(
+        tablet.clone(),
+        TabletReaderParams::with_version(0)
+            .with_columns(vec![0])
+            .with_emit_row_id(true),
+    )
+    .unwrap();
+    scan.prepare().unwrap();
+    let scanned = scan.get_next_chunk().unwrap().unwrap();
+    let raw_rowids = (0..scanned.size())
+        .map(|index| scanned.column(1).unwrap().get_i64(index).unwrap() as u64)
+        .collect::<Vec<_>>();
+
+    let requested = [raw_rowids[2], raw_rowids[0], raw_rowids[2], raw_rowids[1]];
+    let fetched = scan.get_by_rowids(&requested, &[2, 0]).unwrap();
+    assert_eq!(fetched.size(), 4);
+    assert_eq!(fetched.column_count(), 2);
+    assert_eq!(fetched.column(0).unwrap().get_i32(0), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(1), Some(0));
+    assert_eq!(fetched.column(0).unwrap().get_i32(2), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(3), Some(1));
+    assert_eq!(fetched.column(1).unwrap().get_i64(0), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(1), Some(10));
+    assert_eq!(fetched.column(1).unwrap().get_i64(2), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(3), Some(20));
+    assert_eq!(
+        fetched.column(0).unwrap().vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+
+    let point_reader = crate::tablet::TabletRowIdReader::new(
+        tablet.clone(),
+        tablet.capture_consistent_rowsets(0).unwrap(),
+        Arc::new(paro_common::allocator::default_allocator()),
+    )
+    .unwrap();
+    let fetched = point_reader.get_by_rowids(&requested, &[2, 0]).unwrap();
+    assert_eq!(fetched.size(), 4);
+    assert_eq!(fetched.column_count(), 2);
+    assert_eq!(fetched.column(0).unwrap().get_i32(0), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(1), Some(0));
+    assert_eq!(fetched.column(0).unwrap().get_i32(2), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(3), Some(1));
+    assert_eq!(fetched.column(1).unwrap().get_i64(0), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(1), Some(10));
+    assert_eq!(fetched.column(1).unwrap().get_i64(2), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(3), Some(20));
+    assert_eq!(
+        fetched.column(0).unwrap().vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+}
+
+#[test]
 fn test_tablet_reader_row_id_only_projection() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path();

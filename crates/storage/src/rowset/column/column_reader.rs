@@ -392,15 +392,15 @@ pub struct ColumnReader<R: Read + Seek> {
     /// File path for prefetch tasks
     file_path: Option<PathBuf>,
     /// Ordinal index (loaded lazily)
-    ordinal_index: Option<OrdinalIndexReader>,
+    ordinal_index: Option<Arc<OrdinalIndexReader>>,
     /// ZoneMap index (loaded lazily)
-    zonemap_index: Option<ZoneMapIndexReader>,
+    zonemap_index: Option<Arc<ZoneMapIndexReader>>,
     /// Parsed dictionary page (loaded lazily, for dict encoding).
     ///
     /// The offset table is validated once here and the immutable decoder is
     /// cloned into iterators. Data pages must not re-parse a column-global
     /// dictionary for every page or scan morsel.
-    dictionary: Option<BinaryPlainPageDecoder>,
+    dictionary: Option<Arc<BinaryPlainPageDecoder>>,
 }
 
 impl<R: Read + Seek> ColumnReader<R> {
@@ -452,7 +452,7 @@ impl<R: Read + Seek> ColumnReader<R> {
 
         let mut index = OrdinalIndexReader::from_bytes(&body)?;
         index.set_num_rows(self.meta.num_rows);
-        self.ordinal_index = Some(index);
+        self.ordinal_index = Some(Arc::new(index));
 
         Ok(())
     }
@@ -469,7 +469,7 @@ impl<R: Read + Seek> ColumnReader<R> {
 
         let (body, _footer, _) = self.page_reader.read_page(&mut self.reader, &opts)?;
 
-        self.zonemap_index = Some(ZoneMapIndexReader::from_bytes(&body)?);
+        self.zonemap_index = Some(Arc::new(ZoneMapIndexReader::from_bytes(&body)?));
 
         Ok(())
     }
@@ -488,7 +488,7 @@ impl<R: Read + Seek> ColumnReader<R> {
             let (body, _footer, _) = self.page_reader.read_page(&mut self.reader, &opts)?;
             let mut dictionary = BinaryPlainPageDecoder::new(body);
             dictionary.init()?;
-            self.dictionary = Some(dictionary);
+            self.dictionary = Some(Arc::new(dictionary));
         }
 
         Ok(())
@@ -563,9 +563,9 @@ pub struct SharedColumnReader<R: Read + Seek> {
     meta: ColumnReaderMeta,
     opts: ColumnReaderOptions,
     page_reader: PageReader,
-    ordinal_index: Option<OrdinalIndexReader>,
-    zonemap_index: Option<ZoneMapIndexReader>,
-    dictionary: Option<BinaryPlainPageDecoder>,
+    ordinal_index: Option<Arc<OrdinalIndexReader>>,
+    zonemap_index: Option<Arc<ZoneMapIndexReader>>,
+    dictionary: Option<Arc<BinaryPlainPageDecoder>>,
     _phantom: std::marker::PhantomData<R>,
 }
 
