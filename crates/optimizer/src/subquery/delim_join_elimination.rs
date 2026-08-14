@@ -292,6 +292,9 @@ impl DelimJoinElimination {
             LogicalOperator::Projection(proj) => {
                 Self::remove_first_redundant_join(&mut proj.child.operator)
             }
+            LogicalOperator::RowFetch(fetch) => {
+                Self::remove_first_redundant_join(&mut fetch.child.operator)
+            }
             LogicalOperator::ExternalProject(project) => {
                 Self::remove_first_redundant_join(&mut project.child.operator)
             }

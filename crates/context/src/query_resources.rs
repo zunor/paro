@@ -29,8 +29,6 @@ pub trait ConnectionInfoProvider: Send + Sync {
     fn snapshot(&self) -> ConnectionInfoSnapshot;
 }
 
-pub trait SharedPlanCacheHandle: Send + Sync {}
-
 pub trait GraphIndexProvider: Send + Sync {
     fn snapshot(&self, id: &GraphId) -> Option<GraphReadSnapshot>;
 
@@ -53,7 +51,6 @@ pub struct QueryResources {
     pub graph_index: Arc<dyn GraphIndexProvider>,
     pub python_runtime: Option<Arc<dyn PythonRuntimeProvider>>,
     pub governance: QueryResourceGovernance,
-    pub plan_cache: Option<Arc<dyn SharedPlanCacheHandle>>,
     pub connection_info: Option<Arc<dyn ConnectionInfoProvider>>,
 }
 

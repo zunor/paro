@@ -48,6 +48,15 @@ fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet
         LogicalOperator::Projection(proj) => {
             collect_table_bindings_recursive(&proj.child.operator, bindings);
         }
+        LogicalOperator::RowFetch(fetch) => {
+            bindings.extend(
+                fetch
+                    .sources
+                    .iter()
+                    .map(|source| source.materialized_table_index),
+            );
+            collect_table_bindings_recursive(&fetch.child.operator, bindings);
+        }
         LogicalOperator::ExternalProject(project) => {
             bindings.insert(project.project_index);
             collect_table_bindings_recursive(&project.child.operator, bindings);

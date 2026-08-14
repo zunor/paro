@@ -25,6 +25,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwapOption;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -191,10 +192,10 @@ pub struct JoinHashTable {
     entries: Mutex<HtEntryTable>,
 
     /// Optional exact index owner for bounded unique integer equality keys.
-    integer_index: Mutex<Option<Box<ExactIntegerJoinIndex>>>,
+    integer_index: ArcSwapOption<ExactIntegerJoinIndex>,
 
     /// Optional exact index for two-column BIGINT equality keys.
-    pair_integer_index: Mutex<Option<Box<ExactI64PairJoinIndex>>>,
+    pair_integer_index: ArcSwapOption<ExactI64PairJoinIndex>,
 
     /// Lazily allocated compact per-key summaries for fused reductions.
     grouped_reduction_extrema: Mutex<GroupedReductionExtremaState>,
@@ -210,12 +211,6 @@ pub struct JoinHashTable {
     /// Whether any build rows were appended without computing their hash.
     /// Hashing is deferred while a bounded exact integer index is viable.
     deferred_hashes: AtomicBool,
-
-    /// Lock-free read pointer published with `finalized`.
-    probe_integer_index: AtomicPtr<ExactIntegerJoinIndex>,
-
-    /// Lock-free read pointer for the two-BIGINT exact index.
-    probe_pair_integer_index: AtomicPtr<ExactI64PairJoinIndex>,
 
     /// Lock-free read pointer published after finalize.
     probe_entries: AtomicPtr<HtEntry>,
@@ -519,14 +514,12 @@ impl JoinHashTable {
             spill_layout,
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
-            integer_index: Mutex::new(None),
-            pair_integer_index: Mutex::new(None),
+            integer_index: ArcSwapOption::empty(),
+            pair_integer_index: ArcSwapOption::empty(),
             grouped_reduction_extrema: Mutex::new(GroupedReductionExtremaState::Unconfigured),
             integer_index_build_stats: Mutex::new(integer_index_build_stats),
             integer_key_kind,
             deferred_hashes: AtomicBool::new(false),
-            probe_integer_index: AtomicPtr::new(ptr::null_mut()),
-            probe_pair_integer_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
             bitmask: AtomicUsize::new(0),
@@ -601,8 +594,7 @@ impl JoinHashTable {
         let entries_size = self.entries.lock().unwrap().size_in_bytes();
         let integer_index_size = self
             .integer_index
-            .lock()
-            .unwrap()
+            .load()
             .as_ref()
             .map(|index| index.size_in_bytes())
             .unwrap_or(0);
@@ -903,13 +895,9 @@ impl JoinHashTable {
     pub fn reset_runtime_state(&self) {
         self.finalized.store(false, Ordering::Release);
         self.probe_entries.store(ptr::null_mut(), Ordering::Release);
-        self.probe_integer_index
-            .store(ptr::null_mut(), Ordering::Release);
-        self.probe_pair_integer_index
-            .store(ptr::null_mut(), Ordering::Release);
+        self.integer_index.store(None);
+        self.pair_integer_index.store(None);
         *self.entries.lock().unwrap() = HtEntryTable::default();
-        *self.integer_index.lock().unwrap() = None;
-        *self.pair_integer_index.lock().unwrap() = None;
         self.reset_grouped_reduction_extrema();
         self.capacity.store(0, Ordering::Relaxed);
         self.bitmask.store(0, Ordering::Relaxed);
@@ -922,25 +910,17 @@ impl JoinHashTable {
         vector_count: usize,
         output_slots: &mut [usize],
     ) -> Result<bool> {
-        let index_ptr = self.probe_integer_index.load(Ordering::Acquire);
-        if index_ptr.is_null() {
+        let index = self.integer_index.load();
+        let Some(index) = index.as_ref() else {
             return Ok(false);
-        }
-        unsafe {
-            // SAFETY: finalized publication keeps the boxed index alive until
-            // all breaker consumers complete.
-            (&*index_ptr).lookup_i64_group_slots(vector, vector_count, output_slots)
-        }
+        };
+        index.lookup_i64_group_slots(vector, vector_count, output_slots)
     }
 
     fn group_slot_for_build_row(&self, build_row: usize, row_ptr: *const u8) -> Option<usize> {
-        let index_ptr = self.probe_integer_index.load(Ordering::Acquire);
-        if index_ptr.is_null() {
-            return None;
-        }
-        unsafe {
-            (&*index_ptr).group_slot_for_build_row(build_row, row_ptr, self.build_row_layout.base())
-        }
+        self.integer_index.load().as_ref().and_then(|index| {
+            index.group_slot_for_build_row(build_row, row_ptr, self.build_row_layout.base())
+        })
     }
 
     pub fn reset_data_collection(&self) {
@@ -1173,10 +1153,7 @@ impl JoinHashTable {
     fn publish_integer_index(&self, built: BuiltIntegerIndex) -> Result<()> {
         self.chains_longer_than_one
             .store(built.has_long_chains, Ordering::Relaxed);
-        let index = Box::new(built.index);
-        let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut ExactIntegerJoinIndex;
-        *self.integer_index.lock().unwrap() = Some(index);
-        self.probe_integer_index.store(index_ptr, Ordering::Release);
+        self.integer_index.store(Some(Arc::new(built.index)));
         self.finalize_grouped_reduction_extrema()?;
         self.finalized.store(true, Ordering::Release);
         Ok(())
@@ -1185,28 +1162,29 @@ impl JoinHashTable {
     pub(crate) fn publish_build_time_integer_builder(
         &self,
         builder: ConcurrentBuildTimeIntegerIndexBuilder,
-    ) -> Result<()> {
-        let (index, has_long_chains) = builder.finish(|row_ptr, previous| {
+    ) -> Result<bool> {
+        let Some((index, has_long_chains)) = builder.finish(|row_ptr, previous| {
             self.build_row_layout
                 .set_next(row_ptr as *mut u8, previous as *const u8);
-        })?;
+        })?
+        else {
+            return Ok(false);
+        };
         self.publish_integer_index(BuiltIntegerIndex {
             index,
             has_long_chains,
-        })
+        })?;
+        Ok(true)
     }
 
     #[cfg(test)]
     fn has_integer_index(&self) -> bool {
-        !self.probe_integer_index.load(Ordering::Acquire).is_null()
+        self.integer_index.load().is_some()
     }
 
     #[cfg(test)]
     fn has_pair_integer_index(&self) -> bool {
-        !self
-            .probe_pair_integer_index
-            .load(Ordering::Acquire)
-            .is_null()
+        self.pair_integer_index.load().is_some()
     }
 
     /// Check if salt should be used for probing.
@@ -1304,9 +1282,8 @@ impl JoinHashTable {
             return Ok(());
         }
 
-        let integer_index = self.probe_integer_index.load(Ordering::Acquire);
-        if !integer_index.is_null() {
-            let index = unsafe { &*integer_index };
+        let integer_index = self.integer_index.load();
+        if let Some(index) = integer_index.as_ref() {
             Self::probe_exact_integer_index(index, keys, scan_structure, filtered_count)?;
             return Ok(());
         }

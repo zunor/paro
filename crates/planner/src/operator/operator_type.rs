@@ -11,6 +11,7 @@ pub enum LogicalOperatorType {
     Get,
     Filter,
     Projection,
+    RowFetch,
     ExternalProject,
     ExternalTable,
     Limit,

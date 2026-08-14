@@ -4,38 +4,57 @@
 //! Delay functionally-dependent aggregate payload until after a bounded TopN.
 
 use std::collections::{HashMap, HashSet};
-use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
-use paro_planner::operator::projection::{LateRowFetch, LateRowFetchSource};
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection,
+    Aggregate, ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, RowFetch,
+    RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
+use crate::cost_model::CostModel;
 use crate::expression::traversal::visit_expression;
 
 /// Rewrite every eligible subtree while preserving an ordinary narrow plan as
 /// the fallback for shapes whose dependency or expression domain is unclear.
-pub fn optimize_plan(plan: LogicalPlan, bind_context: &BindContext) -> (LogicalPlan, bool) {
+pub fn optimize_plan(
+    plan: LogicalPlan,
+    bind_context: &BindContext,
+    cost_model: &CostModel,
+) -> Result<(LogicalPlan, bool)> {
     let mut changed = false;
-    let plan = plan.map_children(|child| {
-        let (child, child_changed) = optimize_plan(child, bind_context);
+    let plan = plan.try_map_children(|child| {
+        let (child, child_changed) = optimize_plan(child, bind_context, cost_model)?;
         changed |= child_changed;
-        child
-    });
-    match prove_candidate(&plan) {
-        Some(proof) => (apply_rewrite(plan, proof, bind_context), true),
-        None => match prove_row_preserving_candidate(&plan) {
-            Some(proof) => (
-                apply_row_preserving_rewrite(plan, proof, bind_context),
+        Ok(child)
+    })?;
+    let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
+    Ok((plan, changed || node_changed))
+}
+
+/// Keep the comparatively large proof witnesses out of the recursive walk's
+/// stack frame. Real plans such as TPC-H Q15 are deep enough that reserving the
+/// proof/apply frame at every ancestor can exhaust an ordinary worker stack
+/// even though the traversal itself is finite.
+#[inline(never)]
+fn rewrite_node(
+    plan: LogicalPlan,
+    bind_context: &BindContext,
+    cost_model: &CostModel,
+) -> Result<(LogicalPlan, bool)> {
+    match prove_candidate(&plan, cost_model) {
+        Some(proof) => Ok((apply_rewrite(plan, proof, bind_context)?, true)),
+        None => match prove_row_preserving_candidate(&plan, cost_model) {
+            Some(proof) => Ok((
+                apply_row_preserving_rewrite(plan, proof, bind_context)?,
                 true,
-            ),
-            None => (plan, changed),
+            )),
+            None => Ok((plan, false)),
         },
     }
 }
@@ -55,6 +74,8 @@ struct RowPreservingSource {
     /// Output-only columns fetched after TopN has reduced the carrier to its
     /// bounded result cardinality.
     output_catalog_columns: HashMap<usize, usize>,
+    benefit: f64,
+    rowid_path: RowIdPath,
 }
 
 #[derive(Debug)]
@@ -63,19 +84,73 @@ struct Candidate {
     source_table_index: usize,
     table: Arc<TableCatalogEntry>,
     dependent_catalog_columns: HashMap<usize, usize>,
+    benefit: f64,
+    rowid_path: RowIdPath,
 }
 
-fn prove_candidate(plan: &LogicalPlan) -> Option<Candidate> {
+#[derive(Debug)]
+enum RowIdPath {
+    Get,
+    Filter(Box<RowIdPath>),
+    Window(Box<RowIdPath>),
+    Order(Box<RowIdPath>),
+    Limit(Box<RowIdPath>),
+    EmptyResult(Box<RowIdPath>),
+    Join {
+        kind: RowIdJoinKind,
+        side: RowIdJoinSide,
+        child: Box<RowIdPath>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RowIdJoinKind {
+    Comparison,
+    Any,
+    Cross,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RowIdJoinSide {
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RowIdPathPolicy {
+    /// The row survives each operator one-for-one; used when payload is
+    /// removed from an ordinary detail stream.
+    RowPreserving,
+    /// The source may be filtered or duplicated, but its rowid cannot be
+    /// null-extended; used as a functional-dependency group key.
+    NonNull,
+}
+
+impl RowIdPath {
+    fn stages(&self) -> usize {
+        match self {
+            Self::Get => 1,
+            Self::Filter(child)
+            | Self::Window(child)
+            | Self::Order(child)
+            | Self::Limit(child)
+            | Self::EmptyResult(child)
+            | Self::Join { child, .. } => child.stages() + 1,
+        }
+    }
+}
+
+fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
         return None;
     };
-    if topn.total_rows() == 0 || topn.total_rows() > 4096 {
+    if topn.total_rows() == 0 {
         return None;
     }
     let LogicalOperator::Projection(output) = &topn.child.operator else {
         return None;
     };
-    if output.late_row_fetch.is_some()
+    if matches!(output.child.operator, LogicalOperator::RowFetch(_))
         || output
             .expressions
             .iter()
@@ -147,18 +222,18 @@ fn prove_candidate(plan: &LogicalPlan) -> Option<Candidate> {
                 return None;
             }
             let source_table_index = first_column.binding.table_index;
+            let rowid_path = prove_rowid_path(
+                aggregate.child.as_ref(),
+                source_table_index,
+                RowIdPathPolicy::NonNull,
+            )?;
             let get = unique_get(aggregate.child.as_ref(), source_table_index)?;
-            if source_path_preserves_non_null_rowid(aggregate.child.as_ref(), source_table_index)
-                != Some(true)
-            {
-                return None;
-            }
             let table = get.table.as_ref()?.clone();
             if table.get_storage().is_none() {
                 return None;
             }
             let mut dependent_catalog_columns = HashMap::new();
-            let mut has_wide_payload = false;
+            let mut payload_types = Vec::with_capacity(proof.dependents.len());
             for &group_index in proof.dependents.iter() {
                 let Expression::ColumnRef(column) = &aggregate.groups[group_index] else {
                     return None;
@@ -170,14 +245,27 @@ fn prove_candidate(plan: &LogicalPlan) -> Option<Candidate> {
                 if catalog_column >= table.columns.len() {
                     return None;
                 }
-                has_wide_payload |= matches!(column.return_type, LogicalType::Varchar);
+                payload_types.push(column.return_type.clone());
                 dependent_catalog_columns.insert(group_index, catalog_column);
             }
-            has_wide_payload.then_some(Candidate {
+            let carrier_rows = aggregate.child.stats.estimated_cardinality?.expected;
+            let topn_rows = u64::try_from(topn.total_rows()).ok()?;
+            let fetched_rows = topn_rows.min(
+                output
+                    .child
+                    .stats
+                    .estimated_cardinality
+                    .map_or(carrier_rows, |estimate| estimate.expected),
+            );
+            let benefit =
+                cost_model.late_row_fetch_benefit(carrier_rows, fetched_rows, payload_types, 1)?;
+            Some(Candidate {
                 dependency,
                 source_table_index,
                 table,
                 dependent_catalog_columns,
+                benefit,
+                rowid_path,
             })
         })
         .filter(|candidate| {
@@ -196,20 +284,23 @@ fn prove_candidate(plan: &LogicalPlan) -> Option<Candidate> {
                         .contains_key(&output_column.binding.column_index)
             })
         })
-        .max_by_key(|candidate| candidate.dependent_catalog_columns.len())
+        .max_by(|left, right| left.benefit.total_cmp(&right.benefit))
 }
 
-fn prove_row_preserving_candidate(plan: &LogicalPlan) -> Option<RowPreservingCandidate> {
+fn prove_row_preserving_candidate(
+    plan: &LogicalPlan,
+    cost_model: &CostModel,
+) -> Option<RowPreservingCandidate> {
     let LogicalOperator::TopN(topn) = &plan.operator else {
         return None;
     };
-    if topn.total_rows() == 0 || topn.total_rows() > 4096 {
+    if topn.total_rows() == 0 {
         return None;
     }
     let LogicalOperator::Projection(output) = &topn.child.operator else {
         return None;
     };
-    if output.late_row_fetch.is_some()
+    if matches!(output.child.operator, LogicalOperator::RowFetch(_))
         || output
             .expressions
             .iter()
@@ -264,99 +355,66 @@ fn prove_row_preserving_candidate(plan: &LogicalPlan) -> Option<RowPreservingCan
                 table: table.clone(),
                 ordered_catalog_columns: HashMap::new(),
                 output_catalog_columns: HashMap::new(),
+                benefit: 0.0,
+                rowid_path: RowIdPath::Get,
             });
         if ordered_outputs.contains(&output_index) {
             source
                 .ordered_catalog_columns
                 .insert(output_index, catalog_column);
-        } else if matches!(column.return_type, LogicalType::Varchar) {
+        } else {
             source
                 .output_catalog_columns
                 .insert(output_index, catalog_column);
         }
     }
 
+    let carrier_rows = output.child.stats.estimated_cardinality?.expected;
+    let fetched_rows = u64::try_from(topn.total_rows()).ok()?.min(carrier_rows);
     let sources = by_source
         .into_values()
         .filter_map(|mut source| {
-            // Each fetch frontier opens a table reader. Delay an ordering
-            // frontier only when it displaces at least two columns including
-            // variable-width payload; a lone fixed key is cheaper to carry.
-            let ordered_worth_fetching = source.ordered_catalog_columns.len() >= 2
-                && source.ordered_catalog_columns.keys().any(|&output_index| {
-                    matches!(
-                        output.expressions[output_index].return_type(),
-                        LogicalType::Varchar
-                    )
-                });
-            // Output-only varlen payload is consumed after a bounded TopN.
-            // Even one such column is wider than the stable rowid that
-            // replaces it across the relational path, while the sparse base
-            // fetch is capped by `TopN::total_rows` above. Requiring two
-            // columns retained a lone string through every join/breaker and
-            // made join costing observe a needlessly wide intermediate.
-            let output_worth_fetching = !source.output_catalog_columns.is_empty();
+            let rowid_path = prove_rowid_path(
+                output.child.as_ref(),
+                source.source_table_index,
+                RowIdPathPolicy::RowPreserving,
+            )?;
+            let carrier_stages = rowid_path.stages();
+            let ordered_benefit = cost_model.late_row_fetch_benefit(
+                carrier_rows,
+                carrier_rows,
+                source
+                    .ordered_catalog_columns
+                    .keys()
+                    .map(|&index| output.expressions[index].return_type()),
+                carrier_stages,
+            );
+            let output_benefit = cost_model.late_row_fetch_benefit(
+                carrier_rows,
+                fetched_rows,
+                source
+                    .output_catalog_columns
+                    .keys()
+                    .map(|&index| output.expressions[index].return_type()),
+                carrier_stages,
+            );
 
-            if !ordered_worth_fetching {
+            if ordered_benefit.is_none() {
                 source.ordered_catalog_columns.clear();
             }
-            if !output_worth_fetching {
+            if output_benefit.is_none() {
                 source.output_catalog_columns.clear();
             }
+            source.benefit =
+                ordered_benefit.unwrap_or_default() + output_benefit.unwrap_or_default();
+            source.rowid_path = rowid_path;
 
             (!source.ordered_catalog_columns.is_empty()
                 || !source.output_catalog_columns.is_empty())
             .then_some(source)
         })
-        .filter(|source| {
-            row_preserving_source_path(output.child.as_ref(), source.source_table_index).is_some()
-        })
         .collect::<Vec<_>>();
     (!sources.is_empty()).then_some(RowPreservingCandidate { sources })
-}
-
-fn row_preserving_source_path(plan: &LogicalPlan, source_table_index: usize) -> Option<()> {
-    match &plan.operator {
-        LogicalOperator::Get(get) => (get.table_index == source_table_index).then_some(()),
-        LogicalOperator::Filter(filter) => {
-            row_preserving_source_path(filter.child.as_ref(), source_table_index)
-        }
-        LogicalOperator::Window(window) => {
-            row_preserving_source_path(window.child.as_ref(), source_table_index)
-        }
-        LogicalOperator::Order(order) => {
-            row_preserving_source_path(order.child.as_ref(), source_table_index)
-        }
-        LogicalOperator::Limit(limit) => {
-            row_preserving_source_path(limit.child.as_ref(), source_table_index)
-        }
-        LogicalOperator::EmptyResult(empty) => {
-            row_preserving_source_path(empty.child.as_ref(), source_table_index)
-        }
-        LogicalOperator::Join(Join::Comparison(join)) if join.join_type == JoinType::Inner => {
-            let left = unique_get(join.left.as_ref(), source_table_index).is_some();
-            let right = unique_get(join.right.as_ref(), source_table_index).is_some();
-            match (left, right) {
-                (true, false) => row_preserving_source_path(join.left.as_ref(), source_table_index),
-                (false, true) => {
-                    row_preserving_source_path(join.right.as_ref(), source_table_index)
-                }
-                _ => None,
-            }
-        }
-        LogicalOperator::Join(Join::Cross(join)) => {
-            let left = unique_get(join.left.as_ref(), source_table_index).is_some();
-            let right = unique_get(join.right.as_ref(), source_table_index).is_some();
-            match (left, right) {
-                (true, false) => row_preserving_source_path(join.left.as_ref(), source_table_index),
-                (false, true) => {
-                    row_preserving_source_path(join.right.as_ref(), source_table_index)
-                }
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }
 
 fn is_plain_grouping_domain(aggregate: &Aggregate) -> bool {
@@ -371,63 +429,99 @@ fn is_plain_grouping_domain(aggregate: &Aggregate) -> bool {
                 == (0..aggregate.groups.len()).collect())
 }
 
-/// Prove that the source rowid cannot be NULL at the aggregate input.
-///
-/// A base-table rowid is non-NULL, but an outer join may null-extend the side
-/// that produced it. Grouping by that nullable rowid would merge every
-/// unmatched row, so the late fetch is only valid when every join on the path
-/// preserves the source side.
-fn source_path_preserves_non_null_rowid(
+/// Return a structural witness from this operator to one unique base-table
+/// scan. The proof and mutation sides intentionally share this exact operator
+/// whitelist; an unrecognized node is a declined optimization, never a blind
+/// recursive rewrite.
+fn prove_rowid_path(
     plan: &LogicalPlan,
     source_table_index: usize,
-) -> Option<bool> {
-    if let LogicalOperator::Get(get) = &plan.operator {
-        return (get.table_index == source_table_index).then_some(true);
+    policy: RowIdPathPolicy,
+) -> Option<RowIdPath> {
+    if count_source_gets(plan, source_table_index) != 1 {
+        return None;
     }
+    prove_unique_rowid_path(plan, source_table_index, policy)
+}
 
+fn prove_unique_rowid_path(
+    plan: &LogicalPlan,
+    source_table_index: usize,
+    policy: RowIdPathPolicy,
+) -> Option<RowIdPath> {
     match &plan.operator {
-        LogicalOperator::Join(Join::Comparison(join)) => source_join_path_safety(
+        LogicalOperator::Get(get) => {
+            (get.table_index == source_table_index).then_some(RowIdPath::Get)
+        }
+        LogicalOperator::Filter(filter) => {
+            prove_unique_rowid_path(filter.child.as_ref(), source_table_index, policy)
+                .map(|path| RowIdPath::Filter(Box::new(path)))
+        }
+        LogicalOperator::Window(window) => {
+            prove_unique_rowid_path(window.child.as_ref(), source_table_index, policy)
+                .map(|path| RowIdPath::Window(Box::new(path)))
+        }
+        LogicalOperator::Order(order) => {
+            prove_unique_rowid_path(order.child.as_ref(), source_table_index, policy)
+                .map(|path| RowIdPath::Order(Box::new(path)))
+        }
+        LogicalOperator::Limit(limit) => {
+            prove_unique_rowid_path(limit.child.as_ref(), source_table_index, policy)
+                .map(|path| RowIdPath::Limit(Box::new(path)))
+        }
+        LogicalOperator::EmptyResult(empty) => {
+            prove_unique_rowid_path(empty.child.as_ref(), source_table_index, policy)
+                .map(|path| RowIdPath::EmptyResult(Box::new(path)))
+        }
+        LogicalOperator::Join(Join::Comparison(join)) => prove_join_rowid_path(
+            RowIdJoinKind::Comparison,
             join.join_type,
             join.left.as_ref(),
             join.right.as_ref(),
             source_table_index,
+            policy,
         ),
-        LogicalOperator::Join(Join::Any(join)) => source_join_path_safety(
+        LogicalOperator::Join(Join::Any(join)) => prove_join_rowid_path(
+            RowIdJoinKind::Any,
             join.join_type,
             join.left.as_ref(),
             join.right.as_ref(),
             source_table_index,
+            policy,
         ),
-        LogicalOperator::Join(Join::Cross(join)) => {
-            let left = source_path_preserves_non_null_rowid(join.left.as_ref(), source_table_index);
-            let right =
-                source_path_preserves_non_null_rowid(join.right.as_ref(), source_table_index);
-            merge_unique_path(left, right)
-        }
-        _ => {
-            let mut matched = None;
-            for child in plan.children() {
-                matched = merge_unique_path(
-                    matched,
-                    source_path_preserves_non_null_rowid(child, source_table_index),
-                );
-                if matched == Some(false) {
-                    break;
-                }
-            }
-            matched
-        }
+        LogicalOperator::Join(Join::Cross(join)) => prove_join_rowid_path(
+            RowIdJoinKind::Cross,
+            JoinType::Inner,
+            join.left.as_ref(),
+            join.right.as_ref(),
+            source_table_index,
+            policy,
+        ),
+        _ => None,
     }
 }
 
-fn source_join_path_safety(
+fn prove_join_rowid_path(
+    kind: RowIdJoinKind,
     join_type: JoinType,
     left: &LogicalPlan,
     right: &LogicalPlan,
     source_table_index: usize,
-) -> Option<bool> {
-    let left_path = source_path_preserves_non_null_rowid(left, source_table_index).map(|safe| {
-        safe && matches!(
+    policy: RowIdPathPolicy,
+) -> Option<RowIdPath> {
+    let left_count = count_source_gets(left, source_table_index);
+    let right_count = count_source_gets(right, source_table_index);
+    let (side, child_plan) = match (left_count, right_count) {
+        (1, 0) => (RowIdJoinSide::Left, left),
+        (0, 1) => (RowIdJoinSide::Right, right),
+        _ => return None,
+    };
+    let allowed = match (policy, kind, side) {
+        (RowIdPathPolicy::RowPreserving, RowIdJoinKind::Comparison, _)
+        | (RowIdPathPolicy::RowPreserving, RowIdJoinKind::Cross, _) => join_type == JoinType::Inner,
+        (RowIdPathPolicy::RowPreserving, RowIdJoinKind::Any, _) => false,
+        (RowIdPathPolicy::NonNull, RowIdJoinKind::Cross, _) => true,
+        (RowIdPathPolicy::NonNull, _, RowIdJoinSide::Left) => matches!(
             join_type,
             JoinType::Inner
                 | JoinType::Left
@@ -435,38 +529,47 @@ fn source_join_path_safety(
                 | JoinType::Anti
                 | JoinType::Mark
                 | JoinType::Single
-        )
-    });
-    let right_path = source_path_preserves_non_null_rowid(right, source_table_index).map(|safe| {
-        safe && matches!(
+        ),
+        (RowIdPathPolicy::NonNull, _, RowIdJoinSide::Right) => matches!(
             join_type,
             JoinType::Inner | JoinType::Right | JoinType::RightSemi | JoinType::RightAnti
-        )
-    });
-    merge_unique_path(left_path, right_path)
+        ),
+    };
+    if !allowed {
+        return None;
+    }
+    let child = prove_unique_rowid_path(child_plan, source_table_index, policy)?;
+    Some(RowIdPath::Join {
+        kind,
+        side,
+        child: Box::new(child),
+    })
 }
 
-fn merge_unique_path(left: Option<bool>, right: Option<bool>) -> Option<bool> {
-    match (left, right) {
-        (None, path) | (path, None) => path,
-        // The candidate proof requires one unique source Get. Treat any
-        // unexpected duplicate path as unsafe instead of choosing one.
-        (Some(_), Some(_)) => Some(false),
-    }
+fn count_source_gets(plan: &LogicalPlan, source_table_index: usize) -> usize {
+    let here = usize::from(matches!(
+        &plan.operator,
+        LogicalOperator::Get(get) if get.table_index == source_table_index
+    ));
+    plan.children().into_iter().fold(here, |count, child| {
+        count
+            .saturating_add(count_source_gets(child, source_table_index))
+            .min(2)
+    })
 }
 
 fn apply_rewrite(
     plan: LogicalPlan,
     candidate: Candidate,
     bind_context: &BindContext,
-) -> LogicalPlan {
+) -> Result<LogicalPlan> {
     let LogicalPlan {
         id: topn_id,
         stats: topn_stats,
         operator: LogicalOperator::TopN(mut topn),
     } = plan
     else {
-        unreachable!("late payload proof requires TopN")
+        return Err(rewrite_invariant("aggregate candidate root is not TopN"));
     };
     let output_plan = *topn.child;
     let LogicalPlan {
@@ -475,7 +578,9 @@ fn apply_rewrite(
         ..
     } = output_plan
     else {
-        unreachable!("late payload proof requires Projection")
+        return Err(rewrite_invariant(
+            "aggregate candidate child is not Projection",
+        ));
     };
     let aggregate_plan = *output.child;
     let LogicalPlan {
@@ -484,29 +589,39 @@ fn apply_rewrite(
         operator: LogicalOperator::Aggregate(mut aggregate),
     } = aggregate_plan
     else {
-        unreachable!("late payload proof requires Aggregate")
+        return Err(rewrite_invariant(
+            "aggregate candidate payload child is not Aggregate",
+        ));
     };
 
     let required_output_bindings =
         collect_column_bindings(aggregate.groups.iter().chain(&aggregate.aggregates));
     let rowid_binding = append_virtual_rowid(
         aggregate.child.as_mut(),
+        &candidate.rowid_path,
         candidate.source_table_index,
         candidate.table.columns.len(),
         &required_output_bindings,
     )
-    .expect("late payload proof established a unique source Get");
+    .ok_or_else(|| rewrite_invariant("rowid witness no longer matches aggregate source"))?;
     let rowid_expression =
         Expression::ColumnRef(ColumnRefExpression::new(rowid_binding, LogicalType::BigInt));
 
-    let dependent = aggregate.group_dependencies[candidate.dependency]
+    let dependent = aggregate
+        .group_dependencies
+        .get(candidate.dependency)
+        .ok_or_else(|| rewrite_invariant("group dependency ordinal is stale"))?
         .dependents
         .iter()
         .copied()
         .collect::<HashSet<_>>();
     let old_group_count = aggregate.groups.len();
+    let compacted_group_count = old_group_count
+        .checked_sub(dependent.len())
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| rewrite_invariant("dependent group set exceeds aggregate groups"))?;
     let mut old_to_new = vec![None; old_group_count];
-    let mut groups = Vec::with_capacity(old_group_count - dependent.len() + 1);
+    let mut groups = Vec::with_capacity(compacted_group_count);
     let mut group_stats = Vec::with_capacity(groups.capacity());
     for (old_index, (group, stats)) in aggregate
         .groups
@@ -539,7 +654,9 @@ fn apply_rewrite(
 
     for (output_index, expression) in output.expressions.iter().enumerate() {
         let Expression::ColumnRef(column) = expression else {
-            unreachable!("late payload proof accepts direct output columns only")
+            return Err(rewrite_invariant(
+                "aggregate output is no longer a direct column",
+            ));
         };
         if column.binding.table_index == aggregate.group_index {
             let old_group = column.binding.column_index;
@@ -550,8 +667,11 @@ fn apply_rewrite(
                 )));
                 continue;
             }
-            let new_group = old_to_new[old_group]
-                .expect("non-dependent aggregate group has a compacted ordinal");
+            let new_group = old_to_new
+                .get(old_group)
+                .copied()
+                .flatten()
+                .ok_or_else(|| rewrite_invariant("aggregate group remap is incomplete"))?;
             let carrier_index = carrier_expressions.len();
             carrier_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(aggregate.group_index, new_group),
@@ -576,15 +696,20 @@ fn apply_rewrite(
             )));
             continue;
         }
-        unreachable!("late payload proof rejects non-aggregate output bindings")
+        return Err(rewrite_invariant(
+            "aggregate output binding escaped the proven domains",
+        ));
     }
 
     for order in &mut topn.orders {
         let Expression::ColumnRef(column) = &mut order.expression else {
-            unreachable!("late payload proof accepts direct TopN output keys only")
+            return Err(rewrite_invariant("TopN key is no longer a direct column"));
         };
-        let carrier_index = output_to_carrier[column.binding.column_index]
-            .expect("TopN ordering cannot depend on a delayed payload column");
+        let carrier_index = output_to_carrier
+            .get(column.binding.column_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| rewrite_invariant("TopN key depends on delayed payload"))?;
         column.binding = ColumnBinding::new(carrier_table_index, carrier_index);
     }
 
@@ -608,44 +733,47 @@ fn apply_rewrite(
         stats: topn_stats.clone(),
         operator: LogicalOperator::TopN(topn),
     };
-    output.child = Box::new(topn_plan);
+    output.child = Box::new(LogicalPlan::synthetic(LogicalOperator::RowFetch(
+        RowFetch::new(
+            carrier_table_index,
+            vec![RowFetchSource {
+                materialized_table_index,
+                rowid: Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(carrier_table_index, rowid_carrier_index),
+                    LogicalType::BigInt,
+                )),
+                table: candidate.table,
+            }],
+            topn_plan,
+        ),
+    )));
     output.expressions = final_expressions;
     output.returned_types = output
         .expressions
         .iter()
         .map(Expression::return_type)
         .collect();
-    output.late_row_fetch = Some(LateRowFetch {
-        carrier_table_index,
-        sources: vec![LateRowFetchSource {
-            materialized_table_index,
-            rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(carrier_table_index, rowid_carrier_index),
-                LogicalType::BigInt,
-            )),
-            table: candidate.table,
-        }],
-        coalesce_input: false,
-    });
-    LogicalPlan {
+    Ok(LogicalPlan {
         id: output_id,
         stats: topn_stats,
         operator: LogicalOperator::Projection(output),
-    }
+    })
 }
 
 fn apply_row_preserving_rewrite(
     plan: LogicalPlan,
     candidate: RowPreservingCandidate,
     bind_context: &BindContext,
-) -> LogicalPlan {
+) -> Result<LogicalPlan> {
     let LogicalPlan {
         id: topn_id,
         stats: topn_stats,
         operator: LogicalOperator::TopN(mut topn),
     } = plan
     else {
-        unreachable!("row-preserving late payload proof requires TopN")
+        return Err(rewrite_invariant(
+            "row-preserving candidate root is not TopN",
+        ));
     };
     let output_plan = *topn.child;
     let LogicalPlan {
@@ -654,7 +782,9 @@ fn apply_row_preserving_rewrite(
         ..
     } = output_plan
     else {
-        unreachable!("row-preserving late payload proof requires Projection")
+        return Err(rewrite_invariant(
+            "row-preserving candidate child is not Projection",
+        ));
     };
 
     struct RewriteSource {
@@ -671,7 +801,7 @@ fn apply_row_preserving_rewrite(
     let mut sources = candidate
         .sources
         .into_iter()
-        .map(|source| {
+        .map(|source| -> Result<RewriteSource> {
             let required_output_bindings = output
                 .child
                 .get_column_bindings()
@@ -679,25 +809,26 @@ fn apply_row_preserving_rewrite(
                 .collect::<HashSet<_>>();
             let rowid_binding = append_virtual_rowid(
                 output.child.as_mut(),
+                &source.rowid_path,
                 source.source_table_index,
                 source.table.columns.len(),
                 &required_output_bindings,
             )
-            .expect("row-preserving late payload proof established a unique source Get");
+            .ok_or_else(|| rewrite_invariant("rowid witness no longer matches detail source"))?;
             let ordered_table_index = (!source.ordered_catalog_columns.is_empty())
                 .then(|| bind_context.generate_table_index());
             let output_table_index = (!source.output_catalog_columns.is_empty())
                 .then(|| bind_context.generate_table_index());
-            RewriteSource {
+            Ok(RewriteSource {
                 source,
                 rowid_binding,
                 ordered_table_index,
                 output_table_index,
                 narrow_rowid_index: usize::MAX,
                 topn_rowid_index: None,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     // The first carrier crosses joins/window/filter with only columns required
     // before either row-fetch frontier plus one stable rowid per source.
@@ -745,16 +876,26 @@ fn apply_row_preserving_rewrite(
                 .ordered_catalog_columns
                 .contains_key(&output_index)
         }) {
-            let catalog_column = source.source.ordered_catalog_columns[&output_index];
+            let catalog_column = *source
+                .source
+                .ordered_catalog_columns
+                .get(&output_index)
+                .ok_or_else(|| rewrite_invariant("ordered payload mapping disappeared"))?;
             let materialized_table_index = source
                 .ordered_table_index
-                .expect("ordered payload source has a private namespace");
+                .ok_or_else(|| rewrite_invariant("ordered payload namespace is missing"))?;
             let topn_index = topn_expressions.len();
             topn_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(materialized_table_index, catalog_column),
                 expression.return_type(),
             )));
-            topn_names.push(output.output_names[output_index].clone());
+            topn_names.push(
+                output
+                    .output_names
+                    .get(output_index)
+                    .cloned()
+                    .ok_or_else(|| rewrite_invariant("projection output name is missing"))?,
+            );
             output_to_topn[output_index] = Some(topn_index);
             continue;
         }
@@ -767,15 +908,22 @@ fn apply_row_preserving_rewrite(
             continue;
         }
         let topn_index = topn_expressions.len();
+        let narrow_output = output_to_narrow
+            .get(output_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| rewrite_invariant("ordinary output has no narrow carrier column"))?;
         topn_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(
-                narrow_table_index,
-                output_to_narrow[output_index]
-                    .expect("ordinary output has a narrow carrier column"),
-            ),
+            ColumnBinding::new(narrow_table_index, narrow_output),
             expression.return_type(),
         )));
-        topn_names.push(output.output_names[output_index].clone());
+        topn_names.push(
+            output
+                .output_names
+                .get(output_index)
+                .cloned()
+                .ok_or_else(|| rewrite_invariant("projection output name is missing"))?,
+        );
         output_to_topn[output_index] = Some(topn_index);
     }
     for source in &mut sources {
@@ -794,7 +942,7 @@ fn apply_row_preserving_rewrite(
         .filter_map(|source| {
             source
                 .ordered_table_index
-                .map(|materialized_table_index| LateRowFetchSource {
+                .map(|materialized_table_index| RowFetchSource {
                     materialized_table_index,
                     rowid: Expression::ColumnRef(ColumnRefExpression::new(
                         ColumnBinding::new(narrow_table_index, source.narrow_rowid_index),
@@ -804,29 +952,29 @@ fn apply_row_preserving_rewrite(
                 })
         })
         .collect::<Vec<_>>();
-    let mut topn_carrier = Projection::new(
-        topn_table_index,
-        LogicalPlan::synthetic(LogicalOperator::Projection(narrow)),
-        topn_expressions,
-    )
-    .with_output_names(topn_names);
-    if !ordered_fetch_sources.is_empty() {
-        topn_carrier.late_row_fetch = Some(LateRowFetch {
-            carrier_table_index: narrow_table_index,
-            sources: ordered_fetch_sources,
-            coalesce_input: true,
-        });
-    }
+    let narrow_plan = LogicalPlan::synthetic(LogicalOperator::Projection(narrow));
+    let topn_carrier_child = if ordered_fetch_sources.is_empty() {
+        narrow_plan
+    } else {
+        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
+            narrow_table_index,
+            ordered_fetch_sources,
+            narrow_plan,
+        )))
+    };
+    let topn_carrier = Projection::new(topn_table_index, topn_carrier_child, topn_expressions)
+        .with_output_names(topn_names);
 
     for order in &mut topn.orders {
         let Expression::ColumnRef(column) = &mut order.expression else {
-            unreachable!("row-preserving late payload proof accepts direct TopN keys")
+            return Err(rewrite_invariant("TopN key is no longer a direct column"));
         };
-        column.binding = ColumnBinding::new(
-            topn_table_index,
-            output_to_topn[column.binding.column_index]
-                .expect("ordered output is materialized before TopN"),
-        );
+        let topn_output = output_to_topn
+            .get(column.binding.column_index)
+            .copied()
+            .flatten()
+            .ok_or_else(|| rewrite_invariant("ordered output is not materialized before TopN"))?;
+        column.binding = ColumnBinding::new(topn_table_index, topn_output);
     }
     topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(
         topn_carrier,
@@ -845,73 +993,80 @@ fn apply_row_preserving_rewrite(
                 .output_catalog_columns
                 .contains_key(&output_index)
         }) {
-            let catalog_column = source.source.output_catalog_columns[&output_index];
+            let catalog_column = *source
+                .source
+                .output_catalog_columns
+                .get(&output_index)
+                .ok_or_else(|| rewrite_invariant("output payload mapping disappeared"))?;
+            let output_table_index = source
+                .output_table_index
+                .ok_or_else(|| rewrite_invariant("output payload namespace is missing"))?;
             final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(
-                    source
-                        .output_table_index
-                        .expect("output payload source has a private namespace"),
-                    catalog_column,
-                ),
+                ColumnBinding::new(output_table_index, catalog_column),
                 expression.return_type(),
             )));
         } else {
+            let topn_output = output_to_topn
+                .get(output_index)
+                .copied()
+                .flatten()
+                .ok_or_else(|| rewrite_invariant("ordinary output is absent from TopN carrier"))?;
             final_expressions.push(Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(
-                    topn_table_index,
-                    output_to_topn[output_index]
-                        .expect("ordinary output is produced by the TopN carrier"),
-                ),
+                ColumnBinding::new(topn_table_index, topn_output),
                 expression.return_type(),
             )));
         }
     }
-    let output_fetch_sources = sources
-        .into_iter()
-        .filter_map(|source| {
-            source
-                .output_table_index
-                .map(|materialized_table_index| LateRowFetchSource {
-                    materialized_table_index,
-                    rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                        ColumnBinding::new(
-                            topn_table_index,
-                            source
-                                .topn_rowid_index
-                                .expect("output payload source preserves its rowid through TopN"),
-                        ),
-                        LogicalType::BigInt,
-                    )),
-                    table: source.source.table,
-                })
-        })
-        .collect::<Vec<_>>();
-    output.child = Box::new(topn_plan);
+    let mut output_fetch_sources = Vec::new();
+    for source in sources {
+        let Some(materialized_table_index) = source.output_table_index else {
+            continue;
+        };
+        let rowid_index = source
+            .topn_rowid_index
+            .ok_or_else(|| rewrite_invariant("output payload rowid is absent from TopN carrier"))?;
+        output_fetch_sources.push(RowFetchSource {
+            materialized_table_index,
+            rowid: Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(topn_table_index, rowid_index),
+                LogicalType::BigInt,
+            )),
+            table: source.source.table,
+        });
+    }
+    output.child = Box::new(if output_fetch_sources.is_empty() {
+        topn_plan
+    } else {
+        LogicalPlan::synthetic(LogicalOperator::RowFetch(RowFetch::new(
+            topn_table_index,
+            output_fetch_sources,
+            topn_plan,
+        )))
+    });
     output.expressions = final_expressions;
     output.returned_types = output
         .expressions
         .iter()
         .map(Expression::return_type)
         .collect();
-    output.late_row_fetch = (!output_fetch_sources.is_empty()).then_some(LateRowFetch {
-        carrier_table_index: topn_table_index,
-        sources: output_fetch_sources,
-        coalesce_input: false,
-    });
-    LogicalPlan {
+    Ok(LogicalPlan {
         id: output_id,
         stats: topn_stats,
         operator: LogicalOperator::Projection(output),
-    }
+    })
 }
 
 fn append_virtual_rowid(
     plan: &mut LogicalPlan,
+    path: &RowIdPath,
     table_index: usize,
     virtual_column_id: usize,
     required_output_bindings: &HashSet<ColumnBinding>,
 ) -> Option<ColumnBinding> {
-    if let LogicalOperator::Get(get) = &mut plan.operator {
+    if matches!(path, RowIdPath::Get) {
+        let LogicalOperator::Get(get) = &mut plan.operator else {
+            return None;
+        };
         if get.table_index != table_index {
             return None;
         }
@@ -930,9 +1085,13 @@ fn append_virtual_rowid(
         return Some(ColumnBinding::new(table_index, output_index));
     }
 
-    if let LogicalOperator::Filter(filter) = &mut plan.operator {
+    if let RowIdPath::Filter(child_path) = path {
+        let LogicalOperator::Filter(filter) = &mut plan.operator else {
+            return None;
+        };
         let binding = append_virtual_rowid(
             &mut filter.child,
+            child_path,
             table_index,
             virtual_column_id,
             required_output_bindings,
@@ -945,150 +1104,153 @@ fn append_virtual_rowid(
         filter.projection_map.include(child_index);
         return Some(binding);
     }
-    if let LogicalOperator::Join(join) = &mut plan.operator {
-        match join {
-            Join::Comparison(join) => {
-                if unique_get(join.left.as_ref(), table_index).is_some() {
-                    let binding = append_virtual_rowid(
-                        &mut join.left,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    )?;
-                    let child_index = join
-                        .left
-                        .get_column_bindings()
-                        .iter()
-                        .position(|candidate| *candidate == binding)?;
-                    join.left_projection_map.include(child_index);
-                    include_required_join_outputs(
-                        join.left.as_ref(),
-                        &mut join.left_projection_map,
-                        required_output_bindings,
-                    );
-                    include_required_join_outputs(
-                        join.right.as_ref(),
-                        &mut join.right_projection_map,
-                        required_output_bindings,
-                    );
-                    return Some(binding);
-                }
-                if unique_get(join.right.as_ref(), table_index).is_some() {
-                    let binding = append_virtual_rowid(
-                        &mut join.right,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    )?;
-                    let child_index = join
-                        .right
-                        .get_column_bindings()
-                        .iter()
-                        .position(|candidate| *candidate == binding)?;
-                    join.right_projection_map.include(child_index);
-                    include_required_join_outputs(
-                        join.left.as_ref(),
-                        &mut join.left_projection_map,
-                        required_output_bindings,
-                    );
-                    include_required_join_outputs(
-                        join.right.as_ref(),
-                        &mut join.right_projection_map,
-                        required_output_bindings,
-                    );
-                    return Some(binding);
-                }
+    match path {
+        RowIdPath::Window(child_path) => {
+            let LogicalOperator::Window(window) = &mut plan.operator else {
                 return None;
-            }
-            Join::Any(join) => {
-                if unique_get(join.left.as_ref(), table_index).is_some() {
-                    let binding = append_virtual_rowid(
-                        &mut join.left,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    )?;
-                    let child_index = join
-                        .left
-                        .get_column_bindings()
-                        .iter()
-                        .position(|candidate| *candidate == binding)?;
-                    join.left_projection_map.include(child_index);
-                    include_required_join_outputs(
-                        join.left.as_ref(),
-                        &mut join.left_projection_map,
-                        required_output_bindings,
-                    );
-                    include_required_join_outputs(
-                        join.right.as_ref(),
-                        &mut join.right_projection_map,
-                        required_output_bindings,
-                    );
-                    return Some(binding);
-                }
-                if unique_get(join.right.as_ref(), table_index).is_some() {
-                    let binding = append_virtual_rowid(
-                        &mut join.right,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    )?;
-                    let child_index = join
-                        .right
-                        .get_column_bindings()
-                        .iter()
-                        .position(|candidate| *candidate == binding)?;
-                    join.right_projection_map.include(child_index);
-                    include_required_join_outputs(
-                        join.left.as_ref(),
-                        &mut join.left_projection_map,
-                        required_output_bindings,
-                    );
-                    include_required_join_outputs(
-                        join.right.as_ref(),
-                        &mut join.right_projection_map,
-                        required_output_bindings,
-                    );
-                    return Some(binding);
-                }
-                return None;
-            }
-            Join::Cross(join) => {
-                if unique_get(join.left.as_ref(), table_index).is_some() {
-                    return append_virtual_rowid(
-                        &mut join.left,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    );
-                }
-                if unique_get(join.right.as_ref(), table_index).is_some() {
-                    return append_virtual_rowid(
-                        &mut join.right,
-                        table_index,
-                        virtual_column_id,
-                        required_output_bindings,
-                    );
-                }
-                return None;
-            }
+            };
+            return append_virtual_rowid(
+                &mut window.child,
+                child_path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            );
         }
+        RowIdPath::Order(child_path) => {
+            let LogicalOperator::Order(order) = &mut plan.operator else {
+                return None;
+            };
+            return append_virtual_rowid(
+                &mut order.child,
+                child_path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            );
+        }
+        RowIdPath::Limit(child_path) => {
+            let LogicalOperator::Limit(limit) = &mut plan.operator else {
+                return None;
+            };
+            return append_virtual_rowid(
+                &mut limit.child,
+                child_path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            );
+        }
+        RowIdPath::EmptyResult(child_path) => {
+            let LogicalOperator::EmptyResult(empty) = &mut plan.operator else {
+                return None;
+            };
+            return append_virtual_rowid(
+                &mut empty.child,
+                child_path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            );
+        }
+        RowIdPath::Get | RowIdPath::Filter(_) | RowIdPath::Join { .. } => {}
     }
-    let mut found = None;
-    let _ = plan.operator.visit_children_mut(|child| {
-        if let Some(binding) = append_virtual_rowid(
-            child,
-            table_index,
-            virtual_column_id,
-            required_output_bindings,
-        ) {
-            found = Some(binding);
-            ControlFlow::Break(())
-        } else {
-            ControlFlow::Continue(())
+    if let RowIdPath::Join { kind, side, child } = path {
+        let LogicalOperator::Join(join) = &mut plan.operator else {
+            return None;
+        };
+        return match (kind, join) {
+            (RowIdJoinKind::Comparison, Join::Comparison(join)) => append_projected_join_rowid(
+                &mut join.left,
+                &mut join.right,
+                &mut join.left_projection_map,
+                &mut join.right_projection_map,
+                *side,
+                child,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            ),
+            (RowIdJoinKind::Any, Join::Any(join)) => append_projected_join_rowid(
+                &mut join.left,
+                &mut join.right,
+                &mut join.left_projection_map,
+                &mut join.right_projection_map,
+                *side,
+                child,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            ),
+            (RowIdJoinKind::Cross, Join::Cross(join)) => match side {
+                RowIdJoinSide::Left => append_virtual_rowid(
+                    &mut join.left,
+                    child,
+                    table_index,
+                    virtual_column_id,
+                    required_output_bindings,
+                ),
+                RowIdJoinSide::Right => append_virtual_rowid(
+                    &mut join.right,
+                    child,
+                    table_index,
+                    virtual_column_id,
+                    required_output_bindings,
+                ),
+            },
+            _ => None,
+        };
+    }
+    None
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_projected_join_rowid(
+    left: &mut Box<LogicalPlan>,
+    right: &mut Box<LogicalPlan>,
+    left_projection: &mut paro_planner::operator::ProjectionMap,
+    right_projection: &mut paro_planner::operator::ProjectionMap,
+    side: RowIdJoinSide,
+    path: &RowIdPath,
+    table_index: usize,
+    virtual_column_id: usize,
+    required_output_bindings: &HashSet<ColumnBinding>,
+) -> Option<ColumnBinding> {
+    let binding = match side {
+        RowIdJoinSide::Left => {
+            let binding = append_virtual_rowid(
+                left.as_mut(),
+                path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            )?;
+            let child_index = left
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            left_projection.include(child_index);
+            binding
         }
-    });
-    found
+        RowIdJoinSide::Right => {
+            let binding = append_virtual_rowid(
+                right.as_mut(),
+                path,
+                table_index,
+                virtual_column_id,
+                required_output_bindings,
+            )?;
+            let child_index = right
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            right_projection.include(child_index);
+            binding
+        }
+    };
+    include_required_join_outputs(left.as_ref(), left_projection, required_output_bindings);
+    include_required_join_outputs(right.as_ref(), right_projection, required_output_bindings);
+    Some(binding)
 }
 
 fn include_required_join_outputs(
@@ -1101,6 +1263,10 @@ fn include_required_join_outputs(
             projection.include(index);
         }
     }
+}
+
+fn rewrite_invariant(detail: &str) -> paro_common::error::ParoError {
+    paro_error::internal(format!("late row-fetch proof/rewrite mismatch: {detail}"))
 }
 
 fn collect_column_bindings<'a>(
@@ -1119,21 +1285,25 @@ fn collect_column_bindings<'a>(
 
 pub(super) fn unique_get(plan: &LogicalPlan, table_index: usize) -> Option<&Get> {
     let mut found = None;
-    collect_get(plan, table_index, &mut found);
-    found
+    let mut duplicate = false;
+    collect_get(plan, table_index, &mut found, &mut duplicate);
+    (!duplicate).then_some(found).flatten()
 }
 
-fn collect_get<'a>(plan: &'a LogicalPlan, table_index: usize, found: &mut Option<&'a Get>) {
+fn collect_get<'a>(
+    plan: &'a LogicalPlan,
+    table_index: usize,
+    found: &mut Option<&'a Get>,
+    duplicate: &mut bool,
+) {
     if let LogicalOperator::Get(get) = &plan.operator {
         if get.table_index == table_index {
-            if found.is_some() {
-                *found = None;
-                return;
+            if found.replace(get).is_some() {
+                *duplicate = true;
             }
-            *found = Some(get);
         }
     }
     for child in plan.children() {
-        collect_get(child, table_index, found);
+        collect_get(child, table_index, found, duplicate);
     }
 }

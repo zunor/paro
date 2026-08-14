@@ -43,6 +43,7 @@ pub mod limit;
 pub mod order;
 pub mod projection;
 pub mod refresh_property_graph;
+pub mod row_fetch;
 pub mod search_scan;
 pub mod set_operation;
 pub mod table_function;
@@ -87,9 +88,10 @@ pub use join::{
 pub use limit::Limit;
 pub use operator_type::LogicalOperatorType;
 pub use order::Order;
-pub use projection::{LateRowFetch, LateRowFetchSource, Projection};
+pub use projection::Projection;
 pub use projection_map::ProjectionMap;
 pub use refresh_property_graph::RefreshPropertyGraph;
+pub use row_fetch::{RowFetch, RowFetchSource};
 pub use search_scan::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
     Confidence, FullTextFilterScan, FullTextQueryKind, FullTextQueryStats, FullTextQueryStatsKind,

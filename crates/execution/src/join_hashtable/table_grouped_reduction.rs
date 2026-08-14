@@ -77,8 +77,7 @@ impl JoinHashTable {
         };
         let group_count = self
             .integer_index
-            .lock()
-            .unwrap()
+            .load()
             .as_ref()
             .map(|index| index.group_slot_count());
         let Some(group_count) = group_count else {

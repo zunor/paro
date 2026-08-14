@@ -35,10 +35,10 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
             for expr in &proj.expressions {
                 verify_expression(expr)?;
             }
-            if let Some(fetch) = &proj.late_row_fetch {
-                for source in &fetch.sources {
-                    verify_expression(&source.rowid)?;
-                }
+        }
+        LogicalOperator::RowFetch(fetch) => {
+            for source in &fetch.sources {
+                verify_expression(&source.rowid)?;
             }
         }
         LogicalOperator::ExternalProject(project) => {

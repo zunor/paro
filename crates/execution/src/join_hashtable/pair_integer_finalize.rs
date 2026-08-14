@@ -45,11 +45,8 @@ impl JoinHashTable {
 
         self.chains_longer_than_one
             .store(has_long_chains, std::sync::atomic::Ordering::Relaxed);
-        let index = Box::new(index);
-        let index_ptr = std::ptr::from_ref(index.as_ref()) as *mut ExactI64PairJoinIndex;
-        *self.pair_integer_index.lock().unwrap() = Some(index);
-        self.probe_pair_integer_index
-            .store(index_ptr, std::sync::atomic::Ordering::Release);
+        self.pair_integer_index
+            .store(Some(std::sync::Arc::new(index)));
         self.finalize_grouped_reduction_extrema()?;
         self.finalized
             .store(true, std::sync::atomic::Ordering::Release);
@@ -62,18 +59,16 @@ impl JoinHashTable {
         scan_structure: &mut super::super::scan_structure::ScanStructure,
         filtered_count: usize,
     ) -> Result<bool> {
-        let index = self
-            .probe_pair_integer_index
-            .load(std::sync::atomic::Ordering::Acquire);
-        if index.is_null() {
+        let index = self.pair_integer_index.load();
+        let Some(index) = index.as_ref() else {
             return Ok(false);
-        }
+        };
         let left = keys.column(0).expect("pair join key is missing column 0");
         let right = keys.column(1).expect("pair join key is missing column 1");
         let prepared_rows = scan_structure.probe_sel.as_slice();
         scan_structure.sel_vector.set_len(keys.size());
         let matched_rows = scan_structure.sel_vector.as_mut_slice();
-        let matched_count = unsafe { &*index }.lookup_vector_rows(
+        let matched_count = index.lookup_vector_rows(
             left,
             right,
             keys.size(),
@@ -90,8 +85,7 @@ impl JoinHashTable {
 
     pub(super) fn pair_integer_index_size(&self) -> usize {
         self.pair_integer_index
-            .lock()
-            .unwrap()
+            .load()
             .as_ref()
             .map_or(0, |index| index.size_in_bytes())
     }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
@@ -381,9 +381,15 @@ impl FinishTaskState {
 
 #[derive(Debug)]
 pub struct PipelineTaskState {
-    data: Option<PipelineDataTaskState>,
+    role: PipelineTaskRole,
     pub memory: TaskMemoryGrants,
     pub pending: PendingChunkState,
+}
+
+#[derive(Debug)]
+enum PipelineTaskRole {
+    Data(PipelineDataTaskState),
+    Finish,
 }
 
 #[derive(Debug)]
@@ -403,7 +409,7 @@ impl PipelineTaskState {
         scratch: PipelineScratch,
     ) -> Self {
         Self {
-            data: Some(PipelineDataTaskState {
+            role: PipelineTaskRole::Data(PipelineDataTaskState {
                 source,
                 transforms,
                 sink,
@@ -419,57 +425,46 @@ impl PipelineTaskState {
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
         Ok(Self {
-            data: None,
+            role: PipelineTaskRole::Finish,
             memory: TaskMemoryGrants::query_accounted(query_memory, allocator)?,
             pending: PendingChunkState::Empty,
         })
     }
 
     #[inline]
-    pub fn data(&self) -> &PipelineDataTaskState {
-        self.data
-            .as_ref()
-            .expect("data pipeline phase requires task-local operator state")
+    pub fn data(&self) -> Result<&PipelineDataTaskState> {
+        match &self.role {
+            PipelineTaskRole::Data(data) => Ok(data),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
     }
 
     #[inline]
-    pub fn data_mut(&mut self) -> &mut PipelineDataTaskState {
-        self.data
-            .as_mut()
-            .expect("data pipeline phase requires task-local operator state")
+    pub fn data_mut(&mut self) -> Result<&mut PipelineDataTaskState> {
+        match &mut self.role {
+            PipelineTaskRole::Data(data) => Ok(data),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
     }
 
-    pub fn data_and_memory_mut(&mut self) -> (&mut PipelineDataTaskState, &TaskMemoryGrants) {
-        let Self { data, memory, .. } = self;
-        (
-            data.as_mut()
-                .expect("data pipeline phase requires task-local operator state"),
-            memory,
-        )
+    pub fn data_and_memory_mut(
+        &mut self,
+    ) -> Result<(&mut PipelineDataTaskState, &TaskMemoryGrants)> {
+        let Self { role, memory, .. } = self;
+        match role {
+            PipelineTaskRole::Data(data) => Ok((data, memory)),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
     }
 
     pub(crate) fn is_finish_only(&self) -> bool {
-        self.data.is_none()
-    }
-}
-
-// Data-path callers retain the original field-oriented task API. Finish-only states never enter
-// those phases, and fail fast if a future caller crosses that role boundary.
-impl std::ops::Deref for PipelineTaskState {
-    type Target = PipelineDataTaskState;
-
-    fn deref(&self) -> &Self::Target {
-        self.data
-            .as_ref()
-            .expect("finish-only task has no data-path operator state")
-    }
-}
-
-impl std::ops::DerefMut for PipelineTaskState {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        self.data
-            .as_mut()
-            .expect("finish-only task has no data-path operator state")
+        matches!(self.role, PipelineTaskRole::Finish)
     }
 }
 

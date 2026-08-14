@@ -333,27 +333,39 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             }
 
             // =========================================================================
-            // Special case: late row-fetch projection
+            // Special case: projection fused with a RowFetch child
             //
             // Its rowid carriers are ordinary child expressions and resolve to
             // physical input positions here. The visible projection expressions
             // intentionally retain their carrier/materialized logical namespaces;
             // RowFetchProject rebases that combined domain after fetching rows.
             // =========================================================================
-            LogicalOperator::Projection(proj) if proj.late_row_fetch.is_some() => {
-                self.visit_logical_plan(proj.child.as_mut());
-                let child_bindings = proj.child.get_column_bindings();
-                let child_types = proj.child.types();
-                self.bindings = child_bindings;
-                self.types = child_types;
-                self.scope = "late row-fetch rowid carrier".to_string();
-                if let Some(fetch) = &mut proj.late_row_fetch {
-                    for source in &mut fetch.sources {
-                        self.visit_expression(&mut source.rowid);
+            LogicalOperator::Projection(proj)
+                if matches!(proj.child.operator, LogicalOperator::RowFetch(_)) =>
+            {
+                let LogicalOperator::RowFetch(fetch) = &mut proj.child.operator else {
+                    unreachable!("RowFetch projection guard must match its child")
+                };
+                self.visit_logical_plan(fetch.child.as_mut());
+                self.bindings = fetch.child.get_column_bindings();
+                self.types = fetch.child.types();
+                self.scope = "row-fetch rowid carrier".to_string();
+                for source in &mut fetch.sources {
+                    self.visit_expression(&mut source.rowid);
+                }
+                if self.verify_only {
+                    self.bindings = proj.child.get_column_bindings();
+                    self.types = proj.child.types();
+                    self.scope = "row-fetch projection".to_string();
+                    for expression in &mut proj.expressions {
+                        self.visit_expression(expression);
                     }
                 }
-                self.bindings = op.get_column_bindings();
-                self.types = op.types();
+                self.bindings = LogicalOperator::generate_column_bindings(
+                    proj.table_index,
+                    proj.expressions.len(),
+                );
+                self.types = proj.returned_types.clone();
             }
 
             // =========================================================================

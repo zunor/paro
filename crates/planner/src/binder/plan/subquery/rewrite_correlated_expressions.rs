@@ -223,6 +223,13 @@ impl RewriteCorrelatedExpressions {
                 proj.child = Box::new(self.rewrite_logical_plan(*proj.child));
                 LogicalOperator::Projection(proj)
             }
+            LogicalOperator::RowFetch(mut fetch) => {
+                for source in &mut fetch.sources {
+                    source.rowid = self.rewrite_expression(source.rowid.clone());
+                }
+                fetch.child = Box::new(self.rewrite_logical_plan(*fetch.child));
+                LogicalOperator::RowFetch(fetch)
+            }
             LogicalOperator::ExternalProject(mut project) => {
                 project.expressions = project
                     .expressions

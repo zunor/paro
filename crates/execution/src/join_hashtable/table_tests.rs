@@ -386,9 +386,9 @@ fn integer_index_is_filled_during_parallel_build_and_only_published_at_finish() 
     assert!(!merged.has_integer_index());
 
     let builder = Arc::try_unwrap(builder).expect("local tables released builder references");
-    merged
+    assert!(merged
         .publish_build_time_integer_builder(builder)
-        .expect("publish build-time index");
+        .expect("publish build-time index"));
     assert!(merged.has_integer_index());
 
     let probe = chunk_from_optional_i32(&[Some(4), Some(2), Some(9)]);
@@ -396,6 +396,69 @@ fn integer_index_is_filled_during_parallel_build_and_only_published_at_finish() 
     merged
         .probe(&probe, &mut scan, None, probe.size())
         .expect("probe published build-time index");
+    assert_eq!(scan.sel_vector.as_slice(), &[0, 1]);
+}
+
+#[test]
+fn stale_build_time_integer_domain_falls_back_to_retained_rows() {
+    let memory = MemoryAccountingContext::detached(
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    );
+    let builder = Arc::new(
+        ConcurrentBuildTimeIntegerIndexBuilder::try_new_from_values(
+            &LogicalType::Integer,
+            &Value::Integer(1),
+            &Value::Integer(2),
+            2,
+            paro_common::test_utils::test_allocator(),
+            &memory,
+        )
+        .expect("builder admission")
+        .expect("compact integer domain"),
+    );
+    let local = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig {
+            build_keys_unique: true,
+            build_time_integer_builder: Some(Arc::clone(&builder)),
+            ..Default::default()
+        },
+    ));
+    local
+        .build(
+            &chunk_from_optional_i32(&[Some(1), Some(3)]),
+            &chunk_from_optional_i32(&[Some(10), Some(30)]),
+        )
+        .expect("stale domain must not reject the build");
+
+    let merged = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig {
+            build_keys_unique: true,
+            ..Default::default()
+        },
+    ));
+    merged.merge(local).expect("merge local table");
+    let builder = Arc::try_unwrap(builder).expect("local table released builder");
+    assert!(!merged
+        .publish_build_time_integer_builder(builder)
+        .expect("stale hint declines publication"));
+    merged.finalize().expect("fallback retained-row finalize");
+
+    let probe = chunk_from_optional_i32(&[Some(1), Some(3)]);
+    let mut scan = merged.create_scan_structure().expect("scan state");
+    merged
+        .probe(&probe, &mut scan, None, probe.size())
+        .expect("probe fallback index");
     assert_eq!(scan.sel_vector.as_slice(), &[0, 1]);
 }
 

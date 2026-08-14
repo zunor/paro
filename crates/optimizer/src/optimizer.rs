@@ -24,7 +24,9 @@ use crate::pipeline_passes::{
     CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
     ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
     GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
+    JoinFilterPushdownPass, JoinOrderPass, LatePayloadBuildProbeSidePass, LatePayloadFetchPass,
+    LatePayloadJoinFilterPushdownPass, LatePayloadJoinOrderPass, LatePayloadSegmentEndPass,
+    LatePayloadStatisticsPass, LatePayloadUnusedColumnsPass, LimitPushdownPass,
     MixedJoinPredicatePass, ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass,
     StatisticsGatheringPass, StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
@@ -228,9 +230,19 @@ impl Optimizer {
             // stable rowid and fetch it only after a bounded TopN. Dependency
             // proofs are populated by statistics propagation immediately
             // above; pruning is performed atomically inside this pass.
-            Box::new(LatePayloadFetchPass {
+            Box::new(LatePayloadFetchPass),
+            // Late payload changes scan widths, join projection maps and
+            // serialized build costs. Express that invalidation as a visible,
+            // conditionally executed pipeline segment so every pass retains
+            // its own verification and profiling boundary.
+            Box::new(LatePayloadUnusedColumnsPass {
                 binder: late_payload_binder,
             }),
+            Box::new(LatePayloadStatisticsPass),
+            Box::new(LatePayloadJoinOrderPass),
+            Box::new(LatePayloadBuildProbeSidePass),
+            Box::new(LatePayloadJoinFilterPushdownPass),
+            Box::new(LatePayloadSegmentEndPass),
             // Projection maps are positional annotations over the final logical
             // layout. Derive them only after every structural rewrite (most
             // notably build/probe-side flips) has settled that layout. This
@@ -380,7 +392,6 @@ mod tests {
             graph_index: context.services.graph_index.clone(),
             python_runtime: context.services.python_runtime.clone(),
             governance: context.services.governance.clone(),
-            plan_cache: context.services.plan_cache.clone(),
             connection_info: context.services.connection_info.clone(),
         });
         let catalog = session.catalog();
@@ -556,7 +567,6 @@ mod tests {
             graph_index: context.services.graph_index.clone(),
             python_runtime: context.services.python_runtime.clone(),
             governance: context.services.governance.clone(),
-            plan_cache: context.services.plan_cache.clone(),
             connection_info: context.services.connection_info.clone(),
         });
         let catalog = session.catalog();
@@ -666,42 +676,40 @@ mod tests {
             .expect("verify optimized Q15");
 
         fn inspect(plan: &paro_planner::plan::LogicalPlan) -> (usize, usize, usize, usize) {
-            let materialized =
-                usize::from(matches!(plan.operator, LogicalOperator::MaterializedCTE(_)));
-            let references = usize::from(matches!(plan.operator, LogicalOperator::CTERef(_)));
-            let lineitem = usize::from(matches!(
-                &plan.operator,
-                LogicalOperator::Get(get)
-                    if get.table.as_ref().is_some_and(|table| table.base.base.name == "lineitem")
-            ));
-            let reductions = usize::from(matches!(
-                &plan.operator,
-                LogicalOperator::Aggregate(aggregate) if aggregate.post_reduction.is_some()
-            ));
-            plan.children().into_iter().fold(
-                (materialized, references, lineitem, reductions),
-                |totals, child| {
-                    let child = inspect(child);
-                    (
-                        totals.0 + child.0,
-                        totals.1 + child.1,
-                        totals.2 + child.2,
-                        totals.3 + child.3,
-                    )
-                },
-            )
+            let mut totals = (0, 0, 0, 0);
+            let mut pending = vec![plan];
+            while let Some(plan) = pending.pop() {
+                totals.0 +=
+                    usize::from(matches!(plan.operator, LogicalOperator::MaterializedCTE(_)));
+                totals.1 += usize::from(matches!(plan.operator, LogicalOperator::CTERef(_)));
+                totals.2 += usize::from(matches!(
+                    &plan.operator,
+                    LogicalOperator::Get(get)
+                        if get.table.as_ref().is_some_and(|table| table.base.base.name == "lineitem")
+                ));
+                totals.3 += usize::from(matches!(
+                    &plan.operator,
+                    LogicalOperator::Aggregate(aggregate) if aggregate.post_reduction.is_some()
+                ));
+                pending.extend(plan.children());
+            }
+            totals
         }
 
         assert_eq!(inspect(&optimized), (0, 0, 1, 1));
         fn reduction(
             plan: &paro_planner::plan::LogicalPlan,
         ) -> Option<&paro_planner::operator::PostAggregateReduction> {
-            if let LogicalOperator::Aggregate(aggregate) = &plan.operator {
-                if aggregate.post_reduction.is_some() {
-                    return aggregate.post_reduction.as_ref();
+            let mut pending = vec![plan];
+            while let Some(plan) = pending.pop() {
+                if let LogicalOperator::Aggregate(aggregate) = &plan.operator {
+                    if aggregate.post_reduction.is_some() {
+                        return aggregate.post_reduction.as_ref();
+                    }
                 }
+                pending.extend(plan.children());
             }
-            plan.children().into_iter().find_map(reduction)
+            None
         }
         let reduction = reduction(&optimized).expect("Q15 post reduction");
         assert!(matches!(

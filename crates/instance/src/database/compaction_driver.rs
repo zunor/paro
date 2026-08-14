@@ -16,12 +16,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-// Compaction currently runs one scheduler task to completion and therefore
-// cannot yield after a foreground producer becomes ready. Keep at most one
-// such maintenance task in flight: the query driver participates as one
-// worker, so a four-thread instance still has three background workers plus
-// the caller available to satisfy a four-way query budget. Raising this again
-// requires cooperative maintenance task slices, not merely queue priority.
+// Until maintenance work is cooperatively sliced, reserve one low-priority
+// lane so an admitted compaction cannot occupy the foreground worker budget.
 const DEFAULT_COMPACTION_MAX_CONCURRENCY: usize = 1;
 const COMPACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -42,7 +38,7 @@ pub struct ForegroundMaintenanceGuard {
 
 impl Drop for ForegroundMaintenanceGuard {
     fn drop(&mut self) {
-        self.manager.resume("foreground statement");
+        self.manager.finish_foreground_statement();
     }
 }
 
@@ -126,13 +122,12 @@ impl CompactionDriver {
         Some(CompactionSuspendGuard { manager, reason })
     }
 
-    /// Give foreground statements priority over long-running maintenance.
-    /// Suspension is reference counted, so concurrent statements keep
-    /// compaction paused until the last foreground guard leaves.
+    /// Defer new maintenance admission while a foreground statement is active.
+    /// Accepted work is never canceled; the manager provides bounded
+    /// starvation relief during sustained foreground traffic.
     pub fn enter_foreground(&self) -> Option<ForegroundMaintenanceGuard> {
         let manager = self.manager.read().as_ref()?.clone();
-        manager.suspend("foreground statement");
-        manager.preempt_for_foreground("foreground statement");
+        manager.begin_foreground_statement();
         Some(ForegroundMaintenanceGuard { manager })
     }
 

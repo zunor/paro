@@ -368,7 +368,13 @@ impl HashJoinBuildSinkExec {
                                 handle.take_build_time_integer_builder()?.ok_or_else(|| {
                                     paro_error::internal("unique integer join builder disappeared")
                                 })?;
-                            table.publish_build_time_integer_builder(builder)?;
+                            if !table.publish_build_time_integer_builder(builder)? {
+                                // Storage statistics are a speculative runtime
+                                // hint. A cached plan may outlive their value
+                                // domain; rebuild from retained rows rather
+                                // than turning staleness into a query error.
+                                table.finalize()?;
+                            }
                             let published = publish_runtime_filter(ctx, handle.as_ref())?;
                             handle.completion.mark_complete();
                             if published {

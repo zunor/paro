@@ -51,6 +51,16 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
                 )?;
                 Ok(found)
             }
+            LogicalOperator::RowFetch(fetch) => {
+                let mut found = self.plan_one_pass(&mut fetch.child.operator)?;
+                for source in &mut fetch.sources {
+                    found |= self.binder.plan_current_layer_subqueries(
+                        &mut source.rowid,
+                        &mut fetch.child.operator,
+                    )?;
+                }
+                Ok(found)
+            }
             LogicalOperator::ExternalProject(project) => {
                 let mut found = self.plan_one_pass(&mut project.child.operator)?;
                 for expr in &mut project.expressions {

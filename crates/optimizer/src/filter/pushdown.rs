@@ -93,6 +93,11 @@ impl FilterPushdown {
         match op {
             LogicalOperator::Filter(filter) => self.pushdown_filter(filter),
             LogicalOperator::Projection(proj) => self.pushdown_projection(proj),
+            LogicalOperator::RowFetch(mut fetch) => {
+                let mut child_pushdown = FilterPushdown::new();
+                fetch.child = Box::new(child_pushdown.rewrite_plan(*fetch.child));
+                self.push_final_filters(LogicalOperator::RowFetch(fetch))
+            }
             LogicalOperator::Join(join) => self.pushdown_join(join),
             LogicalOperator::Aggregate(agg) => self.pushdown_aggregate(agg),
             LogicalOperator::Distinct(distinct) => self.pushdown_distinct(distinct),
@@ -245,7 +250,7 @@ impl FilterPushdown {
         // A projection over a graph operator chain is a GRAPH_TABLE COLUMNS projection.
         // Its expressions must be evaluated by PhysicalGraphProject after late materialization,
         // so pushing filters below it can bind predicates to the wrong (rowid/local-id) columns.
-        if proj.child.is_graph_chain() || proj.late_row_fetch.is_some() {
+        if proj.child.is_graph_chain() {
             let mut child_pushdown = FilterPushdown::new();
             proj.child = Box::new(child_pushdown.rewrite_plan(*proj.child));
             return self.push_final_filters(LogicalOperator::Projection(proj));

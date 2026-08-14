@@ -63,6 +63,7 @@ impl StatisticsGathering {
             LogicalOperator::DelimGet(_) => Some(CardinalityEstimate::exact(1)),
             LogicalOperator::TableFunctionGet(_) => Some(CardinalityEstimate::exact(100)),
             LogicalOperator::Projection(proj) => proj.child.stats.estimated_cardinality,
+            LogicalOperator::RowFetch(fetch) => fetch.child.stats.estimated_cardinality,
             LogicalOperator::ExternalProject(project) => project.child.stats.estimated_cardinality,
             LogicalOperator::ExternalTable(table) => table
                 .child

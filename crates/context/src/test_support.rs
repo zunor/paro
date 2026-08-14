@@ -243,7 +243,6 @@ impl TestStatementContextBuilder {
                 graph_index: graph_manager.clone(),
                 python_runtime: self.python_runtime,
                 governance: crate::QueryResourceGovernance::default(),
-                plan_cache: None,
                 connection_info: None,
             }),
             graph_registry: graph_manager,

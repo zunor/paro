@@ -65,6 +65,10 @@ impl ScanAccessCostModel {
         self.unknown_selectivity
     }
 
+    pub fn gather_access_penalty(self) -> f64 {
+        self.gather_access_penalty
+    }
+
     pub fn late_materialization_is_cheaper(
         self,
         predicate_width: usize,

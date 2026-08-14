@@ -31,7 +31,7 @@ impl PipelineTaskExecutor {
         let transform_node_id = transform_operator.index() as u64;
         ctx.profiler.start_operator(transform_node_id);
         let (poll, output_rows) = {
-            let (task, memory) = self.task.data_and_memory_mut();
+            let (task, memory) = self.task.data_and_memory_mut()?;
             let memory = memory.call_scope();
             let expression = &mut task.scratch.expression;
             let transform_chunks = &mut task.scratch.transform_chunks;
@@ -158,7 +158,7 @@ impl PipelineTaskExecutor {
         let sink_node_id = sink_operator.index() as u64;
         ctx.profiler.start_operator(sink_node_id);
         let poll = {
-            let (task, memory) = self.task.data_and_memory_mut();
+            let (task, memory) = self.task.data_and_memory_mut()?;
             let memory = memory.call_scope();
             let scratch = OperatorScratchScope::from_expression(&mut task.scratch.expression);
             let mut call_ctx = self.call_context.context(

@@ -11,13 +11,14 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, ComparisonJoin, Get, Join, JoinComparisonType, JoinCondition,
-    JoinType, LogicalOperator, Projection, TopN,
+    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Get, Join, JoinComparisonType,
+    JoinCondition, JoinType, LogicalOperator, Projection, TopN,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
 
 use super::late_payload::optimize_plan;
+use crate::cost_model::CostModel;
 
 const SOURCE: usize = 10;
 const GROUP: usize = 20;
@@ -101,9 +102,14 @@ fn candidate(order_by_payload: bool) -> LogicalPlan {
         determinants: vec![0].into_boxed_slice(),
         dependents: vec![1, 2].into_boxed_slice(),
     });
+    aggregate.child.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    let mut aggregate_plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+    aggregate_plan.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(10_000));
     let projection = Projection::new(
         OUTPUT,
-        LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate)),
+        aggregate_plan,
         vec![
             column(GROUP, 0, LogicalType::BigInt),
             column(GROUP, 1, LogicalType::Varchar),
@@ -125,8 +131,11 @@ fn candidate(order_by_payload: bool) -> LogicalPlan {
         ascending: false,
         nulls_first: true,
     };
+    let mut projection_plan = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
+    projection_plan.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(10_000));
     LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
-        LogicalPlan::synthetic(LogicalOperator::Projection(projection)),
+        projection_plan,
         vec![order],
         20,
         0,
@@ -171,14 +180,17 @@ fn candidate_with_null_extended_source() -> LogicalPlan {
 #[test]
 fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
     let context = BindContext::new();
-    let (optimized, changed) = optimize_plan(candidate(false), &context);
+    let (optimized, changed) =
+        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
     assert!(changed);
     let LogicalOperator::Projection(output) = &optimized.operator else {
         panic!("expected late row-fetch projection")
     };
-    let fetch = output.late_row_fetch.as_ref().expect("fetch contract");
+    let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+        panic!("expected RowFetch below output projection")
+    };
     assert_eq!(fetch.sources.len(), 1);
-    let LogicalOperator::TopN(topn) = &output.child.operator else {
+    let LogicalOperator::TopN(topn) = &fetch.child.operator else {
         panic!("expected TopN below row fetch")
     };
     let LogicalOperator::Projection(carrier) = &topn.child.operator else {
@@ -200,7 +212,8 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
 #[test]
 fn ordering_by_delayed_payload_keeps_preserving_plan() {
     let context = BindContext::new();
-    let (optimized, changed) = optimize_plan(candidate(true), &context);
+    let (optimized, changed) =
+        optimize_plan(candidate(true), &context, &CostModel::default()).unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
 }
@@ -208,7 +221,43 @@ fn ordering_by_delayed_payload_keeps_preserving_plan() {
 #[test]
 fn null_extended_source_rowid_keeps_preserving_plan() {
     let context = BindContext::new();
-    let (optimized, changed) = optimize_plan(candidate_with_null_extended_source(), &context);
+    let (optimized, changed) = optimize_plan(
+        candidate_with_null_extended_source(),
+        &context,
+        &CostModel::default(),
+    )
+    .unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
+}
+
+#[test]
+fn three_matching_gets_never_restore_false_uniqueness() {
+    let source = || {
+        let table = source_table();
+        LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+            SOURCE,
+            table
+                .columns
+                .iter()
+                .map(|column| column.name.clone())
+                .collect(),
+            table
+                .columns
+                .iter()
+                .map(|column| column.logical_type.clone())
+                .collect(),
+            table,
+        )))
+    };
+    let two = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+        source(),
+        source(),
+    ))));
+    let three = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct::new(
+        two,
+        source(),
+    ))));
+
+    assert!(super::late_payload::unique_get(&three, SOURCE).is_none());
 }

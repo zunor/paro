@@ -41,14 +41,27 @@ impl ColumnLifetimeAnalyzer {
                 for expr in &proj.expressions {
                     child_analyzer.visit_expression(expr);
                 }
-                if let Some(fetch) = &proj.late_row_fetch {
-                    for source in &fetch.sources {
-                        child_analyzer.visit_expression(&source.rowid);
-                    }
-                }
                 let child = *proj.child;
                 proj.child = Box::new(child_analyzer.optimize_plan(child)?);
                 LogicalOperator::Projection(proj)
+            }
+            LogicalOperator::RowFetch(mut fetch) => {
+                let child_bindings = fetch.child.get_column_bindings();
+                let mut child_analyzer = ColumnLifetimeAnalyzer::new(self.everything_referenced);
+                if !self.everything_referenced {
+                    child_analyzer.column_references.extend(
+                        self.column_references
+                            .iter()
+                            .filter(|binding| child_bindings.contains(binding))
+                            .copied(),
+                    );
+                }
+                for source in &fetch.sources {
+                    child_analyzer.visit_expression(&source.rowid);
+                }
+                let child = *fetch.child;
+                fetch.child = Box::new(child_analyzer.optimize_plan(child)?);
+                LogicalOperator::RowFetch(fetch)
             }
             LogicalOperator::Filter(mut filter) => {
                 let output_references = self.column_references.clone();

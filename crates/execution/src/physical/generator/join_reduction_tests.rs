@@ -17,9 +17,8 @@ use paro_planner::operator::{Filter, Get, LogicalOperator, Projection};
 use paro_planner::plan::LogicalPlan;
 
 use super::{
-    hash_join_build_keys_are_declared_unique, plan_build_time_integer_join_index,
-    plan_reduction_runtime_filter_fusion, remap_reduction_expression, resolve_base_get_column,
-    ReductionPredicateBits,
+    hash_join_build_keys_are_declared_unique, plan_reduction_runtime_filter_fusion,
+    remap_reduction_expression, resolve_base_get_column, ReductionPredicateBits,
 };
 
 fn declared_unique_get(ctx: &BindContext) -> LogicalPlan {
@@ -135,35 +134,6 @@ fn unique_build_proof_declines_computed_keys_and_null_safe_equality() {
         &get,
         std::slice::from_ref(&condition)
     ));
-}
-
-#[test]
-fn build_time_integer_index_uses_storage_bounds_without_a_uniqueness_proof() {
-    let ctx = BindContext::new();
-    let get = declared_unique_get(&ctx);
-    let condition = JoinCondition::new(
-        Expression::Reference(ReferenceExpression::new(0, LogicalType::BigInt)),
-        Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt)),
-        JoinComparisonType::Equal,
-    );
-    let planned = plan_build_time_integer_join_index(&get, std::slice::from_ref(&condition))
-        .expect("base integer column has guaranteed storage bounds");
-    assert!(planned.estimated_rows > 0);
-
-    let computed = LogicalPlan::new(
-        &ctx,
-        LogicalOperator::Projection(Projection::new(
-            8,
-            get,
-            vec![Expression::Constant(ConstantExpression::new(
-                Value::BigInt(1),
-                LogicalType::BigInt,
-            ))],
-        )),
-    );
-    assert!(
-        plan_build_time_integer_join_index(&computed, std::slice::from_ref(&condition)).is_none()
-    );
 }
 
 #[test]

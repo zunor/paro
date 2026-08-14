@@ -285,7 +285,14 @@ mod tests {
             .create_task_state(&query, paro_common::test_utils::test_allocator())
             .expect("task state");
         assert!(task.pending.is_empty());
-        assert_eq!(task.data().scratch.transform_chunks.len(), 0);
+        assert_eq!(
+            task.data()
+                .expect("data-path task state")
+                .scratch
+                .transform_chunks
+                .len(),
+            0
+        );
 
         let finish = runtime
             .create_finish_task_state(&query, paro_common::test_utils::test_allocator())

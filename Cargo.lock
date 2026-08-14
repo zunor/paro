@@ -1624,6 +1624,7 @@ dependencies = [
 name = "paro-execution"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "divan",
  "num_cpus",
  "parking_lot",

@@ -71,7 +71,12 @@ fn assert_tpch_rewrites() {
         );
         assert_eq!(
             inspection.late_fetch_sources,
-            if query == "q02" { 3 } else { 0 },
+            // Q2's costed plan fetches supplier and nation ordering payload
+            // before TopN, then supplier and part output-only payload after
+            // TopN. Reusing a source rowid across the two cardinality stages
+            // is intentional: carrying the remaining wide supplier columns
+            // through the heap is more expensive than the second sparse read.
+            if query == "q02" { 4 } else { 0 },
             "{query}: {optimized:#?}"
         );
     }
@@ -106,7 +111,6 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
         graph_index: context.services.graph_index.clone(),
         python_runtime: context.services.python_runtime.clone(),
         governance: context.services.governance.clone(),
-        plan_cache: context.services.plan_cache.clone(),
         connection_info: context.services.connection_info.clone(),
     });
 
@@ -376,14 +380,9 @@ impl PlanInspection {
 fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
     fn visit(plan: &paro_planner::plan::LogicalPlan, result: &mut PlanInspection) {
         match &plan.operator {
-            LogicalOperator::Projection(projection) if projection.late_row_fetch.is_some() => {
+            LogicalOperator::RowFetch(fetch) => {
                 result.late_fetches += 1;
-                result.late_fetch_sources += projection
-                    .late_row_fetch
-                    .as_ref()
-                    .expect("checked")
-                    .sources
-                    .len();
+                result.late_fetch_sources += fetch.sources.len();
             }
             LogicalOperator::Window(_) => result.windows += 1,
             LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
@@ -409,7 +408,7 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
 }
 
 #[test]
-fn late_customer_payload_keeps_other_dimension_groups_bound() {
+fn small_customer_payload_declines_late_fetch_without_losing_bindings() {
     let session = setup_session();
     for (table_name, values) in [
         (
@@ -482,7 +481,11 @@ fn late_customer_payload_keeps_other_dimension_groups_bound() {
     let planned = planner.take_plan().expect("logical q10 shape");
     let mut optimizer = Optimizer::new(planner.binder.clone(), session);
     let optimized = optimizer.optimize(planned).expect("optimize q10 shape");
-    assert_eq!(inspect_plan(&optimized).late_fetches, 1, "{optimized:#?}");
+    assert_eq!(
+        inspect_plan(&optimized).late_fetches,
+        0,
+        "the one-row fixture must not force an unprofitable late fetch: {optimized:#?}"
+    );
     crate::verify::verify_logical_plan(&planner.binder.bind_context, &optimized)
         .expect("verify q10 late payload bindings");
 }

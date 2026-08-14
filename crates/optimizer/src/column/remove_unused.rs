@@ -315,10 +315,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     .iter()
                     .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
-                if !self.everything_referenced
-                    && !carries_external_arguments
-                    && proj.late_row_fetch.is_none()
-                {
+                if !self.everything_referenced && !carries_external_arguments {
                     self.clear_unused_expressions(
                         &mut proj.expressions,
                         Some(&mut proj.output_names),
@@ -348,17 +345,45 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 for expr in &mut proj.expressions {
                     child_optimizer.visit_expression(expr);
                 }
-                if let Some(fetch) = &mut proj.late_row_fetch {
-                    for source in &mut fetch.sources {
-                        child_optimizer.visit_expression(&mut source.rowid);
-                    }
-                }
 
                 // Recurse into child
                 child_optimizer.visit_logical_plan(&mut proj.child);
 
                 // Use replace_binding to directly update bindings via raw pointers
                 // No need for ColumnBindingReplacer traversal
+                for replacement in &child_optimizer.replacements {
+                    child_optimizer
+                        .replace_binding(replacement.old_binding, replacement.new_binding);
+                }
+            }
+            LogicalOperator::RowFetch(fetch) => {
+                // Fetched catalog namespaces are produced by this boundary, not
+                // by its carrier. Drop whole sources that no parent expression
+                // observes, then pass only carrier references into the child.
+                if !self.everything_referenced {
+                    fetch.sources.retain(|source| {
+                        self.column_references
+                            .keys()
+                            .any(|binding| binding.table_index == source.materialized_table_index)
+                    });
+                }
+
+                let child_bindings = fetch.child.get_column_bindings();
+                let mut child_optimizer =
+                    RemoveUnusedColumns::new(self.binder, self.session, self.everything_referenced);
+                if !self.everything_referenced {
+                    for binding in child_bindings {
+                        if let Some(references) = self.column_references.remove(&binding) {
+                            child_optimizer
+                                .column_references
+                                .insert(binding, references);
+                        }
+                    }
+                }
+                for source in &mut fetch.sources {
+                    child_optimizer.visit_expression(&mut source.rowid);
+                }
+                child_optimizer.visit_logical_plan(&mut fetch.child);
                 for replacement in &child_optimizer.replacements {
                     child_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);

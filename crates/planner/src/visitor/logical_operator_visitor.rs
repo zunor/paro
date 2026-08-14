@@ -169,10 +169,10 @@ where
             for expr in &mut proj.expressions {
                 callback(expr);
             }
-            if let Some(fetch) = &mut proj.late_row_fetch {
-                for source in &mut fetch.sources {
-                    callback(&mut source.rowid);
-                }
+        }
+        LogicalOperator::RowFetch(fetch) => {
+            for source in &mut fetch.sources {
+                callback(&mut source.rowid);
             }
         }
         LogicalOperator::ExternalProject(project) => {

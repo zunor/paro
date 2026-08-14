@@ -49,6 +49,43 @@ struct ExternalRoutineLowerer<'a> {
     changed: bool,
 }
 
+struct ExternalLoweringFrame {
+    skeleton: LogicalPlan,
+    remaining_children: std::vec::IntoIter<LogicalPlan>,
+    lowered_children: Vec<LogicalPlan>,
+}
+
+impl ExternalLoweringFrame {
+    fn detach(plan: LogicalPlan) -> Result<Self> {
+        let mut children = Vec::new();
+        let skeleton = plan.try_map_children(|child| {
+            children.push(child);
+            Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+        })?;
+        let child_count = children.len();
+        Ok(Self {
+            skeleton,
+            remaining_children: children.into_iter(),
+            lowered_children: Vec::with_capacity(child_count),
+        })
+    }
+
+    fn rebuild(self) -> Result<LogicalPlan> {
+        let mut children = self.lowered_children.into_iter();
+        let plan = self.skeleton.try_map_children(|_| {
+            children
+                .next()
+                .ok_or_else(|| paro_error::internal("external lowering lost a lowered child"))
+        })?;
+        if children.next().is_some() {
+            return Err(paro_error::internal(
+                "external lowering produced excess lowered children",
+            ));
+        }
+        Ok(plan)
+    }
+}
+
 #[derive(Debug, Default)]
 struct ReadyExternalLayer {
     calls: Vec<Expression>,
@@ -120,7 +157,28 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn lower_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.lower_plan(child))?;
+        let mut frames = vec![ExternalLoweringFrame::detach(plan)?];
+        loop {
+            if let Some(child) = frames
+                .last_mut()
+                .and_then(|frame| frame.remaining_children.next())
+            {
+                frames.push(ExternalLoweringFrame::detach(child)?);
+                continue;
+            }
+
+            let frame = frames
+                .pop()
+                .ok_or_else(|| paro_error::internal("external lowering stack is empty"))?;
+            let plan = self.lower_current_plan(frame.rebuild()?)?;
+            let Some(parent) = frames.last_mut() else {
+                return Ok(plan);
+            };
+            parent.lowered_children.push(plan);
+        }
+    }
+
+    fn lower_current_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let LogicalPlan {
             id,
             stats,
@@ -656,9 +714,10 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn ensure_no_unlowered_external_routines(&self, plan: &LogicalPlan) -> Result<()> {
-        self.ensure_operator_is_lowered(&plan.operator)?;
-        for child in plan.children() {
-            self.ensure_no_unlowered_external_routines(child)?;
+        let mut pending = vec![plan];
+        while let Some(plan) = pending.pop() {
+            self.ensure_operator_is_lowered(&plan.operator)?;
+            pending.extend(plan.children());
         }
         Ok(())
     }

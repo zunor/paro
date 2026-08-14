@@ -5,7 +5,7 @@ use paro_common::types::LogicalType;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{
-    ColumnBinding, ExpressionGet, LateRowFetch, LateRowFetchSource, LogicalOperator, Projection,
+    ColumnBinding, ExpressionGet, LogicalOperator, Projection, RowFetch, RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -28,9 +28,24 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
             vec![LogicalType::Integer, LogicalType::BigInt],
         )),
     );
-    let mut projection = Projection::new(
+    let fetch = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::RowFetch(RowFetch::new(
+            CARRIER,
+            vec![RowFetchSource {
+                materialized_table_index: MATERIALIZED,
+                rowid: Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(CARRIER, 1),
+                    LogicalType::BigInt,
+                )),
+                table,
+            }],
+            carrier,
+        )),
+    );
+    let projection = Projection::new(
         OUTPUT,
-        carrier,
+        fetch,
         vec![
             Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(CARRIER, 0),
@@ -43,18 +58,6 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
         ],
     )
     .with_output_names(vec!["key".into(), "payload".into()]);
-    projection.late_row_fetch = Some(LateRowFetch {
-        carrier_table_index: CARRIER,
-        sources: vec![LateRowFetchSource {
-            materialized_table_index: MATERIALIZED,
-            rowid: Expression::ColumnRef(ColumnRefExpression::new(
-                ColumnBinding::new(CARRIER, 1),
-                LogicalType::BigInt,
-            )),
-            table,
-        }],
-        coalesce_input: false,
-    });
     let mut logical = LogicalPlan::new(&ctx, LogicalOperator::Projection(projection));
     crate::column_binding_resolver::ColumnBindingResolver::resolve(&mut logical.operator)
         .expect("late row-fetch bindings resolve");

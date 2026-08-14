@@ -29,6 +29,7 @@ pub(crate) struct ParallelDirectIntegerIndexBuild {
     blocks: Box<[BuildBlockRange]>,
     builder: Mutex<Option<Arc<ConcurrentDirectIntegerIndexBuilder>>>,
     has_long_chains: AtomicBool,
+    completed_rows: AtomicUsize,
     next_block: AtomicUsize,
 }
 
@@ -70,6 +71,8 @@ impl ParallelDirectIntegerIndexBuild {
         {
             self.has_long_chains.store(true, Ordering::Relaxed);
         }
+        self.completed_rows
+            .fetch_add(block.row_count(), Ordering::Release);
         Ok(())
     }
 
@@ -81,7 +84,7 @@ impl ParallelDirectIntegerIndexBuild {
         let builder = Arc::try_unwrap(builder)
             .map_err(|_| paro_error::internal("direct join index retained a task reference"))?;
         let index = if self.table.config.build_keys_unique {
-            builder.finish_unique()
+            builder.finish_unique(self.completed_rows.load(Ordering::Acquire))?
         } else {
             builder.finish()?
         };
@@ -149,6 +152,7 @@ impl JoinHashTable {
             blocks,
             builder: Mutex::new(Some(builder)),
             has_long_chains: AtomicBool::new(false),
+            completed_rows: AtomicUsize::new(0),
             next_block: AtomicUsize::new(0),
         }))
     }
@@ -164,8 +168,13 @@ impl JoinHashTable {
         let builder = Arc::try_unwrap(builder).map_err(|_| {
             paro_error::internal("direct join index retained a temporary reference")
         })?;
+        let completed_rows = blocks.iter().try_fold(0usize, |count, block| {
+            count
+                .checked_add(block.row_count())
+                .ok_or_else(|| paro_error::internal("direct join row count overflow"))
+        })?;
         let index = if self.config.build_keys_unique {
-            builder.finish_unique()
+            builder.finish_unique(completed_rows)?
         } else {
             builder.finish()?
         };

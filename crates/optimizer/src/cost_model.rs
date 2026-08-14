@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
@@ -99,6 +100,7 @@ fn column_aware_conjunction_estimate(
             .map(|estimates| conjunction_estimate(estimates.into_iter()))
             .collect::<Vec<_>>();
         column_estimates.sort_by(|left, right| left.fraction.total_cmp(&right.fraction));
+        let is_damped = column_estimates.len() > 1;
         let proven = column_estimates.iter().all(|estimate| estimate.proven);
         let mut exponent = 1.0;
         let mut fraction = 1.0;
@@ -106,7 +108,7 @@ fn column_aware_conjunction_estimate(
             fraction *= estimate.fraction.powf(exponent);
             exponent *= 0.5;
         }
-        independent.push(if proven {
+        independent.push(if proven && !is_damped {
             SelectivityEstimate::proven(fraction)
         } else {
             SelectivityEstimate::estimated(fraction)
@@ -138,6 +140,7 @@ fn disjunction_estimate(
 #[derive(Debug, Clone, Default)]
 pub struct CostModel {
     pub defaults: SelectivityDefaults,
+    pub scan_access: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +207,36 @@ impl<'a> StatisticsResolver<'a> {
 }
 
 impl CostModel {
+    /// Compare carrying payload through a row-preserving operator path with
+    /// carrying one stable rowid and gathering the payload at a later
+    /// frontier. The stage count makes blocking/serialized intermediates an
+    /// explicit cost input instead of a hidden syntactic heuristic.
+    pub(crate) fn late_row_fetch_benefit(
+        &self,
+        carrier_rows: u64,
+        fetched_rows: u64,
+        payload_types: impl IntoIterator<Item = LogicalType>,
+        carrier_stages: usize,
+    ) -> Option<f64> {
+        if carrier_rows == 0 || carrier_stages == 0 {
+            return None;
+        }
+        let payload_width = payload_types
+            .into_iter()
+            .map(|ty| self.scan_access.estimated_width(&ty))
+            .sum::<usize>();
+        if payload_width == 0 {
+            return None;
+        }
+        let rowid_width = self.scan_access.estimated_width(&LogicalType::BigInt);
+        let carrier_work = carrier_rows as f64 * carrier_stages as f64;
+        let eager = carrier_work * payload_width as f64;
+        let late = carrier_work * rowid_width as f64
+            + fetched_rows as f64 * payload_width as f64 * self.scan_access.gather_access_penalty();
+        let benefit = eager - late;
+        (benefit > 0.0).then_some(benefit)
+    }
+
     pub fn estimate_selectivity(
         &self,
         expr: &Expression,
@@ -1349,6 +1382,26 @@ mod tests {
             model.estimate_filter_cardinality(42, &[proven_zero], &HashMap::new()),
             CardinalityEstimate::exact(0)
         );
+    }
+
+    #[test]
+    fn exponential_damping_never_claims_a_proven_bound() {
+        let estimate = column_aware_conjunction_estimate(
+            [
+                (
+                    SelectivityEstimate::proven(0.1),
+                    Some(ColumnBinding::new(7, 0)),
+                ),
+                (
+                    SelectivityEstimate::proven(0.2),
+                    Some(ColumnBinding::new(7, 1)),
+                ),
+            ]
+            .into_iter(),
+        );
+
+        assert!(!estimate.proven);
+        assert!((estimate.fraction - (0.1 * 0.2_f64.sqrt())).abs() < f64::EPSILON);
     }
 
     #[test]

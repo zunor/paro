@@ -946,6 +946,31 @@ impl DependentJoinFlattener {
                     visible_columns: Self::all_columns_visible(original_projection_count),
                 })
             }
+            LogicalOperator::RowFetch(mut fetch) => {
+                let PushDownResult {
+                    plan: child,
+                    base_binding,
+                    visible_columns,
+                } = self.push_down_dependent_join_internal(binder, *fetch.child, lateral_depth)?;
+                let rewriter = RewriteCorrelatedExpressions::new_recursive(
+                    base_binding,
+                    correlated_map.clone(),
+                    lateral_depth,
+                );
+                for source in &mut fetch.sources {
+                    source.rowid = rewriter.rewrite_expression(source.rowid.clone());
+                }
+                fetch.child = Box::new(child);
+                Ok(PushDownResult {
+                    plan: LogicalPlan {
+                        id,
+                        stats,
+                        operator: LogicalOperator::RowFetch(fetch),
+                    },
+                    base_binding,
+                    visible_columns,
+                })
+            }
             LogicalOperator::ExternalProject(mut project) => {
                 let PushDownResult {
                     plan: child,

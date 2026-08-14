@@ -1270,6 +1270,10 @@ fn hash_join_build_keys_are_declared_unique(
     })
 }
 
+/// Produce a speculative execution hint from the current storage snapshot.
+/// The cached plan does not treat these bounds as a correctness fact: the
+/// concurrent builder invalidates itself on any runtime domain/count drift and
+/// hash-join finish falls back to the canonical retained-row path.
 fn plan_build_time_integer_join_index(
     build: &LogicalPlan,
     key_conditions: &[JoinCondition],
@@ -1329,7 +1333,9 @@ fn resolve_base_get_output(
                 .copied()?;
             resolve_base_get_output(&filter.child, child_index)
         }
-        LogicalOperator::Projection(projection) if projection.late_row_fetch.is_none() => {
+        LogicalOperator::Projection(projection)
+            if !matches!(projection.child.operator, LogicalOperator::RowFetch(_)) =>
+        {
             resolve_base_get_column(&projection.child, projection.expressions.get(output_index)?)
         }
         LogicalOperator::Order(order) => {
@@ -1358,7 +1364,9 @@ fn resolve_bound_get_column(
         LogicalOperator::Filter(filter) => {
             resolve_bound_get_column(&filter.child, table_index, column_index)
         }
-        LogicalOperator::Projection(projection) if projection.late_row_fetch.is_none() => {
+        LogicalOperator::Projection(projection)
+            if !matches!(projection.child.operator, LogicalOperator::RowFetch(_)) =>
+        {
             resolve_bound_get_column(&projection.child, table_index, column_index)
         }
         LogicalOperator::Order(order) => {

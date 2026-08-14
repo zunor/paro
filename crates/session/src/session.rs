@@ -517,7 +517,6 @@ impl Session {
                 graph_index: self.instance.graph_manager().clone(),
                 python_runtime: Some(self.instance.python_runtime().clone()),
                 governance: paro_context::QueryResourceGovernance::default(),
-                plan_cache: None,
                 connection_info: None,
             }),
             graph_registry: self.instance.graph_manager().clone(),

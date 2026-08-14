@@ -21,13 +21,22 @@ use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const TABLET_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const DEFAULT_TABLET_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const FOREGROUND_QUIESCENCE: Duration = Duration::from_secs(2);
+const FOREGROUND_MAX_DEFERRAL: Duration = Duration::from_secs(120);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MaintenanceAdmission {
+    Normal,
+    StarvationRelief,
+    Deferred,
+}
 
 #[derive(Clone)]
 struct CompactionCandidate {
@@ -92,6 +101,8 @@ pub struct CompactionObservability {
     pub failed_tablets: Vec<(TabletId, String)>,
     pub jobs: Vec<CompactionJobObservability>,
     pub suspended: bool,
+    pub foreground_statements: usize,
+    pub foreground_deferred: bool,
 }
 
 pub struct CompactionManager {
@@ -104,6 +115,10 @@ pub struct CompactionManager {
     jobs: Arc<Mutex<HashMap<TabletId, CompactionJobObservability>>>,
     cancellation_tokens: Arc<Mutex<HashMap<TabletId, CancellationToken>>>,
     suspension_count: AtomicUsize,
+    foreground_clock: Instant,
+    foreground_statements: AtomicUsize,
+    foreground_last_activity_ns: AtomicU64,
+    foreground_deferral_since_ns: AtomicU64,
     candidate_queue_len: AtomicUsize,
     executor: Arc<CompactionExecutor>,
     compaction_allocator: Arc<dyn Allocator>,
@@ -133,6 +148,10 @@ impl CompactionManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             suspension_count: AtomicUsize::new(0),
+            foreground_clock: Instant::now(),
+            foreground_statements: AtomicUsize::new(0),
+            foreground_last_activity_ns: AtomicU64::new(0),
+            foreground_deferral_since_ns: AtomicU64::new(0),
             candidate_queue_len: AtomicUsize::new(0),
             executor: Arc::new(CompactionExecutor::new(max_concurrency)),
             compaction_allocator: allocator,
@@ -154,6 +173,10 @@ impl CompactionManager {
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
             suspension_count: AtomicUsize::new(0),
+            foreground_clock: Instant::now(),
+            foreground_statements: AtomicUsize::new(0),
+            foreground_last_activity_ns: AtomicU64::new(0),
+            foreground_deferral_since_ns: AtomicU64::new(0),
             candidate_queue_len: AtomicUsize::new(0),
             executor: Arc::new(CompactionExecutor::new_with_scheduler(
                 max_concurrency,
@@ -291,28 +314,93 @@ impl CompactionManager {
         self.suspension_count.load(AtomicOrdering::Acquire) > 0
     }
 
-    /// Stop accepted maintenance promptly when foreground work becomes ready.
-    /// Queued tasks are cancelled through the executor; running tasks observe
-    /// the same cancellation token inside their merge/build loops.
-    pub fn preempt_for_foreground(&self, reason: &str) {
-        let tablet_ids = self
-            .running_tablets
-            .lock()
-            .unwrap()
-            .iter()
-            .copied()
-            .collect::<Vec<_>>();
-        for tablet_id in tablet_ids {
-            let token = self
-                .cancellation_tokens
-                .lock()
-                .unwrap()
-                .get(&tablet_id)
-                .cloned();
-            if let Some(token) = token {
-                token.cancel();
+    /// Record a foreground statement without canceling already accepted work.
+    /// The hot path is atomic-only; admission observes this lease and waits for
+    /// a bounded foreground-quiescence interval before submitting new jobs.
+    pub fn begin_foreground_statement(&self) {
+        let _ = self.foreground_statements.fetch_update(
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_add(1),
+        );
+        let now = self.foreground_now_ns();
+        self.foreground_last_activity_ns
+            .store(now, AtomicOrdering::Release);
+        let _ = self.foreground_deferral_since_ns.compare_exchange(
+            0,
+            now,
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+        );
+    }
+
+    pub fn finish_foreground_statement(&self) {
+        let _ = self.foreground_statements.fetch_update(
+            AtomicOrdering::AcqRel,
+            AtomicOrdering::Acquire,
+            |count| count.checked_sub(1),
+        );
+        self.foreground_last_activity_ns
+            .store(self.foreground_now_ns(), AtomicOrdering::Release);
+    }
+
+    fn foreground_now_ns(&self) -> u64 {
+        self.foreground_clock
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX - 1)) as u64
+            + 1
+    }
+
+    fn foreground_blocks_new_work_at(&self, now_ns: u64) -> bool {
+        if self.foreground_statements.load(AtomicOrdering::Acquire) > 0 {
+            return true;
+        }
+        let last_activity = self
+            .foreground_last_activity_ns
+            .load(AtomicOrdering::Acquire);
+        last_activity != 0
+            && now_ns.saturating_sub(last_activity) < duration_ns(FOREGROUND_QUIESCENCE)
+    }
+
+    fn foreground_blocks_new_work(&self) -> bool {
+        self.foreground_blocks_new_work_at(self.foreground_now_ns())
+    }
+
+    fn maintenance_admission(&self) -> MaintenanceAdmission {
+        self.maintenance_admission_at(self.foreground_now_ns())
+    }
+
+    fn maintenance_admission_at(&self, now: u64) -> MaintenanceAdmission {
+        if !self.foreground_blocks_new_work_at(now) {
+            self.foreground_deferral_since_ns
+                .store(0, AtomicOrdering::Release);
+            return MaintenanceAdmission::Normal;
+        }
+
+        let mut deferred_since = self
+            .foreground_deferral_since_ns
+            .load(AtomicOrdering::Acquire);
+        if deferred_since == 0 {
+            match self.foreground_deferral_since_ns.compare_exchange(
+                0,
+                now,
+                AtomicOrdering::AcqRel,
+                AtomicOrdering::Acquire,
+            ) {
+                Ok(_) => deferred_since = now,
+                Err(observed) => deferred_since = observed,
             }
-            let _ = self.executor.cancel_pending_tablet(tablet_id, reason);
+        }
+
+        if now.saturating_sub(deferred_since) >= duration_ns(FOREGROUND_MAX_DEFERRAL) {
+            // Admit one job, then begin a fresh bounded deferral interval. This
+            // prevents starvation without compaction cancel/restart livelock.
+            self.foreground_deferral_since_ns
+                .store(now, AtomicOrdering::Release);
+            MaintenanceAdmission::StarvationRelief
+        } else {
+            MaintenanceAdmission::Deferred
         }
     }
 
@@ -418,6 +506,16 @@ impl CompactionManager {
             self.refresh_metrics();
             return;
         }
+        let admission = self.maintenance_admission();
+        let admission_budget = match admission {
+            MaintenanceAdmission::Normal => usize::MAX,
+            MaintenanceAdmission::StarvationRelief => 1,
+            MaintenanceAdmission::Deferred => {
+                self.candidate_queue_len.store(0, AtomicOrdering::Release);
+                self.refresh_metrics();
+                return;
+            }
+        };
 
         let tablets_list: Vec<Arc<Tablet>> = {
             let tablets = self.tablets.lock().unwrap();
@@ -467,8 +565,12 @@ impl CompactionManager {
             .store(candidates.len(), AtomicOrdering::Release);
         self.refresh_metrics();
 
+        let mut submitted = 0usize;
         while let Some(candidate) = candidates.pop() {
             if self.is_suspended() {
+                break;
+            }
+            if admission == MaintenanceAdmission::Normal && self.foreground_blocks_new_work() {
                 break;
             }
 
@@ -573,6 +675,10 @@ impl CompactionManager {
                         tablet_id
                     );
                 });
+            submitted += 1;
+            if submitted >= admission_budget {
+                break;
+            }
         }
 
         self.candidate_queue_len.store(0, AtomicOrdering::Release);
@@ -613,6 +719,8 @@ impl CompactionManager {
             failed_tablets,
             jobs,
             suspended: self.is_suspended(),
+            foreground_statements: self.foreground_statements.load(AtomicOrdering::Acquire),
+            foreground_deferred: self.foreground_blocks_new_work(),
         }
     }
 
@@ -632,6 +740,10 @@ impl CompactionManager {
         metrics.set_compaction_queue_len(self.candidate_queue_len.load(AtomicOrdering::Acquire));
         metrics.set_compaction_running_tablets(self.running_task_count());
     }
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
 fn policy_priority(kind: PolicyKind) -> u8 {
@@ -842,6 +954,47 @@ mod tests {
         // Extra resumes are harmless and cannot underflow the lease count.
         manager.resume("test");
         assert!(!manager.is_suspended());
+    }
+
+    #[test]
+    fn foreground_admission_defers_without_canceling_and_has_starvation_relief() {
+        let manager = CompactionManager::new(1);
+
+        manager.begin_foreground_statement();
+        assert_eq!(
+            manager.maintenance_admission(),
+            MaintenanceAdmission::Deferred
+        );
+        assert_eq!(
+            manager.foreground_statements.load(AtomicOrdering::Acquire),
+            1
+        );
+
+        let overdue = 1;
+        manager
+            .foreground_deferral_since_ns
+            .store(overdue, AtomicOrdering::Release);
+        assert_eq!(
+            manager.maintenance_admission_at(duration_ns(FOREGROUND_MAX_DEFERRAL) + 2),
+            MaintenanceAdmission::StarvationRelief
+        );
+        assert_eq!(
+            manager.maintenance_admission(),
+            MaintenanceAdmission::Deferred
+        );
+
+        manager.finish_foreground_statement();
+        assert_eq!(
+            manager.foreground_statements.load(AtomicOrdering::Acquire),
+            0
+        );
+        manager
+            .foreground_last_activity_ns
+            .store(1, AtomicOrdering::Release);
+        assert_eq!(
+            manager.maintenance_admission_at(duration_ns(FOREGROUND_QUIESCENCE) + 2),
+            MaintenanceAdmission::Normal
+        );
     }
 
     #[test]

@@ -111,8 +111,8 @@ pub struct ActiveQueryContext {
     /// Progress belongs to the active statement and cannot outlive it.
     progress: QueryProgress,
 
-    /// Reference-counted foreground lease that preempts background maintenance
-    /// for the lifetime of this statement, including async execution.
+    /// Atomic-only maintenance admission lease held for the complete async
+    /// statement lifetime.
     _foreground_maintenance: Option<paro_instance::ForegroundMaintenanceGuard>,
 }
 

@@ -423,6 +423,7 @@ impl TransformChainBench {
             let output = self
                 .task
                 .data()
+                .expect("transform benchmark task must carry data-path state")
                 .scratch
                 .transform_chunks
                 .last()
@@ -447,7 +448,10 @@ impl TransformChainBench {
             .transform_globals
             .get(idx)
             .expect("transform global should exist");
-        let (task, memory) = self.task.data_and_memory_mut();
+        let (task, memory) = self
+            .task
+            .data_and_memory_mut()
+            .expect("transform benchmark task must carry data-path state");
         let scratch_state = &mut task.scratch;
         match input {
             TransformInput::BenchInput(input_idx) => {
@@ -795,7 +799,9 @@ impl HashJoinBuildFinishBench {
             let template = &self.inputs[idx];
             input.reference(divan::black_box(template));
             checksum = checksum.wrapping_add(input.size());
-            let (data, memory) = task.data_and_memory_mut();
+            let (data, memory) = task
+                .data_and_memory_mut()
+                .expect("hash join benchmark task must carry data-path state");
             let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
             let poll = divan::black_box(&runtime.program.sink.exec)
                 .consume(&mut ctx, &runtime.sink_global, &mut data.sink, &mut input)
@@ -804,7 +810,9 @@ impl HashJoinBuildFinishBench {
         }
 
         {
-            let (data, memory) = task.data_and_memory_mut();
+            let (data, memory) = task
+                .data_and_memory_mut()
+                .expect("hash join benchmark task must carry data-path state");
             let mut ctx = self.call_context(&runtime, memory, &mut data.scratch.expression);
             let poll = divan::black_box(&runtime.program.sink.exec)
                 .merge_local(&mut ctx, &runtime.sink_global, &mut data.sink)
@@ -939,7 +947,10 @@ impl SinkPendingBench {
     }
 
     fn consume_once(&mut self) -> SinkPoll {
-        let (task, memory) = self.task.data_and_memory_mut();
+        let (task, memory) = self
+            .task
+            .data_and_memory_mut()
+            .expect("sink benchmark task must carry data-path state");
         let mut ctx = OperatorCallContext {
             query: &self.query,
             pipeline: self.runtime.program.id,

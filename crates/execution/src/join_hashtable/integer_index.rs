@@ -320,8 +320,9 @@ impl ConcurrentDirectIntegerIndexBuilder {
     }
 
     /// Publish a row into a slot proven unique by the logical build relation.
-    /// Atomic store keeps publication race-free while avoiding a chain-forming
-    /// read-modify-write for disjoint keys.
+    /// The swap is the runtime proof: a non-zero predecessor means the logical
+    /// uniqueness witness was unsound. Completeness is checked once per build
+    /// block at finish rather than through a contended per-row counter.
     pub(super) fn insert_unique(&self, ordinal: u128, row_ptr: usize) -> Result<()> {
         if row_ptr == 0 {
             return Err(paro_error::internal(
@@ -334,22 +335,42 @@ impl ConcurrentDirectIntegerIndexBuilder {
             ));
         };
         let target = unsafe { self.pointers.as_ptr().cast::<AtomicUsize>().add(index) };
-        unsafe { &*target }.store(row_ptr, Ordering::Relaxed);
+        let previous = unsafe { &*target }.swap(row_ptr, Ordering::Relaxed);
+        if previous != 0 {
+            return Err(paro_error::internal(
+                "declared-unique integer join key produced duplicate build rows",
+            ));
+        }
         Ok(())
     }
 
-    pub(crate) fn insert_value(&self, value: &Value, row_ptr: usize) -> Result<Option<usize>> {
-        let ordinal = self.domain.kind.value_ordinal(value).ok_or_else(|| {
-            paro_error::internal("build-time integer join key does not match its planned type")
-        })?;
-        self.insert(ordinal, row_ptr)
-    }
-
-    pub(crate) fn insert_unique_value(&self, value: &Value, row_ptr: usize) -> Result<()> {
-        let ordinal = self.domain.kind.value_ordinal(value).ok_or_else(|| {
-            paro_error::internal("unique integer join key does not match its planned type")
-        })?;
-        self.insert_unique(ordinal, row_ptr)
+    fn insert_planned_value(
+        &self,
+        value: &Value,
+        row_ptr: usize,
+        unique: bool,
+    ) -> Result<PlannedIntegerInsert> {
+        if row_ptr == 0 {
+            return Err(paro_error::internal(
+                "integer join index cannot store a null build-row pointer",
+            ));
+        }
+        let Some(ordinal) = self.domain.kind.value_ordinal(value) else {
+            return Ok(PlannedIntegerInsert::DomainChanged);
+        };
+        let Some(index) = self.domain.index_for_ordinal(ordinal) else {
+            return Ok(PlannedIntegerInsert::DomainChanged);
+        };
+        let target = unsafe { self.pointers.as_ptr().cast::<AtomicUsize>().add(index) };
+        let previous = unsafe { &*target }.swap(row_ptr, Ordering::Relaxed);
+        if unique && previous != 0 {
+            return Err(paro_error::internal(
+                "declared-unique integer join key produced duplicate build rows",
+            ));
+        }
+        Ok(PlannedIntegerInsert::Inserted(
+            (previous != 0).then_some(previous),
+        ))
     }
 
     pub(super) fn finish(self) -> Result<ExactIntegerJoinIndex> {
@@ -368,22 +389,26 @@ impl ConcurrentDirectIntegerIndexBuilder {
         })
     }
 
-    /// Seal a direct index whose complete input was proven unique. Finish-task
-    /// completion already proves every block ran, so a contended per-row count
-    /// would add no validation value.
-    pub(super) fn finish_unique(self) -> ExactIntegerJoinIndex {
-        ExactIntegerJoinIndex {
+    /// Seal a direct index whose complete input was proven unique. The proof
+    /// only selects this construction strategy; runtime still self-validates
+    /// both duplicate absence and complete row publication.
+    pub(super) fn finish_unique(self, completed_rows: usize) -> Result<ExactIntegerJoinIndex> {
+        if completed_rows != self.expected_rows {
+            return Err(paro_error::internal(format!(
+                "unique direct join index row count mismatch: expected={}, actual={completed_rows}",
+                self.expected_rows
+            )));
+        }
+        Ok(ExactIntegerJoinIndex {
             domain: self.domain,
             storage: IntegerJoinStorage::Direct {
                 pointers: self.pointers,
             },
-        }
+        })
     }
 
-    /// Seal an index whose domain and maximum row count came from immutable
-    /// storage statistics. Runtime filters may make the actual build smaller,
-    /// so completeness is the producer lifecycle rather than equality with
-    /// `expected_rows`; `insert` already rejects an overrun.
+    /// Seal a speculative index whose producer lifecycle is complete. Runtime
+    /// filters may make the build smaller than the storage-level estimate.
     pub(super) fn finish_build_time(self) -> ExactIntegerJoinIndex {
         ExactIntegerJoinIndex {
             domain: self.domain,
@@ -392,6 +417,11 @@ impl ConcurrentDirectIntegerIndexBuilder {
             },
         }
     }
+}
+
+enum PlannedIntegerInsert {
+    Inserted(Option<usize>),
+    DomainChanged,
 }
 
 enum ConcurrentBuildTimeIntegerIndexStrategy {
@@ -407,6 +437,7 @@ enum ConcurrentBuildTimeIntegerIndexStrategy {
 pub(crate) struct ConcurrentBuildTimeIntegerIndexBuilder {
     strategy: ConcurrentBuildTimeIntegerIndexStrategy,
     has_long_chains: AtomicBool,
+    invalidated: AtomicBool,
 }
 
 impl std::fmt::Debug for ConcurrentBuildTimeIntegerIndexBuilder {
@@ -422,6 +453,7 @@ impl std::fmt::Debug for ConcurrentBuildTimeIntegerIndexBuilder {
                 "has_long_chains",
                 &self.has_long_chains.load(Ordering::Relaxed),
             )
+            .field("invalidated", &self.invalidated.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -449,7 +481,7 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
             minimum,
             maximum,
             build_count,
-            Arc::clone(&allocator),
+            allocator.clone(),
             memory,
         )? {
             ConcurrentBuildTimeIntegerIndexStrategy::Direct(builder)
@@ -468,6 +500,7 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         Ok(Some(Self {
             strategy,
             has_long_chains: AtomicBool::new(false),
+            invalidated: AtomicBool::new(false),
         }))
     }
 
@@ -478,13 +511,17 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         unique: bool,
         mut link: impl FnMut(usize, usize),
     ) -> Result<()> {
+        if self.invalidated.load(Ordering::Relaxed) {
+            return Ok(());
+        }
         match &self.strategy {
             ConcurrentBuildTimeIntegerIndexStrategy::Direct(builder) => {
-                let previous = if unique {
-                    builder.insert_unique_value(value, row_ptr)?;
-                    None
-                } else {
-                    builder.insert_value(value, row_ptr)?
+                let previous = match builder.insert_planned_value(value, row_ptr, unique)? {
+                    PlannedIntegerInsert::Inserted(previous) => previous,
+                    PlannedIntegerInsert::DomainChanged => {
+                        self.invalidated.store(true, Ordering::Release);
+                        return Ok(());
+                    }
                 };
                 if let Some(previous) = previous {
                     link(row_ptr, previous);
@@ -493,7 +530,12 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                 Ok(())
             }
             ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) => {
-                builder.record_value(value, row_ptr)
+                if builder.record_planned_value(value, row_ptr, unique)? {
+                    Ok(())
+                } else {
+                    self.invalidated.store(true, Ordering::Release);
+                    Ok(())
+                }
             }
         }
     }
@@ -501,7 +543,10 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
     pub(super) fn finish(
         self,
         mut link: impl FnMut(usize, usize),
-    ) -> Result<(ExactIntegerJoinIndex, bool)> {
+    ) -> Result<Option<(ExactIntegerJoinIndex, bool)>> {
+        if self.invalidated.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         let (index, ranked_has_long_chains) = match self.strategy {
             ConcurrentBuildTimeIntegerIndexStrategy::Direct(builder) => {
                 (builder.finish_build_time(), false)
@@ -510,10 +555,10 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                 builder.finish(&mut link)?
             }
         };
-        Ok((
+        Ok(Some((
             index,
             ranked_has_long_chains || self.has_long_chains.load(Ordering::Relaxed),
-        ))
+        )))
     }
 }
 
@@ -591,25 +636,23 @@ impl ConcurrentRankedIntegerIndexBuilder {
         }))
     }
 
-    fn record_value(&self, value: &Value, row_ptr: usize) -> Result<()> {
+    fn record_planned_value(&self, value: &Value, row_ptr: usize, unique: bool) -> Result<bool> {
         if row_ptr == 0 {
             return Err(paro_error::internal(
                 "ranked join index cannot store a null build-row pointer",
             ));
         }
-        let ordinal = self.domain.kind.value_ordinal(value).ok_or_else(|| {
-            paro_error::internal("build-time ranked key does not match its planned type")
-        })?;
-        let domain_index = self.domain.index_for_ordinal(ordinal).ok_or_else(|| {
-            paro_error::internal("integer join build key fell outside its planned domain")
-        })?;
+        let Some(ordinal) = self.domain.kind.value_ordinal(value) else {
+            return Ok(false);
+        };
+        let Some(domain_index) = self.domain.index_for_ordinal(ordinal) else {
+            return Ok(false);
+        };
         let domain_index = u32::try_from(domain_index)
             .map_err(|_| paro_error::internal("ranked join domain index exceeds u32"))?;
         let row_slot = self.next_row_slot.fetch_add(1, Ordering::Relaxed);
         if row_slot >= self.maximum_rows {
-            return Err(paro_error::internal(
-                "build-time ranked index received more rows than planned",
-            ));
+            return Ok(false);
         }
         unsafe {
             std::ptr::write(
@@ -625,16 +668,21 @@ impl ConcurrentRankedIntegerIndexBuilder {
                 .as_ptr()
                 .cast::<AtomicU64>()
                 .add(domain_index as usize / u64::BITS as usize);
-            (&*word).fetch_or(
+            let previous = (&*word).fetch_or(
                 1_u64 << (domain_index as usize % u64::BITS as usize),
                 Ordering::Relaxed,
             );
+            if unique && previous & (1_u64 << (domain_index as usize % u64::BITS as usize)) != 0 {
+                return Err(paro_error::internal(
+                    "declared-unique integer join key produced duplicate build rows",
+                ));
+            }
         }
         // Publish initialization only after both per-row slots and the
         // occupancy bit are visible. Finish acquires this counter, so the
         // builder's safety does not depend on an undocumented scheduler join.
         self.completed_rows.fetch_add(1, Ordering::Release);
-        Ok(())
+        Ok(true)
     }
 
     fn finish(self, link: &mut impl FnMut(usize, usize)) -> Result<(ExactIntegerJoinIndex, bool)> {
@@ -1423,6 +1471,44 @@ mod tests {
         let error = builder
             .finish()
             .expect_err("incomplete direct index must not publish");
+        assert!(error.to_string().contains("row count mismatch"));
+    }
+
+    #[test]
+    fn unique_direct_index_rejects_duplicate_and_incomplete_proofs() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let kind = IntegerKeyKind::Integer;
+        let duplicate_builder = ConcurrentDirectIntegerIndexBuilder::try_new(
+            kind,
+            ordinal(kind, 10),
+            ordinal(kind, 13),
+            2,
+            allocator.clone(),
+            &memory(),
+        )
+        .unwrap()
+        .unwrap();
+        let key = ordinal(kind, 11);
+        duplicate_builder.insert_unique(key, 100).unwrap();
+        let error = duplicate_builder
+            .insert_unique(key, 200)
+            .expect_err("a drifted uniqueness proof must fail visibly");
+        assert!(error.to_string().contains("duplicate build rows"));
+
+        let incomplete_builder = ConcurrentDirectIntegerIndexBuilder::try_new(
+            kind,
+            ordinal(kind, 10),
+            ordinal(kind, 13),
+            2,
+            allocator,
+            &memory(),
+        )
+        .unwrap()
+        .unwrap();
+        incomplete_builder.insert_unique(key, 100).unwrap();
+        let error = incomplete_builder
+            .finish_unique(1)
+            .expect_err("an incomplete block publication must fail visibly");
         assert!(error.to_string().contains("row count mismatch"));
     }
 

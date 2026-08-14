@@ -90,6 +90,7 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
         LogicalOperator::Get(_) => "GET",
         LogicalOperator::Filter(_) => "FILTER",
         LogicalOperator::Projection(_) => "PROJECTION",
+        LogicalOperator::RowFetch(_) => "ROW_FETCH",
         LogicalOperator::ExternalProject(_) => "EXTERNAL_PROJECT",
         LogicalOperator::ExternalTable(_) => "EXTERNAL_TABLE",
         LogicalOperator::Limit(_) => "LIMIT",

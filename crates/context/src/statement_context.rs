@@ -139,10 +139,6 @@ impl StatementContext {
         }
     }
 
-    pub fn shared_plan_cache(&self) -> Option<&Arc<dyn crate::SharedPlanCacheHandle>> {
-        self.services.plan_cache.as_ref()
-    }
-
     pub fn connection_info_provider(&self) -> Option<&Arc<dyn crate::ConnectionInfoProvider>> {
         self.services.connection_info.as_ref()
     }

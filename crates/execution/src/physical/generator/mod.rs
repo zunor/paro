@@ -27,9 +27,9 @@ use paro_planner::operator::{
     GraphScan as LogicalGraphScan, Insert as LogicalInsert, Limit as LogicalLimit,
     LogicalExternalProject, LogicalExternalTable, LogicalOperator,
     MaterializedCTE as LogicalMaterializedCte, Order as LogicalOrder,
-    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte, SearchCandidate,
-    SearchDecision, SearchScan as LogicalSearchScan, SetOpType,
-    SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
+    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte,
+    RowFetch as LogicalRowFetch, SearchCandidate, SearchDecision, SearchScan as LogicalSearchScan,
+    SetOpType, SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
     TopN as LogicalTopN, Update as LogicalUpdate, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
@@ -67,6 +67,7 @@ mod helpers;
 mod inequality_join_gate;
 mod join;
 mod misc;
+mod row_fetch;
 mod scan;
 mod set;
 
@@ -135,13 +136,23 @@ impl PhysicalPlanGenerator {
             LogicalOperator::Filter(filter) => {
                 self.lower_filter(filter, logical.stats.estimated_cardinality)?
             }
-            LogicalOperator::Projection(project) if project.late_row_fetch.is_some() => {
-                self.lower_late_row_fetch_project(project)?
+            LogicalOperator::Projection(project)
+                if matches!(project.child.operator, LogicalOperator::RowFetch(_)) =>
+            {
+                let LogicalOperator::RowFetch(fetch) = &project.child.operator else {
+                    unreachable!("RowFetch projection guard must match its child")
+                };
+                self.lower_row_fetch_project(project, fetch)?
             }
             LogicalOperator::Projection(project) if is_graph_chain(project.child.as_ref()) => {
                 self.lower_graph_project(project)?
             }
             LogicalOperator::Projection(project) => self.lower_project(project)?,
+            LogicalOperator::RowFetch(_) => {
+                return Err(paro_error::internal(
+                    "logical RowFetch must be consumed by an explicit Projection boundary",
+                ));
+            }
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,

@@ -1052,7 +1052,7 @@ impl PipelineWorkerTask {
                 .create_finish_task_state(self.query.as_ref(), self.allocator.clone())?,
         };
         if let Some(assignment) = self.source_assignment {
-            prepare_source_task(&mut task.data_mut().source, assignment)?;
+            prepare_source_task(&mut task.data_mut()?.source, assignment)?;
         }
         self.executor = Some(match self.mode {
             PipelineWorkerMode::Data => {

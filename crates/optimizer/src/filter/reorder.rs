@@ -175,6 +175,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
+            late_materialization_dirty: false,
         };
 
         let rewritten = ReorderFilter::new()
@@ -218,6 +219,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
+            late_materialization_dirty: false,
         };
 
         let rewritten = ReorderFilter::new()

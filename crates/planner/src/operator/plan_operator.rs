@@ -17,7 +17,7 @@ use super::{
     DependentJoin, Distinct, Drop, DropPropertyGraph, EmptyResult, Explain, ExpressionGet, Filter,
     FullTextFilterScan, Get, GraphExpand, GraphMatch, GraphScan, Insert, Join, Limit,
     LogicalExternalProject, LogicalExternalTable, LogicalOperatorType, MaterializedCTE, Order,
-    Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph, SearchScan, SetOpType,
+    Projection, ProjectionMap, RecursiveCTE, RefreshPropertyGraph, RowFetch, SearchScan, SetOpType,
     SetOperation, TableFunctionGet, TopN, Update, Window,
 };
 
@@ -30,6 +30,8 @@ pub enum LogicalOperator {
     Filter(Filter),
     /// Project columns/expressions
     Projection(Projection),
+    /// Materialize base-table columns from stable rowids carried by the child.
+    RowFetch(RowFetch),
     /// Row-preserving external routine layer
     ExternalProject(LogicalExternalProject),
     /// Relation-expanding external routine source
@@ -129,6 +131,7 @@ impl LogicalOperator {
                 project_names(&child_names, &op.projection_map)
             }
             LogicalOperator::Projection(op) => op.output_names.clone(),
+            LogicalOperator::RowFetch(op) => op.output_names(),
             LogicalOperator::ExternalProject(op) => op.output_names.clone(),
             LogicalOperator::ExternalTable(op) => op.output_columns.clone(),
             LogicalOperator::Limit(op) => op.child.output_names(),
@@ -259,6 +262,7 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => LogicalOperatorType::Get,
             LogicalOperator::Filter(_) => LogicalOperatorType::Filter,
             LogicalOperator::Projection(_) => LogicalOperatorType::Projection,
+            LogicalOperator::RowFetch(_) => LogicalOperatorType::RowFetch,
             LogicalOperator::ExternalProject(_) => LogicalOperatorType::ExternalProject,
             LogicalOperator::ExternalTable(_) => LogicalOperatorType::ExternalTable,
             LogicalOperator::Limit(_) => LogicalOperatorType::Limit,
@@ -325,6 +329,7 @@ impl LogicalOperator {
                 }
             }
             LogicalOperator::Projection(op) => op.returned_types.clone(),
+            LogicalOperator::RowFetch(op) => op.output_types(),
             LogicalOperator::ExternalProject(op) => op.returned_types.clone(),
             LogicalOperator::ExternalTable(op) => op.returned_types.clone(),
             LogicalOperator::Limit(op) => op.child.types(),
@@ -383,6 +388,7 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => vec![],
             LogicalOperator::Filter(op) => vec![op.child.as_ref()],
             LogicalOperator::Projection(op) => vec![op.child.as_ref()],
+            LogicalOperator::RowFetch(op) => vec![op.child.as_ref()],
             LogicalOperator::ExternalProject(op) => vec![op.child.as_ref()],
             LogicalOperator::ExternalTable(op) => op.child.as_deref().into_iter().collect(),
             LogicalOperator::Limit(op) => vec![op.child.as_ref()],
@@ -434,6 +440,7 @@ impl LogicalOperator {
             LogicalOperator::Get(_) => ControlFlow::Continue(()),
             LogicalOperator::Filter(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::Projection(op) => visit_boxed_child(&mut op.child, &mut f),
+            LogicalOperator::RowFetch(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::ExternalProject(op) => visit_boxed_child(&mut op.child, &mut f),
             LogicalOperator::ExternalTable(op) => {
                 if let Some(child) = &mut op.child {
@@ -521,6 +528,10 @@ impl LogicalOperator {
             LogicalOperator::Projection(mut op) => {
                 op.child = try_map_boxed_child(op.child, f)?;
                 Ok(LogicalOperator::Projection(op))
+            }
+            LogicalOperator::RowFetch(mut op) => {
+                op.child = try_map_boxed_child(op.child, f)?;
+                Ok(LogicalOperator::RowFetch(op))
             }
             LogicalOperator::ExternalProject(mut op) => {
                 op.child = try_map_boxed_child(op.child, f)?;
@@ -677,6 +688,16 @@ impl LogicalOperator {
             }
             LogicalOperator::Projection(proj) => {
                 Self::generate_column_bindings(proj.table_index, proj.expressions.len())
+            }
+            LogicalOperator::RowFetch(fetch) => {
+                let mut bindings = fetch.child.get_column_bindings();
+                for source in &fetch.sources {
+                    bindings.extend(Self::generate_column_bindings(
+                        source.materialized_table_index,
+                        source.table.columns.len(),
+                    ));
+                }
+                bindings
             }
             LogicalOperator::ExternalProject(external) => {
                 let mut bindings = external.child.get_column_bindings();
@@ -844,18 +865,12 @@ impl LogicalOperator {
     pub fn get_table_index(&self) -> Vec<usize> {
         match self {
             LogicalOperator::Get(get) => vec![get.table_index],
-            LogicalOperator::Projection(proj) => {
-                let mut indices = vec![proj.table_index];
-                if let Some(fetch) = &proj.late_row_fetch {
-                    indices.extend(
-                        fetch
-                            .sources
-                            .iter()
-                            .map(|source| source.materialized_table_index),
-                    );
-                }
-                indices
-            }
+            LogicalOperator::Projection(proj) => vec![proj.table_index],
+            LogicalOperator::RowFetch(fetch) => fetch
+                .sources
+                .iter()
+                .map(|source| source.materialized_table_index)
+                .collect(),
             LogicalOperator::ExternalProject(external) => vec![external.project_index],
             LogicalOperator::ExternalTable(external) => vec![external.table_index],
             LogicalOperator::Aggregate(agg) => {
