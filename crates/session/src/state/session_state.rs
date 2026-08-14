@@ -9,6 +9,21 @@ use super::file_opener::FileOpener;
 use super::random::RandomEngine;
 use crate::prepared::store::{PortalEntry, PreparedState, PreparedStatementEntry};
 use paro_catalog::search_path::CatalogSearchPath;
+use paro_context::CompileEnvironmentKey;
+use paro_execution::query_executor::compiled::CompiledStatement;
+use paro_parser::ast::Statement;
+
+/// One-entry MRU for the immutable image behind a repeated Simple Query.
+///
+/// Runtime snapshots and statement inputs never live here. The environment
+/// key covers catalog generations and plan-affecting settings, matching the
+/// revalidation contract used by prepared statements.
+#[derive(Debug)]
+struct SimpleQueryPlanCacheEntry {
+    statement: Statement,
+    statement_format: Option<String>,
+    plan: CompiledStatement,
+}
 
 /// Session-level state data.
 #[derive(Debug)]
@@ -21,6 +36,7 @@ pub struct SessionState {
     pub random_engine: RandomEngine,
     pub file_search_path: String,
     pub file_opener: Option<Arc<dyn FileOpener>>,
+    simple_query_plan: Option<SimpleQueryPlanCacheEntry>,
 }
 
 impl SessionState {
@@ -34,6 +50,7 @@ impl SessionState {
             random_engine: RandomEngine::new(),
             file_search_path: String::new(),
             file_opener: None,
+            simple_query_plan: None,
         }
     }
 
@@ -168,12 +185,39 @@ impl SessionState {
         self.prepared.clear_protocol_unnamed_objects()
     }
 
+    pub(crate) fn reusable_simple_query_plan(
+        &self,
+        statement: &Statement,
+        statement_format: Option<&str>,
+        environment: &CompileEnvironmentKey,
+    ) -> Option<CompiledStatement> {
+        let cached = self.simple_query_plan.as_ref()?;
+        (cached.statement == *statement
+            && cached.statement_format.as_deref() == statement_format
+            && cached.plan.compile_environment() == environment)
+            .then(|| cached.plan.clone())
+    }
+
+    pub(crate) fn publish_simple_query_plan(
+        &mut self,
+        statement: Statement,
+        statement_format: Option<String>,
+        plan: CompiledStatement,
+    ) {
+        self.simple_query_plan = Some(SimpleQueryPlanCacheEntry {
+            statement,
+            statement_format,
+            plan,
+        });
+    }
+
     pub fn reset(&mut self, current_database: &str) {
         self.clear_prepared_statements();
         self.clear_portals();
         self.search_path = CatalogSearchPath::new(current_database);
         self.disable_profiler();
         self.application_name.clear();
+        self.simple_query_plan = None;
     }
 
     #[inline]

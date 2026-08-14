@@ -45,6 +45,7 @@ struct QueryPipelineOptions {
     source: StatementSource,
     input: StatementInput,
     completion_override: Option<StatementCompletion>,
+    reuse_simple_query_plan: bool,
 }
 
 impl Session {
@@ -284,6 +285,7 @@ impl Session {
                 statement_format,
                 source: StatementSource::SimpleQuery,
                 completion_override,
+                reuse_simple_query_plan: true,
                 ..QueryPipelineOptions::default()
             },
             sink,
@@ -303,6 +305,7 @@ impl Session {
             source,
             input,
             completion_override,
+            reuse_simple_query_plan,
         } = options;
         let require_new_transaction =
             self.transaction.is_auto_commit() && !self.transaction.has_active_transaction();
@@ -352,6 +355,10 @@ impl Session {
 
         let statement_completion = initial_statement_completion(&stmt);
         let started_at = Instant::now();
+        let simple_plan_cache_eligible = reuse_simple_query_plan
+            && parameter_env.is_none()
+            && matches!(stmt, Statement::Query(_));
+        let cached_statement_format = statement_format.clone();
 
         let ctx = self.freeze_statement_context_with_input(
             StatementOptions {
@@ -370,15 +377,37 @@ impl Session {
             statement_completion = %statement_completion,
             "Statement compilation started"
         );
-        let compile_result = match parameter_env {
-            Some(parameter_env) => {
-                let parameter_types = parameter_env
-                    .iter()
-                    .map(|parameter| parameter.logical_type.clone())
-                    .collect::<Vec<_>>();
-                compile_statement_with_parameter_types(ctx.clone(), stmt.clone(), &parameter_types)
+        let compile_environment = ctx.compile_environment_key();
+        let cached_plan = simple_plan_cache_eligible.then(|| {
+            self.state.reusable_simple_query_plan(
+                &stmt,
+                cached_statement_format.as_deref(),
+                &compile_environment,
+            )
+        });
+        let cached_plan = cached_plan.flatten();
+        let compile_result = if let Some(plan) = cached_plan.as_ref() {
+            debug!(
+                target: targets::QUERY,
+                session_id = self.id,
+                "Repeated Simple Query reused immutable plan"
+            );
+            Ok(plan.clone())
+        } else {
+            match parameter_env {
+                Some(parameter_env) => {
+                    let parameter_types = parameter_env
+                        .iter()
+                        .map(|parameter| parameter.logical_type.clone())
+                        .collect::<Vec<_>>();
+                    compile_statement_with_parameter_types(
+                        ctx.clone(),
+                        stmt.clone(),
+                        &parameter_types,
+                    )
+                }
+                None => compile_statement(ctx.clone(), stmt.clone()),
             }
-            None => compile_statement(ctx.clone(), stmt.clone()),
         };
         let compiled = match compile_result {
             Ok(c) => c,
@@ -397,6 +426,13 @@ impl Session {
                 return Err(e);
             }
         };
+        if simple_plan_cache_eligible && cached_plan.is_none() {
+            self.state.publish_simple_query_plan(
+                stmt.clone(),
+                cached_statement_format,
+                compiled.clone(),
+            );
+        }
         debug!(
             target: targets::QUERY,
             session_id = self.id,
@@ -724,6 +760,7 @@ impl Session {
                     source,
                     input,
                     completion_override: None,
+                    reuse_simple_query_plan: false,
                 },
                 &mut sink,
             )

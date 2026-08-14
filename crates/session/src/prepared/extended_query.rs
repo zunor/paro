@@ -17,7 +17,7 @@ use paro_execution::query_executor::compiled::{
 use paro_execution::query_executor::executor::Executor;
 use paro_parser::ast::{Statement, VariableShowStmt};
 use std::sync::Arc;
-use tracing::error;
+use tracing::{debug, error};
 
 use crate::completion::StatementCompletion;
 use crate::completion_infer::infer_statement_completion;
@@ -178,8 +178,17 @@ async fn execute_parse<R: ExtendedQueryResponder>(
     }
 
     let parameter_types = resolve_parse_parameter_types(&raw_stmt, &message.type_oids)?;
+    let reusable_unnamed = message
+        .name
+        .is_none()
+        .then(|| {
+            reusable_unnamed_parse_artifacts(session, &message.query, &raw_stmt, &parameter_types)
+        })
+        .flatten();
     let (result_schema, generic_plan) = if is_client_copy(&raw_stmt) {
         (Vec::new(), None)
+    } else if let Some(artifacts) = reusable_unnamed {
+        artifacts
     } else {
         build_parse_artifacts(
             session,
@@ -217,6 +226,39 @@ async fn execute_parse<R: ExtendedQueryResponder>(
 
     session.refresh_session_metadata();
     responder.send_parse_complete().await
+}
+
+/// Reuse the immutable image behind a repeated unnamed Parse.
+///
+/// Drivers commonly use an unnamed Parse/Bind/Execute cycle even when they
+/// deliberately disable server-side named statements. PostgreSQL semantics
+/// replace the unnamed statement on every Parse, but do not require rebuilding
+/// an identical value-independent plan. The compile environment contains the
+/// visible catalog generation/epochs and all plan-affecting settings, so any
+/// schema, search-path, database, or setting change declines the reuse.
+fn reusable_unnamed_parse_artifacts(
+    session: &Session,
+    sql: &str,
+    stmt: &Statement,
+    parameter_types: &[Option<LogicalType>],
+) -> Option<(Vec<ResultColumnDesc>, Option<CompiledStatement>)> {
+    let previous = session.state.unnamed_prepared_statement()?;
+    if previous.source != PreparedStatementSource::Protocol
+        || previous.source_sql != sql
+        || previous.raw_stmt != *stmt
+        || previous.parameter_types != parameter_types
+    {
+        return None;
+    }
+    let plan = previous.generic_plan.as_ref()?;
+    (plan.compile_environment() == &session.compile_environment_key()).then(|| {
+        debug!(
+            target: targets::QUERY,
+            sql_bytes = sql.len(),
+            "Repeated unnamed Parse reused immutable generic plan"
+        );
+        (previous.result_schema.clone(), Some(plan.clone()))
+    })
 }
 
 async fn execute_bind<R: ExtendedQueryResponder>(
@@ -2230,6 +2272,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn repeated_unnamed_parse_reuses_only_the_same_compile_environment() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+        let parse = || {
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: None,
+                query: "SELECT 1".to_string(),
+                type_oids: Vec::new(),
+            })
+        };
+
+        execute_extended_query_message(&mut session, parse(), &mut responder)
+            .await
+            .unwrap();
+        let first = session
+            .state
+            .unnamed_prepared_statement()
+            .and_then(|statement| statement.generic_plan.clone())
+            .expect("first unnamed Parse compiles a generic plan");
+
+        execute_extended_query_message(&mut session, parse(), &mut responder)
+            .await
+            .unwrap();
+        let second = session
+            .state
+            .unnamed_prepared_statement()
+            .and_then(|statement| statement.generic_plan.clone())
+            .expect("repeated unnamed Parse keeps a generic plan");
+        assert!(second.shares_image_with(&first));
+
+        session.config.set_setting("threads", Value::Integer(2));
+        crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
+        execute_extended_query_message(&mut session, parse(), &mut responder)
+            .await
+            .unwrap();
+        let changed_environment = session
+            .state
+            .unnamed_prepared_statement()
+            .and_then(|statement| statement.generic_plan.clone())
+            .expect("changed environment recompiles a generic plan");
+        assert!(!changed_environment.shares_image_with(&second));
+    }
+
+    #[tokio::test]
     async fn simple_query_clears_protocol_unnamed_objects() {
         let instance = paro_instance::Instance::new_in_memory();
         let mut session = Session::new(1, instance);
@@ -2271,6 +2358,43 @@ mod tests {
 
         assert!(session.state.unnamed_prepared_statement().is_none());
         assert!(session.state.unnamed_portal().is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_simple_query_reuses_only_the_same_compile_environment() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+
+        let mut first_sink = CollectingSink::new();
+        exec_simple_ok(&mut session, &mut first_sink, "SELECT 1").await;
+        let statement = paro_parser::parse("SELECT 1")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap()
+            .stmt;
+        let first = session
+            .state
+            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
+            .expect("first Simple Query publishes a reusable plan");
+
+        let mut second_sink = CollectingSink::new();
+        exec_simple_ok(&mut session, &mut second_sink, "SELECT 1").await;
+        let second = session
+            .state
+            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
+            .expect("repeated Simple Query retains a reusable plan");
+        assert!(second.shares_image_with(&first));
+
+        session.config.set_setting("threads", Value::Integer(2));
+        crate::utility::settings::reconcile_effective_settings(&mut session).unwrap();
+        let mut changed_sink = CollectingSink::new();
+        exec_simple_ok(&mut session, &mut changed_sink, "SELECT 1").await;
+        let changed = session
+            .state
+            .reusable_simple_query_plan(&statement, None, &session.compile_environment_key())
+            .expect("changed environment publishes a replacement plan");
+        assert!(!changed.shares_image_with(&second));
     }
 
     #[tokio::test]
