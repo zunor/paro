@@ -84,6 +84,21 @@ impl SinkExec {
         }
     }
 
+    /// Whether omitting an empty task-local sink state is an exact identity operation.
+    ///
+    /// This capability is deliberately narrow. It is consumed only after a dependency-gated
+    /// source proves that it has no rows. Unknown/plugin sinks keep the ordinary data-task path.
+    pub(crate) fn empty_local_merge_is_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::ClientResult(_)
+                | Self::Materialize(_)
+                | Self::HashJoinBuild(_)
+                | Self::TopNBuild(_)
+                | Self::PartitionAggregateWindowBuild(_)
+        )
+    }
+
     #[inline]
     pub fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         match self {

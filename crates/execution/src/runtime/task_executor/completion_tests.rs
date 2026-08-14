@@ -649,6 +649,26 @@ fn parallel_finish_group_dispatches_subtasks_to_scheduler() {
 }
 
 #[test]
+fn top_level_finish_does_not_construct_data_path_locals() {
+    let query = query_context(QueryOutputPort::unbounded());
+    let local_creations = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let runtime = counting_local_runtime(&query, local_creations.clone());
+
+    crate::runtime::scheduler::run_inline_finish_pipeline(
+        runtime,
+        &query,
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("finish-only execution");
+
+    assert_eq!(
+        local_creations.load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "top-level finish must not construct source, transform, or sink locals"
+    );
+}
+
+#[test]
 fn finish_task_discovery_error_cancels_group_as_operator_error() {
     let query = query_context(QueryOutputPort::unbounded());
     let runtime = empty_runtime(&query);

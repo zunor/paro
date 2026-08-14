@@ -286,6 +286,9 @@ pub(crate) fn run_bound_pipeline_runtime(
     let Some(source_work) = source_work(&runtime.source_global)? else {
         return run_single_pipeline(runtime, query.as_ref(), allocator, 0, 1);
     };
+    if matches!(source_work, SourceWork::Empty) && runtime.can_complete_empty_without_data_task() {
+        return complete_empty_pipeline(runtime, query.as_ref(), allocator);
+    }
     let work_unit_count = source_work.work_unit_count();
     let total_threads = pipeline_thread_count(parallelism, work_unit_count, query.as_ref());
     if total_threads <= 1 || work_unit_count <= 1 {
@@ -311,6 +314,75 @@ pub(crate) fn run_bound_pipeline_runtime(
         }
     }
     run_finish_task(runtime, total_threads, query, allocator)
+}
+
+/// Complete a producer whose source is known empty after its dependency gates opened.
+///
+/// No data-path source, transform, sink local, or vector scratch is constructed. The producer
+/// still participates in a shared-sink merge barrier and the eventual owner runs every global
+/// transform/sink finish hook, preserving empty-input aggregate and breaker semantics.
+fn complete_empty_pipeline(
+    runtime: Arc<PipelineRuntime>,
+    query: &QueryRuntimeContext,
+    allocator: Arc<dyn Allocator>,
+) -> Result<()> {
+    if let Some(shared) = runtime.shared_sink.as_ref() {
+        match shared.mark_producer_merged()? {
+            SharedSinkMergeEvent::WaitingForProducers { .. } => return Ok(()),
+            SharedSinkMergeEvent::ReadyToFinish => {
+                if !shared.try_begin_finish()? {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    run_inline_finish_pipeline(runtime, query, allocator)
+}
+
+pub(crate) fn run_inline_finish_pipeline(
+    runtime: Arc<PipelineRuntime>,
+    query: &QueryRuntimeContext,
+    allocator: Arc<dyn Allocator>,
+) -> Result<()> {
+    let task = runtime.create_finish_task_state(query, allocator)?;
+    let mut executor = PipelineTaskExecutor::new_finish_task(runtime.clone(), task);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(runtime.program.id.index() as u64),
+        generation: query.output.wake_generation(),
+    };
+    let mut profiler =
+        query
+            .explain_profiler
+            .as_ref()
+            .map_or_else(OperatorProfiler::disabled, |profiler| {
+                OperatorProfiler::new_with_context(
+                    profiler.clone(),
+                    ProfileWorkerContext::new(
+                        Some(runtime.program.id.index() as u64),
+                        Some(runtime.program.id.index() as u64),
+                        Some(0),
+                        Some(1),
+                        None,
+                    ),
+                )
+            });
+    let mut ctx = PipelineTaskStepContext {
+        query,
+        thread: &thread,
+        wake: &wake,
+        profiler: &mut profiler,
+    };
+    loop {
+        match executor.step(&mut ctx)? {
+            TaskStepResult::Continue => {}
+            TaskStepResult::Done => {
+                profiler.flush();
+                return Ok(());
+            }
+            TaskStepResult::Blocked(blocker) => return Err(single_task_blocked_error(&blocker)),
+        }
+    }
 }
 
 fn pipeline_thread_count(
@@ -566,6 +638,7 @@ impl SourceTaskAssignment {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SourceWork {
+    Empty,
     RowsetScan {
         count: usize,
     },
@@ -585,6 +658,7 @@ const DATA_TASKS_PER_THREAD: usize = 4;
 impl SourceWork {
     fn work_unit_count(self) -> usize {
         match self {
+            Self::Empty => 0,
             Self::RowsetScan { count }
             | Self::Chunks { count }
             | Self::SharedWorkers { count, .. } => count,
@@ -593,6 +667,7 @@ impl SourceWork {
 
     fn into_task_assignments(self, total_threads: usize) -> Vec<SourceTaskAssignment> {
         match self {
+            Self::Empty => Vec::new(),
             Self::RowsetScan { count } => (0..count.min(total_threads))
                 .map(|_| SourceTaskAssignment::SharedWorker(SharedSourceWorker::RowsetScan))
                 .collect(),
@@ -968,11 +1043,16 @@ impl PipelineWorkerTask {
         if self.executor.is_some() {
             return Ok(());
         }
-        let mut task = self
-            .runtime
-            .create_task_state(self.query.as_ref(), self.allocator.clone())?;
+        let mut task = match self.mode {
+            PipelineWorkerMode::Data => self
+                .runtime
+                .create_task_state(self.query.as_ref(), self.allocator.clone())?,
+            PipelineWorkerMode::Finish => self
+                .runtime
+                .create_finish_task_state(self.query.as_ref(), self.allocator.clone())?,
+        };
         if let Some(assignment) = self.source_assignment {
-            prepare_source_task(&mut task.source, assignment)?;
+            prepare_source_task(&mut task.data_mut().source, assignment)?;
         }
         self.executor = Some(match self.mode {
             PipelineWorkerMode::Data => {
@@ -1260,6 +1340,9 @@ fn source_work(source: &SourceGlobal) -> Result<Option<SourceWork>> {
                 worker: SharedSourceWorker::PartitionAggregateWindowEmit,
             })
         }
+        SourceGlobal::HashJoinSpillReplay(global) if !global.handle.is_external() => {
+            Some(SourceWork::Empty)
+        }
         _ => None,
     })
 }
@@ -1394,6 +1477,12 @@ mod tests {
         assert!(SourceWork::Chunks { count: 0 }
             .into_task_assignments(4)
             .is_empty());
+    }
+
+    #[test]
+    fn empty_source_work_has_no_data_assignment() {
+        assert_eq!(SourceWork::Empty.work_unit_count(), 0);
+        assert!(SourceWork::Empty.into_task_assignments(4).is_empty());
     }
 
     #[test]

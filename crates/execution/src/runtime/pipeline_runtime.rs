@@ -15,7 +15,7 @@ use crate::pipeline::program::PipelineProgram;
 use super::breaker::{BreakerHandleRegistry, SharedSinkCoordinator};
 use super::context::{PipelineInitContext, QueryRuntimeContext};
 use super::parameter::ParameterBindings;
-use super::scratch::{PendingChunkState, PipelineTaskState, TaskMemoryGrants};
+use super::scratch::{PipelineTaskState, TaskMemoryGrants};
 use super::state::{SinkGlobal, SourceGlobal, TransformGlobalSlots};
 
 /// Runtime state created for one execution attempt of one immutable
@@ -170,14 +170,23 @@ impl PipelineRuntime {
         let scratch = self.program.scratch.create_scratch(allocator.clone())?;
         let memory = TaskMemoryGrants::query_accounted(query.memory.clone(), allocator.clone())?;
 
-        Ok(PipelineTaskState {
-            source,
-            transforms,
-            sink,
-            memory,
-            scratch,
-            pending: PendingChunkState::Empty,
-        })
+        Ok(PipelineTaskState::new_data(
+            source, transforms, sink, memory, scratch,
+        ))
+    }
+
+    /// Create global-completion state without data-path operator locals or vector scratch.
+    pub(crate) fn create_finish_task_state(
+        &self,
+        query: &QueryRuntimeContext,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<PipelineTaskState> {
+        PipelineTaskState::new_finish(query.memory.clone(), allocator)
+    }
+
+    /// Prove that an empty source can bypass all data-path local state.
+    pub(crate) fn can_complete_empty_without_data_task(&self) -> bool {
+        self.program.transforms.is_empty() && self.program.sink.exec.empty_local_merge_is_identity()
     }
 
     fn init_context<'a>(
@@ -276,6 +285,12 @@ mod tests {
             .create_task_state(&query, paro_common::test_utils::test_allocator())
             .expect("task state");
         assert!(task.pending.is_empty());
-        assert_eq!(task.scratch.transform_chunks.len(), 0);
+        assert_eq!(task.data().scratch.transform_chunks.len(), 0);
+
+        let finish = runtime
+            .create_finish_task_state(&query, paro_common::test_utils::test_allocator())
+            .expect("finish task state");
+        assert!(finish.is_finish_only());
+        assert!(finish.pending.is_empty());
     }
 }

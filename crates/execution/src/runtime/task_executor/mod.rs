@@ -134,7 +134,8 @@ impl PipelineTaskExecutor {
     /// Parallel pipeline scheduling runs N data tasks through source,
     /// transform flush, and local sink merge. Once all local merges have
     /// rendezvoused, a single finish task owns the global seal/finalize path.
-    pub fn new_finish_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+    pub(crate) fn new_finish_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+        debug_assert!(task.is_finish_only());
         let mut executor = Self::new(runtime, task);
         executor.phase = PipelineTaskPhase::Merging;
         executor.completion_stage = PipelineCompletionStage::PrepareFinish;
