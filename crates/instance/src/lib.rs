@@ -26,6 +26,7 @@ mod tests;
 
 pub use builder::InstanceBuilder;
 pub use config::{BootConfig, CheckpointConfigOptions, InstanceConfig, InstanceConfigOptions};
+pub use database::compaction_driver::ForegroundMaintenanceGuard;
 pub use database::handle::{
     AccessMode, AttachOptions, AttachVisibility, DatabaseCloseAction, DatabaseHandle, DbState,
     RecoveryMode,

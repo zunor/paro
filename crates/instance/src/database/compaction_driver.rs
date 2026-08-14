@@ -16,7 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_COMPACTION_MAX_CONCURRENCY: usize = 2;
+// Compaction currently runs one scheduler task to completion and therefore
+// cannot yield after a foreground producer becomes ready. Keep at most one
+// such maintenance task in flight: the query driver participates as one
+// worker, so a four-thread instance still has three background workers plus
+// the caller available to satisfy a four-way query budget. Raising this again
+// requires cooperative maintenance task slices, not merely queue priority.
+const DEFAULT_COMPACTION_MAX_CONCURRENCY: usize = 1;
 const COMPACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CompactionDriver {
@@ -28,6 +34,16 @@ pub struct CompactionDriver {
 pub struct CompactionSuspendGuard {
     manager: Arc<CompactionManager>,
     reason: &'static str,
+}
+
+pub struct ForegroundMaintenanceGuard {
+    manager: Arc<CompactionManager>,
+}
+
+impl Drop for ForegroundMaintenanceGuard {
+    fn drop(&mut self) {
+        self.manager.resume("foreground statement");
+    }
 }
 
 impl Drop for CompactionSuspendGuard {
@@ -108,6 +124,16 @@ impl CompactionDriver {
             );
         }
         Some(CompactionSuspendGuard { manager, reason })
+    }
+
+    /// Give foreground statements priority over long-running maintenance.
+    /// Suspension is reference counted, so concurrent statements keep
+    /// compaction paused until the last foreground guard leaves.
+    pub fn enter_foreground(&self) -> Option<ForegroundMaintenanceGuard> {
+        let manager = self.manager.read().as_ref()?.clone();
+        manager.suspend("foreground statement");
+        manager.preempt_for_foreground("foreground statement");
+        Some(ForegroundMaintenanceGuard { manager })
     }
 
     pub fn shutdown(&self) {

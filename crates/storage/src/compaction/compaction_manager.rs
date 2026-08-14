@@ -19,7 +19,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_scheduler::scheduler::TaskScheduler;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::broadcast;
@@ -103,7 +103,7 @@ pub struct CompactionManager {
     failed_tablets: Arc<Mutex<HashMap<TabletId, String>>>,
     jobs: Arc<Mutex<HashMap<TabletId, CompactionJobObservability>>>,
     cancellation_tokens: Arc<Mutex<HashMap<TabletId, CancellationToken>>>,
-    suspended: AtomicBool,
+    suspension_count: AtomicUsize,
     candidate_queue_len: AtomicUsize,
     executor: Arc<CompactionExecutor>,
     compaction_allocator: Arc<dyn Allocator>,
@@ -132,7 +132,7 @@ impl CompactionManager {
             failed_tablets: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
-            suspended: AtomicBool::new(false),
+            suspension_count: AtomicUsize::new(0),
             candidate_queue_len: AtomicUsize::new(0),
             executor: Arc::new(CompactionExecutor::new(max_concurrency)),
             compaction_allocator: allocator,
@@ -153,7 +153,7 @@ impl CompactionManager {
             failed_tablets: Arc::new(Mutex::new(HashMap::new())),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             cancellation_tokens: Arc::new(Mutex::new(HashMap::new())),
-            suspended: AtomicBool::new(false),
+            suspension_count: AtomicUsize::new(0),
             candidate_queue_len: AtomicUsize::new(0),
             executor: Arc::new(CompactionExecutor::new_with_scheduler(
                 max_concurrency,
@@ -270,19 +270,50 @@ impl CompactionManager {
     }
 
     pub fn suspend(&self, reason: &str) {
-        if !self.suspended.swap(true, AtomicOrdering::AcqRel) {
+        if self.suspension_count.fetch_add(1, AtomicOrdering::AcqRel) == 0 {
             info!(reason = reason, "CompactionManager: scheduling suspended");
         }
     }
 
     pub fn resume(&self, reason: &str) {
-        if self.suspended.swap(false, AtomicOrdering::AcqRel) {
+        let previous = self
+            .suspension_count
+            .fetch_update(AtomicOrdering::AcqRel, AtomicOrdering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .unwrap_or(0);
+        if previous == 1 {
             info!(reason = reason, "CompactionManager: scheduling resumed");
         }
     }
 
     pub fn is_suspended(&self) -> bool {
-        self.suspended.load(AtomicOrdering::Acquire)
+        self.suspension_count.load(AtomicOrdering::Acquire) > 0
+    }
+
+    /// Stop accepted maintenance promptly when foreground work becomes ready.
+    /// Queued tasks are cancelled through the executor; running tasks observe
+    /// the same cancellation token inside their merge/build loops.
+    pub fn preempt_for_foreground(&self, reason: &str) {
+        let tablet_ids = self
+            .running_tablets
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for tablet_id in tablet_ids {
+            let token = self
+                .cancellation_tokens
+                .lock()
+                .unwrap()
+                .get(&tablet_id)
+                .cloned();
+            if let Some(token) = token {
+                token.cancel();
+            }
+            let _ = self.executor.cancel_pending_tablet(tablet_id, reason);
+        }
     }
 
     pub fn wait_for_idle(&self, timeout: Duration) -> bool {
@@ -803,6 +834,12 @@ mod tests {
 
         manager.suspend("test");
         assert!(manager.is_suspended());
+        manager.suspend("concurrent test");
+        manager.resume("test");
+        assert!(manager.is_suspended());
+        manager.resume("concurrent test");
+        assert!(!manager.is_suspended());
+        // Extra resumes are harmless and cannot underflow the lease count.
         manager.resume("test");
         assert!(!manager.is_suspended());
     }

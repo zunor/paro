@@ -573,6 +573,12 @@ impl DatabaseHandle {
         self.compaction.observability()
     }
 
+    pub fn enter_foreground_maintenance_guard(
+        &self,
+    ) -> Option<crate::database::compaction_driver::ForegroundMaintenanceGuard> {
+        self.compaction.enter_foreground()
+    }
+
     /// Bind the instance task scheduler for background maintenance tasks.
     pub fn bind_task_scheduler(self: &Arc<Self>, scheduler: Arc<TaskScheduler>) {
         *self.task_scheduler.write() = Some(scheduler.clone());

@@ -879,7 +879,8 @@ impl Session {
         let control = self
             .execution_control
             .begin_statement(self.current_statement_timeout())?;
-        let ctx = ActiveQueryContext::new(query, control);
+        let foreground_maintenance = self.current_database.enter_foreground_maintenance_guard();
+        let ctx = ActiveQueryContext::new(query, control, foreground_maintenance);
         self.active_query = Some(ctx);
         Ok(())
     }

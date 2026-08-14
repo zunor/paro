@@ -110,6 +110,10 @@ pub struct ActiveQueryContext {
 
     /// Progress belongs to the active statement and cannot outlive it.
     progress: QueryProgress,
+
+    /// Reference-counted foreground lease that preempts background maintenance
+    /// for the lifetime of this statement, including async execution.
+    _foreground_maintenance: Option<paro_instance::ForegroundMaintenanceGuard>,
 }
 
 // Manual Debug implementation because Executor doesn't implement Debug
@@ -129,7 +133,11 @@ impl std::fmt::Debug for ActiveQueryContext {
 
 impl ActiveQueryContext {
     /// Creates a new ActiveQueryContext for the given query.
-    pub fn new(query: impl Into<String>, control: Arc<ActiveStatementControl>) -> Self {
+    pub fn new(
+        query: impl Into<String>,
+        control: Arc<ActiveStatementControl>,
+        foreground_maintenance: Option<paro_instance::ForegroundMaintenanceGuard>,
+    ) -> Self {
         Self {
             query: query.into(),
             prepared_name: None,
@@ -138,6 +146,7 @@ impl ActiveQueryContext {
             open_result_id: None,
             executor: None,
             progress: QueryProgress::default(),
+            _foreground_maintenance: foreground_maintenance,
         }
     }
 
@@ -155,6 +164,7 @@ impl ActiveQueryContext {
             open_result_id: None,
             executor: Some(executor),
             progress: QueryProgress::default(),
+            _foreground_maintenance: None,
         }
     }
 
@@ -172,6 +182,7 @@ impl ActiveQueryContext {
             open_result_id: None,
             executor: None,
             progress: QueryProgress::default(),
+            _foreground_maintenance: None,
         }
     }
 
@@ -337,7 +348,7 @@ mod tests {
 
     #[test]
     fn test_active_query_context_new() {
-        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control(), None);
         assert_eq!(ctx.query(), "SELECT 1");
         assert!(ctx.prepared_name().is_none());
         assert!(!ctx.has_open_result());
@@ -353,14 +364,14 @@ mod tests {
 
     #[test]
     fn test_active_query_context_elapsed() {
-        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control(), None);
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(ctx.elapsed().as_millis() >= 10);
     }
 
     #[test]
     fn test_active_query_context_open_result() {
-        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control());
+        let mut ctx = ActiveQueryContext::new("SELECT 1", test_control(), None);
 
         assert!(!ctx.has_open_result());
         assert!(!ctx.is_open_result(42));
@@ -376,7 +387,7 @@ mod tests {
 
     #[test]
     fn test_active_query_context_debug() {
-        let ctx = ActiveQueryContext::new("SELECT 1", test_control());
+        let ctx = ActiveQueryContext::new("SELECT 1", test_control(), None);
         let debug_str = format!("{:?}", ctx);
         assert!(debug_str.contains("ActiveQueryContext"));
         assert!(debug_str.contains("SELECT 1"));
