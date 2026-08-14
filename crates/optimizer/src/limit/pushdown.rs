@@ -179,6 +179,7 @@ mod tests {
             ],
             output_names: vec!["id".to_string(), "name".to_string()],
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
+            late_row_fetch: None,
             child: Box::new(LogicalPlan::synthetic(child)),
         })
     }

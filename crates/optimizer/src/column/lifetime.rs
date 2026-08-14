@@ -41,6 +41,11 @@ impl ColumnLifetimeAnalyzer {
                 for expr in &proj.expressions {
                     child_analyzer.visit_expression(expr);
                 }
+                if let Some(fetch) = &proj.late_row_fetch {
+                    for source in &fetch.sources {
+                        child_analyzer.visit_expression(&source.rowid);
+                    }
+                }
                 let child = *proj.child;
                 proj.child = Box::new(child_analyzer.optimize_plan(child)?);
                 LogicalOperator::Projection(proj)
@@ -105,6 +110,34 @@ impl ColumnLifetimeAnalyzer {
                 let child = *topn.child;
                 topn.child = Box::new(self.optimize_plan(child)?);
                 LogicalOperator::TopN(topn)
+            }
+            LogicalOperator::Window(mut window) => {
+                // A window appends its results but otherwise passes through
+                // child columns. Keep only parent-visible child bindings plus
+                // the partition/order/argument/frame dependencies needed to
+                // compute retained window results. Window-result bindings
+                // themselves must not leak into the child analyzer: they are
+                // produced here and would look like unresolved correlated
+                // references below, disabling join projection pruning.
+                let child_bindings = window.child.get_column_bindings();
+                let mut child_analyzer = ColumnLifetimeAnalyzer::new(self.everything_referenced);
+                if !self.everything_referenced {
+                    child_analyzer.column_references.extend(
+                        self.column_references
+                            .iter()
+                            .filter(|binding| child_bindings.contains(binding))
+                            .copied(),
+                    );
+                }
+                for expression in &window.expressions {
+                    paro_planner::expression::ExpressionIterator::enumerate_window_children(
+                        expression,
+                        |child| child_analyzer.visit_expression(child),
+                    );
+                }
+                let child = *window.child;
+                window.child = Box::new(child_analyzer.optimize_plan(child)?);
+                LogicalOperator::Window(window)
             }
             LogicalOperator::Distinct(mut distinct) => {
                 self.everything_referenced = true;
@@ -406,7 +439,7 @@ mod tests {
     };
     use paro_planner::operator::{
         ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Join, JoinComparisonType,
-        JoinCondition, JoinType, LogicalOperator, Order, Projection,
+        JoinCondition, JoinType, LogicalOperator, Order, Projection, Window,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -533,6 +566,110 @@ mod tests {
         assert_eq!(join.left_projection_map.as_columns(), Some(&[1][..]));
         assert!(join.right_projection_map.is_none());
         assert_eq!(join.get_types(), vec![LogicalType::BigInt]);
+    }
+
+    #[test]
+    fn window_dependencies_do_not_keep_unrelated_join_payload_alive() {
+        let ctx = BindContext::new();
+        let left = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["partition_key".into(), "payload".into(), "dead_left".into()],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::BigInt,
+                    LogicalType::Varchar,
+                ],
+            )),
+        );
+        let right = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                20,
+                Vec::new(),
+                vec!["join_key".into(), "dead_right".into()],
+                vec![LogicalType::Integer, LogicalType::Varchar],
+            )),
+        );
+        let joined = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Inner,
+                left,
+                right,
+                vec![JoinCondition::new(
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(20, 0),
+                        LogicalType::Integer,
+                    )),
+                    JoinComparisonType::Equal,
+                )],
+            ))),
+        );
+        let window = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Window(Window::new(
+                40,
+                vec![WindowExpression::native(
+                    WindowFunction::row_number(),
+                    vec![],
+                    vec![Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 0),
+                        LogicalType::Integer,
+                    ))],
+                    vec![],
+                    WindowFrame {
+                        frame_type: WindowFrameType::Rows,
+                        start_bound: WindowFrameBound::Unbounded,
+                        start_is_preceding: true,
+                        end_bound: WindowFrameBound::Unbounded,
+                        end_is_preceding: false,
+                    },
+                    false,
+                )],
+                joined,
+            )),
+        );
+        let plan = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Projection(Projection::new(
+                50,
+                window,
+                vec![
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(10, 1),
+                        LogicalType::BigInt,
+                    )),
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(40, 0),
+                        LogicalType::BigInt,
+                    )),
+                ],
+            )),
+        );
+
+        let optimized = ColumnLifetimeAnalyzer::new(true).optimize(plan).unwrap();
+        let LogicalOperator::Projection(projection) = optimized.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Window(window) = projection.child.operator else {
+            panic!("expected window");
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = window.child.operator else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.left_projection_map.as_columns(), Some(&[0, 1][..]));
+        assert!(join.right_projection_map.is_none());
+        assert_eq!(
+            join.get_types(),
+            vec![LogicalType::Integer, LogicalType::BigInt]
+        );
     }
 
     #[test]

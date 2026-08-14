@@ -333,9 +333,33 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             }
 
             // =========================================================================
+            // Special case: late row-fetch projection
+            //
+            // Its rowid carriers are ordinary child expressions and resolve to
+            // physical input positions here. The visible projection expressions
+            // intentionally retain their carrier/materialized logical namespaces;
+            // RowFetchProject rebases that combined domain after fetching rows.
+            // =========================================================================
+            LogicalOperator::Projection(proj) if proj.late_row_fetch.is_some() => {
+                self.visit_logical_plan(proj.child.as_mut());
+                let child_bindings = proj.child.get_column_bindings();
+                let child_types = proj.child.types();
+                self.bindings = child_bindings;
+                self.types = child_types;
+                self.scope = "late row-fetch rowid carrier".to_string();
+                if let Some(fetch) = &mut proj.late_row_fetch {
+                    for source in &mut fetch.sources {
+                        self.visit_expression(&mut source.rowid);
+                    }
+                }
+                self.bindings = op.get_column_bindings();
+                self.types = op.types();
+            }
+
+            // =========================================================================
             // Special case: Graph Projection
             // A Projection over a graph chain (GraphScan/GraphExpand)
-            // uses PhysicalGraphProject which does its own late-materialization
+            // uses RowFetchProject which does its own late-materialization
             // column remapping. We must NOT resolve the COLUMNS expressions
             // here because the graph chain's output bindings (local_id, rowid,
             // edge_rowid, ...) don't correspond to the actual table columns

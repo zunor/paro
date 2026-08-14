@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::types::LogicalType;
 use paro_function::scalar::FunctionExecContext;
 use paro_planner::operator::join::{JoinCondition, JoinType};
@@ -27,6 +27,7 @@ use crate::operators::join::hash::payload::{
 };
 use crate::physical::properties::MemoryClass;
 use crate::physical::properties::RequiredProperties;
+use crate::physical::specs::BuildTimeIntegerJoinIndexSpec;
 use crate::runtime::breaker::{
     HandleRef, HashJoinBuildSpillReclaimer, HashJoinLocalBuildSpillReclaimer, JoinBuildHandle,
     JoinRuntimeFilterBuilder,
@@ -46,6 +47,8 @@ use crate::runtime::state::{BreakerHandleGlobal, HashJoinBuildSinkLocal, SinkGlo
 pub struct HashJoinBuildSinkExec {
     pub handle: HandleRef<JoinBuildHandle>,
     pub join_type: JoinType,
+    pub build_keys_unique: bool,
+    pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
     pub key_conditions: Box<[JoinCondition]>,
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
@@ -59,6 +62,33 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
+        let build_time_integer_builder = (!self.force_external)
+            .then_some(self.build_time_integer_index.as_ref())
+            .flatten()
+            .map(|index| {
+                let [condition] = self.key_conditions.as_ref() else {
+                    return Ok(None);
+                };
+                match crate::join_hashtable::table::BuildTimeIntegerIndexBuilder::try_new_from_values(
+                    &condition.right.return_type(),
+                    &index.minimum,
+                    &index.maximum,
+                    index.estimated_rows,
+                    ctx.query.allocator(MemoryTag::HashTable),
+                    &hash_join_memory_context(ctx.query)
+                        .with_class(paro_common::memory::MemoryAccountingClass::NonRevocable),
+                ) {
+                    Ok(builder) => Ok(builder),
+                    Err(error) if error.error_class() == ErrorClass::Resource => Ok(None),
+                    Err(error) => Err(error),
+                }
+            })
+            .transpose()?
+            .flatten()
+            .map(Arc::new);
+        if let Some(builder) = &build_time_integer_builder {
+            handle.install_build_time_integer_builder(Arc::clone(builder))?;
+        }
         let table = handle.initialize_table_with_output_count(
             ctx.query.session.buffer_pool().clone(),
             ctx.query.allocator(MemoryTag::HashTable),
@@ -66,6 +96,7 @@ impl HashJoinBuildSinkExec {
             self.build_payload_types.to_vec(),
             self.build_output_count,
             self.join_type,
+            self.build_keys_unique,
             hash_join_memory_context(ctx.query),
         )?;
         if let Some(channel_count) = self.grouped_reduction_channels {
@@ -86,9 +117,15 @@ impl HashJoinBuildSinkExec {
     pub(crate) fn create_local(
         &self,
         ctx: &mut PipelineInitContext,
-        _global: &SinkGlobal,
+        global: &SinkGlobal,
     ) -> Result<SinkLocal> {
         let handle = ctx.handles.get(self.handle)?;
+        let SinkGlobal::HashJoinBuild(global) = global else {
+            return Err(paro_error::internal(
+                "hash join build global state mismatch",
+            ));
+        };
+        let build_time_integer_builder = global.handle.build_time_integer_builder();
         let build_key_types = join_key_types(&self.key_conditions, JoinKeySide::Build);
         let build_residual_types = join_key_types(&self.residual_conditions, JoinKeySide::Build);
         let hash_table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
@@ -98,7 +135,11 @@ impl HashJoinBuildSinkExec {
             self.build_payload_types.to_vec(),
             self.build_output_count,
             self.join_type,
-            JoinHashTableConfig::default(),
+            JoinHashTableConfig {
+                build_keys_unique: self.build_keys_unique,
+                build_time_integer_builder: build_time_integer_builder.clone(),
+                ..Default::default()
+            },
             hash_join_memory_context(ctx.query),
         ));
         let build_spill = Arc::new(parking_lot::Mutex::new(None));
@@ -159,6 +200,7 @@ impl HashJoinBuildSinkExec {
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             build_residuals: None,
+            build_time_integer_builder,
         }))
     }
 
@@ -267,6 +309,7 @@ impl HashJoinBuildSinkExec {
         if let Some(local_table) = local.hash_table.take() {
             global.handle.require_table()?.merge(local_table)?;
         }
+        local.build_time_integer_builder = None;
         global
             .handle
             .merge_runtime_filter_builder(local.runtime_filter_builder.take())?;
@@ -316,6 +359,25 @@ impl HashJoinBuildSinkExec {
                 ));
             if !handle.completion.is_complete() && !handle.is_external() {
                 let table = handle.require_table()?;
+                if handle.build_time_integer_builder().is_some() {
+                    return Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
+                        "hash_join_publish_build_time_integer",
+                        memory_class,
+                        move |ctx| {
+                            let builder =
+                                handle.take_build_time_integer_builder()?.ok_or_else(|| {
+                                    paro_error::internal("unique integer join builder disappeared")
+                                })?;
+                            table.publish_build_time_integer_builder(builder)?;
+                            let published = publish_runtime_filter(ctx, handle.as_ref())?;
+                            handle.completion.mark_complete();
+                            if published {
+                                record_runtime_filter_installed(ctx);
+                            }
+                            Ok(())
+                        },
+                    )));
+                }
                 if let Some(build) = table.prepare_parallel_direct_integer_index()? {
                     return Ok(FinishWork::Parallel(
                         ParallelDirectJoinFinalizeDriver::group(
@@ -338,6 +400,7 @@ impl HashJoinBuildSinkExec {
                 let result = if force_external
                     || should_use_memory_triggered_external_join(ctx, handle.as_ref())
                 {
+                    discard_build_time_integer_builder(handle.as_ref())?;
                     finish_external_hash_join(ctx, handle.as_ref())
                 } else {
                     finalize_in_memory_hash_join(ctx, handle.as_ref())
@@ -368,6 +431,7 @@ impl HashJoinBuildSinkExec {
             || should_use_memory_triggered_external_join(ctx, global.handle.as_ref()))
             && !global.handle.is_external()
         {
+            discard_build_time_integer_builder(global.handle.as_ref())?;
             finish_external_hash_join(ctx, global.handle.as_ref())?;
         } else if !self.force_external && !global.handle.completion.is_complete() {
             finalize_in_memory_hash_join(ctx, global.handle.as_ref())?;
@@ -375,6 +439,11 @@ impl HashJoinBuildSinkExec {
         unregister_hash_join_build_reclaimer(ctx, global.handle.as_ref());
         Ok(FinishPoll::Done)
     }
+}
+
+fn discard_build_time_integer_builder(handle: &JoinBuildHandle) -> Result<()> {
+    drop(handle.take_build_time_integer_builder()?);
+    Ok(())
 }
 
 fn hash_join_local_build_spill_supported(join_type: JoinType) -> bool {

@@ -12,7 +12,8 @@ use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::graph_expand::graph_path_element_list_type;
 use paro_storage::index::graph::GraphReadSnapshot;
 use paro_storage::table::table_handle::TableHandle;
-use paro_storage::tablet::TabletReader;
+use paro_storage::table::StorageSnapshot;
+use paro_storage::tablet::{TabletReader, TabletRowIdReader};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 
@@ -161,31 +162,34 @@ pub struct GraphShortestPathTransformLocal {
 }
 
 #[derive(Debug)]
-pub struct GraphProjectTableFetchPlan {
+pub struct RowFetchTablePlan {
     pub table_index: usize,
     pub table_name: String,
     pub rowid_col_idx: usize,
     pub storage: Arc<TableHandle>,
-    pub reader: Option<TabletReader>,
+    pub storage_snapshot: Arc<StorageSnapshot>,
+    pub reader: Option<TabletRowIdReader>,
     pub rowids: Vec<u64>,
-    pub column_types: Box<[LogicalType]>,
     pub required_columns: Box<[usize]>,
     pub column_ids: Box<[u32]>,
-    pub full_cols: Vec<Option<Arc<Vector>>>,
 }
 
 #[derive(Debug)]
-pub struct GraphProjectMaterializedRuntime {
-    pub table_fetches: Box<[GraphProjectTableFetchPlan]>,
+pub struct RowFetchMaterializedRuntime {
+    pub table_fetches: Box<[RowFetchTablePlan]>,
     pub path_columns: Box<[usize]>,
     pub filter_executors: Vec<ExpressionExecutor>,
-    pub project_executor: ExpressionExecutor,
+    /// Pure column projections publish the fetched vectors by reference and
+    /// avoid allocating result buffers which would immediately be replaced.
+    pub direct_project_columns: Option<Box<[usize]>>,
+    pub project_executor: Option<ExpressionExecutor>,
 }
 
 #[derive(Debug, Default)]
-pub struct GraphProjectTransformLocal {
+pub struct RowFetchProjectTransformLocal {
     pub filter_selection: Option<SelectionVector>,
     pub raw_filter_executors: Vec<ExpressionExecutor>,
     pub raw_project_executor: Option<ExpressionExecutor>,
-    pub materialized: Option<GraphProjectMaterializedRuntime>,
+    pub materialized: Option<RowFetchMaterializedRuntime>,
+    pub buffered_input: Option<Chunk>,
 }

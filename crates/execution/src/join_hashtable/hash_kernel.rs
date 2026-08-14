@@ -241,6 +241,9 @@ impl JoinKeyLayout {
         hashes: &mut [u64],
     ) -> Result<()> {
         debug_assert!(hashes.len() >= count);
+        if matches!(self.matcher, JoinKeyMatcher::I64PairEqual { .. }) {
+            return hash_i64_pair_equal_into(keys, selection, count, hashes);
+        }
         let hashes = &mut hashes[..count];
         hashes.fill(HASH_SEED);
         let selected_rows = selection.map(|selection| &selection.as_slice()[..count]);
@@ -586,6 +589,45 @@ fn apply_column_hash(
     Ok(())
 }
 
+/// Hash the common two-BIGINT equality shape in one decoded row loop.
+///
+/// The generic column-major path resolves dictionary selections and validity
+/// twice for every row. Composite foreign keys are frequent in analytical
+/// schemas, so both inputs are decoded once and the final hash is produced in
+/// a single loop. The expression remains identical to the generic path.
+fn hash_i64_pair_equal_into(
+    keys: &Chunk,
+    selection: Option<&SelectionVector>,
+    count: usize,
+    hashes: &mut [u64],
+) -> Result<()> {
+    let left = keys
+        .column(0)
+        .expect("two-column join key is missing its first column")
+        .try_decode_ref(keys.size())?;
+    let right = keys
+        .column(1)
+        .expect("two-column join key is missing its second column")
+        .try_decode_ref(keys.size())?;
+    let selected_rows = selection.map(|selection| &selection.as_slice()[..count]);
+
+    for out_idx in 0..count {
+        let row_idx = selected_rows.map_or(out_idx, |rows| rows[out_idx] as usize);
+        let left_hash = if left.is_valid(row_idx) {
+            hash_i64(unsafe { left.get_value::<i64>(row_idx) })
+        } else {
+            NULL_HASH
+        };
+        let right_hash = if right.is_valid(row_idx) {
+            hash_i64(unsafe { right.get_value::<i64>(row_idx) })
+        } else {
+            NULL_HASH
+        };
+        hashes[out_idx] = combine_hash(combine_hash(HASH_SEED, left_hash), right_hash);
+    }
+    Ok(())
+}
+
 fn apply_fixed_hash_column<T: Copy>(
     vector: &Vector,
     selected_rows: Option<&[u32]>,
@@ -843,7 +885,9 @@ fn hash_logical_type_signature(logical_type: &LogicalType) -> u64 {
 mod tests {
     use super::*;
     use paro_common::chunk::Chunk;
-    use paro_common::test_utils::{test_allocator, test_i32_vector_with_allocator, test_vector};
+    use paro_common::test_utils::{
+        test_allocator, test_i32_vector_with_allocator, test_i64_vector_with_allocator, test_vector,
+    };
     use std::sync::Arc;
 
     #[test]
@@ -919,5 +963,30 @@ mod tests {
 
         assert_eq!(hashes[0], layout.hash_key_at(&chunk, 2));
         assert_eq!(hashes[1], layout.hash_key_at(&chunk, 1));
+    }
+
+    #[test]
+    fn two_bigint_kernel_preserves_generic_hashes_for_selected_and_null_rows() {
+        let allocator = test_allocator();
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::BigInt, LogicalType::BigInt],
+            &[JoinComparisonType::Equal, JoinComparisonType::Equal],
+            true,
+        );
+        let left = test_i64_vector_with_allocator(&[7, 42, 99], allocator.clone());
+        let mut right = test_i64_vector_with_allocator(&[70, 420, 990], allocator.clone());
+        right.validity_mut().set_null(1);
+        let chunk =
+            Chunk::from_arc_vectors(vec![Arc::new(left), Arc::new(right)], allocator.clone());
+        let selection =
+            SelectionVector::try_from_indices(vec![2, 1, 0], allocator).expect("selection");
+        let mut hashes = vec![0; 3];
+        layout
+            .hash_selected_into(&chunk, &selection, 3, &mut hashes)
+            .expect("pair hash");
+
+        assert_eq!(hashes[0], layout.hash_key_at(&chunk, 2));
+        assert_eq!(hashes[1], layout.hash_key_at(&chunk, 1));
+        assert_eq!(hashes[2], layout.hash_key_at(&chunk, 0));
     }
 }

@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType, MarkJoinSemantics};
@@ -10,6 +11,15 @@ use std::sync::Arc;
 pub struct HashJoinSpec {
     pub join_type: JoinType,
     pub anti_join_mode: AntiJoinMode,
+    /// Correctness proof that the complete build equality-key tuple is unique.
+    /// Runtime index construction may use this to publish disjoint slots
+    /// without duplicate-chain synchronization.
+    pub build_keys_unique: bool,
+    /// Pre-admitted direct domain for an integral build key. The build sink
+    /// fills this artifact while retaining rows, so finish only publishes it
+    /// instead of rescanning the row store. Unique keys use disjoint stores;
+    /// repeated keys atomically link their build chains in the same pass.
+    pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
     /// Equality predicates used to locate a candidate hash chain.
     pub key_conditions: Box<[JoinCondition]>,
     /// Canonical ordered list of RHS expressions materialized after the visible
@@ -36,6 +46,13 @@ pub struct HashJoinSpec {
     /// one equivalent filtering scan. Each step owns one match bit; the emit
     /// phase applies the required/forbidden masks after the shared probe.
     pub reduction_cascade: Option<HashReductionCascadeSpec>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BuildTimeIntegerJoinIndexSpec {
+    pub minimum: Value,
+    pub maximum: Value,
+    pub estimated_rows: usize,
 }
 
 #[derive(Debug, Clone)]

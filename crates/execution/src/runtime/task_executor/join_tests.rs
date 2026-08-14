@@ -42,6 +42,8 @@ fn run_null_aware_anti_join(
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Anti,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -197,6 +199,8 @@ fn hash_join_output_more_yields_between_output_chunks() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -349,6 +353,8 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
         sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
             handle,
             join_type: JoinType::Inner,
+            build_keys_unique: false,
+            build_time_integer_index: None,
             key_conditions: vec![join_condition()].into_boxed_slice(),
             residual_conditions: Box::default(),
             grouped_reduction_channels: None,
@@ -566,6 +572,8 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle: hash_handle,
                     join_type: JoinType::Inner,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -930,6 +938,8 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Single,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -1064,6 +1074,8 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Right,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,

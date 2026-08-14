@@ -329,6 +329,13 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         }
         PhysicalNodeKind::HashJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
+            if spec.build_time_integer_index.is_some() {
+                push_string_property(
+                    &mut properties,
+                    "Build Index",
+                    "integer_build_time".to_string(),
+                );
+            }
             push_join_conditions(&mut properties, &spec.key_conditions);
             push_join_conditions(&mut properties, &spec.build_residual_conditions);
         }
@@ -394,7 +401,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 format_hops(spec.min_hops, spec.max_hops),
             );
         }
-        PhysicalNodeKind::GraphProject(spec) => {
+        PhysicalNodeKind::RowFetchProject(spec) => {
             push_list_property(&mut properties, "Output", &spec.output_names);
             if !spec.filters.is_empty() {
                 push_string_property(&mut properties, "Filter", "<pushed down>".to_string());

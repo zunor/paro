@@ -733,10 +733,11 @@ impl HashBuildStore {
                     .and_then(|vector| vector.get_u8(output_idx))
                     .unwrap_or(0)
             },
+            |_, _, _| Ok(()),
         )
     }
 
-    pub(super) fn append_key_payload_chunk(
+    pub(super) fn append_key_payload_chunk_with(
         &mut self,
         keys: &Chunk,
         payload: &Chunk,
@@ -744,6 +745,7 @@ impl HashBuildStore {
         selected_count: usize,
         hashes: Option<&[u64]>,
         found: bool,
+        mut on_row: impl FnMut(usize, usize, usize) -> Result<()>,
     ) -> Result<usize> {
         if selected_count == 0 {
             return Ok(0);
@@ -809,6 +811,7 @@ impl HashBuildStore {
             |output_idx| selection.get(output_idx),
             |output_idx, _| Ok(hashes.map_or(0, |hashes| hashes[output_idx])),
             |_, _| u8::from(found),
+            |output_idx, source_row_idx, row_ptr| on_row(output_idx, source_row_idx, row_ptr),
         )
     }
 
@@ -828,18 +831,20 @@ impl HashBuildStore {
         }
     }
 
-    fn append_prepared_rows<S, H, F>(
+    fn append_prepared_rows<S, H, F, V>(
         &mut self,
         source: &PreparedRowScatter<'_>,
         output_count: usize,
         source_row_at: S,
         hash_at: H,
         found_at: F,
+        mut on_row: V,
     ) -> Result<usize>
     where
         S: Fn(usize) -> usize,
         H: Fn(usize, usize) -> Result<u64>,
         F: Fn(usize, usize) -> u8,
+        V: FnMut(usize, usize, usize) -> Result<()>,
     {
         let (row_usage, total_usage) = if source.has_heap_values() {
             let mut row_usage = Vec::with_capacity(output_count);
@@ -891,39 +896,41 @@ impl HashBuildStore {
                             paro_error::out_of_range("hash build row heap size overflow")
                         })?;
                     let block = self.ensure_current_block()?;
-                    block.append_row(&layout, row_heap_bytes, &mut heap, |row_ptr, heap| {
-                        if let Some(fixed_source) = &fixed_source {
-                            unsafe {
-                                fixed_source.scatter_row_unchecked(row_ptr, source_row_idx);
+                    let row_ptr =
+                        block.append_row(&layout, row_heap_bytes, &mut heap, |row_ptr, heap| {
+                            if let Some(fixed_source) = &fixed_source {
+                                unsafe {
+                                    fixed_source.scatter_row_unchecked(row_ptr, source_row_idx);
+                                }
+                            } else {
+                                unsafe {
+                                    source.scatter_row_unchecked(
+                                        layout.base().as_ref(),
+                                        row_ptr,
+                                        source_row_idx,
+                                        heap,
+                                    )?;
+                                }
                             }
-                        } else {
+                            let hash = hash_at(output_idx, source_row_idx)?;
+                            let match_mask = found_at(output_idx, source_row_idx);
+                            layout.set_hash(row_ptr, hash);
+                            layout.set_next(row_ptr, ptr::null());
+                            layout.set_match_mask(row_ptr, match_mask);
+                            #[cfg(debug_assertions)]
                             unsafe {
-                                source.scatter_row_unchecked(
+                                source.debug_assert_row_initialized(
                                     layout.base().as_ref(),
                                     row_ptr,
                                     source_row_idx,
-                                    heap,
-                                )?;
+                                );
+                                debug_assert_eq!(layout.hash(row_ptr), hash);
+                                debug_assert!(layout.next(row_ptr).is_null());
+                                debug_assert_eq!(layout.match_mask(row_ptr), match_mask);
                             }
-                        }
-                        let hash = hash_at(output_idx, source_row_idx)?;
-                        let match_mask = found_at(output_idx, source_row_idx);
-                        layout.set_hash(row_ptr, hash);
-                        layout.set_next(row_ptr, ptr::null());
-                        layout.set_match_mask(row_ptr, match_mask);
-                        #[cfg(debug_assertions)]
-                        unsafe {
-                            source.debug_assert_row_initialized(
-                                layout.base().as_ref(),
-                                row_ptr,
-                                source_row_idx,
-                            );
-                            debug_assert_eq!(layout.hash(row_ptr), hash);
-                            debug_assert!(layout.next(row_ptr).is_null());
-                            debug_assert_eq!(layout.match_mask(row_ptr), match_mask);
-                        }
-                        Ok(())
-                    })?;
+                            Ok(())
+                        })?;
+                    on_row(output_idx, source_row_idx, row_ptr as usize)?;
                 }
                 heap.validate_complete(total_usage)
             })()

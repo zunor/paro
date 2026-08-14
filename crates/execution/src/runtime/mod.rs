@@ -216,9 +216,9 @@ pub use task_executor::{
 };
 pub use transform::{
     CrossProductProbeTransformExec, DynTransformExec, ExternalProjectTransformExec,
-    FilterTransformExec, GraphExpandTransformExec, GraphProjectTransformExec,
-    GraphShortestPathTransformExec, HashJoinProbeTransformExec, ProjectTransformExec,
-    PropertyRepairTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
+    FilterTransformExec, GraphExpandTransformExec, GraphShortestPathTransformExec,
+    HashJoinProbeTransformExec, ProjectTransformExec, PropertyRepairTransformExec,
+    RowFetchProjectTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
     StreamingWindowTransformExec, TransformExec, TransformFinishPoll, TransformFlushPoll,
     TransformPoll,
 };

@@ -188,7 +188,7 @@ fn retain_row_reducing_encodings(
         encodings.fill(GroupKeyEncoding::Identity);
         return;
     };
-    if compact_width >= logical_width {
+    if compact_width > logical_width {
         encodings.fill(GroupKeyEncoding::Identity);
         return;
     }
@@ -198,7 +198,11 @@ fn retain_row_reducing_encodings(
             continue;
         }
         let candidate = std::mem::replace(&mut encodings[encoding_idx], GroupKeyEncoding::Identity);
-        if encoded_group_storage_width(logical_types, encodings) != Some(compact_width) {
+        let preserves_fixed_key_execution =
+            matches!(candidate, GroupKeyEncoding::PackedString { .. });
+        if preserves_fixed_key_execution
+            || encoded_group_storage_width(logical_types, encodings) != Some(compact_width)
+        {
             encodings[encoding_idx] = candidate;
         }
     }
@@ -238,7 +242,8 @@ fn plan_string_group_key(stats: &paro_storage::statistics::BaseStatistics) -> Gr
     ]
     .into_iter()
     .find(|ty| {
-        max_length < ty.physical_size() && ty.physical_size() < LogicalType::Varchar.physical_size()
+        max_length < ty.physical_size()
+            && ty.physical_size() <= LogicalType::Varchar.physical_size()
     })
     .map(|physical_type| GroupKeyEncoding::PackedString {
         physical_type,

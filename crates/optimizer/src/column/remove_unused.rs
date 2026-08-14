@@ -315,7 +315,10 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     .iter()
                     .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
-                if !self.everything_referenced && !carries_external_arguments {
+                if !self.everything_referenced
+                    && !carries_external_arguments
+                    && proj.late_row_fetch.is_none()
+                {
                     self.clear_unused_expressions(
                         &mut proj.expressions,
                         Some(&mut proj.output_names),
@@ -344,6 +347,11 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 // Collect references from projection expressions (stores raw pointers)
                 for expr in &mut proj.expressions {
                     child_optimizer.visit_expression(expr);
+                }
+                if let Some(fetch) = &mut proj.late_row_fetch {
+                    for source in &mut fetch.sources {
+                        child_optimizer.visit_expression(&mut source.rowid);
+                    }
                 }
 
                 // Recurse into child
@@ -543,6 +551,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::Get(get) => {
+                // Runtime join filters are attached after the ordinary unused
+                // column pass. A later structural rewrite may legitimately run
+                // pruning again, so these expressions must participate in the
+                // same binding-retention and compaction map as scan outputs.
+                for expression in &mut get.runtime_filter_expressions {
+                    self.visit_expression(expression);
+                }
                 // Remove unused columns from table scan
                 self.remove_columns_from_get(get);
             }
@@ -1148,5 +1163,42 @@ mod tests {
             panic!("expected scan");
         };
         assert_eq!(scan.names, vec!["correlation_key"]);
+    }
+
+    #[test]
+    fn runtime_filter_binding_tracks_pruned_scan_layout() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let mut get = Get::new_without_table(
+            10,
+            vec![
+                "keep".into(),
+                "unused_0".into(),
+                "unused_1".into(),
+                "filter".into(),
+            ],
+            vec![LogicalType::Integer; 4],
+        );
+        get.runtime_filter_expressions.push(int_column(10, 3));
+        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, scan, vec![int_column(10, 0)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Get(get) = &projection.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(get.column_ids, vec![0, 3]);
+        assert_eq!(
+            binding(&get.runtime_filter_expressions[0]),
+            ColumnBinding::new(10, 1)
+        );
     }
 }

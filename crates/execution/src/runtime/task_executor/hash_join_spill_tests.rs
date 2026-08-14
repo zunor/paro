@@ -135,6 +135,8 @@ fn hash_join_external_spill_replay_source_outputs_probe_matches() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -300,6 +302,8 @@ fn hash_join_external_right_replay_emits_unmatched_build_rows_once() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Right,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -489,6 +493,8 @@ fn hash_join_external_right_replay_outputs_build_rows_when_probe_never_spilled()
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Right,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -622,6 +628,8 @@ fn hash_join_external_mark_replay_preserves_global_build_null_marker() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Mark,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,

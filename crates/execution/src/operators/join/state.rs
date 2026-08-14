@@ -222,6 +222,8 @@ pub struct HashJoinBuildSinkLocal {
     pub build_residual_types: Box<[LogicalType]>,
     pub build_residual_executors: Box<[ExpressionExecutor]>,
     pub build_residuals: Option<Chunk>,
+    pub(crate) build_time_integer_builder:
+        Option<Arc<crate::join_hashtable::table::BuildTimeIntegerIndexBuilder>>,
 }
 
 impl Drop for HashJoinBuildSinkLocal {

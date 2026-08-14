@@ -35,7 +35,7 @@ impl GraphExpandTransformExec {
         }
         if self.spec.edge_filter.is_some() || self.spec.target_filter.is_some() {
             return Err(paro_error::not_implemented(
-                "typed GraphExpand path filters require GraphProject hand-off",
+                "typed GraphExpand path filters require RowFetchProject hand-off",
             ));
         }
         if (self.spec.min_hops != 1 || self.spec.max_hops != 1)

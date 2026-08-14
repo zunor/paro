@@ -6,6 +6,10 @@
 pub mod common;
 pub mod join_preaggregation;
 pub mod join_subsumption;
+pub mod late_payload;
 pub mod post_reduction;
 pub(crate) mod semantic_kernels;
 pub mod statistics_exec;
+
+#[cfg(test)]
+mod late_payload_tests;

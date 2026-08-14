@@ -42,18 +42,19 @@ use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::RowType;
 use super::specs::{
-    AdaptiveSearchSpec, AggregateSpec, ClassicIeJoinSpec, CopyToFileSpec, CreateIndexUtilitySpec,
-    CrossProductSpec, CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec,
-    DelimScanTarget, DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec,
-    FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping,
-    GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, HashReductionCascadeSpec,
+    AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ClassicIeJoinSpec,
+    CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
+    DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget, DummyScanSpec,
+    EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
+    GraphExpandSpec, GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, HashReductionCascadeSpec,
     HashReductionExtremaChannelSpec, HashReductionGroupedExtremaSpec, HashReductionPredicateSpec,
     HashReductionSourcePredicateSpec, HashReductionStepSpec, InsertSpec, LimitSpec,
     MaterializedCteSpec, NestedLoopJoinSpec, PartitionAggregateWindowSpec,
     PerfectHashAggregatePlan, PhysicalNodeKind, PostAggregateReductionSpec, ProjectSpec,
-    RecursiveCteSpec, RowsetColumnProjection, RowsetScanAccessPolicy, RowsetScanSpec,
-    SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
-    TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    RecursiveCteSpec, RowFetchMapping, RowFetchProjectSpec, RowsetColumnProjection,
+    RowsetScanAccessPolicy, RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec,
+    SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec,
+    UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 pub(crate) mod predicate_builder;
@@ -133,6 +134,9 @@ impl PhysicalPlanGenerator {
             LogicalOperator::EmptyResult(empty) => self.lower_empty_result(empty)?,
             LogicalOperator::Filter(filter) => {
                 self.lower_filter(filter, logical.stats.estimated_cardinality)?
+            }
+            LogicalOperator::Projection(project) if project.late_row_fetch.is_some() => {
+                self.lower_late_row_fetch_project(project)?
             }
             LogicalOperator::Projection(project) if is_graph_chain(project.child.as_ref()) => {
                 self.lower_graph_project(project)?
@@ -251,5 +255,7 @@ impl PhysicalPlanGenerator {
 mod partition_aggregate_tests;
 #[cfg(test)]
 mod post_reduction_tests;
+#[cfg(test)]
+mod row_fetch_tests;
 #[cfg(test)]
 mod tests;

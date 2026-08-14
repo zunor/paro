@@ -87,7 +87,7 @@ pub use join::{
 pub use limit::Limit;
 pub use operator_type::LogicalOperatorType;
 pub use order::Order;
-pub use projection::Projection;
+pub use projection::{LateRowFetch, LateRowFetchSource, Projection};
 pub use projection_map::ProjectionMap;
 pub use refresh_property_graph::RefreshPropertyGraph;
 pub use search_scan::{

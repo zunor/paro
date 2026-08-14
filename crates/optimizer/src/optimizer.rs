@@ -24,9 +24,9 @@ use crate::pipeline_passes::{
     CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
     ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
     GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LimitPushdownPass, MixedJoinPredicatePass,
-    ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
-    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
+    MixedJoinPredicatePass, ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass,
+    StatisticsGatheringPass, StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -167,6 +167,7 @@ impl Optimizer {
 
     fn build_pipeline(binder: Binder) -> Vec<Box<dyn Rewriter>> {
         let unused_columns_binder = binder.clone();
+        let late_payload_binder = binder.clone();
         vec![
             Box::new(GraphStartSelectionPass),
             Box::new(GraphMatchDecomposePass),
@@ -223,6 +224,13 @@ impl Optimizer {
             // lifecycle phase from the cost inputs gathered before join order.
             Box::new(StatisticsGatheringPass),
             Box::new(StatisticsPropagationPass),
+            // Replace functionally-dependent wide aggregate payload with a
+            // stable rowid and fetch it only after a bounded TopN. Dependency
+            // proofs are populated by statistics propagation immediately
+            // above; pruning is performed atomically inside this pass.
+            Box::new(LatePayloadFetchPass {
+                binder: late_payload_binder,
+            }),
             // Projection maps are positional annotations over the final logical
             // layout. Derive them only after every structural rewrite (most
             // notably build/probe-side flips) has settled that layout. This

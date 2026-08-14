@@ -152,7 +152,53 @@ impl Verifier {
                         )));
                     }
                 }
-                if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
+                if let Some(fetch) = &proj.late_row_fetch {
+                    let child_bindings = proj.child.get_column_bindings();
+                    if fetch.sources.is_empty() {
+                        return Err(paro_error::internal(
+                            "Late row-fetch projection has no materialized source",
+                        ));
+                    }
+                    if !child_bindings
+                        .iter()
+                        .any(|binding| binding.table_index == fetch.carrier_table_index)
+                    {
+                        return Err(paro_error::internal(format!(
+                            "Late row-fetch carrier table {} is not produced by its child",
+                            fetch.carrier_table_index
+                        )));
+                    }
+                    let mut source_indices = HashSet::with_capacity(fetch.sources.len());
+                    for source in &fetch.sources {
+                        if !source_indices.insert(source.materialized_table_index) {
+                            return Err(paro_error::internal(format!(
+                                "Late row-fetch source table index {} is duplicated",
+                                source.materialized_table_index
+                            )));
+                        }
+                        let Expression::ColumnRef(rowid) = &source.rowid else {
+                            return Err(paro_error::internal(
+                                "Late row-fetch rowid carrier must be a direct column reference",
+                            ));
+                        };
+                        if rowid.depth != 0
+                            || rowid.binding.table_index != fetch.carrier_table_index
+                            || rowid.return_type != paro_common::types::LogicalType::BigInt
+                        {
+                            return Err(paro_error::internal(
+                                "Late row-fetch rowid must be a direct BIGINT carrier column",
+                            ));
+                        }
+                        self.verify_expression_bindings(
+                            &source.rowid,
+                            &child_bindings,
+                            "Late row-fetch rowid",
+                        )?;
+                    }
+                    for expression in &proj.expressions {
+                        self.verify_late_row_fetch_bindings(expression, fetch, &child_bindings)?;
+                    }
+                } else if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
                     for expression in &proj.expressions {
                         self.verify_graph_projection_bindings(expression, &scope)?;
                     }
@@ -307,6 +353,60 @@ impl Verifier {
         ExpressionIterator::enumerate_children(expression, |child| {
             if result.is_ok() {
                 result = self.verify_graph_projection_bindings(child, scope);
+            }
+        });
+        result
+    }
+
+    fn verify_late_row_fetch_bindings(
+        &self,
+        expression: &Expression,
+        fetch: &paro_planner::operator::projection::LateRowFetch,
+        carrier_bindings: &[ColumnBinding],
+    ) -> Result<()> {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth != 0 {
+                return Ok(());
+            }
+            if column.binding.table_index == fetch.carrier_table_index {
+                if carrier_bindings.contains(&column.binding) {
+                    return Ok(());
+                }
+                return Err(paro_error::internal(format!(
+                    "Late row-fetch expression references unavailable carrier binding {:?}",
+                    column.binding
+                )));
+            }
+            let Some(source) = fetch
+                .sources
+                .iter()
+                .find(|source| source.materialized_table_index == column.binding.table_index)
+            else {
+                return Err(paro_error::internal(format!(
+                    "Late row-fetch expression references unknown materialized binding {:?}",
+                    column.binding
+                )));
+            };
+            if column.binding.column_index >= source.table.columns.len() {
+                return Err(paro_error::internal(format!(
+                    "Late row-fetch catalog column {} is out of range for table {}",
+                    column.binding.column_index, source.table.base.base.name
+                )));
+            }
+            let catalog_type = &source.table.columns[column.binding.column_index].logical_type;
+            if &column.return_type != catalog_type {
+                return Err(paro_error::internal(format!(
+                    "Late row-fetch catalog column {} type mismatch: expression={:?}, catalog={:?}",
+                    column.binding.column_index, column.return_type, catalog_type
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expression, |child| {
+            if result.is_ok() {
+                result = self.verify_late_row_fetch_bindings(child, fetch, carrier_bindings);
             }
         });
         result

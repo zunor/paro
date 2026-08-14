@@ -245,7 +245,7 @@ impl FilterPushdown {
         // A projection over a graph operator chain is a GRAPH_TABLE COLUMNS projection.
         // Its expressions must be evaluated by PhysicalGraphProject after late materialization,
         // so pushing filters below it can bind predicates to the wrong (rowid/local-id) columns.
-        if proj.child.is_graph_chain() {
+        if proj.child.is_graph_chain() || proj.late_row_fetch.is_some() {
             let mut child_pushdown = FilterPushdown::new();
             proj.child = Box::new(child_pushdown.rewrite_plan(*proj.child));
             return self.push_final_filters(LogicalOperator::Projection(proj));

@@ -22,7 +22,7 @@ use super::table_function::TableFunctionBindDataWrapper;
 pub struct RowsetSourceGlobal {
     pub table_index: usize,
     pub table: Arc<TableHandle>,
-    pub storage_snapshot: StorageSnapshot,
+    pub storage_snapshot: Arc<StorageSnapshot>,
     pub segments: Box<[(RowsetSharedPtr, SegmentSharedPtr)]>,
     pub morsels: Box<[RowsetScanMorsel]>,
     pub next_morsel: AtomicUsize,

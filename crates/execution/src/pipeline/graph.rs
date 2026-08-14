@@ -12,13 +12,13 @@ use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use crate::physical::properties::{PipelineProperties, RequiredProperties};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
-    AdaptiveSearchSpec, AggregateSpec, ChunkScanSpec, ClassicIeJoinSpec, CopyToFileSpec,
-    DeleteSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec,
-    ExternalTableSpec, FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec,
-    GraphScanSpec, GraphShortestPathSpec, HashReductionCascadeSpec, InsertSpec, LimitSpec,
-    PartitionAggregateWindowSpec, ProjectSpec, RowsetScanSpec, SetOperationInputSide,
-    SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec, UpdateSpec,
-    ValuesSpec, VectorSearchSpec, WindowSpec,
+    AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ChunkScanSpec,
+    ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
+    ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
+    GraphExpandSpec, GraphScanSpec, GraphShortestPathSpec, HashReductionCascadeSpec, InsertSpec,
+    LimitSpec, PartitionAggregateWindowSpec, ProjectSpec, RowFetchProjectSpec, RowsetScanSpec,
+    SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
+    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -767,7 +767,7 @@ pub enum TransformSpec {
     StreamingWindow(WindowSpec),
     ExternalProject(ExternalProjectSpec),
     GraphExpand(GraphExpandSpec),
-    GraphProject(GraphProjectSpec),
+    RowFetchProject(RowFetchProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
     PropertyRepair(PropertyRepairSpec),
 }
@@ -795,7 +795,7 @@ impl TransformSpec {
             Self::GraphExpand(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
-            Self::GraphProject(spec) => {
+            Self::RowFetchProject(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
             Self::GraphShortestPath(spec) => {
@@ -1031,6 +1031,8 @@ pub struct CrossProductBuildSinkSpec {
 pub struct HashJoinBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
+    pub build_keys_unique: bool,
+    pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
     pub key_conditions: Box<[JoinCondition]>,
     pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,

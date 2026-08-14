@@ -259,6 +259,53 @@ fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
 }
 
 #[test]
+fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["nation".to_string()],
+            vec![LogicalType::Varchar],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Varchar)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = StringStats::create_empty(LogicalType::Varchar);
+    StringStats::update(&mut stats, "UNITED KINGDOM");
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::PackedString {
+            physical_type: LogicalType::UHugeInt,
+            max_length: 14,
+        }]
+    );
+}
+
+#[test]
 fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(
@@ -854,7 +901,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
         .generate(&project)
         .expect("graph project should own graph expand filters");
 
-    let PhysicalNodeKind::GraphProject(project_spec) = &plan.node(plan.root).kind else {
+    let PhysicalNodeKind::RowFetchProject(project_spec) = &plan.node(plan.root).kind else {
         panic!("expected graph project root");
     };
     assert_eq!(project_spec.filters.len(), 2);
@@ -1357,7 +1404,7 @@ fn arena_generator_lowers_search_scan_with_planned_token() {
     assert_eq!(spec.output_names.as_ref(), ["c", "score"]);
 }
 
-fn test_get() -> Get {
+pub(super) fn test_get() -> Get {
     let storage = Arc::new(
         paro_storage::table::table_factory::TableFactory::default()
             .create_table(&[

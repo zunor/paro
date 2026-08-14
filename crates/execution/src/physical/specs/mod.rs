@@ -13,6 +13,7 @@ pub mod dml;
 pub mod external;
 pub mod graph;
 pub mod join;
+pub mod row_fetch;
 pub mod scan;
 pub mod search;
 pub mod sort;
@@ -24,6 +25,7 @@ pub use dml::*;
 pub use external::*;
 pub use graph::*;
 pub use join::*;
+pub use row_fetch::*;
 pub use scan::*;
 pub use search::*;
 pub use sort::*;
@@ -64,7 +66,7 @@ pub enum PhysicalNodeKind {
     AdaptiveSearch(AdaptiveSearchSpec),
     GraphScan(GraphScanSpec),
     GraphExpand(GraphExpandSpec),
-    GraphProject(GraphProjectSpec),
+    RowFetchProject(RowFetchProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
     ExternalProject(ExternalProjectSpec),
     ExternalTable(ExternalTableSpec),
@@ -111,7 +113,7 @@ impl PhysicalNodeKind {
             Self::AdaptiveSearch(_) => "ADAPTIVE_SEARCH",
             Self::GraphScan(_) => "GRAPH_SCAN",
             Self::GraphExpand(_) => "GRAPH_EXPAND",
-            Self::GraphProject(_) => "GRAPH_PROJECT",
+            Self::RowFetchProject(_) => "ROW_FETCH_PROJECT",
             Self::GraphShortestPath(_) => "GRAPH_SHORTEST_PATH",
             Self::ExternalProject(_) => "EXTERNAL_PROJECT",
             Self::ExternalTable(_) => "EXTERNAL_TABLE",

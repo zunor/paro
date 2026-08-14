@@ -11,10 +11,12 @@ use std::time::Duration;
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
-use paro_common::error::{ParoError, Result};
+use paro_common::error::{self as paro_error, ParoError, Result};
 use paro_context::{StatementCancellation, StatementContext, TransactionView};
 use paro_function::scalar::FunctionExecContext;
 use paro_function::table::TableFunctionRuntimeContext;
+use paro_storage::table::table_handle::TableHandle;
+use paro_storage::table::StorageSnapshot;
 
 use crate::explain::profiler::{ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::{OperatorMemoryScope, QueryMemoryPool};
@@ -149,6 +151,7 @@ pub struct QueryRuntimeContext {
     pub wake_events: QueryWakeRegistry,
     pub profiler: QueryProfilerRegistry,
     pub explain_profiler: Option<Arc<ExplainProfiler>>,
+    storage_snapshots: Arc<Mutex<HashMap<u64, Arc<StorageSnapshot>>>>,
 }
 
 impl QueryRuntimeContext {
@@ -170,6 +173,7 @@ impl QueryRuntimeContext {
             wake_events: QueryWakeRegistry::default(),
             profiler: QueryProfilerRegistry::default(),
             explain_profiler: None,
+            storage_snapshots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -180,6 +184,26 @@ impl QueryRuntimeContext {
 
     pub fn record_operator_error(&self, error: ParoError) -> QueryErrorId {
         self.errors.record_root(error)
+    }
+
+    /// Return the one immutable storage snapshot owned by this query for a
+    /// tablet. Scans and late row fetches must share the same materialization
+    /// instead of independently walking the tablet layout and pinning epochs.
+    pub fn storage_snapshot(&self, table: &Arc<TableHandle>) -> Result<Arc<StorageSnapshot>> {
+        let tablet_id = table.tablet_id();
+        let mut snapshots = self
+            .storage_snapshots
+            .lock()
+            .map_err(|error| paro_error::internal(format!("storage snapshot registry: {error}")))?;
+        if let Some(snapshot) = snapshots.get(&tablet_id) {
+            return Ok(Arc::clone(snapshot));
+        }
+        let snapshot = Arc::new(table.storage_snapshot(
+            self.transaction.read_ts(),
+            self.transaction.read_snapshot().lease(),
+        )?);
+        snapshots.insert(tablet_id, Arc::clone(&snapshot));
+        Ok(snapshot)
     }
 }
 
@@ -1086,6 +1110,7 @@ mod tests {
         NoopStatementTimeoutDriver, StatementCancellation, TestStatementContextBuilder,
     };
     use paro_function::scalar::FunctionExecContext;
+    use paro_storage::table::table_factory::TableFactory;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -1113,6 +1138,27 @@ mod tests {
 
         assert!(!session.is_interrupted());
         assert!(FunctionExecContext::is_interrupted(&query));
+    }
+
+    #[test]
+    fn query_reuses_one_storage_snapshot_per_tablet() {
+        let query = QueryRuntimeContext::new(
+            TestStatementContextBuilder::minimal().build(),
+            Arc::new(ParameterBindings::empty()),
+            Arc::new(QueryMemoryPool::unbounded()),
+            QueryOutputPort::discarding(),
+        );
+        let table = Arc::new(
+            TableFactory::default()
+                .create_table(&[paro_common::types::LogicalType::Integer])
+                .expect("table"),
+        );
+
+        let first = query.storage_snapshot(&table).expect("first snapshot");
+        let second = query.storage_snapshot(&table).expect("second snapshot");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.tablet_id(), table.tablet_id());
     }
 
     #[test]

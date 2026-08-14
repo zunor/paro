@@ -232,12 +232,20 @@ impl LogicalPlanDeepCopy {
             LogicalOperator::Projection(p) => {
                 let child = self.copy_plan(p.child.as_ref(), bind_shared);
                 let mut table_index = p.table_index;
+                let mut late_row_fetch = p.late_row_fetch.clone();
                 self.remap_table_index(bind_shared, &mut table_index);
+                if let Some(fetch) = &mut late_row_fetch {
+                    self.remap_table_index(bind_shared, &mut fetch.carrier_table_index);
+                    for source in &mut fetch.sources {
+                        self.remap_table_index(bind_shared, &mut source.materialized_table_index);
+                    }
+                }
                 LogicalOperator::Projection(ProjNode {
                     table_index,
                     expressions: p.expressions.clone(),
                     output_names: p.output_names.clone(),
                     returned_types: p.returned_types.clone(),
+                    late_row_fetch,
                     child: Box::new(child),
                 })
             }

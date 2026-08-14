@@ -527,6 +527,8 @@ impl<'a> PipelineLowerer<'a> {
             SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                 handle,
                 join_type: spec.join_type,
+                build_keys_unique: spec.build_keys_unique,
+                build_time_integer_index: spec.build_time_integer_index.clone(),
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.build_residual_conditions.clone(),
                 build_projection: spec.build_input_projection.clone(),
@@ -734,6 +736,8 @@ impl<'a> PipelineLowerer<'a> {
                     SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                         handle,
                         join_type: spec.join_type,
+                        build_keys_unique: spec.build_keys_unique,
+                        build_time_integer_index: spec.build_time_integer_index.clone(),
                         key_conditions: spec.key_conditions.clone(),
                         residual_conditions: spec.build_residual_conditions.clone(),
                         build_projection: spec.build_input_projection.clone(),

@@ -127,10 +127,7 @@ impl RowsetSourceExec {
             .get_storage()
             .cloned()
             .ok_or_else(|| paro_error::internal("rowset scan table has no storage handle"))?;
-        let storage_snapshot = table.storage_snapshot(
-            ctx.query.transaction.read_ts(),
-            ctx.query.transaction.read_snapshot().lease(),
-        )?;
+        let storage_snapshot = ctx.query.storage_snapshot(&table)?;
         let overlay = TxnOverlayReader::for_tablet(&table.tablet(), &ctx.query.transaction)?;
         let segment_options = SegmentOptions::default()
             .with_page_cache(ctx.query.session.page_cache().clone())

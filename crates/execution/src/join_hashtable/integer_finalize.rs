@@ -80,8 +80,13 @@ impl ParallelDirectIntegerIndexBuild {
             })?;
         let builder = Arc::try_unwrap(builder)
             .map_err(|_| paro_error::internal("direct join index retained a task reference"))?;
+        let index = if self.table.config.build_keys_unique {
+            builder.finish_unique()
+        } else {
+            builder.finish()?
+        };
         self.table.publish_integer_index(BuiltIntegerIndex {
-            index: builder.finish()?,
+            index,
             has_long_chains: self.has_long_chains.load(Ordering::Relaxed),
         })
     }
@@ -159,8 +164,13 @@ impl JoinHashTable {
         let builder = Arc::try_unwrap(builder).map_err(|_| {
             paro_error::internal("direct join index retained a temporary reference")
         })?;
+        let index = if self.config.build_keys_unique {
+            builder.finish_unique()
+        } else {
+            builder.finish()?
+        };
         Ok(Some(BuiltIntegerIndex {
-            index: builder.finish()?,
+            index,
             has_long_chains,
         }))
     }
@@ -227,7 +237,13 @@ impl JoinHashTable {
     ) -> Result<bool> {
         let mut has_long_chains = false;
         self.visit_integer_build_block(kind, block, |_, row_ptr, ordinal| {
-            if let Some(previous) = builder.insert(ordinal, row_ptr)? {
+            let previous = if self.config.build_keys_unique {
+                builder.insert_unique(ordinal, row_ptr)?;
+                None
+            } else {
+                builder.insert(ordinal, row_ptr)?
+            };
+            if let Some(previous) = previous {
                 self.build_row_layout
                     .set_next(row_ptr as *mut u8, previous as *const u8);
                 has_long_chains = true;

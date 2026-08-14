@@ -168,8 +168,8 @@ impl<'a> PipelineLowerer<'a> {
                     transforms.push(TransformSpec::GraphExpand(spec.clone()));
                     current = self.only_child(current)?;
                 }
-                PhysicalNodeKind::GraphProject(spec) => {
-                    transforms.push(TransformSpec::GraphProject(spec.clone()));
+                PhysicalNodeKind::RowFetchProject(spec) => {
+                    transforms.push(TransformSpec::RowFetchProject(spec.clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphShortestPath(spec) => {

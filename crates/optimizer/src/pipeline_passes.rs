@@ -10,6 +10,7 @@ use paro_planner::plan::LogicalPlan;
 use crate::aggregate::common::CommonAggregateOptimizer;
 use crate::aggregate::join_preaggregation;
 use crate::aggregate::join_subsumption;
+use crate::aggregate::late_payload;
 use crate::aggregate::post_reduction;
 use crate::aggregate::statistics_exec::AggregateStatisticsExecutor;
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
@@ -356,6 +357,45 @@ impl Rewriter for UnusedColumnsPass {
 }
 
 pub struct ColumnLifetimePass;
+
+pub struct LatePayloadFetchPass {
+    pub binder: Binder,
+}
+
+impl Rewriter for LatePayloadFetchPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::LateMaterialization
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        let (mut plan, changed) = late_payload::optimize_plan(plan, &ctx.bind_context);
+        if changed {
+            // The rewrite introduces virtual rowids and makes the former wide
+            // dependent columns dead below the aggregate. Re-run pruning in
+            // the same verified pass so join projection maps and compacted Get
+            // bindings are updated atomically before plan verification.
+            RemoveUnusedColumns::optimize(&mut plan, &self.binder, ctx.session.as_ref(), true);
+
+            // Rowid carriers change both relation widths and serialized hash
+            // build layouts. Recompute only when the structural rewrite fired:
+            // reordering an unchanged query a second time can perturb stable
+            // plans without any new cost input. Keep the dependent stats,
+            // topology, side orientation, and runtime filters in this atomic
+            // pass so no later verifier observes stale physical properties.
+            ctx.column_stats.clear();
+            plan = StatisticsGathering::new().gather(plan, ctx)?;
+            plan = JoinOrderOptimizer::new().optimize_plan(
+                ctx.session.as_ref(),
+                plan,
+                &ctx.column_stats,
+                &ctx.bind_context,
+            )?;
+            plan = BuildProbeSideOptimizer::new(ctx.session.clone()).optimize_plan(plan);
+            plan = JoinFilterPushdown::new(ctx.session.clone()).optimize_plan(plan);
+        }
+        Ok(plan)
+    }
+}
 
 impl Rewriter for ColumnLifetimePass {
     fn optimizer_type(&self) -> OptimizerType {

@@ -274,6 +274,10 @@ impl PhysicalPlanGenerator {
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
         let (key_conditions, residual_conditions) = partition_hash_join_conditions(join);
+        let build_keys_unique =
+            hash_join_build_keys_are_declared_unique(join.right.as_ref(), &key_conditions);
+        let build_time_integer_index =
+            plan_build_time_integer_join_index(join.right.as_ref(), &key_conditions);
         let probe_residual_count = residual_conditions.len();
         let build_output_count = right_types.len();
         let mut build_payload_types = right_types;
@@ -285,6 +289,8 @@ impl PhysicalPlanGenerator {
         let spec = HashJoinSpec {
             join_type: join.join_type,
             anti_join_mode: join.anti_join_mode,
+            build_keys_unique,
+            build_time_integer_index,
             key_conditions,
             build_residual_conditions: residual_conditions,
             probe_residual_count,
@@ -597,6 +603,8 @@ impl PhysicalPlanGenerator {
         let spec = HashJoinSpec {
             join_type: JoinType::RightSemi,
             anti_join_mode: AntiJoinMode::Regular,
+            build_keys_unique: false,
+            build_time_integer_index: None,
             key_conditions: key_conditions.into_boxed_slice(),
             build_residual_conditions: build_residual_conditions.into_boxed_slice(),
             probe_residual_count: 0,
@@ -751,6 +759,10 @@ impl PhysicalPlanGenerator {
         let output_names = join_output_names(join.join_type, left_names, right_names);
         let output_types = join.get_types();
         let (key_conditions, residual_conditions) = partition_hash_join_conditions(join);
+        let build_keys_unique =
+            hash_join_build_keys_are_declared_unique(join.right.as_ref(), &key_conditions);
+        let build_time_integer_index =
+            plan_build_time_integer_join_index(join.right.as_ref(), &key_conditions);
         let probe_residual_count = residual_conditions.len();
         let build_output_count = right_types.len();
         let mut build_payload_types = right_types;
@@ -762,6 +774,8 @@ impl PhysicalPlanGenerator {
         let spec = HashJoinSpec {
             join_type: join.join_type,
             anti_join_mode: join.anti_join_mode,
+            build_keys_unique,
+            build_time_integer_index,
             key_conditions,
             build_residual_conditions: residual_conditions,
             probe_residual_count,
@@ -1212,92 +1226,154 @@ fn partition_hash_join_conditions(
     (keys.into_boxed_slice(), residuals.into_boxed_slice())
 }
 
-#[cfg(test)]
-mod reduction_cascade_tests {
-    use paro_common::runtime_value::Value;
-    use paro_common::types::LogicalType;
-    use paro_planner::expression::{
-        ComparisonExpression, ComparisonType, ConstantExpression, Expression, ReferenceExpression,
+/// Prove uniqueness from the declared build relation rather than inferring it
+/// from sampled cardinalities. Filters preserve a base table's key; other
+/// operators must explicitly propagate keys before they can enter this path.
+fn hash_join_build_keys_are_declared_unique(
+    build: &LogicalPlan,
+    key_conditions: &[JoinCondition],
+) -> bool {
+    let build_keys = key_conditions
+        .iter()
+        .map(|condition| {
+            (condition.comparison == JoinComparisonType::Equal)
+                .then(|| resolve_base_get_column(build, &condition.right))?
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(build_keys) = build_keys.filter(|keys| !keys.is_empty()) else {
+        return false;
     };
-
-    use super::{
-        plan_reduction_runtime_filter_fusion, remap_reduction_expression, ReductionPredicateBits,
+    let (get, _) = build_keys[0];
+    if build_keys
+        .iter()
+        .any(|(candidate, _)| candidate.table_index != get.table_index)
+    {
+        return false;
+    }
+    let Some(table) = &get.table else {
+        return false;
     };
+    let build_key_columns = build_keys
+        .iter()
+        .map(|(_, column_id)| *column_id)
+        .collect::<std::collections::HashSet<_>>();
+    table.constraints().iter().any(|constraint| {
+        matches!(
+            constraint.constraint_type,
+            paro_catalog::entry::ConstraintType::Unique
+                | paro_catalog::entry::ConstraintType::PrimaryKey
+        ) && !constraint.columns.is_empty()
+            && constraint
+                .columns
+                .iter()
+                .all(|column| build_key_columns.contains(column))
+    })
+}
 
-    #[test]
-    fn build_and_source_predicates_share_one_collision_free_namespace() {
-        let mut bits = ReductionPredicateBits::default();
-        let build_residual = bits.allocate().unwrap();
-        // A duplicate build residual reuses its existing bit and therefore
-        // does not consume the allocator. The next source predicate must still
-        // receive a distinct bit.
-        let duplicate_build_residual = build_residual;
-        let source_predicate = bits.allocate().unwrap();
-
-        assert_eq!(duplicate_build_residual, build_residual);
-        assert_ne!(source_predicate, build_residual);
-        assert_eq!(source_predicate, 0b10);
-        for _ in 2..u8::BITS {
-            assert!(bits.allocate().is_some());
-        }
-        assert_eq!(bits.allocate(), None);
+fn plan_build_time_integer_join_index(
+    build: &LogicalPlan,
+    key_conditions: &[JoinCondition],
+) -> Option<BuildTimeIntegerJoinIndexSpec> {
+    let [condition] = key_conditions else {
+        return None;
+    };
+    if condition.comparison != JoinComparisonType::Equal {
+        return None;
     }
+    let (get, column_id) = resolve_base_get_column(build, &condition.right)?;
+    let table = get.table.as_ref()?;
+    let storage = table.get_storage()?;
+    let column_stats = storage.column_statistics(column_id)?;
+    let (minimum, maximum) =
+        paro_storage::statistics::NumericStats::guaranteed_bounds(column_stats.statistics())?;
+    let estimated_rows = usize::try_from(storage.tablet().statistics().ok()?.num_rows).ok()?;
+    (estimated_rows > 0).then_some(BuildTimeIntegerJoinIndexSpec {
+        minimum,
+        maximum,
+        estimated_rows,
+    })
+}
 
-    #[test]
-    fn branch_runtime_filters_require_one_shared_pruning_contract() {
-        fn bound(index: usize, value: i64) -> Expression {
-            Expression::Comparison(ComparisonExpression::new(
-                ComparisonType::GreaterThanOrEqual,
-                Expression::Reference(ReferenceExpression::new(index, LogicalType::BigInt)),
-                Expression::Constant(ConstantExpression::new(
-                    Value::BigInt(value),
-                    LogicalType::BigInt,
-                )),
-            ))
-        }
-        let shared = vec![bound(0, 10), bound(1, 11)];
-        let merged = plan_reduction_runtime_filter_fusion(
-            vec![
-                Some(shared.clone()),
-                Some(vec![shared[1].clone(), shared[0].clone()]),
-            ],
-            16,
-            32,
-        )
-        .unwrap();
-        assert_eq!(merged.len(), 2);
-        assert!(merged
-            .iter()
-            .zip(&shared)
-            .all(|(left, right)| left.equals(right)));
-        assert!(plan_reduction_runtime_filter_fusion(
-            vec![Some(vec![bound(0, 10)]), Some(vec![bound(0, 20)])],
-            16,
-            32,
-        )
-        .is_some_and(|filters| filters.len() == 1));
-        assert!(plan_reduction_runtime_filter_fusion(
-            vec![Some(Vec::new()), Some(Vec::new())],
-            16,
-            32,
-        )
-        .is_some_and(|filters| filters.is_empty()));
-        assert!(plan_reduction_runtime_filter_fusion(
-            vec![Some(vec![bound(0, 10)]), Some(vec![bound(0, 20)])],
-            16,
-            16,
-        )
-        .is_none());
-    }
-
-    #[test]
-    fn reduction_remap_rejects_correlated_source_bindings() {
-        let expression =
-            Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::with_depth(
-                paro_planner::operator::ColumnBinding::new(7, 0),
-                LogicalType::BigInt,
-                1,
-            ));
-        assert!(remap_reduction_expression(&expression, &[3], 7, &[3], 9).is_none());
+/// Resolve one physical build-side output back to a stable base-table column.
+///
+/// Join conditions are positional `Reference`s after column binding resolution,
+/// while catalog constraints and storage statistics use physical column ids.
+/// Keeping this translation here makes uniqueness an explicit property of a
+/// transparent unary carrier rather than an accident of expression bindings.
+fn resolve_base_get_column<'a>(
+    build: &'a LogicalPlan,
+    expression: &Expression,
+) -> Option<(&'a paro_planner::operator::Get, usize)> {
+    match expression {
+        Expression::Reference(reference) => resolve_base_get_output(build, reference.index),
+        Expression::ColumnRef(column) if column.depth == 0 => resolve_bound_get_column(
+            build,
+            column.binding.table_index,
+            column.binding.column_index,
+        ),
+        _ => None,
     }
 }
+
+fn resolve_base_get_output(
+    build: &LogicalPlan,
+    output_index: usize,
+) -> Option<(&paro_planner::operator::Get, usize)> {
+    match &build.operator {
+        LogicalOperator::Get(get) => Some((get, *get.column_ids.get(output_index)?)),
+        LogicalOperator::Filter(filter) => {
+            let child_index = filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .get(output_index)
+                .copied()?;
+            resolve_base_get_output(&filter.child, child_index)
+        }
+        LogicalOperator::Projection(projection) if projection.late_row_fetch.is_none() => {
+            resolve_base_get_column(&projection.child, projection.expressions.get(output_index)?)
+        }
+        LogicalOperator::Order(order) => {
+            let child_index = order
+                .projection_map
+                .to_indices(order.child.types().len())
+                .get(output_index)
+                .copied()?;
+            resolve_base_get_output(&order.child, child_index)
+        }
+        LogicalOperator::Limit(limit) => resolve_base_get_output(&limit.child, output_index),
+        LogicalOperator::TopN(topn) => resolve_base_get_output(&topn.child, output_index),
+        _ => None,
+    }
+}
+
+fn resolve_bound_get_column(
+    build: &LogicalPlan,
+    table_index: usize,
+    column_index: usize,
+) -> Option<(&paro_planner::operator::Get, usize)> {
+    match &build.operator {
+        LogicalOperator::Get(get) if get.table_index == table_index => {
+            Some((get, *get.column_ids.get(column_index)?))
+        }
+        LogicalOperator::Filter(filter) => {
+            resolve_bound_get_column(&filter.child, table_index, column_index)
+        }
+        LogicalOperator::Projection(projection) if projection.late_row_fetch.is_none() => {
+            resolve_bound_get_column(&projection.child, table_index, column_index)
+        }
+        LogicalOperator::Order(order) => {
+            resolve_bound_get_column(&order.child, table_index, column_index)
+        }
+        LogicalOperator::Limit(limit) => {
+            resolve_bound_get_column(&limit.child, table_index, column_index)
+        }
+        LogicalOperator::TopN(topn) => {
+            resolve_bound_get_column(&topn.child, table_index, column_index)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+#[path = "join_reduction_tests.rs"]
+mod reduction_cascade_tests;

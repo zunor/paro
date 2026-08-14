@@ -21,6 +21,7 @@ use paro_storage::row::{
     RowValidityType,
 };
 
+use crate::join_hashtable::table::BuildTimeIntegerIndexBuilder;
 use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
 use crate::pipeline::graph::PipelineId;
@@ -63,6 +64,7 @@ pub struct JoinBuildHandle {
     pending_consumers: Mutex<HashSet<PipelineId>>,
     runtime_filter_builder: Mutex<Option<JoinRuntimeFilterBuilder>>,
     runtime_filter: OnceLock<JoinRuntimeFilter>,
+    build_time_integer_builder: Mutex<Option<Arc<BuildTimeIntegerIndexBuilder>>>,
     mode: AtomicU8,
     build_reclaim_state: AtomicU8,
     build_spill_gate: Mutex<()>,
@@ -84,6 +86,7 @@ impl JoinBuildHandle {
             pending_consumers: Mutex::new(pending_consumers),
             runtime_filter_builder: Mutex::new(None),
             runtime_filter: OnceLock::new(),
+            build_time_integer_builder: Mutex::new(None),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
             build_reclaim_state: AtomicU8::new(BuildReclaimState::Disabled as u8),
             build_spill_gate: Mutex::new(()),
@@ -122,6 +125,35 @@ impl JoinBuildHandle {
         Ok(())
     }
 
+    pub(crate) fn install_build_time_integer_builder(
+        &self,
+        builder: Arc<BuildTimeIntegerIndexBuilder>,
+    ) -> Result<()> {
+        let mut state = self.build_time_integer_builder.lock();
+        if state.is_some() {
+            return Err(paro_error::internal(
+                "unique integer join builder was already installed",
+            ));
+        }
+        *state = Some(builder);
+        Ok(())
+    }
+
+    pub(crate) fn build_time_integer_builder(&self) -> Option<Arc<BuildTimeIntegerIndexBuilder>> {
+        self.build_time_integer_builder.lock().as_ref().cloned()
+    }
+
+    pub(crate) fn take_build_time_integer_builder(
+        &self,
+    ) -> Result<Option<BuildTimeIntegerIndexBuilder>> {
+        let Some(builder) = self.build_time_integer_builder.lock().take() else {
+            return Ok(None);
+        };
+        Arc::try_unwrap(builder).map(Some).map_err(|_| {
+            paro_error::internal("unique integer join builder retained a local reference")
+        })
+    }
+
     pub fn initialize_table(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -139,6 +171,7 @@ impl JoinBuildHandle {
             build_types,
             build_output_count,
             join_type,
+            false,
             memory,
         )
     }
@@ -151,6 +184,7 @@ impl JoinBuildHandle {
         build_types: Vec<LogicalType>,
         build_output_count: usize,
         join_type: JoinType,
+        build_keys_unique: bool,
         memory: MemoryAccountingContext,
     ) -> Result<Arc<JoinHashTable>> {
         let runtime_filter_key_types = conditions
@@ -178,7 +212,10 @@ impl JoinBuildHandle {
             build_types,
             build_output_count,
             join_type,
-            JoinHashTableConfig::default(),
+            JoinHashTableConfig {
+                build_keys_unique,
+                ..Default::default()
+            },
             memory,
         ));
         *state = JoinHashTableState::Live(Arc::clone(&table));

@@ -844,7 +844,18 @@ impl LogicalOperator {
     pub fn get_table_index(&self) -> Vec<usize> {
         match self {
             LogicalOperator::Get(get) => vec![get.table_index],
-            LogicalOperator::Projection(proj) => vec![proj.table_index],
+            LogicalOperator::Projection(proj) => {
+                let mut indices = vec![proj.table_index];
+                if let Some(fetch) = &proj.late_row_fetch {
+                    indices.extend(
+                        fetch
+                            .sources
+                            .iter()
+                            .map(|source| source.materialized_table_index),
+                    );
+                }
+                indices
+            }
             LogicalOperator::ExternalProject(external) => vec![external.project_index],
             LogicalOperator::ExternalTable(external) => vec![external.table_index],
             LogicalOperator::Aggregate(agg) => {

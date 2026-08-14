@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use paro_catalog::catalog::Catalog;
 use paro_catalog::entry::{
-    AggregateFunctionCatalogEntry, ColumnDefinition, Constraint, CreateTableInfo, OnCreateConflict,
-    ScalarFunctionCatalogEntry, TableCatalogEntry,
+    AggregateFunctionCatalogEntry, CatalogEntryEnum, ColumnDefinition, Constraint, CreateTableInfo,
+    OnCreateConflict, ScalarFunctionCatalogEntry, TableCatalogEntry,
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_catalog::search_path::CatalogSearchEntry;
@@ -13,7 +13,7 @@ use paro_function::aggregate::distributive::{
     avg::get_avg_function, minmax::get_min_function, sum::get_sum_function,
 };
 use paro_function::scalar::cast::{
-    decimal_casts, numeric_casts, BindCastInput, BoundCastInfo, CastFunctionSet,
+    date_casts, decimal_casts, numeric_casts, BindCastInput, BoundCastInfo, CastFunctionSet,
 };
 use paro_function::scalar::ScalarFunctionSet;
 use paro_planner::expression::{ColumnRefExpression, Expression};
@@ -64,6 +64,16 @@ fn assert_tpch_rewrites() {
             "lineitem"
         };
         assert_eq!(inspection.gets_named(common), 1, "{query}: {optimized:#?}");
+        assert_eq!(
+            inspection.late_fetches,
+            if query == "q02" { 2 } else { 0 },
+            "{query}: {optimized:#?}"
+        );
+        assert_eq!(
+            inspection.late_fetch_sources,
+            if query == "q02" { 3 } else { 0 },
+            "{query}: {optimized:#?}"
+        );
     }
 }
 
@@ -81,6 +91,11 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
         LogicalType::BigInt,
         LogicalType::Integer,
         BoundCastInfo::fixed(numeric_casts::int64_to_int32),
+    );
+    casts.register_cast(
+        LogicalType::Varchar,
+        LogicalType::Date,
+        BoundCastInfo::varlen(date_casts::varchar_to_date),
     );
     casts.register_bind_function(decimal_casts::bind_decimal_casts);
     casts.register_bind_function(bind_literals);
@@ -101,9 +116,9 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
     let schema = catalog
         .get_schema(&transaction, "public")
         .expect("public schema");
-    for operator in ["=", "<", "*", "/"] {
+    for operator in ["=", "<", "-", "*", "/"] {
         let mut set = ScalarFunctionSet::new(operator.to_string());
-        if matches!(operator, "*" | "/") {
+        if matches!(operator, "-" | "*" | "/") {
             paro_function::scalar::operators::arithmetic::register_arithmetic_functions(&mut set);
         } else {
             paro_function::scalar::operators::comparison::register_comparison_functions(&mut set);
@@ -234,6 +249,39 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
         ],
         vec![0, 3],
     );
+    install_table(
+        &schema,
+        &transaction,
+        "customer",
+        vec![
+            ("c_custkey", LogicalType::BigInt),
+            ("c_name", LogicalType::Varchar),
+            ("c_address", LogicalType::Varchar),
+            ("c_nationkey", LogicalType::Integer),
+            ("c_phone", LogicalType::Varchar),
+            ("c_acctbal", decimal.clone()),
+            ("c_mktsegment", LogicalType::Varchar),
+            ("c_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
+    install_table(
+        &schema,
+        &transaction,
+        "orders",
+        vec![
+            ("o_orderkey", LogicalType::BigInt),
+            ("o_custkey", LogicalType::BigInt),
+            ("o_orderstatus", LogicalType::Varchar),
+            ("o_totalprice", decimal.clone()),
+            ("o_orderdate", LogicalType::Date),
+            ("o_orderpriority", LogicalType::Varchar),
+            ("o_clerk", LogicalType::Varchar),
+            ("o_shippriority", LogicalType::Integer),
+            ("o_comment", LogicalType::Varchar),
+        ],
+        vec![0],
+    );
     session
 }
 
@@ -261,6 +309,22 @@ fn install_table(
     columns: Vec<(&str, LogicalType)>,
     unique: Vec<usize>,
 ) {
+    install_table_with_constraint(
+        schema,
+        transaction,
+        name,
+        columns,
+        Constraint::unique(unique),
+    );
+}
+
+fn install_table_with_constraint(
+    schema: &paro_catalog::entry::SchemaEntry,
+    transaction: &CatalogSnapshot,
+    name: &str,
+    columns: Vec<(&str, LogicalType)>,
+    constraint: Constraint,
+) {
     let definitions = columns
         .into_iter()
         .map(|(name, ty)| ColumnDefinition::new(name.to_string(), ty))
@@ -281,7 +345,7 @@ fn install_table(
         name.to_string(),
         definitions,
     )
-    .with_constraints(vec![Constraint::unique(unique)]);
+    .with_constraints(vec![constraint]);
     let table =
         TableCatalogEntry::from_info(info, storage, schema.object_id_allocator().allocate(), 0)
             .expect("table entry");
@@ -298,6 +362,8 @@ fn install_table(
 struct PlanInspection {
     windows: usize,
     delim_joins: usize,
+    late_fetches: usize,
+    late_fetch_sources: usize,
     gets: std::collections::HashMap<String, usize>,
 }
 
@@ -310,6 +376,15 @@ impl PlanInspection {
 fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
     fn visit(plan: &paro_planner::plan::LogicalPlan, result: &mut PlanInspection) {
         match &plan.operator {
+            LogicalOperator::Projection(projection) if projection.late_row_fetch.is_some() => {
+                result.late_fetches += 1;
+                result.late_fetch_sources += projection
+                    .late_row_fetch
+                    .as_ref()
+                    .expect("checked")
+                    .sources
+                    .len();
+            }
             LogicalOperator::Window(_) => result.windows += 1,
             LogicalOperator::Join(paro_planner::operator::Join::Comparison(join))
                 if !join.duplicate_eliminated_columns.is_empty() =>
@@ -331,6 +406,123 @@ fn inspect_plan(plan: &paro_planner::plan::LogicalPlan) -> PlanInspection {
     let mut result = PlanInspection::default();
     visit(plan, &mut result);
     result
+}
+
+#[test]
+fn late_customer_payload_keeps_other_dimension_groups_bound() {
+    let session = setup_session();
+    for (table_name, values) in [
+        (
+            "customer",
+            vec![
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::Varchar("Customer#1".to_string()),
+                paro_common::runtime_value::Value::Varchar("Address".to_string()),
+                paro_common::runtime_value::Value::Integer(1),
+                paro_common::runtime_value::Value::Varchar("Phone".to_string()),
+                paro_common::runtime_value::Value::Decimal(100, 15, 2),
+                paro_common::runtime_value::Value::Varchar("BUILDING".to_string()),
+                paro_common::runtime_value::Value::Varchar("Comment".to_string()),
+            ],
+        ),
+        (
+            "orders",
+            vec![
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::Varchar("O".to_string()),
+                paro_common::runtime_value::Value::Decimal(100, 15, 2),
+                paro_common::runtime_value::Value::Date(8_674),
+                paro_common::runtime_value::Value::Varchar("1-URGENT".to_string()),
+                paro_common::runtime_value::Value::Varchar("Clerk#1".to_string()),
+                paro_common::runtime_value::Value::Integer(0),
+                paro_common::runtime_value::Value::Varchar("Comment".to_string()),
+            ],
+        ),
+        (
+            "nation",
+            vec![
+                paro_common::runtime_value::Value::Integer(1),
+                paro_common::runtime_value::Value::Varchar("NATION".to_string()),
+                paro_common::runtime_value::Value::Integer(1),
+                paro_common::runtime_value::Value::Varchar("Comment".to_string()),
+            ],
+        ),
+        (
+            "lineitem",
+            vec![
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::BigInt(1),
+                paro_common::runtime_value::Value::Decimal(100, 15, 2),
+                paro_common::runtime_value::Value::Decimal(100, 15, 2),
+                paro_common::runtime_value::Value::Decimal(5, 15, 2),
+                paro_common::runtime_value::Value::Decimal(0, 15, 2),
+                paro_common::runtime_value::Value::Varchar("R".to_string()),
+                paro_common::runtime_value::Value::Varchar("F".to_string()),
+                paro_common::runtime_value::Value::Date(8_674),
+                paro_common::runtime_value::Value::Date(8_674),
+                paro_common::runtime_value::Value::Date(8_674),
+                paro_common::runtime_value::Value::Varchar("DELIVER IN PERSON".to_string()),
+                paro_common::runtime_value::Value::Varchar("AIR".to_string()),
+                paro_common::runtime_value::Value::Varchar("Comment".to_string()),
+            ],
+        ),
+    ] {
+        append_catalog_row(&session, table_name, values);
+    }
+    let statement = paro_parser::parse_one(include_str!(
+        "../../../../benchmark/workloads/tpch/sql/q10.sql"
+    ))
+    .expect("parse q10 shape")
+    .stmt;
+    let mut planner = Planner::new(session.clone());
+    planner.create_plan(statement).expect("plan q10 shape");
+    let planned = planner.take_plan().expect("logical q10 shape");
+    let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+    let optimized = optimizer.optimize(planned).expect("optimize q10 shape");
+    assert_eq!(inspect_plan(&optimized).late_fetches, 1, "{optimized:#?}");
+    crate::verify::verify_logical_plan(&planner.binder.bind_context, &optimized)
+        .expect("verify q10 late payload bindings");
+}
+
+fn append_catalog_row(
+    session: &paro_context::StatementContext,
+    table_name: &str,
+    values: Vec<paro_common::runtime_value::Value>,
+) {
+    let transaction = CatalogSnapshot::permanent_writer(u64::MAX);
+    let table = session
+        .catalog()
+        .get_schema(&transaction, "public")
+        .expect("public schema")
+        .get_table(
+            transaction.transaction_id,
+            transaction.start_time,
+            table_name,
+        )
+        .expect("test table");
+    let CatalogEntryEnum::Table(table) = table.as_ref() else {
+        panic!("expected table entry")
+    };
+    let storage = table.get_storage().expect("test storage");
+    let mut vectors = values
+        .iter()
+        .zip(storage.types())
+        .map(|(value, ty)| {
+            let mut vector = paro_common::test_utils::test_vector_with_capacity(ty.clone(), 1);
+            vector.set_value(0, value);
+            vector.set_count(1);
+            vector
+        })
+        .collect::<Vec<_>>();
+    let mut chunk = paro_common::chunk::Chunk::from_vectors(
+        std::mem::take(&mut vectors),
+        paro_common::test_utils::test_allocator(),
+    );
+    chunk.try_set_cardinality(1).expect("row cardinality");
+    storage.append(&chunk).expect("append test row");
 }
 
 #[test]

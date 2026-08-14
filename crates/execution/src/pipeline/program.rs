@@ -15,14 +15,14 @@ use crate::runtime::{
     DeleteSinkExec, DelimCaptureSinkExec, DelimScanSourceExec, DummySourceExec, EmptySourceExec,
     ExpressionSourceExec, ExternalProjectTransformExec, ExternalTableSinkExec,
     ExternalTableSourceExec, FilterTransformExec, FullTextSearchSourceExec,
-    GraphExpandTransformExec, GraphProjectTransformExec, GraphScanSourceExec,
-    GraphShortestPathTransformExec, HashAggregateBuildSinkExec, HashAggregateEmitSourceExec,
-    HashJoinBuildSinkExec, HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec,
-    HashJoinUnmatchedSourceExec, InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec,
-    NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec, OperatorRole,
-    PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
-    PerfectHashAggregateEmitSourceExec, PerfectHashAggregateSinkExec, ProjectTransformExec,
-    PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
+    GraphExpandTransformExec, GraphScanSourceExec, GraphShortestPathTransformExec,
+    HashAggregateBuildSinkExec, HashAggregateEmitSourceExec, HashJoinBuildSinkExec,
+    HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec,
+    InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec, NestedLoopJoinProbeTransformExec,
+    NljUnmatchedSourceExec, OperatorRole, PartitionAggregateWindowBuildSinkExec,
+    PartitionAggregateWindowEmitSourceExec, PerfectHashAggregateEmitSourceExec,
+    PerfectHashAggregateSinkExec, ProjectTransformExec, PropertyRepairTransformExec,
+    RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec, RowFetchProjectTransformExec,
     RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
     SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
     SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
@@ -535,8 +535,8 @@ impl OperatorRuntimeRegistry {
             TransformSpec::GraphExpand(spec) => {
                 TransformExec::GraphExpand(GraphExpandTransformExec { spec: spec.clone() })
             }
-            TransformSpec::GraphProject(spec) => {
-                TransformExec::GraphProject(GraphProjectTransformExec { spec: spec.clone() })
+            TransformSpec::RowFetchProject(spec) => {
+                TransformExec::RowFetchProject(RowFetchProjectTransformExec { spec: spec.clone() })
             }
             TransformSpec::GraphShortestPath(spec) => {
                 TransformExec::GraphShortestPath(GraphShortestPathTransformExec {
@@ -575,6 +575,8 @@ impl OperatorRuntimeRegistry {
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 join_type: spec.join_type,
+                build_keys_unique: spec.build_keys_unique,
+                build_time_integer_index: spec.build_time_integer_index.clone(),
                 key_conditions: spec.key_conditions.clone(),
                 residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),
@@ -759,7 +761,7 @@ fn scratch_layout_for(
         transform_layouts.push(transform_chunk_layout(transform, &current));
     }
     Ok(PipelineScratchLayout::new(
-        chunk_layout(&source),
+        source_chunk_layout(&spec.source, &source),
         transform_layouts,
         spec.output.column_count().max(1),
     ))
@@ -771,7 +773,28 @@ fn chunk_layout(row_type: &RowType) -> ChunkLayout {
 
 fn transform_chunk_layout(transform: &TransformSpec, row_type: &RowType) -> ChunkLayout {
     match transform {
-        TransformSpec::Filter(_) | TransformSpec::Limit(_) => {
+        TransformSpec::Filter(_)
+        | TransformSpec::Limit(_)
+        | TransformSpec::Project(_)
+        | TransformSpec::RowFetchProject(_) => {
+            ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
+        }
+        _ => chunk_layout(row_type),
+    }
+}
+
+/// Sources that publish immutable breaker chunks replace every output vector
+/// by reference. Preallocating a full materialized chunk for them only creates
+/// buffers which are immediately discarded on the first poll.
+fn source_chunk_layout(source: &SourceSpec, row_type: &RowType) -> ChunkLayout {
+    match source {
+        SourceSpec::Chunk(_)
+        | SourceSpec::CteScan(_)
+        | SourceSpec::DelimScan(_)
+        | SourceSpec::RecursiveTableScan(_)
+        | SourceSpec::TopNEmit(_)
+        | SourceSpec::WindowEmit(_)
+        | SourceSpec::SetOperationEmit(_) => {
             ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
         }
         _ => chunk_layout(row_type),
@@ -1137,7 +1160,7 @@ mod tests {
         );
         assert_eq!(
             program.scratch.transform_outputs[1].kind,
-            crate::runtime::ChunkLayoutKind::Materialized
+            crate::runtime::ChunkLayoutKind::View
         );
         assert_eq!(
             program.scratch.transform_outputs[2].kind,
@@ -1362,6 +1385,8 @@ mod tests {
                     sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                         handle: join,
                         join_type: JoinType::Inner,
+                        build_keys_unique: false,
+                        build_time_integer_index: None,
                         key_conditions: Box::new([join_condition()]),
                         residual_conditions: Box::default(),
                         grouped_reduction_channels: None,

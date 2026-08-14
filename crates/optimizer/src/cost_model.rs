@@ -7,7 +7,8 @@ use std::sync::Arc;
 use paro_common::runtime_value::Value;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionType, Expression, OperatorType,
+    ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
+    ExpressionVisitDecision, OperatorType,
 };
 use paro_planner::operator::ColumnBinding;
 use paro_planner::plan::CardinalityEstimate;
@@ -62,6 +63,56 @@ fn conjunction_estimate(
     } else {
         SelectivityEstimate::estimated(fraction)
     }
+}
+
+/// Combine predicates with exponential backoff only across distinct columns
+/// of the same relation.
+///
+/// Per-column statistics cannot prove independence between category-like
+/// attributes. Multiplying all such estimates systematically underestimates
+/// filtered relations. Predicates on one column are still combined exactly
+/// (and ordered ranges are coalesced before reaching this function), while
+/// predicates on different relations remain independent.
+fn column_aware_conjunction_estimate(
+    estimates: impl Iterator<Item = (SelectivityEstimate, Option<ColumnBinding>)>,
+) -> SelectivityEstimate {
+    let mut independent = Vec::new();
+    let mut by_relation = HashMap::<usize, HashMap<usize, Vec<SelectivityEstimate>>>::new();
+    for (estimate, binding) in estimates {
+        if estimate.proven && estimate.fraction == 0.0 {
+            return SelectivityEstimate::proven(0.0);
+        }
+        match binding {
+            Some(binding) => by_relation
+                .entry(binding.table_index)
+                .or_default()
+                .entry(binding.column_index)
+                .or_default()
+                .push(estimate),
+            None => independent.push(estimate),
+        }
+    }
+
+    for columns in by_relation.into_values() {
+        let mut column_estimates = columns
+            .into_values()
+            .map(|estimates| conjunction_estimate(estimates.into_iter()))
+            .collect::<Vec<_>>();
+        column_estimates.sort_by(|left, right| left.fraction.total_cmp(&right.fraction));
+        let proven = column_estimates.iter().all(|estimate| estimate.proven);
+        let mut exponent = 1.0;
+        let mut fraction = 1.0;
+        for estimate in column_estimates {
+            fraction *= estimate.fraction.powf(exponent);
+            exponent *= 0.5;
+        }
+        independent.push(if proven {
+            SelectivityEstimate::proven(fraction)
+        } else {
+            SelectivityEstimate::estimated(fraction)
+        });
+    }
+    conjunction_estimate(independent.into_iter())
 }
 
 fn disjunction_estimate(
@@ -449,17 +500,21 @@ impl CostModel {
             interval_for_expression[expression_idx] = Some(interval_idx);
         }
 
-        conjunction_estimate(flattened.iter().enumerate().filter_map(
+        column_aware_conjunction_estimate(flattened.iter().enumerate().filter_map(
             |(expression_idx, expression)| match interval_for_expression[expression_idx] {
                 Some(interval_idx)
                     if intervals[interval_idx].first_expression == expression_idx =>
                 {
-                    Some(SelectivityEstimate::estimated(
-                        intervals[interval_idx].selectivity(),
+                    Some((
+                        SelectivityEstimate::estimated(intervals[interval_idx].selectivity()),
+                        Some(intervals[interval_idx].binding),
                     ))
                 }
                 Some(_) => None,
-                None => Some(self.estimate_selectivity_with_provenance(expression, resolver)),
+                None => Some((
+                    self.estimate_selectivity_with_provenance(expression, resolver),
+                    expression_single_binding(expression, resolver),
+                )),
             },
         ))
     }
@@ -554,6 +609,26 @@ fn flatten_and<'e>(expression: &'e Expression, output: &mut Vec<&'e Expression>)
     output.push(expression);
 }
 
+fn expression_single_binding(
+    expression: &Expression,
+    resolver: &StatisticsResolver<'_>,
+) -> Option<ColumnBinding> {
+    let mut binding = None;
+    let mut ambiguous = false;
+    ExpressionIterator::visit(expression, &mut |node| {
+        let Some(candidate) = resolver.binding(node) else {
+            return ExpressionVisitDecision::Descend;
+        };
+        match binding {
+            None => binding = Some(candidate),
+            Some(existing) if existing != candidate => ambiguous = true,
+            Some(_) => {}
+        }
+        ExpressionVisitDecision::SkipChildren
+    });
+    (!ambiguous).then_some(binding).flatten()
+}
+
 #[derive(Debug, Clone, Copy)]
 struct IntegralRangeConstraint {
     binding: ColumnBinding,
@@ -617,6 +692,7 @@ fn integral_range_constraint(
 
 #[derive(Debug)]
 struct IntegralIntervalEstimate {
+    binding: ColumnBinding,
     domain: IntegralDomain,
     minimum: u128,
     maximum: u128,
@@ -629,6 +705,7 @@ struct IntegralIntervalEstimate {
 impl IntegralIntervalEstimate {
     fn new(first_expression: usize, constraint: &IntegralRangeConstraint) -> Self {
         Self {
+            binding: constraint.binding,
             domain: constraint.domain,
             minimum: constraint.minimum,
             maximum: constraint.maximum,
@@ -1039,6 +1116,77 @@ mod tests {
                 .estimate_filter_cardinality(64, &[expression], &column_stats)
                 .expected,
             19
+        );
+    }
+
+    #[test]
+    fn conjunction_dampens_only_distinct_columns_within_one_relation() {
+        let model = CostModel::default();
+        let size_binding = ColumnBinding::new(1, 0);
+        let type_binding = ColumnBinding::new(1, 1);
+        let mut size_stats = ColumnStatistics::new(
+            paro_storage::statistics::BaseStatistics::create_empty(LogicalType::Integer),
+        );
+        let hashes = (0..50).map(paro_common::hash::hash_u64).collect::<Vec<_>>();
+        size_stats.update_distinct_statistics(&hashes, hashes.len());
+        let distinct = size_stats.get_distinct_count();
+        let column_stats = HashMap::from([(size_binding, Arc::new(size_stats))]);
+        let equality = |value| {
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::NotEqual,
+                Expression::ColumnRef(ColumnRefExpression::new(size_binding, LogicalType::Integer)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(value),
+                    LogicalType::Integer,
+                )),
+            ))
+        };
+        let suffix = Expression::Operator(OperatorExpression::new(
+            OperatorType::Like,
+            vec![
+                Expression::ColumnRef(ColumnRefExpression::new(type_binding, LogicalType::Varchar)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("%BRASS".to_string()),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+
+        let same_column = (1.0 - 1.0 / distinct as f64).powi(2);
+        let expected = model.defaults.like_contains * same_column.sqrt();
+        let actual = model
+            .estimate_filter_cardinality(
+                200_000,
+                &[equality(14), equality(16), suffix],
+                &column_stats,
+            )
+            .expected;
+        assert_eq!(actual, (200_000.0 * expected).round() as u64);
+    }
+
+    #[test]
+    fn conjunction_keeps_different_relations_independent() {
+        let model = CostModel::default();
+        let equality = |table_index| {
+            Expression::Comparison(ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(table_index, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(1),
+                    LogicalType::Integer,
+                )),
+            ))
+        };
+
+        assert_eq!(
+            model
+                .estimate_filter_cardinality(10_000, &[equality(1), equality(2)], &HashMap::new())
+                .expected,
+            100
         );
     }
 

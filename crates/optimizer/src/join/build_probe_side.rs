@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_planner::operator::{Join, JoinType, LogicalOperator};
+use paro_planner::operator::{Join, JoinComparisonType, JoinType, LogicalOperator, ProjectionMap};
 use paro_planner::plan::LogicalPlan;
 
 /// Choose a cheaper build side for joins.
@@ -88,8 +88,18 @@ impl BuildProbeSideOptimizer {
             return;
         }
 
-        let left_cost = self.build_cost(join.left.as_ref());
-        let right_cost = self.build_cost(join.right.as_ref());
+        let left_cost = self.comparison_build_cost(
+            join.left.as_ref(),
+            &join.left_projection_map,
+            join.conditions.iter().map(|condition| &condition.left),
+            join.conditions.iter().map(|condition| condition.comparison),
+        );
+        let right_cost = self.comparison_build_cost(
+            join.right.as_ref(),
+            &join.right_projection_map,
+            join.conditions.iter().map(|condition| &condition.right),
+            join.conditions.iter().map(|condition| condition.comparison),
+        );
         if right_cost <= left_cost {
             return;
         }
@@ -120,6 +130,51 @@ impl BuildProbeSideOptimizer {
     fn build_cost(&self, plan: &LogicalPlan) -> u128 {
         let cardinality = self.estimated_cardinality(plan) as u128;
         let row_width = estimate_row_width(&plan.types()) as u128;
+        cardinality.saturating_mul(row_width.max(1))
+    }
+
+    fn comparison_build_cost<'a>(
+        &self,
+        plan: &LogicalPlan,
+        projection: &ProjectionMap,
+        condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
+        comparisons: impl Iterator<Item = JoinComparisonType>,
+    ) -> u128 {
+        let cardinality = self.estimated_cardinality(plan) as u128;
+        let plan_types = plan.types();
+        let projected_types = projection
+            .to_indices(plan_types.len())
+            .into_iter()
+            .filter_map(|index| plan_types.get(index).cloned());
+        let condition_types = condition_expressions
+            .zip(comparisons)
+            .map(|(expression, comparison)| (expression.return_type(), comparison));
+        let mut stored_types = projected_types.collect::<Vec<_>>();
+        let mut keys = Vec::new();
+        let mut residuals = Vec::new();
+        for (ty, comparison) in condition_types {
+            if matches!(
+                comparison,
+                JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
+            ) {
+                keys.push(ty);
+            } else {
+                residuals.push(ty);
+            }
+        }
+        keys.append(&mut stored_types);
+        keys.append(&mut residuals);
+
+        // Hash build rows store equality keys independently of the visible
+        // payload, followed by hash, next-pointer, and match-mask state. The
+        // former width-only estimate omitted these fixed bytes and therefore
+        // preferred very large narrow build inputs over substantially smaller
+        // relations. Charge the actual serialized shape used by
+        // `BuildRowLayout`; projected key columns deliberately remain in the
+        // payload because the join may expose them above the operator.
+        const HASH_BUILD_RUNTIME_BYTES: usize =
+            std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + std::mem::size_of::<u8>();
+        let row_width = estimate_row_width(&keys).saturating_add(HASH_BUILD_RUNTIME_BYTES) as u128;
         cardinality.saturating_mul(row_width.max(1))
     }
 
@@ -295,6 +350,54 @@ mod tests {
             }
             _ => panic!("expected comparison join"),
         }
+    }
+
+    #[test]
+    fn build_probe_charges_hash_row_state_before_choosing_a_large_narrow_build() {
+        let ctx = BindContext::new();
+        let filtered_fact = expression_get(
+            0,
+            1,
+            vec![
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+            ],
+        );
+        let dimension = expression_get(1, 1, vec![LogicalType::BigInt, LogicalType::Date]);
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, filtered_fact, 320_000),
+            plan_with_cardinality(&ctx, dimension, 1_500_000),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::BigInt,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::BigInt,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        // Only the date payload is consumed above the join. The equality key
+        // remains independently stored in the physical build row.
+        join.right_projection_map = vec![1].into();
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(
+            join.right.stats.estimated_cardinality.unwrap().expected,
+            320_000,
+            "the smaller filtered input should become the hash build"
+        );
+        assert_eq!(join.right.types().len(), 5);
     }
 
     #[test]

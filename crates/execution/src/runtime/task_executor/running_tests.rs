@@ -745,6 +745,8 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,
@@ -996,6 +998,8 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Left,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
                     key_conditions: vec![join_condition()].into_boxed_slice(),
                     residual_conditions: Box::default(),
                     grouped_reduction_channels: None,

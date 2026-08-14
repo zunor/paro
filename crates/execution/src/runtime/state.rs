@@ -34,9 +34,9 @@ pub use crate::operators::external::state::{
 };
 pub use crate::operators::graph::state::{
     GraphExpandTransformGlobal, GraphExpandTransformLocal, GraphFilterScanState,
-    GraphProjectMaterializedRuntime, GraphProjectTableFetchPlan, GraphProjectTransformLocal,
     GraphScanSourceGlobal, GraphScanSourceLocal, GraphShortestPathTransformGlobal,
-    GraphShortestPathTransformLocal,
+    GraphShortestPathTransformLocal, RowFetchMaterializedRuntime, RowFetchProjectTransformLocal,
+    RowFetchTablePlan,
 };
 pub use crate::operators::join::state::{
     ClassicIeJoinSourceLocal, CrossProductProbeTransformLocal, HashJoinBuildSinkLocal,
@@ -359,7 +359,7 @@ pub enum TransformLocal {
     CrossProductProbe(CrossProductProbeTransformLocal),
     ExternalProject(ExternalProjectTransformLocal),
     GraphExpand(GraphExpandTransformLocal),
-    GraphProject(GraphProjectTransformLocal),
+    RowFetchProject(RowFetchProjectTransformLocal),
     GraphShortestPath(GraphShortestPathTransformLocal),
     PropertyRepair,
     Dyn(DynLocalStateBox),

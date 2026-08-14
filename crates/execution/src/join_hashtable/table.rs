@@ -40,13 +40,19 @@ use paro_storage::row::RowLayout;
 use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
 use super::hash_kernel::{JoinKeyLayout, PreparedProbeKeys};
 use super::ht_entry::HtEntry;
-use super::integer_index::{ExactIntegerJoinIndex, IntegerKeyKind};
+pub(crate) use super::integer_index::ConcurrentBuildTimeIntegerIndexBuilder as BuildTimeIntegerIndexBuilder;
+use super::integer_index::{
+    ConcurrentBuildTimeIntegerIndexBuilder, ExactIntegerJoinIndex, IntegerKeyKind,
+};
+use super::pair_integer_index::ExactI64PairJoinIndex;
 use super::scan_structure::ScanStructure;
 
 #[path = "integer_finalize.rs"]
 mod integer_finalize;
 use integer_finalize::BuiltIntegerIndex;
 pub(crate) use integer_finalize::ParallelDirectIntegerIndexBuild;
+#[path = "pair_integer_finalize.rs"]
+mod pair_integer_finalize;
 #[path = "table_grouped_reduction.rs"]
 mod table_grouped_reduction;
 use table_grouped_reduction::GroupedReductionExtremaState;
@@ -103,6 +109,11 @@ pub struct JoinHashTableConfig {
     pub initial_radix_bits: usize,
     /// Whether to use salt for large hash tables.
     pub use_salt_threshold: usize,
+    /// The complete equality-key tuple is proven unique by the logical plan.
+    pub build_keys_unique: bool,
+    /// Build-time direct artifact shared by local tables. It is absent from the
+    /// merged table so finish can take sole ownership and publish it.
+    pub(crate) build_time_integer_builder: Option<Arc<ConcurrentBuildTimeIntegerIndexBuilder>>,
 }
 
 impl Default for JoinHashTableConfig {
@@ -110,6 +121,8 @@ impl Default for JoinHashTableConfig {
         Self {
             initial_radix_bits: 4,
             use_salt_threshold: 8192,
+            build_keys_unique: false,
+            build_time_integer_builder: None,
         }
     }
 }
@@ -180,6 +193,9 @@ pub struct JoinHashTable {
     /// Optional exact index owner for bounded unique integer equality keys.
     integer_index: Mutex<Option<Box<ExactIntegerJoinIndex>>>,
 
+    /// Optional exact index for two-column BIGINT equality keys.
+    pair_integer_index: Mutex<Option<Box<ExactI64PairJoinIndex>>>,
+
     /// Lazily allocated compact per-key summaries for fused reductions.
     grouped_reduction_extrema: Mutex<GroupedReductionExtremaState>,
 
@@ -197,6 +213,9 @@ pub struct JoinHashTable {
 
     /// Lock-free read pointer published with `finalized`.
     probe_integer_index: AtomicPtr<ExactIntegerJoinIndex>,
+
+    /// Lock-free read pointer for the two-BIGINT exact index.
+    probe_pair_integer_index: AtomicPtr<ExactI64PairJoinIndex>,
 
     /// Lock-free read pointer published after finalize.
     probe_entries: AtomicPtr<HtEntry>,
@@ -501,11 +520,13 @@ impl JoinHashTable {
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
             integer_index: Mutex::new(None),
+            pair_integer_index: Mutex::new(None),
             grouped_reduction_extrema: Mutex::new(GroupedReductionExtremaState::Unconfigured),
             integer_index_build_stats: Mutex::new(integer_index_build_stats),
             integer_key_kind,
             deferred_hashes: AtomicBool::new(false),
             probe_integer_index: AtomicPtr::new(ptr::null_mut()),
+            probe_pair_integer_index: AtomicPtr::new(ptr::null_mut()),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
             bitmask: AtomicUsize::new(0),
@@ -585,7 +606,7 @@ impl JoinHashTable {
             .as_ref()
             .map(|index| index.size_in_bytes())
             .unwrap_or(0);
-        data_size + entries_size + integer_index_size
+        data_size + entries_size + integer_index_size + self.pair_integer_index_size()
     }
 
     /// Estimate pointer-table size for a given row count.
@@ -884,8 +905,11 @@ impl JoinHashTable {
         self.probe_entries.store(ptr::null_mut(), Ordering::Release);
         self.probe_integer_index
             .store(ptr::null_mut(), Ordering::Release);
+        self.probe_pair_integer_index
+            .store(ptr::null_mut(), Ordering::Release);
         *self.entries.lock().unwrap() = HtEntryTable::default();
         *self.integer_index.lock().unwrap() = None;
+        *self.pair_integer_index.lock().unwrap() = None;
         self.reset_grouped_reduction_extrema();
         self.capacity.store(0, Ordering::Relaxed);
         self.bitmask.store(0, Ordering::Relaxed);
@@ -982,7 +1006,12 @@ impl JoinHashTable {
             return Ok(0);
         }
 
-        let defer_hashes = {
+        let defer_hashes = if self.config.build_time_integer_builder.is_some() {
+            // Storage bounds and the producer lifecycle already prove this
+            // artifact's complete domain. Avoid repeating a min/max pass over
+            // every hot key vector merely to rediscover runtime bounds.
+            true
+        } else {
             let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
             if integer_stats.exact_index_candidate() {
                 let key = keys.column(0).ok_or_else(|| {
@@ -1004,13 +1033,36 @@ impl JoinHashTable {
         }
 
         let mut store = self.build_store.lock().unwrap();
-        let appended_count = store.append_key_payload_chunk(
+        let build_time_integer_builder = self.config.build_time_integer_builder.as_ref();
+        let direct_key = build_time_integer_builder
+            .map(|_| {
+                keys.column(0)
+                    .ok_or_else(|| paro_error::internal("hash join build has no direct-index key"))
+            })
+            .transpose()?;
+        let appended_count = store.append_key_payload_chunk_with(
             keys,
             payload,
             build_sel,
             appended_count,
             (!defer_hashes).then_some(hashes.as_slice()),
             false,
+            |_, source_row_idx, row_ptr| {
+                if let (Some(builder), Some(key)) =
+                    (build_time_integer_builder, direct_key.as_ref())
+                {
+                    builder.insert_value_with_link(
+                        &key.get_value(source_row_idx),
+                        row_ptr,
+                        self.config.build_keys_unique,
+                        |row_ptr, previous| {
+                            self.build_row_layout
+                                .set_next(row_ptr as *mut u8, previous as *const u8);
+                        },
+                    )?;
+                }
+                Ok(())
+            },
         )?;
         if defer_hashes {
             // Publish the deferred state while holding the same store lock that
@@ -1088,6 +1140,9 @@ impl JoinHashTable {
             self.publish_integer_index(index)?;
             return Ok(());
         }
+        if self.try_build_pair_integer_index()? {
+            return Ok(());
+        }
 
         // Exact-index admission is speculative. If bounds or uniqueness make
         // it unsuitable, initialize the canonical hash field once here before
@@ -1127,9 +1182,31 @@ impl JoinHashTable {
         Ok(())
     }
 
+    pub(crate) fn publish_build_time_integer_builder(
+        &self,
+        builder: ConcurrentBuildTimeIntegerIndexBuilder,
+    ) -> Result<()> {
+        let (index, has_long_chains) = builder.finish(|row_ptr, previous| {
+            self.build_row_layout
+                .set_next(row_ptr as *mut u8, previous as *const u8);
+        })?;
+        self.publish_integer_index(BuiltIntegerIndex {
+            index,
+            has_long_chains,
+        })
+    }
+
     #[cfg(test)]
     fn has_integer_index(&self) -> bool {
         !self.probe_integer_index.load(Ordering::Acquire).is_null()
+    }
+
+    #[cfg(test)]
+    fn has_pair_integer_index(&self) -> bool {
+        !self
+            .probe_pair_integer_index
+            .load(Ordering::Acquire)
+            .is_null()
     }
 
     /// Check if salt should be used for probing.
@@ -1231,6 +1308,9 @@ impl JoinHashTable {
         if !integer_index.is_null() {
             let index = unsafe { &*integer_index };
             Self::probe_exact_integer_index(index, keys, scan_structure, filtered_count)?;
+            return Ok(());
+        }
+        if self.probe_pair_integer_index(keys, scan_structure, filtered_count)? {
             return Ok(());
         }
 

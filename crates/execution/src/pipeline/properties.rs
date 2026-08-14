@@ -49,8 +49,16 @@ impl PipelinePropertyAccumulator {
             | TransformSpec::SortRangeJoinProbe(_)
             | TransformSpec::CrossProductProbe(_)
             | TransformSpec::ExternalProject(_)
-            | TransformSpec::GraphExpand(_)
-            | TransformSpec::GraphProject(_) => {}
+            | TransformSpec::GraphExpand(_) => {}
+            TransformSpec::RowFetchProject(spec) => {
+                if spec.coalesce_input {
+                    self.capabilities.parallelism =
+                        self.capabilities.parallelism.merge(Parallelism::single());
+                    self.placement = self.placement.merge(Placement::SingleTask);
+                    self.current.partitioning = PartitioningProperty::None;
+                    self.memory.class = self.memory.class.max(MemoryClass::Blocking);
+                }
+            }
             TransformSpec::Limit(_)
             | TransformSpec::StreamingTopN(_)
             | TransformSpec::StreamingWindow(_)

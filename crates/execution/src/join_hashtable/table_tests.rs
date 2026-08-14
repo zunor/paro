@@ -41,6 +41,10 @@ fn bigint_equality_condition() -> JoinCondition {
     )
 }
 
+fn bigint_pair_equality_conditions() -> Vec<JoinCondition> {
+    vec![bigint_equality_condition(), bigint_equality_condition()]
+}
+
 fn not_distinct_condition() -> JoinCondition {
     JoinCondition::new(
         Expression::Constant(ConstantExpression::new(
@@ -315,6 +319,183 @@ fn bounded_unique_integer_inner_join_uses_exact_index() {
 }
 
 #[test]
+fn integer_index_is_filled_during_parallel_build_and_only_published_at_finish() {
+    let memory = MemoryAccountingContext::detached(
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    );
+    let builder = Arc::new(
+        ConcurrentBuildTimeIntegerIndexBuilder::try_new_from_values(
+            &LogicalType::Integer,
+            &Value::Integer(1),
+            &Value::Integer(4),
+            4,
+            paro_common::test_utils::test_allocator(),
+            &memory,
+        )
+        .expect("direct builder admission")
+        .expect("compact integer domain"),
+    );
+    let config = JoinHashTableConfig {
+        build_keys_unique: true,
+        build_time_integer_builder: Some(Arc::clone(&builder)),
+        ..Default::default()
+    };
+    let first = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        config.clone(),
+    ));
+    let second = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        config,
+    ));
+    first
+        .build(
+            &chunk_from_optional_i32(&[Some(1), Some(3)]),
+            &chunk_from_optional_i32(&[Some(10), Some(30)]),
+        )
+        .expect("first local build");
+    second
+        .build(
+            &chunk_from_optional_i32(&[Some(2), Some(4)]),
+            &chunk_from_optional_i32(&[Some(20), Some(40)]),
+        )
+        .expect("second local build");
+
+    let merged = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig {
+            build_keys_unique: true,
+            ..Default::default()
+        },
+    ));
+    merged.merge(first).expect("merge first local");
+    merged.merge(second).expect("merge second local");
+    assert!(!merged.has_integer_index());
+
+    let builder = Arc::try_unwrap(builder).expect("local tables released builder references");
+    merged
+        .publish_build_time_integer_builder(builder)
+        .expect("publish build-time index");
+    assert!(merged.has_integer_index());
+
+    let probe = chunk_from_optional_i32(&[Some(4), Some(2), Some(9)]);
+    let mut scan = merged.create_scan_structure().expect("scan state");
+    merged
+        .probe(&probe, &mut scan, None, probe.size())
+        .expect("probe published build-time index");
+    assert_eq!(scan.sel_vector.as_slice(), &[0, 1]);
+}
+
+#[test]
+fn ranked_build_time_index_links_duplicates_across_parallel_local_tables() {
+    let memory = MemoryAccountingContext::detached(
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    );
+    // A 1,001-value domain for four maximum rows declines the direct layout
+    // (over 24 slots/row) but admits the compact ranked representation (under
+    // 256 slots/row).
+    let builder = Arc::new(
+        ConcurrentBuildTimeIntegerIndexBuilder::try_new_from_values(
+            &LogicalType::Integer,
+            &Value::Integer(0),
+            &Value::Integer(1_000),
+            4,
+            paro_common::test_utils::test_allocator(),
+            &memory,
+        )
+        .expect("ranked builder admission")
+        .expect("bounded sparse integer domain"),
+    );
+    let config = JoinHashTableConfig {
+        build_time_integer_builder: Some(Arc::clone(&builder)),
+        ..Default::default()
+    };
+    let first = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        config.clone(),
+    ));
+    let second = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        config,
+    ));
+    first
+        .build(
+            &chunk_from_optional_i32(&[Some(900), Some(10)]),
+            &chunk_from_optional_i32(&[Some(90), Some(10)]),
+        )
+        .expect("first local build");
+    second
+        .build(
+            &chunk_from_optional_i32(&[Some(500), Some(900)]),
+            &chunk_from_optional_i32(&[Some(50), Some(91)]),
+        )
+        .expect("second local build");
+
+    let merged = Arc::new(JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    ));
+    // Reverse local creation order to make build-record ordinals differ from
+    // merged-store ordinals. Probe chains must remain pointer-based and exact.
+    merged.merge(second).expect("merge second local first");
+    merged.merge(first).expect("merge first local second");
+    let builder = Arc::try_unwrap(builder).expect("local tables released builder references");
+    merged
+        .publish_build_time_integer_builder(builder)
+        .expect("publish ranked build-time index");
+    assert!(merged.has_integer_index());
+    assert!(merged.chains_longer_than_one.load(Ordering::Relaxed));
+
+    let probe = chunk_from_optional_i32(&[Some(900), Some(500), Some(11)]);
+    let mut scan = merged.create_scan_structure().expect("scan state");
+    merged
+        .probe(&probe, &mut scan, None, probe.size())
+        .expect("probe ranked build-time index");
+    assert_eq!(scan.sel_vector.as_slice(), &[0, 1]);
+    let mut output = Chunk::try_initialize(
+        &[LogicalType::Integer, LogicalType::Integer],
+        VECTOR_SIZE,
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("output chunk");
+    let count = scan
+        .next_inner_join(&probe, &probe, &mut output, &merged, &[0])
+        .expect("scan duplicate matches");
+    assert_eq!(count, 3);
+    let mut payloads = (0..count)
+        .map(|row| output.column(1).unwrap().get_i32(row).unwrap())
+        .collect::<Vec<_>>();
+    payloads.sort_unstable();
+    assert_eq!(payloads, [50, 90, 91]);
+}
+
+#[test]
 fn duplicate_direct_integer_build_uses_exact_index_chains() {
     let ht = JoinHashTable::new(
         create_test_buffer_pool(),
@@ -345,6 +526,53 @@ fn duplicate_direct_integer_build_uses_exact_index_chains() {
         .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
         .expect("scan duplicate matches");
     assert_eq!(count, 2);
+}
+
+#[test]
+fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        bigint_pair_equality_conditions(),
+        vec![LogicalType::Integer],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    let keys = chunk_from_optional_i64_columns(&[
+        &[Some(1), Some(1), Some(7)],
+        &[Some(2), Some(2), Some(9)],
+    ]);
+    let payload = chunk_from_optional_i32(&[Some(10), Some(20), Some(30)]);
+    ht.build(&keys, &payload).expect("build pair keys");
+    ht.finalize().expect("finalize pair index");
+    assert!(ht.has_pair_integer_index());
+    assert!(ht.chains_longer_than_one.load(Ordering::Relaxed));
+
+    let probe = chunk_from_optional_i64_columns(&[
+        &[Some(1), Some(7), Some(7), None],
+        &[Some(2), Some(8), Some(9), Some(2)],
+    ]);
+    let mut scan = ht.create_scan_structure().expect("scan state");
+    ht.probe(&probe, &mut scan, None, probe.size())
+        .expect("probe pair index");
+    assert_eq!(scan.count, 2);
+    assert_eq!(scan.sel_vector.as_slice(), &[0, 2]);
+
+    let mut output = Chunk::try_initialize(
+        &[LogicalType::BigInt, LogicalType::Integer],
+        VECTOR_SIZE,
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("output chunk");
+    let count = scan
+        .next_inner_join(&probe, &probe, &mut output, &ht, &[0])
+        .expect("scan pair matches");
+    assert_eq!(count, 3);
+    let mut payloads = (0..count)
+        .map(|row| output.column(1).unwrap().get_i32(row).unwrap())
+        .collect::<Vec<_>>();
+    payloads.sort_unstable();
+    assert_eq!(payloads, [10, 20, 30]);
 }
 
 #[test]
