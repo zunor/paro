@@ -26,6 +26,7 @@ pub mod encoding;
 pub mod page;
 pub mod page_reader;
 pub mod partial_row;
+mod row_id;
 pub mod rowset;
 pub mod rowset_meta;
 pub mod rowset_statistics;
@@ -44,6 +45,7 @@ pub use page::{
 };
 pub use page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 pub use partial_row::{load_base_rowids, load_base_rowids_for_offsets, save_base_rowids};
+pub use row_id::{BatchRowOrdinal, SegmentRowId};
 
 // Re-export encoding types
 pub use encoding::{

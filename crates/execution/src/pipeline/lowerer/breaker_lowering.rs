@@ -20,6 +20,109 @@ pub(crate) enum BreakerDispatch {
     ExternalTable(ExternalTableSpec),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BreakerRole {
+    /// The native emit source is at least as parallel as Materialized and can
+    /// directly drive a downstream probe chain.
+    ParallelEmit,
+    /// The native emit source is single-task. Materialization is the explicit
+    /// scheduling adapter that restores downstream probe parallelism.
+    MaterializedEmit,
+    /// A blocking operator without a probe-fusible emit path.
+    Tail,
+    /// A subtree-owning control region lowered by its dedicated entry point.
+    Control,
+}
+
+enum BreakerRef<'a> {
+    TopN(&'a TopNSpec),
+    Sort(&'a SortSpec),
+    Aggregate(&'a AggregateSpec),
+    SetOperation(&'a SetOperationSpec),
+    Window(&'a WindowSpec),
+    PartitionAggregateWindow(&'a PartitionAggregateWindowSpec),
+    HashJoin(&'a HashJoinSpec),
+    NestedLoopJoin(&'a NestedLoopJoinSpec),
+    SortRangeJoin(&'a SortRangeJoinSpec),
+    ClassicIeJoin(&'a ClassicIeJoinSpec),
+    CrossProduct(&'a CrossProductSpec),
+    ExternalTable(&'a ExternalTableSpec),
+    MaterializedCteControl,
+    DelimJoinControl,
+    RecursiveCteControl,
+}
+
+impl<'a> BreakerRef<'a> {
+    fn from_kind(kind: &'a PhysicalNodeKind) -> Option<Self> {
+        Some(match kind {
+            PhysicalNodeKind::TopN(spec) => Self::TopN(spec),
+            PhysicalNodeKind::Sort(spec) => Self::Sort(spec),
+            PhysicalNodeKind::Aggregate(spec) => Self::Aggregate(spec),
+            PhysicalNodeKind::SetOperation(spec) => Self::SetOperation(spec),
+            PhysicalNodeKind::Window(spec) if !is_streaming_window_supported(spec) => {
+                Self::Window(spec)
+            }
+            PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+                Self::PartitionAggregateWindow(spec)
+            }
+            PhysicalNodeKind::HashJoin(spec) => Self::HashJoin(spec),
+            PhysicalNodeKind::NestedLoopJoin(spec) => Self::NestedLoopJoin(spec),
+            PhysicalNodeKind::SortRangeJoin(spec) => Self::SortRangeJoin(spec),
+            PhysicalNodeKind::ClassicIeJoin(spec) => Self::ClassicIeJoin(spec),
+            PhysicalNodeKind::CrossProduct(spec) => Self::CrossProduct(spec),
+            PhysicalNodeKind::ExternalTable(spec) => Self::ExternalTable(spec),
+            PhysicalNodeKind::MaterializedCte(_) => Self::MaterializedCteControl,
+            PhysicalNodeKind::DelimJoin(_) => Self::DelimJoinControl,
+            PhysicalNodeKind::RecursiveCte(_) => Self::RecursiveCteControl,
+            _ => return None,
+        })
+    }
+
+    fn role(&self) -> BreakerRole {
+        match self {
+            Self::Aggregate(_) | Self::PartitionAggregateWindow(_) => BreakerRole::ParallelEmit,
+            Self::TopN(_) | Self::Sort(_) | Self::SetOperation(_) | Self::Window(_) => {
+                BreakerRole::MaterializedEmit
+            }
+            Self::HashJoin(_)
+            | Self::NestedLoopJoin(_)
+            | Self::SortRangeJoin(_)
+            | Self::ClassicIeJoin(_)
+            | Self::CrossProduct(_)
+            | Self::ExternalTable(_) => BreakerRole::Tail,
+            Self::MaterializedCteControl | Self::DelimJoinControl | Self::RecursiveCteControl => {
+                BreakerRole::Control
+            }
+        }
+    }
+
+    fn to_dispatch(&self) -> Option<BreakerDispatch> {
+        Some(match self {
+            Self::TopN(spec) => BreakerDispatch::TopN((*spec).clone()),
+            Self::Sort(spec) => BreakerDispatch::Sort((*spec).clone()),
+            Self::Aggregate(spec) => BreakerDispatch::Aggregate((*spec).clone()),
+            Self::SetOperation(spec) => BreakerDispatch::SetOperation((*spec).clone()),
+            Self::Window(spec) => BreakerDispatch::Window((*spec).clone()),
+            Self::PartitionAggregateWindow(spec) => {
+                BreakerDispatch::PartitionAggregateWindow((*spec).clone())
+            }
+            Self::HashJoin(spec) => BreakerDispatch::HashJoin((*spec).clone()),
+            Self::NestedLoopJoin(spec) => BreakerDispatch::NestedLoopJoin((*spec).clone()),
+            Self::SortRangeJoin(spec) => BreakerDispatch::SortRangeJoin((*spec).clone()),
+            Self::ClassicIeJoin(spec) => BreakerDispatch::ClassicIeJoin((*spec).clone()),
+            Self::CrossProduct(spec) => BreakerDispatch::CrossProduct((*spec).clone()),
+            Self::ExternalTable(spec) => BreakerDispatch::ExternalTable((*spec).clone()),
+            Self::MaterializedCteControl | Self::DelimJoinControl | Self::RecursiveCteControl => {
+                return None
+            }
+        })
+    }
+
+    fn is_tail_boundary(&self) -> bool {
+        !matches!(self, Self::MaterializedCteControl)
+    }
+}
+
 enum EmitBreakerBuild {
     TopN(TopNSpec),
     Sort(SortSpec),
@@ -30,56 +133,14 @@ enum EmitBreakerBuild {
 }
 
 impl EmitBreakerBuild {
-    /// Split an owned breaker into its build description and prospective emit
-    /// source. The source initially carries a harmless placeholder handle so
-    /// its authoritative properties can be checked before lowering mutates
-    /// the handle catalog or pipeline graph.
-    fn from_dispatch(breaker: BreakerDispatch, output: &RowType) -> Option<(Self, SourceSpec)> {
-        let placeholder = BreakerHandleId::new(0);
+    fn from_dispatch(breaker: BreakerDispatch) -> Option<Self> {
         Some(match breaker {
-            BreakerDispatch::Aggregate(spec) => {
-                let source = aggregate_emit_source_spec(placeholder, spec.clone());
-                (Self::Aggregate(spec), source)
-            }
-            BreakerDispatch::TopN(spec) => {
-                let source = SourceSpec::TopNEmit(TopNEmitSourceSpec {
-                    handle: placeholder,
-                    spec: spec.clone(),
-                });
-                (Self::TopN(spec), source)
-            }
-            BreakerDispatch::Sort(spec) => {
-                let source = SourceSpec::SortEmit(SortEmitSourceSpec {
-                    handle: placeholder,
-                    ordering: ordering_spec_from_orders(&spec.orders),
-                    output_names: output.names.clone(),
-                    output_types: output.types.clone(),
-                });
-                (Self::Sort(spec), source)
-            }
-            BreakerDispatch::Window(spec) => {
-                let source = SourceSpec::WindowEmit(WindowEmitSourceSpec {
-                    handle: placeholder,
-                    spec: spec.clone(),
-                });
-                (Self::Window(spec), source)
-            }
-            BreakerDispatch::PartitionAggregateWindow(spec) => {
-                let source = SourceSpec::PartitionAggregateWindowEmit(
-                    PartitionAggregateWindowEmitSourceSpec {
-                        handle: placeholder,
-                        spec: spec.clone(),
-                    },
-                );
-                (Self::PartitionAggregateWindow(spec), source)
-            }
-            BreakerDispatch::SetOperation(spec) => {
-                let source = SourceSpec::SetOperationEmit(SetOperationEmitSourceSpec {
-                    handle: placeholder,
-                    spec: spec.clone(),
-                });
-                (Self::SetOperation(spec), source)
-            }
+            BreakerDispatch::Aggregate(spec) => Self::Aggregate(spec),
+            BreakerDispatch::TopN(spec) => Self::TopN(spec),
+            BreakerDispatch::Sort(spec) => Self::Sort(spec),
+            BreakerDispatch::Window(spec) => Self::Window(spec),
+            BreakerDispatch::PartitionAggregateWindow(spec) => Self::PartitionAggregateWindow(spec),
+            BreakerDispatch::SetOperation(spec) => Self::SetOperation(spec),
             BreakerDispatch::HashJoin(_)
             | BreakerDispatch::NestedLoopJoin(_)
             | BreakerDispatch::SortRangeJoin(_)
@@ -87,6 +148,36 @@ impl EmitBreakerBuild {
             | BreakerDispatch::CrossProduct(_)
             | BreakerDispatch::ExternalTable(_) => return None,
         })
+    }
+
+    fn source(&self, handle: BreakerHandleId, output: &RowType) -> SourceSpec {
+        match self {
+            Self::Aggregate(spec) => aggregate_emit_source_spec(handle, spec.clone()),
+            Self::TopN(spec) => SourceSpec::TopNEmit(TopNEmitSourceSpec {
+                handle,
+                spec: spec.clone(),
+            }),
+            Self::Sort(spec) => SourceSpec::SortEmit(SortEmitSourceSpec {
+                handle,
+                ordering: ordering_spec_from_orders(&spec.orders),
+                output_names: output.names.clone(),
+                output_types: output.types.clone(),
+            }),
+            Self::Window(spec) => SourceSpec::WindowEmit(WindowEmitSourceSpec {
+                handle,
+                spec: spec.clone(),
+            }),
+            Self::PartitionAggregateWindow(spec) => {
+                SourceSpec::PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceSpec {
+                    handle,
+                    spec: spec.clone(),
+                })
+            }
+            Self::SetOperation(spec) => SourceSpec::SetOperationEmit(SetOperationEmitSourceSpec {
+                handle,
+                spec: spec.clone(),
+            }),
+        }
     }
 
     fn handle_kind(&self) -> BreakerHandleKind {
@@ -101,25 +192,6 @@ impl EmitBreakerBuild {
     }
 }
 
-fn assign_emit_source_handle(source: &mut SourceSpec, handle: BreakerHandleId) -> Result<()> {
-    match source {
-        SourceSpec::HashAggregateEmit(spec) => spec.handle = handle,
-        SourceSpec::UngroupedAggregateEmit(spec) => spec.handle = handle,
-        SourceSpec::PerfectHashAggregateEmit(spec) => spec.handle = handle,
-        SourceSpec::TopNEmit(spec) => spec.handle = handle,
-        SourceSpec::SortEmit(spec) => spec.handle = handle,
-        SourceSpec::WindowEmit(spec) => spec.handle = handle,
-        SourceSpec::PartitionAggregateWindowEmit(spec) => spec.handle = handle,
-        SourceSpec::SetOperationEmit(spec) => spec.handle = handle,
-        _ => {
-            return Err(paro_error::internal(
-                "emit breaker produced a source without a breaker handle",
-            ))
-        }
-    }
-    Ok(())
-}
-
 impl<'a> PipelineLowerer<'a> {
     fn lower_emit_breaker_source(
         &mut self,
@@ -130,17 +202,19 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
         let output = self.plan.node(root).output.clone();
-        let Some((build, mut source)) = EmitBreakerBuild::from_dispatch(breaker, &output) else {
+        let Some(build) = EmitBreakerBuild::from_dispatch(breaker) else {
             return Ok(None);
         };
-        if require_parallel_probe && !source_supports_parallel_probe_fusion(&source) {
-            return Ok(None);
-        }
 
         let handle = self
             .handles
             .register(build.handle_kind(), output.clone(), Default::default());
-        assign_emit_source_handle(&mut source, handle)?;
+        let source = build.source(handle, &output);
+        if require_parallel_probe && !source_supports_parallel_probe_fusion(&source) {
+            return Err(paro_error::internal(
+                "parallel emit-breaker classification drifted from source properties",
+            ));
+        }
         let pending = match build {
             EmitBreakerBuild::Aggregate(spec) => {
                 let child = self.only_child(root)?;
@@ -300,7 +374,9 @@ impl<'a> PipelineLowerer<'a> {
     /// Expose only emit sources that retain Materialized's unbounded reader
     /// parallelism. Single-task emitters intentionally keep the materialized
     /// boundary because its parallel readers are the scheduling adapter for
-    /// the downstream probe chain.
+    /// the downstream probe chain. This is deliberately a static capability
+    /// boundary rather than a row-count cost decision: even a small breaker
+    /// must not silently cap an otherwise parallel probe pipeline.
     pub(crate) fn lower_breaker_to_probe_source(
         &mut self,
         root: PhysicalPlanNodeId,
@@ -350,106 +426,24 @@ impl<'a> PipelineLowerer<'a> {
         &self,
         root: PhysicalPlanNodeId,
     ) -> Option<BreakerDispatch> {
-        match &self.plan.node(root).kind {
-            PhysicalNodeKind::TopN(spec) => Some(BreakerDispatch::TopN(spec.clone())),
-            PhysicalNodeKind::Sort(spec) => Some(BreakerDispatch::Sort(spec.clone())),
-            PhysicalNodeKind::Aggregate(spec) => Some(BreakerDispatch::Aggregate(spec.clone())),
-            PhysicalNodeKind::SetOperation(spec) => {
-                Some(BreakerDispatch::SetOperation(spec.clone()))
-            }
-            PhysicalNodeKind::Window(spec) if !is_streaming_window_supported(spec) => {
-                Some(BreakerDispatch::Window(spec.clone()))
-            }
-            PhysicalNodeKind::PartitionAggregateWindow(spec) => {
-                Some(BreakerDispatch::PartitionAggregateWindow(spec.clone()))
-            }
-            PhysicalNodeKind::HashJoin(spec) => Some(BreakerDispatch::HashJoin(spec.clone())),
-            PhysicalNodeKind::NestedLoopJoin(spec) => {
-                Some(BreakerDispatch::NestedLoopJoin(spec.clone()))
-            }
-            PhysicalNodeKind::SortRangeJoin(spec) => {
-                Some(BreakerDispatch::SortRangeJoin(spec.clone()))
-            }
-            PhysicalNodeKind::ClassicIeJoin(spec) => {
-                Some(BreakerDispatch::ClassicIeJoin(spec.clone()))
-            }
-            PhysicalNodeKind::CrossProduct(spec) => {
-                Some(BreakerDispatch::CrossProduct(spec.clone()))
-            }
-            PhysicalNodeKind::ExternalTable(spec) => {
-                Some(BreakerDispatch::ExternalTable(spec.clone()))
-            }
-            _ => None,
-        }
+        BreakerRef::from_kind(&self.plan.node(root).kind)?.to_dispatch()
     }
 
     pub(crate) fn tail_breaker_dispatch(
         &self,
         root: PhysicalPlanNodeId,
     ) -> Result<BreakerDispatch> {
-        match &self.plan.node(root).kind {
-            PhysicalNodeKind::TopN(spec) => Ok(BreakerDispatch::TopN(spec.clone())),
-            PhysicalNodeKind::Sort(spec) => Ok(BreakerDispatch::Sort(spec.clone())),
-            PhysicalNodeKind::Aggregate(spec) => Ok(BreakerDispatch::Aggregate(spec.clone())),
-            PhysicalNodeKind::SetOperation(spec) => Ok(BreakerDispatch::SetOperation(spec.clone())),
-            PhysicalNodeKind::Window(spec) => Ok(BreakerDispatch::Window(spec.clone())),
-            PhysicalNodeKind::PartitionAggregateWindow(spec) => {
-                Ok(BreakerDispatch::PartitionAggregateWindow(spec.clone()))
-            }
-            PhysicalNodeKind::HashJoin(spec) => Ok(BreakerDispatch::HashJoin(spec.clone())),
-            PhysicalNodeKind::NestedLoopJoin(spec) => {
-                Ok(BreakerDispatch::NestedLoopJoin(spec.clone()))
-            }
-            PhysicalNodeKind::SortRangeJoin(spec) => {
-                Ok(BreakerDispatch::SortRangeJoin(spec.clone()))
-            }
-            PhysicalNodeKind::ClassicIeJoin(spec) => {
-                Ok(BreakerDispatch::ClassicIeJoin(spec.clone()))
-            }
-            PhysicalNodeKind::CrossProduct(spec) => Ok(BreakerDispatch::CrossProduct(spec.clone())),
-            PhysicalNodeKind::ExternalTable(spec) => {
-                Ok(BreakerDispatch::ExternalTable(spec.clone()))
-            }
-            _ => Err(paro_error::internal(
-                "collect_tail_to_breaker returned a non-breaker node",
-            )),
-        }
+        BreakerRef::from_kind(&self.plan.node(root).kind)
+            .and_then(|breaker| breaker.to_dispatch())
+            .ok_or_else(|| paro_error::internal("tail breaker has no lowering dispatch"))
     }
 
     pub(crate) fn is_tail_breaker(kind: &PhysicalNodeKind) -> bool {
-        match kind {
-            PhysicalNodeKind::TopN(_)
-            | PhysicalNodeKind::Sort(_)
-            | PhysicalNodeKind::HashJoin(_)
-            | PhysicalNodeKind::NestedLoopJoin(_)
-            | PhysicalNodeKind::SortRangeJoin(_)
-            | PhysicalNodeKind::ClassicIeJoin(_)
-            | PhysicalNodeKind::CrossProduct(_)
-            | PhysicalNodeKind::ExternalTable(_)
-            | PhysicalNodeKind::SetOperation(_)
-            | PhysicalNodeKind::DelimJoin(_)
-            | PhysicalNodeKind::RecursiveCte(_) => true,
-            PhysicalNodeKind::Aggregate(_) => true,
-            PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
-            PhysicalNodeKind::PartitionAggregateWindow(_) => true,
-            _ => false,
-        }
+        BreakerRef::from_kind(kind).is_some_and(|breaker| breaker.is_tail_boundary())
     }
 
-    /// Breakers with a native emit source. This is a cheap discriminator used
-    /// before cloning an owned dispatch spec for probe-source consideration;
-    /// scheduling eligibility is still decided from the constructed source's
-    /// canonical pipeline properties.
-    pub(crate) fn is_emit_breaker(kind: &PhysicalNodeKind) -> bool {
-        match kind {
-            PhysicalNodeKind::TopN(_)
-            | PhysicalNodeKind::Sort(_)
-            | PhysicalNodeKind::Aggregate(_)
-            | PhysicalNodeKind::SetOperation(_)
-            | PhysicalNodeKind::PartitionAggregateWindow(_) => true,
-            PhysicalNodeKind::Window(spec) => !is_streaming_window_supported(spec),
-            _ => false,
-        }
+    pub(crate) fn breaker_role(kind: &PhysicalNodeKind) -> Option<BreakerRole> {
+        BreakerRef::from_kind(kind).map(|breaker| breaker.role())
     }
 
     #[allow(clippy::too_many_arguments)]

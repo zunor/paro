@@ -7,6 +7,7 @@ use crate::index::{
     FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateResult, PredicateTree,
 };
 use crate::rowset::page::CompressionType;
+use crate::rowset::{BatchRowOrdinal, SegmentRowId};
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
 use crate::tablet::TabletSchemaRef;
@@ -189,7 +190,10 @@ fn segment_materialized_batch_api_forces_late_materialization() {
     let eager_batch = eager.next_batch_with_rowid_policy(10, false).unwrap();
     assert_eq!(eager_batch.rows, 1);
     assert_eq!(eager_batch.physical_rows, 10);
-    assert_eq!(eager_batch.selection.as_deref(), Some([7_u32].as_slice()));
+    assert_eq!(
+        eager_batch.selection.as_deref(),
+        Some([BatchRowOrdinal::from_index(7)].as_slice())
+    );
     assert_eq!(
         i32::from_le_bytes(eager_batch.columns[0].1.data[..4].try_into().unwrap()),
         0
@@ -205,7 +209,7 @@ fn segment_materialized_batch_api_forces_late_materialization() {
     assert_eq!(second_eager_batch.physical_rows, 10);
     assert_eq!(
         second_eager_batch.selection.as_deref(),
-        Some([7_u32].as_slice())
+        Some([BatchRowOrdinal::from_index(7)].as_slice())
     );
     assert!(eager.uses_late_materialize());
 
@@ -292,7 +296,7 @@ fn late_materialization_adapts_to_observed_batch_density() {
     let dense_batch = dense.next_batch_with_rowid_policy(10, false).unwrap();
     assert_eq!(dense_batch.rows, 8);
     assert_eq!(dense_batch.physical_rows, 10);
-    let expected_selection = (0u32..8).collect::<Vec<_>>();
+    let expected_selection = (0..8).map(BatchRowOrdinal::from_index).collect::<Vec<_>>();
     assert_eq!(
         dense_batch.selection.as_deref(),
         Some(expected_selection.as_slice())
@@ -462,13 +466,16 @@ fn staged_and_gathers_later_predicate_columns_and_preserves_order() {
     assert_eq!(projected_sizes, vec![15; rowids.len()]);
     assert_eq!(
         projected_keys,
-        rowids.iter().map(|row| *row as i32).collect::<Vec<_>>()
+        rowids
+            .iter()
+            .map(|row| row.get() as i32)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         payloads,
         rowids
             .iter()
-            .map(|row| 10_000 + *row as i32)
+            .map(|row| 10_000 + row.get() as i32)
             .collect::<Vec<_>>()
     );
     let stats = iter.predicate_stage_read_stats();
@@ -619,7 +626,7 @@ fn staged_and_switches_access_modes_groups_same_column_and_accepts_sorted_member
         payloads,
         rowids
             .iter()
-            .map(|row| 100 + *row as i32)
+            .map(|row| 100 + row.get() as i32)
             .collect::<Vec<_>>()
     );
     let stats = iter.predicate_stage_read_stats();
@@ -920,8 +927,14 @@ fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
         );
     }
     assert_eq!(matched_rowids.len(), 1800);
-    assert_eq!(matched_rowids.first().copied(), Some(0));
-    assert_eq!(matched_rowids.last().copied(), Some(1899));
+    assert_eq!(
+        matched_rowids.first().copied(),
+        Some(SegmentRowId::from_raw(0))
+    );
+    assert_eq!(
+        matched_rowids.last().copied(),
+        Some(SegmentRowId::from_raw(1899))
+    );
     assert_eq!(matched_values.len(), 1800);
     assert_eq!(matched_values[0], 0);
     assert_eq!(matched_values[899], 8990);

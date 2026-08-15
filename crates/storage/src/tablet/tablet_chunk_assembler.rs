@@ -4,6 +4,7 @@
 use super::tablet_reader::TabletReader;
 use crate::codec::vector_decoder;
 use crate::rowset::load_base_rowids_for_offsets;
+use crate::rowset::{BatchRowOrdinal, SegmentRowId};
 use crate::tablet::{ColumnId, PhysicalRowRef, TabletRef};
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
@@ -70,8 +71,13 @@ impl TabletReader {
         rowset_id: u64,
         segment_id: u32,
     ) -> Result<Chunk> {
+        let rowids = rowids
+            .iter()
+            .copied()
+            .map(SegmentRowId::from_raw)
+            .collect::<Vec<_>>();
         self.build_chunk_with_owned_selection(
-            batch, rows, rows, None, rowids, rowset_id, segment_id,
+            batch, rows, rows, None, &rowids, rowset_id, segment_id,
         )
     }
 
@@ -80,8 +86,8 @@ impl TabletReader {
         batch: &[(ColumnId, crate::rowset::column::ColumnBatch)],
         rows: usize,
         physical_rows: usize,
-        selection: Option<Vec<u32>>,
-        rowids: &[u32],
+        selection: Option<Vec<BatchRowOrdinal>>,
+        rowids: &[SegmentRowId],
         rowset_id: u64,
         segment_id: u32,
     ) -> Result<Chunk> {
@@ -99,6 +105,7 @@ impl TabletReader {
         let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
         let selection = selection
+            .map(BatchRowOrdinal::into_raw_vec)
             .map(|indices| SelectionVector::try_from_owned_indices(indices, allocator.clone()))
             .transpose()?
             .map(|selection| {
@@ -199,7 +206,7 @@ impl TabletReader {
         &self,
         rowset_id: u64,
         segment_id: u32,
-        rowids: &[u32],
+        rowids: &[SegmentRowId],
     ) -> Result<Option<Vec<u64>>> {
         let rowset = self
             .rowsets
@@ -213,30 +220,34 @@ impl TabletReader {
                     rowset_id
                 ))
             })?;
-        Ok(
-            load_base_rowids_for_offsets(rowset.rowset_path(), segment_id, rowids)?.map(
-                |base_rowids| {
-                    base_rowids
-                        .into_iter()
-                        .map(|rowid| rowid.to_raw())
-                        .collect()
-                },
-            ),
-        )
+        Ok(load_base_rowids_for_offsets(
+            rowset.rowset_path(),
+            segment_id,
+            SegmentRowId::as_raw_slice(rowids),
+        )?
+        .map(|base_rowids| {
+            base_rowids
+                .into_iter()
+                .map(|rowid| rowid.to_raw())
+                .collect()
+        }))
     }
 
     fn build_row_id_vector(
         tablet: &TabletRef,
         rows: usize,
-        rowids: &[u32],
+        rowids: &[SegmentRowId],
         rowset_id: u64,
         segment_id: u32,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Vector> {
         let mut vector = Vector::try_new(LogicalType::BigInt, rows, allocator)?;
         for (idx, row_offset) in rowids.iter().copied().enumerate() {
-            let row_id = tablet
-                .encode_row_location(PhysicalRowRef::new(rowset_id, segment_id, row_offset))?;
+            let row_id = tablet.encode_row_location(PhysicalRowRef::new(
+                rowset_id,
+                segment_id,
+                row_offset.get(),
+            ))?;
             vector.set_i64(idx, row_id.to_raw() as i64);
         }
         vector.set_count(rows);

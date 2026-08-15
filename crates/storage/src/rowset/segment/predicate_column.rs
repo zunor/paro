@@ -16,6 +16,7 @@ use crate::codec::vector_decoder;
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::encoding::BinaryPlainPageSlice;
+use crate::rowset::BatchRowOrdinal;
 
 /// The least materialized representation accepted by every predicate that
 /// references a column. A decoded consumer dominates typed consumers.
@@ -376,7 +377,12 @@ impl StorageDictionaryPredicateBatch {
         self.dictionary.value_ref_at(self.code_at(row_idx))
     }
 
-    pub(super) fn filter_codes(&self, code_matches: &[bool], selection: &mut Vec<u32>, seed: bool) {
+    pub(super) fn filter_codes(
+        &self,
+        code_matches: &[bool],
+        selection: &mut Vec<BatchRowOrdinal>,
+        seed: bool,
+    ) {
         debug_assert_eq!(code_matches.len(), self.dictionary_len());
         let matches =
             |row_idx: usize| !self.is_null(row_idx) && code_matches[self.code_at(row_idx) as usize];
@@ -384,10 +390,10 @@ impl StorageDictionaryPredicateBatch {
             selection.extend(
                 (0..self.rows)
                     .filter(|row_idx| matches(*row_idx))
-                    .map(|row_idx| row_idx as u32),
+                    .map(BatchRowOrdinal::from_index),
             );
         } else {
-            selection.retain(|row_idx| matches(*row_idx as usize));
+            selection.retain(|row_idx| matches(row_idx.index()));
         }
     }
 }
@@ -474,7 +480,7 @@ impl PredicateColumnBatch {
     pub(super) fn append_reusable_rows(
         &self,
         encoding: PredicateColumnReuse,
-        rows: &[u32],
+        rows: &[BatchRowOrdinal],
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
         row_ends: &mut Vec<usize>,
@@ -514,14 +520,14 @@ impl PredicateColumnBatch {
     fn append_reusable_fixed_rows(
         &self,
         width: usize,
-        rows: &[u32],
+        rows: &[BatchRowOrdinal],
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
     ) -> Result<bool> {
         match self {
             Self::Raw(batch) => {
                 for &row_idx in rows {
-                    let row_idx = row_idx as usize;
+                    let row_idx = row_idx.index();
                     let start = row_idx.checked_mul(width).ok_or_else(|| {
                         paro_error::data_corrupted("Predicate row offset overflow")
                     })?;
@@ -537,7 +543,7 @@ impl PredicateColumnBatch {
             }
             Self::StorageDictionary(batch) => {
                 for &row_idx in rows {
-                    let row_idx = row_idx as usize;
+                    let row_idx = row_idx.index();
                     if let Some(value) = batch.row_value(row_idx) {
                         if value.len() != width {
                             return Err(paro_error::data_corrupted(
@@ -563,7 +569,7 @@ impl PredicateColumnBatch {
 
     fn append_reusable_varlen_rows(
         &self,
-        rows: &[u32],
+        rows: &[BatchRowOrdinal],
         values: &mut Vec<u8>,
         nulls: &mut Vec<u8>,
         row_ends: &mut Vec<usize>,
@@ -571,7 +577,7 @@ impl PredicateColumnBatch {
         match self {
             Self::RawVarlen(batch) => {
                 for &row_idx in rows {
-                    let row_idx = row_idx as usize;
+                    let row_idx = row_idx.index();
                     batch.append_encoded_row(row_idx, values, nulls)?;
                     row_ends.push(values.len());
                 }
@@ -579,7 +585,7 @@ impl PredicateColumnBatch {
             }
             Self::StorageDictionary(batch) => {
                 for &row_idx in rows {
-                    let row_idx = row_idx as usize;
+                    let row_idx = row_idx.index();
                     append_varlen_value(batch.row_value(row_idx), values, nulls)?;
                     row_ends.push(values.len());
                 }
@@ -588,7 +594,7 @@ impl PredicateColumnBatch {
             Self::Decoded(vector) => {
                 let view = vector.try_to_varlen_view(vector.len())?;
                 for &row_idx in rows {
-                    let row_idx = row_idx as usize;
+                    let row_idx = row_idx.index();
                     if row_idx >= vector.len() {
                         return Err(paro_error::data_corrupted(
                             "Reusable predicate row exceeds the decoded batch",

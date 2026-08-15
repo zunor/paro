@@ -126,7 +126,7 @@ impl PrimaryKeyMerger {
                                 .encode_row_location(PhysicalRowRef::new(
                                     rowset.rowset_id(),
                                     segment.segment_id(),
-                                    row_offset,
+                                    row_offset.get(),
                                 ))
                                 .map(|rowid| rowid.to_raw())
                         })
@@ -168,7 +168,7 @@ impl PrimaryKeyMerger {
                         source_locations.push(PhysicalRowRef::new(
                             rowset.rowset_id(),
                             segment.segment_id(),
-                            row_id,
+                            row_id.get(),
                         ));
                     }
                 }

@@ -456,7 +456,7 @@ impl Tablet {
                     let expected = self.encode_row_location(PhysicalRowRef::new(
                         rowset.rowset_id(),
                         segment.segment_id(),
-                        row_id,
+                        row_id.get(),
                     ))?;
                     let actual = self.lookup_primary_key(&key)?.ok_or_else(|| {
                         paro_error::internal(format!(
@@ -840,10 +840,14 @@ impl Tablet {
                         }
                         let is_deleted = delete_vector
                             .as_ref()
-                            .map(|dv| dv.is_deleted(row_id))
+                            .map(|dv| dv.is_deleted(row_id.get()))
                             .unwrap_or(false);
                         occurrences.push((
-                            PhysicalRowRef::new(rowset.rowset_id(), segment.segment_id(), row_id),
+                            PhysicalRowRef::new(
+                                rowset.rowset_id(),
+                                segment.segment_id(),
+                                row_id.get(),
+                            ),
                             is_deleted,
                         ));
                     }
@@ -1016,7 +1020,7 @@ impl Tablet {
                         let row_id = self.encode_row_location(PhysicalRowRef::new(
                             rowset.rowset_id(),
                             segment.segment_id(),
-                            row_id,
+                            row_id.get(),
                         ))?;
                         pairs.push((key, row_id));
                     }

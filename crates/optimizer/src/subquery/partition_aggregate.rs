@@ -29,9 +29,7 @@ use paro_planner::operator::{
 use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
-use crate::statistics::unique_keys::{
-    declared_unique_keys, KeyNullSemantics, NullRejectedKeyProof,
-};
+use crate::statistics::unique_keys::{declared_unique_keys, NullRejectedKeyProof};
 
 /// Rewrite eligible correlated scalar aggregates into partition windows or
 /// keyed grouped joins.
@@ -234,7 +232,6 @@ struct GroupedJoinRewrite {
     scalar_expression: Expression,
     aggregate: AggregateExpression,
     delim_table_index: usize,
-    join_conditions: Vec<JoinCondition>,
     null_rejection: NullRejectedKeyProof,
     outer_bindings: Vec<ColumnBinding>,
     outer_types: Vec<paro_common::types::LogicalType>,
@@ -437,7 +434,6 @@ fn recognize_grouped_join_filter(
         scalar_expression: shape.scalar.scalar_expression.clone(),
         aggregate: shape.scalar.aggregate_expression.clone(),
         delim_table_index: shape.delim.table_index,
-        join_conditions,
         null_rejection,
         outer_bindings,
         outer_types,
@@ -523,12 +519,7 @@ fn prove_null_rejected_preserved_unique_key(
                 }
                 declared_unique_keys(get)
                     .iter()
-                    .any(|key| {
-                        key.proves_uniqueness(
-                            KeyNullSemantics::NullRejected(null_rejection),
-                            |_| false,
-                        )
-                    })
+                    .any(|key| key.is_covered_by(null_rejection.bindings()))
                     .then_some(())
             }
             LogicalOperator::Filter(filter) => recurse(&filter.child, null_rejection),
@@ -1243,13 +1234,9 @@ fn apply_grouped_join_rewrite(
         .copied()
         .zip(copied_outer_bindings.iter().copied())
         .collect::<HashMap<_, _>>();
-    if !rewrite.null_rejection.proves(&rewrite.join_conditions) {
-        return Err(paro_error::internal(
-            "grouped-join conditions no longer match their NULL-rejection witness",
-        ));
-    }
     let conditions = rewrite
-        .join_conditions
+        .null_rejection
+        .conditions()
         .iter()
         .cloned()
         .map(|mut condition| -> Result<_> {

@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use super::breaker_lowering::BreakerRole;
 use super::*;
 use crate::pipeline::graph::NljUnmatchedSourceSpec;
 
@@ -707,7 +708,7 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
-        if Self::is_emit_breaker(&self.plan.node(root).kind) {
+        if Self::breaker_role(&self.plan.node(root).kind) == Some(BreakerRole::ParallelEmit) {
             let breaker = self.breaker_dispatch_for_root(root).ok_or_else(|| {
                 paro_error::internal("emit breaker did not produce a lowering dispatch")
             })?;

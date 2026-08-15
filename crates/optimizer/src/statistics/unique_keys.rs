@@ -16,8 +16,9 @@ use paro_planner::operator::{ColumnBinding, Get, JoinComparisonType, JoinConditi
 
 /// Evidence that every candidate key binding is evaluated by an ordinary
 /// equality predicate and therefore rejects NULL before uniqueness is used.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct NullRejectedKeyProof {
+    conditions: Box<[JoinCondition]>,
     bindings: Box<[ColumnBinding]>,
 }
 
@@ -37,33 +38,23 @@ impl NullRejectedKeyProof {
                 _ => None,
             })
             .collect::<Option<Box<[_]>>>()?;
-        Some(Self { bindings })
+        Some(Self {
+            conditions: conditions.into(),
+            bindings,
+        })
     }
 
     pub(crate) fn bindings(&self) -> &[ColumnBinding] {
         &self.bindings
     }
 
-    pub(crate) fn proves(&self, conditions: &[JoinCondition]) -> bool {
-        conditions.len() == self.bindings.len()
-            && conditions
-                .iter()
-                .zip(self.bindings.iter())
-                .all(|(condition, expected)| {
-                    condition.comparison == JoinComparisonType::Equal
-                        && matches!(&condition.right,
-                            Expression::ColumnRef(column)
-                                if column.depth == 0 && column.binding == *expected)
-                })
+    /// Return the exact ordinary-equality conditions from which this proof
+    /// was constructed. Keeping conditions and evidence in one value makes it
+    /// impossible for a rewrite to mutate one while accidentally retaining
+    /// the other.
+    pub(crate) fn conditions(&self) -> &[JoinCondition] {
+        &self.conditions
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyNullSemantics<'a> {
-    /// An equality predicate rejects every row with a NULL key component.
-    NullRejected(&'a NullRejectedKeyProof),
-    /// NULL key components participate in equality, as they do in GROUP BY.
-    NullsEqual,
 }
 
 pub(crate) struct DeclaredUniqueKey {
@@ -78,17 +69,14 @@ impl DeclaredUniqueKey {
             .all(|binding| candidates.contains(binding))
     }
 
-    pub(crate) fn proves_uniqueness(
+    /// Whether the declared key remains unique when NULL tuples compare equal,
+    /// as they do in GROUP BY. Key coverage is deliberately a separate proof
+    /// obligation so all callers use the same division of responsibility.
+    pub(crate) fn is_unique_with_nulls_equal(
         &self,
-        null_semantics: KeyNullSemantics<'_>,
         mut has_no_null: impl FnMut(ColumnBinding) -> bool,
     ) -> bool {
-        match null_semantics {
-            KeyNullSemantics::NullRejected(proof) => self.is_covered_by(proof.bindings()),
-            KeyNullSemantics::NullsEqual => {
-                self.primary_key || self.bindings.iter().copied().all(&mut has_no_null)
-            }
-        }
+        self.primary_key || self.bindings.iter().copied().all(&mut has_no_null)
     }
 }
 
@@ -147,12 +135,12 @@ mod tests {
         let equal = JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal);
         let proof = NullRejectedKeyProof::from_equal_right_keys(&[equal.clone()])
             .expect("ordinary equality proves NULL rejection");
-        assert!(proof.proves(&[equal]));
-        assert!(!proof.proves(&[JoinCondition::new(
-            column(1, 0),
-            column(2, 1),
-            JoinComparisonType::Equal,
-        )]));
+        let [condition] = proof.conditions() else {
+            panic!("proof must retain its sole equality condition")
+        };
+        assert_eq!(condition.comparison, JoinComparisonType::Equal);
+        assert!(matches!(&condition.right,
+            Expression::ColumnRef(column) if column.binding == ColumnBinding::new(2, 0)));
 
         let null_safe = JoinCondition::new(
             column(1, 0),

@@ -130,7 +130,9 @@ impl PipelinePropertyAccumulator {
                 self.placement = self.placement.merge(Placement::SingleTask);
             }
             PropertyRepairKind::MaterializationAdapter => {
-                self.current.ordering = OrderingProperty::Preserved;
+                // Parallel readers dynamically claim materialized batches.
+                // They preserve row contents, not a global consumption order.
+                self.current.ordering = OrderingProperty::Unordered;
                 self.current.partitioning = PartitioningProperty::None;
                 self.memory.class = self.memory.class.max(MemoryClass::Blocking);
             }
@@ -138,6 +140,7 @@ impl PipelinePropertyAccumulator {
     }
 }
 
+#[derive(Debug, Clone)]
 struct SourceProperties {
     provided: ProvidedProperties,
     capabilities: ExecutionCapabilities,
@@ -145,13 +148,25 @@ struct SourceProperties {
     placement: Placement,
 }
 
-fn source_properties(source: &SourceSpec) -> SourceProperties {
-    let mut properties = SourceProperties {
+fn default_source_properties() -> SourceProperties {
+    SourceProperties {
         provided: ProvidedProperties::default(),
         capabilities: ExecutionCapabilities::default(),
         memory: MemoryRequirement::default(),
         placement: Placement::Local,
-    };
+    }
+}
+
+fn materialized_source_properties() -> SourceProperties {
+    let mut properties = default_source_properties();
+    properties.provided.ordering = OrderingProperty::Unordered;
+    properties.capabilities.parallelism = Parallelism::unbounded();
+    properties.memory.class = MemoryClass::Blocking;
+    properties
+}
+
+fn source_properties(source: &SourceSpec) -> SourceProperties {
+    let mut properties = default_source_properties();
 
     match source {
         SourceSpec::Rowset(_) => {
@@ -187,9 +202,7 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
             };
         }
         SourceSpec::Materialized(_) => {
-            properties.provided.ordering = OrderingProperty::Preserved;
-            properties.capabilities.parallelism = Parallelism::unbounded();
-            properties.memory.class = MemoryClass::Blocking;
+            properties = materialized_source_properties();
         }
         SourceSpec::NljUnmatched(_)
         | SourceSpec::ClassicIeJoin(_)
@@ -253,8 +266,13 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
 /// source's scheduling contract cannot drift from lowering eligibility.
 pub(crate) fn source_supports_parallel_probe_fusion(source: &SourceSpec) -> bool {
     let properties = source_properties(source);
-    properties.capabilities.parallelism == Parallelism::unbounded()
-        && properties.placement != Placement::SingleTask
+    let materialized = materialized_source_properties();
+    properties
+        .capabilities
+        .parallelism
+        .dominates(materialized.capabilities.parallelism)
+        && (materialized.placement == Placement::SingleTask
+            || properties.placement != Placement::SingleTask)
 }
 
 fn ordering_spec_from_topn(orders: &[paro_planner::binder::ir::OrderByNode]) -> OrderingSpec {
@@ -292,4 +310,40 @@ pub fn repair_transform(kind: PropertyRepairKind) -> TransformSpec {
 
 pub fn rowset_prefetch_policy(distance: usize) -> PrefetchPolicy {
     PrefetchPolicy::RowsetSegments { distance }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pipeline::graph::MaterializedSourceSpec;
+    use crate::pipeline::handles::BreakerHandleId;
+
+    #[test]
+    fn parallel_materialized_reader_is_explicitly_unordered() {
+        let source = SourceSpec::Materialized(MaterializedSourceSpec {
+            handle: BreakerHandleId::new(0),
+        });
+        let properties = source_properties(&source);
+        assert_eq!(properties.provided.ordering, OrderingProperty::Unordered);
+        assert_eq!(
+            properties.capabilities.parallelism,
+            Parallelism::unbounded()
+        );
+        assert!(source_supports_parallel_probe_fusion(&source));
+    }
+
+    #[test]
+    fn materialization_repair_drops_global_order() {
+        let mut accumulator = PipelinePropertyAccumulator {
+            current: ProvidedProperties {
+                ordering: OrderingProperty::Fixed(OrderingSpec::new(Vec::new())),
+                ..Default::default()
+            },
+            capabilities: ExecutionCapabilities::default(),
+            memory: MemoryRequirement::default(),
+            placement: Placement::Local,
+        };
+        accumulator.apply_repair(&PropertyRepairKind::MaterializationAdapter);
+        assert_eq!(accumulator.current.ordering, OrderingProperty::Unordered);
+    }
 }

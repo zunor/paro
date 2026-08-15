@@ -5,7 +5,7 @@
 
 use crate::filter::propagate_result::FilterPropagateResult;
 use crate::filter::pushdown::FilterPushdown;
-use crate::statistics::unique_keys::{declared_unique_keys, KeyNullSemantics};
+use crate::statistics::unique_keys::declared_unique_keys;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
@@ -129,7 +129,7 @@ fn collect_group_dependencies(
             else {
                 continue;
             };
-            if !key.proves_uniqueness(KeyNullSemantics::NullsEqual, |binding| {
+            if !key.is_unique_with_nulls_equal(|binding| {
                 group_bindings
                     .iter()
                     .position(|candidate| candidate == &Some(binding))

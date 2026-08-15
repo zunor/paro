@@ -378,6 +378,20 @@ fn i32_range_seed_preserves_open_bounds_and_domain_edges() {
         ]),
         [1, 3, 4, 5, 6, 7, 13]
     );
+    assert_eq!(
+        evaluate(vec![PredicateTree::leaf(Predicate::Gt {
+            column_id: 7,
+            value: Value::Integer(3),
+        })]),
+        [6, 11, 12, 15]
+    );
+    assert_eq!(
+        evaluate(vec![PredicateTree::leaf(Predicate::Lt {
+            column_id: 7,
+            value: Value::Integer(1),
+        })]),
+        [0, 2, 8, 9]
+    );
     assert!(evaluate(vec![PredicateTree::leaf(Predicate::Gt {
         column_id: 7,
         value: Value::Integer(i32::MAX),
@@ -435,6 +449,20 @@ fn i64_range_seed_preserves_open_bounds_and_domain_edges() {
             }),
         ]),
         [2, 3, 4]
+    );
+    assert_eq!(
+        evaluate(vec![PredicateTree::leaf(Predicate::Ge {
+            column_id: 7,
+            value: Value::BigInt(4),
+        })]),
+        [4, 5, 6]
+    );
+    assert_eq!(
+        evaluate(vec![PredicateTree::leaf(Predicate::Lt {
+            column_id: 7,
+            value: Value::BigInt(3),
+        })]),
+        [0, 1, 2]
     );
     assert!(evaluate(vec![PredicateTree::leaf(Predicate::Gt {
         column_id: 7,

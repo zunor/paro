@@ -11,6 +11,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::string_pattern::{PreparedLikePattern, PreparedLikeSearchAnchor};
 
 use crate::index::{FixedMembershipBuildPolicy, FixedMembershipSet};
+use crate::rowset::BatchRowOrdinal;
 
 use super::predicate_column::PredicateColumnBatch;
 use super::segment_predicate::ComparisonOperator;
@@ -161,7 +162,7 @@ impl VarlenMatcher {
         &self,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<u32>,
+        selection: &mut Vec<BatchRowOrdinal>,
         seed: bool,
     ) -> Result<()> {
         if let Some(batch) = batch.storage_dictionary() {
@@ -553,7 +554,7 @@ impl VarlenConjunction {
         &self,
         batch: &PredicateColumnBatch,
         rows: usize,
-        selection: &mut Vec<u32>,
+        selection: &mut Vec<BatchRowOrdinal>,
         seed: bool,
     ) -> Result<()> {
         if let Some(batch) = batch.storage_dictionary() {
@@ -628,7 +629,7 @@ impl VarlenConjunction {
 fn filter_varlen_batch(
     batch: &PredicateColumnBatch,
     rows: usize,
-    selection: &mut Vec<u32>,
+    selection: &mut Vec<BatchRowOrdinal>,
     seed: bool,
     matches: impl Fn(&[u8]) -> bool,
 ) -> Result<()> {
@@ -638,10 +639,10 @@ fn filter_varlen_batch(
             selection.extend(
                 (0..rows)
                     .filter(|row_idx| row_matches(*row_idx))
-                    .map(|row_idx| row_idx as u32),
+                    .map(BatchRowOrdinal::from_index),
             );
         } else {
-            selection.retain(|row_idx| row_matches(*row_idx as usize));
+            selection.retain(|row_idx| row_matches(row_idx.index()));
         }
         return Ok(());
     }
@@ -656,10 +657,10 @@ fn filter_varlen_batch(
         selection.extend(
             (0..rows)
                 .filter(|row_idx| row_matches(*row_idx))
-                .map(|row_idx| row_idx as u32),
+                .map(BatchRowOrdinal::from_index),
         );
     } else {
-        selection.retain(|row_idx| row_matches(*row_idx as usize));
+        selection.retain(|row_idx| row_matches(row_idx.index()));
     }
     Ok(())
 }
@@ -670,7 +671,7 @@ fn filter_varlen_batch(
 fn filter_raw_like_with_anchor(
     batch: &super::predicate_column::RawVarlenPredicateBatch,
     rows: usize,
-    selection: &mut Vec<u32>,
+    selection: &mut Vec<BatchRowOrdinal>,
     seed: bool,
     pattern: &PreparedLikePattern,
     negated: bool,
@@ -743,10 +744,10 @@ fn filter_raw_like_with_anchor(
         selection.extend(
             (0..rows)
                 .filter(|row_idx| row_matches(*row_idx))
-                .map(|row_idx| row_idx as u32),
+                .map(BatchRowOrdinal::from_index),
         );
     } else {
-        selection.retain(|row_idx| row_matches(*row_idx as usize));
+        selection.retain(|row_idx| row_matches(row_idx.index()));
     }
     true
 }
@@ -757,7 +758,7 @@ fn anchor_scan_range(
     batch: &super::predicate_column::RawVarlenPredicateBatch,
     payload_len: usize,
     rows: usize,
-    selection: &[u32],
+    selection: &[BatchRowOrdinal],
     seed: bool,
 ) -> Option<Range<usize>> {
     const MAX_SCAN_AMPLIFICATION: usize = 4;
@@ -767,13 +768,13 @@ fn anchor_scan_range(
     if !selection.windows(2).all(|rows| rows[0] < rows[1]) {
         return None;
     }
-    let first = batch.contiguous_row_range(*selection.first()? as usize)?;
-    let last = batch.contiguous_row_range(*selection.last()? as usize)?;
-    if *selection.last()? as usize >= rows || first.start > last.end || last.end > payload_len {
+    let first = batch.contiguous_row_range(selection.first()?.index())?;
+    let last = batch.contiguous_row_range(selection.last()?.index())?;
+    if selection.last()?.index() >= rows || first.start > last.end || last.end > payload_len {
         return None;
     }
     let selected_bytes = selection.iter().try_fold(0usize, |bytes, &row_idx| {
-        let row_idx = row_idx as usize;
+        let row_idx = row_idx.index();
         if row_idx >= rows {
             return None;
         }
@@ -961,7 +962,7 @@ mod tests {
             Some(&[0, 0, 0, 1]),
         );
         let matcher = VarlenMatcher::like("%special%requests%", true).unwrap();
-        let mut selection = vec![0, 1, 3];
+        let mut selection = [0, 1, 3].map(BatchRowOrdinal::from_index).to_vec();
 
         matcher
             .filter_batch(&batch, 4, &mut selection, false)
@@ -987,20 +988,28 @@ mod tests {
             .unwrap()
             .len();
 
-        assert!(
-            anchor_scan_range(batch.raw_varlen().unwrap(), payload_len, 3, &[0, 2], false,)
-                .is_none()
-        );
-        assert!(
-            anchor_scan_range(batch.raw_varlen().unwrap(), payload_len, 3, &[2, 0], false,)
-                .is_none()
-        );
+        assert!(anchor_scan_range(
+            batch.raw_varlen().unwrap(),
+            payload_len,
+            3,
+            &[0, 2].map(BatchRowOrdinal::from_index),
+            false,
+        )
+        .is_none());
+        assert!(anchor_scan_range(
+            batch.raw_varlen().unwrap(),
+            payload_len,
+            3,
+            &[2, 0].map(BatchRowOrdinal::from_index),
+            false,
+        )
+        .is_none());
         assert_eq!(
             anchor_scan_range(
                 batch.raw_varlen().unwrap(),
                 payload_len,
                 3,
-                &[0, 1, 2],
+                &[0, 1, 2].map(BatchRowOrdinal::from_index),
                 false,
             ),
             Some(0..payload_len)

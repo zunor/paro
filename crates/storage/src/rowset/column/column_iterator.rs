@@ -22,6 +22,7 @@ use crate::rowset::page::{
     EncodingType, NullEncoding, PageFooter, PageReadOptions, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
 use crate::rowset::page_reader::{DecodedPageAccess, PageReader};
+use crate::rowset::SegmentRowId;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
 use std::io::{Read, Seek};
@@ -93,10 +94,10 @@ impl RowIdSequence for [(usize, u64)] {
 /// Strictly increasing physical row IDs validated once for a multi-column
 /// gather. The private representation prevents callers from bypassing the
 /// ordering contract.
-pub struct OrderedRowIds<'a>(&'a [u32]);
+pub struct OrderedRowIds<'a>(&'a [SegmentRowId]);
 
 impl<'a> OrderedRowIds<'a> {
-    pub fn try_new(rowids: &'a [u32]) -> Result<Self> {
+    pub fn try_new(rowids: &'a [SegmentRowId]) -> Result<Self> {
         if rowids.windows(2).any(|window| window[0] >= window[1]) {
             return Err(paro_error::invalid_input(
                 "ordered row IDs must be strictly increasing",
@@ -121,7 +122,7 @@ impl RowIdSequence for OrderedRowIds<'_> {
 
     #[inline]
     fn pair(&self, index: usize) -> (usize, u64) {
-        (index, u64::from(self.0[index]))
+        (index, u64::from(self.0[index].get()))
     }
 }
 
@@ -1898,10 +1899,14 @@ mod tests {
 
     #[test]
     fn ordered_rowids_require_strict_order() {
-        assert!(OrderedRowIds::try_new(&[1, 2, 4]).is_ok());
+        let ordered = [1, 2, 4].map(SegmentRowId::from_raw);
+        assert!(OrderedRowIds::try_new(&ordered).is_ok());
         assert!(OrderedRowIds::try_new(&[]).is_ok());
-        assert!(OrderedRowIds::try_new(&[1, 1]).is_err());
-        assert!(OrderedRowIds::try_new(&[2, 1]).is_err());
+        assert!(OrderedRowIds::try_new(&[SegmentRowId::from_raw(1); 2]).is_err());
+        assert!(
+            OrderedRowIds::try_new(&[SegmentRowId::from_raw(2), SegmentRowId::from_raw(1),])
+                .is_err()
+        );
     }
 
     fn create_test_column() -> (Cursor<Vec<u8>>, ColumnReaderMeta, OrdinalIndexReader) {

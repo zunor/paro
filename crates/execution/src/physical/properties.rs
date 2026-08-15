@@ -313,6 +313,15 @@ impl Parallelism {
             saturates_threads: self.saturates_threads || other.saturates_threads,
         }
     }
+
+    /// Whether this capability is no more restrictive than `baseline`.
+    /// `min` is a lower scheduling requirement, while `max` and thread
+    /// saturation describe available concurrency.
+    pub fn dominates(self, baseline: Self) -> bool {
+        self.min <= baseline.min
+            && self.max >= baseline.max
+            && (!baseline.saturates_threads || self.saturates_threads)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
