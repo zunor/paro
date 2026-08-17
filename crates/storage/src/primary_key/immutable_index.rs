@@ -716,16 +716,31 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"k1".to_vec(), v(RowID::new(1, 10), 1)),
-                    (b"k2".to_vec(), v(RowID::new(2, 20), 1)),
-                    (b"k3".to_vec(), v(RowID::new(3, 30), 1)),
+                    (
+                        b"k1".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)), 1),
+                    ),
+                    (
+                        b"k2".to_vec(),
+                        v(RowID::new(2, crate::rowset::SegmentRowId::from_raw(20)), 1),
+                    ),
+                    (
+                        b"k3".to_vec(),
+                        v(RowID::new(3, crate::rowset::SegmentRowId::from_raw(30)), 1),
+                    ),
                 ],
             )
             .unwrap();
 
         let reader = ImmutableIndexReader::open(&path).unwrap();
-        assert_eq!(reader.get(b"k1").unwrap(), Some(RowID::new(1, 10)));
-        assert_eq!(reader.get(b"k3").unwrap(), Some(RowID::new(3, 30)));
+        assert_eq!(
+            reader.get(b"k1").unwrap(),
+            Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)))
+        );
+        assert_eq!(
+            reader.get(b"k3").unwrap(),
+            Some(RowID::new(3, crate::rowset::SegmentRowId::from_raw(30)))
+        );
         assert_eq!(reader.get(b"missing").unwrap(), None);
     }
 
@@ -741,7 +756,7 @@ mod tests {
             .map(|i| {
                 (
                     format!("key-{i:04}-payload").into_bytes(),
-                    v(RowID::new(7, i), 1),
+                    v(RowID::new(7, crate::rowset::SegmentRowId::from_raw(i)), 1),
                 )
             })
             .collect();
@@ -751,7 +766,7 @@ mod tests {
         let reader = ImmutableIndexReader::open(&path).unwrap();
         assert_eq!(
             reader.get(b"key-0042-payload").unwrap(),
-            Some(RowID::new(7, 42))
+            Some(RowID::new(7, crate::rowset::SegmentRowId::from_raw(42)))
         );
     }
 
@@ -764,7 +779,10 @@ mod tests {
                 &path,
                 &[
                     (b"gone".to_vec(), tombstone(2)),
-                    (b"live".to_vec(), v(RowID::new(9, 1), 1)),
+                    (
+                        b"live".to_vec(),
+                        v(RowID::new(9, crate::rowset::SegmentRowId::from_raw(1)), 1),
+                    ),
                 ],
             )
             .unwrap();
@@ -775,7 +793,10 @@ mod tests {
             reader.get_version_at(b"gone", u64::MAX).unwrap(),
             Some(tombstone(2))
         );
-        assert_eq!(reader.get(b"live").unwrap(), Some(RowID::new(9, 1)));
+        assert_eq!(
+            reader.get(b"live").unwrap(),
+            Some(RowID::new(9, crate::rowset::SegmentRowId::from_raw(1)))
+        );
     }
 
     #[test]
@@ -786,9 +807,18 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"k2".to_vec(), v(RowID::new(1, 2), 1)),
-                    (b"k1".to_vec(), v(RowID::new(1, 1), 1)),
-                    (b"k2".to_vec(), v(RowID::new(9, 9), 1)),
+                    (
+                        b"k2".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)), 1),
+                    ),
+                    (
+                        b"k1".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 1),
+                    ),
+                    (
+                        b"k2".to_vec(),
+                        v(RowID::new(9, crate::rowset::SegmentRowId::from_raw(9)), 1),
+                    ),
                 ],
             )
             .unwrap();
@@ -798,8 +828,14 @@ mod tests {
         assert_eq!(
             reader.entries().unwrap(),
             vec![
-                (b"k1".to_vec(), v(RowID::new(1, 1), 1)),
-                (b"k2".to_vec(), v(RowID::new(9, 9), 1)),
+                (
+                    b"k1".to_vec(),
+                    v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 1)
+                ),
+                (
+                    b"k2".to_vec(),
+                    v(RowID::new(9, crate::rowset::SegmentRowId::from_raw(9)), 1)
+                ),
             ]
         );
     }
@@ -812,8 +848,14 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"k".to_vec(), v(RowID::new(1, 1), 10)),
-                    (b"k".to_vec(), v(RowID::new(2, 2), 20)),
+                    (
+                        b"k".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 10),
+                    ),
+                    (
+                        b"k".to_vec(),
+                        v(RowID::new(2, crate::rowset::SegmentRowId::from_raw(2)), 20),
+                    ),
                     (b"k".to_vec(), tombstone(30)),
                 ],
             )
@@ -824,11 +866,17 @@ mod tests {
         assert_eq!(reader.get(b"k").unwrap(), None);
         assert_eq!(
             reader.get_version_at(b"k", 10).unwrap(),
-            Some(v(RowID::new(1, 1), 10))
+            Some(v(
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+                10
+            ))
         );
         assert_eq!(
             reader.get_version_at(b"k", 29).unwrap(),
-            Some(v(RowID::new(2, 2), 20))
+            Some(v(
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(2)),
+                20
+            ))
         );
         assert_eq!(
             reader.get_version_at(b"k", 30).unwrap(),
@@ -844,10 +892,19 @@ mod tests {
             .write_entries(
                 &path,
                 &[
-                    (b"a".to_vec(), v(RowID::new(1, 1), 10)),
-                    (b"b".to_vec(), v(RowID::new(1, 2), 20)),
+                    (
+                        b"a".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 10),
+                    ),
+                    (
+                        b"b".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)), 20),
+                    ),
                     (b"b".to_vec(), tombstone(30)),
-                    (b"z".to_vec(), v(RowID::new(1, 9), 40)),
+                    (
+                        b"z".to_vec(),
+                        v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(9)), 40),
+                    ),
                 ],
             )
             .unwrap();
@@ -873,8 +930,18 @@ mod tests {
     #[test]
     fn immutable_index_page_bloom_tracks_inserted_keys() {
         let mut builder = PageBuilder::new(256);
-        builder.try_push(b"alpha", v(RowID::new(1, 1), 1)).unwrap();
-        builder.try_push(b"bravo", v(RowID::new(1, 2), 1)).unwrap();
+        builder
+            .try_push(
+                b"alpha",
+                v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 1),
+            )
+            .unwrap();
+        builder
+            .try_push(
+                b"bravo",
+                v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)), 1),
+            )
+            .unwrap();
         let page_bytes = builder.finish();
         let page = ImmutableIndexPage::parse(&page_bytes).unwrap();
 
@@ -891,7 +958,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("index.idx");
         ImmutableIndexWriter::default()
-            .write_entries(&path, &[(b"k".to_vec(), v(RowID::new(1, 1), 1))])
+            .write_entries(
+                &path,
+                &[(
+                    b"k".to_vec(),
+                    v(RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)), 1),
+                )],
+            )
             .unwrap();
 
         let first = ImmutableIndexReader::open_cached(&path).unwrap();

@@ -74,6 +74,6 @@ fn is_overlay_deleted(
     snapshot.is_overlay_deleted(SearchPhysicalRowRef::new(
         segment.rowset_id,
         segment.segment_id,
-        row_id,
+        crate::rowset::SegmentRowId::from_raw(row_id),
     ))
 }

@@ -11,51 +11,68 @@
 use std::collections::HashMap;
 
 use paro_catalog::entry::ConstraintType;
-use paro_planner::expression::Expression;
+use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::{ColumnBinding, Get, JoinComparisonType, JoinCondition};
 
 /// Evidence that every candidate key binding is evaluated by an ordinary
 /// equality predicate and therefore rejects NULL before uniqueness is used.
 #[derive(Debug, Clone)]
 pub(crate) struct NullRejectedKeyProof {
-    conditions: Box<[JoinCondition]>,
+    keys: Box<[NullRejectedRightKey]>,
+}
+
+#[derive(Debug, Clone)]
+struct NullRejectedRightKey {
+    left: Expression,
+    right: ColumnRefExpression,
 }
 
 impl NullRejectedKeyProof {
     pub(crate) fn from_equal_right_keys(conditions: &[JoinCondition]) -> Option<Self> {
-        if conditions.is_empty()
-            || conditions
-                .iter()
-                .any(|condition| condition.comparison != JoinComparisonType::Equal)
-        {
+        if conditions.is_empty() {
             return None;
         }
-        conditions
+        let keys = conditions
             .iter()
-            .try_for_each(|condition| match &condition.right {
-                Expression::ColumnRef(column) if column.depth == 0 => Some(()),
-                _ => None,
-            })?;
-        Some(Self {
-            conditions: conditions.into(),
-        })
+            .cloned()
+            .map(|condition| {
+                if condition.comparison != JoinComparisonType::Equal {
+                    return None;
+                }
+                let Expression::ColumnRef(right) = condition.right else {
+                    return None;
+                };
+                if right.depth != 0 {
+                    return None;
+                }
+                Some(NullRejectedRightKey {
+                    left: condition.left,
+                    right,
+                })
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(Self { keys: keys.into() })
     }
 
     pub(crate) fn bindings(&self) -> impl Iterator<Item = ColumnBinding> + '_ {
-        self.conditions.iter().map(|condition| {
-            let Expression::ColumnRef(column) = &condition.right else {
-                unreachable!("NULL-rejection proof validates every right key")
-            };
-            column.binding
+        self.keys.iter().map(|key| key.right.binding)
+    }
+
+    /// Reconstruct the exact ordinary-equality conditions encoded by the
+    /// witness. Equality is a type invariant rather than mutable payload.
+    #[cfg(test)]
+    pub(crate) fn conditions(&self) -> impl Iterator<Item = JoinCondition> + '_ {
+        self.keys.iter().map(|key| {
+            JoinCondition::new(
+                key.left.clone(),
+                Expression::ColumnRef(key.right.clone()),
+                JoinComparisonType::Equal,
+            )
         })
     }
 
-    /// Return the exact ordinary-equality conditions from which this proof
-    /// was constructed. Keeping conditions and evidence in one value makes it
-    /// impossible for a rewrite to mutate one while accidentally retaining
-    /// the other.
-    pub(crate) fn conditions(&self) -> &[JoinCondition] {
-        &self.conditions
+    pub(crate) fn right_keys(&self) -> impl Iterator<Item = (&Expression, &ColumnRefExpression)> {
+        self.keys.iter().map(|key| (&key.left, &key.right))
     }
 }
 
@@ -137,9 +154,7 @@ mod tests {
         let equal = JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal);
         let proof = NullRejectedKeyProof::from_equal_right_keys(&[equal.clone()])
             .expect("ordinary equality proves NULL rejection");
-        let [condition] = proof.conditions() else {
-            panic!("proof must retain its sole equality condition")
-        };
+        let condition = proof.conditions().next().expect("sole equality condition");
         assert_eq!(condition.comparison, JoinComparisonType::Equal);
         assert!(matches!(&condition.right,
             Expression::ColumnRef(column) if column.binding == ColumnBinding::new(2, 0)));

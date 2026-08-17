@@ -19,7 +19,6 @@ use crate::operators::aggregate::build_helpers::{
 };
 use crate::operators::aggregate::perfect_hash::finalize::prepare_parallel_perfect_merge;
 use crate::operators::aggregate::post_reduction::{PostAggregateInputRollup, PostAggregateReducer};
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
@@ -36,7 +35,6 @@ use crate::runtime::state::{
 pub struct PerfectHashAggregateSinkExec {
     pub handle: HandleRef<AggregateHandle>,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 impl PerfectHashAggregateSinkExec {

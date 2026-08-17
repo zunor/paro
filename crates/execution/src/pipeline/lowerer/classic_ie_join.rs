@@ -25,10 +25,7 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_subtree_to_sink(
             child,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::Materialize(MaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             self.plan.node(child).output.clone(),
             pipelines,
@@ -87,7 +84,6 @@ impl<'a> PipelineLowerer<'a> {
             sink_sharing,
             output,
             pipelines,
-            dependencies,
         )?;
         self.handles.add_consumer(left_handle, pushed.entry)?;
         self.handles.add_consumer(right_handle, pushed.entry)?;

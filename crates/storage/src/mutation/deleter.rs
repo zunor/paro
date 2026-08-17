@@ -78,7 +78,7 @@ pub(crate) fn delete(
         )?;
         if existing
             .as_ref()
-            .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset.get()))
+            .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset))
         {
             continue;
         }
@@ -151,7 +151,7 @@ pub(crate) fn delete_all(
             )?;
             if let Some(delete_vector) = existing {
                 for row_id in 0..num_rows {
-                    if !delete_vector.is_deleted(row_id) {
+                    if !delete_vector.is_deleted(SegmentRowId::from_raw(row_id)) {
                         locations.push(PhysicalRowRef::new(
                             rowset_id,
                             segment_id,

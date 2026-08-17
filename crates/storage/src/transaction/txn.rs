@@ -794,7 +794,7 @@ impl Transaction {
                     .pending_delete_vectors
                     .entry(location.segment_key())
                     .or_insert_with(crate::primary_key::DeleteVector::new)
-                    .mark_deleted(location.row_offset.get());
+                    .mark_deleted(location.row_offset);
             }
         }
         Ok(())
@@ -841,7 +841,7 @@ impl Transaction {
             let deleted = primary_update
                 .pending_delete_vectors
                 .get(&location.segment_key())
-                .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset.get()));
+                .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset));
             if !deleted {
                 return Ok(false);
             }

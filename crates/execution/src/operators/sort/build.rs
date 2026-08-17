@@ -10,7 +10,7 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 
 use crate::explain::types::ExplainRuntimeStats;
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::runtime::breaker::{HandleRef, SortHandle, SortPendingRunsReclaimer};
 use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
@@ -40,7 +40,6 @@ pub struct SortBuildSinkExec {
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub force_external: bool,
-    pub required: RequiredProperties,
 }
 
 impl SortBuildSinkExec {

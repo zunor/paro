@@ -36,15 +36,8 @@ impl<'a> PipelineLowerer<'a> {
         transforms.push(cross_product_probe_transform(handle, spec));
         transforms.extend(consumer_transforms);
 
-        let pushed = self.push_pipeline(
-            source,
-            transforms,
-            sink,
-            sink_sharing,
-            output,
-            pipelines,
-            dependencies,
-        )?;
+        let pushed =
+            self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
         let consumer = pushed.entry;
         self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
         for pending in &pending_builds {
@@ -88,10 +81,7 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_subtree_to_sink(
             right,
-            SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec { handle }),
             SinkSharing::Exclusive,
             self.plan.node(right).output.clone(),
             pipelines,
@@ -187,7 +177,6 @@ impl<'a> PipelineLowerer<'a> {
             branch_sharing,
             pipeline_output,
             pipelines,
-            dependencies,
         )?;
         let consumer = pushed.entry;
         self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
@@ -226,7 +215,6 @@ impl<'a> PipelineLowerer<'a> {
                 branch_sharing,
                 output,
                 pipelines,
-                dependencies,
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
@@ -260,10 +248,7 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_subtree_to_sink(
             right,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::Materialize(MaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             self.plan.node(right).output.clone(),
             pipelines,
@@ -293,10 +278,7 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_subtree_to_sink(
             right,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::Materialize(MaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             self.plan.node(right).output.clone(),
             pipelines,
@@ -371,7 +353,6 @@ impl<'a> PipelineLowerer<'a> {
             branch_sharing,
             output.clone(),
             pipelines,
-            dependencies,
         )?;
         let consumer = pushed.entry;
         self.add_source_handle_dependencies(&source_handles, consumer, dependencies)?;
@@ -410,7 +391,6 @@ impl<'a> PipelineLowerer<'a> {
                 branch_sharing,
                 output,
                 pipelines,
-                dependencies,
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
@@ -494,7 +474,6 @@ impl<'a> PipelineLowerer<'a> {
                     SinkSpec::TopNBuild(TopNBuildSinkSpec {
                         handle: *handle,
                         spec: spec.clone(),
-                        required: Default::default(),
                     }),
                     SinkSharing::Shared(self.next_shared_sink()),
                     input.clone(),
@@ -503,7 +482,6 @@ impl<'a> PipelineLowerer<'a> {
                 (
                     SinkSpec::Materialize(MaterializeSinkSpec {
                         handle: merge_handle,
-                        required: Default::default(),
                     }),
                     SinkSharing::Shared(self.next_shared_sink()),
                     join_output.clone(),
@@ -539,7 +517,6 @@ impl<'a> PipelineLowerer<'a> {
                     .as_ref()
                     .and_then(|cascade| cascade.grouped_extrema.as_ref())
                     .map(|grouped| grouped.channels.len()),
-                required: Default::default(),
                 force_external: spec.force_external,
             }),
             SinkSharing::Exclusive,
@@ -562,7 +539,6 @@ impl<'a> PipelineLowerer<'a> {
             branch_sharing,
             branch_output.clone(),
             pipelines,
-            dependencies,
         )?;
         let consumer = pushed.entry;
         self.add_source_handle_dependencies(&probe_source_handles, consumer, dependencies)?;
@@ -612,7 +588,6 @@ impl<'a> PipelineLowerer<'a> {
             branch_sharing,
             branch_output.clone(),
             pipelines,
-            dependencies,
         )?;
         self.handles.add_consumer(handle, replay.entry)?;
         dependencies.push(PipelineDependency {
@@ -639,7 +614,6 @@ impl<'a> PipelineLowerer<'a> {
                 branch_sharing,
                 branch_output,
                 pipelines,
-                dependencies,
             )?;
             self.handles.add_consumer(handle, unmatched.entry)?;
             dependencies.push(PipelineDependency {
@@ -662,7 +636,6 @@ impl<'a> PipelineLowerer<'a> {
                 sink_sharing,
                 output,
                 pipelines,
-                dependencies,
             )?;
             self.handles.add_consumer(topn_handle, merged.entry)?;
             dependencies.push(PipelineDependency {
@@ -690,7 +663,6 @@ impl<'a> PipelineLowerer<'a> {
             sink_sharing,
             output,
             pipelines,
-            dependencies,
         )?;
         self.handles.add_consumer(merge_handle, merged.entry)?;
         dependencies.push(PipelineDependency {
@@ -707,7 +679,7 @@ impl<'a> PipelineLowerer<'a> {
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<(SourceSpec, Vec<TransformSpec>, Vec<PendingProbeDependency>)> {
-        if let Some(breaker) = Self::probe_fusible_breaker_dispatch(&self.plan.node(root).kind) {
+        if let Some(breaker) = Self::probe_fusion_candidate_dispatch(&self.plan.node(root).kind) {
             if let Some(probe_source) =
                 self.lower_breaker_to_probe_source(root, breaker, pipelines, dependencies)?
             {
@@ -755,7 +727,6 @@ impl<'a> PipelineLowerer<'a> {
                             .as_ref()
                             .and_then(|cascade| cascade.grouped_extrema.as_ref())
                             .map(|grouped| grouped.channels.len()),
-                        required: Default::default(),
                         force_external: false,
                     }),
                     SinkSharing::Exclusive,

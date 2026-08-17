@@ -177,7 +177,7 @@ fn sparse_ranked_rows_from_points(
                 let row = PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    point.idx as u32,
+                    crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                 );
                 (!snapshot.is_overlay_deleted(row)).then(|| RankedRow::new(row, point.score))
             })
@@ -190,7 +190,7 @@ fn sparse_ranked_rows_from_points(
                     PhysicalRowRef::new(
                         visible_segment.rowset_id,
                         visible_segment.segment_id,
-                        point.idx as u32,
+                        crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                     ),
                     point.score,
                 )
@@ -318,7 +318,7 @@ impl SparseSearchCursor {
                 PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    row_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
                 ),
                 score,
             ));
@@ -488,7 +488,7 @@ mod tests {
         };
 
         assert_eq!(batch.rows.len(), 1);
-        assert_eq!(batch.rows[0].row_id, 0);
+        assert_eq!(batch.rows[0].row_offset, 0);
         let metrics = storage_metrics().snapshot();
         let sidecar = metrics
             .search_sidecar_reader_by_key
@@ -560,7 +560,7 @@ mod tests {
         };
 
         assert_eq!(batch.rows.len(), 1);
-        assert_eq!(batch.rows[0].row_id, 0);
+        assert_eq!(batch.rows[0].row_offset, 0);
     }
 
     fn test_blob_vector(values: &[Vec<u8>]) -> Vector {

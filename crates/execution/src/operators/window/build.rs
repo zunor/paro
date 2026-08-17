@@ -8,7 +8,7 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_function::scalar::FunctionExecContext;
 
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::physical::specs::WindowSpec;
 use crate::runtime::breaker::{HandleRef, WindowHandle};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -25,7 +25,6 @@ use crate::runtime::state::{BreakerHandleGlobal, SinkGlobal, SinkLocal, WindowBu
 pub struct WindowBuildSinkExec {
     pub handle: HandleRef<WindowHandle>,
     pub spec: WindowSpec,
-    pub required: RequiredProperties,
 }
 
 impl WindowBuildSinkExec {

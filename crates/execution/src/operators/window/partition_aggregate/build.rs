@@ -25,7 +25,7 @@ use crate::operators::aggregate::payload_spill::{
 };
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::sort::build::query_has_temporary_directory;
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::physical::specs::PartitionAggregateWindowSpec;
 use crate::runtime::breaker::{
     HandleRef, PartitionAggregatePendingSpillReclaimer, PartitionAggregateWindowHandle,
@@ -180,7 +180,6 @@ impl Reclaimer for PartitionAggregateLocalSpillReclaimer {
 pub struct PartitionAggregateWindowBuildSinkExec {
     pub handle: HandleRef<PartitionAggregateWindowHandle>,
     pub spec: PartitionAggregateWindowSpec,
-    pub required: RequiredProperties,
 }
 
 impl PartitionAggregateWindowBuildSinkExec {

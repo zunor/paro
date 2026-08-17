@@ -13,6 +13,8 @@ use std::mem::ManuallyDrop;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
 
+use super::rowset_meta::RowsetId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(transparent)]
 pub struct BatchRowOrdinal(u32);
@@ -22,7 +24,7 @@ impl BatchRowOrdinal {
     /// vector-sized batch. Keeping this check in debug builds catches future
     /// batch-strategy drift without adding a branch to every hot loop lane.
     #[inline]
-    pub(crate) fn from_index(index: usize) -> Self {
+    pub(crate) fn from_validated_index(index: usize) -> Self {
         debug_assert!(index < VECTOR_SIZE);
         debug_assert!(u32::try_from(index).is_ok());
         Self(index as u32)
@@ -149,6 +151,36 @@ impl std::fmt::Display for SegmentRowId {
     }
 }
 
+/// Stable physical row location shared by tablet, search, mutation, and
+/// primary-key paths. There is exactly one representation of a segment-local
+/// row coordinate in the storage engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PhysicalRowRef {
+    pub rowset_id: RowsetId,
+    pub segment_id: u32,
+    pub row_offset: SegmentRowId,
+}
+
+impl PhysicalRowRef {
+    pub const fn new(rowset_id: RowsetId, segment_id: u32, row_offset: SegmentRowId) -> Self {
+        Self {
+            rowset_id,
+            segment_id,
+            row_offset,
+        }
+    }
+
+    pub const fn segment_key(self) -> (RowsetId, u32) {
+        (self.rowset_id, self.segment_id)
+    }
+}
+
+impl From<(RowsetId, u32, SegmentRowId)> for PhysicalRowRef {
+    fn from(value: (RowsetId, u32, SegmentRowId)) -> Self {
+        Self::new(value.0, value.1, value.2)
+    }
+}
+
 #[cfg(test)]
 impl PartialEq<u32> for SegmentRowId {
     fn eq(&self, other: &u32) -> bool {
@@ -171,8 +203,8 @@ mod tests {
     #[test]
     fn owned_abi_conversion_reuses_the_allocation() {
         let values = vec![
-            BatchRowOrdinal::from_index(1),
-            BatchRowOrdinal::from_index(3),
+            BatchRowOrdinal::from_validated_index(1),
+            BatchRowOrdinal::from_validated_index(3),
         ];
         let pointer = values.as_ptr().cast::<u32>();
         let raw = BatchRowOrdinal::into_raw_vec(values);

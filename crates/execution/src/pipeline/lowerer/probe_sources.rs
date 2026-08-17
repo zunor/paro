@@ -125,10 +125,7 @@ impl PipelineLowerer<'_> {
         );
         let producer = self.lower_subtree_to_sink(
             root,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::Materialize(MaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             output,
             pipelines,

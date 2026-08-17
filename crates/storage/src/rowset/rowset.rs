@@ -1278,7 +1278,7 @@ mod tests {
 
         // Write delete vector marking middle row
         let mut dv = DeleteVector::new();
-        dv.mark_deleted(1);
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(1));
         dv.save_to_dir(&rowset_dir, 0).unwrap();
 
         let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))

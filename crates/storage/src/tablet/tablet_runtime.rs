@@ -35,7 +35,7 @@ use crate::primary_key::{
 };
 use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
 use crate::rowset::{
-    Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
+    PhysicalRowRef, Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
 };
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
@@ -67,33 +67,6 @@ pub struct TabletIdentity {
     pub tablet_id: u64,
     pub schema_id: u64,
     pub schema_version: u32,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PhysicalRowRef {
-    pub rowset_id: u64,
-    pub segment_id: u32,
-    pub row_offset: SegmentRowId,
-}
-
-impl PhysicalRowRef {
-    pub const fn new(rowset_id: u64, segment_id: u32, row_offset: SegmentRowId) -> Self {
-        Self {
-            rowset_id,
-            segment_id,
-            row_offset,
-        }
-    }
-
-    pub const fn segment_key(self) -> (u64, u32) {
-        (self.rowset_id, self.segment_id)
-    }
-}
-
-impl From<(u64, u32, SegmentRowId)> for PhysicalRowRef {
-    fn from(value: (u64, u32, SegmentRowId)) -> Self {
-        Self::new(value.0, value.1, value.2)
-    }
 }
 
 impl From<PhysicalRowRef> for (u64, u32, SegmentRowId) {
@@ -1981,7 +1954,7 @@ impl Tablet {
             )?;
             match pending.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
-                    if o.get().is_deleted(location.row_offset.get()) {
+                    if o.get().is_deleted(location.row_offset) {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -1993,11 +1966,11 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    o.get_mut().mark_deleted(location.row_offset.get());
+                    o.get_mut().mark_deleted(location.row_offset);
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     let mut dv = DeleteVector::with_version(version);
-                    if dv.is_deleted(location.row_offset.get()) {
+                    if dv.is_deleted(location.row_offset) {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -2009,9 +1982,10 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    if existing.as_ref().is_some_and(|delete_vector| {
-                        delete_vector.is_deleted(location.row_offset.get())
-                    }) {
+                    if existing
+                        .as_ref()
+                        .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset))
+                    {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -2023,7 +1997,7 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    dv.mark_deleted(location.row_offset.get());
+                    dv.mark_deleted(location.row_offset);
                     v.insert(dv);
                 }
             }
@@ -2064,7 +2038,7 @@ impl Tablet {
 
         let mut had_rowset_updates = false;
         for ((_, segment_id), delete_vector) in rowset_vectors {
-            let deletes: Vec<u32> = delete_vector.iter().collect();
+            let deletes: Vec<SegmentRowId> = delete_vector.iter().collect();
             if deletes.is_empty() {
                 continue;
             }
@@ -2096,7 +2070,7 @@ impl Tablet {
             if let Some(rowset) = self.find_rowset_by_id(rs_id) {
                 let mut chain =
                     DeleteVector::load_versioned_from_dir(rowset.rowset_path(), seg_id)?;
-                let deletes: Vec<u32> = dv.iter().collect();
+                let deletes: Vec<SegmentRowId> = dv.iter().collect();
                 if deletes.is_empty() {
                     continue;
                 }
@@ -3019,7 +2993,7 @@ impl Tablet {
                     location.rowset_id, location.segment_id
                 ))
             })?;
-        Ok(RowID::new(rssid, location.row_offset.get()))
+        Ok(RowID::new(rssid, location.row_offset))
     }
 
     pub fn decode_row_id(&self, row_id: RowID) -> Result<PhysicalRowRef> {
@@ -3036,7 +3010,7 @@ impl Tablet {
         Ok(PhysicalRowRef::new(
             rowset_id,
             segment_id,
-            SegmentRowId::from_raw(row_id.row_offset()),
+            row_id.row_offset(),
         ))
     }
 
@@ -4110,7 +4084,7 @@ mod tests {
         // Build persistent index with one key
         let pi_dir = tmp.path().join("primary_index");
         let pi = PersistentIndex::new(&pi_dir).unwrap();
-        pi.apply_upserts(&[(b"k1".to_vec(), RowID::new(1, 0))])
+        pi.apply_upserts(&[(b"k1".to_vec(), RowID::new(1, SegmentRowId::from_raw(0)))])
             .unwrap();
 
         let tablet = Tablet::create_from_meta(meta, None).unwrap();

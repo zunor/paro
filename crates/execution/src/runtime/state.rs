@@ -342,7 +342,6 @@ pub enum TransformGlobal {
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
     GraphShortestPath(Arc<GraphShortestPathTransformGlobal>),
-    PropertyRepair,
     Dyn(DynGlobalStateBox),
 }
 
@@ -363,7 +362,6 @@ pub enum TransformLocal {
     RowFetch(RowFetchTransformLocal),
     GraphProject(GraphProjectTransformLocal),
     GraphShortestPath(GraphShortestPathTransformLocal),
-    PropertyRepair,
     Dyn(DynLocalStateBox),
 }
 
@@ -546,15 +544,10 @@ mod tests {
         let slots = TransformGlobalSlots::new(vec![
             TransformGlobal::Empty,
             TransformGlobal::Filter(Arc::new(FilterTransformGlobal)),
-            TransformGlobal::PropertyRepair,
         ]);
 
         assert!(matches!(slots.get(0), Some(TransformGlobal::Empty)));
         assert!(matches!(slots.get(1), Some(TransformGlobal::Filter(_))));
-        assert!(matches!(
-            slots.get(2),
-            Some(TransformGlobal::PropertyRepair)
-        ));
-        assert!(slots.get(3).is_none());
+        assert!(slots.get(2).is_none());
     }
 }

@@ -31,10 +31,7 @@ impl<'a> PipelineLowerer<'a> {
                 .register(BreakerHandleKind::Cte, cte_row_type, Default::default());
         let producer = self.lower_subtree_to_sink(
             *producer_root,
-            SinkSpec::CteMaterialize(CteMaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::CteMaterialize(CteMaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             self.plan.node(*producer_root).output.clone(),
             pipelines,
@@ -107,12 +104,8 @@ impl<'a> PipelineLowerer<'a> {
         );
         let dedup = !spec.union_all;
 
-        let append_sink = |handle| {
-            SinkSpec::RecursiveTableAppend(RecursiveTableAppendSinkSpec {
-                handle,
-                required: Default::default(),
-            })
-        };
+        let append_sink =
+            |handle| SinkSpec::RecursiveTableAppend(RecursiveTableAppendSinkSpec { handle });
         let anchor = self.lower_subtree_to_sink(
             *anchor_root,
             append_sink(intermediate),
@@ -157,7 +150,6 @@ impl<'a> PipelineLowerer<'a> {
             sink_sharing,
             output,
             pipelines,
-            dependencies,
         )?;
         self.add_source_handle_dependencies(&emit_source_handles, pushed.entry, dependencies)?;
         let emit = pushed.tail;

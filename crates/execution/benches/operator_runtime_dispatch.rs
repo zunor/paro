@@ -706,7 +706,6 @@ impl HashJoinBuildFinishBench {
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    required: Default::default(),
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,

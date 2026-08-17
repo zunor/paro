@@ -137,24 +137,12 @@ pub(crate) fn needs_nlj_unmatched_source(join_type: JoinType) -> bool {
 
 pub(crate) fn aggregate_build_sink_spec(handle: BreakerHandleId, spec: AggregateSpec) -> SinkSpec {
     if spec.grouping_key_count == 0 {
-        return SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
-            handle,
-            spec,
-            required: Default::default(),
-        });
+        return SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec { handle, spec });
     }
     if spec.perfect_hash.is_some() {
-        return SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
-            handle,
-            spec,
-            required: Default::default(),
-        });
+        return SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec { handle, spec });
     }
-    SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
-        handle,
-        spec,
-        required: Default::default(),
-    })
+    SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec { handle, spec })
 }
 
 pub(crate) fn aggregate_emit_source_spec(
@@ -182,16 +170,6 @@ pub(crate) enum AggregateEmitKind {
     Hash,
     Ungrouped,
     PerfectHash,
-}
-
-impl AggregateEmitKind {
-    pub(crate) fn source_kind(self) -> EmitSourceKind {
-        match self {
-            Self::Hash => EmitSourceKind::HashAggregate,
-            Self::Ungrouped => EmitSourceKind::UngroupedAggregate,
-            Self::PerfectHash => EmitSourceKind::PerfectHashAggregate,
-        }
-    }
 }
 
 pub(crate) fn aggregate_emit_kind(spec: &AggregateSpec) -> AggregateEmitKind {

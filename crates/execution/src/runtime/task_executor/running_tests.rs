@@ -260,10 +260,7 @@ fn materialized_breaker_moves_chunks_through_typed_handle() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::Materialize(MaterializeSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),
@@ -359,10 +356,7 @@ fn cte_materialize_scan_gives_each_consumer_independent_cursor() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::CteMaterialize(CteMaterializeSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),
@@ -485,7 +479,6 @@ fn delim_capture_deduplicates_values_and_keeps_cached_outer_explicit() {
                     ))]
                     .into_boxed_slice(),
                     cached_outer: Some(cached_outer),
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -582,7 +575,6 @@ fn delim_capture_with_no_duplicate_keys_stores_zero_column_values() {
                     handle: delim,
                     duplicate_keys: Vec::new().into_boxed_slice(),
                     cached_outer: Some(cached_outer),
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -649,65 +641,6 @@ fn delim_capture_with_no_duplicate_keys_stores_zero_column_values() {
 }
 
 #[test]
-fn batch_index_adapter_property_repair_is_zero_copy_pass_through() {
-    assert_streaming_property_repair_references_input(PropertyRepairKind::BatchIndexAdapter);
-}
-
-#[test]
-fn single_task_fallback_property_repair_is_zero_copy_pass_through() {
-    assert_streaming_property_repair_references_input(PropertyRepairKind::SingleTaskFallback);
-}
-
-fn assert_streaming_property_repair_references_input(kind: PropertyRepairKind) {
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let row_type = RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]);
-    let source_chunk =
-        paro_common::test_utils::test_chunk_from_vectors(vec![Vector::try_from_i32(
-            &[31, 41],
-            paro_common::test_utils::test_allocator(),
-        )
-        .expect("source vector")]);
-    let source_column = source_chunk.column(0).expect("source column").clone();
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Chunk(ChunkScanSpec {
-            chunks: Arc::from(vec![source_chunk].into_boxed_slice()),
-            output_names: vec!["v".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::Integer].into_boxed_slice(),
-        }),
-        transforms: vec![TransformSpec::PropertyRepair(PropertyRepairSpec { kind })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: row_type,
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let thread = ThreadContext::single_threaded();
-    let wake = OperatorWakeScope {
-        task_id: PipelineTaskId(12),
-        generation: WakeGeneration(0),
-    };
-    let mut profiler = OperatorProfiler::disabled();
-
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-
-    let chunk = output.pop_front().expect("streaming repair output");
-    assert_eq!(chunk.size(), 2);
-    assert!(Arc::ptr_eq(
-        chunk.column(0).expect("output column"),
-        &source_column
-    ));
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(31));
-    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(41));
-    assert!(output.pop_front().is_none());
-}
-
-#[test]
 fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
     let output = QueryOutputPort::unbounded();
     let query = query_context(output.clone());
@@ -753,7 +686,6 @@ fn hash_join_build_and_probe_use_typed_handle_without_sink_state() {
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    required: Default::default(),
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
@@ -874,10 +806,7 @@ fn cross_product_probe_reuses_materialized_build_vectors() {
                     vec![LogicalType::Integer],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: build_row_type,
@@ -1006,7 +935,6 @@ fn hash_join_left_probe_null_fills_when_build_is_empty() {
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
                     build_output_count: 1,
-                    required: Default::default(),
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,

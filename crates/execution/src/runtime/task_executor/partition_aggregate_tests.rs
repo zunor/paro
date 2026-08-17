@@ -70,7 +70,6 @@ fn partition_aggregate_window_graph_from_source(
                     PartitionAggregateWindowBuildSinkSpec {
                         handle,
                         spec: spec.clone(),
-                        required: Default::default(),
                     },
                 ),
                 sink_sharing: SinkSharing::Exclusive,

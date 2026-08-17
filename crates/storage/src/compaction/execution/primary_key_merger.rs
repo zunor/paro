@@ -201,7 +201,7 @@ impl PrimaryKeyMerger {
         {
             if let Some((prev_out, _prev_src)) = latest.insert(key, (loc, src_loc)) {
                 let entry = delete_vectors.entry(prev_out.segment_id).or_default();
-                entry.mark_deleted(prev_out.row_offset.get());
+                entry.mark_deleted(prev_out.row_offset);
             }
         }
 

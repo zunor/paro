@@ -43,7 +43,7 @@ impl Ord for RankedRow {
             .total_cmp(&other.score)
             .then_with(|| self.row.rowset_id.cmp(&other.row.rowset_id))
             .then_with(|| self.row.segment_id.cmp(&other.row.segment_id))
-            .then_with(|| self.row.row_id.cmp(&other.row.row_id))
+            .then_with(|| self.row.row_offset.cmp(&other.row.row_offset))
     }
 }
 
@@ -136,16 +136,28 @@ mod tests {
         let mut collector = TopKCollector::new(2);
         assert_eq!(collector.min_competitive_score(), None);
 
-        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 0), 0.2));
+        collector.push(RankedRow::new(
+            PhysicalRowRef::new(1, 0, crate::rowset::SegmentRowId::from_raw(0)),
+            0.2,
+        ));
         assert_eq!(collector.min_competitive_score(), None);
 
-        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 1), 0.4));
+        collector.push(RankedRow::new(
+            PhysicalRowRef::new(1, 0, crate::rowset::SegmentRowId::from_raw(1)),
+            0.4,
+        ));
         assert_eq!(collector.min_competitive_score(), Some(0.2));
 
-        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 2), 0.1));
+        collector.push(RankedRow::new(
+            PhysicalRowRef::new(1, 0, crate::rowset::SegmentRowId::from_raw(2)),
+            0.1,
+        ));
         assert_eq!(collector.min_competitive_score(), Some(0.2));
 
-        collector.push(RankedRow::new(PhysicalRowRef::new(1, 0, 3), 0.6));
+        collector.push(RankedRow::new(
+            PhysicalRowRef::new(1, 0, crate::rowset::SegmentRowId::from_raw(3)),
+            0.6,
+        ));
         assert_eq!(collector.min_competitive_score(), Some(0.4));
 
         let hint = collector.pruning_hint(Some(16));

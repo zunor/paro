@@ -749,12 +749,12 @@ mod tests {
         assert_eq!(rowsets[0].rowset_id(), 1);
 
         let mut dv = DeleteVector::new();
-        dv.mark_deleted(3);
-        dv.mark_deleted(9);
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(3));
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(9));
         manager.save_del_vector(10, 0, 7, &dv).unwrap();
         let loaded_dv = manager.load_del_vector(10, 0, 7).unwrap().unwrap();
-        assert!(loaded_dv.is_deleted(3));
-        assert!(loaded_dv.is_deleted(9));
+        assert!(loaded_dv.is_deleted(crate::rowset::SegmentRowId::from_raw(3)));
+        assert!(loaded_dv.is_deleted(crate::rowset::SegmentRowId::from_raw(9)));
 
         manager.clear_del_vectors(10).unwrap();
         assert!(manager.load_del_vector(10, 0, 7).unwrap().is_none());

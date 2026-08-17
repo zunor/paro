@@ -639,7 +639,7 @@ fn filter_varlen_batch(
             selection.extend(
                 (0..rows)
                     .filter(|row_idx| row_matches(*row_idx))
-                    .map(BatchRowOrdinal::from_index),
+                    .map(BatchRowOrdinal::from_validated_index),
             );
         } else {
             selection.retain(|row_idx| row_matches(row_idx.index()));
@@ -657,7 +657,7 @@ fn filter_varlen_batch(
         selection.extend(
             (0..rows)
                 .filter(|row_idx| row_matches(*row_idx))
-                .map(BatchRowOrdinal::from_index),
+                .map(BatchRowOrdinal::from_validated_index),
         );
     } else {
         selection.retain(|row_idx| row_matches(row_idx.index()));
@@ -744,7 +744,7 @@ fn filter_raw_like_with_anchor(
         selection.extend(
             (0..rows)
                 .filter(|row_idx| row_matches(*row_idx))
-                .map(BatchRowOrdinal::from_index),
+                .map(BatchRowOrdinal::from_validated_index),
         );
     } else {
         selection.retain(|row_idx| row_matches(row_idx.index()));
@@ -962,7 +962,9 @@ mod tests {
             Some(&[0, 0, 0, 1]),
         );
         let matcher = VarlenMatcher::like("%special%requests%", true).unwrap();
-        let mut selection = [0, 1, 3].map(BatchRowOrdinal::from_index).to_vec();
+        let mut selection = [0, 1, 3]
+            .map(BatchRowOrdinal::from_validated_index)
+            .to_vec();
 
         matcher
             .filter_batch(&batch, 4, &mut selection, false)
@@ -992,7 +994,7 @@ mod tests {
             batch.raw_varlen().unwrap(),
             payload_len,
             3,
-            &[0, 2].map(BatchRowOrdinal::from_index),
+            &[0, 2].map(BatchRowOrdinal::from_validated_index),
             false,
         )
         .is_none());
@@ -1000,7 +1002,7 @@ mod tests {
             batch.raw_varlen().unwrap(),
             payload_len,
             3,
-            &[2, 0].map(BatchRowOrdinal::from_index),
+            &[2, 0].map(BatchRowOrdinal::from_validated_index),
             false,
         )
         .is_none());
@@ -1009,7 +1011,7 @@ mod tests {
                 batch.raw_varlen().unwrap(),
                 payload_len,
                 3,
-                &[0, 1, 2].map(BatchRowOrdinal::from_index),
+                &[0, 1, 2].map(BatchRowOrdinal::from_validated_index),
                 false,
             ),
             Some(0..payload_len)

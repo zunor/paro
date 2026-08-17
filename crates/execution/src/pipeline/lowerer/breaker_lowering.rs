@@ -20,10 +20,9 @@ pub(crate) enum BreakerDispatch {
     ExternalTable(ExternalTableSpec),
 }
 
-/// Owned breaker dispatch whose native emit source has already been proven at
-/// least as schedulable as `Materialized`. The private field prevents probe
-/// lowering from bypassing the authoritative source-property check.
-pub(crate) struct ProbeFusibleBreakerDispatch(BreakerDispatch);
+/// Owned breaker dispatch that passed the cheap borrowed precheck. The actual
+/// constructed source remains authoritative for fusion eligibility.
+pub(crate) struct ProbeFusionCandidateDispatch(BreakerDispatch);
 
 enum BreakerRef<'a> {
     TopN(&'a TopNSpec),
@@ -69,26 +68,6 @@ impl<'a> BreakerRef<'a> {
         })
     }
 
-    fn emit_source_kind(&self) -> Option<EmitSourceKind> {
-        match self {
-            Self::Aggregate(spec) => Some(aggregate_emit_kind(spec).source_kind()),
-            Self::PartitionAggregateWindow(_) => Some(EmitSourceKind::PartitionAggregateWindow),
-            Self::TopN(_) => Some(EmitSourceKind::TopN),
-            Self::Sort(_) => Some(EmitSourceKind::Sort),
-            Self::SetOperation(_) => Some(EmitSourceKind::SetOperation),
-            Self::Window(_) => Some(EmitSourceKind::Window),
-            Self::HashJoin(_)
-            | Self::NestedLoopJoin(_)
-            | Self::SortRangeJoin(_)
-            | Self::ClassicIeJoin(_)
-            | Self::CrossProduct(_)
-            | Self::ExternalTable(_)
-            | Self::MaterializedCteControl
-            | Self::DelimJoinControl
-            | Self::RecursiveCteControl => None,
-        }
-    }
-
     fn to_dispatch(&self) -> Option<BreakerDispatch> {
         Some(match self {
             Self::TopN(spec) => BreakerDispatch::TopN((*spec).clone()),
@@ -108,6 +87,31 @@ impl<'a> BreakerRef<'a> {
             Self::MaterializedCteControl | Self::DelimJoinControl | Self::RecursiveCteControl => {
                 return None
             }
+        })
+    }
+
+    /// Clone only physical breakers that can actually construct an emit
+    /// source. Scheduling eligibility is deliberately not decided here: the
+    /// constructed `SourceSpec` is the sole authority for that contract.
+    fn to_emit_dispatch(&self) -> Option<BreakerDispatch> {
+        Some(match self {
+            Self::TopN(spec) => BreakerDispatch::TopN((*spec).clone()),
+            Self::Sort(spec) => BreakerDispatch::Sort((*spec).clone()),
+            Self::Aggregate(spec) => BreakerDispatch::Aggregate((*spec).clone()),
+            Self::SetOperation(spec) => BreakerDispatch::SetOperation((*spec).clone()),
+            Self::Window(spec) => BreakerDispatch::Window((*spec).clone()),
+            Self::PartitionAggregateWindow(spec) => {
+                BreakerDispatch::PartitionAggregateWindow((*spec).clone())
+            }
+            Self::HashJoin(_)
+            | Self::NestedLoopJoin(_)
+            | Self::SortRangeJoin(_)
+            | Self::ClassicIeJoin(_)
+            | Self::CrossProduct(_)
+            | Self::ExternalTable(_)
+            | Self::MaterializedCteControl
+            | Self::DelimJoinControl
+            | Self::RecursiveCteControl => return None,
         })
     }
 
@@ -190,6 +194,7 @@ impl<'a> PipelineLowerer<'a> {
         &mut self,
         root: PhysicalPlanNodeId,
         breaker: BreakerDispatch,
+        require_parallel_probe: bool,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
@@ -202,6 +207,10 @@ impl<'a> PipelineLowerer<'a> {
             .handles
             .register(build.handle_kind(), output.clone(), Default::default());
         let source = build.source(handle, &output);
+        if require_parallel_probe && !source_supports_parallel_probe_fusion(&source) {
+            self.handles.unregister_unbound(handle)?;
+            return Ok(None);
+        }
         let pending = match build {
             EmitBreakerBuild::Aggregate(spec) => {
                 let child = self.only_child(root)?;
@@ -225,11 +234,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 let producer = self.lower_subtree_to_sink(
                     child,
-                    SinkSpec::TopNBuild(TopNBuildSinkSpec {
-                        handle,
-                        spec,
-                        required: Default::default(),
-                    }),
+                    SinkSpec::TopNBuild(TopNBuildSinkSpec { handle, spec }),
                     SinkSharing::Exclusive,
                     self.plan.node(child).output.clone(),
                     pipelines,
@@ -255,7 +260,6 @@ impl<'a> PipelineLowerer<'a> {
                         output_names: output.names.clone(),
                         output_types: output.types.clone(),
                         force_external: false,
-                        required: Default::default(),
                     }),
                     SinkSharing::Exclusive,
                     input,
@@ -273,11 +277,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 let producer = self.lower_subtree_to_sink(
                     child,
-                    SinkSpec::WindowBuild(WindowBuildSinkSpec {
-                        handle,
-                        spec,
-                        required: Default::default(),
-                    }),
+                    SinkSpec::WindowBuild(WindowBuildSinkSpec { handle, spec }),
                     SinkSharing::Exclusive,
                     self.plan.node(child).output.clone(),
                     pipelines,
@@ -296,11 +296,7 @@ impl<'a> PipelineLowerer<'a> {
                 let producer = self.lower_subtree_to_sink(
                     child,
                     SinkSpec::PartitionAggregateWindowBuild(
-                        PartitionAggregateWindowBuildSinkSpec {
-                            handle,
-                            spec,
-                            required: Default::default(),
-                        },
+                        PartitionAggregateWindowBuildSinkSpec { handle, spec },
                     ),
                     SinkSharing::Exclusive,
                     self.plan.node(child).output.clone(),
@@ -367,11 +363,11 @@ impl<'a> PipelineLowerer<'a> {
     pub(crate) fn lower_breaker_to_probe_source(
         &mut self,
         root: PhysicalPlanNodeId,
-        breaker: ProbeFusibleBreakerDispatch,
+        breaker: ProbeFusionCandidateDispatch,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
-        self.lower_emit_breaker_source(root, breaker.0, pipelines, dependencies)
+        self.lower_emit_breaker_source(root, breaker.0, true, pipelines, dependencies)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -387,7 +383,7 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         let probe_source = self
-            .lower_emit_breaker_source(root, breaker, pipelines, dependencies)?
+            .lower_emit_breaker_source(root, breaker, false, pipelines, dependencies)?
             .ok_or_else(|| paro_error::internal("requested emit source for a non-emit breaker"))?;
         let pushed = self.push_pipeline(
             probe_source.source,
@@ -396,7 +392,6 @@ impl<'a> PipelineLowerer<'a> {
             sink_sharing,
             output,
             pipelines,
-            dependencies,
         )?;
         for pending in probe_source.dependencies {
             self.handles.add_consumer(pending.handle, pushed.entry)?;
@@ -429,15 +424,11 @@ impl<'a> PipelineLowerer<'a> {
         BreakerRef::from_kind(kind).is_some_and(|breaker| breaker.is_tail_boundary())
     }
 
-    pub(crate) fn probe_fusible_breaker_dispatch(
+    pub(crate) fn probe_fusion_candidate_dispatch(
         kind: &PhysicalNodeKind,
-    ) -> Option<ProbeFusibleBreakerDispatch> {
+    ) -> Option<ProbeFusionCandidateDispatch> {
         let breaker = BreakerRef::from_kind(kind)?;
-        let source_kind = breaker.emit_source_kind()?;
-        emit_source_supports_parallel_probe_fusion(source_kind)
-            .then(|| breaker.to_dispatch())
-            .flatten()
-            .map(ProbeFusibleBreakerDispatch)
+        breaker.to_emit_dispatch().map(ProbeFusionCandidateDispatch)
     }
 
     #[allow(clippy::too_many_arguments)]

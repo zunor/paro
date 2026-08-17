@@ -398,49 +398,54 @@ impl FixedComparisonValues {
     }
 }
 
-trait BoundedInteger: FixedPhysical {
+/// A finite, discrete ordered domain with exact adjacent values.
+///
+/// This is intentionally opt-in: continuous domains such as floating point
+/// must not emulate successor/predecessor with `+/- 1` when normalizing open
+/// bounds.
+trait DiscreteOrdered: FixedPhysical {
     const MIN: Self;
     const MAX: Self;
 
-    fn checked_increment(self) -> Option<Self>;
-    fn checked_decrement(self) -> Option<Self>;
+    fn successor(self) -> Option<Self>;
+    fn predecessor(self) -> Option<Self>;
 }
 
-impl BoundedInteger for i32 {
+impl DiscreteOrdered for i32 {
     const MIN: Self = i32::MIN;
     const MAX: Self = i32::MAX;
 
-    fn checked_increment(self) -> Option<Self> {
+    fn successor(self) -> Option<Self> {
         self.checked_add(1)
     }
 
-    fn checked_decrement(self) -> Option<Self> {
+    fn predecessor(self) -> Option<Self> {
         self.checked_sub(1)
     }
 }
 
-impl BoundedInteger for i64 {
+impl DiscreteOrdered for i64 {
     const MIN: Self = i64::MIN;
     const MAX: Self = i64::MAX;
 
-    fn checked_increment(self) -> Option<Self> {
+    fn successor(self) -> Option<Self> {
         self.checked_add(1)
     }
 
-    fn checked_decrement(self) -> Option<Self> {
+    fn predecessor(self) -> Option<Self> {
         self.checked_sub(1)
     }
 }
 
-impl BoundedInteger for i128 {
+impl DiscreteOrdered for i128 {
     const MIN: Self = i128::MIN;
     const MAX: Self = i128::MAX;
 
-    fn checked_increment(self) -> Option<Self> {
+    fn successor(self) -> Option<Self> {
         self.checked_add(1)
     }
 
-    fn checked_decrement(self) -> Option<Self> {
+    fn predecessor(self) -> Option<Self> {
         self.checked_sub(1)
     }
 }
@@ -454,7 +459,7 @@ enum InclusiveBounds<T> {
     Between(T, T),
 }
 
-impl<T: BoundedInteger> InclusiveBounds<T> {
+impl<T: DiscreteOrdered> InclusiveBounds<T> {
     fn closed_range(self) -> Option<(T, T)> {
         match self {
             Self::Empty => None,
@@ -469,36 +474,32 @@ impl<T: BoundedInteger> InclusiveBounds<T> {
 /// Normalize every open/closed, one/two-sided integer range to one inclusive
 /// shape. Scalar and width-specific SIMD code therefore share one boundary
 /// definition; adding a bound shape cannot create an execution-path hole.
-fn inclusive_bounds<T: BoundedInteger>(kernel: &FixedConjunction<T>) -> Option<InclusiveBounds<T>> {
-    match kernel.execution_shape() {
-        FixedKernelShape::Bounds { lower, upper } => {
-            let lower = match lower {
-                None => None,
-                Some(lower) if lower.inclusive => Some(lower.value),
-                Some(lower) => match lower.value.checked_increment() {
-                    Some(lower) => Some(lower),
-                    None => return Some(InclusiveBounds::Empty),
-                },
-            };
-            let upper = match upper {
-                None => None,
-                Some(upper) if upper.inclusive => Some(upper.value),
-                Some(upper) => match upper.value.checked_decrement() {
-                    Some(upper) => Some(upper),
-                    None => return Some(InclusiveBounds::Empty),
-                },
-            };
-            Some(match (lower, upper) {
-                (None, None) => InclusiveBounds::All,
-                (Some(lower), None) => InclusiveBounds::Lower(lower),
-                (None, Some(upper)) => InclusiveBounds::Upper(upper),
-                (Some(lower), Some(upper)) if lower <= upper => {
-                    InclusiveBounds::Between(lower, upper)
-                }
-                (Some(_), Some(_)) => InclusiveBounds::Empty,
-            })
-        }
-        _ => None,
+fn inclusive_bounds<T: DiscreteOrdered>(
+    lower: Option<FixedBound<T>>,
+    upper: Option<FixedBound<T>>,
+) -> InclusiveBounds<T> {
+    let lower = match lower {
+        None => None,
+        Some(lower) if lower.inclusive => Some(lower.value),
+        Some(lower) => match lower.value.successor() {
+            Some(lower) => Some(lower),
+            None => return InclusiveBounds::Empty,
+        },
+    };
+    let upper = match upper {
+        None => None,
+        Some(upper) if upper.inclusive => Some(upper.value),
+        Some(upper) => match upper.value.predecessor() {
+            Some(upper) => Some(upper),
+            None => return InclusiveBounds::Empty,
+        },
+    };
+    match (lower, upper) {
+        (None, None) => InclusiveBounds::All,
+        (Some(lower), None) => InclusiveBounds::Lower(lower),
+        (None, Some(upper)) => InclusiveBounds::Upper(upper),
+        (Some(lower), Some(upper)) if lower <= upper => InclusiveBounds::Between(lower, upper),
+        (Some(_), Some(_)) => InclusiveBounds::Empty,
     }
 }
 
@@ -515,9 +516,10 @@ fn try_filter_seed_i64_batch(
     if !seed || batch.nulls.is_some() {
         return false;
     }
-    let Some(bounds) = inclusive_bounds(kernel) else {
+    let FixedKernelShape::Bounds { lower, upper } = kernel.execution_shape() else {
         return false;
     };
+    let bounds = inclusive_bounds(lower, upper);
     let Some((lower, upper)) = bounds.closed_range() else {
         selection.clear();
         return true;
@@ -694,7 +696,11 @@ unsafe fn filter_i64_range_inclusive_neon(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(BatchRowOrdinal::from_index(row)) };
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
             written += 1;
         }
     }
@@ -756,7 +762,11 @@ unsafe fn filter_i64_range_inclusive_avx2(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(BatchRowOrdinal::from_index(row)) };
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
             written += 1;
         }
         row += 1;
@@ -779,9 +789,10 @@ fn try_filter_seed_i32_batch(
         return false;
     }
 
-    let Some(bounds) = inclusive_bounds(kernel) else {
+    let FixedKernelShape::Bounds { lower, upper } = kernel.execution_shape() else {
         return false;
     };
+    let bounds = inclusive_bounds(lower, upper);
     let Some((lower, upper)) = bounds.closed_range() else {
         selection.clear();
         return true;
@@ -856,7 +867,11 @@ unsafe fn filter_i32_range_inclusive_neon(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(BatchRowOrdinal::from_index(row)) };
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
             written += 1;
         }
         row += 1;
@@ -918,7 +933,11 @@ unsafe fn filter_i32_range_inclusive_avx2(
                 .read_unaligned()
         });
         if value >= lower && value <= upper {
-            unsafe { output.add(written).write(BatchRowOrdinal::from_index(row)) };
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
             written += 1;
         }
         row += 1;
@@ -927,7 +946,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
     true
 }
 
-fn filter_fixed_batch<T: BoundedInteger>(
+fn filter_fixed_batch<T: DiscreteOrdered>(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<T>,
     rows: usize,
@@ -997,7 +1016,7 @@ fn dispatch_fixed_kernel<T, L, V>(
     load: L,
     valid: V,
 ) where
-    T: BoundedInteger,
+    T: DiscreteOrdered,
     L: Fn(usize) -> T + Copy,
     V: Fn(usize) -> bool + Copy,
 {
@@ -1030,23 +1049,22 @@ fn dispatch_fixed_kernel<T, L, V>(
                 kernel.matches(value)
             });
         }
-        FixedKernelShape::Bounds { .. } => match inclusive_bounds(kernel) {
-            Some(InclusiveBounds::Empty) => selection.clear(),
-            Some(InclusiveBounds::All) => {
+        FixedKernelShape::Bounds { lower, upper } => match inclusive_bounds(lower, upper) {
+            InclusiveBounds::Empty => selection.clear(),
+            InclusiveBounds::All => {
                 filter_selection(rows, selection, seed, load, valid, |_| true);
             }
-            Some(InclusiveBounds::Lower(lower)) => {
+            InclusiveBounds::Lower(lower) => {
                 filter_selection(rows, selection, seed, load, valid, |value| value >= lower);
             }
-            Some(InclusiveBounds::Upper(upper)) => {
+            InclusiveBounds::Upper(upper) => {
                 filter_selection(rows, selection, seed, load, valid, |value| value <= upper);
             }
-            Some(InclusiveBounds::Between(lower, upper)) => {
+            InclusiveBounds::Between(lower, upper) => {
                 filter_selection(rows, selection, seed, load, valid, |value| {
                     value >= lower && value <= upper
                 });
             }
-            None => unreachable!("bounds execution shape must normalize as bounds"),
         },
     }
 }
@@ -1072,7 +1090,7 @@ fn filter_selection<T, L, V, P>(
         let mut written = 0usize;
         for row_idx in 0..rows {
             if valid(row_idx) && predicate(load(row_idx)) {
-                spare[written].write(BatchRowOrdinal::from_index(row_idx));
+                spare[written].write(BatchRowOrdinal::from_validated_index(row_idx));
                 written += 1;
             }
         }
@@ -1086,7 +1104,7 @@ fn filter_selection<T, L, V, P>(
     for read_idx in 0..selection.len() {
         let row_idx = selection[read_idx].index();
         if valid(row_idx) && predicate(load(row_idx)) {
-            selection[write_idx] = BatchRowOrdinal::from_index(row_idx);
+            selection[write_idx] = BatchRowOrdinal::from_validated_index(row_idx);
             write_idx += 1;
         }
     }
@@ -1101,9 +1119,12 @@ mod tests {
     fn scalar_i128_bounds_share_inclusive_normalization() {
         let mut kernel = FixedConjunction::new(ComparisonOperator::GreaterThan, 0_i128);
         kernel.add(ComparisonOperator::LessThan, 4);
+        let FixedKernelShape::Bounds { lower, upper } = kernel.execution_shape() else {
+            panic!("range kernel must expose bounds")
+        };
         assert_eq!(
-            inclusive_bounds(&kernel),
-            Some(InclusiveBounds::Between(1, 3))
+            inclusive_bounds(lower, upper),
+            InclusiveBounds::Between(1, 3)
         );
 
         let values = [-1_i128, 0, 1, 2, 3, 4];
@@ -1119,7 +1140,10 @@ mod tests {
         assert_eq!(selection, [2, 3, 4]);
 
         let impossible = FixedConjunction::new(ComparisonOperator::GreaterThan, i128::MAX);
-        assert_eq!(inclusive_bounds(&impossible), Some(InclusiveBounds::Empty));
+        let FixedKernelShape::Bounds { lower, upper } = impossible.execution_shape() else {
+            panic!("range kernel must expose bounds")
+        };
+        assert_eq!(inclusive_bounds(lower, upper), InclusiveBounds::Empty);
     }
 
     #[test]
@@ -1139,7 +1163,7 @@ mod tests {
                 .filter_map(|(row, value)| {
                     (20..=70)
                         .contains(value)
-                        .then_some(BatchRowOrdinal::from_index(row))
+                        .then_some(BatchRowOrdinal::from_validated_index(row))
                 })
                 .collect::<Vec<_>>();
 

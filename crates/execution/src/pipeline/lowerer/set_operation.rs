@@ -20,7 +20,6 @@ impl<'a> PipelineLowerer<'a> {
                 handle,
                 spec: spec.clone(),
                 side,
-                required: Default::default(),
             }),
             sharing,
             self.plan.node(root).output.clone(),

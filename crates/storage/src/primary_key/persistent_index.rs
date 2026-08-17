@@ -952,25 +952,46 @@ mod tests {
         let dir = tempdir().unwrap();
         let mut pi = PersistentIndex::new(dir.path()).unwrap();
         let pairs = vec![
-            (b"k1".to_vec(), RowID::new(1, 10)),
-            (b"k2".to_vec(), RowID::new(2, 20)),
+            (
+                b"k1".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)),
+            ),
+            (
+                b"k2".to_vec(),
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(20)),
+            ),
         ];
         pi.apply_upserts(&pairs).unwrap();
 
         let mut idx = pi.load().unwrap();
         assert_eq!(idx.len(), 2);
-        assert_eq!(idx.get(b"k2"), Some(RowID::new(2, 20)));
+        assert_eq!(
+            idx.get(b"k2"),
+            Some(RowID::new(2, crate::rowset::SegmentRowId::from_raw(20)))
+        );
 
         pi.flush_l0(&idx, true).unwrap();
         let new_pairs = vec![
-            (b"k2".to_vec(), RowID::new(9, 99)),
-            (b"k3".to_vec(), RowID::new(3, 30)),
+            (
+                b"k2".to_vec(),
+                RowID::new(9, crate::rowset::SegmentRowId::from_raw(99)),
+            ),
+            (
+                b"k3".to_vec(),
+                RowID::new(3, crate::rowset::SegmentRowId::from_raw(30)),
+            ),
         ];
         pi.apply_upserts(&new_pairs).unwrap();
         idx = pi.load().unwrap();
         assert_eq!(idx.len(), 3);
-        assert_eq!(idx.get(b"k2"), Some(RowID::new(9, 99)));
-        assert_eq!(idx.get(b"k3"), Some(RowID::new(3, 30)));
+        assert_eq!(
+            idx.get(b"k2"),
+            Some(RowID::new(9, crate::rowset::SegmentRowId::from_raw(99)))
+        );
+        assert_eq!(
+            idx.get(b"k3"),
+            Some(RowID::new(3, crate::rowset::SegmentRowId::from_raw(30)))
+        );
     }
 
     #[test]
@@ -978,9 +999,15 @@ mod tests {
         storage_metrics().reset_for_tests();
         let dir = tempdir().unwrap();
         let pi = PersistentIndex::new(dir.path()).unwrap();
-        pi.apply_upserts(&[(b"k1".to_vec(), RowID::new(1, 10))])
-            .unwrap();
-        assert_eq!(pi.get(b"k1").unwrap(), Some(RowID::new(1, 10)));
+        pi.apply_upserts(&[(
+            b"k1".to_vec(),
+            RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)),
+        )])
+        .unwrap();
+        assert_eq!(
+            pi.get(b"k1").unwrap(),
+            Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)))
+        );
 
         pi.apply_deletes(&[b"k1".to_vec()]).unwrap();
         assert_eq!(pi.get(b"k1").unwrap(), None);
@@ -996,15 +1023,24 @@ mod tests {
         let mut pi = PersistentIndex::new(dir.path()).unwrap();
 
         pi.apply_upserts(&[
-            (b"k1".to_vec(), RowID::new(1, 10)),
-            (b"k2".to_vec(), RowID::new(2, 20)),
+            (
+                b"k1".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(10)),
+            ),
+            (
+                b"k2".to_vec(),
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(20)),
+            ),
         ])
         .unwrap();
         let idx = pi.load().unwrap();
         pi.flush_l0(&idx, true).unwrap();
 
-        pi.apply_upserts(&[(b"k3".to_vec(), RowID::new(3, 30))])
-            .unwrap();
+        pi.apply_upserts(&[(
+            b"k3".to_vec(),
+            RowID::new(3, crate::rowset::SegmentRowId::from_raw(30)),
+        )])
+        .unwrap();
         pi.apply_deletes(&[b"k1".to_vec()]).unwrap();
 
         let rows = pi
@@ -1017,7 +1053,12 @@ mod tests {
             .unwrap();
         assert_eq!(
             rows,
-            vec![None, Some(RowID::new(2, 20)), Some(RowID::new(3, 30)), None,]
+            vec![
+                None,
+                Some(RowID::new(2, crate::rowset::SegmentRowId::from_raw(20))),
+                Some(RowID::new(3, crate::rowset::SegmentRowId::from_raw(30))),
+                None,
+            ]
         );
     }
 
@@ -1028,11 +1069,23 @@ mod tests {
         let mut pi = PersistentIndex::new(dir.path()).unwrap();
         let empty = PrimaryIndex::new();
 
-        pi.apply_upserts_at(&[(b"a".to_vec(), RowID::new(1, 1))], 10)
-            .unwrap();
+        pi.apply_upserts_at(
+            &[(
+                b"a".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+            )],
+            10,
+        )
+        .unwrap();
         pi.flush_l0(&empty, true).unwrap();
-        pi.apply_upserts_at(&[(b"b".to_vec(), RowID::new(1, 2))], 20)
-            .unwrap();
+        pi.apply_upserts_at(
+            &[(
+                b"b".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)),
+            )],
+            20,
+        )
+        .unwrap();
         pi.apply_deletes_at(&[b"b".to_vec()], 30).unwrap();
 
         assert!(!pi.has_write_in_range(b"a", 10, 99).unwrap());
@@ -1061,8 +1114,11 @@ mod tests {
         let empty = PrimaryIndex::new();
 
         for i in 0..6u32 {
-            pi.apply_upserts(&[(format!("k{i}").into_bytes(), RowID::new(1, i))])
-                .unwrap();
+            pi.apply_upserts(&[(
+                format!("k{i}").into_bytes(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+            )])
+            .unwrap();
             pi.flush_l0(&empty, true).unwrap();
         }
         pi.apply_deletes(&[b"k1".to_vec()]).unwrap();
@@ -1072,7 +1128,10 @@ mod tests {
         assert!(reopened.l2_file.is_some());
         assert!(reopened.l1_files.len() <= 1);
         assert_eq!(reopened.get(b"k1").unwrap(), None);
-        assert_eq!(reopened.get(b"k4").unwrap(), Some(RowID::new(1, 4)));
+        assert_eq!(
+            reopened.get(b"k4").unwrap(),
+            Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(4)))
+        );
     }
 
     #[test]

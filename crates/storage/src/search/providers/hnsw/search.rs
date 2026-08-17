@@ -233,7 +233,7 @@ impl VectorSearchCursor {
                                 let row = PhysicalRowRef::new(
                                     visible_segment.rowset_id,
                                     visible_segment.segment_id,
-                                    point.idx as u32,
+                                    crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                                 );
                                 (!self.snapshot.is_overlay_deleted(row))
                                     .then(|| RankedRow::new(row, point.score))
@@ -246,7 +246,7 @@ impl VectorSearchCursor {
                                     PhysicalRowRef::new(
                                         visible_segment.rowset_id,
                                         visible_segment.segment_id,
-                                        point.idx as u32,
+                                        crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                                     ),
                                     point.score,
                                 )
@@ -326,7 +326,7 @@ impl VectorSearchCursor {
                 PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    row_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
                 ),
                 self.distance
                     .similarity(self.prepared_query.as_slice(), &decoded),
@@ -392,7 +392,7 @@ fn hnsw_ranked_rows_from_points(
                 let row = PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    point.idx as u32,
+                    crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                 );
                 (!snapshot.is_overlay_deleted(row)).then(|| RankedRow::new(row, point.score))
             })
@@ -405,7 +405,7 @@ fn hnsw_ranked_rows_from_points(
                     PhysicalRowRef::new(
                         visible_segment.rowset_id,
                         visible_segment.segment_id,
-                        point.idx as u32,
+                        crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                     ),
                     point.score,
                 )

@@ -26,7 +26,6 @@ use crate::operators::join::hash::payload::{
     build_payload_chunk_ref, build_payload_with_extras_ref,
 };
 use crate::physical::properties::MemoryClass;
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::BuildTimeIntegerJoinIndexSpec;
 use crate::runtime::breaker::{
     HandleRef, HashJoinBuildSpillReclaimer, HashJoinLocalBuildSpillReclaimer, JoinBuildHandle,
@@ -55,7 +54,6 @@ pub struct HashJoinBuildSinkExec {
     pub build_output_count: usize,
     pub grouped_reduction_channels: Option<usize>,
     pub build_payload_types: Box<[LogicalType]>,
-    pub required: RequiredProperties,
     pub force_external: bool,
 }
 

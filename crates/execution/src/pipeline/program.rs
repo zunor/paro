@@ -22,14 +22,14 @@ use crate::runtime::{
     NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec, OperatorRole,
     PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
     PerfectHashAggregateEmitSourceExec, PerfectHashAggregateSinkExec, ProjectTransformExec,
-    PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
-    RowFetchTransformExec, RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin,
-    RuntimeRoleOrdinal, SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec,
-    SortBuildSinkExec, SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec,
-    SparseVectorSearchSourceExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
-    StreamingWindowTransformExec, TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec,
-    TransformExec, UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec,
-    ValuesSourceExec, VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
+    RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec, RowFetchTransformExec,
+    RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
+    SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
+    SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
+    StreamingLimitTransformExec, StreamingTopNTransformExec, StreamingWindowTransformExec,
+    TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec, TransformExec,
+    UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
+    VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
 use crate::runtime::{ChunkLayout, HandleRef, PipelineScratchLayout, RuntimeOperatorId};
 
@@ -546,9 +546,6 @@ impl OperatorRuntimeRegistry {
                     spec: spec.clone(),
                 })
             }
-            TransformSpec::PropertyRepair(spec) => TransformExec::PropertyRepair(
-                PropertyRepairTransformExec::try_new(spec.kind.clone())?,
-            ),
         };
         Ok(TransformSlot {
             operator_id,
@@ -569,11 +566,9 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::Materialize(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::CrossProductBuild(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
@@ -586,28 +581,24 @@ impl OperatorRuntimeRegistry {
                 build_output_count: spec.build_output_count,
                 grouped_reduction_channels: spec.grouped_reduction_channels,
                 build_payload_types: spec.build_payload_types.clone(),
-                required: spec.required.clone(),
                 force_external: spec.force_external,
             }),
             SinkSpec::HashAggregateBuild(spec) => {
                 SinkExec::HashAggregateBuild(HashAggregateBuildSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::UngroupedAggregate(spec) => {
                 SinkExec::UngroupedAggregate(UngroupedAggregateSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::PerfectHashAggregate(spec) => {
                 SinkExec::PerfectHashAggregate(PerfectHashAggregateSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::SortBuild(spec) => SinkExec::SortBuild(SortBuildSinkExec {
@@ -618,23 +609,19 @@ impl OperatorRuntimeRegistry {
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
                 force_external: spec.force_external,
-                required: spec.required.clone(),
             }),
             SinkSpec::TopNBuild(spec) => SinkExec::TopNBuild(TopNBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::WindowBuild(spec) => SinkExec::WindowBuild(WindowBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::PartitionAggregateWindowBuild(spec) => {
                 SinkExec::PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::SetOperationInput(spec) => {
@@ -642,45 +629,36 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
                     side: spec.side,
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::CteMaterialize(spec) => SinkExec::CteMaterialize(CteMaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::DelimCapture(spec) => SinkExec::DelimCapture(DelimCaptureSinkExec {
                 handle: HandleRef::new(spec.handle),
                 duplicate_keys: spec.duplicate_keys.clone(),
                 cached_outer: spec.cached_outer.map(HandleRef::new),
-                required: spec.required.clone(),
             }),
             SinkSpec::RecursiveTableAppend(spec) => {
                 SinkExec::RecursiveTableAppend(RecursiveTableAppendSinkExec {
                     handle: HandleRef::new(spec.handle),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::ExternalTable(spec) => SinkExec::ExternalTable(ExternalTableSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Insert(spec) => SinkExec::Insert(InsertSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Update(spec) => SinkExec::Update(UpdateSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Delete(spec) => SinkExec::Delete(DeleteSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::CopyToFile(spec) => SinkExec::CopyToFile(CopyToFileSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
         };
         Ok(SinkSlot {
@@ -874,10 +852,7 @@ mod tests {
     use paro_planner::expression::{ConstantExpression, Expression, ReferenceExpression};
     use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
-    use crate::physical::properties::{
-        NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PipelineProperties,
-        PropertyRepairKind,
-    };
+    use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
     use crate::physical::specs::{
         AggregateSpec, DeleteSpec, DummyScanSpec, FilterSpec, GraphExpandSpec, GraphScanSpec,
@@ -1072,7 +1047,6 @@ mod tests {
                     row_id_index: 1,
                     is_full_table_delete: false,
                 },
-                required: Default::default(),
             }),
             sink_sharing: SinkSharing::Exclusive,
             properties: PipelineProperties::default(),
@@ -1239,39 +1213,6 @@ mod tests {
     }
 
     #[test]
-    fn blocking_property_repair_transform_fails_program_build() {
-        let output = row_type(&["a"], &[LogicalType::Integer]);
-        let blocking_repairs = [PropertyRepairKind::Sort(OrderingSpec::new(vec![
-            OrderingColumn {
-                column: 0,
-                direction: OrderingDirection::Asc,
-                nulls: NullOrdering::Last,
-            },
-        ]))];
-
-        for repair in blocking_repairs {
-            let spec = PipelineSpec {
-                id: PipelineId::new(0),
-                source: values_source(),
-                transforms: vec![TransformSpec::PropertyRepair(
-                    super::super::graph::PropertyRepairSpec { kind: repair },
-                )],
-                sink: client_sink(),
-                sink_sharing: SinkSharing::Exclusive,
-                properties: PipelineProperties::default(),
-                output: output.clone(),
-            };
-
-            let err = PipelineProgramBuilder::default()
-                .build_program(&spec)
-                .expect_err("blocking repair should fail before runtime execution");
-            assert!(err
-                .to_string()
-                .contains("blocking property repair must be lowered into breaker pipelines"));
-        }
-    }
-
-    #[test]
     fn materialized_slots_store_typed_handle_refs_for_runtime_binding() {
         let mut handles = BreakerHandleCatalogBuilder::default();
         let handle = handles.register(
@@ -1285,10 +1226,7 @@ mod tests {
                 handle,
             }),
             transforms: Vec::new(),
-            sink: SinkSpec::Materialize(super::super::graph::MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            sink: SinkSpec::Materialize(super::super::graph::MaterializeSinkSpec { handle }),
             sink_sharing: SinkSharing::Exclusive,
             properties: PipelineProperties::default(),
             output: row_type(&["a"], &[LogicalType::Integer]),
@@ -1394,7 +1332,6 @@ mod tests {
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
                         build_output_count: 1,
-                        required: Default::default(),
                         force_external: false,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
@@ -1414,7 +1351,6 @@ mod tests {
                         super::super::graph::HashAggregateBuildSinkSpec {
                             handle: aggregate,
                             spec: aggregate_spec,
-                            required: Default::default(),
                         },
                     ),
                     sink_sharing: SinkSharing::Exclusive,
@@ -1438,7 +1374,6 @@ mod tests {
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),
                         force_external: false,
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1454,7 +1389,6 @@ mod tests {
                     sink: SinkSpec::TopNBuild(super::super::graph::TopNBuildSinkSpec {
                         handle: topn,
                         spec: topn_spec(),
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1470,7 +1404,6 @@ mod tests {
                     sink: SinkSpec::WindowBuild(super::super::graph::WindowBuildSinkSpec {
                         handle: window,
                         spec: window_spec(),
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1484,7 +1417,6 @@ mod tests {
                     transforms: Vec::new(),
                     sink: SinkSpec::CteMaterialize(super::super::graph::CteMaterializeSinkSpec {
                         handle: cte,
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

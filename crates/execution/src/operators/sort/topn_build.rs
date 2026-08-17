@@ -13,7 +13,7 @@ use paro_function::scalar::FunctionExecContext;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::sort::topn_heap::{TopNBoundaryValue, TopNHeap};
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::physical::specs::TopNSpec;
 use crate::runtime::breaker::{HandleRef, TopNHandle, TopNRuntimeState};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -33,7 +33,6 @@ use super::topn_memory_context;
 pub struct TopNBuildSinkExec {
     pub handle: HandleRef<TopNHandle>,
     pub spec: TopNSpec,
-    pub required: RequiredProperties,
 }
 
 impl TopNBuildSinkExec {

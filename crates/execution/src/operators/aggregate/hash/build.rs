@@ -50,7 +50,6 @@ use crate::operators::aggregate::post_reduction::PostAggregateReducer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::operators::sort::build::query_has_temporary_directory;
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::aggregate::AggregateSpilledOutput;
 use crate::runtime::breaker::{
@@ -75,7 +74,6 @@ const HASH_AGGREGATE_PREEMPTIVE_SPILL_CAP_PER_THREAD: usize =
 pub struct HashAggregateBuildSinkExec {
     pub handle: HandleRef<AggregateHandle>,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 impl HashAggregateBuildSinkExec {

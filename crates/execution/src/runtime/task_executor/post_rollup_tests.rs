@@ -176,7 +176,6 @@ fn perfect_rollup_graph(spec: AggregateSpec, chunks: Vec<Chunk>) -> PipelineGrap
                 sink: SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
                     handle,
                     spec: spec.clone(),
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),

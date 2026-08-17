@@ -8,7 +8,6 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_function::scalar::FunctionExecContext;
 
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::{SetOperationInputSide, SetOperationSpec};
 use crate::runtime::breaker::{HandleRef, SetOperationHandle};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
@@ -24,7 +23,6 @@ pub struct SetOperationInputSinkExec {
     pub handle: HandleRef<SetOperationHandle>,
     pub spec: SetOperationSpec,
     pub side: SetOperationInputSide,
-    pub required: RequiredProperties,
 }
 
 impl SetOperationInputSinkExec {

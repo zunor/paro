@@ -4,6 +4,7 @@
 //! DeleteVector - versioned per-segment delete bitmaps with persistence helpers.
 
 use crate::metrics::storage_metrics;
+use crate::rowset::SegmentRowId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
 use std::collections::HashMap;
@@ -43,38 +44,38 @@ impl DeleteVector {
         &self.bitmap
     }
 
-    pub fn mark_deleted(&mut self, row_id: u32) {
-        if self.bitmap.insert(row_id) {
+    pub fn mark_deleted(&mut self, row_id: SegmentRowId) {
+        if self.bitmap.insert(row_id.get()) {
             storage_metrics().inc_delete_vector_entries(1);
         }
     }
 
     pub fn extend<I>(&mut self, row_ids: I)
     where
-        I: IntoIterator<Item = u32>,
+        I: IntoIterator<Item = SegmentRowId>,
     {
         for row_id in row_ids {
             self.mark_deleted(row_id);
         }
     }
 
-    pub fn add_dels_as_new_version(&self, row_ids: &[u32], version: i64) -> Self {
+    pub fn add_dels_as_new_version(&self, row_ids: &[SegmentRowId], version: i64) -> Self {
         let mut next = self.clone();
         next.version = version;
         next.extend(row_ids.iter().copied());
         next
     }
 
-    pub fn is_deleted(&self, row_id: u32) -> bool {
-        self.bitmap.contains(row_id)
+    pub fn is_deleted(&self, row_id: SegmentRowId) -> bool {
+        self.bitmap.contains(row_id.get())
     }
 
     pub fn cardinality(&self) -> u64 {
         self.bitmap.len()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = u32> + '_ {
-        self.bitmap.iter()
+    pub fn iter(&self) -> impl Iterator<Item = SegmentRowId> + '_ {
+        self.bitmap.iter().map(SegmentRowId::from_raw)
     }
 
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
@@ -169,7 +170,11 @@ impl VersionedDeleteVector {
         }
     }
 
-    pub fn add_dels_as_new_version(&mut self, row_ids: &[u32], version: i64) -> DeleteVector {
+    pub fn add_dels_as_new_version(
+        &mut self,
+        row_ids: &[SegmentRowId],
+        version: i64,
+    ) -> DeleteVector {
         let base = self
             .latest_at(version)
             .or_else(|| self.latest().cloned())
@@ -348,9 +353,9 @@ mod tests {
     fn mark_and_check() {
         storage_metrics().reset_for_tests();
         let mut dv = DeleteVector::with_version(7);
-        dv.mark_deleted(5);
-        assert!(dv.is_deleted(5));
-        assert!(!dv.is_deleted(6));
+        dv.mark_deleted(SegmentRowId::from_raw(5));
+        assert!(dv.is_deleted(SegmentRowId::from_raw(5)));
+        assert!(!dv.is_deleted(SegmentRowId::from_raw(6)));
         assert_eq!(dv.cardinality(), 1);
         assert_eq!(dv.version(), 7);
     }
@@ -359,12 +364,12 @@ mod tests {
     fn serialize_roundtrip() {
         storage_metrics().reset_for_tests();
         let mut dv = DeleteVector::new();
-        dv.mark_deleted(1);
-        dv.mark_deleted(1000);
+        dv.mark_deleted(SegmentRowId::from_raw(1));
+        dv.mark_deleted(SegmentRowId::from_raw(1000));
         let bytes = dv.to_bytes().unwrap();
         let restored = DeleteVector::from_bytes(&bytes).unwrap();
-        assert!(restored.is_deleted(1));
-        assert!(restored.is_deleted(1000));
+        assert!(restored.is_deleted(SegmentRowId::from_raw(1)));
+        assert!(restored.is_deleted(SegmentRowId::from_raw(1000)));
         assert_eq!(restored.cardinality(), 2);
     }
 
@@ -373,12 +378,12 @@ mod tests {
         storage_metrics().reset_for_tests();
         let dir = tempdir().unwrap();
         let mut chain = VersionedDeleteVector::new();
-        chain.add_dels_as_new_version(&[7, 8], 3);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[7, 8]), 3);
         let path = chain.save_to_dir(dir.path(), 3).unwrap();
         assert!(path.exists());
         let loaded = DeleteVector::load_from_dir(dir.path(), 3).unwrap().unwrap();
-        assert!(loaded.is_deleted(7));
-        assert!(loaded.is_deleted(8));
+        assert!(loaded.is_deleted(SegmentRowId::from_raw(7)));
+        assert!(loaded.is_deleted(SegmentRowId::from_raw(8)));
         assert_eq!(loaded.version(), 3);
     }
 
@@ -389,7 +394,7 @@ mod tests {
         let mut chain = VersionedDeleteVector::new();
 
         let row_ids = [0u32, 1, 1, 7, 42, 1_024, 65_535];
-        chain.add_dels_as_new_version(&row_ids, 9);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&row_ids), 9);
 
         let expected = vec![0u32, 1, 7, 42, 1_024, 65_535];
         let loaded = chain
@@ -406,16 +411,16 @@ mod tests {
     fn version_chain_selects_latest_visible_snapshot() {
         storage_metrics().reset_for_tests();
         let mut chain = VersionedDeleteVector::new();
-        chain.add_dels_as_new_version(&[1, 2], 3);
-        chain.add_dels_as_new_version(&[9], 5);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[1, 2]), 3);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[9]), 5);
 
         let at_v3 = chain.latest_at(3).expect("snapshot at v3");
-        assert!(at_v3.is_deleted(1));
-        assert!(at_v3.is_deleted(2));
-        assert!(!at_v3.is_deleted(9));
+        assert!(at_v3.is_deleted(SegmentRowId::from_raw(1)));
+        assert!(at_v3.is_deleted(SegmentRowId::from_raw(2)));
+        assert!(!at_v3.is_deleted(SegmentRowId::from_raw(9)));
 
         let at_v5 = chain.latest_at(5).expect("snapshot at v5");
-        assert!(at_v5.is_deleted(9));
+        assert!(at_v5.is_deleted(SegmentRowId::from_raw(9)));
         assert_eq!(at_v5.cardinality(), 3);
     }
 
@@ -423,9 +428,9 @@ mod tests {
     fn version_chain_gc_keeps_anchor_version() {
         storage_metrics().reset_for_tests();
         let mut chain = VersionedDeleteVector::new();
-        chain.add_dels_as_new_version(&[1], 1);
-        chain.add_dels_as_new_version(&[2], 3);
-        chain.add_dels_as_new_version(&[3], 7);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[1]), 1);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[2]), 3);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[3]), 7);
 
         assert_eq!(chain.gc_versions_older_than(5), 1);
         let versions: Vec<i64> = chain.versions().iter().map(|dv| dv.version()).collect();
@@ -437,9 +442,9 @@ mod tests {
         storage_metrics().reset_for_tests();
         let dir = tempdir().unwrap();
         let mut chain = VersionedDeleteVector::new();
-        chain.add_dels_as_new_version(&[1, 2], 3);
-        chain.add_dels_as_new_version(&[7], 5);
-        chain.add_dels_as_new_version(&[11], 9);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[1, 2]), 3);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[7]), 5);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[11]), 9);
 
         chain.save_to_dir(dir.path(), 42).unwrap();
         let loaded = VersionedDeleteVector::load_from_dir(dir.path(), 42).unwrap();
@@ -459,7 +464,7 @@ mod tests {
     fn version_chain_latest_at_returns_none_before_first_version() {
         storage_metrics().reset_for_tests();
         let mut chain = VersionedDeleteVector::new();
-        chain.add_dels_as_new_version(&[9], 4);
+        chain.add_dels_as_new_version(SegmentRowId::from_raw_slice(&[9]), 4);
         assert!(chain.latest_at(3).is_none());
     }
 
@@ -467,7 +472,7 @@ mod tests {
     fn version_chain_rejects_legacy_payload_without_header() {
         storage_metrics().reset_for_tests();
         let mut dv = DeleteVector::new();
-        dv.mark_deleted(7);
+        dv.mark_deleted(SegmentRowId::from_raw(7));
 
         let legacy_bytes = dv.to_bytes().unwrap();
         let err = VersionedDeleteVector::from_bytes(&legacy_bytes).unwrap_err();
@@ -483,15 +488,18 @@ mod tests {
         storage_metrics().reset_for_tests();
         let mut snap = DeleteVectorSnapshot::new();
         let mut dv1 = DeleteVector::new();
-        dv1.mark_deleted(1);
+        dv1.mark_deleted(SegmentRowId::from_raw(1));
         let mut dv2 = DeleteVector::new();
-        dv2.mark_deleted(10);
-        dv2.mark_deleted(11);
+        dv2.mark_deleted(SegmentRowId::from_raw(10));
+        dv2.mark_deleted(SegmentRowId::from_raw(11));
         snap.insert(100, 0, dv1);
         snap.insert(100, 1, dv2);
         assert_eq!(snap.total_deleted_rows(), 3);
         assert_eq!(snap.total_delete_vectors(), 2);
         assert_eq!(snap.segments_in_rowset(100), 2);
-        assert!(snap.get(100, 1).unwrap().is_deleted(11));
+        assert!(snap
+            .get(100, 1)
+            .unwrap()
+            .is_deleted(SegmentRowId::from_raw(11)));
     }
 }

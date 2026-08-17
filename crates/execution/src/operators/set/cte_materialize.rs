@@ -6,7 +6,7 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::runtime::breaker::{CteHandle, HandleRef};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{
@@ -17,7 +17,6 @@ use crate::runtime::state::{BreakerHandleGlobal, CteMaterializeSinkLocal, SinkGl
 #[derive(Debug, Clone)]
 pub struct CteMaterializeSinkExec {
     pub handle: HandleRef<CteHandle>,
-    pub required: RequiredProperties,
 }
 
 impl CteMaterializeSinkExec {

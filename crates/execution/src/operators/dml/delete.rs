@@ -8,7 +8,6 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_transaction::TableId;
 
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::DeleteSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -22,7 +21,6 @@ use super::helpers::{
 #[derive(Debug, Clone)]
 pub struct DeleteSinkExec {
     pub spec: DeleteSpec,
-    pub required: RequiredProperties,
 }
 
 impl DeleteSinkExec {

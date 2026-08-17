@@ -1235,26 +1235,19 @@ fn apply_grouped_join_rewrite(
         .collect::<HashMap<_, _>>();
     let conditions = rewrite
         .null_rejection
-        .conditions()
-        .iter()
-        .cloned()
-        .map(|mut condition| -> Result<_> {
-            let Expression::ColumnRef(column) = &condition.right else {
-                return Err(paro_error::internal(
-                    "grouped-join NULL-rejection witness lost its key column",
-                ));
-            };
+        .right_keys()
+        .map(|(left, right)| -> Result<_> {
             let binding = outer_binding_map
-                .get(&column.binding)
+                .get(&right.binding)
                 .copied()
                 .ok_or_else(|| {
                     paro_error::internal("grouped-join copied source lost a witnessed key binding")
                 })?;
-            condition.right = Expression::ColumnRef(ColumnRefExpression::new(
-                binding,
-                column.return_type.clone(),
-            ));
-            Ok(condition)
+            Ok(JoinCondition::new(
+                left.clone(),
+                Expression::ColumnRef(ColumnRefExpression::new(binding, right.return_type.clone())),
+                JoinComparisonType::Equal,
+            ))
         })
         .collect::<Result<Vec<_>>>()?;
     let LogicalOperator::Projection(scalar_projection) = delim_join.right.operator else {

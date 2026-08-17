@@ -11,6 +11,7 @@
 
 use crate::metrics::storage_metrics;
 use crate::primary_key::{ComparableEncoder, RowID, NULL_ROW_ID};
+use crate::rowset::SegmentRowId;
 use crate::tablet::{KeysType, TabletSchema, TabletSchemaRef};
 use parking_lot::{Condvar, Mutex, RwLock};
 use paro_common::chunk::Chunk;
@@ -871,7 +872,10 @@ impl PrimaryIndex {
         let mut pairs = Vec::with_capacity(chunk.size());
         for (row_offset, row_idx) in (0..chunk.size()).enumerate() {
             let key = serializer.encode_row(chunk, row_idx)?;
-            let row_id = RowID::new(rssid, row_offset_start + row_offset as u32);
+            let row_id = RowID::new(
+                rssid,
+                SegmentRowId::from_raw(row_offset_start + row_offset as u32),
+            );
             pairs.push((key, row_id));
         }
         Ok(self.batch_upsert(pairs))
@@ -1239,7 +1243,7 @@ mod tests {
     fn basic_put_get_remove() {
         let idx = PrimaryIndex::new();
         let key = b"k1".to_vec();
-        let loc = RowID::new(1, 3);
+        let loc = RowID::new(1, crate::rowset::SegmentRowId::from_raw(3));
         idx.upsert(key.clone(), loc);
         assert_eq!(idx.get(&key), Some(loc));
         assert_eq!(idx.len(), 1);
@@ -1252,16 +1256,28 @@ mod tests {
     fn batch_upsert_and_snapshot() {
         let idx = PrimaryIndex::with_options(4, 1024);
         let entries = vec![
-            (b"a".to_vec(), RowID::new(1, 1)),
-            (b"b".to_vec(), RowID::new(1, 2)),
-            (b"c".to_vec(), RowID::new(2, 0)),
+            (
+                b"a".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+            ),
+            (
+                b"b".to_vec(),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)),
+            ),
+            (
+                b"c".to_vec(),
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(0)),
+            ),
         ];
         let added = idx.batch_upsert(entries.clone());
         assert_eq!(added, 3);
         assert_eq!(idx.len(), 3);
         let snap = idx.snapshot();
         assert_eq!(snap.len(), 3);
-        assert_eq!(idx.get(b"b"), Some(RowID::new(1, 2)));
+        assert_eq!(
+            idx.get(b"b"),
+            Some(RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)))
+        );
     }
 
     #[test]
@@ -1269,7 +1285,10 @@ mod tests {
         let idx = PrimaryIndex::with_options(2, 1024 * 1024);
         let keys = vec![b"a".to_vec(), b"bb".to_vec(), make_long_key(7)];
         for (i, key) in keys.iter().enumerate() {
-            idx.upsert(key.clone(), RowID::new(3, i as u32));
+            idx.upsert(
+                key.clone(),
+                RowID::new(3, crate::rowset::SegmentRowId::from_raw(i as u32)),
+            );
         }
 
         assert!(idx.contains(&keys[0]));
@@ -1281,16 +1300,30 @@ mod tests {
             keys[0].as_slice(),
         ];
         let got = idx.multi_get(query);
-        assert_eq!(got[0], Some(RowID::new(3, 2)));
+        assert_eq!(
+            got[0],
+            Some(RowID::new(3, crate::rowset::SegmentRowId::from_raw(2)))
+        );
         assert_eq!(got[1], None);
-        assert_eq!(got[2], Some(RowID::new(3, 0)));
+        assert_eq!(
+            got[2],
+            Some(RowID::new(3, crate::rowset::SegmentRowId::from_raw(0)))
+        );
     }
 
     #[test]
     fn write_conflict_window_finds_point_and_range_versions() {
         let idx = PrimaryIndex::with_options(4, 1024 * 1024);
-        idx.upsert_at(b"a".to_vec(), RowID::new(1, 1), 10);
-        idx.upsert_at(b"b".to_vec(), RowID::new(1, 2), 20);
+        idx.upsert_at(
+            b"a".to_vec(),
+            RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+            10,
+        );
+        idx.upsert_at(
+            b"b".to_vec(),
+            RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)),
+            20,
+        );
         idx.remove_at(b"b", 30);
 
         assert!(!idx.has_write_in_range(b"a", 10, 30));
@@ -1298,7 +1331,10 @@ mod tests {
 
         let conflict = idx.first_write_in_range(b"b", 19, 30).unwrap();
         assert_eq!(conflict.commit_ts(), 20);
-        assert_eq!(conflict.version.row_id, RowID::new(1, 2));
+        assert_eq!(
+            conflict.version.row_id,
+            RowID::new(1, crate::rowset::SegmentRowId::from_raw(2))
+        );
 
         let range_conflict = idx
             .first_key_range_write_in_range(Some(b"b"), Some(b"z"), 20, 30)
@@ -1313,8 +1349,14 @@ mod tests {
         let idx = PrimaryIndex::with_options(8, 1024 * 1024);
         idx.batch_upsert_at(
             [
-                (b"k1".to_vec(), RowID::new(1, 1)),
-                (b"k2".to_vec(), RowID::new(1, 2)),
+                (
+                    b"k1".to_vec(),
+                    RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+                ),
+                (
+                    b"k2".to_vec(),
+                    RowID::new(1, crate::rowset::SegmentRowId::from_raw(2)),
+                ),
             ],
             40,
         );
@@ -1332,8 +1374,14 @@ mod tests {
         let long = PrimaryIndex::with_options(4, usize::MAX / 2);
 
         for i in 0..1024u32 {
-            fixed.upsert(make_fixed_key(i), RowID::new(1, i));
-            long.upsert(make_long_key(i), RowID::new(1, i));
+            fixed.upsert(
+                make_fixed_key(i),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+            );
+            long.upsert(
+                make_long_key(i),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+            );
         }
 
         assert!(fixed.memory_usage_bytes() < long.memory_usage_bytes());
@@ -1352,7 +1400,10 @@ mod tests {
         let idx_writer = idx.clone();
         let key_writer = key.clone();
         let handle = thread::spawn(move || {
-            idx_writer.upsert(key_writer, RowID::new(1, 1));
+            idx_writer.upsert(
+                key_writer,
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(1)),
+            );
         });
 
         while fired.load(Ordering::Relaxed) == 0 {
@@ -1371,7 +1422,10 @@ mod tests {
         let key_writer = key.clone();
         let handle = thread::spawn(move || {
             let start = Instant::now();
-            idx_writer.upsert(key_writer, RowID::new(2, 7));
+            idx_writer.upsert(
+                key_writer,
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(7)),
+            );
             start.elapsed()
         });
 
@@ -1390,7 +1444,10 @@ mod tests {
         let idx = PrimaryIndex::with_options(4, usize::MAX / 2);
 
         for i in 0..4096u32 {
-            idx.upsert(make_long_key(i), RowID::new(1, i));
+            idx.upsert(
+                make_long_key(i),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+            );
         }
 
         let snapshot_usage = idx.memory_usage_bytes();
@@ -1410,14 +1467,26 @@ mod tests {
         assert_memory_usage_exact(&idx);
 
         for i in 0..512u32 {
-            idx.upsert(make_fixed_key(i), RowID::new(1, i));
-            idx.upsert(make_long_key(i), RowID::new(2, i));
+            idx.upsert(
+                make_fixed_key(i),
+                RowID::new(1, crate::rowset::SegmentRowId::from_raw(i)),
+            );
+            idx.upsert(
+                make_long_key(i),
+                RowID::new(2, crate::rowset::SegmentRowId::from_raw(i)),
+            );
         }
         assert_memory_usage_exact(&idx);
 
         for i in 0..128u32 {
-            idx.upsert(make_fixed_key(i), RowID::new(9, i));
-            idx.upsert(make_long_key(i), RowID::new(10, i));
+            idx.upsert(
+                make_fixed_key(i),
+                RowID::new(9, crate::rowset::SegmentRowId::from_raw(i)),
+            );
+            idx.upsert(
+                make_long_key(i),
+                RowID::new(10, crate::rowset::SegmentRowId::from_raw(i)),
+            );
         }
         assert_memory_usage_exact(&idx);
 
@@ -1482,7 +1551,7 @@ mod tests {
         assert_eq!(added, 2);
         assert_eq!(
             idx.get(&serializer.encode_row(&chunk, 1).unwrap()),
-            Some(RowID::new(7, 1))
+            Some(RowID::new(7, crate::rowset::SegmentRowId::from_raw(1)))
         );
     }
 
@@ -1493,11 +1562,14 @@ mod tests {
 
         let idx = PrimaryIndex::with_options(2, 1024);
         let key = b"k1".to_vec();
-        let loc = RowID::new(1, 0);
+        let loc = RowID::new(1, crate::rowset::SegmentRowId::from_raw(0));
         assert!(idx.get(&key).is_none()); // miss
         idx.upsert(key.clone(), loc);
         assert_eq!(idx.get(&key), Some(loc)); // hit
-        idx.upsert(key.clone(), RowID::new(2, 0)); // conflict
+        idx.upsert(
+            key.clone(),
+            RowID::new(2, crate::rowset::SegmentRowId::from_raw(0)),
+        ); // conflict
 
         let snap = m.snapshot();
         assert!(snap.primary_index_hits >= 1);

@@ -29,7 +29,6 @@ use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::ordered_helpers::{
     collect_ordered_rows, finalize_ordered_ungrouped, merge_ordered_collectors,
 };
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
@@ -47,7 +46,6 @@ use crate::runtime::ExpressionEvalInput;
 pub struct UngroupedAggregateSinkExec {
     pub handle: HandleRef<AggregateHandle>,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 impl UngroupedAggregateSinkExec {

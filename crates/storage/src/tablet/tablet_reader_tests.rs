@@ -630,7 +630,7 @@ fn create_rowset_with_delete_vector(
 
     let mut dv = DeleteVector::new();
     for d in deleted {
-        dv.mark_deleted(*d);
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(*d));
     }
     dv.save_to_dir(&rowset_dir, 0).unwrap();
 

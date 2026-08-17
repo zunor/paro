@@ -390,7 +390,7 @@ impl StorageDictionaryPredicateBatch {
             selection.extend(
                 (0..self.rows)
                     .filter(|row_idx| matches(*row_idx))
-                    .map(BatchRowOrdinal::from_index),
+                    .map(BatchRowOrdinal::from_validated_index),
             );
         } else {
             selection.retain(|row_idx| matches(row_idx.index()));

@@ -1047,10 +1047,7 @@ fn materialized_graph(
                 id: PipelineId::new(0),
                 source: SourceSpec::Chunk(chunk_spec),
                 transforms: Vec::new(),
-                sink: SinkSpec::Materialize(MaterializeSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),

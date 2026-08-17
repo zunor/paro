@@ -22,10 +22,7 @@ impl<'a> PipelineLowerer<'a> {
         );
         let producer = self.lower_linear_pipeline(
             producer_root,
-            SinkSpec::Materialize(MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            SinkSpec::Materialize(MaterializeSinkSpec { handle }),
             SinkSharing::Exclusive,
             &mut pipelines,
         )?;
@@ -42,7 +39,7 @@ impl<'a> PipelineLowerer<'a> {
             transforms: Vec::new(),
             sink: consumer_sink,
             sink_sharing: SinkSharing::Exclusive,
-            properties: build.properties,
+            properties: build,
             output: row_type.clone(),
         });
         self.handles.add_consumer(handle, consumer)?;

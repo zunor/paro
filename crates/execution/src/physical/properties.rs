@@ -1,15 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Canonical physical property types shared by plan and pipeline lowering.
-//!
-//! This module intentionally contains only immutable property descriptions and
-//! repair decisions. Pipeline-specific accumulation lives in
-//! `crate::pipeline::properties` so `physical` does not depend on `pipeline`.
+//! Execution contracts consumed by pipeline scheduling and memory admission.
 
 use paro_common::vector::VECTOR_SIZE;
-use paro_planner::plan::CardinalityEstimate;
-
 pub type ColumnId = usize;
 pub type MemoryBytes = u64;
 
@@ -18,9 +12,6 @@ pub struct PlanPropertyMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipelineProperties {
-    pub placement: Placement,
-    pub required: RequiredProperties,
-    pub provided: ProvidedProperties,
     pub capabilities: ExecutionCapabilities,
     pub memory: MemoryRequirement,
     pub tuning: ExecutionTuning,
@@ -29,9 +20,6 @@ pub struct PipelineProperties {
 impl Default for PipelineProperties {
     fn default() -> Self {
         Self {
-            placement: Placement::Local,
-            required: RequiredProperties::default(),
-            provided: ProvidedProperties::default(),
             capabilities: ExecutionCapabilities::default(),
             memory: MemoryRequirement::default(),
             tuning: ExecutionTuning::default(),
@@ -40,50 +28,9 @@ impl Default for PipelineProperties {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RequiredProperties {
-    pub ordering: OrderingRequirement,
-    pub partitioning: PartitioningRequirement,
-    pub batch_index: BatchIndexRequirement,
-    pub cardinality: CardinalityRequirement,
-}
-
-impl Default for RequiredProperties {
-    fn default() -> Self {
-        Self {
-            ordering: OrderingRequirement::Any,
-            partitioning: PartitioningRequirement::Any,
-            batch_index: BatchIndexRequirement::Any,
-            cardinality: CardinalityRequirement::Any,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProvidedProperties {
-    pub ordering: OrderingProperty,
-    pub partitioning: PartitioningProperty,
-    pub uniqueness: UniqueKeyProperty,
-    pub cardinality: Option<CardinalityEstimate>,
-    pub late_materialization: LateMaterializationProperty,
-}
-
-impl Default for ProvidedProperties {
-    fn default() -> Self {
-        Self {
-            ordering: OrderingProperty::Any,
-            partitioning: PartitioningProperty::None,
-            uniqueness: UniqueKeyProperty::Unknown,
-            cardinality: None,
-            late_materialization: LateMaterializationProperty::None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionCapabilities {
     pub parallelism: Parallelism,
     pub morsel: MorselCapability,
-    pub preserves_order: bool,
     pub supports_backpressure: bool,
     pub supports_spill: bool,
     pub supports_late_materialization: bool,
@@ -94,7 +41,6 @@ impl Default for ExecutionCapabilities {
         Self {
             parallelism: Parallelism::unbounded(),
             morsel: MorselCapability::None,
-            preserves_order: true,
             supports_backpressure: true,
             supports_spill: false,
             supports_late_materialization: false,
@@ -155,59 +101,6 @@ impl Default for ExecutionTuning {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Placement {
-    Local,
-    SingleTask,
-    Partitioned(MorselPartitioning),
-}
-
-impl Placement {
-    pub fn merge(self, other: Self) -> Self {
-        match (self, other) {
-            (Self::SingleTask, _) | (_, Self::SingleTask) => Self::SingleTask,
-            (Self::Partitioned(left), Self::Partitioned(right)) => {
-                if left.is_compatible_with(right) {
-                    Self::Partitioned(left)
-                } else {
-                    Self::Local
-                }
-            }
-            (Self::Partitioned(partitioning), Self::Local)
-            | (Self::Local, Self::Partitioned(partitioning)) => Self::Partitioned(partitioning),
-            (Self::Local, Self::Local) => Self::Local,
-        }
-    }
-
-    /// Whether this placement is no more restrictive than `baseline`.
-    /// `Local` can run wherever the scheduler chooses, while single-task and
-    /// partitioned placements carry constraints that only dominate the same
-    /// constraint class.
-    pub fn dominates(self, baseline: Self) -> bool {
-        match (self, baseline) {
-            (Self::Local, _) => true,
-            (Self::SingleTask, Self::SingleTask) => true,
-            (Self::Partitioned(left), Self::Partitioned(right)) => left.is_compatible_with(right),
-            _ => false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrderingProperty {
-    Any,
-    Preserved,
-    Fixed(OrderingSpec),
-    Unordered,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OrderingRequirement {
-    Any,
-    PreserveInput,
-    Fixed(OrderingSpec),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrderingSpec {
     pub columns: Vec<OrderingColumn>,
@@ -236,52 +129,6 @@ pub enum OrderingDirection {
 pub enum NullOrdering {
     First,
     Last,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PartitioningProperty {
-    None,
-    BatchIndex,
-    Morsel(MorselPartitioning),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PartitioningRequirement {
-    Any,
-    SingleTask,
-    BatchIndex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BatchIndexRequirement {
-    Any,
-    Required,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CardinalityRequirement {
-    Any,
-    AtMost(u64),
-    Exact(u64),
-}
-
-impl Default for CardinalityRequirement {
-    fn default() -> Self {
-        Self::Any
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum UniqueKeyProperty {
-    Unknown,
-    None,
-    Columns(Vec<ColumnId>),
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LateMaterializationProperty {
-    None,
-    RowIds { columns: Vec<ColumnId> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -364,173 +211,5 @@ pub struct DecompressionBudget {
 impl Default for DecompressionBudget {
     fn default() -> Self {
         Self { bytes_per_task: 0 }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MorselPartitioning {
-    pub key_count: usize,
-}
-
-impl MorselPartitioning {
-    pub fn rowset_segments() -> Self {
-        Self { key_count: 0 }
-    }
-
-    pub fn with_key_count(key_count: usize) -> Self {
-        Self { key_count }
-    }
-
-    pub fn is_compatible_with(self, other: Self) -> bool {
-        self == other
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct PropertyRepair {
-    pub repairs: Vec<PropertyRepairKind>,
-}
-
-impl PropertyRepair {
-    pub fn none() -> Self {
-        Self {
-            repairs: Vec::new(),
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.repairs.is_empty()
-    }
-
-    fn push(&mut self, repair: PropertyRepairKind) {
-        if !self.repairs.contains(&repair) {
-            self.repairs.push(repair);
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PropertyRepairKind {
-    Sort(OrderingSpec),
-    BatchIndexAdapter,
-    SingleTaskFallback,
-}
-
-pub struct PhysicalPropertySolver;
-
-impl PhysicalPropertySolver {
-    pub fn reconcile(
-        required: &RequiredProperties,
-        provided: &ProvidedProperties,
-        capabilities: &ExecutionCapabilities,
-    ) -> PropertyRepair {
-        let mut repair = PropertyRepair::none();
-
-        match &required.ordering {
-            OrderingRequirement::Any => {}
-            OrderingRequirement::PreserveInput => {
-                if matches!(
-                    provided.ordering,
-                    OrderingProperty::Unordered | OrderingProperty::Any
-                ) {
-                    repair.push(PropertyRepairKind::SingleTaskFallback);
-                }
-            }
-            OrderingRequirement::Fixed(spec) => {
-                if !matches!(&provided.ordering, OrderingProperty::Fixed(existing) if existing == spec)
-                {
-                    repair.push(PropertyRepairKind::Sort(spec.clone()));
-                }
-            }
-        }
-
-        match &required.partitioning {
-            PartitioningRequirement::Any => {}
-            PartitioningRequirement::SingleTask => {
-                if capabilities.parallelism.max != 1 {
-                    repair.push(PropertyRepairKind::SingleTaskFallback);
-                }
-            }
-            PartitioningRequirement::BatchIndex => {
-                if !matches!(provided.partitioning, PartitioningProperty::BatchIndex) {
-                    repair.push(PropertyRepairKind::BatchIndexAdapter);
-                }
-            }
-        }
-
-        if matches!(required.batch_index, BatchIndexRequirement::Required)
-            && !matches!(provided.partitioning, PartitioningProperty::BatchIndex)
-            && !repair
-                .repairs
-                .contains(&PropertyRepairKind::BatchIndexAdapter)
-        {
-            repair.push(PropertyRepairKind::BatchIndexAdapter);
-        }
-
-        repair
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn placement_merge_preserves_compatible_partitioning() {
-        let partitioning = MorselPartitioning::rowset_segments();
-
-        assert_eq!(
-            Placement::Partitioned(partitioning).merge(Placement::Partitioned(partitioning)),
-            Placement::Partitioned(partitioning)
-        );
-        assert_eq!(
-            Placement::Partitioned(partitioning).merge(Placement::Local),
-            Placement::Partitioned(partitioning)
-        );
-    }
-
-    #[test]
-    fn placement_merge_drops_incompatible_partitioning_claim() {
-        let left = MorselPartitioning::with_key_count(1);
-        let right = MorselPartitioning::with_key_count(2);
-
-        assert_eq!(
-            Placement::Partitioned(left).merge(Placement::Partitioned(right)),
-            Placement::Local
-        );
-        assert_eq!(
-            Placement::Partitioned(left).merge(Placement::SingleTask),
-            Placement::SingleTask
-        );
-    }
-
-    #[test]
-    fn placement_domination_compares_actual_scheduler_constraints() {
-        let partitioning = MorselPartitioning::rowset_segments();
-        assert!(Placement::Local.dominates(Placement::SingleTask));
-        assert!(Placement::Local.dominates(Placement::Partitioned(partitioning)));
-        assert!(
-            Placement::Partitioned(partitioning).dominates(Placement::Partitioned(partitioning))
-        );
-        assert!(!Placement::SingleTask.dominates(Placement::Local));
-        assert!(!Placement::Partitioned(partitioning).dominates(Placement::Local));
-    }
-
-    #[test]
-    fn preserve_input_repairs_parallel_interleaving_with_one_reader() {
-        let required = RequiredProperties {
-            ordering: OrderingRequirement::PreserveInput,
-            ..Default::default()
-        };
-        let provided = ProvidedProperties {
-            ordering: OrderingProperty::Unordered,
-            ..Default::default()
-        };
-        let repair = PhysicalPropertySolver::reconcile(
-            &required,
-            &provided,
-            &ExecutionCapabilities::default(),
-        );
-        assert_eq!(repair.repairs, vec![PropertyRepairKind::SingleTaskFallback]);
     }
 }

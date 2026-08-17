@@ -957,7 +957,7 @@ impl DeltaWriter {
             .pending_delete_vectors
             .entry(loc.segment_key())
             .or_default();
-        entry.mark_deleted(loc.row_offset.get());
+        entry.mark_deleted(loc.row_offset);
         Ok(())
     }
 
@@ -1223,7 +1223,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dv.cardinality(), 4);
-        assert!(dv.is_deleted(0));
+        assert!(dv.is_deleted(crate::rowset::SegmentRowId::from_raw(0)));
 
         drop(tmp);
     }

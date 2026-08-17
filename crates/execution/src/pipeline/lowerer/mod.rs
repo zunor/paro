@@ -9,15 +9,12 @@ use std::mem;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
-use paro_planner::binder::ir::OrderByNode;
-use paro_planner::expression::{Expression, ReferenceExpression};
+use paro_planner::expression::Expression;
 use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::plan::PhysicalPlan;
-use crate::physical::properties::{
-    NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PropertyRepairKind,
-};
+use crate::physical::properties::{NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
@@ -46,10 +43,7 @@ use super::graph::{
     WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
-use super::properties::{
-    emit_source_supports_parallel_probe_fusion, repair_transform, EmitSourceKind,
-    PipelinePropertyAccumulator,
-};
+use super::properties::{source_supports_parallel_probe_fusion, PipelinePropertyAccumulator};
 
 pub struct PipelineLowerer<'a> {
     plan: &'a PhysicalPlan,
@@ -110,10 +104,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Insert(InsertSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Insert(InsertSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -121,10 +112,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Update(UpdateSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Update(UpdateSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -132,10 +120,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Delete(DeleteSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Delete(DeleteSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -143,10 +128,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::CopyToFile(CopyToFileSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::CopyToFile(CopyToFileSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }

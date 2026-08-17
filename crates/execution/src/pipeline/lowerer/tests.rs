@@ -39,11 +39,7 @@ use crate::physical::generator::{PhysicalPlanGenerator, PlanBuildContext};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::node::{OperatorLabel, PhysicalPlanNode};
 use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
-use crate::physical::properties::{
-    BatchIndexRequirement, MorselCapability, MorselPartitioning, OrderingColumn, OrderingDirection,
-    OrderingRequirement, OrderingSpec, PartitioningRequirement, Placement, PlanPropertyMap,
-    PropertyRepairKind,
-};
+use crate::physical::properties::{MorselCapability, PlanPropertyMap};
 use crate::physical::specs::{ExternalProjectSpec, ExternalTableSpec, PhysicalNodeKind};
 use crate::physical::{RowType, RowsetScanSpec};
 

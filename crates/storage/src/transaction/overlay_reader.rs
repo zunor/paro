@@ -104,7 +104,7 @@ impl TxnOverlayReader {
             delete_vectors
                 .entry((location.rowset_id, location.segment_id))
                 .or_insert_with(|| DeleteVector::with_version(view.visible_version_i64()))
-                .mark_deleted(location.row_offset.get());
+                .mark_deleted(location.row_offset);
         }
 
         let spilled_artifacts = snapshot

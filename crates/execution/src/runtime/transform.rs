@@ -19,7 +19,6 @@ pub use crate::operators::row_fetch::RowFetchTransformExec;
 pub use crate::operators::sort::StreamingTopNTransformExec;
 pub use crate::operators::transform::FilterTransformExec;
 pub use crate::operators::transform::ProjectTransformExec;
-pub use crate::operators::transform::PropertyRepairTransformExec;
 pub use crate::operators::transform::StreamingLimitTransformExec;
 pub use crate::operators::window::StreamingWindowTransformExec;
 
@@ -39,7 +38,6 @@ pub enum TransformExec {
     RowFetch(RowFetchTransformExec),
     GraphProject(GraphProjectTransformExec),
     GraphShortestPath(GraphShortestPathTransformExec),
-    PropertyRepair(PropertyRepairTransformExec),
     Dyn(Box<dyn DynTransformExec>),
 }
 
@@ -60,7 +58,6 @@ impl TransformExec {
             Self::RowFetch(_) => "ROW_FETCH",
             Self::GraphProject(_) => "GRAPH_PROJECT",
             Self::GraphShortestPath(_) => "GRAPH_SHORTEST_PATH",
-            Self::PropertyRepair(_) => "PROPERTY_REPAIR",
             Self::Dyn(_) => "DYN_TRANSFORM",
         }
     }
@@ -82,7 +79,6 @@ impl TransformExec {
             Self::RowFetch(exec) => exec.create_global(ctx),
             Self::GraphProject(exec) => exec.create_global(ctx),
             Self::GraphShortestPath(exec) => exec.create_global(ctx),
-            Self::PropertyRepair(exec) => exec.create_global(ctx),
             Self::Dyn(exec) => exec.create_global(ctx),
         }
     }
@@ -108,7 +104,6 @@ impl TransformExec {
             Self::RowFetch(exec) => exec.create_local(ctx, global),
             Self::GraphProject(exec) => exec.create_local(ctx, global),
             Self::GraphShortestPath(exec) => exec.create_local(ctx, global),
-            Self::PropertyRepair(exec) => exec.create_local(ctx, global),
             Self::Dyn(exec) => exec.create_local(ctx, global),
         }
     }
@@ -137,7 +132,6 @@ impl TransformExec {
             Self::RowFetch(exec) => exec.transform(ctx, global, local, input, output),
             Self::GraphProject(exec) => exec.transform(ctx, global, local, input, output),
             Self::GraphShortestPath(exec) => exec.transform(ctx, global, local, input, output),
-            Self::PropertyRepair(exec) => exec.transform(ctx, global, local, input, output),
             Self::Dyn(exec) => exec.transform(ctx, global, local, input, output),
         }
     }
@@ -165,7 +159,6 @@ impl TransformExec {
             Self::RowFetch(exec) => exec.flush(ctx, global, local, output),
             Self::GraphProject(exec) => exec.flush(ctx, global, local, output),
             Self::GraphShortestPath(exec) => exec.flush(ctx, global, local, output),
-            Self::PropertyRepair(exec) => exec.flush(ctx, global, local, output),
             Self::Dyn(exec) => exec.flush(ctx, global, local, output),
         }
     }
@@ -191,7 +184,6 @@ impl TransformExec {
             Self::RowFetch(exec) => exec.finish_global(ctx, global),
             Self::GraphProject(exec) => exec.finish_global(ctx, global),
             Self::GraphShortestPath(exec) => exec.finish_global(ctx, global),
-            Self::PropertyRepair(exec) => exec.finish_global(ctx, global),
             Self::Dyn(exec) => exec.finish_global(ctx, global),
         }
     }

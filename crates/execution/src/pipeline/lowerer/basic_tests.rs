@@ -149,7 +149,6 @@ fn aggregate_probe_fuses_emit_into_hash_join_without_row_copy() {
         probe.properties.capabilities.parallelism,
         crate::physical::properties::Parallelism::unbounded()
     );
-    assert_eq!(probe.properties.placement, Placement::Local);
     assert!(graph
         .dependencies
         .iter()
@@ -172,7 +171,6 @@ fn single_task_breaker_emit_materializes_before_parallel_probe() {
             emit.properties.capabilities.parallelism,
             crate::physical::properties::Parallelism::single()
         );
-        assert_eq!(emit.properties.placement, Placement::SingleTask);
         assert!(matches!(emit.sink, SinkSpec::Materialize(_)));
         assert!(!emit
             .transforms
@@ -194,7 +192,6 @@ fn single_task_breaker_emit_materializes_before_parallel_probe() {
             probe.properties.capabilities.parallelism,
             crate::physical::properties::Parallelism::unbounded()
         );
-        assert_eq!(probe.properties.placement, Placement::Local);
     }
 }
 
@@ -230,7 +227,6 @@ fn partition_aggregate_window_lowers_to_build_emit_breaker_pipelines() {
     assert!(build.capabilities.supports_spill);
     let emit = &graph.pipelines[1].properties;
     assert_eq!(emit.memory.class, MemoryClass::Blocking);
-    assert!(!emit.capabilities.preserves_order);
 }
 
 #[test]

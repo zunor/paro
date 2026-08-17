@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{Vector, VECTOR_SIZE};
+use paro_common::vector::VECTOR_SIZE;
 use paro_context::{
     NoopStatementTimeoutDriver, RuntimeLimits, StatementCancelReason, StatementCancellation,
     TestStatementContextBuilder,
@@ -29,7 +29,7 @@ use paro_planner::operator::join::{AntiJoinMode, JoinComparisonType, JoinConditi
 
 use crate::explain::profiler::{ExplainProfileSnapshot, ExplainProfiler, OperatorProfiler};
 use crate::memory_runtime::QueryMemoryPool;
-use crate::physical::properties::{MemoryClass, PipelineProperties, PropertyRepairKind};
+use crate::physical::properties::{MemoryClass, PipelineProperties};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ChunkScanSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, FilterSpec,
@@ -44,7 +44,7 @@ use crate::pipeline::graph::{
     MaterializeSinkSpec, MaterializedSourceSpec, PartitionAggregateWindowBuildSinkSpec,
     PartitionAggregateWindowEmitSourceSpec, PerfectHashAggregateEmitSourceSpec,
     PerfectHashAggregateSinkSpec, PipelineDependency, PipelineGraph, PipelineId, PipelineRoot,
-    PipelineSpec, PropertyRepairSpec, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
+    PipelineSpec, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
     SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
     UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, WindowBuildSinkSpec,
     WindowEmitSourceSpec,

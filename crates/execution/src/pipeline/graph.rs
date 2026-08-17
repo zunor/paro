@@ -9,7 +9,7 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
-use crate::physical::properties::{PipelineProperties, RequiredProperties};
+use crate::physical::properties::PipelineProperties;
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ChunkScanSpec,
@@ -770,7 +770,6 @@ pub enum TransformSpec {
     RowFetch(RowFetchSpec),
     GraphProject(GraphProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
-    PropertyRepair(PropertyRepairSpec),
 }
 
 impl TransformSpec {
@@ -828,7 +827,7 @@ impl TransformSpec {
             Self::CrossProductProbe(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
-            Self::Filter(_) | Self::Limit(_) | Self::PropertyRepair(_) => input.clone(),
+            Self::Filter(_) | Self::Limit(_) => input.clone(),
         }
     }
 
@@ -854,11 +853,6 @@ impl TransformSpec {
         }
         Ok(())
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct PropertyRepairSpec {
-    pub kind: crate::physical::properties::PropertyRepairKind,
 }
 
 #[derive(Debug, Clone)]
@@ -936,32 +930,6 @@ pub enum SinkSpec {
 
 impl SinkSpec {
     #[inline]
-    pub fn required_properties(&self) -> RequiredProperties {
-        match self {
-            Self::ClientResult(spec) => spec.required.clone(),
-            Self::Materialize(spec) => spec.required.clone(),
-            Self::CrossProductBuild(spec) => spec.required.clone(),
-            Self::HashJoinBuild(spec) => spec.required.clone(),
-            Self::HashAggregateBuild(spec) => spec.required.clone(),
-            Self::UngroupedAggregate(spec) => spec.required.clone(),
-            Self::PerfectHashAggregate(spec) => spec.required.clone(),
-            Self::SortBuild(spec) => spec.required.clone(),
-            Self::TopNBuild(spec) => spec.required.clone(),
-            Self::WindowBuild(spec) => spec.required.clone(),
-            Self::PartitionAggregateWindowBuild(spec) => spec.required.clone(),
-            Self::SetOperationInput(spec) => spec.required.clone(),
-            Self::CteMaterialize(spec) => spec.required.clone(),
-            Self::DelimCapture(spec) => spec.required.clone(),
-            Self::RecursiveTableAppend(spec) => spec.required.clone(),
-            Self::ExternalTable(spec) => spec.required.clone(),
-            Self::Insert(spec) => spec.required.clone(),
-            Self::Update(spec) => spec.required.clone(),
-            Self::Delete(spec) => spec.required.clone(),
-            Self::CopyToFile(spec) => spec.required.clone(),
-        }
-    }
-
-    #[inline]
     pub fn visit_expected_handles(
         &self,
         mut visit: impl FnMut(BreakerHandleId, BreakerHandleKind) -> Result<()>,
@@ -1026,20 +994,16 @@ impl SinkSpec {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ClientResultSpec {
-    pub required: RequiredProperties,
-}
+pub struct ClientResultSpec;
 
 #[derive(Debug, Clone)]
 pub struct MaterializeSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CrossProductBuildSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1054,7 +1018,6 @@ pub struct HashJoinBuildSinkSpec {
     pub build_payload_types: Box<[LogicalType]>,
     pub build_output_count: usize,
     pub grouped_reduction_channels: Option<usize>,
-    pub required: RequiredProperties,
     pub force_external: bool,
 }
 
@@ -1062,21 +1025,18 @@ pub struct HashJoinBuildSinkSpec {
 pub struct HashAggregateBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct UngroupedAggregateSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct PerfectHashAggregateSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1088,28 +1048,24 @@ pub struct SortBuildSinkSpec {
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub force_external: bool,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct TopNBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: TopNSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct WindowBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: WindowSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct PartitionAggregateWindowBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: PartitionAggregateWindowSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1117,13 +1073,11 @@ pub struct SetOperationInputSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: SetOperationSpec,
     pub side: SetOperationInputSide,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CteMaterializeSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1131,44 +1085,37 @@ pub struct DelimCaptureSinkSpec {
     pub handle: BreakerHandleId,
     pub duplicate_keys: Box<[Expression]>,
     pub cached_outer: Option<BreakerHandleId>,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct RecursiveTableAppendSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExternalTableSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: ExternalTableSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct InsertSinkSpec {
     pub spec: InsertSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateSinkSpec {
     pub spec: UpdateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeleteSinkSpec {
     pub spec: DeleteSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CopyToFileSinkSpec {
     pub spec: CopyToFileSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -446,7 +446,7 @@ impl PredicateEvaluator {
                 seeded = true;
             } else {
                 if !seeded {
-                    matches.extend((0..rows).map(BatchRowOrdinal::from_index));
+                    matches.extend((0..rows).map(BatchRowOrdinal::from_validated_index));
                     seeded = true;
                 }
                 self.filter_selected_tree(predicate, batches_by_col, matches)?;
@@ -456,7 +456,7 @@ impl PredicateEvaluator {
             }
         }
         if !seeded {
-            matches.extend((0..rows).map(BatchRowOrdinal::from_index));
+            matches.extend((0..rows).map(BatchRowOrdinal::from_validated_index));
         }
         Ok(())
     }
@@ -585,7 +585,7 @@ impl PredicateEvaluator {
     ) -> Result<()> {
         for row_idx in 0..rows {
             if self.evaluate_tree(&self.program.tree, batches_by_col, row_idx)? {
-                matches.push(BatchRowOrdinal::from_index(row_idx));
+                matches.push(BatchRowOrdinal::from_validated_index(row_idx));
             }
         }
         Ok(())

@@ -502,9 +502,9 @@ mod tests {
     #[test]
     fn stage_match_rebase_round_trips_without_changing_domains() {
         let matches = [
-            BatchRowOrdinal::from_index(7),
-            BatchRowOrdinal::from_index(9),
-            BatchRowOrdinal::from_index(12),
+            BatchRowOrdinal::from_validated_index(7),
+            BatchRowOrdinal::from_validated_index(9),
+            BatchRowOrdinal::from_validated_index(12),
         ];
         let first = matches[0];
         let mut rebased = matches;
@@ -517,13 +517,16 @@ mod tests {
 
     #[test]
     fn stage_match_rebase_rejects_invalid_coordinate_changes() {
-        let mut underflow = [BatchRowOrdinal::from_index(2)];
-        assert!(rebase_stage_matches(&mut underflow, BatchRowOrdinal::from_index(3)).is_err());
-
-        let mut overflow = [BatchRowOrdinal::from_index(1)];
+        let mut underflow = [BatchRowOrdinal::from_validated_index(2)];
         assert!(
-            restore_stage_matches(&mut overflow, BatchRowOrdinal::from_index(VECTOR_SIZE - 1),)
-                .is_err()
+            rebase_stage_matches(&mut underflow, BatchRowOrdinal::from_validated_index(3)).is_err()
         );
+
+        let mut overflow = [BatchRowOrdinal::from_validated_index(1)];
+        assert!(restore_stage_matches(
+            &mut overflow,
+            BatchRowOrdinal::from_validated_index(VECTOR_SIZE - 1),
+        )
+        .is_err());
     }
 }

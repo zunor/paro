@@ -736,7 +736,7 @@ impl SegmentIterator {
                     let not_deleted = self
                         .delete_vector
                         .as_ref()
-                        .is_none_or(|dv| !dv.is_deleted(ord as u32));
+                        .is_none_or(|dv| !dv.is_deleted(SegmentRowId::from_raw(ord as u32)));
 
                     if matches_predicate && not_deleted {
                         rowids.push(SegmentRowId::try_from_ordinal(ord)?);
@@ -944,7 +944,7 @@ impl SegmentIterator {
             if predicate_guaranteed {
                 self.eager_predicate_matches.clear();
                 self.eager_predicate_matches
-                    .extend((0..rows_read).map(BatchRowOrdinal::from_index));
+                    .extend((0..rows_read).map(BatchRowOrdinal::from_validated_index));
             } else {
                 let evaluator = self
                     .predicate_evaluator
@@ -994,10 +994,9 @@ impl SegmentIterator {
                 self.eager_predicate_matches.retain(|&row_idx| {
                     let ordinal = start_ordinal + u64::from(row_idx.get());
                     selection_bitmap.is_none_or(|bitmap| bitmap.contains(ordinal as u32))
-                        && self
-                            .delete_vector
-                            .as_ref()
-                            .is_none_or(|deletes| !deletes.is_deleted(ordinal as u32))
+                        && self.delete_vector.as_ref().is_none_or(|deletes| {
+                            !deletes.is_deleted(SegmentRowId::from_raw(ordinal as u32))
+                        })
                 });
             }
             if self.eager_predicate_matches.is_empty() {
@@ -1187,7 +1186,7 @@ impl SegmentIterator {
                     state.predicate_matches.clear();
                     state
                         .predicate_matches
-                        .extend((0..rows_read).map(BatchRowOrdinal::from_index));
+                        .extend((0..rows_read).map(BatchRowOrdinal::from_validated_index));
                 } else if let Some(matches) = staged_matches.take() {
                     state.predicate_matches = matches;
                 } else {
@@ -1212,10 +1211,9 @@ impl SegmentIterator {
             state.predicate_matches.retain(|&row_idx| {
                 let ordinal = self.current_ordinal + u64::from(row_idx.get());
                 !(selection_bitmap.is_some_and(|bitmap| !bitmap.contains(ordinal as u32))
-                    || self
-                        .delete_vector
-                        .as_ref()
-                        .is_some_and(|deletes| deletes.is_deleted(ordinal as u32)))
+                    || self.delete_vector.as_ref().is_some_and(|deletes| {
+                        deletes.is_deleted(SegmentRowId::from_raw(ordinal as u32))
+                    }))
             });
             let dense_matches = (!materialize_sequential_rowids
                 && state.rowids.is_empty()
@@ -1395,12 +1393,15 @@ mod tests {
             None,
         ));
         reused
-            .append_rows(&raw, &[BatchRowOrdinal::from_index(0)])
+            .append_rows(&raw, &[BatchRowOrdinal::from_validated_index(0)])
             .unwrap();
 
         let dictionary_decoded = PredicateColumnBatch::Decoded(test_i32_vector(&[11]));
         reused
-            .append_rows(&dictionary_decoded, &[BatchRowOrdinal::from_index(0)])
+            .append_rows(
+                &dictionary_decoded,
+                &[BatchRowOrdinal::from_validated_index(0)],
+            )
             .unwrap();
 
         assert!(reused.take_prefix(1).unwrap().is_none());
@@ -1415,7 +1416,7 @@ mod tests {
             .collect::<Vec<_>>();
         let raw = PredicateColumnBatch::Raw(ColumnBatch::new(Bytes::from(values), None));
         reused
-            .append_rows(&raw, &[2, 0, 1].map(BatchRowOrdinal::from_index))
+            .append_rows(&raw, &[2, 0, 1].map(BatchRowOrdinal::from_validated_index))
             .unwrap();
 
         let first = reused.take_prefix(2).unwrap().expect("reused prefix");
@@ -1437,7 +1438,10 @@ mod tests {
             Some("a value longer than the inline string capacity"),
         ]));
         reused
-            .append_rows(&decoded, &[0, 1, 2].map(BatchRowOrdinal::from_index))
+            .append_rows(
+                &decoded,
+                &[0, 1, 2].map(BatchRowOrdinal::from_validated_index),
+            )
             .unwrap();
 
         let first = reused.take_prefix(2).unwrap().expect("reused prefix");
@@ -1477,7 +1481,10 @@ mod tests {
 
         let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen);
         reused
-            .append_rows(&batch, &[2, 0, 2].map(BatchRowOrdinal::from_index))
+            .append_rows(
+                &batch,
+                &[2, 0, 2].map(BatchRowOrdinal::from_validated_index),
+            )
             .unwrap();
 
         let first = reused.take_prefix(2).unwrap().expect("reused prefix");

@@ -127,7 +127,6 @@ fn sort_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                     output_names: Box::new(["v".to_string()]),
                     output_types: Box::new([LogicalType::Integer]),
                     force_external: false,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -188,7 +187,6 @@ fn topn_breaker_graph(input_rows: Vec<Vec<Expression>>, limit: usize) -> Pipelin
                 sink: SinkSpec::TopNBuild(TopNBuildSinkSpec {
                     handle,
                     spec: spec.clone(),
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -273,7 +271,6 @@ fn window_breaker_graph(input_rows: Vec<Vec<Expression>>) -> PipelineGraph {
                 sink: SinkSpec::WindowBuild(WindowBuildSinkSpec {
                     handle,
                     spec: spec.clone(),
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -365,7 +362,6 @@ fn ungrouped_aggregate_breaker_merges_and_emits_count() {
         SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -416,7 +412,6 @@ fn ungrouped_distinct_accepts_batches_larger_than_vector_size() {
         SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -451,7 +446,6 @@ fn grouped_distinct_lazily_creates_its_finalize_target_table() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -508,7 +502,6 @@ fn ungrouped_aggregate_having_can_suppress_its_single_row() {
         SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -541,7 +534,6 @@ fn hash_aggregate_breaker_groups_and_emits_counts() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -599,7 +591,6 @@ fn hash_aggregate_breaker_spills_payload_partitions_when_forced_external() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -664,7 +655,6 @@ fn hash_aggregate_breaker_preemptively_spills_payload_under_low_query_cap() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -733,7 +723,6 @@ fn hash_aggregate_breaker_does_not_spill_for_unrelated_query_memory() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -789,7 +778,6 @@ fn perfect_hash_aggregate_breaker_groups_and_emits_counts() {
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -908,7 +896,6 @@ fn perfect_hash_having_rejection_still_validates_every_aggregate_state() {
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -988,7 +975,6 @@ fn perfect_hash_post_reduction_retains_every_global_maximum_tie() {
         SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -1035,7 +1021,6 @@ fn generic_hash_post_reduction_observes_all_finalized_groups() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -1098,7 +1083,6 @@ fn external_hash_post_reduction_filters_against_the_global_spilled_domain() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),
@@ -1153,7 +1137,6 @@ fn post_reduction_precedes_having_and_both_reject_null_predicates() {
         SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
             handle: BreakerHandleId::new(0),
             spec: spec.clone(),
-            required: Default::default(),
         }),
         SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec {
             handle: BreakerHandleId::new(0),

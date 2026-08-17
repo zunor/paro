@@ -192,7 +192,7 @@ fn segment_materialized_batch_api_forces_late_materialization() {
     assert_eq!(eager_batch.physical_rows, 10);
     assert_eq!(
         eager_batch.selection.as_deref(),
-        Some([BatchRowOrdinal::from_index(7)].as_slice())
+        Some([BatchRowOrdinal::from_validated_index(7)].as_slice())
     );
     assert_eq!(
         i32::from_le_bytes(eager_batch.columns[0].1.data[..4].try_into().unwrap()),
@@ -209,7 +209,7 @@ fn segment_materialized_batch_api_forces_late_materialization() {
     assert_eq!(second_eager_batch.physical_rows, 10);
     assert_eq!(
         second_eager_batch.selection.as_deref(),
-        Some([BatchRowOrdinal::from_index(7)].as_slice())
+        Some([BatchRowOrdinal::from_validated_index(7)].as_slice())
     );
     assert!(eager.uses_late_materialize());
 
@@ -296,7 +296,9 @@ fn late_materialization_adapts_to_observed_batch_density() {
     let dense_batch = dense.next_batch_with_rowid_policy(10, false).unwrap();
     assert_eq!(dense_batch.rows, 8);
     assert_eq!(dense_batch.physical_rows, 10);
-    let expected_selection = (0..8).map(BatchRowOrdinal::from_index).collect::<Vec<_>>();
+    let expected_selection = (0..8)
+        .map(BatchRowOrdinal::from_validated_index)
+        .collect::<Vec<_>>();
     assert_eq!(
         dense_batch.selection.as_deref(),
         Some(expected_selection.as_slice())
