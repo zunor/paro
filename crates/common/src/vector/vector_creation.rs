@@ -136,11 +136,7 @@ impl Vector {
         // Create heap for string storage
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
-        let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<StringView>(),
-            values.len(),
-            allocator,
-        )?;
+        let buffer = VectorBuffer::try_with_allocator(StringView::SIZE, values.len(), allocator)?;
 
         // SAFETY: We allocated space for StringView array
         unsafe {
@@ -149,6 +145,7 @@ impl Vector {
                 match s {
                     Some(str_val) => {
                         // try_add_string handles both short (inlined) and long (heap) strings.
+                        // SAFETY: `heap` is stored in the vector with this entry.
                         *entries.add(i) = heap.try_add_string(str_val)?;
                     }
                     None => {
@@ -176,17 +173,14 @@ impl Vector {
         // Create heap for string storage
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
-        let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<StringView>(),
-            values.len(),
-            allocator,
-        )?;
+        let buffer = VectorBuffer::try_with_allocator(StringView::SIZE, values.len(), allocator)?;
 
         // SAFETY: We allocated space for StringView array
         unsafe {
             let entries = buffer.data() as *mut StringView;
             for (i, s) in values.iter().enumerate() {
                 // try_add_string handles both short (inlined) and long (heap) strings.
+                // SAFETY: `heap` is stored in the vector with this entry.
                 *entries.add(i) = heap.try_add_string(s)?;
             }
         }

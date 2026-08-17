@@ -7,7 +7,7 @@ use std::ptr;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::{LogicalType, StringView, INLINE_CAPACITY};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{Vector, VectorType};
 
 use crate::row::codec::{unsafe_api, ColumnCodec};
@@ -150,26 +150,17 @@ where
 
         // SAFETY: the row pointer and column offset identify a live varlen cell.
         let cell = unsafe { row_ptr.add(offset) };
-        let len = unsafe { ptr::read_unaligned(cell.cast::<u32>()) as usize };
-        if len <= INLINE_CAPACITY {
-            // Row varlen cells deliberately share StringView's 16-byte
-            // inline representation. Copying the complete cell avoids
-            // reconstructing the same length/prefix/suffix for every value.
-            let value = unsafe { ptr::read_unaligned(cell.cast::<StringView>()) };
+        // SAFETY: `cell` is a live row varlen cell and the row owner keeps any
+        // referenced allocation alive for this gather operation.
+        let value = unsafe { StringView::from_cell(cell) };
+        if value.is_inlined() {
             unsafe { ptr::write(entries.add(row_idx), value) };
             continue;
         }
 
-        let heap_ptr = unsafe { ptr::read_unaligned(cell.add(8).cast::<*const u8>()) };
-        if heap_ptr.is_null() {
-            return Err(paro_error::internal(format!(
-                "row gather found null heap pointer for {len}-byte value"
-            )));
-        }
-        // SAFETY: the row owner keeps the referenced varlen allocation live.
-        let bytes = unsafe { std::slice::from_raw_parts(heap_ptr, len) };
-        let value = heap.try_add_blob(bytes)?;
-        unsafe { ptr::write(entries.add(row_idx), value) };
+        // SAFETY: the output vector retains `heap` alongside the copied view.
+        let copied = unsafe { heap.try_add_blob(value.as_bytes()) }?;
+        unsafe { ptr::write(entries.add(row_idx), copied) };
     }
     Ok(())
 }

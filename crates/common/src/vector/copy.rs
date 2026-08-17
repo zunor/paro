@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
-use crate::types::{LogicalType, StringView, INLINE_CAPACITY};
+use crate::types::{LogicalType, StringView};
 
 use super::{SelectionRef, SelectionVector, StringHeap, Vector, VectorSelection, VectorType};
 
@@ -785,17 +785,21 @@ impl Vector {
         heap: &mut Option<StringHeap>,
         allocator: Arc<dyn Allocator>,
     ) -> Result<StringView> {
-        if bytes.len() <= INLINE_CAPACITY {
-            return Ok(StringView::from_bytes(bytes));
+        if let Some(value) = StringView::try_inline(bytes) {
+            return Ok(value);
         }
 
         if heap.is_none() {
             *heap = Some(StringHeap::with_allocator(1024, allocator));
         }
 
-        heap.as_mut()
-            .expect("invariant: heap was initialized")
-            .try_add_blob(bytes)
+        // SAFETY: the heap is installed alongside the returned entry in the
+        // destination vector and therefore owns its out-of-line bytes.
+        unsafe {
+            heap.as_mut()
+                .expect("invariant: heap was initialized")
+                .try_add_blob(bytes)
+        }
     }
 
     fn try_copy_flat_fixed_range(
@@ -935,7 +939,7 @@ impl Vector {
                 allocator.clone(),
             );
             let rebuilt_buffer = super::VectorBuffer::try_with_allocator(
-                std::mem::size_of::<StringView>(),
+                StringView::SIZE,
                 self.buffer.capacity(),
                 allocator,
             )?;
@@ -945,6 +949,7 @@ impl Vector {
                 let new_entries = rebuilt_buffer.data() as *mut StringView;
                 for row_idx in 0..self.count {
                     let entry = *old_entries.add(row_idx);
+                    // SAFETY: `rebuilt_heap` becomes the owner of `new_entries`.
                     *new_entries.add(row_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
                 }
 
@@ -964,6 +969,7 @@ impl Vector {
                                 "copy range missing varlen value at row {src_idx}"
                             ))
                         })?;
+                    // SAFETY: `rebuilt_heap` becomes the owner of `new_entries`.
                     *new_entries.add(dst_idx) = rebuilt_heap.try_add_blob(bytes)?;
                 }
             }
@@ -995,13 +1001,14 @@ impl Vector {
                             "copy range missing varlen value at row {src_idx}"
                         ))
                     })?;
-                *entries.add(dst_idx) = if bytes.len() <= INLINE_CAPACITY {
-                    StringView::from_bytes(bytes)
+                *entries.add(dst_idx) = if let Some(value) = StringView::try_inline(bytes) {
+                    value
                 } else {
                     let allocator = self.buffer.allocator().clone();
                     let heap = self.string_heap.get_or_insert_with(|| {
                         Arc::new(StringHeap::with_allocator(count.max(1), allocator))
                     });
+                    // SAFETY: this heap is retained by the destination vector.
                     Arc::get_mut(heap)
                         .expect("varlen append heap should be unique after shared path")
                         .try_add_blob(bytes)?

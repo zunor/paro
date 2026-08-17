@@ -8,16 +8,13 @@ use std::sync::Arc;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{SelectionVector, Vector};
 
 use super::{
     RawRowCollection, RawRowLayout, RawRowPinProperties, RawRowPinState, RawRowScanState,
     RawRowSegment,
 };
-
-/// Size threshold for inlined strings.
-const STRING_INLINE_LENGTH: usize = 12;
 
 /// Gather data from row storage to a Chunk.
 ///
@@ -279,28 +276,14 @@ pub unsafe fn read_value(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            let len = std::ptr::read(data_ptr as *const u32) as usize;
-            if len == 0 {
-                if logical_type == &LogicalType::Blob {
-                    Ok(Value::Blob(vec![]))
-                } else {
-                    Ok(Value::Varchar(String::new()))
-                }
-            } else if len <= STRING_INLINE_LENGTH {
-                let bytes = std::slice::from_raw_parts(data_ptr.add(4), len);
-                if logical_type == &LogicalType::Blob {
-                    Ok(Value::Blob(bytes.to_vec()))
-                } else {
-                    Ok(Value::Varchar(String::from_utf8_lossy(bytes).into_owned()))
-                }
+            // SAFETY: `data_ptr` addresses a live canonical row varlen cell.
+            let value = StringView::from_cell(data_ptr);
+            if logical_type == &LogicalType::Blob {
+                Ok(Value::Blob(value.as_bytes().to_vec()))
             } else {
-                let heap_ptr = std::ptr::read(data_ptr.add(8) as *const *const u8);
-                let bytes = std::slice::from_raw_parts(heap_ptr, len);
-                if logical_type == &LogicalType::Blob {
-                    Ok(Value::Blob(bytes.to_vec()))
-                } else {
-                    Ok(Value::Varchar(String::from_utf8_lossy(bytes).into_owned()))
-                }
+                Ok(Value::Varchar(
+                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                ))
             }
         }
 
@@ -554,44 +537,14 @@ fn gather_string_internal<const ALL_VALID: bool>(
         };
 
         if is_valid {
-            // SAFETY: row_ptr + offset points to string_t structure
-            unsafe {
-                let src = row_ptr.add(offset);
-
-                // Read length (4 bytes)
-                let len = std::ptr::read(src as *const u32) as usize;
-
-                if len == 0 {
-                    if is_blob {
-                        vector.try_set_blob(i, &[])?;
-                    } else {
-                        vector.try_set_string(i, "")?;
-                    }
-                } else if len <= STRING_INLINE_LENGTH {
-                    // Inline string: data starts at offset 4 (after length)
-                    let data_ptr = src.add(4);
-                    let slice = std::slice::from_raw_parts(data_ptr, len);
-                    if is_blob {
-                        vector.try_set_blob(i, slice)?;
-                    } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.try_set_string(i, s)?;
-                    } else {
-                        // Invalid UTF-8, set as empty
-                        vector.try_set_string(i, "")?;
-                    }
-                } else {
-                    // Non-inline: read heap pointer from offset 8
-                    let heap_ptr = std::ptr::read(src.add(8) as *const *const u8);
-                    let slice = std::slice::from_raw_parts(heap_ptr, len);
-                    if is_blob {
-                        vector.try_set_blob(i, slice)?;
-                    } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.try_set_string(i, s)?;
-                    } else {
-                        // Invalid UTF-8, set as empty
-                        vector.try_set_string(i, "")?;
-                    }
-                }
+            // SAFETY: `row_ptr + offset` addresses a live canonical row cell.
+            let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
+            if is_blob {
+                vector.try_set_blob(i, value.as_bytes())?;
+            } else if let Ok(text) = value.as_str() {
+                vector.try_set_string(i, text)?;
+            } else {
+                vector.try_set_string(i, "")?;
             }
             vector.try_set_null(i, false)?;
         } else {
@@ -819,37 +772,14 @@ fn gather_string_with_sel(
         let is_valid = all_valid || unsafe { is_row_valid(row_ptr, col_idx) };
 
         if is_valid {
-            unsafe {
-                let src = row_ptr.add(offset);
-                let len = std::ptr::read(src as *const u32) as usize;
-
-                if len == 0 {
-                    if vector.logical_type() == &LogicalType::Blob {
-                        vector.try_set_blob(dst_idx, &[])?;
-                    } else {
-                        vector.try_set_string(dst_idx, "")?;
-                    }
-                } else if len <= STRING_INLINE_LENGTH {
-                    let data_ptr = src.add(4);
-                    let slice = std::slice::from_raw_parts(data_ptr, len);
-                    if vector.logical_type() == &LogicalType::Blob {
-                        vector.try_set_blob(dst_idx, slice)?;
-                    } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.try_set_string(dst_idx, s)?;
-                    } else {
-                        vector.try_set_string(dst_idx, "")?;
-                    }
-                } else {
-                    let heap_ptr = std::ptr::read(src.add(8) as *const *const u8);
-                    let slice = std::slice::from_raw_parts(heap_ptr, len);
-                    if vector.logical_type() == &LogicalType::Blob {
-                        vector.try_set_blob(dst_idx, slice)?;
-                    } else if let Ok(s) = std::str::from_utf8(slice) {
-                        vector.try_set_string(dst_idx, s)?;
-                    } else {
-                        vector.try_set_string(dst_idx, "")?;
-                    }
-                }
+            // SAFETY: `row_ptr + offset` addresses a live canonical row cell.
+            let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
+            if vector.logical_type() == &LogicalType::Blob {
+                vector.try_set_blob(dst_idx, value.as_bytes())?;
+            } else if let Ok(text) = value.as_str() {
+                vector.try_set_string(dst_idx, text)?;
+            } else {
+                vector.try_set_string(dst_idx, "")?;
             }
             vector.try_set_null(dst_idx, false)?;
         } else {
@@ -959,7 +889,7 @@ unsafe fn gather_collection_payload(
                     heap_bytes = heap_bytes.saturating_add(string.len());
                 }
             }
-            let inline_size = std::mem::size_of::<paro_common::types::StringView>();
+            let inline_size = paro_common::types::StringView::SIZE;
             Ok(payload_ptr.add(source_count * inline_size + heap_bytes))
         }
         LogicalType::Struct(fields) => {
@@ -1695,14 +1625,11 @@ mod tests {
         // Write inline strings
         let strings = ["hello", "world"];
         for (i, s) in strings.iter().enumerate() {
-            let bytes = s.as_bytes();
-            let len = bytes.len();
             unsafe {
                 let dst = storage[i].as_mut_ptr().add(offset);
-                // Length (4 bytes)
-                std::ptr::write(dst as *mut u32, len as u32);
-                // Data starts at offset 4 (inline)
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(4), len);
+                let value = StringView::try_inline(s.as_bytes()).unwrap();
+                // SAFETY: `dst` is a writable varlen cell in the test row.
+                value.write_cell(dst);
             }
         }
 
@@ -1733,12 +1660,10 @@ mod tests {
 
         unsafe {
             let dst = storage[0].as_mut_ptr().add(offset);
-            // Length (4 bytes)
-            std::ptr::write(dst as *mut u32, len as u32);
-            // Prefix (4 bytes) - first 4 chars
-            std::ptr::copy_nonoverlapping(heap_data.as_ptr(), dst.add(4), 4);
-            // Heap pointer (8 bytes at offset 8)
-            std::ptr::write(dst.add(8) as *mut *const u8, heap_data.as_ptr());
+            // SAFETY: `heap_data` remains alive through gather and owns all bytes.
+            let value = StringView::from_raw_parts(heap_data.as_ptr(), len as u32);
+            // SAFETY: `dst` is a writable varlen cell in the test row.
+            value.write_cell(dst);
         }
 
         let row_locations: Vec<*const u8> = storage.iter().map(|b| b.as_ptr()).collect();
@@ -1762,9 +1687,10 @@ mod tests {
 
         unsafe {
             let dst = storage[0].as_mut_ptr().add(offset);
-            std::ptr::write(dst as *mut u32, heap_data.len() as u32);
-            std::ptr::copy_nonoverlapping(heap_data.as_ptr(), dst.add(4), 4);
-            std::ptr::write(dst.add(8) as *mut *const u8, heap_data.as_ptr());
+            // SAFETY: `heap_data` remains alive through gather and owns all bytes.
+            let value = StringView::from_raw_parts(heap_data.as_ptr(), heap_data.len() as u32);
+            // SAFETY: `dst` is a writable varlen cell in the test row.
+            value.write_cell(dst);
         }
         let row_locations: Vec<*const u8> = storage.iter().map(|row| row.as_ptr()).collect();
 

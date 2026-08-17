@@ -53,8 +53,8 @@ where
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_string_view(row);
-            let source = source_value.as_str();
+            // SAFETY: this cast accepts a VARCHAR source.
+            let source = unsafe { view.str_unchecked(row) };
             match source.trim().parse::<T>() {
                 Ok(value) => {
                     unsafe { result.set_flat::<T>(row, value) };
@@ -90,8 +90,8 @@ pub fn varchar_to_uuid_cast(
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_string_view(row);
-            let source = source_value.as_str();
+            // SAFETY: this cast accepts a VARCHAR source.
+            let source = unsafe { view.str_unchecked(row) };
             match parse_uuid_str(source) {
                 Ok(value) => {
                     unsafe { result.set_flat::<u128>(row, value) };
@@ -152,8 +152,8 @@ fn varchar_to_json_like_cast(
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_string_view(row);
-            let source = source_value.as_str();
+            // SAFETY: JSON-like casts accept a VARCHAR source.
+            let source = unsafe { view.str_unchecked(row) };
             if serde_json::from_str::<JsonValue>(source).is_ok() {
                 writer.write_str(row, source)?;
             } else if ctx.try_cast {

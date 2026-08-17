@@ -242,7 +242,29 @@ impl<'a> VarlenView<'a> {
     }
 
     #[inline]
-    pub fn get_string_view(&self, idx: usize) -> StringView {
+    pub fn bytes(&self, idx: usize) -> &[u8] {
+        // SAFETY: `entries` belongs to the borrowed vector, and the selected
+        // index is valid for this view. The returned slice is tied to `self`.
+        unsafe { (&*self.entries.add(self.sel.get(idx))).as_bytes() }
+    }
+
+    /// Read a UTF-8 value without validation.
+    ///
+    /// # Safety
+    /// The selected entry must belong to a UTF-8 logical type rather than a
+    /// binary `Blob` vector.
+    #[inline]
+    pub unsafe fn str_unchecked(&self, idx: usize) -> &str {
+        unsafe { std::str::from_utf8_unchecked(self.bytes(idx)) }
+    }
+
+    /// Copy the physical view value out of the owning vector.
+    ///
+    /// # Safety
+    /// The result must not be used after the vector borrowed by this
+    /// `VarlenView` is dropped or its backing string heap is replaced.
+    #[inline]
+    pub unsafe fn value(&self, idx: usize) -> StringView {
         unsafe { *self.entries.add(self.sel.get(idx)) }
     }
 }
@@ -755,8 +777,8 @@ mod tests {
         let dictionary = crate::test_utils::test_dictionary(base, vec![2_u32, 0]);
         let view = dictionary.try_to_varlen_view(2).unwrap();
 
-        assert_eq!(view.get_string_view(0).as_str(), "gamma");
-        assert_eq!(view.get_string_view(1).as_str(), "alpha");
+        assert_eq!(std::str::from_utf8(view.bytes(0)).unwrap(), "gamma");
+        assert_eq!(std::str::from_utf8(view.bytes(1)).unwrap(), "alpha");
     }
 
     #[test]

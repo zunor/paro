@@ -13,7 +13,7 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, Memory
 
 use super::segment::RawRowChunkPart;
 use super::{RawRowChunkState, RawRowLayout, RawRowPinProperties, RawRowPinState};
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 
 /// A block of memory for storing raw row data.
 ///
@@ -611,32 +611,32 @@ impl RawRowAllocator {
 
             let string_location = row_ptr.add(string_location_offset);
 
-            // Read length (first 4 bytes)
-            let len_ptr = string_location as *const u32;
-            let len = std::ptr::read_unaligned(len_ptr);
+            // SAFETY: `string_location` addresses a live canonical row cell.
+            let mut value = StringView::from_cell(string_location);
 
-            if len > 12 {
-                // Heap string: last 8 bytes is the pointer
-                // string_t size is 16 bytes.
-                // [len:4][prefix:4][ptr:8]
-                let ptr_location = string_location.add(8) as *mut *mut u8;
-                let current_ptr = std::ptr::read_unaligned(ptr_location);
+            if !value.is_inlined() {
+                // SAFETY: the branch established the out-of-line representation.
+                let current_ptr = value.heap_ptr();
                 let current_address = current_ptr as usize;
                 let heap_offset = current_address.checked_sub(old_heap_address).ok_or_else(|| {
                     paro_error::data_corrupted(format!(
                         "raw row varlen pointer precedes its heap range: pointer={current_address:#x} heap_base={old_heap_address:#x}"
                     ))
                 })?;
-                let string_end = heap_offset.checked_add(len as usize).ok_or_else(|| {
+                let string_end = heap_offset.checked_add(value.len()).ok_or_else(|| {
                     paro_error::data_corrupted("raw row varlen heap range overflow")
                 })?;
                 if string_end > heap_size {
                     return Err(paro_error::data_corrupted(format!(
-                        "raw row varlen pointer exceeds its heap range: offset={heap_offset} length={len} heap_size={heap_size}"
+                        "raw row varlen pointer exceeds its heap range: offset={heap_offset} length={} heap_size={heap_size}",
+                        value.len()
                     )));
                 }
                 let new_target = new_heap_ptr.add(heap_offset);
-                std::ptr::write_unaligned(ptr_location, new_target);
+                // SAFETY: relocation preserves the same immutable bytes and length.
+                value.set_ptr(new_target);
+                // SAFETY: rewrite the same live cell with its relocated pointer.
+                value.write_cell(string_location);
             }
         }
         Ok(())

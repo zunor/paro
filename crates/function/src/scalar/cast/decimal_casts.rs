@@ -299,8 +299,8 @@ pub fn varchar_to_decimal_cast(
             continue;
         }
 
-        let source_value = view.get_string_view(row);
-        let s = source_value.as_str();
+        // SAFETY: this cast accepts a VARCHAR source.
+        let s = unsafe { view.str_unchecked(row) };
 
         let (raw_value, raw_scale) = match parse_decimal_string(s) {
             Ok(v) => v,

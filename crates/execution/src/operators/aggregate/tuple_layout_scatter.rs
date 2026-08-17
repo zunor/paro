@@ -143,8 +143,7 @@ impl<'a> TupleScatterSource<'a> {
                     view,
                     last_heap_ref,
                 } => {
-                    let value = view.get_string_view(row_idx);
-                    let bytes = value.as_bytes();
+                    let bytes = view.bytes(row_idx);
                     let target_ref = if bytes.len() <= VarlenRef::inline_capacity() {
                         VarlenRef::from_inline(bytes)?
                     } else {
@@ -224,8 +223,7 @@ impl<'a> TupleScatterSource<'a> {
                 ScatterColumn::Varlen { view, .. } => {
                     let stored_ref =
                         unsafe { std::ptr::read_unaligned(stored as *const VarlenRef) };
-                    let source = view.get_string_view(row_idx);
-                    if read_varlen_ref_bytes(&stored_ref, varlen_heap)? != source.as_bytes() {
+                    if read_varlen_ref_bytes(&stored_ref, varlen_heap)? != view.bytes(row_idx) {
                         return Ok(false);
                     }
                 }

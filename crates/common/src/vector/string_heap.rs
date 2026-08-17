@@ -9,14 +9,14 @@
 use std::sync::Arc;
 
 use crate::allocator::{Allocator, ArenaAllocator, DefaultAllocator};
-use crate::error::Result;
-use crate::types::{StringView, INLINE_CAPACITY};
+use crate::error::{self as paro_error, Result};
+use crate::types::StringView;
 
 /// Arena allocator for string data.
 ///
 /// Uses `ArenaAllocator` for memory management. Memory is never moved once
-/// allocated, so pointers returned by `add_string` remain valid until the
-/// `StringHeap` is destroyed.
+/// allocated, so views returned by the unsafe insertion methods remain valid
+/// until the `StringHeap` is cleared or destroyed.
 #[derive(Debug)]
 pub struct StringHeap {
     /// Arena allocator for string storage
@@ -53,68 +53,62 @@ impl StringHeap {
         }
     }
 
-    /// Add a string to the heap, returning an `StringView`.
+    /// Test-only infallible wrapper for [`Self::try_add_string`].
+    ///
+    /// # Safety
+    /// The returned view must be stored with an owner that keeps this heap alive
+    /// and must not be used after its allocation is cleared or destroyed.
     #[cfg(test)]
     #[inline]
-    pub fn add_string(&mut self, s: &str) -> StringView {
-        self.try_add_string(s)
-            .expect("test string heap allocation failed")
+    pub unsafe fn add_string(&mut self, s: &str) -> StringView {
+        unsafe { self.try_add_string(s) }.expect("test string heap allocation failed")
     }
 
-    /// Add a string to the heap, returning an `StringView`.
+    /// Add a string to the heap, returning a `StringView`.
+    ///
+    /// # Safety
+    /// The returned view must be stored with an owner that keeps this heap alive
+    /// and must not be used after its allocation is cleared or destroyed.
     #[inline]
-    pub fn try_add_string(&mut self, s: &str) -> Result<StringView> {
-        self.try_add_blob(s.as_bytes())
+    pub unsafe fn try_add_string(&mut self, s: &str) -> Result<StringView> {
+        unsafe { self.try_add_blob(s.as_bytes()) }
     }
 
-    /// Add bytes directly to the heap, returning an `StringView`.
+    /// Test-only infallible wrapper for [`Self::try_add_blob`].
+    ///
+    /// # Safety
+    /// The returned view must be stored with an owner that keeps this heap alive
+    /// and must not be used after its allocation is cleared or destroyed.
     #[cfg(test)]
     #[inline]
-    pub fn add_blob(&mut self, bytes: &[u8]) -> StringView {
-        self.try_add_blob(bytes)
-            .expect("test string heap allocation failed")
+    pub unsafe fn add_blob(&mut self, bytes: &[u8]) -> StringView {
+        unsafe { self.try_add_blob(bytes) }.expect("test string heap allocation failed")
     }
 
-    /// Add bytes directly to the heap, returning an `StringView`.
+    /// Add bytes directly to the heap, returning a `StringView`.
+    ///
+    /// # Safety
+    /// The returned view must be stored with an owner that keeps this heap alive
+    /// and must not be used after its allocation is cleared or destroyed.
     #[inline]
-    pub fn try_add_blob(&mut self, bytes: &[u8]) -> Result<StringView> {
-        let len = bytes.len();
-
-        if len <= INLINE_CAPACITY {
-            return Ok(StringView::from_bytes(bytes));
+    pub unsafe fn try_add_blob(&mut self, bytes: &[u8]) -> Result<StringView> {
+        if let Some(value) = StringView::try_inline(bytes) {
+            return Ok(value);
         }
 
-        let result = self.try_alloc_uninit(len)?;
+        let len = u32::try_from(bytes.len())
+            .map_err(|_| paro_error::out_of_range("string heap value exceeds u32 length"))?;
+        let ptr = self.allocator.allocate(bytes.len())?;
 
+        // SAFETY: the allocation is writable for `bytes.len()` bytes and does
+        // not overlap the source. The arena keeps it stable until reset.
         unsafe {
-            let ptr = result.get_data() as *mut u8;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, len);
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
         }
 
-        let mut result = result;
-        result.finalize();
-        Ok(result)
-    }
-
-    /// Allocate uninitialized out-of-line string storage of the given length.
-    ///
-    /// Returns an StringView with uninitialized data. The caller must
-    /// fill in the data and call `finalize()` on the result.
-    ///
-    /// # Panics
-    /// Panics in debug builds if len <= INLINE_CAPACITY (use StringView::from_bytes
-    /// directly for short strings).
-    #[inline]
-    pub fn try_alloc_uninit(&mut self, len: usize) -> Result<StringView> {
-        debug_assert!(
-            len > INLINE_CAPACITY,
-            "try_alloc_uninit should only be called for strings > {} bytes",
-            INLINE_CAPACITY
-        );
-
-        let ptr = self.allocator.allocate(len)?;
-
-        Ok(unsafe { StringView::from_ptr(ptr, len as u32) })
+        // SAFETY: the bytes were fully initialized above and remain owned by
+        // this arena. The caller accepts the returned view's owner contract.
+        Ok(unsafe { StringView::from_raw_parts(ptr, len) })
     }
 
     /// Total bytes used in the heap.
@@ -196,9 +190,10 @@ mod tests {
         let mut heap = StringHeap::new();
 
         // Short string should be inlined
-        let s = heap.add_string("hello");
+        // SAFETY: `heap` remains alive while `s` is used.
+        let s = unsafe { heap.add_string("hello") };
         assert!(s.is_inlined());
-        assert_eq!(s.as_str(), "hello");
+        assert_eq!(s.as_str().unwrap(), "hello");
 
         // Heap should still be empty (no allocation for inlined strings)
         assert_eq!(heap.size(), 0);
@@ -210,9 +205,10 @@ mod tests {
 
         // Long string should be stored in heap
         let long_str = "this is a very long string that exceeds inline length";
-        let s = heap.add_string(long_str);
+        // SAFETY: `heap` remains alive while `s` is used.
+        let s = unsafe { heap.add_string(long_str) };
         assert!(!s.is_inlined());
-        assert_eq!(s.as_str(), long_str);
+        assert_eq!(s.as_str().unwrap(), long_str);
 
         // Heap should have allocated memory
         assert!(heap.size() > 0);
@@ -223,14 +219,24 @@ mod tests {
         let mut heap = StringHeap::new();
 
         // Add multiple long strings
-        let s1 = heap.add_string("first long string that needs heap allocation");
-        let s2 = heap.add_string("second long string that needs heap allocation");
-        let s3 = heap.add_string("third long string that needs heap allocation");
+        // SAFETY: `heap` remains alive and unchanged while the views are used.
+        let s1 = unsafe { heap.add_string("first long string that needs heap allocation") };
+        let s2 = unsafe { heap.add_string("second long string that needs heap allocation") };
+        let s3 = unsafe { heap.add_string("third long string that needs heap allocation") };
 
         // All pointers should still be valid
-        assert_eq!(s1.as_str(), "first long string that needs heap allocation");
-        assert_eq!(s2.as_str(), "second long string that needs heap allocation");
-        assert_eq!(s3.as_str(), "third long string that needs heap allocation");
+        assert_eq!(
+            s1.as_str().unwrap(),
+            "first long string that needs heap allocation"
+        );
+        assert_eq!(
+            s2.as_str().unwrap(),
+            "second long string that needs heap allocation"
+        );
+        assert_eq!(
+            s3.as_str().unwrap(),
+            "third long string that needs heap allocation"
+        );
     }
 
     #[test]
@@ -238,54 +244,36 @@ mod tests {
         let mut heap = StringHeap::new();
 
         // Short blob
-        let short_blob = heap.add_blob(b"hello");
+        // SAFETY: `heap` remains alive while the view is used.
+        let short_blob = unsafe { heap.add_blob(b"hello") };
         assert!(short_blob.is_inlined());
         assert_eq!(short_blob.as_bytes(), b"hello");
 
         // Long blob
         let long_data = b"this is a very long blob that exceeds inline length";
-        let long_blob = heap.add_blob(long_data);
+        // SAFETY: `heap` remains alive while the view is used.
+        let long_blob = unsafe { heap.add_blob(long_data) };
         assert!(!long_blob.is_inlined());
         assert_eq!(long_blob.as_bytes(), long_data);
-    }
-
-    #[test]
-    fn test_string_heap_try_alloc_uninit() {
-        let mut heap = StringHeap::new();
-
-        // Allocate uninitialized storage of specific length
-        let len = 50;
-        let mut s = heap.try_alloc_uninit(len).unwrap();
-
-        // Fill with data
-        unsafe {
-            let ptr = s.get_data() as *mut u8;
-            for i in 0..len {
-                *ptr.add(i) = b'x';
-            }
-        }
-        s.finalize();
-
-        assert_eq!(s.len(), len);
-        assert_eq!(s.as_str(), "x".repeat(len));
     }
 
     #[test]
     fn test_string_heap_try_add_short_string_no_allocation() {
         let mut heap = StringHeap::with_allocator(0, Arc::new(FailingAllocator));
 
-        let s = heap.try_add_string("hello").unwrap();
+        // SAFETY: the inline result is self-contained.
+        let s = unsafe { heap.try_add_string("hello") }.unwrap();
 
         assert!(s.is_inlined());
-        assert_eq!(s.as_str(), "hello");
+        assert_eq!(s.as_str().unwrap(), "hello");
     }
 
     #[test]
     fn test_string_heap_try_add_long_string_propagates_error() {
         let mut heap = StringHeap::with_allocator(0, Arc::new(FailingAllocator));
 
-        let err = heap
-            .try_add_string("this is a very long string that must allocate")
+        // SAFETY: the expected allocation error cannot produce an escaping view.
+        let err = unsafe { heap.try_add_string("this is a very long string that must allocate") }
             .unwrap_err();
 
         assert!(err.to_string().contains("injected allocation failure"));
@@ -296,7 +284,8 @@ mod tests {
         let mut heap = StringHeap::with_allocator(0, Arc::new(DefaultAllocator::new()));
 
         let data = b"this is a very long blob that exceeds inline length";
-        let blob = heap.try_add_blob(data).unwrap();
+        // SAFETY: `heap` remains alive while the view is used.
+        let blob = unsafe { heap.try_add_blob(data) }.unwrap();
 
         assert_eq!(blob.as_bytes(), data);
         assert!(heap.size() > 0);
@@ -306,7 +295,8 @@ mod tests {
     fn test_string_heap_clear() {
         let mut heap = StringHeap::new();
 
-        heap.add_string("long string that needs heap allocation here");
+        // SAFETY: the view is discarded before the heap is cleared.
+        unsafe { heap.add_string("long string that needs heap allocation here") };
         assert!(heap.size() > 0);
 
         heap.clear();
@@ -324,14 +314,15 @@ mod tests {
         let mut heap = StringHeap::new();
 
         // Exactly at inline boundary (12 bytes)
-        let s12 = heap.add_string("123456789012");
+        // SAFETY: `heap` remains alive while the views are used.
+        let s12 = unsafe { heap.add_string("123456789012") };
         assert!(s12.is_inlined());
-        assert_eq!(s12.as_str(), "123456789012");
+        assert_eq!(s12.as_str().unwrap(), "123456789012");
 
         // Just over inline boundary (13 bytes)
-        let s13 = heap.add_string("1234567890123");
+        let s13 = unsafe { heap.add_string("1234567890123") };
         assert!(!s13.is_inlined());
-        assert_eq!(s13.as_str(), "1234567890123");
+        assert_eq!(s13.as_str().unwrap(), "1234567890123");
     }
 
     #[test]
@@ -342,13 +333,14 @@ mod tests {
         // Add many long strings to trigger multiple arena chunks
         for i in 0..100 {
             let s = format!("long string number {} that needs heap allocation", i);
-            strings.push(heap.add_string(&s));
+            // SAFETY: `heap` remains alive until every collected view is read.
+            strings.push(unsafe { heap.add_string(&s) });
         }
 
         // Verify all strings are still valid
         for (i, s) in strings.iter().enumerate() {
             let expected = format!("long string number {} that needs heap allocation", i);
-            assert_eq!(s.as_str(), expected);
+            assert_eq!(s.as_str().unwrap(), expected);
         }
     }
 }

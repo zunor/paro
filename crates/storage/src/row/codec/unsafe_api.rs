@@ -5,12 +5,11 @@ use std::ptr;
 
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
+use paro_common::types::StringView;
 use paro_common::vector::Vector;
 
 use super::RowHeapWriter;
 use crate::row::RowLayout;
-
-const STRING_INLINE_LENGTH: usize = 12;
 
 #[inline]
 pub unsafe fn row_is_valid(row_ptr: *const u8, col_idx: usize) -> bool {
@@ -129,28 +128,14 @@ pub unsafe fn read_row_value(layout: &RowLayout, row_ptr: *const u8, col_idx: us
         | paro_common::types::LogicalType::Json
         | paro_common::types::LogicalType::Jsonb
         | paro_common::types::LogicalType::StringLiteral => {
-            let len = unsafe { ptr::read_unaligned(data_ptr as *const u32) as usize };
-            if len == 0 {
-                Value::Varchar(String::new())
-            } else if len <= STRING_INLINE_LENGTH {
-                let bytes = unsafe { std::slice::from_raw_parts(data_ptr.add(4), len) };
-                Value::Varchar(String::from_utf8_lossy(bytes).into_owned())
-            } else {
-                let heap_ptr = unsafe { ptr::read_unaligned(data_ptr.add(8) as *const *const u8) };
-                let bytes = unsafe { std::slice::from_raw_parts(heap_ptr, len) };
-                Value::Varchar(String::from_utf8_lossy(bytes).into_owned())
-            }
+            // SAFETY: `data_ptr` addresses a live canonical row varlen cell.
+            let value = unsafe { StringView::from_cell(data_ptr) };
+            Value::Varchar(String::from_utf8_lossy(value.as_bytes()).into_owned())
         }
         paro_common::types::LogicalType::Blob => {
-            let len = unsafe { ptr::read_unaligned(data_ptr as *const u32) as usize };
-            if len == 0 {
-                Value::Blob(vec![])
-            } else if len <= STRING_INLINE_LENGTH {
-                Value::Blob(unsafe { std::slice::from_raw_parts(data_ptr.add(4), len) }.to_vec())
-            } else {
-                let heap_ptr = unsafe { ptr::read_unaligned(data_ptr.add(8) as *const *const u8) };
-                Value::Blob(unsafe { std::slice::from_raw_parts(heap_ptr, len) }.to_vec())
-            }
+            // SAFETY: `data_ptr` addresses a live canonical row varlen cell.
+            let value = unsafe { StringView::from_cell(data_ptr) };
+            Value::Blob(value.as_bytes().to_vec())
         }
         paro_common::types::LogicalType::List(_)
         | paro_common::types::LogicalType::Array(_, _)
@@ -412,26 +397,16 @@ unsafe fn write_varlen_bytes(
     bytes: &[u8],
     heap: &mut impl RowHeapWriter,
 ) -> Result<()> {
-    unsafe {
-        let len = u32::try_from(bytes.len())
-            .map_err(|_| paro_common::error::out_of_range("row varlen value exceeds u32 length"))?;
-        ptr::write_unaligned(cell_ptr as *mut u32, len);
-        if bytes.len() <= STRING_INLINE_LENGTH {
-            if !bytes.is_empty() {
-                ptr::copy_nonoverlapping(bytes.as_ptr(), cell_ptr.add(4), bytes.len());
-            }
-            if bytes.len() < STRING_INLINE_LENGTH {
-                ptr::write_bytes(
-                    cell_ptr.add(4 + bytes.len()),
-                    0,
-                    STRING_INLINE_LENGTH - bytes.len(),
-                );
-            }
-        } else {
-            ptr::copy_nonoverlapping(bytes.as_ptr(), cell_ptr.add(4), 4);
-            let heap_ptr = heap.store_bytes(bytes)?;
-            ptr::write_unaligned(cell_ptr.add(8) as *mut *const u8, heap_ptr);
-        }
-    }
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| paro_common::error::out_of_range("row varlen value exceeds u32 length"))?;
+    let value = if let Some(value) = StringView::try_inline(bytes) {
+        value
+    } else {
+        let heap_ptr = heap.store_bytes(bytes)?;
+        // SAFETY: the row heap owns the initialized bytes for the row lifetime.
+        unsafe { StringView::from_raw_parts(heap_ptr, len) }
+    };
+    // SAFETY: `cell_ptr` addresses a writable StringView-sized row cell.
+    unsafe { value.write_cell(cell_ptr) };
     Ok(())
 }

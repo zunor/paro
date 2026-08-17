@@ -523,7 +523,8 @@ fn decode_storage_binary_plain_batch(
             std::str::from_utf8(value)
                 .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
         }
-        let entry = heap.try_add_blob(value)?;
+        // SAFETY: the target vector retains this heap with the decoded entry.
+        let entry = unsafe { heap.try_add_blob(value) }?;
         // SAFETY: begin_varlen_write returned exactly `rows` writable entries.
         unsafe { entries.add(row_idx).write(entry) };
     }
@@ -755,8 +756,9 @@ fn build_varlen_vector(
             std::str::from_utf8(value)
                 .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
         }
-        let entry = heap.try_add_blob(value)?;
-        // SAFETY: `begin_varlen_write(rows)` returns an `StringView` array
+        // SAFETY: the target vector retains this heap with the decoded entry.
+        let entry = unsafe { heap.try_add_blob(value) }?;
+        // SAFETY: `begin_varlen_write(rows)` returns a `StringView` array
         // with exactly `rows` writable entries and `row_idx < rows`.
         unsafe { entries.add(row_idx).write(entry) };
         offset = value_end;

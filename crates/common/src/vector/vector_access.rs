@@ -4,7 +4,7 @@
 use super::{StringHeap, Vector, VectorBuffer, VectorType};
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{LogicalType, StringView, INLINE_CAPACITY};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -365,7 +365,7 @@ impl Vector {
                     let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
-                Some(inline_str.as_str())
+                inline_str.as_str().ok()
             }
             VectorType::Dictionary => {
                 let physical_idx = self.selection().physical_index(idx);
@@ -738,8 +738,8 @@ impl Vector {
         self.try_make_exclusive()?;
         self.validity.try_make_exclusive()?;
 
-        let inline_value = if val.len() <= INLINE_CAPACITY {
-            StringView::from_bytes(val)
+        let inline_value = if let Some(value) = StringView::try_inline(val) {
+            value
         } else {
             self.try_add_out_of_line_varlen(idx, val)?
         };
@@ -753,7 +753,8 @@ impl Vector {
 
     fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<StringView> {
         if let Some(heap) = self.string_heap.as_mut().and_then(Arc::get_mut) {
-            return heap.try_add_blob(val);
+            // SAFETY: `heap` is retained by `self`, which also stores the view.
+            return unsafe { heap.try_add_blob(val) };
         }
 
         let preserve_entries = self
@@ -771,22 +772,21 @@ impl Vector {
             .max(1);
 
         let mut rebuilt_heap = StringHeap::with_allocator(initial_capacity, allocator.clone());
-        let rebuilt_buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<StringView>(),
-            self.buffer.capacity(),
-            allocator,
-        )?;
+        let rebuilt_buffer =
+            VectorBuffer::try_with_allocator(StringView::SIZE, self.buffer.capacity(), allocator)?;
 
         unsafe {
             let entries = self.buffer.data() as *const StringView;
             let rewritten_entries = rebuilt_buffer.data() as *mut StringView;
             for entry_idx in 0..preserve_entries {
                 let entry = *entries.add(entry_idx);
+                // SAFETY: `rebuilt_heap` becomes the owner of the rewritten buffer.
                 *rewritten_entries.add(entry_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
             }
         }
 
-        let inline_value = rebuilt_heap.try_add_blob(val)?;
+        // SAFETY: `rebuilt_heap` becomes the owner of the rewritten buffer.
+        let inline_value = unsafe { rebuilt_heap.try_add_blob(val) }?;
 
         self.buffer = rebuilt_buffer;
         self.string_heap = Some(Arc::new(rebuilt_heap));

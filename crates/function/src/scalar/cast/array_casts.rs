@@ -273,10 +273,10 @@ pub fn varchar_to_array_cast(
             continue;
         }
 
-        let s = source_view.get_string_view(row);
-        let s = s.as_str();
+        // SAFETY: this parser is reached only for a VARCHAR source.
+        let s = unsafe { source_view.str_unchecked(row) };
 
-        match parse_vector_literal(&s) {
+        match parse_vector_literal(s) {
             Ok(values) => {
                 if values.len() != target_size {
                     let error_msg = format!(

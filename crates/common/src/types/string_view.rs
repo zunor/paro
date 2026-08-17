@@ -1,23 +1,29 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! ## Implementation Notes
-//! - 16-byte string type with inline optimization
-//! - Strings ≤12 bytes are stored inline (no heap allocation)
-//! - Longer strings store 4-byte prefix for fast comparison + pointer
-//! - Self-contained: can be compared without external heap reference
+//! A non-owning, 16-byte view over variable-length bytes.
+//!
+//! Values up to 12 bytes are stored directly in the view. Longer values retain
+//! a four-byte comparison prefix and a pointer into storage owned elsewhere,
+//! normally a vector [`StringHeap`](crate::vector::StringHeap) or a row heap.
 
 use std::cmp::Ordering;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-/// Maximum length for inlined strings.
-pub const INLINE_CAPACITY: usize = 12;
+const LENGTH_LEN: usize = std::mem::size_of::<u32>();
+const PREFIX_LEN: usize = 4;
+const INLINE_CAPACITY: usize = 12;
+const INLINE_SUFFIX_LEN: usize = INLINE_CAPACITY - PREFIX_LEN;
 
-/// Prefix length for pointer strings.
-pub const PREFIX_LEN: usize = 4;
+#[repr(C)]
+#[derive(Clone, Copy)]
+union StringViewPayload {
+    pointer: *const u8,
+    inline: [u8; INLINE_SUFFIX_LEN],
+}
 
-/// String view type (16 bytes).
+/// Non-owning view over a variable-length byte sequence.
 ///
 /// Layout:
 /// ```text
@@ -30,119 +36,137 @@ pub const PREFIX_LEN: usize = 4;
 /// - Inlined (≤12 bytes): `[length: u32][inlined: [u8; 12]]`
 /// - Pointer (>12 bytes): `[length: u32][prefix: [u8; 4]][ptr: *const u8]`
 ///
-/// # Safety
-/// For pointer strings, the caller must ensure the pointed data remains valid
-/// for the lifetime of this `StringView`. Typically, the data lives in a `StringHeap`.
+/// Inline values are canonical: every unused byte in the 12-byte payload is
+/// zero. Equality relies on this invariant for its fixed-width inline fast path.
+/// All constructors and row-cell writers owned by this type preserve it.
+///
+/// Out-of-line values do not own their data. Unsafe construction sites must
+/// keep the backing allocation alive and immutable for every use of the view.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct StringView {
-    /// String length in bytes
+    /// Viewed length in bytes
     length: u32,
     /// First 4 bytes: prefix (for pointer) or inlined[0..4]
-    prefix: [u8; 4],
+    prefix: [u8; PREFIX_LEN],
     /// Last 8 bytes: pointer (for long strings) or inlined[4..12]
-    ptr_or_inlined: u64,
+    payload: StringViewPayload,
 }
 
+const _: () = assert!(INLINE_CAPACITY == PREFIX_LEN + INLINE_SUFFIX_LEN);
+const _: () = assert!(std::mem::size_of::<*const u8>() == INLINE_SUFFIX_LEN);
+const _: () = assert!(StringView::SIZE == 16);
+const _: () = assert!(std::mem::size_of::<StringView>() == StringView::SIZE);
+const _: () = assert!(std::mem::offset_of!(StringView, length) == 0);
+const _: () = assert!(std::mem::offset_of!(StringView, prefix) == LENGTH_LEN);
+const _: () = assert!(std::mem::offset_of!(StringView, payload) == LENGTH_LEN + PREFIX_LEN);
+
+// SAFETY: an out-of-line view points to immutable bytes. Moving or sharing the
+// view between threads is sound when its unsafe construction contract is upheld:
+// the backing owner must outlive every access and must not mutate the bytes.
+unsafe impl Send for StringView {}
+// SAFETY: see the `Send` implementation above.
+unsafe impl Sync for StringView {}
+
 impl StringView {
-    /// Create a new StringView from a string slice.
+    /// Fixed physical width of a view and of a compatible row cell.
+    pub const SIZE: usize = LENGTH_LEN + INLINE_CAPACITY;
+
+    /// Maximum byte length stored directly in the view.
+    pub const INLINE_CAPACITY: usize = INLINE_CAPACITY;
+
+    /// Number of leading bytes cached by an out-of-line view.
+    pub const PREFIX_LEN: usize = PREFIX_LEN;
+
+    /// Construct a self-contained inline view.
     ///
-    /// For short strings (≤12 bytes), data is stored inline.
-    /// For longer strings, only the pointer is stored - caller must ensure
-    /// the data remains valid.
+    /// Returns `None` when `bytes` exceeds [`Self::INLINE_CAPACITY`]. Longer
+    /// values must be installed in an owning heap before a view is created.
     #[inline]
-    pub fn new(s: &str) -> Self {
-        Self::from_bytes(s.as_bytes())
-    }
-
-    /// Create a StringView from raw bytes.
-    #[inline]
-    pub fn from_bytes(bytes: &[u8]) -> Self {
-        let len = bytes.len() as u32;
-
-        if bytes.len() <= INLINE_CAPACITY {
-            // Inlined: copy data directly
-            let mut prefix = [0u8; 4];
-            let mut suffix = [0u8; 8];
-
-            let prefix_len = bytes.len().min(4);
-            prefix[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
-
-            if bytes.len() > 4 {
-                let suffix_len = bytes.len() - 4;
-                suffix[..suffix_len].copy_from_slice(&bytes[4..]);
-            }
-
-            Self {
-                length: len,
-                prefix,
-                ptr_or_inlined: u64::from_le_bytes(suffix),
-            }
-        } else {
-            // Pointer: store prefix + pointer
-            let mut prefix = [0u8; 4];
-            prefix.copy_from_slice(&bytes[..PREFIX_LEN]);
-
-            Self {
-                length: len,
-                prefix,
-                ptr_or_inlined: bytes.as_ptr() as u64,
-            }
+    pub fn try_inline(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() > INLINE_CAPACITY {
+            return None;
         }
+
+        let mut prefix = [0u8; PREFIX_LEN];
+        let mut suffix = [0u8; INLINE_SUFFIX_LEN];
+        let prefix_len = bytes.len().min(PREFIX_LEN);
+        prefix[..prefix_len].copy_from_slice(&bytes[..prefix_len]);
+
+        if bytes.len() > PREFIX_LEN {
+            let suffix_len = bytes.len() - PREFIX_LEN;
+            suffix[..suffix_len].copy_from_slice(&bytes[PREFIX_LEN..]);
+        }
+
+        Some(Self {
+            length: bytes.len() as u32,
+            prefix,
+            payload: StringViewPayload { inline: suffix },
+        })
     }
 
-    /// Create a StringView from a raw pointer and length.
+    /// Construct a view from initialized raw bytes.
     ///
     /// # Safety
-    /// The pointer must point to valid UTF-8 data of at least `len` bytes,
-    /// and must remain valid for the lifetime of this StringView.
+    /// - `ptr` must be readable for `len` initialized bytes.
+    /// - For `len > Self::INLINE_CAPACITY`, the allocation must remain alive
+    ///   and immutable for every subsequent access through the returned view.
+    /// - The returned view must not escape that backing allocation's lifetime.
     #[inline]
-    pub unsafe fn from_ptr(ptr: *const u8, len: u32) -> Self {
+    pub unsafe fn from_raw_parts(ptr: *const u8, len: u32) -> Self {
         if (len as usize) <= INLINE_CAPACITY {
-            // Inlined: copy data
-            let mut prefix = [0u8; 4];
-            let mut suffix = [0u8; 8];
+            let mut prefix = [0u8; PREFIX_LEN];
+            let mut suffix = [0u8; INLINE_SUFFIX_LEN];
 
-            let prefix_len = (len as usize).min(4);
-            std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), prefix_len);
+            let prefix_len = (len as usize).min(PREFIX_LEN);
+            if prefix_len != 0 {
+                unsafe { std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), prefix_len) };
+            }
 
-            if len > 4 {
-                let suffix_len = len as usize - 4;
-                std::ptr::copy_nonoverlapping(ptr.add(4), suffix.as_mut_ptr(), suffix_len);
+            if len as usize > PREFIX_LEN {
+                let suffix_len = len as usize - PREFIX_LEN;
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ptr.add(PREFIX_LEN),
+                        suffix.as_mut_ptr(),
+                        suffix_len,
+                    )
+                };
             }
 
             Self {
                 length: len,
                 prefix,
-                ptr_or_inlined: u64::from_le_bytes(suffix),
+                payload: StringViewPayload { inline: suffix },
             }
         } else {
-            // Pointer: store prefix + pointer
-            let mut prefix = [0u8; 4];
-            std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), PREFIX_LEN);
+            let mut prefix = [0u8; PREFIX_LEN];
+            unsafe { std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), PREFIX_LEN) };
 
             Self {
                 length: len,
                 prefix,
-                ptr_or_inlined: ptr as u64,
+                payload: StringViewPayload { pointer: ptr },
             }
         }
     }
 
-    /// Create an empty string.
+    /// Create an empty view.
     #[inline]
     pub const fn empty() -> Self {
         Self {
             length: 0,
-            prefix: [0u8; 4],
-            ptr_or_inlined: 0,
+            prefix: [0u8; PREFIX_LEN],
+            payload: StringViewPayload {
+                inline: [0u8; INLINE_SUFFIX_LEN],
+            },
         }
     }
 
     /// Returns true if the string is stored inline (≤12 bytes).
     #[inline]
     pub fn is_inlined(&self) -> bool {
-        (self.length as usize) <= INLINE_CAPACITY
+        (self.length as usize) <= Self::INLINE_CAPACITY
     }
 
     /// Returns the length of the string in bytes.
@@ -157,192 +181,118 @@ impl StringView {
         self.length == 0
     }
 
-    /// Get the raw data pointer.
-    ///
-    /// For inlined strings, returns pointer to internal buffer.
-    /// For pointer strings, returns the stored pointer.
-    #[inline]
-    pub fn get_data(&self) -> *const u8 {
-        if self.is_inlined() {
-            self.prefix.as_ptr()
-        } else {
-            self.ptr_or_inlined as *const u8
-        }
-    }
-
-    /// Get the string data as a byte slice.
+    /// Borrow the viewed bytes.
     #[inline]
     pub fn as_bytes(&self) -> &[u8] {
         if self.is_inlined() {
-            // For inlined strings, we need to reconstruct from prefix + suffix
-            // SAFETY: We're reading from our own struct
+            // SAFETY: the layout assertions above guarantee a contiguous,
+            // initialized 12-byte inline payload immediately after `length`.
             unsafe {
-                let ptr = &self.prefix as *const [u8; 4] as *const u8;
-                std::slice::from_raw_parts(ptr, self.len())
+                let inline = std::ptr::from_ref(self).cast::<u8>().add(LENGTH_LEN);
+                std::slice::from_raw_parts(inline, self.len())
             }
         } else {
-            // SAFETY: Pointer is valid (caller's responsibility)
+            // SAFETY: validity is part of the out-of-line view invariant
+            // established by every unsafe construction boundary.
             unsafe {
-                let ptr = self.ptr_or_inlined as *const u8;
+                let ptr = self.payload.pointer;
                 std::slice::from_raw_parts(ptr, self.len())
             }
         }
     }
 
-    /// Get the string data as a str slice.
+    /// Interpret the viewed bytes as UTF-8.
+    #[inline]
+    pub fn as_str(&self) -> Result<&str, std::str::Utf8Error> {
+        std::str::from_utf8(self.as_bytes())
+    }
+
+    /// Interpret the viewed bytes as UTF-8 without validation.
     ///
     /// # Safety
-    /// Assumes the data is valid UTF-8. This is guaranteed if the StringView
-    /// was created from valid UTF-8 data.
+    /// The bytes must be valid UTF-8. Callers normally establish this from the
+    /// logical type of the owning vector (for example `LogicalType::Varchar`).
     #[inline]
-    pub fn as_str(&self) -> &str {
-        // SAFETY: We assume valid UTF-8 (enforced at construction)
+    pub unsafe fn as_str_unchecked(&self) -> &str {
         unsafe { std::str::from_utf8_unchecked(self.as_bytes()) }
     }
 
-    /// Get the prefix bytes (first 4 bytes).
-    ///
-    /// Used for fast comparison of long strings.
+    /// Return the cached leading bytes used by comparisons.
     #[inline]
-    pub fn get_prefix(&self) -> &[u8; 4] {
+    pub fn prefix(&self) -> &[u8; PREFIX_LEN] {
         &self.prefix
     }
 
-    /// Update the pointer for a pointer string.
+    /// Return the backing pointer for an out-of-line value.
+    ///
+    /// # Safety
+    /// The view must not be inline, and its backing allocation must still be
+    /// alive under the view's construction contract.
+    #[inline]
+    pub unsafe fn heap_ptr(&self) -> *const u8 {
+        debug_assert!(!self.is_inlined(), "inline values have no heap pointer");
+        // SAFETY: the caller guarantees that the pointer representation is active.
+        unsafe { self.payload.pointer }
+    }
+
+    /// Update the pointer for an out-of-line value.
     ///
     /// Used when relocating string data (e.g., after StringHeap reallocation).
     ///
     /// # Safety
-    /// - Must only be called on pointer strings (len > 12)
-    /// - New pointer must point to valid data of the same length
+    /// - Must only be called on out-of-line values (len > 12)
+    /// - New pointer must point to the same byte sequence at a new location,
+    ///   preserving the cached prefix and length
     #[inline]
     pub unsafe fn set_ptr(&mut self, new_ptr: *const u8) {
         debug_assert!(!self.is_inlined(), "Cannot set_ptr on inlined string");
-        self.ptr_or_inlined = new_ptr as u64;
+        self.payload = StringViewPayload { pointer: new_ptr };
     }
 
-    /// Finalize the string by updating the prefix from the data.
+    /// Read a view from an unaligned physical row cell.
     ///
-    /// Call this after modifying the underlying data to ensure the prefix
-    /// is consistent with the actual string content.
+    /// # Safety
+    /// `src` must be readable for [`Self::SIZE`] bytes and contain a canonical
+    /// cell previously written by [`Self::write_cell`]. Any out-of-line pointer
+    /// in the cell must remain valid and immutable for every use of the result.
     #[inline]
-    pub fn finalize(&mut self) {
-        if self.is_inlined() {
-            // For inlined strings, zero out unused bytes in suffix
-            let len = self.len();
-            if len < 4 {
-                // Zero unused prefix bytes
-                for item in self.prefix.iter_mut().take(4).skip(len) {
-                    *item = 0;
-                }
-                self.ptr_or_inlined = 0;
-            } else if len < 12 {
-                // Zero unused suffix bytes
-                let suffix_len = len - 4;
-                let mut suffix = self.ptr_or_inlined.to_le_bytes();
-                for item in suffix.iter_mut().take(8).skip(suffix_len) {
-                    *item = 0;
-                }
-                self.ptr_or_inlined = u64::from_le_bytes(suffix);
-            }
+    pub unsafe fn from_cell(src: *const u8) -> Self {
+        let value = unsafe { std::ptr::read_unaligned(src.cast::<Self>()) };
+        debug_assert!(value.has_canonical_inline_padding());
+        value
+    }
+
+    /// Write this view to an unaligned physical row cell.
+    ///
+    /// # Safety
+    /// `dst` must be writable for [`Self::SIZE`] bytes. For an out-of-line
+    /// value, the caller must ensure that the backing owner outlives the cell.
+    #[inline]
+    pub unsafe fn write_cell(&self, dst: *mut u8) {
+        debug_assert!(self.has_canonical_inline_padding());
+        unsafe { std::ptr::write_unaligned(dst.cast::<Self>(), *self) };
+    }
+
+    #[inline]
+    fn inline_suffix(&self) -> [u8; INLINE_SUFFIX_LEN] {
+        debug_assert!(self.is_inlined());
+        // SAFETY: the inline representation is active by the length invariant.
+        unsafe { self.payload.inline }
+    }
+
+    #[inline]
+    fn has_canonical_inline_padding(&self) -> bool {
+        if !self.is_inlined() {
+            return true;
+        }
+
+        let len = self.len();
+        let suffix = self.inline_suffix();
+        if len < PREFIX_LEN {
+            self.prefix[len..].iter().all(|byte| *byte == 0) && suffix.iter().all(|byte| *byte == 0)
         } else {
-            // For pointer strings, copy prefix from data
-            // SAFETY: Pointer is valid
-            unsafe {
-                let data_ptr = self.ptr_or_inlined as *const u8;
-                std::ptr::copy_nonoverlapping(data_ptr, self.prefix.as_mut_ptr(), PREFIX_LEN);
-            }
+            suffix[len - PREFIX_LEN..].iter().all(|byte| *byte == 0)
         }
-    }
-}
-
-// --- Comparison operations ---
-
-impl StringView {
-    /// Fast equality check using bulk comparison.
-    ///
-    /// Optimized path:
-    /// 1. Compare first 8 bytes (length + prefix) as u64
-    /// 2. Compare next 8 bytes as u64
-    /// 3. For pointer strings with same prefix, compare full data
-    #[inline]
-    pub fn equals(&self, other: &Self) -> bool {
-        // Quick length check
-        if self.length != other.length {
-            return false;
-        }
-
-        // Compare prefix
-        if self.prefix != other.prefix {
-            return false;
-        }
-
-        if self.is_inlined() {
-            // For inlined strings, compare the suffix
-            self.ptr_or_inlined == other.ptr_or_inlined
-        } else {
-            // For pointer strings, compare actual data
-            // (prefix already matched, so compare full data)
-            let len = self.len();
-            let self_data = self.ptr_or_inlined as *const u8;
-            let other_data = other.ptr_or_inlined as *const u8;
-
-            // SAFETY: Pointers are valid
-            unsafe {
-                std::slice::from_raw_parts(self_data, len)
-                    == std::slice::from_raw_parts(other_data, len)
-            }
-        }
-    }
-
-    /// Lexicographic greater-than comparison.
-    ///
-    /// Optimized path:
-    /// 1. Compare prefixes first (fast path for different prefixes)
-    /// 2. Fall back to full memcmp for equal prefixes
-    #[inline]
-    pub fn greater_than(&self, other: &Self) -> bool {
-        let self_len = self.len();
-        let other_len = other.len();
-        let min_len = self_len.min(other_len);
-
-        // Compare prefixes first (for strings >= 4 bytes)
-        if min_len >= PREFIX_LEN {
-            let self_prefix = u32::from_be_bytes(self.prefix);
-            let other_prefix = u32::from_be_bytes(other.prefix);
-
-            if self_prefix != other_prefix {
-                return self_prefix > other_prefix;
-            }
-        }
-
-        // Full comparison
-        let self_data = self.as_bytes();
-        let other_data = other.as_bytes();
-
-        match self_data[..min_len].cmp(&other_data[..min_len]) {
-            Ordering::Greater => true,
-            Ordering::Less => false,
-            Ordering::Equal => self_len > other_len,
-        }
-    }
-
-    /// Lexicographic less-than comparison.
-    #[inline]
-    pub fn less_than(&self, other: &Self) -> bool {
-        other.greater_than(self)
-    }
-
-    /// Lexicographic greater-than-or-equal comparison.
-    #[inline]
-    pub fn greater_than_or_equal(&self, other: &Self) -> bool {
-        !self.less_than(other)
-    }
-
-    /// Lexicographic less-than-or-equal comparison.
-    #[inline]
-    pub fn less_than_or_equal(&self, other: &Self) -> bool {
-        !self.greater_than(other)
     }
 }
 
@@ -357,7 +307,17 @@ impl Default for StringView {
 impl PartialEq for StringView {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.equals(other)
+        if self.length != other.length || self.prefix != other.prefix {
+            return false;
+        }
+
+        if self.is_inlined() {
+            self.inline_suffix() == other.inline_suffix()
+        } else {
+            // Prefix and length already match, so compare only the remaining
+            // bytes. This is the single variable-width equality read.
+            self.as_bytes()[PREFIX_LEN..] == other.as_bytes()[PREFIX_LEN..]
+        }
     }
 }
 
@@ -373,12 +333,25 @@ impl PartialOrd for StringView {
 impl Ord for StringView {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        if self.equals(other) {
-            Ordering::Equal
-        } else if self.greater_than(other) {
-            Ordering::Greater
+        let self_len = self.len();
+        let other_len = other.len();
+        let min_len = self_len.min(other_len);
+
+        let content_ordering = if min_len >= PREFIX_LEN {
+            let prefix_ordering =
+                u32::from_be_bytes(self.prefix).cmp(&u32::from_be_bytes(other.prefix));
+            if prefix_ordering != Ordering::Equal {
+                return prefix_ordering;
+            }
+            self.as_bytes()[PREFIX_LEN..min_len].cmp(&other.as_bytes()[PREFIX_LEN..min_len])
         } else {
-            Ordering::Less
+            self.prefix[..min_len].cmp(&other.prefix[..min_len])
+        };
+
+        if content_ordering == Ordering::Equal {
+            self_len.cmp(&other_len)
+        } else {
+            content_ordering
         }
     }
 }
@@ -391,31 +364,10 @@ impl Hash for StringView {
 
 impl fmt::Debug for StringView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StringView({:?})", self.as_str())
-    }
-}
-
-impl fmt::Display for StringView {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.as_str())
-    }
-}
-
-impl From<&str> for StringView {
-    fn from(s: &str) -> Self {
-        Self::new(s)
-    }
-}
-
-impl From<String> for StringView {
-    fn from(s: String) -> Self {
-        Self::new(&s)
-    }
-}
-
-impl From<&String> for StringView {
-    fn from(s: &String) -> Self {
-        Self::new(s)
+        match self.as_str() {
+            Ok(value) => f.debug_tuple("StringView").field(&value).finish(),
+            Err(_) => f.debug_tuple("StringView").field(&self.as_bytes()).finish(),
+        }
     }
 }
 
@@ -424,6 +376,17 @@ impl From<&String> for StringView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn view(value: &'static str) -> StringView {
+        view_bytes(value.as_bytes())
+    }
+
+    fn view_bytes(value: &'static [u8]) -> StringView {
+        StringView::try_inline(value).unwrap_or_else(|| {
+            // SAFETY: byte and string literals have immutable static storage.
+            unsafe { StringView::from_raw_parts(value.as_ptr(), value.len() as u32) }
+        })
+    }
 
     #[test]
     fn test_size() {
@@ -436,40 +399,40 @@ mod tests {
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
         assert!(s.is_inlined());
-        assert_eq!(s.as_str(), "");
+        assert_eq!(s.as_str().unwrap(), "");
     }
 
     #[test]
     fn test_short_inlined() {
-        let s = StringView::new("hello");
+        let s = view("hello");
         assert!(!s.is_empty());
         assert_eq!(s.len(), 5);
         assert!(s.is_inlined());
-        assert_eq!(s.as_str(), "hello");
+        assert_eq!(s.as_str().unwrap(), "hello");
     }
 
     #[test]
     fn test_max_inlined_string() {
-        let s = StringView::new("123456789012");
+        let s = view("123456789012");
         assert_eq!(s.len(), 12);
         assert!(s.is_inlined());
-        assert_eq!(s.as_str(), "123456789012");
+        assert_eq!(s.as_str().unwrap(), "123456789012");
     }
 
     #[test]
     fn test_long_string_pointer() {
         let data = "1234567890123";
-        let s = StringView::new(data);
+        let s = view(data);
         assert_eq!(s.len(), 13);
         assert!(!s.is_inlined());
-        assert_eq!(s.as_str(), data);
+        assert_eq!(s.as_str().unwrap(), data);
     }
 
     #[test]
     fn test_equality_inlined() {
-        let s1 = StringView::new("hello");
-        let s2 = StringView::new("hello");
-        let s3 = StringView::new("world");
+        let s1 = view("hello");
+        let s2 = view("hello");
+        let s3 = view("world");
 
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
@@ -481,9 +444,9 @@ mod tests {
         let data2 = "this is a long string";
         let data3 = "this is another long string";
 
-        let s1 = StringView::new(data1);
-        let s2 = StringView::new(data2);
-        let s3 = StringView::new(data3);
+        let s1 = view(data1);
+        let s2 = view(data2);
+        let s3 = view(data3);
 
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
@@ -491,9 +454,9 @@ mod tests {
 
     #[test]
     fn test_ordering_inlined() {
-        let s1 = StringView::new("apple");
-        let s2 = StringView::new("banana");
-        let s3 = StringView::new("apple");
+        let s1 = view("apple");
+        let s2 = view("banana");
+        let s3 = view("apple");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -503,9 +466,9 @@ mod tests {
 
     #[test]
     fn test_ordering_pointer() {
-        let s1 = StringView::new("apple is a fruit");
-        let s2 = StringView::new("banana is a fruit");
-        let s3 = StringView::new("apple is a fruit");
+        let s1 = view("apple is a fruit");
+        let s2 = view("banana is a fruit");
+        let s3 = view("apple is a fruit");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -515,8 +478,8 @@ mod tests {
 
     #[test]
     fn test_length_ordering() {
-        let s1 = StringView::new("abc");
-        let s2 = StringView::new("abcd");
+        let s1 = view("abc");
+        let s2 = view("abcd");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -524,25 +487,26 @@ mod tests {
 
     #[test]
     fn test_prefix_optimization() {
-        let s1 = StringView::new("aaaa_long_string_here");
-        let s2 = StringView::new("bbbb_long_string_here");
+        let s1 = view("aaaa_long_string_here");
+        let s2 = view("bbbb_long_string_here");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
     }
 
     #[test]
-    fn test_from_bytes() {
+    fn test_try_inline() {
         let bytes = b"hello world";
-        let s = StringView::from_bytes(bytes);
+        let s = StringView::try_inline(bytes).unwrap();
         assert_eq!(s.as_bytes(), bytes);
+        assert!(StringView::try_inline(b"thirteen bytes").is_none());
     }
 
     #[test]
-    fn test_from_ptr() {
+    fn test_from_raw_parts() {
         let data = "test string";
-        let s = unsafe { StringView::from_ptr(data.as_ptr(), data.len() as u32) };
-        assert_eq!(s.as_str(), data);
+        let s = unsafe { StringView::from_raw_parts(data.as_ptr(), data.len() as u32) };
+        assert_eq!(s.as_str().unwrap(), data);
     }
 
     #[test]
@@ -550,44 +514,45 @@ mod tests {
         use std::collections::HashSet;
 
         let mut set = HashSet::new();
-        set.insert(StringView::new("hello"));
-        set.insert(StringView::new("world"));
-        set.insert(StringView::new("hello"));
+        set.insert(view("hello"));
+        set.insert(view("world"));
+        set.insert(view("hello"));
 
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&StringView::new("hello")));
-        assert!(set.contains(&StringView::new("world")));
+        assert!(set.contains(&view("hello")));
+        assert!(set.contains(&view("world")));
     }
 
     #[test]
-    fn test_finalize() {
-        let mut s = StringView::new("hi");
-        s.finalize();
-        assert_eq!(s.as_str(), "hi");
+    fn test_cell_roundtrip_preserves_canonical_layout() {
+        let value = view("hi");
+        let mut cell = [0xff; StringView::SIZE];
+        // SAFETY: `cell` is writable for one complete view.
+        unsafe { value.write_cell(cell.as_mut_ptr()) };
+        assert!(cell[4 + value.len()..].iter().all(|byte| *byte == 0));
+
+        // SAFETY: the cell was just initialized by `write_cell` and contains
+        // only inline bytes, so it has no external lifetime dependency.
+        let decoded = unsafe { StringView::from_cell(cell.as_ptr()) };
+        assert_eq!(decoded, value);
     }
 
     #[test]
     fn test_default() {
         let s: StringView = Default::default();
         assert!(s.is_empty());
-        assert_eq!(s.as_str(), "");
-    }
-
-    #[test]
-    fn test_display() {
-        let s = StringView::new("hello");
-        assert_eq!(format!("{}", s), "hello");
+        assert_eq!(s.as_str().unwrap(), "");
     }
 
     #[test]
     fn test_very_short_strings() {
-        let s1 = StringView::new("a");
-        let s2 = StringView::new("ab");
-        let s3 = StringView::new("abc");
+        let s1 = view("a");
+        let s2 = view("ab");
+        let s3 = view("abc");
 
-        assert_eq!(s1.as_str(), "a");
-        assert_eq!(s2.as_str(), "ab");
-        assert_eq!(s3.as_str(), "abc");
+        assert_eq!(s1.as_str().unwrap(), "a");
+        assert_eq!(s2.as_str().unwrap(), "ab");
+        assert_eq!(s3.as_str().unwrap(), "abc");
 
         assert!(s1 < s2);
         assert!(s2 < s3);
@@ -595,96 +560,57 @@ mod tests {
 
     #[test]
     fn test_boundary_strings() {
-        let s4 = StringView::new("1234");
-        let s8 = StringView::new("12345678");
-        let s12 = StringView::new("123456789012");
-        let s13 = StringView::new("1234567890123");
+        let s4 = view("1234");
+        let s8 = view("12345678");
+        let s12 = view("123456789012");
+        let s13 = view("1234567890123");
 
         assert!(s4.is_inlined());
         assert!(s8.is_inlined());
         assert!(s12.is_inlined());
         assert!(!s13.is_inlined());
 
-        assert_eq!(s4.as_str(), "1234");
-        assert_eq!(s8.as_str(), "12345678");
-        assert_eq!(s12.as_str(), "123456789012");
-        assert_eq!(s13.as_str(), "1234567890123");
-    }
-
-    // ==========================================================================
-    #[test]
-    fn test_comparison_equals_method() {
-        // Test the equals() method directly
-        let s1 = StringView::new("hello");
-        let s2 = StringView::new("hello");
-        let s3 = StringView::new("world");
-
-        assert!(s1.equals(&s2));
-        assert!(!s1.equals(&s3));
-
-        // Long strings
-        let long1 = StringView::new("this is a very long string");
-        let long2 = StringView::new("this is a very long string");
-        let long3 = StringView::new("this is a different long string");
-
-        assert!(long1.equals(&long2));
-        assert!(!long1.equals(&long3));
+        assert_eq!(s4.as_str().unwrap(), "1234");
+        assert_eq!(s8.as_str().unwrap(), "12345678");
+        assert_eq!(s12.as_str().unwrap(), "123456789012");
+        assert_eq!(s13.as_str().unwrap(), "1234567890123");
     }
 
     #[test]
-    fn test_comparison_greater_than_method() {
-        // Test the greater_than() method directly
-        let apple = StringView::new("apple");
-        let banana = StringView::new("banana");
+    fn test_equality_trait_fast_paths() {
+        let s1 = view("hello");
+        let s2 = view("hello");
+        let s3 = view("world");
 
-        assert!(!apple.greater_than(&banana));
-        assert!(banana.greater_than(&apple));
-        assert!(!apple.greater_than(&apple));
-    }
+        assert_eq!(s1, s2);
+        assert_ne!(s1, s3);
 
-    #[test]
-    fn test_comparison_less_than_method() {
-        // Test the less_than() method directly
-        let apple = StringView::new("apple");
-        let banana = StringView::new("banana");
+        let long1 = view("this is a very long string");
+        let long2 = view("this is a very long string");
+        let long3 = view("this is a different long string");
 
-        assert!(apple.less_than(&banana));
-        assert!(!banana.less_than(&apple));
-        assert!(!apple.less_than(&apple));
-    }
-
-    #[test]
-    fn test_comparison_gte_lte_methods() {
-        let s1 = StringView::new("abc");
-        let s2 = StringView::new("abc");
-        let s3 = StringView::new("abd");
-
-        assert!(s1.greater_than_or_equal(&s2));
-        assert!(s1.less_than_or_equal(&s2));
-        assert!(s1.less_than_or_equal(&s3));
-        assert!(s3.greater_than_or_equal(&s1));
+        assert_eq!(long1, long2);
+        assert_ne!(long1, long3);
     }
 
     #[test]
     fn test_mixed_inlined_pointer_comparison() {
         // Compare short (inlined) with long (pointer) strings
-        let short = StringView::new("abc");
-        let long = StringView::new("abcdefghijklmnop");
+        let short = view("abc");
+        let long = view("abcdefghijklmnop");
 
         assert!(short < long);
-        assert!(short.less_than(&long));
         assert!(long > short);
-        assert!(long.greater_than(&short));
         assert_ne!(short, long);
     }
 
     #[test]
     fn test_prefix_same_different_suffix_pointer() {
         // Test strings with same prefix but different suffix (for pointer strings)
-        let s1 = StringView::new("same_prefix_different_end_1");
-        let s2 = StringView::new("same_prefix_different_end_2");
+        let s1 = view("same_prefix_different_end_1");
+        let s2 = view("same_prefix_different_end_2");
 
-        assert!(!s1.equals(&s2));
+        assert_ne!(s1, s2);
         assert!(s1 < s2);
         assert!(s2 > s1);
     }
@@ -692,40 +618,40 @@ mod tests {
     #[test]
     fn test_unicode_strings() {
         // Test UTF-8 unicode strings
-        let emoji = StringView::new("🎉");
-        let chinese = StringView::new("你好");
-        let japanese = StringView::new("こんにちは");
+        let emoji = view("🎉");
+        let chinese = view("你好");
+        let japanese = view("こんにちは");
 
         // Emoji is 4 bytes, so it's inlined
         assert!(emoji.is_inlined());
         assert_eq!(emoji.len(), 4);
-        assert_eq!(emoji.as_str(), "🎉");
+        assert_eq!(emoji.as_str().unwrap(), "🎉");
 
         // Chinese "你好" is 6 bytes, so it's inlined
         assert!(chinese.is_inlined());
         assert_eq!(chinese.len(), 6);
-        assert_eq!(chinese.as_str(), "你好");
+        assert_eq!(chinese.as_str().unwrap(), "你好");
 
         // Japanese "こんにちは" is 15 bytes, so it's a pointer
         assert!(!japanese.is_inlined());
         assert_eq!(japanese.len(), 15);
-        assert_eq!(japanese.as_str(), "こんにちは");
+        assert_eq!(japanese.as_str().unwrap(), "こんにちは");
     }
 
     #[test]
     fn test_special_characters() {
-        let s1 = StringView::new("\t\n\r");
-        let s2 = StringView::new("\0\0\0");
-        let s3 = StringView::new("a\x00b");
+        let s1 = view("\t\n\r");
+        let s2 = view("\0\0\0");
+        let s3 = view("a\x00b");
 
-        assert_eq!(s1.as_str(), "\t\n\r");
+        assert_eq!(s1.as_str().unwrap(), "\t\n\r");
         assert_eq!(s2.as_bytes(), b"\0\0\0");
         assert_eq!(s3.as_bytes(), b"a\0b");
     }
 
     #[test]
     fn test_copy_semantics() {
-        let s1 = StringView::new("hello");
+        let s1 = view("hello");
         let s2 = s1; // Copy, not move
         let s3 = s1; // Still valid
 
@@ -734,75 +660,72 @@ mod tests {
     }
 
     #[test]
-    fn test_get_prefix() {
-        let short = StringView::new("hi");
-        let exact_prefix = StringView::new("1234");
-        let long = StringView::new("hello_world_this_is_long");
+    fn test_prefix() {
+        let short = view("hi");
+        let exact_prefix = view("1234");
+        let long = view("hello_world_this_is_long");
 
         // For inlined strings, prefix is first 4 bytes of data
-        assert_eq!(short.get_prefix()[..2], *b"hi");
-        assert_eq!(exact_prefix.get_prefix(), b"1234");
-        assert_eq!(long.get_prefix(), b"hell");
+        assert_eq!(short.prefix()[..2], *b"hi");
+        assert_eq!(exact_prefix.prefix(), b"1234");
+        assert_eq!(long.prefix(), b"hell");
     }
 
     #[test]
-    fn test_get_data_pointer() {
-        let inlined = StringView::new("hello");
-        let long = StringView::new("this is a very long string");
-
-        // Both should return valid pointers
-        let ptr1 = inlined.get_data();
-        let ptr2 = long.get_data();
-
-        assert!(!ptr1.is_null());
-        assert!(!ptr2.is_null());
-
-        // Should be able to read the data
-        unsafe {
-            assert_eq!(*ptr1, b'h');
-            assert_eq!(*ptr2, b't');
-        }
+    fn test_blob_utf8_validation() {
+        let value = StringView::try_inline(&[0xff]).unwrap();
+        assert!(value.as_str().is_err());
     }
 
     #[test]
     fn test_ordering_edge_cases() {
         // Empty string should be less than any non-empty string
         let empty = StringView::empty();
-        let non_empty = StringView::new("a");
+        let non_empty = view("a");
 
         assert!(empty < non_empty);
         assert!(non_empty > empty);
 
         // Same length strings with different content
-        let abc = StringView::new("abc");
-        let abd = StringView::new("abd");
+        let abc = view("abc");
+        let abd = view("abd");
         assert!(abc < abd);
 
         // Prefix comparison for very long strings
-        let long_a = StringView::new("aaaa_very_very_long_string_here_1");
-        let long_b = StringView::new("bbbb_very_very_long_string_here_2");
+        let long_a = view("aaaa_very_very_long_string_here_1");
+        let long_b = view("bbbb_very_very_long_string_here_2");
         assert!(long_a < long_b);
     }
 
     #[test]
-    fn test_from_string_owned() {
-        let owned = String::from("hello world");
-        let s = StringView::from(owned.clone());
-        assert_eq!(s.as_str(), "hello world");
+    fn test_ordering_matches_byte_slice_ordering() {
+        const VALUES: &[&[u8]] = &[
+            b"",
+            b"a",
+            b"abcd",
+            b"abcd0",
+            b"abcdefghijkl",
+            b"abcdefghijklm",
+            b"same_prefix_long_value_1",
+            b"same_prefix_long_value_2",
+            b"\xffbinary",
+        ];
 
-        let s2 = StringView::from(&owned);
-        assert_eq!(s2, s);
+        for left in VALUES {
+            for right in VALUES {
+                assert_eq!(
+                    view_bytes(left).cmp(&view_bytes(right)),
+                    left.cmp(right),
+                    "left={left:?}, right={right:?}"
+                );
+            }
+        }
     }
 
     #[test]
-    fn test_to_string_conversion() {
-        let s = StringView::new("hello");
-        let owned = s.to_string();
-        assert_eq!(owned, "hello");
-
-        let long = StringView::new("this is a long string for testing");
-        let owned_long = long.to_string();
-        assert_eq!(owned_long, "this is a long string for testing");
+    fn test_send_sync_contract_is_explicit() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<StringView>();
     }
 
     #[test]
@@ -810,37 +733,33 @@ mod tests {
         use std::collections::HashMap;
 
         let mut map = HashMap::new();
-        let key = StringView::new("test_key");
+        let key = view("test_key");
         map.insert(key, 42);
 
         // Same content should hash to same value
-        let lookup_key = StringView::new("test_key");
+        let lookup_key = view("test_key");
         assert_eq!(map.get(&lookup_key), Some(&42));
 
         // Different content should not be found
-        let other_key = StringView::new("other_key");
+        let other_key = view("other_key");
         assert_eq!(map.get(&other_key), None);
     }
 
     #[test]
     fn test_ord_trait() {
         // Test Ord trait through sort
-        let mut strings = [
-            StringView::new("cherry"),
-            StringView::new("apple"),
-            StringView::new("banana"),
-        ];
+        let mut strings = [view("cherry"), view("apple"), view("banana")];
         strings.sort();
 
-        assert_eq!(strings[0].as_str(), "apple");
-        assert_eq!(strings[1].as_str(), "banana");
-        assert_eq!(strings[2].as_str(), "cherry");
+        assert_eq!(strings[0].as_str().unwrap(), "apple");
+        assert_eq!(strings[1].as_str().unwrap(), "banana");
+        assert_eq!(strings[2].as_str().unwrap(), "cherry");
     }
 
     #[test]
     fn test_partial_ord_trait() {
-        let a = StringView::new("abc");
-        let b = StringView::new("def");
+        let a = view("abc");
+        let b = view("def");
 
         assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
         assert_eq!(b.partial_cmp(&a), Some(std::cmp::Ordering::Greater));

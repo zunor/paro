@@ -2512,6 +2512,7 @@ impl ExpressionExecutor {
                         runtime.allocator(MemoryTag::BaseTable),
                     )?;
                     let values = value.as_vector().try_to_varlen_view(count)?;
+                    // SAFETY: LIKE binds its value operand as VARCHAR.
                     for row_idx in 0..count {
                         if !values.is_valid(row_idx) {
                             result.set_null(row_idx, true);
@@ -2519,7 +2520,7 @@ impl ExpressionExecutor {
                         }
                         result.set_bool(
                             row_idx,
-                            pattern.matches(values.get_string_view(row_idx).as_str()),
+                            pattern.matches(unsafe { values.str_unchecked(row_idx) }),
                         );
                     }
                 } else {
@@ -2542,6 +2543,7 @@ impl ExpressionExecutor {
                     )?;
                     let values = value.as_vector().try_to_varlen_view(count)?;
                     let patterns = pattern.as_vector().try_to_varlen_view(count)?;
+                    // SAFETY: LIKE binds both operands as VARCHAR.
                     for row_idx in 0..count {
                         if !values.is_valid(row_idx) || !patterns.is_valid(row_idx) {
                             result.set_null(row_idx, true);
@@ -2550,8 +2552,8 @@ impl ExpressionExecutor {
                         result.set_bool(
                             row_idx,
                             sql_like(
-                                values.get_string_view(row_idx).as_str(),
-                                patterns.get_string_view(row_idx).as_str(),
+                                unsafe { values.str_unchecked(row_idx) },
+                                unsafe { patterns.str_unchecked(row_idx) },
                                 case_insensitive,
                             ),
                         );

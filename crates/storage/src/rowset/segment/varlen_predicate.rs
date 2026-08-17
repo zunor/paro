@@ -650,9 +650,7 @@ fn filter_varlen_batch(
         .decoded()
         .ok_or_else(|| paro_error::internal("varlen predicate received a fixed-width batch"))?;
     let view = vector.try_to_varlen_view(rows)?;
-    let row_matches = |row_idx: usize| {
-        view.is_valid(row_idx) && matches(view.get_string_view(row_idx).as_bytes())
-    };
+    let row_matches = |row_idx: usize| view.is_valid(row_idx) && matches(view.bytes(row_idx));
     if seed {
         selection.extend(
             (0..rows)

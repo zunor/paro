@@ -16,16 +16,17 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
+    // SAFETY: concat binds every input as VARCHAR.
     for row in 0..count {
         let capacity = views
             .iter()
             .filter(|view| view.is_valid(row))
-            .map(|view| view.get_string_view(row).as_str().len())
+            .map(|view| unsafe { view.str_unchecked(row) }.len())
             .sum();
         let mut concatenated = String::with_capacity(capacity);
         for view in &views {
             if view.is_valid(row) {
-                concatenated.push_str(view.get_string_view(row).as_str());
+                concatenated.push_str(unsafe { view.str_unchecked(row) });
             }
         }
         writer.write_str(row, &concatenated)?;
@@ -54,14 +55,14 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             continue;
         }
 
-        let separator_value = separator.get_string_view(row);
-        let sep = separator_value.as_str();
+        // SAFETY: concat_ws binds the separator and arguments as VARCHAR.
+        let sep = unsafe { separator.str_unchecked(row) };
         let mut value_count = 0;
         let mut capacity = 0;
         for view in &arguments {
             if view.is_valid(row) {
                 value_count += 1;
-                capacity += view.get_string_view(row).as_str().len();
+                capacity += unsafe { view.str_unchecked(row) }.len();
             }
         }
         if value_count > 1 {
@@ -77,7 +78,7 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             if wrote_any {
                 concatenated.push_str(sep);
             }
-            concatenated.push_str(view.get_string_view(row).as_str());
+            concatenated.push_str(unsafe { view.str_unchecked(row) });
             wrote_any = true;
         }
 

@@ -592,8 +592,7 @@ fn encode_packed_rows<T: PackedWord>(
             validity.try_set_null(row_idx)?;
             continue;
         }
-        let value = source.get_string_view(row_idx);
-        let bytes = value.as_bytes();
+        let bytes = source.bytes(row_idx);
         if bytes.len() > max_length {
             return Err(paro_error::data_corrupted(format!(
                 "group key exceeded its planned string bound: row={row_idx}, length={}, max_length={max_length}",
@@ -652,7 +651,7 @@ fn decode_packed_rows<T: PackedWord>(
             let source_idx = source.physical_index(row_idx);
             if !source.validity().is_valid(source_idx) {
                 unsafe {
-                    *entries.add(row_idx) = StringView::from_bytes(&[]);
+                    *entries.add(row_idx) = StringView::empty();
                 }
                 validity.try_set_null(row_idx)?;
                 continue;
@@ -672,6 +671,7 @@ fn decode_packed_rows<T: PackedWord>(
                 ))
             })?;
             unsafe {
+                // SAFETY: `heap` is retained by the decoded target vector.
                 *entries.add(row_idx) = heap.try_add_blob(value)?;
             }
         }

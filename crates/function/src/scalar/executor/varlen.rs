@@ -23,7 +23,8 @@ impl<'a> VarcharResultWriter<'a> {
 
     #[inline]
     pub fn write_str(&mut self, row: usize, value: &str) -> Result<()> {
-        let entry = self.heap.try_add_string(value)?;
+        // SAFETY: the writer stores the view and its heap in the same vector.
+        let entry = unsafe { self.heap.try_add_string(value) }?;
         unsafe {
             *self.entries.add(row) = entry;
         }
@@ -33,7 +34,8 @@ impl<'a> VarcharResultWriter<'a> {
 
     #[inline]
     pub fn write_bytes(&mut self, row: usize, value: &[u8]) -> Result<()> {
-        let entry = self.heap.try_add_blob(value)?;
+        // SAFETY: the writer stores the view and its heap in the same vector.
+        let entry = unsafe { self.heap.try_add_blob(value) }?;
         unsafe {
             *self.entries.add(row) = entry;
         }
@@ -62,12 +64,13 @@ where
     let view = input.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !view.is_valid(row) {
             writer.set_null(row);
             continue;
         }
-        op(view.get_string_view(row).as_str(), row, &mut writer)?;
+        op(unsafe { view.str_unchecked(row) }, row, &mut writer)?;
     }
 
     Ok(())
@@ -85,12 +88,13 @@ where
     let view = input.try_to_varlen_view(count)?;
     result.set_count(count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !view.is_valid(row) {
             result.set_null(row, true);
             continue;
         }
-        result.set_i64(row, op(view.get_string_view(row).as_str()));
+        result.set_i64(row, op(unsafe { view.str_unchecked(row) }));
     }
 
     Ok(())
@@ -110,6 +114,7 @@ where
     let right = right.try_to_varlen_view(count)?;
     result.set_count(count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !left.is_valid(row) || !right.is_valid(row) {
             result.set_null(row, true);
@@ -117,10 +122,9 @@ where
         }
         result.set_bool(
             row,
-            op(
-                left.get_string_view(row).as_str(),
-                right.get_string_view(row).as_str(),
-            ),
+            op(unsafe { left.str_unchecked(row) }, unsafe {
+                right.str_unchecked(row)
+            }),
         );
     }
 
@@ -141,6 +145,7 @@ where
     let right = right.try_to_varlen_view(count)?;
     result.set_count(count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !left.is_valid(row) || !right.is_valid(row) {
             result.set_null(row, true);
@@ -148,10 +153,9 @@ where
         }
         result.set_i64(
             row,
-            op(
-                left.get_string_view(row).as_str(),
-                right.get_string_view(row).as_str(),
-            ),
+            op(unsafe { left.str_unchecked(row) }, unsafe {
+                right.str_unchecked(row)
+            }),
         );
     }
 
@@ -172,14 +176,15 @@ where
     let right = right.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !left.is_valid(row) || !right.is_valid(row) {
             writer.set_null(row);
             continue;
         }
         op(
-            left.get_string_view(row).as_str(),
-            right.get_string_view(row).as_str(),
+            unsafe { left.str_unchecked(row) },
+            unsafe { right.str_unchecked(row) },
             row,
             &mut writer,
         )?;
@@ -204,15 +209,16 @@ where
     let third = third.try_to_varlen_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
+    // SAFETY: this executor is instantiated only for VARCHAR inputs.
     for row in 0..count {
         if !first.is_valid(row) || !second.is_valid(row) || !third.is_valid(row) {
             writer.set_null(row);
             continue;
         }
         op(
-            first.get_string_view(row).as_str(),
-            second.get_string_view(row).as_str(),
-            third.get_string_view(row).as_str(),
+            unsafe { first.str_unchecked(row) },
+            unsafe { second.str_unchecked(row) },
+            unsafe { third.str_unchecked(row) },
             row,
             &mut writer,
         )?;

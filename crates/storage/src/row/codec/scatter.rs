@@ -8,7 +8,7 @@ use std::ptr;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::INLINE_CAPACITY;
+use paro_common::types::StringView;
 use paro_common::vector::{DataRef, VarlenView, Vector, VectorView};
 
 use super::{unsafe_api, ColumnCodec, RowHeapWriter};
@@ -253,9 +253,9 @@ impl<'a> PreparedRowScatter<'a> {
             let column_usage = match column {
                 PreparedColumn::Fixed { .. } => RowHeapUsage::default(),
                 PreparedColumn::Varlen { view } => {
-                    let value = view.get_string_view(row_idx);
+                    let len = view.bytes(row_idx).len();
                     RowHeapUsage {
-                        varlen_bytes: usize::from(value.len() > INLINE_CAPACITY) * value.len(),
+                        varlen_bytes: usize::from(len > StringView::INLINE_CAPACITY) * len,
                         nested_value_bytes: 0,
                     }
                 }
@@ -351,8 +351,7 @@ impl<'a> PreparedRowScatter<'a> {
                     },
                 },
                 PreparedColumn::Varlen { view } => {
-                    let value = view.get_string_view(row_idx);
-                    unsafe { write_varlen(target, value.as_bytes(), heap)? };
+                    unsafe { write_varlen(target, view.bytes(row_idx), heap)? };
                 }
                 PreparedColumn::Nested { source } => unsafe {
                     unsafe_api::write_vector_value(
@@ -414,26 +413,16 @@ unsafe fn copy_fixed_width(source: *const u8, target: *mut u8, width: usize) {
 unsafe fn write_varlen(target: *mut u8, bytes: &[u8], heap: &mut impl RowHeapWriter) -> Result<()> {
     let len = u32::try_from(bytes.len())
         .map_err(|_| paro_error::out_of_range("row varlen value exceeds u32 length"))?;
-    unsafe { ptr::write_unaligned(target.cast::<u32>(), len) };
-    if bytes.len() <= INLINE_CAPACITY {
-        if !bytes.is_empty() {
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target.add(4), bytes.len()) };
-        }
-        if bytes.len() < INLINE_CAPACITY {
-            unsafe {
-                ptr::write_bytes(
-                    target.add(4 + bytes.len()),
-                    0,
-                    INLINE_CAPACITY - bytes.len(),
-                )
-            };
-        }
-        return Ok(());
-    }
-
-    unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target.add(4), 4) };
-    let retained = heap.store_bytes(bytes)?;
-    unsafe { ptr::write_unaligned(target.add(8).cast::<*const u8>(), retained) };
+    let value = if let Some(value) = StringView::try_inline(bytes) {
+        value
+    } else {
+        let retained = heap.store_bytes(bytes)?;
+        // SAFETY: `store_bytes` returned immutable row-owned storage containing
+        // all `len` bytes, and that owner outlives the target row cell.
+        unsafe { StringView::from_raw_parts(retained, len) }
+    };
+    // SAFETY: `target` identifies a writable StringView-sized row cell.
+    unsafe { value.write_cell(target) };
     Ok(())
 }
 

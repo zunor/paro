@@ -601,8 +601,7 @@ impl PredicateColumnBatch {
                         ));
                     }
                     if view.is_valid(row_idx) {
-                        let value = view.get_string_view(row_idx);
-                        append_varlen_value(Some(value.as_bytes()), values, nulls)?;
+                        append_varlen_value(Some(view.bytes(row_idx)), values, nulls)?;
                     } else {
                         append_varlen_value(None, values, nulls)?;
                     }

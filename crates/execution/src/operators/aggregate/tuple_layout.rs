@@ -528,6 +528,7 @@ impl TupleLayout {
                 let value_ptr = unsafe { row_ptr.add(self.group_offsets[group_idx]) };
                 let varlen_ref = unsafe { std::ptr::read_unaligned(value_ptr as *const VarlenRef) };
                 let bytes = read_varlen_ref_bytes(&varlen_ref, varlen_heap)?;
+                // SAFETY: `heap` is retained by the target vector.
                 let value = heap.try_add_blob(bytes)?;
                 unsafe {
                     *entries.add(row_idx) = value;

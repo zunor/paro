@@ -116,8 +116,8 @@ pub fn varchar_to_bool(
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_string_view(row);
-            let source = source_value.as_str();
+            // SAFETY: this cast accepts a VARCHAR source.
+            let source = unsafe { view.str_unchecked(row) };
             if let Some(value) = parse_bool_literal(source) {
                 result.set_bool(row, value);
             } else if ctx.try_cast {

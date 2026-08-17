@@ -19,8 +19,9 @@ pub(crate) fn select_prepared_like(
     let values = values.try_to_varlen_view(count)?;
     output.set_len(count);
     let mut selected = 0usize;
+    // SAFETY: the LIKE predicate binder guarantees a VARCHAR input.
     for row_idx in 0..count {
-        if values.is_valid(row_idx) && pattern.matches(values.get_string_view(row_idx).as_str()) {
+        if values.is_valid(row_idx) && pattern.matches(unsafe { values.str_unchecked(row_idx) }) {
             output.set(selected, map_row(input_sel, row_idx));
             selected += 1;
         }

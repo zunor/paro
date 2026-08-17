@@ -193,16 +193,16 @@ fn execute_regexp(
         if !text_view.is_valid(row) || !pattern_view.is_valid(row) {
             result.set_null(row, true);
         } else {
-            let text_value = text_view.get_string_view(row);
-            let text = text_value.as_str();
+            // SAFETY: both inputs are bound as VARCHAR by this scalar function.
+            let text = unsafe { text_view.str_unchecked(row) };
             let matched = match local_pattern {
                 Some(BoundRegexp::Compiled(regex)) => regex.is_match(text),
                 Some(BoundRegexp::Invalid) => false,
                 None => {
-                    let pattern_value = pattern_view.get_string_view(row);
                     let pattern = match bound_pattern {
                         Some(bind) => bind.pattern.as_str(),
-                        None => pattern_value.as_str(),
+                        // SAFETY: the pattern input is bound as VARCHAR.
+                        None => unsafe { pattern_view.str_unchecked(row) },
                     };
                     match compile_regex(pattern, case_insensitive) {
                         Ok(regex) => regex.is_match(text),

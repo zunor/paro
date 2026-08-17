@@ -236,7 +236,7 @@ fn hash_varlen(input: &Vector, count: usize, output: &mut [u64]) -> Result<()> {
         let value_hash = if !view.is_valid(0) {
             NULL_HASH
         } else {
-            hash_bytes(view.get_string_view(0).as_bytes())
+            hash_bytes(view.bytes(0))
         };
         output.fill(value_hash);
         return Ok(());
@@ -248,7 +248,7 @@ fn hash_varlen(input: &Vector, count: usize, output: &mut [u64]) -> Result<()> {
             let physical_idx = view.sel().get(row_idx);
             if physical_idx != previous_idx {
                 previous_hash = if view.validity().is_valid(physical_idx) {
-                    hash_bytes(view.get_string_view(row_idx).as_bytes())
+                    hash_bytes(view.bytes(row_idx))
                 } else {
                     NULL_HASH
                 };
@@ -260,7 +260,7 @@ fn hash_varlen(input: &Vector, count: usize, output: &mut [u64]) -> Result<()> {
     }
     if view.validity().all_valid() {
         for (row_idx, slot) in output.iter_mut().enumerate().take(count) {
-            *slot = hash_bytes(view.get_string_view(row_idx).as_bytes());
+            *slot = hash_bytes(view.bytes(row_idx));
         }
         return Ok(());
     }
@@ -268,7 +268,7 @@ fn hash_varlen(input: &Vector, count: usize, output: &mut [u64]) -> Result<()> {
         *slot = if !view.is_valid(row_idx) {
             NULL_HASH
         } else {
-            hash_bytes(view.get_string_view(row_idx).as_bytes())
+            hash_bytes(view.bytes(row_idx))
         };
     }
     Ok(())

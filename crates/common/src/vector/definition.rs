@@ -1111,8 +1111,8 @@ impl LogicalType {
             | LogicalType::TsVector
             | LogicalType::TsQuery
             | LogicalType::Json
-            | LogicalType::Jsonb => 16, // StringView: 16 bytes
-            LogicalType::Blob => 16, // StringView: 16 bytes (same as Varchar)
+            | LogicalType::Jsonb => StringView::SIZE,
+            LogicalType::Blob => StringView::SIZE,
             LogicalType::Decimal { precision, .. } => {
                 if *precision <= 18 {
                     8
