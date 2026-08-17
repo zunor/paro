@@ -5,7 +5,7 @@ use std::cmp::Ordering;
 
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType, PhysicalType};
+use paro_common::types::{LogicalType, PhysicalType, StringView};
 use paro_common::vector::{SelectionVector, Vector, VectorOperations};
 use paro_function::scalar::executor::binary::BinaryExecutor;
 use paro_function::scalar::operators::comparison::{
@@ -171,37 +171,37 @@ define_fixed_width_comparison!(compare_bool_ne, select_bool_ne, bool, NotEqualsO
 define_fixed_width_comparison!(
     compare_varchar_eq,
     select_varchar_eq,
-    InlineString,
+    StringView,
     EqualsOperator
 );
 define_fixed_width_comparison!(
     compare_varchar_ne,
     select_varchar_ne,
-    InlineString,
+    StringView,
     NotEqualsOperator
 );
 define_fixed_width_comparison!(
     compare_varchar_lt,
     select_varchar_lt,
-    InlineString,
+    StringView,
     LessThanOperator
 );
 define_fixed_width_comparison!(
     compare_varchar_le,
     select_varchar_le,
-    InlineString,
+    StringView,
     LessThanEqualsOperator
 );
 define_fixed_width_comparison!(
     compare_varchar_gt,
     select_varchar_gt,
-    InlineString,
+    StringView,
     GreaterThanOperator
 );
 define_fixed_width_comparison!(
     compare_varchar_ge,
     select_varchar_ge,
-    InlineString,
+    StringView,
     GreaterThanEqualsOperator
 );
 

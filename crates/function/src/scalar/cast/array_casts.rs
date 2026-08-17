@@ -273,7 +273,7 @@ pub fn varchar_to_array_cast(
             continue;
         }
 
-        let s = source_view.get_inline_string(row);
+        let s = source_view.get_string_view(row);
         let s = s.as_str();
 
         match parse_vector_literal(&s) {

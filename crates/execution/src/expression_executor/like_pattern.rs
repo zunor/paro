@@ -20,7 +20,7 @@ pub(crate) fn select_prepared_like(
     output.set_len(count);
     let mut selected = 0usize;
     for row_idx in 0..count {
-        if values.is_valid(row_idx) && pattern.matches(values.get_inline_string(row_idx).as_str()) {
+        if values.is_valid(row_idx) && pattern.matches(values.get_string_view(row_idx).as_str()) {
             output.set(selected, map_row(input_sel, row_idx));
             selected += 1;
         }

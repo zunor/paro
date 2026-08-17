@@ -10,7 +10,7 @@ use crate::scalar::executor::BinaryOperator;
 use crate::scalar::{ScalarFunction, ScalarFunctionSet};
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::Vector;
 
 // --- Operators ---
@@ -123,7 +123,7 @@ where
         + BinaryOperator<u64, u64, bool>
         + BinaryOperator<f64, f64, bool>
         + BinaryOperator<bool, bool, bool>
-        + BinaryOperator<InlineString, InlineString, bool>,
+        + BinaryOperator<StringView, StringView, bool>,
 {
     // INTEGER
     set.add_function(ScalarFunction::new(
@@ -170,6 +170,6 @@ where
         name.to_string(),
         vec![LogicalType::Varchar, LogicalType::Varchar],
         LogicalType::Boolean,
-        |chunk, _state, result| execute_binary_comparison::<InlineString, OP>(chunk, result),
+        |chunk, _state, result| execute_binary_comparison::<StringView, OP>(chunk, result),
     ));
 }

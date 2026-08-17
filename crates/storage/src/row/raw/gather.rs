@@ -937,7 +937,7 @@ unsafe fn gather_collection_payload(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            let inline_data = payload_ptr as *const paro_common::types::InlineString;
+            let inline_data = payload_ptr as *const paro_common::types::StringView;
             let mut heap_bytes = 0usize;
             for elem_i in 0..expected_count {
                 let child_idx = child_base + elem_i;
@@ -959,7 +959,7 @@ unsafe fn gather_collection_payload(
                     heap_bytes = heap_bytes.saturating_add(string.len());
                 }
             }
-            let inline_size = std::mem::size_of::<paro_common::types::InlineString>();
+            let inline_size = std::mem::size_of::<paro_common::types::StringView>();
             Ok(payload_ptr.add(source_count * inline_size + heap_bytes))
         }
         LogicalType::Struct(fields) => {
@@ -1684,7 +1684,7 @@ mod tests {
     }
 
     #[test]
-    fn test_gather_inline_string() {
+    fn test_gather_string_view() {
         let layout = create_test_layout(vec![LogicalType::Varchar]);
         let row_width = layout.get_row_width();
 

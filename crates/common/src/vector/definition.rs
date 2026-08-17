@@ -8,7 +8,7 @@ use bytes::Bytes;
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
 use crate::memory::AllocationId;
-use crate::types::{InlineString, LogicalType, PhysicalType};
+use crate::types::{LogicalType, PhysicalType, StringView};
 
 use super::{
     AllocationSet, SelectionVector, StringHeap, ValidityMask, VectorBuffer, VectorSelection,
@@ -319,7 +319,7 @@ impl Vector {
     pub fn begin_varlen_write(
         &mut self,
         count: usize,
-    ) -> (*mut InlineString, &mut ValidityMask, &mut StringHeap) {
+    ) -> (*mut StringView, &mut ValidityMask, &mut StringHeap) {
         debug_assert!(matches!(
             self.logical_type,
             LogicalType::Varchar
@@ -344,7 +344,7 @@ impl Vector {
         let heap = Arc::get_mut(heap_arc).expect("varlen heap must be uniquely owned");
         heap.clear();
 
-        let entries = self.buffer.data() as *mut InlineString;
+        let entries = self.buffer.data() as *mut StringView;
         let validity = &mut self.validity;
         (entries, validity, heap)
     }
@@ -1111,8 +1111,8 @@ impl LogicalType {
             | LogicalType::TsVector
             | LogicalType::TsQuery
             | LogicalType::Json
-            | LogicalType::Jsonb => 16, // InlineString: 16 bytes
-            LogicalType::Blob => 16, // InlineString: 16 bytes (same as Varchar)
+            | LogicalType::Jsonb => 16, // StringView: 16 bytes
+            LogicalType::Blob => 16, // StringView: 16 bytes (same as Varchar)
             LogicalType::Decimal { precision, .. } => {
                 if *precision <= 18 {
                     8

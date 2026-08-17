@@ -4,13 +4,13 @@
 //! String heap - arena allocator for strings.
 //!
 //! Uses an arena allocator to provide stable backing storage for out-of-line
-//! strings referenced by `InlineString`.
+//! strings referenced by `StringView`.
 
 use std::sync::Arc;
 
 use crate::allocator::{Allocator, ArenaAllocator, DefaultAllocator};
 use crate::error::Result;
-use crate::types::{InlineString, INLINE_LENGTH};
+use crate::types::{StringView, INLINE_CAPACITY};
 
 /// Arena allocator for string data.
 ///
@@ -53,35 +53,35 @@ impl StringHeap {
         }
     }
 
-    /// Add a string to the heap, returning an `InlineString`.
+    /// Add a string to the heap, returning an `StringView`.
     #[cfg(test)]
     #[inline]
-    pub fn add_string(&mut self, s: &str) -> InlineString {
+    pub fn add_string(&mut self, s: &str) -> StringView {
         self.try_add_string(s)
             .expect("test string heap allocation failed")
     }
 
-    /// Add a string to the heap, returning an `InlineString`.
+    /// Add a string to the heap, returning an `StringView`.
     #[inline]
-    pub fn try_add_string(&mut self, s: &str) -> Result<InlineString> {
+    pub fn try_add_string(&mut self, s: &str) -> Result<StringView> {
         self.try_add_blob(s.as_bytes())
     }
 
-    /// Add bytes directly to the heap, returning an `InlineString`.
+    /// Add bytes directly to the heap, returning an `StringView`.
     #[cfg(test)]
     #[inline]
-    pub fn add_blob(&mut self, bytes: &[u8]) -> InlineString {
+    pub fn add_blob(&mut self, bytes: &[u8]) -> StringView {
         self.try_add_blob(bytes)
             .expect("test string heap allocation failed")
     }
 
-    /// Add bytes directly to the heap, returning an `InlineString`.
+    /// Add bytes directly to the heap, returning an `StringView`.
     #[inline]
-    pub fn try_add_blob(&mut self, bytes: &[u8]) -> Result<InlineString> {
+    pub fn try_add_blob(&mut self, bytes: &[u8]) -> Result<StringView> {
         let len = bytes.len();
 
-        if len <= INLINE_LENGTH {
-            return Ok(InlineString::from_bytes(bytes));
+        if len <= INLINE_CAPACITY {
+            return Ok(StringView::from_bytes(bytes));
         }
 
         let result = self.try_alloc_uninit(len)?;
@@ -98,23 +98,23 @@ impl StringHeap {
 
     /// Allocate uninitialized out-of-line string storage of the given length.
     ///
-    /// Returns an InlineString with uninitialized data. The caller must
+    /// Returns an StringView with uninitialized data. The caller must
     /// fill in the data and call `finalize()` on the result.
     ///
     /// # Panics
-    /// Panics in debug builds if len <= INLINE_LENGTH (use InlineString::from_bytes
+    /// Panics in debug builds if len <= INLINE_CAPACITY (use StringView::from_bytes
     /// directly for short strings).
     #[inline]
-    pub fn try_alloc_uninit(&mut self, len: usize) -> Result<InlineString> {
+    pub fn try_alloc_uninit(&mut self, len: usize) -> Result<StringView> {
         debug_assert!(
-            len > INLINE_LENGTH,
+            len > INLINE_CAPACITY,
             "try_alloc_uninit should only be called for strings > {} bytes",
-            INLINE_LENGTH
+            INLINE_CAPACITY
         );
 
         let ptr = self.allocator.allocate(len)?;
 
-        Ok(unsafe { InlineString::from_ptr(ptr, len as u32) })
+        Ok(unsafe { StringView::from_ptr(ptr, len as u32) })
     }
 
     /// Total bytes used in the heap.

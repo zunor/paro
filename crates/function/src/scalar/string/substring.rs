@@ -220,7 +220,7 @@ fn substring_2_varchar(
             continue;
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
-        let value = str_view.get_inline_string(row);
+        let value = str_view.get_string_view(row);
         let sub = substring_unicode(value.as_str(), start, None);
         writer.write_str(row, sub)?;
     }
@@ -259,7 +259,7 @@ fn substring_3_varchar(
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
         let length = bound_length.unwrap_or_else(|| len_view.get_i64(row));
-        let value = str_view.get_inline_string(row);
+        let value = str_view.get_string_view(row);
         let sub = substring_unicode(value.as_str(), start, Some(length));
         writer.write_str(row, sub)?;
     }
@@ -286,7 +286,7 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
             writer.set_null(row);
             continue;
         }
-        let value_inline = str_view.get_inline_string(row);
+        let value_inline = str_view.get_string_view(row);
         let value = value_inline.as_str();
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
         let sub = if n >= 0 {
@@ -321,7 +321,7 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
             writer.set_null(row);
             continue;
         }
-        let value_inline = str_view.get_inline_string(row);
+        let value_inline = str_view.get_string_view(row);
         let value = value_inline.as_str();
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
 

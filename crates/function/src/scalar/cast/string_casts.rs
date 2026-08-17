@@ -53,7 +53,7 @@ where
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
+            let source_value = view.get_string_view(row);
             let source = source_value.as_str();
             match source.trim().parse::<T>() {
                 Ok(value) => {
@@ -90,7 +90,7 @@ pub fn varchar_to_uuid_cast(
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
+            let source_value = view.get_string_view(row);
             let source = source_value.as_str();
             match parse_uuid_str(source) {
                 Ok(value) => {
@@ -152,7 +152,7 @@ fn varchar_to_json_like_cast(
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
+            let source_value = view.get_string_view(row);
             let source = source_value.as_str();
             if serde_json::from_str::<JsonValue>(source).is_ok() {
                 writer.write_str(row, source)?;

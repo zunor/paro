@@ -35,7 +35,7 @@ pub enum PhysicalType {
     Float = 11,
     /// 64-bit floating point
     Double = 12,
-    /// Variable-length string (InlineString/string_t)
+    /// Variable-length string (StringView/string_t)
     Varchar = 200,
     /// Validity mask (bit array)
     Bit = 206,
@@ -56,7 +56,7 @@ impl PhysicalType {
             PhysicalType::Int32 | PhysicalType::UInt32 | PhysicalType::Float => 4,
             PhysicalType::Int64 | PhysicalType::UInt64 | PhysicalType::Double => 8,
             PhysicalType::Int128 | PhysicalType::UInt128 => 16,
-            PhysicalType::Varchar => 16, // InlineString size
+            PhysicalType::Varchar => 16, // StringView size
             PhysicalType::List => 8,     // list_entry_t size (u32 offset + u32 length)
             PhysicalType::Struct | PhysicalType::Array => 0,
             PhysicalType::Bit => 1,

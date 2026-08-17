@@ -756,7 +756,7 @@ fn build_varlen_vector(
                 .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
         }
         let entry = heap.try_add_blob(value)?;
-        // SAFETY: `begin_varlen_write(rows)` returns an `InlineString` array
+        // SAFETY: `begin_varlen_write(rows)` returns an `StringView` array
         // with exactly `rows` writable entries and `row_idx < rows`.
         unsafe { entries.add(row_idx).write(entry) };
         offset = value_end;

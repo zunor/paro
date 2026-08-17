@@ -7,7 +7,7 @@ use std::ptr;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType, INLINE_LENGTH};
+use paro_common::types::{LogicalType, StringView, INLINE_CAPACITY};
 use paro_common::vector::{Vector, VectorType};
 
 use crate::row::codec::{unsafe_api, ColumnCodec};
@@ -143,7 +143,7 @@ where
         // SAFETY: upheld by this function's caller.
         if !unsafe { row_value_is_valid(layout, row_ptr, column_idx) } {
             // SAFETY: `entries` has capacity for `count` values.
-            unsafe { ptr::write(entries.add(row_idx), InlineString::empty()) };
+            unsafe { ptr::write(entries.add(row_idx), StringView::empty()) };
             validity.try_set_invalid(row_idx)?;
             continue;
         }
@@ -151,11 +151,11 @@ where
         // SAFETY: the row pointer and column offset identify a live varlen cell.
         let cell = unsafe { row_ptr.add(offset) };
         let len = unsafe { ptr::read_unaligned(cell.cast::<u32>()) as usize };
-        if len <= INLINE_LENGTH {
-            // Row varlen cells deliberately share InlineString's 16-byte
+        if len <= INLINE_CAPACITY {
+            // Row varlen cells deliberately share StringView's 16-byte
             // inline representation. Copying the complete cell avoids
             // reconstructing the same length/prefix/suffix for every value.
-            let value = unsafe { ptr::read_unaligned(cell.cast::<InlineString>()) };
+            let value = unsafe { ptr::read_unaligned(cell.cast::<StringView>()) };
             unsafe { ptr::write(entries.add(row_idx), value) };
             continue;
         }

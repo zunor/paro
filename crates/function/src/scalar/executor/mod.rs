@@ -149,28 +149,28 @@ mod tests {
     // =========================================================================
     // =========================================================================
 
-    use paro_common::types::InlineString;
+    use paro_common::types::StringView;
 
     /// String equality operator for testing
     struct StringEqualsOp;
-    impl BinaryOperator<InlineString, InlineString, bool> for StringEqualsOp {
-        fn operation(left: InlineString, right: InlineString) -> bool {
+    impl BinaryOperator<StringView, StringView, bool> for StringEqualsOp {
+        fn operation(left: StringView, right: StringView) -> bool {
             left == right
         }
     }
 
     /// String less-than operator for testing
     struct StringLessThanOp;
-    impl BinaryOperator<InlineString, InlineString, bool> for StringLessThanOp {
-        fn operation(left: InlineString, right: InlineString) -> bool {
+    impl BinaryOperator<StringView, StringView, bool> for StringLessThanOp {
+        fn operation(left: StringView, right: StringView) -> bool {
             left < right
         }
     }
 
     /// String greater-than operator for testing
     struct StringGreaterThanOp;
-    impl BinaryOperator<InlineString, InlineString, bool> for StringGreaterThanOp {
-        fn operation(left: InlineString, right: InlineString) -> bool {
+    impl BinaryOperator<StringView, StringView, bool> for StringGreaterThanOp {
+        fn operation(left: StringView, right: StringView) -> bool {
             left > right
         }
     }
@@ -187,7 +187,7 @@ mod tests {
         );
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringEqualsOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringEqualsOp>(
             &left,
             &right,
             &mut result,
@@ -212,7 +212,7 @@ mod tests {
         );
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringLessThanOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringLessThanOp>(
             &left,
             &right,
             &mut result,
@@ -237,7 +237,7 @@ mod tests {
         );
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringGreaterThanOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringGreaterThanOp>(
             &left,
             &right,
             &mut result,
@@ -271,7 +271,7 @@ mod tests {
         );
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringEqualsOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringEqualsOp>(
             &left,
             &right,
             &mut result,
@@ -300,7 +300,7 @@ mod tests {
 
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringEqualsOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringEqualsOp>(
             &left,
             &right,
             &mut result,
@@ -325,7 +325,7 @@ mod tests {
         );
         let mut selection = paro_common::test_utils::test_selection_with_capacity(5);
 
-        BinaryExecutor::select_into::<InlineString, InlineString, StringEqualsOp>(
+        BinaryExecutor::select_into::<StringView, StringView, StringEqualsOp>(
             &left,
             &right,
             None,
@@ -350,7 +350,7 @@ mod tests {
         );
         let mut selection = paro_common::test_utils::test_selection_with_capacity(4);
 
-        BinaryExecutor::select_into::<InlineString, InlineString, StringLessThanOp>(
+        BinaryExecutor::select_into::<StringView, StringView, StringLessThanOp>(
             &left,
             &right,
             None,
@@ -375,7 +375,7 @@ mod tests {
         );
         let mut result = paro_common::test_utils::test_vector(LogicalType::Boolean);
 
-        BinaryExecutor::execute::<InlineString, InlineString, bool, StringEqualsOp>(
+        BinaryExecutor::execute::<StringView, StringView, bool, StringEqualsOp>(
             &left,
             &right,
             &mut result,
@@ -401,7 +401,7 @@ mod tests {
         );
         let mut selection = paro_common::test_utils::test_selection_with_capacity(3);
 
-        BinaryExecutor::select_into::<InlineString, InlineString, StringEqualsOp>(
+        BinaryExecutor::select_into::<StringView, StringView, StringEqualsOp>(
             &left,
             &right,
             None,

@@ -456,7 +456,7 @@ impl PreparedProbeColumn<'_> {
                 }
             },
             Self::Varlen(view) => {
-                view.get_inline_string(probe_row_idx).as_bytes()
+                view.get_string_view(probe_row_idx).as_bytes()
                     == read_row_varlen_bytes(layout, row_ptr, col_idx)
             }
             Self::ValueFallback(vector) => {
@@ -696,7 +696,7 @@ fn apply_varlen_hash_column(
         let value_hash = if !view.is_valid(0) {
             NULL_HASH
         } else {
-            hash_bytes(view.get_inline_string(0).as_bytes())
+            hash_bytes(view.get_string_view(0).as_bytes())
         };
         for slot in hashes.iter_mut().take(count) {
             *slot = combine_hash(*slot, value_hash);
@@ -708,7 +708,7 @@ fn apply_varlen_hash_column(
     for out_idx in 0..count {
         let row_idx = selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
         let value_hash = if all_valid || view.is_valid(row_idx) {
-            hash_bytes(view.get_inline_string(row_idx).as_bytes())
+            hash_bytes(view.get_string_view(row_idx).as_bytes())
         } else {
             NULL_HASH
         };

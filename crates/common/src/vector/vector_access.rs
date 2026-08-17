@@ -4,7 +4,7 @@
 use super::{StringHeap, Vector, VectorBuffer, VectorType};
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
+use crate::types::{LogicalType, StringView, INLINE_CAPACITY};
 use std::sync::Arc;
 
 impl Vector {
@@ -360,9 +360,9 @@ impl Vector {
                 } else {
                     idx
                 };
-                // SAFETY: We know buffer contains InlineString array
+                // SAFETY: We know buffer contains StringView array
                 let inline_str = unsafe {
-                    let entries = self.buffer.data() as *const InlineString;
+                    let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
                 Some(inline_str.as_str())
@@ -387,9 +387,9 @@ impl Vector {
                 } else {
                     idx
                 };
-                // SAFETY: We know buffer contains InlineString array
+                // SAFETY: We know buffer contains StringView array
                 let inline_str = unsafe {
-                    let entries = self.buffer.data() as *const InlineString;
+                    let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
                 Some(inline_str.as_bytes())
@@ -695,8 +695,8 @@ impl Vector {
 
     /// Set string value at index.
     ///
-    /// For short strings (≤12 bytes), data is stored inline in InlineString.
-    /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short strings (≤12 bytes), data is stored inline in StringView.
+    /// For longer strings, data is stored in StringHeap and StringView.ptr points to it.
     pub fn set_string(&mut self, idx: usize, val: &str) {
         self.try_set_string(idx, val)
             .expect("vector string allocation failed");
@@ -704,16 +704,16 @@ impl Vector {
 
     /// Set string value at index.
     ///
-    /// For short strings (≤12 bytes), data is stored inline in InlineString.
-    /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short strings (≤12 bytes), data is stored inline in StringView.
+    /// For longer strings, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_string(&mut self, idx: usize, val: &str) -> Result<()> {
         self.try_set_varlen(idx, val.as_bytes())
     }
 
     /// Set blob value at index.
     ///
-    /// For short blobs (≤12 bytes), data is stored inline in InlineString.
-    /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short blobs (≤12 bytes), data is stored inline in StringView.
+    /// For longer blobs, data is stored in StringHeap and StringView.ptr points to it.
     pub fn set_blob(&mut self, idx: usize, val: &[u8]) {
         self.try_set_blob(idx, val)
             .expect("vector blob allocation failed");
@@ -721,8 +721,8 @@ impl Vector {
 
     /// Set blob value at index.
     ///
-    /// For short blobs (≤12 bytes), data is stored inline in InlineString.
-    /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short blobs (≤12 bytes), data is stored inline in StringView.
+    /// For longer blobs, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_blob(&mut self, idx: usize, val: &[u8]) -> Result<()> {
         self.try_set_varlen(idx, val)
     }
@@ -738,8 +738,8 @@ impl Vector {
         self.try_make_exclusive()?;
         self.validity.try_make_exclusive()?;
 
-        let inline_value = if val.len() <= INLINE_LENGTH {
-            InlineString::from_bytes(val)
+        let inline_value = if val.len() <= INLINE_CAPACITY {
+            StringView::from_bytes(val)
         } else {
             self.try_add_out_of_line_varlen(idx, val)?
         };
@@ -751,7 +751,7 @@ impl Vector {
         Ok(())
     }
 
-    fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<InlineString> {
+    fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<StringView> {
         if let Some(heap) = self.string_heap.as_mut().and_then(Arc::get_mut) {
             return heap.try_add_blob(val);
         }
@@ -772,14 +772,14 @@ impl Vector {
 
         let mut rebuilt_heap = StringHeap::with_allocator(initial_capacity, allocator.clone());
         let rebuilt_buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
+            std::mem::size_of::<StringView>(),
             self.buffer.capacity(),
             allocator,
         )?;
 
         unsafe {
-            let entries = self.buffer.data() as *const InlineString;
-            let rewritten_entries = rebuilt_buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *const StringView;
+            let rewritten_entries = rebuilt_buffer.data() as *mut StringView;
             for entry_idx in 0..preserve_entries {
                 let entry = *entries.add(entry_idx);
                 *rewritten_entries.add(entry_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;

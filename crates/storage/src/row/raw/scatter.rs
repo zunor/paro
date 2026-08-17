@@ -358,7 +358,7 @@ fn compute_string_heap_sizes_internal<const HAS_APPEND_SEL: bool, const ALL_VALI
         }
 
         // Get string using physical index
-        let data_ptr = format.get_data::<paro_common::types::InlineString>();
+        let data_ptr = format.get_data::<paro_common::types::StringView>();
         if !data_ptr.is_null() {
             unsafe {
                 let string_t = &*data_ptr.add(source_idx);
@@ -485,7 +485,7 @@ fn compute_string_within_collection_heap_sizes(
 ) {
     let source_sel = format.sel();
     let source_validity = format.validity();
-    let source_data = format.get_data::<paro_common::types::InlineString>();
+    let source_data = format.get_data::<paro_common::types::StringView>();
 
     for (i, heap_size) in heap_sizes.iter_mut().enumerate().take(count) {
         let append_idx = append_index(append_sel, i);
@@ -505,7 +505,7 @@ fn compute_string_within_collection_heap_sizes(
         }
 
         *heap_size += RawRowLayout::validity_mask_size(list_entry.length);
-        *heap_size += list_entry.length * std::mem::size_of::<paro_common::types::InlineString>();
+        *heap_size += list_entry.length * std::mem::size_of::<paro_common::types::StringView>();
 
         if source_data.is_null() {
             continue;
@@ -663,9 +663,8 @@ fn compute_single_collection_heap_size(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            heap_size +=
-                list_entry.length * std::mem::size_of::<paro_common::types::InlineString>();
-            let source_data = format.get_data::<paro_common::types::InlineString>();
+            heap_size += list_entry.length * std::mem::size_of::<paro_common::types::StringView>();
+            let source_data = format.get_data::<paro_common::types::StringView>();
             if source_data.is_null() {
                 return heap_size;
             }
@@ -1507,7 +1506,7 @@ fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
 ) {
     let source_sel = format.sel();
     let source_validity = format.validity();
-    let data_ptr = format.get_data::<paro_common::types::InlineString>();
+    let data_ptr = format.get_data::<paro_common::types::StringView>();
 
     let entry_idx = col_idx / 8;
     let bit_idx = col_idx % 8;
@@ -1635,26 +1634,26 @@ unsafe fn scatter_collection_payload(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            let inline_size = std::mem::size_of::<paro_common::types::InlineString>();
-            let source_data = format.get_data::<paro_common::types::InlineString>();
+            let inline_size = std::mem::size_of::<paro_common::types::StringView>();
+            let source_data = format.get_data::<paro_common::types::StringView>();
             let mut heap_cursor = payload_ptr.add(list_entry.length * inline_size);
 
             for elem_i in 0..list_entry.length {
                 let source_pos = list_entry.offset + elem_i;
                 let dst_ptr =
-                    payload_ptr.add(elem_i * inline_size) as *mut paro_common::types::InlineString;
+                    payload_ptr.add(elem_i * inline_size) as *mut paro_common::types::StringView;
 
                 let Some(source_idx) =
                     (source_pos < source_sel.len()).then(|| source_sel.get(source_pos))
                 else {
                     clear_collection_validity_bit(validity_mask_ptr, elem_i);
-                    std::ptr::write(dst_ptr, paro_common::types::InlineString::empty());
+                    std::ptr::write(dst_ptr, paro_common::types::StringView::empty());
                     continue;
                 };
 
                 if !is_valid_at(source_validity, source_idx) || source_data.is_null() {
                     clear_collection_validity_bit(validity_mask_ptr, elem_i);
-                    std::ptr::write(dst_ptr, paro_common::types::InlineString::empty());
+                    std::ptr::write(dst_ptr, paro_common::types::StringView::empty());
                     continue;
                 }
 
@@ -2355,7 +2354,7 @@ mod tests {
 
         let base = std::mem::size_of::<u64>()
             + RawRowLayout::validity_mask_size(2)
-            + 2 * std::mem::size_of::<paro_common::types::InlineString>();
+            + 2 * std::mem::size_of::<paro_common::types::StringView>();
         let expected_0 = base + values[1].len();
         let expected_1 = base + values[3].len();
 

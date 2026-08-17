@@ -8,7 +8,7 @@ use super::{
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -137,14 +137,14 @@ impl Vector {
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
         let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
+            std::mem::size_of::<StringView>(),
             values.len(),
             allocator,
         )?;
 
-        // SAFETY: We allocated space for InlineString array
+        // SAFETY: We allocated space for StringView array
         unsafe {
-            let entries = buffer.data() as *mut InlineString;
+            let entries = buffer.data() as *mut StringView;
             for (i, s) in values.iter().enumerate() {
                 match s {
                     Some(str_val) => {
@@ -153,7 +153,7 @@ impl Vector {
                     }
                     None => {
                         vec.validity.set_null(i);
-                        *entries.add(i) = InlineString::empty();
+                        *entries.add(i) = StringView::empty();
                     }
                 }
             }
@@ -177,14 +177,14 @@ impl Vector {
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
         let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
+            std::mem::size_of::<StringView>(),
             values.len(),
             allocator,
         )?;
 
-        // SAFETY: We allocated space for InlineString array
+        // SAFETY: We allocated space for StringView array
         unsafe {
-            let entries = buffer.data() as *mut InlineString;
+            let entries = buffer.data() as *mut StringView;
             for (i, s) in values.iter().enumerate() {
                 // try_add_string handles both short (inlined) and long (heap) strings.
                 *entries.add(i) = heap.try_add_string(s)?;

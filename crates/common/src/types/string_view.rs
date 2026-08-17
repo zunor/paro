@@ -12,12 +12,12 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 /// Maximum length for inlined strings.
-pub const INLINE_LENGTH: usize = 12;
+pub const INLINE_CAPACITY: usize = 12;
 
 /// Prefix length for pointer strings.
-pub const PREFIX_LENGTH: usize = 4;
+pub const PREFIX_LEN: usize = 4;
 
-/// Inline string type (16 bytes).
+/// String view type (16 bytes).
 ///
 /// Layout:
 /// ```text
@@ -32,10 +32,10 @@ pub const PREFIX_LENGTH: usize = 4;
 ///
 /// # Safety
 /// For pointer strings, the caller must ensure the pointed data remains valid
-/// for the lifetime of this `InlineString`. Typically, the data lives in a `StringHeap`.
+/// for the lifetime of this `StringView`. Typically, the data lives in a `StringHeap`.
 #[repr(C)]
 #[derive(Clone, Copy)]
-pub struct InlineString {
+pub struct StringView {
     /// String length in bytes
     length: u32,
     /// First 4 bytes: prefix (for pointer) or inlined[0..4]
@@ -44,8 +44,8 @@ pub struct InlineString {
     ptr_or_inlined: u64,
 }
 
-impl InlineString {
-    /// Create a new InlineString from a string slice.
+impl StringView {
+    /// Create a new StringView from a string slice.
     ///
     /// For short strings (≤12 bytes), data is stored inline.
     /// For longer strings, only the pointer is stored - caller must ensure
@@ -55,12 +55,12 @@ impl InlineString {
         Self::from_bytes(s.as_bytes())
     }
 
-    /// Create an InlineString from raw bytes.
+    /// Create a StringView from raw bytes.
     #[inline]
     pub fn from_bytes(bytes: &[u8]) -> Self {
         let len = bytes.len() as u32;
 
-        if bytes.len() <= INLINE_LENGTH {
+        if bytes.len() <= INLINE_CAPACITY {
             // Inlined: copy data directly
             let mut prefix = [0u8; 4];
             let mut suffix = [0u8; 8];
@@ -81,7 +81,7 @@ impl InlineString {
         } else {
             // Pointer: store prefix + pointer
             let mut prefix = [0u8; 4];
-            prefix.copy_from_slice(&bytes[..PREFIX_LENGTH]);
+            prefix.copy_from_slice(&bytes[..PREFIX_LEN]);
 
             Self {
                 length: len,
@@ -91,14 +91,14 @@ impl InlineString {
         }
     }
 
-    /// Create an InlineString from a raw pointer and length.
+    /// Create a StringView from a raw pointer and length.
     ///
     /// # Safety
     /// The pointer must point to valid UTF-8 data of at least `len` bytes,
-    /// and must remain valid for the lifetime of this InlineString.
+    /// and must remain valid for the lifetime of this StringView.
     #[inline]
     pub unsafe fn from_ptr(ptr: *const u8, len: u32) -> Self {
-        if (len as usize) <= INLINE_LENGTH {
+        if (len as usize) <= INLINE_CAPACITY {
             // Inlined: copy data
             let mut prefix = [0u8; 4];
             let mut suffix = [0u8; 8];
@@ -119,7 +119,7 @@ impl InlineString {
         } else {
             // Pointer: store prefix + pointer
             let mut prefix = [0u8; 4];
-            std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), PREFIX_LENGTH);
+            std::ptr::copy_nonoverlapping(ptr, prefix.as_mut_ptr(), PREFIX_LEN);
 
             Self {
                 length: len,
@@ -142,7 +142,7 @@ impl InlineString {
     /// Returns true if the string is stored inline (≤12 bytes).
     #[inline]
     pub fn is_inlined(&self) -> bool {
-        (self.length as usize) <= INLINE_LENGTH
+        (self.length as usize) <= INLINE_CAPACITY
     }
 
     /// Returns the length of the string in bytes.
@@ -192,7 +192,7 @@ impl InlineString {
     /// Get the string data as a str slice.
     ///
     /// # Safety
-    /// Assumes the data is valid UTF-8. This is guaranteed if the InlineString
+    /// Assumes the data is valid UTF-8. This is guaranteed if the StringView
     /// was created from valid UTF-8 data.
     #[inline]
     pub fn as_str(&self) -> &str {
@@ -250,7 +250,7 @@ impl InlineString {
             // SAFETY: Pointer is valid
             unsafe {
                 let data_ptr = self.ptr_or_inlined as *const u8;
-                std::ptr::copy_nonoverlapping(data_ptr, self.prefix.as_mut_ptr(), PREFIX_LENGTH);
+                std::ptr::copy_nonoverlapping(data_ptr, self.prefix.as_mut_ptr(), PREFIX_LEN);
             }
         }
     }
@@ -258,7 +258,7 @@ impl InlineString {
 
 // --- Comparison operations ---
 
-impl InlineString {
+impl StringView {
     /// Fast equality check using bulk comparison.
     ///
     /// Optimized path:
@@ -307,7 +307,7 @@ impl InlineString {
         let min_len = self_len.min(other_len);
 
         // Compare prefixes first (for strings >= 4 bytes)
-        if min_len >= PREFIX_LENGTH {
+        if min_len >= PREFIX_LEN {
             let self_prefix = u32::from_be_bytes(self.prefix);
             let other_prefix = u32::from_be_bytes(other.prefix);
 
@@ -348,29 +348,29 @@ impl InlineString {
 
 // --- Trait Implementations ---
 
-impl Default for InlineString {
+impl Default for StringView {
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl PartialEq for InlineString {
+impl PartialEq for StringView {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.equals(other)
     }
 }
 
-impl Eq for InlineString {}
+impl Eq for StringView {}
 
-impl PartialOrd for InlineString {
+impl PartialOrd for StringView {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl Ord for InlineString {
+impl Ord for StringView {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
         if self.equals(other) {
@@ -383,37 +383,37 @@ impl Ord for InlineString {
     }
 }
 
-impl Hash for InlineString {
+impl Hash for StringView {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.as_bytes().hash(state);
     }
 }
 
-impl fmt::Debug for InlineString {
+impl fmt::Debug for StringView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "InlineString({:?})", self.as_str())
+        write!(f, "StringView({:?})", self.as_str())
     }
 }
 
-impl fmt::Display for InlineString {
+impl fmt::Display for StringView {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
 }
 
-impl From<&str> for InlineString {
+impl From<&str> for StringView {
     fn from(s: &str) -> Self {
         Self::new(s)
     }
 }
 
-impl From<String> for InlineString {
+impl From<String> for StringView {
     fn from(s: String) -> Self {
         Self::new(&s)
     }
 }
 
-impl From<&String> for InlineString {
+impl From<&String> for StringView {
     fn from(s: &String) -> Self {
         Self::new(s)
     }
@@ -427,12 +427,12 @@ mod tests {
 
     #[test]
     fn test_size() {
-        assert_eq!(std::mem::size_of::<InlineString>(), 16);
+        assert_eq!(std::mem::size_of::<StringView>(), 16);
     }
 
     #[test]
     fn test_empty_string() {
-        let s = InlineString::empty();
+        let s = StringView::empty();
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
         assert!(s.is_inlined());
@@ -441,7 +441,7 @@ mod tests {
 
     #[test]
     fn test_short_inlined() {
-        let s = InlineString::new("hello");
+        let s = StringView::new("hello");
         assert!(!s.is_empty());
         assert_eq!(s.len(), 5);
         assert!(s.is_inlined());
@@ -450,7 +450,7 @@ mod tests {
 
     #[test]
     fn test_max_inlined_string() {
-        let s = InlineString::new("123456789012");
+        let s = StringView::new("123456789012");
         assert_eq!(s.len(), 12);
         assert!(s.is_inlined());
         assert_eq!(s.as_str(), "123456789012");
@@ -459,7 +459,7 @@ mod tests {
     #[test]
     fn test_long_string_pointer() {
         let data = "1234567890123";
-        let s = InlineString::new(data);
+        let s = StringView::new(data);
         assert_eq!(s.len(), 13);
         assert!(!s.is_inlined());
         assert_eq!(s.as_str(), data);
@@ -467,9 +467,9 @@ mod tests {
 
     #[test]
     fn test_equality_inlined() {
-        let s1 = InlineString::new("hello");
-        let s2 = InlineString::new("hello");
-        let s3 = InlineString::new("world");
+        let s1 = StringView::new("hello");
+        let s2 = StringView::new("hello");
+        let s3 = StringView::new("world");
 
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
@@ -481,9 +481,9 @@ mod tests {
         let data2 = "this is a long string";
         let data3 = "this is another long string";
 
-        let s1 = InlineString::new(data1);
-        let s2 = InlineString::new(data2);
-        let s3 = InlineString::new(data3);
+        let s1 = StringView::new(data1);
+        let s2 = StringView::new(data2);
+        let s3 = StringView::new(data3);
 
         assert_eq!(s1, s2);
         assert_ne!(s1, s3);
@@ -491,9 +491,9 @@ mod tests {
 
     #[test]
     fn test_ordering_inlined() {
-        let s1 = InlineString::new("apple");
-        let s2 = InlineString::new("banana");
-        let s3 = InlineString::new("apple");
+        let s1 = StringView::new("apple");
+        let s2 = StringView::new("banana");
+        let s3 = StringView::new("apple");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -503,9 +503,9 @@ mod tests {
 
     #[test]
     fn test_ordering_pointer() {
-        let s1 = InlineString::new("apple is a fruit");
-        let s2 = InlineString::new("banana is a fruit");
-        let s3 = InlineString::new("apple is a fruit");
+        let s1 = StringView::new("apple is a fruit");
+        let s2 = StringView::new("banana is a fruit");
+        let s3 = StringView::new("apple is a fruit");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -515,8 +515,8 @@ mod tests {
 
     #[test]
     fn test_length_ordering() {
-        let s1 = InlineString::new("abc");
-        let s2 = InlineString::new("abcd");
+        let s1 = StringView::new("abc");
+        let s2 = StringView::new("abcd");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -524,8 +524,8 @@ mod tests {
 
     #[test]
     fn test_prefix_optimization() {
-        let s1 = InlineString::new("aaaa_long_string_here");
-        let s2 = InlineString::new("bbbb_long_string_here");
+        let s1 = StringView::new("aaaa_long_string_here");
+        let s2 = StringView::new("bbbb_long_string_here");
 
         assert!(s1 < s2);
         assert!(s2 > s1);
@@ -534,14 +534,14 @@ mod tests {
     #[test]
     fn test_from_bytes() {
         let bytes = b"hello world";
-        let s = InlineString::from_bytes(bytes);
+        let s = StringView::from_bytes(bytes);
         assert_eq!(s.as_bytes(), bytes);
     }
 
     #[test]
     fn test_from_ptr() {
         let data = "test string";
-        let s = unsafe { InlineString::from_ptr(data.as_ptr(), data.len() as u32) };
+        let s = unsafe { StringView::from_ptr(data.as_ptr(), data.len() as u32) };
         assert_eq!(s.as_str(), data);
     }
 
@@ -550,40 +550,40 @@ mod tests {
         use std::collections::HashSet;
 
         let mut set = HashSet::new();
-        set.insert(InlineString::new("hello"));
-        set.insert(InlineString::new("world"));
-        set.insert(InlineString::new("hello"));
+        set.insert(StringView::new("hello"));
+        set.insert(StringView::new("world"));
+        set.insert(StringView::new("hello"));
 
         assert_eq!(set.len(), 2);
-        assert!(set.contains(&InlineString::new("hello")));
-        assert!(set.contains(&InlineString::new("world")));
+        assert!(set.contains(&StringView::new("hello")));
+        assert!(set.contains(&StringView::new("world")));
     }
 
     #[test]
     fn test_finalize() {
-        let mut s = InlineString::new("hi");
+        let mut s = StringView::new("hi");
         s.finalize();
         assert_eq!(s.as_str(), "hi");
     }
 
     #[test]
     fn test_default() {
-        let s: InlineString = Default::default();
+        let s: StringView = Default::default();
         assert!(s.is_empty());
         assert_eq!(s.as_str(), "");
     }
 
     #[test]
     fn test_display() {
-        let s = InlineString::new("hello");
+        let s = StringView::new("hello");
         assert_eq!(format!("{}", s), "hello");
     }
 
     #[test]
     fn test_very_short_strings() {
-        let s1 = InlineString::new("a");
-        let s2 = InlineString::new("ab");
-        let s3 = InlineString::new("abc");
+        let s1 = StringView::new("a");
+        let s2 = StringView::new("ab");
+        let s3 = StringView::new("abc");
 
         assert_eq!(s1.as_str(), "a");
         assert_eq!(s2.as_str(), "ab");
@@ -595,10 +595,10 @@ mod tests {
 
     #[test]
     fn test_boundary_strings() {
-        let s4 = InlineString::new("1234");
-        let s8 = InlineString::new("12345678");
-        let s12 = InlineString::new("123456789012");
-        let s13 = InlineString::new("1234567890123");
+        let s4 = StringView::new("1234");
+        let s8 = StringView::new("12345678");
+        let s12 = StringView::new("123456789012");
+        let s13 = StringView::new("1234567890123");
 
         assert!(s4.is_inlined());
         assert!(s8.is_inlined());
@@ -615,17 +615,17 @@ mod tests {
     #[test]
     fn test_comparison_equals_method() {
         // Test the equals() method directly
-        let s1 = InlineString::new("hello");
-        let s2 = InlineString::new("hello");
-        let s3 = InlineString::new("world");
+        let s1 = StringView::new("hello");
+        let s2 = StringView::new("hello");
+        let s3 = StringView::new("world");
 
         assert!(s1.equals(&s2));
         assert!(!s1.equals(&s3));
 
         // Long strings
-        let long1 = InlineString::new("this is a very long string");
-        let long2 = InlineString::new("this is a very long string");
-        let long3 = InlineString::new("this is a different long string");
+        let long1 = StringView::new("this is a very long string");
+        let long2 = StringView::new("this is a very long string");
+        let long3 = StringView::new("this is a different long string");
 
         assert!(long1.equals(&long2));
         assert!(!long1.equals(&long3));
@@ -634,8 +634,8 @@ mod tests {
     #[test]
     fn test_comparison_greater_than_method() {
         // Test the greater_than() method directly
-        let apple = InlineString::new("apple");
-        let banana = InlineString::new("banana");
+        let apple = StringView::new("apple");
+        let banana = StringView::new("banana");
 
         assert!(!apple.greater_than(&banana));
         assert!(banana.greater_than(&apple));
@@ -645,8 +645,8 @@ mod tests {
     #[test]
     fn test_comparison_less_than_method() {
         // Test the less_than() method directly
-        let apple = InlineString::new("apple");
-        let banana = InlineString::new("banana");
+        let apple = StringView::new("apple");
+        let banana = StringView::new("banana");
 
         assert!(apple.less_than(&banana));
         assert!(!banana.less_than(&apple));
@@ -655,9 +655,9 @@ mod tests {
 
     #[test]
     fn test_comparison_gte_lte_methods() {
-        let s1 = InlineString::new("abc");
-        let s2 = InlineString::new("abc");
-        let s3 = InlineString::new("abd");
+        let s1 = StringView::new("abc");
+        let s2 = StringView::new("abc");
+        let s3 = StringView::new("abd");
 
         assert!(s1.greater_than_or_equal(&s2));
         assert!(s1.less_than_or_equal(&s2));
@@ -668,8 +668,8 @@ mod tests {
     #[test]
     fn test_mixed_inlined_pointer_comparison() {
         // Compare short (inlined) with long (pointer) strings
-        let short = InlineString::new("abc");
-        let long = InlineString::new("abcdefghijklmnop");
+        let short = StringView::new("abc");
+        let long = StringView::new("abcdefghijklmnop");
 
         assert!(short < long);
         assert!(short.less_than(&long));
@@ -681,8 +681,8 @@ mod tests {
     #[test]
     fn test_prefix_same_different_suffix_pointer() {
         // Test strings with same prefix but different suffix (for pointer strings)
-        let s1 = InlineString::new("same_prefix_different_end_1");
-        let s2 = InlineString::new("same_prefix_different_end_2");
+        let s1 = StringView::new("same_prefix_different_end_1");
+        let s2 = StringView::new("same_prefix_different_end_2");
 
         assert!(!s1.equals(&s2));
         assert!(s1 < s2);
@@ -692,9 +692,9 @@ mod tests {
     #[test]
     fn test_unicode_strings() {
         // Test UTF-8 unicode strings
-        let emoji = InlineString::new("🎉");
-        let chinese = InlineString::new("你好");
-        let japanese = InlineString::new("こんにちは");
+        let emoji = StringView::new("🎉");
+        let chinese = StringView::new("你好");
+        let japanese = StringView::new("こんにちは");
 
         // Emoji is 4 bytes, so it's inlined
         assert!(emoji.is_inlined());
@@ -714,9 +714,9 @@ mod tests {
 
     #[test]
     fn test_special_characters() {
-        let s1 = InlineString::new("\t\n\r");
-        let s2 = InlineString::new("\0\0\0");
-        let s3 = InlineString::new("a\x00b");
+        let s1 = StringView::new("\t\n\r");
+        let s2 = StringView::new("\0\0\0");
+        let s3 = StringView::new("a\x00b");
 
         assert_eq!(s1.as_str(), "\t\n\r");
         assert_eq!(s2.as_bytes(), b"\0\0\0");
@@ -725,7 +725,7 @@ mod tests {
 
     #[test]
     fn test_copy_semantics() {
-        let s1 = InlineString::new("hello");
+        let s1 = StringView::new("hello");
         let s2 = s1; // Copy, not move
         let s3 = s1; // Still valid
 
@@ -735,9 +735,9 @@ mod tests {
 
     #[test]
     fn test_get_prefix() {
-        let short = InlineString::new("hi");
-        let exact_prefix = InlineString::new("1234");
-        let long = InlineString::new("hello_world_this_is_long");
+        let short = StringView::new("hi");
+        let exact_prefix = StringView::new("1234");
+        let long = StringView::new("hello_world_this_is_long");
 
         // For inlined strings, prefix is first 4 bytes of data
         assert_eq!(short.get_prefix()[..2], *b"hi");
@@ -747,8 +747,8 @@ mod tests {
 
     #[test]
     fn test_get_data_pointer() {
-        let inlined = InlineString::new("hello");
-        let long = InlineString::new("this is a very long string");
+        let inlined = StringView::new("hello");
+        let long = StringView::new("this is a very long string");
 
         // Both should return valid pointers
         let ptr1 = inlined.get_data();
@@ -767,40 +767,40 @@ mod tests {
     #[test]
     fn test_ordering_edge_cases() {
         // Empty string should be less than any non-empty string
-        let empty = InlineString::empty();
-        let non_empty = InlineString::new("a");
+        let empty = StringView::empty();
+        let non_empty = StringView::new("a");
 
         assert!(empty < non_empty);
         assert!(non_empty > empty);
 
         // Same length strings with different content
-        let abc = InlineString::new("abc");
-        let abd = InlineString::new("abd");
+        let abc = StringView::new("abc");
+        let abd = StringView::new("abd");
         assert!(abc < abd);
 
         // Prefix comparison for very long strings
-        let long_a = InlineString::new("aaaa_very_very_long_string_here_1");
-        let long_b = InlineString::new("bbbb_very_very_long_string_here_2");
+        let long_a = StringView::new("aaaa_very_very_long_string_here_1");
+        let long_b = StringView::new("bbbb_very_very_long_string_here_2");
         assert!(long_a < long_b);
     }
 
     #[test]
     fn test_from_string_owned() {
         let owned = String::from("hello world");
-        let s = InlineString::from(owned.clone());
+        let s = StringView::from(owned.clone());
         assert_eq!(s.as_str(), "hello world");
 
-        let s2 = InlineString::from(&owned);
+        let s2 = StringView::from(&owned);
         assert_eq!(s2, s);
     }
 
     #[test]
     fn test_to_string_conversion() {
-        let s = InlineString::new("hello");
+        let s = StringView::new("hello");
         let owned = s.to_string();
         assert_eq!(owned, "hello");
 
-        let long = InlineString::new("this is a long string for testing");
+        let long = StringView::new("this is a long string for testing");
         let owned_long = long.to_string();
         assert_eq!(owned_long, "this is a long string for testing");
     }
@@ -810,15 +810,15 @@ mod tests {
         use std::collections::HashMap;
 
         let mut map = HashMap::new();
-        let key = InlineString::new("test_key");
+        let key = StringView::new("test_key");
         map.insert(key, 42);
 
         // Same content should hash to same value
-        let lookup_key = InlineString::new("test_key");
+        let lookup_key = StringView::new("test_key");
         assert_eq!(map.get(&lookup_key), Some(&42));
 
         // Different content should not be found
-        let other_key = InlineString::new("other_key");
+        let other_key = StringView::new("other_key");
         assert_eq!(map.get(&other_key), None);
     }
 
@@ -826,9 +826,9 @@ mod tests {
     fn test_ord_trait() {
         // Test Ord trait through sort
         let mut strings = [
-            InlineString::new("cherry"),
-            InlineString::new("apple"),
-            InlineString::new("banana"),
+            StringView::new("cherry"),
+            StringView::new("apple"),
+            StringView::new("banana"),
         ];
         strings.sort();
 
@@ -839,8 +839,8 @@ mod tests {
 
     #[test]
     fn test_partial_ord_trait() {
-        let a = InlineString::new("abc");
-        let b = InlineString::new("def");
+        let a = StringView::new("abc");
+        let b = StringView::new("def");
 
         assert_eq!(a.partial_cmp(&b), Some(std::cmp::Ordering::Less));
         assert_eq!(b.partial_cmp(&a), Some(std::cmp::Ordering::Greater));

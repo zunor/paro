@@ -12,7 +12,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::hash::{combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, NULL_HASH};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::Vector;
 
 use super::aggregate_object::AggregateObject;
@@ -520,7 +520,7 @@ impl TupleLayout {
                 let row_ptr = unsafe { row_base.add(row_idx * row_stride) };
                 if !row_is_valid(row_ptr, group_idx) {
                     unsafe {
-                        *entries.add(row_idx) = InlineString::empty();
+                        *entries.add(row_idx) = StringView::empty();
                     }
                     validity.set_null(row_idx);
                     continue;

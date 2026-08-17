@@ -4,7 +4,7 @@
 use std::marker::PhantomData;
 
 use crate::error::Result;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{LogicalType, StringView};
 
 use super::{
     ArrayVector, SelectionVector, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
@@ -219,7 +219,7 @@ impl<'a> VectorView<'a> {
 
 #[derive(Debug, Clone)]
 pub struct VarlenView<'a> {
-    entries: *const InlineString,
+    entries: *const StringView,
     sel: SelectionRef<'a>,
     validity: ValidityRef<'a>,
     _vector: PhantomData<&'a Vector>,
@@ -242,7 +242,7 @@ impl<'a> VarlenView<'a> {
     }
 
     #[inline]
-    pub fn get_inline_string(&self, idx: usize) -> InlineString {
+    pub fn get_string_view(&self, idx: usize) -> StringView {
         unsafe { *self.entries.add(self.sel.get(idx)) }
     }
 }
@@ -500,7 +500,7 @@ impl Vector {
             panic!("to_varlen_view requires pointer-backed data");
         };
         Ok(VarlenView {
-            entries: entries as *const InlineString,
+            entries: entries as *const StringView,
             sel: view.sel,
             validity: view.validity,
             _vector: PhantomData,
@@ -755,8 +755,8 @@ mod tests {
         let dictionary = crate::test_utils::test_dictionary(base, vec![2_u32, 0]);
         let view = dictionary.try_to_varlen_view(2).unwrap();
 
-        assert_eq!(view.get_inline_string(0).as_str(), "gamma");
-        assert_eq!(view.get_inline_string(1).as_str(), "alpha");
+        assert_eq!(view.get_string_view(0).as_str(), "gamma");
+        assert_eq!(view.get_string_view(1).as_str(), "alpha");
     }
 
     #[test]

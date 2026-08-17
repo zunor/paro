@@ -10,7 +10,7 @@ use paro_common::runtime_value::{
     format_date_days, format_decimal_i128, format_interval_parts, format_timestamp_micros,
     format_uuid, Value,
 };
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{DecodedVectorRef, Vector};
 use tokio_util::bytes::BytesMut;
 
@@ -188,12 +188,12 @@ impl<'a> TextVectorEncoder<'a> {
             | LogicalType::Json
             | LogicalType::Jsonb
             | LogicalType::StringLiteral => {
-                let value = unsafe { self.fixed::<InlineString>(row_idx) };
+                let value = unsafe { self.fixed::<StringView>(row_idx) };
                 buffer.extend_from_slice(value.as_bytes());
                 Ok(())
             }
             LogicalType::Blob => {
-                let value = unsafe { self.fixed::<InlineString>(row_idx) };
+                let value = unsafe { self.fixed::<StringView>(row_idx) };
                 buffer.extend_from_slice(b"BLOB[");
                 self.append_integer(buffer, value.len())?;
                 buffer.extend_from_slice(b"]");

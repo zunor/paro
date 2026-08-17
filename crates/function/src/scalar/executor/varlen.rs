@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::error::Result;
-use paro_common::types::InlineString;
+use paro_common::types::StringView;
 use paro_common::vector::{StringHeap, ValidityMask, Vector};
 
 pub struct VarcharResultWriter<'a> {
-    entries: *mut InlineString,
+    entries: *mut StringView,
     validity: &'a mut ValidityMask,
     heap: &'a mut StringHeap,
 }
@@ -44,7 +44,7 @@ impl<'a> VarcharResultWriter<'a> {
     #[inline]
     pub fn set_null(&mut self, row: usize) {
         unsafe {
-            *self.entries.add(row) = InlineString::empty();
+            *self.entries.add(row) = StringView::empty();
         }
         self.validity.set_null(row);
     }
@@ -67,7 +67,7 @@ where
             writer.set_null(row);
             continue;
         }
-        op(view.get_inline_string(row).as_str(), row, &mut writer)?;
+        op(view.get_string_view(row).as_str(), row, &mut writer)?;
     }
 
     Ok(())
@@ -90,7 +90,7 @@ where
             result.set_null(row, true);
             continue;
         }
-        result.set_i64(row, op(view.get_inline_string(row).as_str()));
+        result.set_i64(row, op(view.get_string_view(row).as_str()));
     }
 
     Ok(())
@@ -118,8 +118,8 @@ where
         result.set_bool(
             row,
             op(
-                left.get_inline_string(row).as_str(),
-                right.get_inline_string(row).as_str(),
+                left.get_string_view(row).as_str(),
+                right.get_string_view(row).as_str(),
             ),
         );
     }
@@ -149,8 +149,8 @@ where
         result.set_i64(
             row,
             op(
-                left.get_inline_string(row).as_str(),
-                right.get_inline_string(row).as_str(),
+                left.get_string_view(row).as_str(),
+                right.get_string_view(row).as_str(),
             ),
         );
     }
@@ -178,8 +178,8 @@ where
             continue;
         }
         op(
-            left.get_inline_string(row).as_str(),
-            right.get_inline_string(row).as_str(),
+            left.get_string_view(row).as_str(),
+            right.get_string_view(row).as_str(),
             row,
             &mut writer,
         )?;
@@ -210,9 +210,9 @@ where
             continue;
         }
         op(
-            first.get_inline_string(row).as_str(),
-            second.get_inline_string(row).as_str(),
-            third.get_inline_string(row).as_str(),
+            first.get_string_view(row).as_str(),
+            second.get_string_view(row).as_str(),
+            third.get_string_view(row).as_str(),
             row,
             &mut writer,
         )?;

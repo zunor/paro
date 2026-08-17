@@ -13,7 +13,7 @@ use std::sync::Arc;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{VarlenView, Vector};
 
 use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
@@ -592,7 +592,7 @@ fn encode_packed_rows<T: PackedWord>(
             validity.try_set_null(row_idx)?;
             continue;
         }
-        let value = source.get_inline_string(row_idx);
+        let value = source.get_string_view(row_idx);
         let bytes = value.as_bytes();
         if bytes.len() > max_length {
             return Err(paro_error::data_corrupted(format!(
@@ -652,7 +652,7 @@ fn decode_packed_rows<T: PackedWord>(
             let source_idx = source.physical_index(row_idx);
             if !source.validity().is_valid(source_idx) {
                 unsafe {
-                    *entries.add(row_idx) = InlineString::from_bytes(&[]);
+                    *entries.add(row_idx) = StringView::from_bytes(&[]);
                 }
                 validity.try_set_null(row_idx)?;
                 continue;

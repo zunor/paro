@@ -20,12 +20,12 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
         let capacity = views
             .iter()
             .filter(|view| view.is_valid(row))
-            .map(|view| view.get_inline_string(row).as_str().len())
+            .map(|view| view.get_string_view(row).as_str().len())
             .sum();
         let mut concatenated = String::with_capacity(capacity);
         for view in &views {
             if view.is_valid(row) {
-                concatenated.push_str(view.get_inline_string(row).as_str());
+                concatenated.push_str(view.get_string_view(row).as_str());
             }
         }
         writer.write_str(row, &concatenated)?;
@@ -54,14 +54,14 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             continue;
         }
 
-        let separator_value = separator.get_inline_string(row);
+        let separator_value = separator.get_string_view(row);
         let sep = separator_value.as_str();
         let mut value_count = 0;
         let mut capacity = 0;
         for view in &arguments {
             if view.is_valid(row) {
                 value_count += 1;
-                capacity += view.get_inline_string(row).as_str().len();
+                capacity += view.get_string_view(row).as_str().len();
             }
         }
         if value_count > 1 {
@@ -77,7 +77,7 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             if wrote_any {
                 concatenated.push_str(sep);
             }
-            concatenated.push_str(view.get_inline_string(row).as_str());
+            concatenated.push_str(view.get_string_view(row).as_str());
             wrote_any = true;
         }
 

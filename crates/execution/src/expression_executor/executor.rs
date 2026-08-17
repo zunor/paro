@@ -2519,7 +2519,7 @@ impl ExpressionExecutor {
                         }
                         result.set_bool(
                             row_idx,
-                            pattern.matches(values.get_inline_string(row_idx).as_str()),
+                            pattern.matches(values.get_string_view(row_idx).as_str()),
                         );
                     }
                 } else {
@@ -2550,8 +2550,8 @@ impl ExpressionExecutor {
                         result.set_bool(
                             row_idx,
                             sql_like(
-                                values.get_inline_string(row_idx).as_str(),
-                                patterns.get_inline_string(row_idx).as_str(),
+                                values.get_string_view(row_idx).as_str(),
+                                patterns.get_string_view(row_idx).as_str(),
                                 case_insensitive,
                             ),
                         );

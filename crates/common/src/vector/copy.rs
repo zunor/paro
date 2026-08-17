@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
-use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
+use crate::types::{LogicalType, StringView, INLINE_CAPACITY};
 
 use super::{SelectionRef, SelectionVector, StringHeap, Vector, VectorSelection, VectorType};
 
@@ -784,9 +784,9 @@ impl Vector {
         bytes: &[u8],
         heap: &mut Option<StringHeap>,
         allocator: Arc<dyn Allocator>,
-    ) -> Result<InlineString> {
-        if bytes.len() <= INLINE_LENGTH {
-            return Ok(InlineString::from_bytes(bytes));
+    ) -> Result<StringView> {
+        if bytes.len() <= INLINE_CAPACITY {
+            return Ok(StringView::from_bytes(bytes));
         }
 
         if heap.is_none() {
@@ -883,13 +883,13 @@ impl Vector {
         let allocator = self.buffer.allocator().clone();
 
         unsafe {
-            let entries = self.buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *mut StringView;
             for i in 0..count {
                 let dst_idx = dst_offset + i;
                 let src_idx = src_offset + i;
                 if source.is_null(src_idx) {
                     self.validity.try_set_null(dst_idx)?;
-                    *entries.add(dst_idx) = InlineString::empty();
+                    *entries.add(dst_idx) = StringView::empty();
                     continue;
                 }
 
@@ -935,14 +935,14 @@ impl Vector {
                 allocator.clone(),
             );
             let rebuilt_buffer = super::VectorBuffer::try_with_allocator(
-                std::mem::size_of::<InlineString>(),
+                std::mem::size_of::<StringView>(),
                 self.buffer.capacity(),
                 allocator,
             )?;
 
             unsafe {
-                let old_entries = self.buffer.data() as *const InlineString;
-                let new_entries = rebuilt_buffer.data() as *mut InlineString;
+                let old_entries = self.buffer.data() as *const StringView;
+                let new_entries = rebuilt_buffer.data() as *mut StringView;
                 for row_idx in 0..self.count {
                     let entry = *old_entries.add(row_idx);
                     *new_entries.add(row_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
@@ -953,7 +953,7 @@ impl Vector {
                     let src_idx = src_offset + i;
                     if source.is_null(src_idx) {
                         self.validity.try_set_null(dst_idx)?;
-                        *new_entries.add(dst_idx) = InlineString::empty();
+                        *new_entries.add(dst_idx) = StringView::empty();
                         continue;
                     }
 
@@ -978,13 +978,13 @@ impl Vector {
         }
 
         unsafe {
-            let entries = self.buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *mut StringView;
             for i in 0..count {
                 let dst_idx = dst_offset + i;
                 let src_idx = src_offset + i;
                 if source.is_null(src_idx) {
                     self.validity.try_set_null(dst_idx)?;
-                    *entries.add(dst_idx) = InlineString::empty();
+                    *entries.add(dst_idx) = StringView::empty();
                     continue;
                 }
 
@@ -995,8 +995,8 @@ impl Vector {
                             "copy range missing varlen value at row {src_idx}"
                         ))
                     })?;
-                *entries.add(dst_idx) = if bytes.len() <= INLINE_LENGTH {
-                    InlineString::from_bytes(bytes)
+                *entries.add(dst_idx) = if bytes.len() <= INLINE_CAPACITY {
+                    StringView::from_bytes(bytes)
                 } else {
                     let allocator = self.buffer.allocator().clone();
                     let heap = self.string_heap.get_or_insert_with(|| {

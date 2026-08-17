@@ -193,13 +193,13 @@ fn execute_regexp(
         if !text_view.is_valid(row) || !pattern_view.is_valid(row) {
             result.set_null(row, true);
         } else {
-            let text_value = text_view.get_inline_string(row);
+            let text_value = text_view.get_string_view(row);
             let text = text_value.as_str();
             let matched = match local_pattern {
                 Some(BoundRegexp::Compiled(regex)) => regex.is_match(text),
                 Some(BoundRegexp::Invalid) => false,
                 None => {
-                    let pattern_value = pattern_view.get_inline_string(row);
+                    let pattern_value = pattern_view.get_string_view(row);
                     let pattern = match bound_pattern {
                         Some(bind) => bind.pattern.as_str(),
                         None => pattern_value.as_str(),

@@ -8,7 +8,7 @@ use std::ptr;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::INLINE_LENGTH;
+use paro_common::types::INLINE_CAPACITY;
 use paro_common::vector::{DataRef, VarlenView, Vector, VectorView};
 
 use super::{unsafe_api, ColumnCodec, RowHeapWriter};
@@ -253,9 +253,9 @@ impl<'a> PreparedRowScatter<'a> {
             let column_usage = match column {
                 PreparedColumn::Fixed { .. } => RowHeapUsage::default(),
                 PreparedColumn::Varlen { view } => {
-                    let value = view.get_inline_string(row_idx);
+                    let value = view.get_string_view(row_idx);
                     RowHeapUsage {
-                        varlen_bytes: usize::from(value.len() > INLINE_LENGTH) * value.len(),
+                        varlen_bytes: usize::from(value.len() > INLINE_CAPACITY) * value.len(),
                         nested_value_bytes: 0,
                     }
                 }
@@ -351,7 +351,7 @@ impl<'a> PreparedRowScatter<'a> {
                     },
                 },
                 PreparedColumn::Varlen { view } => {
-                    let value = view.get_inline_string(row_idx);
+                    let value = view.get_string_view(row_idx);
                     unsafe { write_varlen(target, value.as_bytes(), heap)? };
                 }
                 PreparedColumn::Nested { source } => unsafe {
@@ -415,13 +415,17 @@ unsafe fn write_varlen(target: *mut u8, bytes: &[u8], heap: &mut impl RowHeapWri
     let len = u32::try_from(bytes.len())
         .map_err(|_| paro_error::out_of_range("row varlen value exceeds u32 length"))?;
     unsafe { ptr::write_unaligned(target.cast::<u32>(), len) };
-    if bytes.len() <= INLINE_LENGTH {
+    if bytes.len() <= INLINE_CAPACITY {
         if !bytes.is_empty() {
             unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), target.add(4), bytes.len()) };
         }
-        if bytes.len() < INLINE_LENGTH {
+        if bytes.len() < INLINE_CAPACITY {
             unsafe {
-                ptr::write_bytes(target.add(4 + bytes.len()), 0, INLINE_LENGTH - bytes.len())
+                ptr::write_bytes(
+                    target.add(4 + bytes.len()),
+                    0,
+                    INLINE_CAPACITY - bytes.len(),
+                )
             };
         }
         return Ok(());
