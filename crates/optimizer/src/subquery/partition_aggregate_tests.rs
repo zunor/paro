@@ -10,12 +10,16 @@ use paro_catalog::search_path::CatalogSearchEntry;
 use paro_common::types::LogicalType;
 use paro_context::{test_support::TestStatementContextBuilder, QueryResources};
 use paro_function::aggregate::distributive::{
-    avg::get_avg_function, count::get_count_function, minmax::get_min_function,
+    avg::get_avg_function,
+    count::{get_count_function, get_count_star_function},
+    minmax::get_min_function,
     sum::get_sum_function,
 };
+use paro_function::aggregate::AggregateFunctionSet;
 use paro_function::scalar::cast::{
     date_casts, decimal_casts, numeric_casts, BindCastInput, BoundCastInfo, CastFunctionSet,
 };
+use paro_function::scalar::string::get_substring_functions;
 use paro_function::scalar::ScalarFunctionSet;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::LogicalOperator;
@@ -208,7 +212,7 @@ fn assert_tpch_rewrites() {
     }
 }
 
-fn setup_session() -> Arc<paro_context::StatementContext> {
+pub(super) fn setup_session() -> Arc<paro_context::StatementContext> {
     let mut session = TestStatementContextBuilder::minimal()
         .with_current_database("paro")
         .with_search_path(vec![
@@ -222,6 +226,11 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
         LogicalType::BigInt,
         LogicalType::Integer,
         BoundCastInfo::fixed(numeric_casts::int64_to_int32),
+    );
+    casts.register_cast(
+        LogicalType::Integer,
+        LogicalType::BigInt,
+        BoundCastInfo::fixed(numeric_casts::int32_to_int64),
     );
     casts.register_cast(
         LogicalType::Varchar,
@@ -267,6 +276,19 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
             )
             .expect("install scalar");
     }
+    schema
+        .create_scalar_function(
+            &transaction,
+            Arc::new(ScalarFunctionCatalogEntry::new(
+                "paro".to_string(),
+                "public".to_string(),
+                get_substring_functions(),
+                schema.object_id_allocator().allocate(),
+                0,
+            )),
+            OnCreateConflict::ReplaceOnConflict,
+        )
+        .expect("install substring");
     for function in [
         get_min_function(),
         get_avg_function(),
@@ -287,6 +309,21 @@ fn setup_session() -> Arc<paro_context::StatementContext> {
             )
             .expect("install aggregate");
     }
+    let mut count_star = AggregateFunctionSet::new("count_star".to_string());
+    count_star.add_function(get_count_star_function());
+    schema
+        .create_aggregate_function(
+            &transaction,
+            Arc::new(AggregateFunctionCatalogEntry::new(
+                "paro".to_string(),
+                "public".to_string(),
+                count_star,
+                schema.object_id_allocator().allocate(),
+                0,
+            )),
+            OnCreateConflict::ReplaceOnConflict,
+        )
+        .expect("install count_star");
 
     let decimal = LogicalType::Decimal {
         precision: 15,

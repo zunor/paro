@@ -13,7 +13,9 @@
 //! - Returns Chunks for pipeline execution
 
 use super::schema_adapter::{build_reader_schema_adapters, RowsetSchemaAdapter};
-pub use super::tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
+pub use super::tablet_reader_params::{
+    ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
+};
 use super::tablet_runtime::{TabletReadGuard, TabletRef, TabletSnapshotMaterialization};
 use super::tablet_schema::TabletSchemaRef;
 use crate::codec::vector_decoder::StorageDictionaryDecoderCache;
@@ -59,6 +61,7 @@ impl RowsetCursor {
     fn new(
         rowset: RowsetSharedPtr,
         projection: &[ColumnId],
+        read_prefix_widths: &[Option<usize>],
         params: &TabletReaderParams,
     ) -> Result<Self> {
         // Ensure segments are loaded and protect rowset from deletion during read.
@@ -114,13 +117,20 @@ impl RowsetCursor {
             };
 
             let mut iter = if use_late_materialize && !predicate_columns.is_empty() {
-                SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+                let matched_prefixes = projection
+                    .iter()
+                    .copied()
+                    .zip(read_prefix_widths.iter().copied())
+                    .filter_map(|(column_id, width)| width.map(|width| (column_id, width)))
+                    .collect::<HashMap<_, _>>();
+                SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize_with_prefixes(
                     &seg,
                     col_ids,
                     predicate_columns,
                     delete_vector,
                     params.predicate_tree.clone(),
                     params.prefetcher.clone(),
+                    matched_prefixes,
                 )?
             } else {
                 SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
@@ -229,6 +239,13 @@ pub struct TabletReader {
     /// Output column mapping (output idx -> read idx)
     pub(super) output_to_read: Vec<usize>,
 
+    /// Output decode transform, parallel to `output_to_read`.
+    pub(super) value_projections: Vec<ColumnValueProjection>,
+
+    /// Raw predicate columns that can be compacted to a proven prefix before
+    /// they leave the segment iterator, parallel to `projection`.
+    read_prefix_widths: Vec<Option<usize>>,
+
     /// Prepare-stage rowset schema adapters keyed by rowset id.
     schema_adapters: HashMap<u64, RowsetSchemaAdapter>,
 
@@ -266,6 +283,8 @@ impl std::fmt::Debug for TabletReader {
             .field("read_types", &self.read_types)
             .field("projection", &self.projection)
             .field("output_to_read", &self.output_to_read)
+            .field("value_projections", &self.value_projections)
+            .field("read_prefix_widths", &self.read_prefix_widths)
             .field("schema_adapters", &self.schema_adapters.len())
             .field("state", &self.state)
             .field("current_cursor", &self.current_cursor)
@@ -323,6 +342,29 @@ impl TabletReader {
             ColumnProjection::new(output_columns.clone())
         };
 
+        for (output_index, (&column_index, projection)) in column_projection
+            .output_columns()
+            .iter()
+            .zip(column_projection.value_projections())
+            .enumerate()
+        {
+            let ColumnValueProjection::MatchedUtf8Prefix { byte_width } = projection else {
+                continue;
+            };
+            let column = schema.column(column_index).ok_or_else(|| {
+                paro_error::invalid_input("matched-prefix column index is out of range")
+            })?;
+            if column.logical_type != LogicalType::Varchar
+                || !params.predicate_tree.as_ref().is_some_and(|predicate| {
+                    predicate.proves_ascii_prefix_width(column.id, *byte_width)
+                })
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "matched-prefix output {output_index} lacks its exact VARCHAR predicate witness"
+                )));
+            }
+        }
+
         // Determine output types based on output columns
         let mut output_types = output_columns
             .iter()
@@ -361,6 +403,7 @@ impl TabletReader {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let read_prefix_widths = column_projection.exclusive_matched_prefix_widths();
         Ok(Self {
             tablet,
             params,
@@ -370,6 +413,8 @@ impl TabletReader {
             read_types,
             projection,
             output_to_read: column_projection.output_to_read().to_vec(),
+            value_projections: column_projection.value_projections().to_vec(),
+            read_prefix_widths,
             schema_adapters: HashMap::new(),
             state: ReaderState::new(),
             current_cursor: None,
@@ -445,7 +490,12 @@ impl TabletReader {
                 }
 
                 let rowset = self.rowsets[self.state.current_rowset_idx].clone();
-                let cursor = RowsetCursor::new(rowset, &self.projection, &self.params)?;
+                let cursor = RowsetCursor::new(
+                    rowset,
+                    &self.projection,
+                    &self.read_prefix_widths,
+                    &self.params,
+                )?;
                 self.current_cursor = Some(cursor);
             }
 

@@ -5,6 +5,22 @@
 
 use paro_function::scalar::cast::{BoundCastInfo, CastDispatch};
 use paro_function::scalar::{BoundScalarFunction, ScalarDispatch};
+use paro_planner::expression::AggregateExpression;
+
+/// Compare the complete bound aggregate execution contract, never its display
+/// name. Extensions may reuse a built-in signature with different state
+/// transitions or bind payload.
+pub(crate) fn aggregate_kernels_equal(
+    left: &AggregateExpression,
+    right: &AggregateExpression,
+) -> bool {
+    left.function.execution_semantics_equal(&right.function)
+        && match (&left.bind_info, &right.bind_info) {
+            (Some(left), Some(right)) => left.equals(&**right),
+            (None, None) => true,
+            _ => false,
+        }
+}
 
 pub(crate) fn scalar_kernels_equal(
     left: &BoundScalarFunction,

@@ -281,8 +281,11 @@ pub unsafe fn read_value(
             if logical_type == &LogicalType::Blob {
                 Ok(Value::Blob(value.as_bytes().to_vec()))
             } else {
+                // SAFETY: raw-row writers only accept textual vectors or
+                // `Value::Varchar`, so a textual cell carries the UTF-8
+                // invariant of its logical type.
                 Ok(Value::Varchar(
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
+                    unsafe { value.as_str_unchecked() }.to_owned(),
                 ))
             }
         }
@@ -524,10 +527,11 @@ fn gather_string_internal<const ALL_VALID: bool>(
     row_locations: &[*const u8],
     count: usize,
 ) -> Result<()> {
-    let is_blob = vector.logical_type() == &LogicalType::Blob;
-
-    // Set vector length first to ensure validity mask is properly sized
-    vector.try_set_len(count)?;
+    // This replaces every output row, so build one owned varlen heap and write
+    // entries directly. Besides avoiding one COW/type-dispatch check per row,
+    // copying bytes preserves the raw-row UTF-8 invariant without lossy
+    // substitutions.
+    let (entries, validity, heap) = vector.begin_varlen_write(count);
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
         let is_valid = if ALL_VALID {
@@ -539,22 +543,15 @@ fn gather_string_internal<const ALL_VALID: bool>(
         if is_valid {
             // SAFETY: `row_ptr + offset` addresses a live canonical row cell.
             let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
-            if is_blob {
-                vector.try_set_blob(i, value.as_bytes())?;
-            } else if let Ok(text) = value.as_str() {
-                vector.try_set_string(i, text)?;
-            } else {
-                vector.try_set_string(i, "")?;
-            }
-            vector.try_set_null(i, false)?;
+            // SAFETY: the destination vector retains this heap with the entry.
+            let copied = unsafe { heap.try_add_blob(value.as_bytes()) }?;
+            // SAFETY: `begin_varlen_write(count)` returned `count` writable entries.
+            unsafe { entries.add(i).write(copied) };
+            validity.try_set_valid(i)?;
         } else {
-            // Write default value based on type
-            if is_blob {
-                vector.try_set_blob(i, &[])?;
-            } else {
-                vector.try_set_string(i, "")?;
-            }
-            vector.try_set_null(i, true)?;
+            // SAFETY: `begin_varlen_write(count)` returned `count` writable entries.
+            unsafe { entries.add(i).write(StringView::empty()) };
+            validity.try_set_invalid(i)?;
         }
     }
     Ok(())
@@ -776,10 +773,10 @@ fn gather_string_with_sel(
             let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
             if vector.logical_type() == &LogicalType::Blob {
                 vector.try_set_blob(dst_idx, value.as_bytes())?;
-            } else if let Ok(text) = value.as_str() {
-                vector.try_set_string(dst_idx, text)?;
             } else {
-                vector.try_set_string(dst_idx, "")?;
+                // SAFETY: textual raw-row cells inherit the UTF-8 invariant
+                // from the typed vector/value writer that created them.
+                vector.try_set_string(dst_idx, unsafe { value.as_str_unchecked() })?;
             }
             vector.try_set_null(dst_idx, false)?;
         } else {
@@ -882,8 +879,9 @@ unsafe fn gather_collection_payload(
                 if matches!(logical_type, LogicalType::Blob) {
                     child_vector.try_set_blob(child_idx, bytes)?;
                 } else {
-                    let value = String::from_utf8_lossy(bytes);
-                    child_vector.try_set_string(child_idx, value.as_ref())?;
+                    // SAFETY: textual collection payloads are emitted only
+                    // from typed textual child vectors.
+                    child_vector.try_set_string(child_idx, unsafe { string.as_str_unchecked() })?;
                 }
                 if !string.is_inlined() && !string.is_empty() && elem_i < source_count {
                     heap_bytes = heap_bytes.saturating_add(string.len());

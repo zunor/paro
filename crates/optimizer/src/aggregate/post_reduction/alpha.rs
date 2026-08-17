@@ -5,17 +5,19 @@
 
 use std::collections::HashMap;
 
-use paro_planner::expression::Expression;
+use paro_planner::expression::{Expression, ExpressionIterator, ExpressionVisitDecision};
 use paro_planner::operator::{
-    ColumnBinding, ComparisonJoin, Filter, Join, LogicalOperator, Projection,
+    ColumnBinding, ComparisonJoin, Filter, Get, Join, LogicalOperator, Projection,
 };
 use paro_planner::plan::LogicalPlan;
 
-use super::{aggregate_kernels_equal, clean_inner_join, is_movable};
-use crate::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
+use super::{clean_inner_join, is_movable};
+use crate::aggregate::semantic_kernels::{
+    aggregate_kernels_equal, cast_kernels_equal, scalar_kernels_equal,
+};
 
 #[derive(Default)]
-pub(super) struct AlphaBindings {
+pub(crate) struct AlphaBindings {
     forward: HashMap<ColumnBinding, ColumnBinding>,
     reverse: HashMap<ColumnBinding, ColumnBinding>,
 }
@@ -24,6 +26,14 @@ impl AlphaBindings {
     pub(super) fn match_sources(grouped: &LogicalPlan, scalar: &LogicalPlan) -> Option<Self> {
         let mut bindings = Self::default();
         bindings.match_plan(grouped, scalar).then_some(bindings)
+    }
+
+    /// Pair two scans of the same catalog object through stable physical
+    /// column ids. The detail scan may expose columns absent from the scalar
+    /// branch, but every scalar column must have an exact detail counterpart.
+    pub(crate) fn match_gets(detail: &Get, scalar: &Get) -> Option<Self> {
+        let mut bindings = Self::default();
+        bindings.match_get_pair(detail, scalar).then_some(bindings)
     }
 
     pub(super) fn bind(&mut self, grouped: ColumnBinding, scalar: ColumnBinding) -> bool {
@@ -38,7 +48,7 @@ impl AlphaBindings {
         }
     }
 
-    pub(super) fn expressions_equal(&self, grouped: &Expression, scalar: &Expression) -> bool {
+    pub(crate) fn expressions_equal(&self, grouped: &Expression, scalar: &Expression) -> bool {
         if grouped.return_type() != scalar.return_type()
             || !is_movable(grouped)
             || !is_movable(scalar)
@@ -46,6 +56,33 @@ impl AlphaBindings {
             return false;
         }
         self.semantic_expression_equal(grouped, scalar)
+    }
+
+    /// Rebase a scalar-branch expression into the detail scan's binding
+    /// domain. Unknown or unmapped expression domains fail closed.
+    pub(crate) fn rebase_scalar(&self, expression: &Expression) -> Option<Expression> {
+        let mut valid = true;
+        ExpressionIterator::visit(expression, &mut |node| match node {
+            Expression::ColumnRef(column) => {
+                valid &= column.depth == 0 && self.reverse.contains_key(&column.binding);
+                ExpressionVisitDecision::SkipChildren
+            }
+            Expression::Reference(_) | Expression::Subquery(_) | Expression::Window(_) => {
+                valid = false;
+                ExpressionVisitDecision::SkipChildren
+            }
+            _ => ExpressionVisitDecision::Descend,
+        });
+        valid.then(|| {
+            expression.clone().replace_column_ref(&|column| {
+                self.reverse.get(&column.binding).copied().map(|binding| {
+                    Expression::ColumnRef(paro_planner::expression::ColumnRefExpression::new(
+                        binding,
+                        column.return_type.clone(),
+                    ))
+                })
+            })
+        })
     }
 
     /// Proof-grade equality for the deliberately small expression language
@@ -86,6 +123,11 @@ impl AlphaBindings {
                     && self.semantic_expression_equal(&left.left, &right.left)
                     && self.semantic_expression_equal(&left.right, &right.right)
             }
+            (Expression::Operator(left), Expression::Operator(right)) => {
+                left.operator_type == right.operator_type
+                    && left.return_type == right.return_type
+                    && self.expression_slices_equal(&left.children, &right.children)
+            }
             (Expression::Aggregate(left), Expression::Aggregate(right)) => {
                 left.return_type == right.return_type
                     && left.aggr_type == right.aggr_type
@@ -108,10 +150,9 @@ impl AlphaBindings {
                                     .semantic_expression_equal(&left.expression, &right.expression)
                         })
             }
-            // Operator, Case, Parameter, Reference, Subquery, and Window
-            // nodes are intentionally outside the proof language.  Q11's
-            // common relational input needs none of them; admitting one in
-            // the future requires spelling out all of its bound semantics.
+            // Case, Parameter, Reference, Subquery, and Window nodes are
+            // intentionally outside the proof language. Admitting one
+            // requires spelling out all of its bound semantics.
             _ => false,
         }
     }
@@ -127,40 +168,7 @@ impl AlphaBindings {
     fn match_plan(&mut self, grouped: &LogicalPlan, scalar: &LogicalPlan) -> bool {
         match (&grouped.operator, &scalar.operator) {
             (LogicalOperator::Get(left), LogicalOperator::Get(right)) => {
-                let (Some(left_table), Some(right_table)) = (&left.table, &right.table) else {
-                    return false;
-                };
-                if left_table.base.base.catalog != right_table.base.base.catalog
-                    || left_table.base.schema_name != right_table.base.schema_name
-                    || left_table.base.base.object_id != right_table.base.base.object_id
-                    || left.column_ids.len() != left.column_types.len()
-                    || left.column_ids.len() != left.returned_types.len()
-                    || right.column_ids.len() != right.column_types.len()
-                    || right.column_ids.len() != right.returned_types.len()
-                    || left.scan_order.is_some()
-                    || right.scan_order.is_some()
-                    || !left.runtime_filter_expressions.is_empty()
-                    || !right.runtime_filter_expressions.is_empty()
-                {
-                    return false;
-                }
-
-                // The grouped branch may retain an additional grouping key.
-                // Pair outputs through stable physical column ids, never
-                // through branch-local scan ordinals.
-                right.column_ids.iter().enumerate().all(|(right_idx, id)| {
-                    let Some(left_idx) =
-                        left.column_ids.iter().position(|candidate| candidate == id)
-                    else {
-                        return false;
-                    };
-                    left.column_types[left_idx] == right.column_types[right_idx]
-                        && left.returned_types[left_idx] == right.returned_types[right_idx]
-                        && self.bind(
-                            ColumnBinding::new(left.table_index, left_idx),
-                            ColumnBinding::new(right.table_index, right_idx),
-                        )
-                })
+                self.match_get_pair(left, right)
             }
             (LogicalOperator::Filter(left), LogicalOperator::Filter(right)) => {
                 self.match_filters(left, right)
@@ -174,6 +182,50 @@ impl AlphaBindings {
             ) => self.match_joins(left, right),
             _ => false,
         }
+    }
+
+    fn match_get_pair(&mut self, detail: &Get, scalar: &Get) -> bool {
+        let (Some(detail_table), Some(scalar_table)) = (&detail.table, &scalar.table) else {
+            return false;
+        };
+        if detail_table.base.base.catalog != scalar_table.base.base.catalog
+            || detail_table.base.schema_name != scalar_table.base.schema_name
+            || detail_table.base.base.object_id != scalar_table.base.base.object_id
+            || detail.column_ids.len() != detail.column_types.len()
+            || detail.column_ids.len() != detail.returned_types.len()
+            || detail.column_ids.len() != detail.column_projections.len()
+            || scalar.column_ids.len() != scalar.column_types.len()
+            || scalar.column_ids.len() != scalar.returned_types.len()
+            || scalar.column_ids.len() != scalar.column_projections.len()
+            || detail.scan_order.is_some()
+            || scalar.scan_order.is_some()
+            || !detail.runtime_filter_expressions.is_empty()
+            || !scalar.runtime_filter_expressions.is_empty()
+        {
+            return false;
+        }
+
+        scalar
+            .column_ids
+            .iter()
+            .enumerate()
+            .all(|(scalar_idx, id)| {
+                let Some(detail_idx) = detail
+                    .column_ids
+                    .iter()
+                    .position(|candidate| candidate == id)
+                else {
+                    return false;
+                };
+                detail.column_types[detail_idx] == scalar.column_types[scalar_idx]
+                    && detail.returned_types[detail_idx] == scalar.returned_types[scalar_idx]
+                    && detail.column_projections[detail_idx]
+                        == scalar.column_projections[scalar_idx]
+                    && self.bind(
+                        ColumnBinding::new(detail.table_index, detail_idx),
+                        ColumnBinding::new(scalar.table_index, scalar_idx),
+                    )
+            })
     }
 
     fn match_filters(&mut self, grouped: &Filter, scalar: &Filter) -> bool {

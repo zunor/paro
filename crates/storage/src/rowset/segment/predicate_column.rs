@@ -509,6 +509,62 @@ impl PredicateColumnBatch {
         }
     }
 
+    /// Materialize only the ASCII prefix whose truth was established by the
+    /// predicate that selected `rows`.  This is not a general UTF-8 substring:
+    /// a missing, NULL, short, or non-ASCII prefix contradicts the optimizer
+    /// and storage predicate witness and therefore fails closed.
+    pub(super) fn append_reusable_matched_utf8_prefix_rows(
+        &self,
+        byte_width: usize,
+        rows: &[BatchRowOrdinal],
+        values: &mut Vec<u8>,
+        nulls: &mut Vec<u8>,
+        row_ends: &mut Vec<usize>,
+    ) -> Result<bool> {
+        if byte_width == 0 {
+            return Err(paro_error::internal(
+                "matched UTF-8 prefix width must be positive",
+            ));
+        }
+        let additional_bytes = rows
+            .len()
+            .checked_mul(byte_width.saturating_add(std::mem::size_of::<u32>()))
+            .ok_or_else(|| paro_error::out_of_memory("matched-prefix capacity overflow"))?;
+        values.reserve(additional_bytes);
+        nulls.reserve(rows.len());
+        row_ends.reserve(rows.len());
+
+        for &row in rows {
+            let row = row.index();
+            let value = match self {
+                Self::RawVarlen(batch) => batch.row_value(row),
+                Self::StorageDictionary(batch) => batch.row_value(row),
+                Self::Decoded(vector) => {
+                    if row >= vector.len() || vector.is_null(row) {
+                        None
+                    } else {
+                        vector.get_string(row).map(str::as_bytes)
+                    }
+                }
+                Self::Raw(_) => return Ok(false),
+            }
+            .ok_or_else(|| {
+                paro_error::data_corrupted("NULL row escaped a matched-prefix predicate")
+            })?;
+            let prefix = value.get(..byte_width).ok_or_else(|| {
+                paro_error::data_corrupted("matched string is shorter than its prefix witness")
+            })?;
+            if !prefix.is_ascii() {
+                return Err(paro_error::data_corrupted(
+                    "matched string contradicts its ASCII prefix witness",
+                ));
+            }
+            append_varlen_value(Some(prefix), values, nulls)?;
+            row_ends.push(values.len());
+        }
+        Ok(true)
+    }
+
     pub(super) fn reusable_rows_have_verified_utf8(&self) -> bool {
         match self {
             Self::RawVarlen(batch) => batch.utf8_verified,

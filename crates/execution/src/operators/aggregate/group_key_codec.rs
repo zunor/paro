@@ -250,7 +250,7 @@ fn physical_type(encoding: &GroupKeyEncoding, logical_type: &LogicalType) -> Res
         } => {
             validate_integer_type(logical_type)?;
             validate_unsigned_physical_type(physical_type)?;
-            if physical_type.physical_size() >= logical_type.physical_size() {
+            if physical_type.type_size() >= logical_type.type_size() {
                 return Err(paro_error::internal(format!(
                     "offset integer group key must reduce physical width: logical={logical_type:?}, physical={physical_type:?}"
                 )));

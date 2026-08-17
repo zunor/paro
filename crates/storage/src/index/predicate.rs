@@ -214,6 +214,29 @@ impl PredicateTree {
     pub fn leaf(predicate: Predicate) -> Self {
         PredicateTree::Leaf(predicate)
     }
+
+    /// Prove that every row admitted by this tree has the requested ASCII
+    /// prefix width on `column_id`.  A witness under conjunction is sufficient;
+    /// disjunction requires branch-wise reasoning and is deliberately rejected.
+    pub fn proves_ascii_prefix_width(&self, column_id: ColumnId, byte_width: usize) -> bool {
+        match self {
+            Self::Leaf(Predicate::StringPrefixIn {
+                column_id: candidate,
+                prefixes,
+            }) => {
+                *candidate == column_id
+                    && byte_width > 0
+                    && !prefixes.is_empty()
+                    && prefixes
+                        .iter()
+                        .all(|prefix| prefix.is_ascii() && prefix.len() == byte_width)
+            }
+            Self::And(children) => children
+                .iter()
+                .any(|child| child.proves_ascii_prefix_width(column_id, byte_width)),
+            Self::Or(_) | Self::Leaf(_) => false,
+        }
+    }
 }
 
 impl fmt::Display for PredicateTree {

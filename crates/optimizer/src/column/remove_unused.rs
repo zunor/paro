@@ -149,6 +149,7 @@ impl<'a> RemoveUnusedColumns<'a> {
     fn remove_columns_from_get(&mut self, get: &mut paro_planner::operator::Get) {
         let mut new_column_ids = Vec::new();
         let mut new_column_types = Vec::new();
+        let mut new_column_projections = Vec::new();
         let mut new_names = Vec::new();
         let mut new_col_idx = 0usize;
 
@@ -164,6 +165,7 @@ impl<'a> RemoveUnusedColumns<'a> {
                 }
                 new_column_ids.push(col_id);
                 new_column_types.push(get.column_types[old_idx].clone());
+                new_column_projections.push(get.column_projections[old_idx]);
                 if old_idx < get.names.len() {
                     new_names.push(get.names[old_idx].clone());
                 }
@@ -173,6 +175,7 @@ impl<'a> RemoveUnusedColumns<'a> {
 
         get.column_ids = new_column_ids;
         get.column_types = new_column_types.clone();
+        get.column_projections = new_column_projections;
         get.returned_types = new_column_types;
         get.names = new_names;
     }

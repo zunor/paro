@@ -18,6 +18,7 @@ fn partition_aggregate_window_graph(
     aggregate.groups = Box::new([reference(0, key_type.clone())]);
     aggregate.output_types = Box::new([key_type.clone(), LogicalType::BigInt]);
     let spec = PartitionAggregateWindowSpec {
+        domain: PartitionAggregateDomain::Keyed,
         input_types: input_types.clone(),
         detail_columns: Box::new([0, 1]),
         aggregate,
@@ -175,6 +176,129 @@ fn partition_aggregate_window_executes_bigint_key_domain() {
     assert_eq!(chunk.column(2).unwrap().get_i64(2), Some(2));
 }
 
+fn global_filtered_count_window_spec() -> PartitionAggregateWindowSpec {
+    let (count, targets) = get_count_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind count(integer)");
+    assert_eq!(targets, vec![LogicalType::Integer]);
+    let aggregate = Expression::Aggregate(
+        AggregateExpression::new(
+            count,
+            vec![reference(0, LogicalType::Integer)],
+            LogicalType::BigInt,
+        )
+        .with_filter(Some(reference(1, LogicalType::Boolean))),
+    );
+    let input_types = Box::new([LogicalType::Integer, LogicalType::Boolean]);
+    PartitionAggregateWindowSpec {
+        domain: PartitionAggregateDomain::Global,
+        input_types: input_types.clone(),
+        detail_columns: Box::new([0]),
+        aggregate: AggregateSpec {
+            grouping_key_count: 0,
+            state_output_projection: Box::new([]),
+            estimated_input_rows: None,
+            projection_exprs: Box::new([
+                reference(0, LogicalType::Integer),
+                reference(1, LogicalType::Boolean),
+            ]),
+            payload_types: input_types,
+            groups: Box::new([]),
+            group_key_encodings: Box::new([]),
+            grouping_sets: Box::new([]),
+            aggregates: Box::new([aggregate]),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: Box::new([Box::new([0])]),
+            aggregate_filters: Box::new([Some(1)]),
+            aggregate_orders: Box::new([Box::new([])]),
+            post_reduction: None,
+            having_filter: Box::new([]),
+            perfect_hash: None,
+            output_names: Box::new(["count".to_string()]),
+            output_types: Box::new([LogicalType::BigInt]),
+        },
+        output_names: Box::new(["v".to_string(), "count".to_string()]),
+        output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
+    }
+}
+
+#[test]
+fn global_aggregate_window_replays_detail_with_one_filtered_state() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let graph = partition_aggregate_window_graph_from_spec(
+        global_filtered_count_window_spec(),
+        vec![
+            vec![int_constant(10), bool_constant(true)],
+            vec![int_constant(20), bool_constant(false)],
+            vec![int_constant(30), null_constant(LogicalType::Boolean)],
+            vec![int_constant(40), bool_constant(true)],
+        ],
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(37),
+        generation: WakeGeneration(0),
+    };
+    run_two_stage_breaker(graph, &query, &thread, &wake);
+
+    let chunk = output.pop_front().expect("global aggregate detail output");
+    assert_eq!(chunk.size(), 4);
+    for row in 0..chunk.size() {
+        assert_eq!(chunk.column(1).unwrap().get_i64(row), Some(2));
+    }
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(10));
+    assert_eq!(chunk.column(0).unwrap().get_i32(3), Some(40));
+    assert!(output.pop_front().is_none());
+}
+
+#[test]
+fn global_aggregate_window_forced_external_spills_only_detail_payload() {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context_with_limits(
+        output.clone(),
+        RuntimeLimits {
+            max_threads: 1,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: true,
+            temporary_directory: unique_temp_dir("paro_global_partition_aggregate_spill"),
+            max_temp_directory_size: None,
+            force_external: true,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: false,
+        },
+    );
+    let graph = partition_aggregate_window_graph_from_spec(
+        global_filtered_count_window_spec(),
+        vec![
+            vec![int_constant(10), bool_constant(true)],
+            vec![int_constant(20), bool_constant(false)],
+            vec![int_constant(30), null_constant(LogicalType::Boolean)],
+            vec![int_constant(40), bool_constant(true)],
+        ],
+    );
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(38),
+        generation: WakeGeneration(0),
+    };
+    let profile = run_two_stage_breaker_with_profile(graph, &query, &thread, &wake);
+
+    let chunk = output
+        .pop_front()
+        .expect("external global aggregate output");
+    assert_eq!(chunk.size(), 4);
+    for row in 0..chunk.size() {
+        assert_eq!(chunk.column(1).unwrap().get_i64(row), Some(2));
+    }
+    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(10));
+    assert_eq!(chunk.column(0).unwrap().get_i32(3), Some(40));
+    assert!(output.pop_front().is_none());
+    assert!(profile.operators.values().any(|actual| {
+        actual.runtime.spilled == Some(true) && actual.runtime.spilled_bytes.unwrap_or(0) > 0
+    }));
+}
+
 #[test]
 fn partition_aggregate_window_forced_external_replays_raw_payload() {
     let output = QueryOutputPort::unbounded();
@@ -268,6 +392,7 @@ fn partition_aggregate_window_forced_external_preserves_filter_payload() {
         LogicalType::Boolean,
     ]);
     let spec = PartitionAggregateWindowSpec {
+        domain: PartitionAggregateDomain::Keyed,
         input_types: input_types.clone(),
         detail_columns: Box::new([0, 1]),
         aggregate: AggregateSpec {
@@ -364,6 +489,7 @@ fn partition_aggregate_window_spills_after_columnar_growth_hits_query_cap() {
     ]);
     aggregate.payload_types = input_types.clone();
     let spec = PartitionAggregateWindowSpec {
+        domain: PartitionAggregateDomain::Keyed,
         input_types: input_types.clone(),
         detail_columns: Box::new([0, 1]),
         aggregate,

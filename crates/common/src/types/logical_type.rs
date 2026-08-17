@@ -1087,6 +1087,10 @@ mod tests {
         assert_eq!(LogicalType::TsVector.physical_type(), PhysicalType::Varchar);
         assert_eq!(LogicalType::TsQuery.physical_type(), PhysicalType::Varchar);
         assert_eq!(
+            LogicalType::StringLiteral.physical_type(),
+            PhysicalType::Varchar
+        );
+        assert_eq!(
             LogicalType::Array(Box::new(LogicalType::Float), 3).physical_type(),
             PhysicalType::Array
         );

@@ -240,11 +240,11 @@ impl PredicateEvaluator {
             match access {
                 PredicateColumnAccess::Typed {
                     raw_width: Some(width),
-                } if *width != types[idx].physical_size() => {
+                } if *width != types[idx].type_size() => {
                     return Err(paro_error::internal(format!(
                         "Compiled predicate width {width} disagrees with {:?} physical width {}",
                         types[idx],
-                        types[idx].physical_size(),
+                        types[idx].type_size(),
                     )));
                 }
                 PredicateColumnAccess::Unused => access.require_decoded(),

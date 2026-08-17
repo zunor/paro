@@ -42,10 +42,12 @@ impl PhysicalPlanGenerator {
         };
         let table_column_count = table.columns.len();
         let mut column_ids = Vec::with_capacity(get.column_ids.len());
+        let mut value_projections = Vec::with_capacity(get.column_ids.len());
         let mut emit_row_id = false;
         for (idx, column_id) in get.column_ids.iter().copied().enumerate() {
             if column_id < table_column_count {
                 column_ids.push(column_id);
+                value_projections.push(rowset_value_projection(get, idx, predicate.as_ref())?);
             } else if column_id == table_column_count
                 && get
                     .names
@@ -60,7 +62,8 @@ impl PhysicalPlanGenerator {
             }
         }
 
-        let column_projection = RowsetColumnProjection::new(column_ids);
+        let column_projection =
+            RowsetColumnProjection::try_with_value_projections(column_ids, value_projections)?;
 
         Ok(RowsetScanSpec {
             table_index: get.table_index,
@@ -588,6 +591,7 @@ fn project_rowset_scan_spec(
     let mut output_names = Vec::with_capacity(projection_map.len());
     let mut returned_types = Vec::with_capacity(projection_map.len());
     let mut column_ids = Vec::with_capacity(projection_map.len());
+    let mut value_projections = Vec::with_capacity(projection_map.len());
     let mut column_types = Vec::with_capacity(projection_map.len());
     let mut emit_row_id = false;
 
@@ -615,6 +619,7 @@ fn project_rowset_scan_spec(
         returned_types.push(returned_type);
         if column_id < table_column_count {
             column_ids.push(column_id);
+            value_projections.push(rowset_value_projection(get, idx, spec.predicate.as_ref())?);
             let column_type = get.column_types.get(idx).cloned().ok_or_else(|| {
                 paro_error::internal(format!(
                     "filter projection column type index {idx} is out of range for rowset output with {} columns",
@@ -633,10 +638,43 @@ fn project_rowset_scan_spec(
 
     spec.output_names = output_names.into_boxed_slice();
     spec.returned_types = returned_types.into_boxed_slice();
-    spec.column_projection = RowsetColumnProjection::new(column_ids);
+    spec.column_projection =
+        RowsetColumnProjection::try_with_value_projections(column_ids, value_projections)?;
     spec.column_types = column_types.into_boxed_slice();
     spec.emit_row_id = emit_row_id;
     Ok(())
+}
+
+fn rowset_value_projection(
+    get: &Get,
+    output_index: usize,
+    predicate: Option<&PredicateTree>,
+) -> Result<RowsetColumnValueProjection> {
+    let projection = get
+        .column_projections
+        .get(output_index)
+        .ok_or_else(|| paro_error::internal("Get value projection is missing for rowset output"))?;
+    match projection {
+        paro_planner::operator::GetColumnProjection::Stored => {
+            Ok(RowsetColumnValueProjection::Stored)
+        }
+        paro_planner::operator::GetColumnProjection::MatchedUtf8Prefix { byte_width } => {
+            let column_id = *get.column_ids.get(output_index).ok_or_else(|| {
+                paro_error::internal("matched-prefix output has no physical column")
+            })? as u32;
+            if *byte_width == 0
+                || !predicate
+                    .is_some_and(|tree| tree.proves_ascii_prefix_width(column_id, *byte_width))
+            {
+                return Err(paro_error::internal(
+                    "matched-prefix scan output lacks its exact pushed predicate witness",
+                ));
+            }
+            Ok(RowsetColumnValueProjection::MatchedUtf8Prefix {
+                byte_width: *byte_width,
+            })
+        }
+    }
 }
 
 fn estimated_filter_selectivity(

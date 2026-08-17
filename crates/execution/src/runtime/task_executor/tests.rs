@@ -33,8 +33,9 @@ use crate::physical::properties::{MemoryClass, PipelineProperties};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ChunkScanSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, FilterSpec,
-    LimitSpec, PartitionAggregateWindowSpec, PerfectHashAggregatePlan, PostAggregateReductionSpec,
-    ProjectSpec, TableFunctionScanSpec, TopNSpec, ValuesSpec, WindowSpec,
+    LimitSpec, PartitionAggregateDomain, PartitionAggregateWindowSpec, PerfectHashAggregatePlan,
+    PostAggregateReductionSpec, ProjectSpec, TableFunctionScanSpec, TopNSpec, ValuesSpec,
+    WindowSpec,
 };
 use crate::pipeline::graph::{
     ClientResultSpec, CrossProductBuildSinkSpec, CrossProductProbeSpec, CteMaterializeSinkSpec,

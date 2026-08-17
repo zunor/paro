@@ -244,7 +244,7 @@ impl BuildRowLayout {
         }
         let column_idx = self.payload_base_col_idx(build_idx);
         debug_assert_eq!(
-            self.base.types()[column_idx].physical_size(),
+            self.base.types()[column_idx].type_size(),
             std::mem::size_of::<T>(),
             "fixed payload reader physical width mismatch"
         );

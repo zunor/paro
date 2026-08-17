@@ -1900,6 +1900,44 @@ fn test_try_set_len_rejects_flat_capacity_overflow() {
     assert_eq!(vector.len(), 0);
 }
 
+#[test]
+fn string_literal_vectors_use_owned_varlen_storage() {
+    let allocator = Arc::new(DefaultAllocator::new());
+    let mut source = Vector::try_new(LogicalType::StringLiteral, 1, allocator.clone()).unwrap();
+    source.try_set_count(1).unwrap();
+    source
+        .try_set_string(0, "a string literal longer than the inline payload")
+        .unwrap();
+
+    assert_eq!(source.buffer.element_size(), crate::types::StringView::SIZE);
+    assert_eq!(
+        source.get_value(0),
+        Value::Varchar("a string literal longer than the inline payload".into())
+    );
+
+    let mut destination = Vector::try_new(LogicalType::StringLiteral, 1, allocator).unwrap();
+    destination.try_copy_range(0, &source, 0, 1).unwrap();
+    drop(source);
+    assert_eq!(
+        destination.get_string(0),
+        Some("a string literal longer than the inline payload")
+    );
+}
+
+#[test]
+fn zero_copy_retyping_cannot_strengthen_blob_bytes_to_utf8() {
+    let allocator = Arc::new(DefaultAllocator::new());
+    let mut blob = Vector::try_new(LogicalType::Blob, 1, allocator).unwrap();
+    blob.try_set_count(1).unwrap();
+    blob.try_set_blob(0, &[0xff]).unwrap();
+
+    assert!(blob.try_reference_as(LogicalType::Varchar).is_err());
+
+    let text = crate::test_utils::test_string_vector(&["valid UTF-8"]);
+    let binary = text.try_reference_as(LogicalType::Blob).unwrap();
+    assert_eq!(binary.get_blob(0), Some(b"valid UTF-8".as_slice()));
+}
+
 #[derive(Debug)]
 struct LifetimeDropFlag(Arc<AtomicBool>);
 

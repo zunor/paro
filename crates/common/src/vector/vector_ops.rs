@@ -126,6 +126,7 @@ impl Vector {
             | LogicalType::TsQuery
             | LogicalType::Json
             | LogicalType::Jsonb
+            | LogicalType::StringLiteral
             | LogicalType::Blob => {
                 let mut heap: Option<StringHeap> = None;
                 unsafe {

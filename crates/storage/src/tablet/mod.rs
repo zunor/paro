@@ -67,7 +67,9 @@ pub use schema_adapter::TabletSchemaAdaptationPlan;
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::{SearchGenerationHeadMeta, TabletMeta};
 pub use tablet_reader::TabletReader;
-pub use tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
+pub use tablet_reader_params::{
+    ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
+};
 pub use tablet_rowid_lookup::TabletRowIdReader;
 pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,

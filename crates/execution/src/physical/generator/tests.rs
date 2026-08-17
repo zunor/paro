@@ -1443,6 +1443,11 @@ pub(super) fn test_get() -> Get {
             LogicalType::Integer,
             LogicalType::Varchar,
         ],
+        column_projections: vec![
+            paro_planner::operator::GetColumnProjection::Stored,
+            paro_planner::operator::GetColumnProjection::Stored,
+            paro_planner::operator::GetColumnProjection::Stored,
+        ],
         table: Some(table),
         scan_order: None,
         runtime_filter_expressions: Vec::new(),

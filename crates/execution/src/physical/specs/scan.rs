@@ -161,20 +161,58 @@ impl RowsetScanMaterialization {
 /// An empty projection means that only row cardinality is requested. Reading
 /// every table column is represented by listing every column explicitly at the
 /// logical scan boundary, so no layer has to guess what an empty list means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowsetColumnValueProjection {
+    Stored,
+    MatchedUtf8Prefix { byte_width: usize },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RowsetColumnProjection(Box<[usize]>);
+pub struct RowsetColumnProjection {
+    columns: Box<[usize]>,
+    value_projections: Box<[RowsetColumnValueProjection]>,
+}
 
 impl RowsetColumnProjection {
     pub fn new(columns: impl Into<Box<[usize]>>) -> Self {
-        Self(columns.into())
+        let columns = columns.into();
+        let value_projections =
+            vec![RowsetColumnValueProjection::Stored; columns.len()].into_boxed_slice();
+        Self {
+            columns,
+            value_projections,
+        }
+    }
+
+    pub fn try_with_value_projections(
+        columns: impl Into<Box<[usize]>>,
+        value_projections: impl Into<Box<[RowsetColumnValueProjection]>>,
+    ) -> paro_common::error::Result<Self> {
+        let columns = columns.into();
+        let value_projections = value_projections.into();
+        if columns.len() != value_projections.len() {
+            return Err(paro_common::error::internal(format!(
+                "rowset projection width mismatch: columns={}, value projections={}",
+                columns.len(),
+                value_projections.len()
+            )));
+        }
+        Ok(Self {
+            columns,
+            value_projections,
+        })
     }
 
     pub fn column_id(&self, output_index: usize) -> Option<usize> {
-        self.0.get(output_index).copied()
+        self.columns.get(output_index).copied()
     }
 
     pub fn columns(&self) -> &[usize] {
-        &self.0
+        &self.columns
+    }
+
+    pub fn value_projections(&self) -> &[RowsetColumnValueProjection] {
+        &self.value_projections
     }
 }
 

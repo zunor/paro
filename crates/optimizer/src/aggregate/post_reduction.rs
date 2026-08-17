@@ -31,8 +31,9 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 
-mod alpha;
+pub(crate) mod alpha;
 
+use crate::aggregate::semantic_kernels::aggregate_kernels_equal;
 use alpha::AlphaBindings;
 /// Replace eligible grouped/scalar sibling plans with one grouped aggregate
 /// carrying a hidden post-aggregate reduction.
@@ -944,18 +945,6 @@ fn recognize_orientation(
             predicate,
         },
     })
-}
-
-/// Compare the bound execution semantics, not the SQL/display name.  Catalog
-/// extensions may deliberately reuse a built-in name and signature while
-/// providing different state transitions.
-fn aggregate_kernels_equal(left: &AggregateExpression, right: &AggregateExpression) -> bool {
-    left.function.execution_semantics_equal(&right.function)
-        && match (&left.bind_info, &right.bind_info) {
-            (Some(left), Some(right)) => left.equals(&**right),
-            (None, None) => true,
-            _ => false,
-        }
 }
 
 fn plain_grouped_aggregate(aggregate: &Aggregate) -> bool {

@@ -25,8 +25,9 @@ use crate::pipeline_passes::{
     ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
     GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
     JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
-    MixedJoinPredicatePass, ReorderFilterPass, SearchOptimizationPass, SegmentPrunerPass,
-    StatisticsGatheringPass, StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    MixedJoinPredicatePass, ReorderFilterPass, ScalarAggregateWindowPass, SearchOptimizationPass,
+    SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass, TopNPass,
+    UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -250,6 +251,7 @@ impl Optimizer {
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
         let late_payload_binder = binder.clone();
+        let scalar_late_payload_binder = binder.clone();
         vec![
             pass(GraphStartSelectionPass),
             pass(GraphMatchDecomposePass),
@@ -310,7 +312,9 @@ impl Optimizer {
             // stable rowid and fetch it only after a bounded TopN. Dependency
             // proofs are populated by statistics propagation immediately
             // above; pruning is performed atomically inside this pass.
-            pass(LatePayloadFetchPass),
+            pass(LatePayloadFetchPass {
+                enable_matched_prefix: false,
+            }),
             // Late payload changes scan widths, join projection maps and
             // serialized build costs. Express that invalidation as a visible,
             // conditionally executed pipeline segment so every pass retains
@@ -327,13 +331,28 @@ impl Optimizer {
                     Box::new(JoinFilterPushdownPass),
                 ],
             }),
+            // Publish the settled tree's exact output contracts before asking
+            // whether a scalar aggregate branch is implementation-only.
+            pass(ColumnLifetimePass),
+            // Fold a subset-filtered scalar aggregate into its matching detail
+            // stream as a complete-partition aggregate window.
+            pass(ScalarAggregateWindowPass),
+            // The shared scan deliberately creates a blocking full-partition
+            // window. A pushed ASCII prefix predicate can produce its exact
+            // leading substring directly from raw scan bytes; other wide
+            // payload is gathered by stable rowid only for surviving rows.
+            pass(LatePayloadFetchPass {
+                enable_matched_prefix: true,
+            }),
+            PipelineStep::Conditional(ConditionalSegment {
+                condition: PipelineCondition::LateMaterializationInvalidated,
+                passes: vec![Box::new(UnusedColumnsPass {
+                    binder: scalar_late_payload_binder,
+                })],
+            }),
             // Projection maps are positional annotations over the final logical
-            // layout. Derive them only after every structural rewrite (most
-            // notably build/probe-side flips) has settled that layout. This
-            // terminal pass may reduce output widths, but it must not reorder
-            // retained columns or invalidate operator/cardinality statistics:
-            // statistics propagated above are operator-level, never indexed by
-            // the pre-pruning output position.
+            // layout. Re-derive them after the scalar-window structural rewrite
+            // so physical lowering consumes one authoritative terminal layout.
             pass(ColumnLifetimePass),
         ]
     }

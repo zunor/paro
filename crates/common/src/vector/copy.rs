@@ -177,8 +177,7 @@ impl Vector {
             return Ok(());
         }
 
-        if Self::is_inline_varlen_type(&self.logical_type) && self.logical_type != LogicalType::Blob
-        {
+        if Self::is_varlen_type(&self.logical_type) && self.logical_type != LogicalType::Blob {
             if let Some(s) = source.vector.get_string(source.row_idx) {
                 self.try_set_string(idx, s)?;
             } else {
@@ -302,14 +301,14 @@ impl Vector {
             {
                 self.try_copy_dictionary_fixed_range(dst_offset, source, src_offset, count)?;
             }
-            _ if Self::is_inline_varlen_type(&self.logical_type)
+            _ if Self::is_varlen_type(&self.logical_type)
                 && source.logical_type == self.logical_type
                 && dst_offset == 0
                 && dst_end >= self.count =>
             {
                 self.try_copy_varlen_range_rebuild_heap(dst_offset, source, src_offset, count)?;
             }
-            _ if Self::is_inline_varlen_type(&self.logical_type)
+            _ if Self::is_varlen_type(&self.logical_type)
                 && source.logical_type == self.logical_type
                 && dst_offset >= self.count =>
             {
@@ -743,27 +742,18 @@ impl Vector {
     }
 
     #[inline]
-    pub(super) fn is_inline_varlen_type(logical_type: &LogicalType) -> bool {
-        matches!(
-            logical_type,
-            LogicalType::Varchar
-                | LogicalType::VarcharCollation(_)
-                | LogicalType::TsVector
-                | LogicalType::TsQuery
-                | LogicalType::Json
-                | LogicalType::Jsonb
-                | LogicalType::Blob
-        )
+    pub(super) fn is_varlen_type(logical_type: &LogicalType) -> bool {
+        logical_type.physical_type() == crate::types::PhysicalType::Varchar
     }
 
     #[inline]
     fn is_fixed_payload_type(logical_type: &LogicalType) -> bool {
-        !Self::is_inline_varlen_type(logical_type)
+        !Self::is_varlen_type(logical_type)
             && !matches!(
                 logical_type,
                 LogicalType::Array(_, _) | LogicalType::List(_) | LogicalType::Struct(_)
             )
-            && logical_type.physical_size() > 0
+            && logical_type.type_size() > 0
     }
 
     #[inline]
@@ -809,7 +799,7 @@ impl Vector {
         src_offset: usize,
         count: usize,
     ) -> Result<()> {
-        let element_size = self.logical_type.physical_size();
+        let element_size = self.logical_type.type_size();
         let bytes = element_size.checked_mul(count).ok_or_else(|| {
             paro_error::internal(format!(
                 "copy range byte count overflow: element_size={element_size}, count={count}"
@@ -845,7 +835,7 @@ impl Vector {
             .child
             .as_ref()
             .expect("Dictionary vector missing child");
-        let element_size = self.logical_type.physical_size();
+        let element_size = self.logical_type.type_size();
 
         self.try_make_exclusive()?;
         self.validity.try_ensure_capacity(dst_offset + count)?;

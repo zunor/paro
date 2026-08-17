@@ -345,6 +345,30 @@ impl PartitionAggregateWindowHandle {
         Ok(())
     }
 
+    /// Publish a snapshot produced by a specialized execution domain.
+    ///
+    /// Keyed windows build their snapshot from sink-local hash tables in
+    /// [`Self::seal`]. A zero-key window owns one global aggregate state and
+    /// can publish its detail batches and scalar results directly.
+    pub(crate) fn publish_snapshot(&self, snapshot: PartitionAggregateSnapshot) -> Result<()> {
+        let pending = self.pending.lock();
+        if self.is_sealed() {
+            return Err(paro_error::internal(
+                "partition aggregate window was published more than once",
+            ));
+        }
+        if !pending.is_empty() {
+            return Err(paro_error::internal(
+                "specialized partition aggregate snapshot has pending keyed locals",
+            ));
+        }
+        self.snapshot.set(Arc::new(snapshot)).map_err(|_| {
+            paro_error::internal("partition aggregate window was published more than once")
+        })?;
+        self.sealed.store(true, Ordering::Release);
+        Ok(())
+    }
+
     #[inline]
     pub fn is_sealed(&self) -> bool {
         self.sealed.load(Ordering::Acquire)
@@ -717,7 +741,7 @@ mod tests {
     use crate::operators::aggregate::group_hash::hash_group_columns;
     use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
-    use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
+    use crate::physical::specs::{AggregateSpec, GroupKeyEncoding, PartitionAggregateDomain};
     use crate::pipeline::handles::{BreakerHandleId, BreakerHandleKind};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
@@ -753,6 +777,7 @@ mod tests {
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
         };
         PartitionAggregateWindowSpec {
+            domain: PartitionAggregateDomain::Keyed,
             input_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
             detail_columns: Box::new([0, 1]),
             aggregate,

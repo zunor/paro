@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::codec::vector_decoder;
+use crate::index::{Predicate, PredicateTree};
 use crate::primary_key::{DeleteVector, RowID};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageBuilder;
@@ -594,6 +595,49 @@ fn create_segment_with_values(
     )
 }
 
+fn create_segment_with_names(
+    schema: &TabletSchemaRef,
+    names: &[&str],
+    path: &Path,
+) -> SegmentSharedPtr {
+    let opts = SegmentWriterOptions::new(0)
+        .with_short_key_index(false)
+        .with_compression(CompressionType::None);
+    let mut writer = SegmentWriter::create(schema.clone(), path, opts).unwrap();
+    let rows = names.len() as u32;
+    let ids: Vec<u8> = (0..rows)
+        .flat_map(|value| i64::from(value).to_le_bytes())
+        .collect();
+    let mut encoded_names = Vec::new();
+    for name in names {
+        encoded_names.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        encoded_names.extend_from_slice(name.as_bytes());
+    }
+    let values: Vec<u8> = (0..rows)
+        .flat_map(|value| (value as i32).to_le_bytes())
+        .collect();
+    writer
+        .append_chunk(&[
+            ColumnData::new(ids, rows),
+            ColumnData::new(encoded_names, rows),
+            ColumnData::new(values, rows),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+    Arc::new(
+        Segment::open(
+            0,
+            path,
+            schema.clone(),
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    )
+}
+
 fn create_segment_with_values_column0_only(
     schema: &TabletSchemaRef,
     segment_id: u32,
@@ -722,6 +766,71 @@ fn test_tablet_reader_duplicate_projection() {
     assert_eq!(col2.get_i32(1), Some(1));
     assert_eq!(col2.get_i32(2), Some(2));
     assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn matched_prefix_projection_keeps_stored_sibling_and_emits_compact_value() {
+    let tmp = TempDir::new().unwrap();
+    let schema = create_test_schema();
+    let rowset_dir = tmp.path().join("rowset");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment = create_segment_with_names(
+        &schema,
+        &["13alice", "31bob", "99drop"],
+        &rowset_dir.join("0.dat"),
+    );
+    let meta = RowsetMetaBuilder::with_id(1, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let projection = ColumnProjection::try_with_value_projections(
+        vec![1, 1],
+        vec![
+            ColumnValueProjection::Stored,
+            ColumnValueProjection::MatchedUtf8Prefix { byte_width: 2 },
+        ],
+    )
+    .unwrap();
+    let params = TabletReaderParams::with_version(0)
+        .with_projection(projection)
+        .with_predicates(PredicateTree::leaf(Predicate::StringPrefixIn {
+            column_id: 1,
+            prefixes: vec!["13".to_string(), "31".to_string()],
+        }))
+        .with_late_materialize(vec![1]);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+    let chunk = reader.get_next_chunk().unwrap().expect("matching rows");
+    assert_eq!(chunk.len(), 2);
+    assert_eq!(chunk.column(0).unwrap().get_string(0), Some("13alice"));
+    assert_eq!(chunk.column(0).unwrap().get_string(1), Some("31bob"));
+    assert_eq!(chunk.column(1).unwrap().get_string(0), Some("13"));
+    assert_eq!(chunk.column(1).unwrap().get_string(1), Some("31"));
+}
+
+#[test]
+fn matched_prefix_projection_requires_exact_predicate_witness() {
+    let projection = ColumnProjection::try_with_value_projections(
+        vec![1],
+        vec![ColumnValueProjection::MatchedUtf8Prefix { byte_width: 2 }],
+    )
+    .unwrap();
+    let params = TabletReaderParams::with_version(0).with_projection(projection);
+    let error = TabletReader::new(create_test_tablet(), params)
+        .expect_err("prefix projection without its predicate witness must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("lacks its exact VARCHAR predicate witness"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

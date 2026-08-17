@@ -47,6 +47,7 @@ use crate::statistics::segment_pruner::SegmentPruner;
 use crate::subquery::delim_join_elimination::DelimJoinElimination;
 use crate::subquery::empty_result::EmptyResultPullup;
 use crate::subquery::partition_aggregate::CorrelatedPartitionAggregate;
+use crate::subquery::scalar_aggregate_window;
 
 pub struct GraphStartSelectionPass;
 
@@ -237,6 +238,18 @@ impl Rewriter for CorrelatedPartitionAggregatePass {
     }
 }
 
+pub struct ScalarAggregateWindowPass;
+
+impl Rewriter for ScalarAggregateWindowPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::ScalarAggregateWindow
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        scalar_aggregate_window::optimize_plan(plan, &ctx.bind_context)
+    }
+}
+
 pub struct JoinEliminationPass;
 
 impl Rewriter for JoinEliminationPass {
@@ -358,7 +371,9 @@ impl Rewriter for UnusedColumnsPass {
 
 pub struct ColumnLifetimePass;
 
-pub struct LatePayloadFetchPass;
+pub struct LatePayloadFetchPass {
+    pub enable_matched_prefix: bool,
+}
 
 impl Rewriter for LatePayloadFetchPass {
     fn optimizer_type(&self) -> OptimizerType {
@@ -366,8 +381,12 @@ impl Rewriter for LatePayloadFetchPass {
     }
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        let (plan, changed) =
-            late_payload::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
+        let (plan, changed) = late_payload::optimize_plan(
+            plan,
+            &ctx.bind_context,
+            &ctx.cost_model,
+            self.enable_matched_prefix,
+        )?;
         if changed {
             ctx.invalidations.mark_late_materialization();
         }

@@ -76,7 +76,7 @@ pub use expression_get::ExpressionGet;
 pub use external_project::LogicalExternalProject;
 pub use external_table::LogicalExternalTable;
 pub use filter::Filter;
-pub use get::Get;
+pub use get::{Get, GetColumnProjection};
 pub use graph_expand::{ExpandDirection, GraphExpand};
 pub use graph_match::GraphMatch;
 pub use graph_scan::GraphScan;

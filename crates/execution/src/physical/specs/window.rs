@@ -26,6 +26,7 @@ pub struct WindowSpec {
 /// does not depend on row order.
 #[derive(Debug, Clone)]
 pub struct PartitionAggregateWindowSpec {
+    pub domain: PartitionAggregateDomain,
     /// Types presented to the breaker sink before aggregate projection.
     pub input_types: Box<[LogicalType]>,
     /// Input columns retained in the detail stream, in output order.
@@ -35,6 +36,12 @@ pub struct PartitionAggregateWindowSpec {
     /// Detail columns followed by finalized aggregate columns.
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PartitionAggregateDomain {
+    Global,
+    Keyed,
 }
 
 impl PartitionAggregateWindowSpec {
@@ -49,23 +56,32 @@ impl PartitionAggregateWindowSpec {
     /// do not need to change detail/index publication.
     pub fn verify(&self) -> Result<()> {
         let aggregate = &self.aggregate;
-        if aggregate.grouping_key_count == 0
-            || aggregate.groups.len() != aggregate.grouping_key_count
-            || aggregate.aggregates.is_empty()
+        if aggregate.groups.len() != aggregate.grouping_key_count || aggregate.aggregates.is_empty()
         {
             return Err(paro_error::internal(
                 "partition aggregate window requires groups and aggregate functions",
             ));
         }
-        if aggregate.groups.len() != 1
-            || !matches!(
-                aggregate.groups[0].return_type(),
-                LogicalType::Integer | LogicalType::BigInt
-            )
-        {
-            return Err(paro_error::not_implemented(
-                "partition aggregate window's first lookup backend requires one INTEGER or BIGINT partition key",
-            ));
+        match self.domain {
+            PartitionAggregateDomain::Global
+                if aggregate.grouping_key_count != 0 || !aggregate.groups.is_empty() =>
+            {
+                return Err(paro_error::internal(
+                    "global aggregate window cannot carry partition keys",
+                ));
+            }
+            PartitionAggregateDomain::Keyed
+                if aggregate.groups.len() != 1
+                    || !matches!(
+                        aggregate.groups[0].return_type(),
+                        LogicalType::Integer | LogicalType::BigInt
+                    ) =>
+            {
+                return Err(paro_error::not_implemented(
+                    "partition aggregate window's keyed lookup backend requires one INTEGER or BIGINT partition key",
+                ));
+            }
+            _ => {}
         }
         if !aggregate.grouping_functions.is_empty()
             || !aggregate.state_output_projection.is_empty()

@@ -42,7 +42,10 @@ impl Vector {
             | LogicalType::TsVector
             | LogicalType::TsQuery
             | LogicalType::Json
-            | LogicalType::Jsonb => Value::Varchar(self.get_string(idx).unwrap().to_string()),
+            | LogicalType::Jsonb
+            | LogicalType::StringLiteral => {
+                Value::Varchar(self.get_string(idx).unwrap().to_string())
+            }
             LogicalType::Blob => Value::Blob(self.get_blob(idx).unwrap().to_vec()),
             LogicalType::Array(child_type, array_size) => {
                 fn resolve_array_row(vector: &Vector, idx: usize) -> (&Vector, usize) {

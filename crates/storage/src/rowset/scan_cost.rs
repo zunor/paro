@@ -66,7 +66,7 @@ impl ScanAccessCostModel {
             PhysicalType::List | PhysicalType::Struct | PhysicalType::Array => {
                 self.default_nested_width
             }
-            _ => ty.physical_size().max(1),
+            _ => ty.type_size().max(1),
         }
     }
 

@@ -181,7 +181,7 @@ fn candidate_with_null_extended_source() -> LogicalPlan {
 fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
     let context = BindContext::new();
     let (optimized, changed) =
-        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
+        optimize_plan(candidate(false), &context, &CostModel::default(), false).unwrap();
     assert!(changed);
     let LogicalOperator::Projection(output) = &optimized.operator else {
         panic!("expected late row-fetch projection")
@@ -214,7 +214,7 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
 fn verifier_rejects_materialized_column_type_drift() {
     let context = BindContext::new();
     let (mut optimized, changed) =
-        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
+        optimize_plan(candidate(false), &context, &CostModel::default(), false).unwrap();
     assert!(changed);
     crate::verify::verify_logical_plan(&context, &optimized).expect("valid rewrite");
 
@@ -248,7 +248,7 @@ fn verifier_rejects_materialized_column_type_drift() {
 fn ordering_by_delayed_payload_keeps_preserving_plan() {
     let context = BindContext::new();
     let (optimized, changed) =
-        optimize_plan(candidate(true), &context, &CostModel::default()).unwrap();
+        optimize_plan(candidate(true), &context, &CostModel::default(), false).unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
 }
@@ -260,6 +260,7 @@ fn null_extended_source_rowid_keeps_preserving_plan() {
         candidate_with_null_extended_source(),
         &context,
         &CostModel::default(),
+        false,
     )
     .unwrap();
     assert!(!changed);

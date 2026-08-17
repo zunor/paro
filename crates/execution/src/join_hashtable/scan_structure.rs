@@ -1310,7 +1310,7 @@ fn dictionary_gather_is_smaller(
     row_count: usize,
     unique_count: usize,
 ) -> bool {
-    let value_width = logical_type.physical_size();
+    let value_width = logical_type.type_size();
     let flat_bytes = row_count.saturating_mul(value_width);
     let dictionary_bytes = unique_count
         .saturating_mul(value_width)

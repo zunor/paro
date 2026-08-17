@@ -9,17 +9,20 @@ use parking_lot::Mutex;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::{SelectionVector, Vector};
+use paro_storage::row::{RowStore, RowStoreSpillWriter};
 
 use crate::expression_executor::executor::ExpressionExecutor;
-use crate::memory_runtime::{QueryMemoryPool, RetainedChunkVec};
+use crate::memory_runtime::{QueryMemoryPool, RetainedChunkVec, RetainedMemoryHandle};
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::group_hash::GroupHashScratch;
 use crate::operators::aggregate::payload_spill::AggregatePayloadSpillBuffer;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
-use crate::runtime::breaker::PartitionAggregateWindowHandle;
-use crate::runtime::state::{DynGlobalState, DynLocalState, DynStateTypeId};
+use crate::runtime::breaker::{PartitionAggregateWindowHandle, UngroupedAggregateRuntimeState};
+use crate::runtime::state::{
+    DynGlobalState, DynLocalState, DynStateTypeId, UngroupedAggregateSinkLocal,
+};
 
-use super::PartitionAggregateSnapshot;
+use super::{GlobalPartitionAggregateDetailFormat, PartitionAggregateSnapshot};
 
 #[derive(Debug)]
 pub(crate) enum PartitionAggregateLocalBacking {
@@ -51,10 +54,30 @@ pub(crate) const PARTITION_AGGREGATE_BUILD_GLOBAL: DynStateTypeId =
     DynStateTypeId("partition_aggregate_build_global");
 pub(crate) const PARTITION_AGGREGATE_BUILD_LOCAL: DynStateTypeId =
     DynStateTypeId("partition_aggregate_build_local");
+pub(crate) const GLOBAL_AGGREGATE_WINDOW_BUILD_LOCAL: DynStateTypeId =
+    DynStateTypeId("global_aggregate_window_build_local");
+
+#[derive(Debug)]
+pub(crate) struct GlobalAggregateBuildState {
+    pub accumulator: UngroupedAggregateRuntimeState,
+    pub payloads: Vec<Chunk>,
+    pub payload_memory: Vec<Arc<RetainedMemoryHandle>>,
+    pub external_payloads: Vec<RowStore>,
+}
+
+#[derive(Debug)]
+pub(crate) enum GlobalAggregatePayloadBacking {
+    Columnar(RetainedChunkVec),
+    External(RowStoreSpillWriter<GlobalPartitionAggregateDetailFormat>),
+    Merged,
+}
 
 #[derive(Debug)]
 pub(crate) struct PartitionAggregateBuildGlobal {
     pub handle: Arc<PartitionAggregateWindowHandle>,
+    /// Present only for the zero-key execution domain. Keyed windows publish
+    /// sink-local hash tables through the runtime handle instead.
+    pub global: Option<Mutex<GlobalAggregateBuildState>>,
 }
 
 impl DynGlobalState for PartitionAggregateBuildGlobal {
@@ -117,6 +140,29 @@ impl DynLocalState for PartitionAggregateBuildLocal {
     }
 }
 
+/// Task-local state for a complete, unpartitioned aggregate window.
+///
+/// The accumulator is exactly the scalar-aggregate state used by the ordinary
+/// ungrouped aggregate operator. Detail batches retain their existing vectors;
+/// no projected payload or row copy is created.
+#[derive(Debug)]
+pub(crate) struct GlobalAggregateWindowBuildLocal {
+    pub accumulator: UngroupedAggregateSinkLocal,
+    pub payloads: GlobalAggregatePayloadBacking,
+}
+
+impl DynLocalState for GlobalAggregateWindowBuildLocal {
+    fn state_type(&self) -> DynStateTypeId {
+        GLOBAL_AGGREGATE_WINDOW_BUILD_LOCAL
+    }
+    fn as_any(&self) -> &(dyn Any + Send) {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut (dyn Any + Send) {
+        self
+    }
+}
+
 #[derive(Debug)]
 pub struct PartitionAggregateEmitGlobal {
     handle: Arc<PartitionAggregateWindowHandle>,
@@ -160,6 +206,7 @@ impl PartitionAggregateEmitGlobal {
 pub struct PartitionAggregateEmitLocal {
     pub aggregate_selection: SelectionVector,
     pub external_cursor: Option<paro_storage::row::ReclaimingRowScanCursor>,
+    pub global_external_chunk: Option<Chunk>,
 }
 
 impl PartitionAggregateEmitLocal {
@@ -167,6 +214,7 @@ impl PartitionAggregateEmitLocal {
         Ok(Self {
             aggregate_selection: SelectionVector::try_with_capacity(0, allocator)?,
             external_cursor: None,
+            global_external_chunk: None,
         })
     }
 }
@@ -197,6 +245,20 @@ pub(crate) fn build_local_mut(
         .as_any_mut()
         .downcast_mut::<PartitionAggregateBuildLocal>()
         .ok_or_else(|| paro_error::internal("partition aggregate build local type mismatch"))
+}
+
+pub(crate) fn global_build_local_mut(
+    state: &mut crate::runtime::state::SinkLocal,
+) -> Result<&mut GlobalAggregateWindowBuildLocal> {
+    let crate::runtime::state::SinkLocal::Dyn(state) = state else {
+        return Err(paro_error::internal(
+            "global aggregate window build local state mismatch",
+        ));
+    };
+    state
+        .as_any_mut()
+        .downcast_mut::<GlobalAggregateWindowBuildLocal>()
+        .ok_or_else(|| paro_error::internal("global aggregate window build local type mismatch"))
 }
 
 pub(crate) fn emit_global(

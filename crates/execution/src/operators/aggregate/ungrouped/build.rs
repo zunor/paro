@@ -78,39 +78,9 @@ impl UngroupedAggregateSinkExec {
         ctx: &mut PipelineInitContext,
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
-        let state = create_ungrouped_runtime_state(
-            &self.spec,
-            ctx.query.allocator(MemoryTag::HashTable),
-            ctx.query.session.buffer_pool().clone(),
-            query_modifier_memory(ctx.query),
-        )?;
-        Ok(SinkLocal::UngroupedAggregate(UngroupedAggregateSinkLocal {
-            aggregate_objects: Arc::clone(&state.aggregate_objects),
-            layout: state.layout.clone(),
-            aggregate_inputs: Arc::clone(&state.aggregate_inputs),
-            projection_executor: (!self.spec.projection_exprs.is_empty()).then(|| {
-                ExpressionExecutor::with_expressions_for_session(
-                    &self.spec.projection_exprs,
-                    ctx.query.session.as_ref(),
-                )
-            }),
-            payload_chunk: Chunk::try_initialize(
-                &self.spec.payload_types,
-                VECTOR_SIZE,
-                ctx.query.allocator(MemoryTag::BaseTable),
-            )?,
-            state_buffer: state.state_buffer,
-            addresses: Vector::try_new(
-                LogicalType::BigInt,
-                VECTOR_SIZE,
-                ctx.query.allocator(MemoryTag::HashTable),
-            )?,
-            ordered_collectors: state.ordered_collectors,
-            arena_allocator: state.arena_allocator,
-            destroyed: state.destroyed,
-            modifier_memory: query_modifier_memory(ctx.query),
-            distinct: DistinctAggregateState::new(state.aggregate_objects.len()),
-        }))
+        Ok(SinkLocal::UngroupedAggregate(create_ungrouped_sink_local(
+            &self.spec, ctx,
+        )?))
     }
 
     pub(crate) fn consume(
@@ -129,134 +99,7 @@ impl UngroupedAggregateSinkExec {
                 "ungrouped aggregate sink local state mismatch",
             ));
         };
-        if let Some(executor) = local.projection_executor.as_mut() {
-            if local.payload_chunk.column_count() != self.spec.payload_types.len()
-                || local.payload_chunk.capacity() < input.size()
-            {
-                local.payload_chunk = Chunk::try_initialize(
-                    &self.spec.payload_types,
-                    input.size().max(1),
-                    ctx.query.allocator(MemoryTag::BaseTable),
-                )?;
-            }
-            executor.execute_all_kernel(
-                VectorKernelInput::from_eval_input(ExpressionEvalInput {
-                    params: ctx.query.params.as_ref(),
-                    columns: input,
-                }),
-                ctx.query,
-                &mut local.payload_chunk,
-            )?;
-        }
-        let payload = if local.projection_executor.is_some() {
-            &local.payload_chunk
-        } else {
-            input
-        };
-        let has_distinct = has_aggregate_distinct(&self.spec);
-        let has_filters = has_aggregate_filters(&self.spec);
-        let has_ordered = has_aggregate_ordered(&self.spec);
-        if has_distinct {
-            // Ungrouped DISTINCT still needs a zero-column key prefix with the
-            // same logical row count as the payload. Scan batches may exceed
-            // VECTOR_SIZE, so its capacity must come from the batch rather
-            // than Chunk::try_new's default.
-            let mut groups =
-                Chunk::try_initialize(&[], payload.size().max(1), payload.allocator().clone())?;
-            groups.try_set_cardinality(payload.size())?;
-            collect_distinct_rows(
-                &self.spec,
-                &local.aggregate_objects,
-                payload,
-                &groups,
-                ctx.query.session.number_of_threads(),
-                ctx.query.memory.capacity_bytes(),
-                &local.modifier_memory,
-                &mut local.distinct,
-            )?;
-        }
-        if has_ordered {
-            collect_ordered_rows(
-                &self.spec,
-                &local.aggregate_objects,
-                payload,
-                &[],
-                &mut local.ordered_collectors,
-            )?;
-        }
-        if has_filters || has_distinct || has_ordered {
-            let filters = if has_filters {
-                build_per_aggregate_filters(&self.spec, payload)?
-            } else {
-                local.aggregate_objects.iter().map(|_| None).collect()
-            };
-            let base_ptr = local.state_buffer.as_mut_ptr() as *mut u8;
-            for (agg_idx, (object, filter)) in local
-                .aggregate_objects
-                .iter()
-                .zip(filters.iter())
-                .enumerate()
-            {
-                if object.is_distinct() || !object.order_bys.is_empty() {
-                    continue;
-                }
-                let state_offset = local.layout.state_offset(agg_idx);
-                let agg_ptr = unsafe { base_ptr.add(state_offset) };
-                fill_repeated_state_addresses(&mut local.addresses, agg_ptr, payload.size())?;
-                let payload_desc = AggregatePayload {
-                    chunk: payload,
-                    aggregate_inputs: &local.aggregate_inputs[agg_idx..agg_idx + 1],
-                };
-                let mut input_data = AggregateInputData::new(
-                    object.bind_info.as_deref(),
-                    &mut local.arena_allocator,
-                    AggregateCombineType::PreserveInput,
-                );
-                if let Some(selection) = filter {
-                    if !selection.is_empty() {
-                        update_filtered_states(
-                            std::slice::from_ref(object),
-                            &mut input_data,
-                            &payload_desc,
-                            &local.addresses,
-                            selection,
-                            selection.len(),
-                        )?;
-                    }
-                } else {
-                    update_states(
-                        std::slice::from_ref(object),
-                        &mut input_data,
-                        &payload_desc,
-                        &local.addresses,
-                        payload.size(),
-                    )?;
-                }
-            }
-        } else {
-            fill_repeated_state_addresses(
-                &mut local.addresses,
-                local.state_buffer.as_mut_ptr() as *mut u8,
-                payload.size(),
-            )?;
-            let payload_desc = AggregatePayload {
-                chunk: payload,
-                aggregate_inputs: &local.aggregate_inputs,
-            };
-            let mut input_data = AggregateInputData::new(
-                None,
-                &mut local.arena_allocator,
-                AggregateCombineType::PreserveInput,
-            );
-            update_states(
-                &local.aggregate_objects,
-                &mut input_data,
-                &payload_desc,
-                &local.addresses,
-                payload.size(),
-            )?;
-        }
-        Ok(SinkPoll::NeedMoreInput)
+        consume_ungrouped_sink_local(&self.spec, ctx, local, input)
     }
 
     pub(crate) fn merge_local(
@@ -333,4 +176,179 @@ impl UngroupedAggregateSinkExec {
         global.handle.enable_state_reclaim();
         Ok(FinishPoll::Done)
     }
+}
+
+pub(crate) fn create_ungrouped_sink_local(
+    spec: &AggregateSpec,
+    ctx: &mut PipelineInitContext,
+) -> Result<UngroupedAggregateSinkLocal> {
+    let state = create_ungrouped_runtime_state(
+        spec,
+        ctx.query.allocator(MemoryTag::HashTable),
+        ctx.query.session.buffer_pool().clone(),
+        query_modifier_memory(ctx.query),
+    )?;
+    Ok(UngroupedAggregateSinkLocal {
+        aggregate_objects: Arc::clone(&state.aggregate_objects),
+        layout: state.layout.clone(),
+        aggregate_inputs: Arc::clone(&state.aggregate_inputs),
+        projection_executor: (!spec.projection_exprs.is_empty()).then(|| {
+            ExpressionExecutor::with_expressions_for_session(
+                &spec.projection_exprs,
+                ctx.query.session.as_ref(),
+            )
+        }),
+        payload_chunk: Chunk::try_initialize(
+            &spec.payload_types,
+            VECTOR_SIZE,
+            ctx.query.allocator(MemoryTag::BaseTable),
+        )?,
+        state_buffer: state.state_buffer,
+        addresses: Vector::try_new(
+            LogicalType::BigInt,
+            VECTOR_SIZE,
+            ctx.query.allocator(MemoryTag::HashTable),
+        )?,
+        ordered_collectors: state.ordered_collectors,
+        arena_allocator: state.arena_allocator,
+        destroyed: state.destroyed,
+        modifier_memory: query_modifier_memory(ctx.query),
+        distinct: DistinctAggregateState::new(state.aggregate_objects.len()),
+    })
+}
+
+pub(crate) fn consume_ungrouped_sink_local(
+    spec: &AggregateSpec,
+    ctx: &mut OperatorCallContext,
+    local: &mut UngroupedAggregateSinkLocal,
+    input: &mut Chunk,
+) -> Result<SinkPoll> {
+    if let Some(executor) = local.projection_executor.as_mut() {
+        if local.payload_chunk.column_count() != spec.payload_types.len()
+            || local.payload_chunk.capacity() < input.size()
+        {
+            local.payload_chunk = Chunk::try_initialize(
+                &spec.payload_types,
+                input.size().max(1),
+                ctx.query.allocator(MemoryTag::BaseTable),
+            )?;
+        }
+        executor.execute_all_kernel(
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                params: ctx.query.params.as_ref(),
+                columns: input,
+            }),
+            ctx.query,
+            &mut local.payload_chunk,
+        )?;
+    }
+    let payload = if local.projection_executor.is_some() {
+        &local.payload_chunk
+    } else {
+        input
+    };
+    let has_distinct = has_aggregate_distinct(spec);
+    let has_filters = has_aggregate_filters(spec);
+    let has_ordered = has_aggregate_ordered(spec);
+    if has_distinct {
+        // Ungrouped DISTINCT still needs a zero-column key prefix with the
+        // same logical row count as the payload. Scan batches may exceed
+        // VECTOR_SIZE, so its capacity must come from the batch rather
+        // than Chunk::try_new's default.
+        let mut groups =
+            Chunk::try_initialize(&[], payload.size().max(1), payload.allocator().clone())?;
+        groups.try_set_cardinality(payload.size())?;
+        collect_distinct_rows(
+            spec,
+            &local.aggregate_objects,
+            payload,
+            &groups,
+            ctx.query.session.number_of_threads(),
+            ctx.query.memory.capacity_bytes(),
+            &local.modifier_memory,
+            &mut local.distinct,
+        )?;
+    }
+    if has_ordered {
+        collect_ordered_rows(
+            spec,
+            &local.aggregate_objects,
+            payload,
+            &[],
+            &mut local.ordered_collectors,
+        )?;
+    }
+    if has_filters || has_distinct || has_ordered {
+        let filters = if has_filters {
+            build_per_aggregate_filters(spec, payload)?
+        } else {
+            local.aggregate_objects.iter().map(|_| None).collect()
+        };
+        let base_ptr = local.state_buffer.as_mut_ptr() as *mut u8;
+        for (agg_idx, (object, filter)) in local
+            .aggregate_objects
+            .iter()
+            .zip(filters.iter())
+            .enumerate()
+        {
+            if object.is_distinct() || !object.order_bys.is_empty() {
+                continue;
+            }
+            let state_offset = local.layout.state_offset(agg_idx);
+            let agg_ptr = unsafe { base_ptr.add(state_offset) };
+            fill_repeated_state_addresses(&mut local.addresses, agg_ptr, payload.size())?;
+            let payload_desc = AggregatePayload {
+                chunk: payload,
+                aggregate_inputs: &local.aggregate_inputs[agg_idx..agg_idx + 1],
+            };
+            let mut input_data = AggregateInputData::new(
+                object.bind_info.as_deref(),
+                &mut local.arena_allocator,
+                AggregateCombineType::PreserveInput,
+            );
+            if let Some(selection) = filter {
+                if !selection.is_empty() {
+                    update_filtered_states(
+                        std::slice::from_ref(object),
+                        &mut input_data,
+                        &payload_desc,
+                        &local.addresses,
+                        selection,
+                        selection.len(),
+                    )?;
+                }
+            } else {
+                update_states(
+                    std::slice::from_ref(object),
+                    &mut input_data,
+                    &payload_desc,
+                    &local.addresses,
+                    payload.size(),
+                )?;
+            }
+        }
+    } else {
+        fill_repeated_state_addresses(
+            &mut local.addresses,
+            local.state_buffer.as_mut_ptr() as *mut u8,
+            payload.size(),
+        )?;
+        let payload_desc = AggregatePayload {
+            chunk: payload,
+            aggregate_inputs: &local.aggregate_inputs,
+        };
+        let mut input_data = AggregateInputData::new(
+            None,
+            &mut local.arena_allocator,
+            AggregateCombineType::PreserveInput,
+        );
+        update_states(
+            &local.aggregate_objects,
+            &mut input_data,
+            &payload_desc,
+            &local.addresses,
+            payload.size(),
+        )?;
+    }
+    Ok(SinkPoll::NeedMoreInput)
 }

@@ -432,7 +432,7 @@ fn reference_identity_cast(
     _ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let target_type = result.logical_type().clone();
-    *result = source.reference_as(target_type);
+    *result = source.try_reference_as(target_type)?;
     result.set_count(count);
     Ok(true)
 }

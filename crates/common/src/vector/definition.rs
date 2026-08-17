@@ -148,7 +148,7 @@ impl Vector {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
-        let element_size = logical_type.physical_size();
+        let element_size = logical_type.type_size();
         let mut vec = Self {
             vector_type: VectorType::Flat,
             buffer: VectorBuffer::try_with_allocator(element_size, capacity, allocator.clone())?,
@@ -214,7 +214,7 @@ impl Vector {
                 "external fixed-width vector does not support {logical_type:?}"
             )));
         }
-        let element_size = logical_type.physical_size();
+        let element_size = logical_type.type_size();
         Ok(Self {
             vector_type: VectorType::Flat,
             buffer: VectorBuffer::try_from_bytes(element_size, rows, bytes, allocator.clone())?,
@@ -373,13 +373,21 @@ impl Vector {
         }
     }
 
-    /// Create a shallow reference while presenting a different logical type.
+    /// Create a shallow reference while presenting a storage-compatible logical type.
     ///
-    /// This is valid for casts that keep the physical representation unchanged.
-    pub fn reference_as(&self, logical_type: LogicalType) -> Self {
+    /// This validates the representation and the direction of the UTF-8
+    /// invariant. In particular, arbitrary BLOB bytes cannot be relabeled as a
+    /// textual value and later consumed through an unchecked UTF-8 view.
+    pub fn try_reference_as(&self, logical_type: LogicalType) -> Result<Self> {
+        if !logical_types_are_reference_compatible(&self.logical_type, &logical_type) {
+            return Err(paro_error::type_mismatch(format!(
+                "zero-copy vector reference is not storage-compatible: {:?} -> {:?}",
+                self.logical_type, logical_type
+            )));
+        }
         let mut vector = self.reference();
         vector.logical_type = logical_type;
-        vector
+        Ok(vector)
     }
 
     /// Ensure the vector's primary buffer and validity mask are exclusively owned.
@@ -404,11 +412,8 @@ impl Vector {
         if self.buffer.capacity() >= capacity {
             return Ok(());
         }
-        self.buffer = VectorBuffer::try_with_allocator(
-            self.logical_type.physical_size(),
-            capacity,
-            allocator,
-        )?;
+        self.buffer =
+            VectorBuffer::try_with_allocator(self.logical_type.type_size(), capacity, allocator)?;
         Ok(())
     }
 
@@ -498,13 +503,7 @@ impl Vector {
                 self.child = None;
                 self.string_heap = None;
             }
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::Blob => {
+            logical_type if logical_type.physical_type() == PhysicalType::Varchar => {
                 self.try_ensure_buffer_capacity(capacity, allocator.clone())?;
                 self.child = None;
                 self.children.clear();
@@ -1074,48 +1073,19 @@ impl Vector {
     }
 }
 
-// ============================================================================
-// LogicalType extension
-// ============================================================================
+fn logical_types_are_reference_compatible(source: &LogicalType, target: &LogicalType) -> bool {
+    if source == target {
+        return true;
+    }
 
-impl LogicalType {
-    /// Get the physical size in bytes for this type.
-    ///
-    /// For compound types (Array, List, Struct), returns 0 as data is stored in child vector.
-    pub fn physical_size(&self) -> usize {
-        match self {
-            LogicalType::Boolean => 1,
-            LogicalType::TinyInt | LogicalType::UTinyInt => 1,
-            LogicalType::SmallInt | LogicalType::USmallInt => 2,
-            LogicalType::Integer | LogicalType::UInteger => 4,
-            LogicalType::BigInt | LogicalType::UBigInt => 8,
-            LogicalType::HugeInt | LogicalType::UHugeInt | LogicalType::Uuid => 16,
-            LogicalType::Float => 4,
-            LogicalType::Double => 8,
-            LogicalType::Date => 4,
-            LogicalType::Timestamp => 8,
-            LogicalType::TimestampTz => 8,
-            LogicalType::Time => 8,
-            LogicalType::Interval => 16,
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb => StringView::SIZE,
-            LogicalType::Blob => StringView::SIZE,
-            LogicalType::Decimal { precision, .. } => {
-                if *precision <= 18 {
-                    8
-                } else {
-                    16
-                }
-            }
-            LogicalType::Null => 1, // Still needs validity bit, and at least 1 byte if we allocate
-            LogicalType::Array(_, _) => 0, // Data in child vector
-            LogicalType::List(_) => 8, // Offset (u32) + length (u32)
-            LogicalType::Struct(_) => 0, // Data in child vectors
-            _ => 8,
+    match (source, target) {
+        // A shallow reference does not recursively retype child vectors.
+        (LogicalType::Array(..), LogicalType::Array(..))
+        | (LogicalType::List(_), LogicalType::List(_))
+        | (LogicalType::Struct(_), LogicalType::Struct(_)) => false,
+        _ => {
+            source.physical_type() == target.physical_type()
+                && !(source == &LogicalType::Blob && target.is_utf8_varlen())
         }
     }
 }

@@ -10,6 +10,19 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
 
+/// Value projection applied while a physical base-table column is decoded.
+///
+/// Most outputs expose the stored value unchanged.  A matched UTF-8 prefix is
+/// narrower: it may only be installed when an exact pushed predicate proves
+/// that every emitted value begins with `byte_width` ASCII bytes.  Keeping the
+/// proof-bearing projection on the scan output prevents later operators from
+/// mistaking a storage optimization for general substring semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetColumnProjection {
+    Stored,
+    MatchedUtf8Prefix { byte_width: usize },
+}
+
 /// Get represents a scan operation on a table.
 ///
 /// This operator is created during planning when a base table is referenced
@@ -31,6 +44,8 @@ pub struct Get {
     pub column_ids: Vec<usize>,
     /// The logical types of the columns in `column_ids`.
     pub column_types: Vec<LogicalType>,
+    /// Per-output value projections, parallel to `column_ids`.
+    pub column_projections: Vec<GetColumnProjection>,
     /// Reference to the table catalog entry.
     /// This provides access to table metadata and storage (segments) during
     /// physical plan generation.
@@ -61,6 +76,7 @@ impl Get {
         table: Arc<TableCatalogEntry>,
     ) -> Self {
         let column_ids: Vec<usize> = (0..types.len()).collect();
+        let column_projections = vec![GetColumnProjection::Stored; types.len()];
         Self {
             table_index,
             returned_types: types.clone(),
@@ -69,6 +85,7 @@ impl Get {
             relation_alias: None,
             column_ids,
             column_types: types,
+            column_projections,
             table: Some(table),
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
@@ -85,6 +102,7 @@ impl Get {
         types: Vec<LogicalType>,
     ) -> Self {
         let column_ids: Vec<usize> = (0..types.len()).collect();
+        let column_projections = vec![GetColumnProjection::Stored; types.len()];
         Self {
             table_index,
             returned_types: types.clone(),
@@ -93,6 +111,7 @@ impl Get {
             relation_alias: None,
             column_ids,
             column_types: types,
+            column_projections,
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

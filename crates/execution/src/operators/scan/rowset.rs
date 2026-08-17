@@ -17,10 +17,12 @@ use paro_planner::operator::JoinComparisonType;
 use paro_storage::index::{collect_predicate_columns, Predicate, PredicateTree};
 use paro_storage::rowset::{RowsetSharedPtr, SegmentOptions, SegmentSharedPtr};
 use paro_storage::table::segment_reorderer::{reorder_segments, SegmentOrderOptions};
-use paro_storage::tablet::{ColumnProjection, TabletReaderParams};
+use paro_storage::tablet::{ColumnProjection, ColumnValueProjection, TabletReaderParams};
 use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 
-use crate::physical::specs::{RowsetColumnProjection, RowsetScanAccessPolicy, RowsetScanSpec};
+use crate::physical::specs::{
+    RowsetColumnProjection, RowsetColumnValueProjection, RowsetScanAccessPolicy, RowsetScanSpec,
+};
 use crate::pipeline::graph::{RowsetSourceSpec, ScalarFilterSemantics};
 use crate::runtime::breaker::{HandleRef, JoinBuildHandle, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
@@ -150,8 +152,22 @@ impl RowsetSourceExec {
             reorder_segments(&mut segments, order);
         }
         let overlay_delete_vectors = overlay.as_ref().and_then(TxnOverlayReader::delete_vectors);
-        let column_projection =
-            ColumnProjection::new(self.desc.column_projection.columns().to_vec());
+        let column_projection = ColumnProjection::try_with_value_projections(
+            self.desc.column_projection.columns().to_vec(),
+            self.desc
+                .column_projection
+                .value_projections()
+                .iter()
+                .map(|projection| match projection {
+                    RowsetColumnValueProjection::Stored => ColumnValueProjection::Stored,
+                    RowsetColumnValueProjection::MatchedUtf8Prefix { byte_width } => {
+                        ColumnValueProjection::MatchedUtf8Prefix {
+                            byte_width: *byte_width,
+                        }
+                    }
+                })
+                .collect(),
+        )?;
         let prepared_predicate = prepare_effective_predicate(
             self.effective_predicate(ctx)?,
             self.desc.access_policy,

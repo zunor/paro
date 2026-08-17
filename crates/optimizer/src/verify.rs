@@ -106,13 +106,15 @@ impl Verifier {
                 if get.names.len() != len
                     || get.column_ids.len() != len
                     || get.column_types.len() != len
+                    || get.column_projections.len() != len
                 {
                     return Err(paro_error::internal(format!(
-                        "Get output mismatch: returned_types={}, names={}, column_ids={}, column_types={}",
+                        "Get output mismatch: returned_types={}, names={}, column_ids={}, column_types={}, column_projections={}",
                         get.returned_types.len(),
                         get.names.len(),
                         get.column_ids.len(),
-                        get.column_types.len()
+                        get.column_types.len(),
+                        get.column_projections.len()
                     )));
                 }
 
@@ -131,6 +133,16 @@ impl Verifier {
                                 "Get column id {} out of range (table columns={})",
                                 col_id, table_col_count
                             )));
+                        }
+                        if !matches!(
+                            get.column_projections[idx],
+                            paro_planner::operator::GetColumnProjection::Stored
+                        ) && (col_id >= table_col_count
+                            || get.column_types[idx] != paro_common::types::LogicalType::Varchar)
+                        {
+                            return Err(paro_error::internal(
+                                "Get matched-prefix projection requires a stored VARCHAR column",
+                            ));
                         }
                     }
                 }

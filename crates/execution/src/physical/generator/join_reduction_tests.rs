@@ -61,6 +61,10 @@ fn declared_unique_get(ctx: &BindContext) -> LogicalPlan {
             relation_alias: None,
             column_ids: vec![0, 1],
             column_types: vec![LogicalType::Varchar, LogicalType::BigInt],
+            column_projections: vec![
+                paro_planner::operator::GetColumnProjection::Stored,
+                paro_planner::operator::GetColumnProjection::Stored,
+            ],
             table: Some(table),
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

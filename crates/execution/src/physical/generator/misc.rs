@@ -97,7 +97,7 @@ impl PhysicalPlanGenerator {
 /// Lower complete-partition aggregate windows to a sort-free breaker.
 ///
 /// Eligibility is semantic rather than name based: every invocation must be a
-/// bound, unordered aggregate over the same non-empty partition domain, and
+/// bound, unordered aggregate over the same partition domain, and
 /// every frame must cover that domain completely. Unsupported modifiers keep
 /// the ordinary window implementation as the preserving fallback.
 fn lower_partition_aggregate_window_spec(
@@ -107,18 +107,16 @@ fn lower_partition_aggregate_window_spec(
     let Some(first) = window.expressions.first() else {
         return Ok(None);
     };
-    if first.partitions.is_empty() {
-        return Ok(None);
-    }
     // Other key domains retain the preserving sorted window path until the
     // immutable lookup index consumes the aggregate tuple codec directly.
     // Boxed Value equality is not a correctness substitute for SQL grouping
     // semantics (collations and floating keys in particular).
-    if first.partitions.len() != 1
-        || !matches!(
-            first.partitions[0].return_type(),
-            LogicalType::Integer | LogicalType::BigInt
-        )
+    if !first.partitions.is_empty()
+        && (first.partitions.len() != 1
+            || !matches!(
+                first.partitions[0].return_type(),
+                LogicalType::Integer | LogicalType::BigInt
+            ))
     {
         return Ok(None);
     }
@@ -219,6 +217,11 @@ fn lower_partition_aggregate_window_spec(
         output_types: aggregate_output_types.into_boxed_slice(),
     };
     let spec = PartitionAggregateWindowSpec {
+        domain: if first.partitions.is_empty() {
+            PartitionAggregateDomain::Global
+        } else {
+            PartitionAggregateDomain::Keyed
+        },
         input_types: input_types.into_boxed_slice(),
         detail_columns: detail_columns.into_boxed_slice(),
         aggregate,

@@ -14,6 +14,7 @@ use crate::tablet::ColumnId;
 use bytes::Bytes;
 use paro_common::allocator::MemoryTag;
 use paro_common::error::{self as paro_error, Result};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -79,6 +80,7 @@ pub struct SegmentIterator {
     rowid_tracker: ColumnDataBytesTracker,
     prefetcher: Option<Arc<Prefetcher>>,
     predicate_stage_read_stats: PredicateStageReadStats,
+    matched_prefix_widths: HashMap<ColumnId, usize>,
 }
 
 pub struct SegmentBatch {
@@ -96,6 +98,7 @@ struct ReusedPredicateColumn {
     column_id: ColumnId,
     predicate_idx: usize,
     encoding: PredicateColumnReuse,
+    matched_prefix_width: Option<usize>,
     state: PredicateColumnReuseState,
 }
 
@@ -164,11 +167,17 @@ fn predicate_proof_span(proof: &PredicateResult, start: u64, scan_end: u64) -> (
 }
 
 impl ReusedPredicateColumn {
-    fn new(column_id: ColumnId, predicate_idx: usize, encoding: PredicateColumnReuse) -> Self {
+    fn new(
+        column_id: ColumnId,
+        predicate_idx: usize,
+        encoding: PredicateColumnReuse,
+        matched_prefix_width: Option<usize>,
+    ) -> Self {
         Self {
             column_id,
             predicate_idx,
             encoding,
+            matched_prefix_width,
             state: PredicateColumnReuseState::Collecting {
                 data: Vec::new(),
                 nulls: Vec::new(),
@@ -183,8 +192,10 @@ impl ReusedPredicateColumn {
         batch: &super::predicate_column::PredicateColumnBatch,
         rows: &[BatchRowOrdinal],
     ) -> Result<()> {
-        if let Some(dictionary_batch) = batch.storage_dictionary() {
-            return self.append_dictionary_rows(dictionary_batch, rows);
+        if self.matched_prefix_width.is_none() {
+            if let Some(dictionary_batch) = batch.storage_dictionary() {
+                return self.append_dictionary_rows(dictionary_batch, rows);
+            }
         }
         if matches!(self.state, PredicateColumnReuseState::Dictionary { .. }) {
             self.state = PredicateColumnReuseState::Readback;
@@ -199,7 +210,13 @@ impl ReusedPredicateColumn {
         else {
             return Ok(());
         };
-        if batch.append_reusable_rows(self.encoding, rows, data, nulls, row_ends)? {
+        let reusable = match self.matched_prefix_width {
+            Some(byte_width) => batch.append_reusable_matched_utf8_prefix_rows(
+                byte_width, rows, data, nulls, row_ends,
+            )?,
+            None => batch.append_reusable_rows(self.encoding, rows, data, nulls, row_ends)?,
+        };
+        if reusable {
             *utf8_verified &= batch.reusable_rows_have_verified_utf8();
         } else {
             self.state = PredicateColumnReuseState::Readback;
@@ -392,6 +409,7 @@ impl LateMaterializationState {
     fn new(
         column_iterators: &[(ColumnId, Box<dyn ColumnIterator + Send + Sync>)],
         evaluator: &PredicateEvaluator,
+        matched_prefix_widths: &HashMap<ColumnId, usize>,
     ) -> Self {
         let reused_predicate_columns = column_iterators
             .iter()
@@ -399,7 +417,12 @@ impl LateMaterializationState {
                 evaluator
                     .reusable_column_info(*column_id)
                     .map(|(predicate_idx, encoding)| {
-                        ReusedPredicateColumn::new(*column_id, predicate_idx, encoding)
+                        ReusedPredicateColumn::new(
+                            *column_id,
+                            predicate_idx,
+                            encoding,
+                            matched_prefix_widths.get(column_id).copied(),
+                        )
                     })
             })
             .collect();
@@ -479,6 +502,7 @@ impl SegmentIterator {
             rowid_tracker: ColumnDataBytesTracker::new(buffer_pool),
             prefetcher,
             predicate_stage_read_stats: PredicateStageReadStats::default(),
+            matched_prefix_widths: HashMap::new(),
         })
     }
 
@@ -500,7 +524,7 @@ impl SegmentIterator {
     ) -> Result<Self> {
         let mut iter = Self::new(segment, column_ids)?;
         iter.delete_vector = delete_vector;
-        iter.initialize_predicate(segment, predicate_tree, None)?;
+        iter.initialize_predicate(segment, predicate_tree, None, HashMap::new())?;
         Ok(iter)
     }
 
@@ -513,7 +537,7 @@ impl SegmentIterator {
     ) -> Result<Self> {
         let mut iter = Self::new_with_prefetcher(segment, column_ids, prefetcher)?;
         iter.delete_vector = delete_vector;
-        iter.initialize_predicate(segment, predicate_tree, None)?;
+        iter.initialize_predicate(segment, predicate_tree, None, HashMap::new())?;
         Ok(iter)
     }
 
@@ -525,9 +549,34 @@ impl SegmentIterator {
         predicate_tree: Option<PredicateTree>,
         prefetcher: Option<Arc<Prefetcher>>,
     ) -> Result<Self> {
+        Self::new_with_delete_vector_predicate_and_prefetcher_late_materialize_with_prefixes(
+            segment,
+            column_ids,
+            predicate_columns,
+            delete_vector,
+            predicate_tree,
+            prefetcher,
+            HashMap::new(),
+        )
+    }
+
+    pub fn new_with_delete_vector_predicate_and_prefetcher_late_materialize_with_prefixes(
+        segment: &Segment,
+        column_ids: Vec<ColumnId>,
+        predicate_columns: Vec<ColumnId>,
+        delete_vector: Option<DeleteVector>,
+        predicate_tree: Option<PredicateTree>,
+        prefetcher: Option<Arc<Prefetcher>>,
+        matched_prefix_widths: HashMap<ColumnId, usize>,
+    ) -> Result<Self> {
         let mut iter = Self::new_with_prefetcher(segment, column_ids, prefetcher)?;
         iter.delete_vector = delete_vector;
-        iter.initialize_predicate(segment, predicate_tree, Some(predicate_columns))?;
+        iter.initialize_predicate(
+            segment,
+            predicate_tree,
+            Some(predicate_columns),
+            matched_prefix_widths,
+        )?;
         Ok(iter)
     }
 
@@ -536,7 +585,9 @@ impl SegmentIterator {
         segment: &Segment,
         predicate_tree: Option<PredicateTree>,
         explicit_predicate_columns: Option<Vec<ColumnId>>,
+        matched_prefix_widths: HashMap<ColumnId, usize>,
     ) -> Result<()> {
+        self.matched_prefix_widths = matched_prefix_widths;
         if let Some(tree) = predicate_tree {
             let use_late_materialization = explicit_predicate_columns.is_some();
             let evaluator = IndexEvaluator::new(segment.predicate_indexes());
@@ -565,7 +616,13 @@ impl SegmentIterator {
             self.late_materialization = self.predicate_evaluator.as_ref().and_then(|evaluator| {
                 (use_late_materialization
                     || !evaluator.all_columns_projected(&self.column_iterators))
-                .then(|| LateMaterializationState::new(&self.column_iterators, evaluator))
+                .then(|| {
+                    LateMaterializationState::new(
+                        &self.column_iterators,
+                        evaluator,
+                        &self.matched_prefix_widths,
+                    )
+                })
             });
         }
         Ok(())
@@ -663,6 +720,7 @@ impl SegmentIterator {
             self.late_materialization = Some(LateMaterializationState::new(
                 &self.column_iterators,
                 evaluator,
+                &self.matched_prefix_widths,
             ));
         }
         let batch = self.next_batch_with_rowid_policy(batch_size, true)?;
@@ -1026,6 +1084,7 @@ impl SegmentIterator {
                 self.late_materialization = Some(LateMaterializationState::new(
                     &self.column_iterators,
                     evaluator,
+                    &self.matched_prefix_widths,
                 ));
                 // Eager evaluation may have reused projected predicate columns,
                 // leaving the independent predicate readers at the previous
@@ -1387,7 +1446,8 @@ mod tests {
 
     #[test]
     fn decoded_predicate_batch_disables_column_reuse_for_readback() {
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 });
+        let mut reused =
+            ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 }, None);
         let raw = PredicateColumnBatch::Raw(ColumnBatch::new(
             Bytes::copy_from_slice(&11_i32.to_le_bytes()),
             None,
@@ -1409,7 +1469,8 @@ mod tests {
 
     #[test]
     fn fixed_predicate_values_are_reused_across_output_batches() {
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 });
+        let mut reused =
+            ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Fixed { width: 4 }, None);
         let values = [10_i32, 20, 30]
             .into_iter()
             .flat_map(i32::to_le_bytes)
@@ -1431,7 +1492,7 @@ mod tests {
 
     #[test]
     fn decoded_varlen_predicate_values_are_reused_across_output_batches() {
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen);
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, None);
         let decoded = PredicateColumnBatch::Decoded(test_nullable_string_vector(&[
             Some("alpha"),
             None,
@@ -1479,7 +1540,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen);
+        let mut reused = ReusedPredicateColumn::new(7, 0, PredicateColumnReuse::Varlen, None);
         reused
             .append_rows(
                 &batch,

@@ -37,10 +37,36 @@ pub struct ColumnProjection {
     output_columns: Vec<usize>,
     read_columns: Vec<usize>,
     output_to_read: Vec<usize>,
+    value_projections: Vec<ColumnValueProjection>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnValueProjection {
+    Stored,
+    MatchedUtf8Prefix { byte_width: usize },
 }
 
 impl ColumnProjection {
     pub fn new(output_columns: Vec<usize>) -> Self {
+        let value_projections = vec![ColumnValueProjection::Stored; output_columns.len()];
+        Self::build(output_columns, value_projections)
+    }
+
+    pub fn try_with_value_projections(
+        output_columns: Vec<usize>,
+        value_projections: Vec<ColumnValueProjection>,
+    ) -> Result<Self> {
+        if output_columns.len() != value_projections.len() {
+            return Err(paro_common::error::invalid_input(format!(
+                "column projection width mismatch: outputs={}, value projections={}",
+                output_columns.len(),
+                value_projections.len()
+            )));
+        }
+        Ok(Self::build(output_columns, value_projections))
+    }
+
+    fn build(output_columns: Vec<usize>, value_projections: Vec<ColumnValueProjection>) -> Self {
         let mut read_columns = Vec::new();
         let mut output_to_read = Vec::with_capacity(output_columns.len());
         let mut seen = HashMap::new();
@@ -58,6 +84,7 @@ impl ColumnProjection {
             output_columns,
             read_columns,
             output_to_read,
+            value_projections,
         }
     }
 
@@ -71,6 +98,34 @@ impl ColumnProjection {
 
     pub fn output_to_read(&self) -> &[usize] {
         &self.output_to_read
+    }
+
+    pub fn value_projections(&self) -> &[ColumnValueProjection] {
+        &self.value_projections
+    }
+
+    /// Return a compact prefix transform for read columns that have no stored
+    /// output consumer.  Conflicting derived widths conservatively retain the
+    /// stored batch; a single raw read may legally feed several outputs.
+    pub fn exclusive_matched_prefix_widths(&self) -> Vec<Option<usize>> {
+        let mut widths = vec![None; self.read_columns.len()];
+        let mut disabled = vec![false; self.read_columns.len()];
+        for (&read_idx, projection) in self.output_to_read.iter().zip(&self.value_projections) {
+            match projection {
+                ColumnValueProjection::Stored => disabled[read_idx] = true,
+                ColumnValueProjection::MatchedUtf8Prefix { byte_width } => match widths[read_idx] {
+                    None => widths[read_idx] = Some(*byte_width),
+                    Some(existing) if existing == *byte_width => {}
+                    Some(_) => disabled[read_idx] = true,
+                },
+            }
+        }
+        for (width, disabled) in widths.iter_mut().zip(disabled) {
+            if disabled {
+                *width = None;
+            }
+        }
+        widths
     }
 }
 

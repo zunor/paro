@@ -387,6 +387,12 @@ impl PhysicalPlanGenerator {
                     .iter()
                     .chain(branch.get.runtime_filter_expressions.iter())
                     .any(|expression| !expression.evaluation_properties().can_share_evaluation())
+                || branch.get.column_projections.iter().any(|projection| {
+                    !matches!(
+                        projection,
+                        paro_planner::operator::GetColumnProjection::Stored
+                    )
+                })
         }) {
             return Ok(None);
         }
@@ -401,6 +407,8 @@ impl PhysicalPlanGenerator {
         }
         let mut merged_get = branches[0].get.clone();
         merged_get.column_ids = merged_column_ids.clone();
+        merged_get.column_projections =
+            vec![paro_planner::operator::GetColumnProjection::Stored; merged_column_ids.len()];
         merged_get.names = merged_column_ids
             .iter()
             .map(|&column_id| first_table.columns[column_id].name.clone())

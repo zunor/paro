@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_storage::row::{RowFormat, RowStore};
 
@@ -37,6 +38,18 @@ pub(crate) enum PartitionAggregateLocalOutput {
 
 #[derive(Debug)]
 pub(crate) enum PartitionAggregateSnapshot {
+    /// Zero-key aggregate result paired with the original detail batches.
+    /// Every emitted row observes the same finalized aggregate values, so no
+    /// lookup index or per-row selection vector exists in this domain.
+    Global {
+        payloads: Arc<[Chunk]>,
+        /// Detail batches that crossed the query memory boundary are owned by
+        /// exactly one emit task, just like keyed external output partitions.
+        external_payloads: Mutex<Vec<Option<RowStore>>>,
+        aggregates: Box<[Value]>,
+        _payload_memory: Box<[Arc<RetainedMemoryHandle>]>,
+        spilled_bytes: usize,
+    },
     InMemory {
         payloads: Arc<[Chunk]>,
         index: FinalizedPartitionIndex,
@@ -59,9 +72,52 @@ pub(crate) enum PartitionAggregateSnapshot {
 impl PartitionAggregateSnapshot {
     pub(crate) fn work_count(&self) -> usize {
         match self {
+            Self::Global {
+                payloads,
+                external_payloads,
+                ..
+            } => payloads
+                .len()
+                .saturating_add(external_payloads.lock().len()),
             Self::InMemory { payloads, .. } => payloads.len(),
             Self::External { outputs, .. } => outputs.lock().len(),
         }
+    }
+
+    pub(crate) fn global_batch(&self, index: usize) -> Option<(&Chunk, &[Value])> {
+        let Self::Global {
+            payloads,
+            aggregates,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        payloads
+            .get(index)
+            .map(|payload| (payload, aggregates.as_ref()))
+    }
+
+    pub(crate) fn global_aggregates(&self) -> Option<&[Value]> {
+        let Self::Global { aggregates, .. } = self else {
+            return None;
+        };
+        Some(aggregates)
+    }
+
+    pub(crate) fn take_global_external_payload(&self, index: usize) -> Option<RowStore> {
+        let Self::Global {
+            payloads,
+            external_payloads,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        external_payloads
+            .lock()
+            .get_mut(index.checked_sub(payloads.len())?)?
+            .take()
     }
 
     pub(crate) fn take_output(&self, index: usize) -> Option<RowStore> {
@@ -97,6 +153,9 @@ impl PartitionAggregateSnapshot {
                 repartition_depth,
                 ..
             } => Some((*spilled_bytes, *repartition_depth)),
+            Self::Global { spilled_bytes, .. } => {
+                (*spilled_bytes > 0).then_some((*spilled_bytes, 0))
+            }
             Self::InMemory { .. } => None,
         }
     }
@@ -123,6 +182,32 @@ impl PartitionAggregateSnapshot {
                 .sum::<usize>(),
         );
         *depth = repartition_depth;
+    }
+}
+
+/// Spill layout for the detail side of a zero-key aggregate window. Aggregate
+/// state is finalized once in memory; only the replay payload crosses this
+/// row-store boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct GlobalPartitionAggregateDetailFormat {
+    detail_types: Box<[LogicalType]>,
+}
+
+impl GlobalPartitionAggregateDetailFormat {
+    pub(crate) fn new(detail_types: &[LogicalType]) -> Self {
+        Self {
+            detail_types: detail_types.to_vec().into_boxed_slice(),
+        }
+    }
+}
+
+impl RowFormat for GlobalPartitionAggregateDetailFormat {
+    fn name(&self) -> &'static str {
+        "global_partition_aggregate_detail"
+    }
+
+    fn logical_types(&self) -> &[LogicalType] {
+        &self.detail_types
     }
 }
 

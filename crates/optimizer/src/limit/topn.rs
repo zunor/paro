@@ -193,6 +193,10 @@ mod tests {
             relation_alias: None,
             column_ids: vec![0, 1],
             column_types: vec![LogicalType::Integer, LogicalType::Integer],
+            column_projections: vec![
+                paro_planner::operator::GetColumnProjection::Stored,
+                paro_planner::operator::GetColumnProjection::Stored,
+            ],
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

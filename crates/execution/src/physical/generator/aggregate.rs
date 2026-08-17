@@ -108,7 +108,7 @@ fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupL
                     .dependents
                     .iter()
                     .try_fold(0usize, |width, &group_idx| {
-                        width.checked_add(aggregate.groups[group_idx].return_type().physical_size())
+                        width.checked_add(aggregate.groups[group_idx].return_type().type_size())
                     })?;
             Some((dependency, functions, removed_width))
         })
@@ -241,10 +241,7 @@ fn plan_string_group_key(stats: &paro_storage::statistics::BaseStatistics) -> Gr
         LogicalType::UHugeInt,
     ]
     .into_iter()
-    .find(|ty| {
-        max_length < ty.physical_size()
-            && ty.physical_size() <= LogicalType::Varchar.physical_size()
-    })
+    .find(|ty| max_length < ty.type_size() && ty.type_size() <= LogicalType::Varchar.type_size())
     .map(|physical_type| GroupKeyEncoding::PackedString {
         physical_type,
         max_length,
@@ -279,7 +276,7 @@ fn plan_integer_group_key(
     ]
     .into_iter()
     .find(|(physical_type, maximum)| {
-        range <= *maximum && physical_type.physical_size() < logical_type.physical_size()
+        range <= *maximum && physical_type.type_size() < logical_type.type_size()
     })
     .map(|(physical_type, _)| GroupKeyEncoding::OffsetInteger {
         physical_type,

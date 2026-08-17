@@ -30,6 +30,9 @@ use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::semantic_kernels::{cast_kernels_equal, scalar_kernels_equal};
 use crate::statistics::unique_keys::{declared_unique_keys, NullRejectedKeyProof};
+use crate::subquery::output_contract::{
+    child_output_contracts, OutputContract, RewriteOutputShape,
+};
 
 /// Rewrite eligible correlated scalar aggregates into partition windows or
 /// keyed grouped joins.
@@ -51,7 +54,11 @@ impl CorrelatedPartitionAggregate {
         plan: LogicalPlan,
         output_contract: Option<OutputContract>,
     ) -> Result<LogicalPlan> {
-        let child_contracts = child_output_contracts(&plan.operator, output_contract.as_ref());
+        let child_contracts = child_output_contracts(
+            &plan.operator,
+            output_contract.as_ref(),
+            RewriteOutputShape::ArbitraryLayout,
+        );
         let mut child_ordinal = 0;
         let plan = plan.try_map_children(|child| {
             let contract = child_contracts.get(child_ordinal).cloned().flatten();
@@ -73,93 +80,6 @@ impl CorrelatedPartitionAggregate {
             return apply_grouped_join_rewrite(plan, rewrite, &self.bind_context);
         }
         Ok(plan)
-    }
-}
-
-/// Bindings consumed between a subtree and the projection that hides the rest
-/// of its implicit output.  The contract is propagated only across operators
-/// whose preserved child is addressed by binding; positional or implicit
-/// consumers deliberately terminate it.
-#[derive(Clone, Default)]
-struct OutputContract {
-    referenced: HashSet<ColumnBinding>,
-}
-
-impl OutputContract {
-    fn from_expressions<'a>(expressions: impl IntoIterator<Item = &'a Expression>) -> Self {
-        let mut contract = Self::default();
-        contract.extend(expressions);
-        contract
-    }
-
-    fn extend<'a>(&mut self, expressions: impl IntoIterator<Item = &'a Expression>) {
-        for expression in expressions {
-            ExpressionIterator::visit(expression, &mut |candidate| {
-                if let Expression::ColumnRef(column) = candidate {
-                    self.referenced.insert(column.binding);
-                }
-                ExpressionVisitDecision::Descend
-            });
-        }
-    }
-
-    fn references(&self, binding: ColumnBinding) -> bool {
-        self.referenced.contains(&binding)
-    }
-}
-
-fn child_output_contracts(
-    operator: &LogicalOperator,
-    inherited: Option<&OutputContract>,
-) -> Vec<Option<OutputContract>> {
-    match operator {
-        LogicalOperator::Projection(projection) => vec![Some(OutputContract::from_expressions(
-            projection.expressions.iter(),
-        ))],
-        LogicalOperator::Aggregate(aggregate) => vec![Some(OutputContract::from_expressions(
-            aggregate.groups.iter().chain(aggregate.aggregates.iter()),
-        ))],
-        LogicalOperator::Filter(filter)
-            if inherited.is_some() && filter.projection_map.is_all() =>
-        {
-            let mut contract = inherited.cloned().unwrap_or_default();
-            contract.extend(filter.expressions.iter());
-            vec![Some(contract)]
-        }
-        LogicalOperator::Order(order) if inherited.is_some() && order.projection_map.is_all() => {
-            let mut contract = inherited.cloned().unwrap_or_default();
-            contract.extend(order.orders.iter().map(|order| &order.expression));
-            vec![Some(contract)]
-        }
-        LogicalOperator::Limit(limit) if inherited.is_some() => {
-            let mut contract = inherited.cloned().unwrap_or_default();
-            contract.extend(limit.limit.iter().chain(limit.offset.iter()));
-            vec![Some(contract)]
-        }
-        LogicalOperator::TopN(topn) if inherited.is_some() => {
-            let mut contract = inherited.cloned().unwrap_or_default();
-            contract.extend(topn.orders.iter().map(|order| &order.expression));
-            vec![Some(contract)]
-        }
-        LogicalOperator::Join(Join::Comparison(join)) if inherited.is_some() => {
-            let mut contract = inherited.cloned().unwrap_or_default();
-            contract.extend(
-                join.conditions
-                    .iter()
-                    .flat_map(|condition| [&condition.left, &condition.right])
-                    .chain(join.duplicate_eliminated_columns.iter()),
-            );
-            match join.join_type {
-                JoinType::Semi | JoinType::Anti if join.left_projection_map.is_all() => {
-                    vec![Some(contract), None]
-                }
-                JoinType::RightSemi | JoinType::RightAnti if join.right_projection_map.is_all() => {
-                    vec![None, Some(contract)]
-                }
-                _ => vec![None, None],
-            }
-        }
-        _ => operator.children().into_iter().map(|_| None).collect(),
     }
 }
 
@@ -1753,6 +1673,7 @@ mod proof_tests {
         let contracts = child_output_contracts(
             &LogicalOperator::Filter(filter),
             Some(&OutputContract::default()),
+            RewriteOutputShape::ArbitraryLayout,
         );
 
         assert_eq!(contracts.len(), 1);
@@ -1767,6 +1688,7 @@ mod proof_tests {
         let contracts = child_output_contracts(
             &LogicalOperator::Filter(filter),
             Some(&OutputContract::default()),
+            RewriteOutputShape::ArbitraryLayout,
         );
 
         assert_eq!(contracts.len(), 1);

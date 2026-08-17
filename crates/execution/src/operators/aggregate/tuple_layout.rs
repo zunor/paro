@@ -1057,7 +1057,7 @@ fn group_storage_width(logical_type: &LogicalType) -> Result<usize> {
     if is_varlen_group_type(logical_type) {
         return Ok(size_of::<VarlenRef>());
     }
-    let width = logical_type.physical_size();
+    let width = logical_type.type_size();
     if width == 0 {
         return Err(paro_error::internal(format!(
             "Unsupported group key type in TupleLayout: {logical_type:?}"

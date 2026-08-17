@@ -618,6 +618,8 @@ mod tests {
         let mut get = Get::new(table_index, names, types.clone(), table);
         get.column_ids = column_ids;
         get.column_types = types.clone();
+        get.column_projections =
+            vec![paro_planner::operator::GetColumnProjection::Stored; types.len()];
         get.returned_types = types;
         LogicalOperator::Get(get)
     }
