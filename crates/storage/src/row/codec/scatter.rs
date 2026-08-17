@@ -419,7 +419,7 @@ unsafe fn write_varlen(target: *mut u8, bytes: &[u8], heap: &mut impl RowHeapWri
         let retained = heap.store_bytes(bytes)?;
         // SAFETY: `store_bytes` returned immutable row-owned storage containing
         // all `len` bytes, and that owner outlives the target row cell.
-        unsafe { StringView::from_raw_parts(retained, len) }
+        unsafe { StringView::from_out_of_line(bytes, retained, len) }
     };
     // SAFETY: `target` identifies a writable StringView-sized row cell.
     unsafe { value.write_cell(target) };

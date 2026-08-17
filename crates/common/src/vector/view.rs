@@ -3,8 +3,8 @@
 
 use std::marker::PhantomData;
 
-use crate::error::Result;
-use crate::types::{LogicalType, StringView};
+use crate::error::{self as paro_error, Result};
+use crate::types::{LogicalType, PhysicalType, StringView};
 
 use super::{
     ArrayVector, SelectionVector, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
@@ -219,6 +219,7 @@ impl<'a> VectorView<'a> {
 
 #[derive(Debug, Clone)]
 pub struct VarlenView<'a> {
+    logical_type: &'a LogicalType,
     entries: *const StringView,
     sel: SelectionRef<'a>,
     validity: ValidityRef<'a>,
@@ -226,6 +227,11 @@ pub struct VarlenView<'a> {
 }
 
 impl<'a> VarlenView<'a> {
+    #[inline]
+    pub fn logical_type(&self) -> &'a LogicalType {
+        self.logical_type
+    }
+
     #[inline]
     pub fn sel(&self) -> &SelectionRef<'a> {
         &self.sel
@@ -248,14 +254,16 @@ impl<'a> VarlenView<'a> {
         unsafe { (&*self.entries.add(self.sel.get(idx))).as_bytes() }
     }
 
-    /// Read a UTF-8 value without validation.
-    ///
-    /// # Safety
-    /// The selected entry must belong to a UTF-8 logical type rather than a
-    /// binary `Blob` vector.
+    /// Prove once that this view contains UTF-8 logical values.
     #[inline]
-    pub unsafe fn str_unchecked(&self, idx: usize) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.bytes(idx)) }
+    pub fn try_as_utf8(self) -> Result<Utf8View<'a>> {
+        if !self.logical_type.is_utf8_varlen() {
+            return Err(paro_error::type_mismatch(format!(
+                "UTF-8 view requires a textual varlen type, got {:?}",
+                self.logical_type
+            )));
+        }
+        Ok(Utf8View { inner: self })
     }
 
     /// Copy the physical view value out of the owning vector.
@@ -266,6 +274,42 @@ impl<'a> VarlenView<'a> {
     #[inline]
     pub unsafe fn value(&self, idx: usize) -> StringView {
         unsafe { *self.entries.add(self.sel.get(idx)) }
+    }
+}
+
+/// Varlen vector view whose logical type guarantees valid UTF-8 bytes.
+#[derive(Debug, Clone)]
+pub struct Utf8View<'a> {
+    inner: VarlenView<'a>,
+}
+
+impl<'a> Utf8View<'a> {
+    #[inline]
+    pub fn logical_type(&self) -> &'a LogicalType {
+        self.inner.logical_type()
+    }
+
+    #[inline]
+    pub fn sel(&self) -> &SelectionRef<'a> {
+        self.inner.sel()
+    }
+
+    #[inline]
+    pub fn validity(&self) -> &ValidityRef<'a> {
+        self.inner.validity()
+    }
+
+    #[inline]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.inner.is_valid(idx)
+    }
+
+    /// Read a string without revalidating every row's bytes.
+    #[inline]
+    pub fn str(&self, idx: usize) -> &str {
+        // SAFETY: `try_as_utf8` proves that the vector's logical type carries
+        // the UTF-8 invariant, which all safe vector write paths preserve.
+        unsafe { std::str::from_utf8_unchecked(self.inner.bytes(idx)) }
     }
 }
 
@@ -518,15 +562,28 @@ impl Vector {
 
     pub fn try_to_varlen_view(&self, count: usize) -> Result<VarlenView<'_>> {
         let view = self.try_to_view(count)?;
+        if view.logical_type.physical_type() != PhysicalType::Varchar {
+            return Err(paro_error::type_mismatch(format!(
+                "varlen view requires VARCHAR physical storage, got {:?}",
+                view.logical_type
+            )));
+        }
         let DataRef::Ptr(entries) = view.data else {
             panic!("to_varlen_view requires pointer-backed data");
         };
         Ok(VarlenView {
+            logical_type: view.logical_type,
             entries: entries as *const StringView,
             sel: view.sel,
             validity: view.validity,
             _vector: PhantomData,
         })
+    }
+
+    /// Decode a textual varlen vector and prove its UTF-8 invariant once.
+    #[inline]
+    pub fn try_to_utf8_view(&self, count: usize) -> Result<Utf8View<'_>> {
+        self.try_to_varlen_view(count)?.try_as_utf8()
     }
 
     pub fn try_to_array_view(&self, count: usize) -> Result<ArrayView<'_>> {
@@ -779,6 +836,37 @@ mod tests {
 
         assert_eq!(std::str::from_utf8(view.bytes(0)).unwrap(), "gamma");
         assert_eq!(std::str::from_utf8(view.bytes(1)).unwrap(), "alpha");
+    }
+
+    #[test]
+    fn utf8_view_proves_text_type_once() {
+        let mut vector =
+            Vector::try_new(LogicalType::Varchar, 2, crate::test_utils::test_allocator()).unwrap();
+        vector.try_set_count(2).unwrap();
+        vector.try_set_string(0, "short").unwrap();
+        vector
+            .try_set_string(1, "a longer UTF-8 value 你好")
+            .unwrap();
+
+        let view = vector.try_to_utf8_view(2).unwrap();
+        assert_eq!(view.str(0), "short");
+        assert_eq!(view.str(1), "a longer UTF-8 value 你好");
+    }
+
+    #[test]
+    fn utf8_and_binary_safe_apis_reject_cross_type_access() {
+        let mut blob =
+            Vector::try_new(LogicalType::Blob, 1, crate::test_utils::test_allocator()).unwrap();
+        blob.try_set_blob(0, &[0xff]).unwrap();
+        assert!(blob.try_to_utf8_view(1).is_err());
+        assert!(blob.try_set_string(0, "text").is_err());
+
+        let mut text =
+            Vector::try_new(LogicalType::Varchar, 1, crate::test_utils::test_allocator()).unwrap();
+        assert!(text.try_set_blob(0, &[0xff]).is_err());
+
+        let fixed = crate::test_utils::test_i64_vector(&[1]);
+        assert!(fixed.try_to_varlen_view(1).is_err());
     }
 
     #[test]

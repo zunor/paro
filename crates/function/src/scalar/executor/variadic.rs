@@ -12,21 +12,20 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
     let views = input
         .data
         .iter()
-        .map(|vector| vector.try_to_varlen_view(count))
+        .map(|vector| vector.try_to_utf8_view(count))
         .collect::<Result<Vec<_>>>()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
-    // SAFETY: concat binds every input as VARCHAR.
     for row in 0..count {
         let capacity = views
             .iter()
             .filter(|view| view.is_valid(row))
-            .map(|view| unsafe { view.str_unchecked(row) }.len())
+            .map(|view| view.str(row).len())
             .sum();
         let mut concatenated = String::with_capacity(capacity);
         for view in &views {
             if view.is_valid(row) {
-                concatenated.push_str(unsafe { view.str_unchecked(row) });
+                concatenated.push_str(view.str(row));
             }
         }
         writer.write_str(row, &concatenated)?;
@@ -40,12 +39,12 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
     let separator = input
         .column(0)
         .ok_or_else(|| paro_error::internal("Missing separator column".to_string()))?
-        .try_to_varlen_view(count)?;
+        .try_to_utf8_view(count)?;
     let arguments = input
         .data
         .iter()
         .skip(1)
-        .map(|vector| vector.try_to_varlen_view(count))
+        .map(|vector| vector.try_to_utf8_view(count))
         .collect::<Result<Vec<_>>>()?;
     let mut writer = VarcharResultWriter::new(result, count);
 
@@ -55,14 +54,13 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             continue;
         }
 
-        // SAFETY: concat_ws binds the separator and arguments as VARCHAR.
-        let sep = unsafe { separator.str_unchecked(row) };
+        let sep = separator.str(row);
         let mut value_count = 0;
         let mut capacity = 0;
         for view in &arguments {
             if view.is_valid(row) {
                 value_count += 1;
-                capacity += unsafe { view.str_unchecked(row) }.len();
+                capacity += view.str(row).len();
             }
         }
         if value_count > 1 {
@@ -78,7 +76,7 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
             if wrote_any {
                 concatenated.push_str(sep);
             }
-            concatenated.push_str(unsafe { view.str_unchecked(row) });
+            concatenated.push_str(view.str(row));
             wrote_any = true;
         }
 

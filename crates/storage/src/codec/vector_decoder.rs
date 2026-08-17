@@ -220,12 +220,16 @@ fn decode_storage_dictionary_child(
                 let value = dictionary_decoder
                     .string_at(idx as u32)
                     .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                if !utf8_verified {
+                let value = if utf8_verified {
+                    // SAFETY: the encoded page's verified-UTF-8 contract covers
+                    // every dictionary value in this batch.
+                    unsafe { std::str::from_utf8_unchecked(&value) }
+                } else {
                     std::str::from_utf8(&value).map_err(|_| {
                         paro_error::data_corrupted("dictionary entry is not valid UTF-8")
-                    })?;
-                }
-                child.try_set_blob(idx, &value)?;
+                    })?
+                };
+                child.try_set_string(idx, value)?;
             }
         }
         LogicalType::Blob => {

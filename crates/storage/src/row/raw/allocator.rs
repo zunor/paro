@@ -612,31 +612,31 @@ impl RawRowAllocator {
             let string_location = row_ptr.add(string_location_offset);
 
             // SAFETY: `string_location` addresses a live canonical row cell.
-            let mut value = StringView::from_cell(string_location);
+            let value_len = StringView::cell_len(string_location);
 
-            if !value.is_inlined() {
-                // SAFETY: the branch established the out-of-line representation.
-                let current_ptr = value.heap_ptr();
+            if value_len > StringView::INLINE_CAPACITY {
+                // SAFETY: the branch established the out-of-line row-cell
+                // representation and the cell's pointer remains live.
+                let current_ptr = StringView::cell_heap_ptr(string_location);
                 let current_address = current_ptr as usize;
                 let heap_offset = current_address.checked_sub(old_heap_address).ok_or_else(|| {
                     paro_error::data_corrupted(format!(
                         "raw row varlen pointer precedes its heap range: pointer={current_address:#x} heap_base={old_heap_address:#x}"
                     ))
                 })?;
-                let string_end = heap_offset.checked_add(value.len()).ok_or_else(|| {
+                let string_end = heap_offset.checked_add(value_len).ok_or_else(|| {
                     paro_error::data_corrupted("raw row varlen heap range overflow")
                 })?;
                 if string_end > heap_size {
                     return Err(paro_error::data_corrupted(format!(
                         "raw row varlen pointer exceeds its heap range: offset={heap_offset} length={} heap_size={heap_size}",
-                        value.len()
+                        value_len
                     )));
                 }
                 let new_target = new_heap_ptr.add(heap_offset);
-                // SAFETY: relocation preserves the same immutable bytes and length.
-                value.set_ptr(new_target);
-                // SAFETY: rewrite the same live cell with its relocated pointer.
-                value.write_cell(string_location);
+                // SAFETY: relocation preserves the same immutable bytes,
+                // prefix, and length while updating only the pointer field.
+                StringView::set_cell_heap_ptr(string_location, new_target);
             }
         }
         Ok(())

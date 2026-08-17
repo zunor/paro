@@ -15,6 +15,7 @@ const LENGTH_LEN: usize = std::mem::size_of::<u32>();
 const PREFIX_LEN: usize = 4;
 const INLINE_CAPACITY: usize = 12;
 const INLINE_SUFFIX_LEN: usize = INLINE_CAPACITY - PREFIX_LEN;
+const PAYLOAD_OFFSET: usize = LENGTH_LEN + PREFIX_LEN;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -57,9 +58,10 @@ const _: () = assert!(INLINE_CAPACITY == PREFIX_LEN + INLINE_SUFFIX_LEN);
 const _: () = assert!(std::mem::size_of::<*const u8>() == INLINE_SUFFIX_LEN);
 const _: () = assert!(StringView::SIZE == 16);
 const _: () = assert!(std::mem::size_of::<StringView>() == StringView::SIZE);
+const _: () = assert!(std::mem::align_of::<StringView>() >= std::mem::align_of::<u64>());
 const _: () = assert!(std::mem::offset_of!(StringView, length) == 0);
 const _: () = assert!(std::mem::offset_of!(StringView, prefix) == LENGTH_LEN);
-const _: () = assert!(std::mem::offset_of!(StringView, payload) == LENGTH_LEN + PREFIX_LEN);
+const _: () = assert!(std::mem::offset_of!(StringView, payload) == PAYLOAD_OFFSET);
 
 // SAFETY: an out-of-line view points to immutable bytes. Moving or sharing the
 // view between threads is sound when its unsafe construction contract is upheld:
@@ -148,6 +150,37 @@ impl StringView {
                 prefix,
                 payload: StringViewPayload { pointer: ptr },
             }
+        }
+    }
+
+    /// Construct an out-of-line view after `ptr` has been installed in its
+    /// owning allocation.
+    ///
+    /// The comparison prefix is copied from `prefix_source`, avoiding a second
+    /// read through a freshly retained or relocated pointer.
+    ///
+    /// # Safety
+    /// - `len` must exceed [`Self::INLINE_CAPACITY`].
+    /// - `prefix_source` must contain at least [`Self::PREFIX_LEN`] bytes and
+    ///   its first four bytes must match the bytes at `ptr`.
+    /// - `ptr` must be readable for `len` initialized bytes, and its allocation
+    ///   must remain alive and immutable for every use of the returned view.
+    #[inline]
+    pub unsafe fn from_out_of_line(prefix_source: &[u8], ptr: *const u8, len: u32) -> Self {
+        debug_assert!((len as usize) > INLINE_CAPACITY);
+        debug_assert!(prefix_source.len() >= PREFIX_LEN);
+        debug_assert!(!ptr.is_null());
+
+        let mut prefix = [0u8; PREFIX_LEN];
+        // SAFETY: the caller guarantees that `prefix_source` contains four
+        // bytes. The destination is a distinct, initialized local array.
+        unsafe {
+            std::ptr::copy_nonoverlapping(prefix_source.as_ptr(), prefix.as_mut_ptr(), PREFIX_LEN)
+        };
+        Self {
+            length: len,
+            prefix,
+            payload: StringViewPayload { pointer: ptr },
         }
     }
 
@@ -249,16 +282,55 @@ impl StringView {
         self.payload = StringViewPayload { pointer: new_ptr };
     }
 
+    /// Read the byte length directly from an unaligned physical row cell.
+    ///
+    /// # Safety
+    /// `src` must be readable for at least [`LENGTH_LEN`] bytes and contain the
+    /// leading bytes of a valid `StringView` row cell.
+    #[inline]
+    pub unsafe fn cell_len(src: *const u8) -> usize {
+        unsafe { std::ptr::read_unaligned(src.cast::<u32>()) as usize }
+    }
+
+    /// Read only the backing pointer from an out-of-line physical row cell.
+    ///
+    /// # Safety
+    /// `src` must be readable for [`Self::SIZE`] bytes and contain a valid
+    /// out-of-line `StringView` row cell whose pointer is still live.
+    #[inline]
+    pub unsafe fn cell_heap_ptr(src: *const u8) -> *const u8 {
+        debug_assert!(unsafe { Self::cell_len(src) } > INLINE_CAPACITY);
+        let pointer =
+            unsafe { std::ptr::read_unaligned(src.add(PAYLOAD_OFFSET).cast::<*const u8>()) };
+        debug_assert!(!pointer.is_null());
+        pointer
+    }
+
+    /// Replace only the backing pointer in an out-of-line physical row cell.
+    ///
+    /// # Safety
+    /// - `dst` must be writable for [`Self::SIZE`] bytes and contain a valid
+    ///   out-of-line `StringView` row cell.
+    /// - `new_ptr` must point to the same immutable byte sequence at its new
+    ///   location and remain valid for every subsequent access through the cell.
+    #[inline]
+    pub unsafe fn set_cell_heap_ptr(dst: *mut u8, new_ptr: *const u8) {
+        debug_assert!(unsafe { Self::cell_len(dst) } > INLINE_CAPACITY);
+        debug_assert!(!new_ptr.is_null());
+        unsafe { std::ptr::write_unaligned(dst.add(PAYLOAD_OFFSET).cast::<*const u8>(), new_ptr) };
+    }
+
     /// Read a view from an unaligned physical row cell.
     ///
     /// # Safety
     /// `src` must be readable for [`Self::SIZE`] bytes and contain a canonical
-    /// cell previously written by [`Self::write_cell`]. Any out-of-line pointer
-    /// in the cell must remain valid and immutable for every use of the result.
+    /// cell previously written by [`Self::write_cell`]. This function does not
+    /// validate the cell contents in release builds. Any out-of-line pointer in
+    /// the cell must remain valid and immutable for every use of the result.
     #[inline]
     pub unsafe fn from_cell(src: *const u8) -> Self {
         let value = unsafe { std::ptr::read_unaligned(src.cast::<Self>()) };
-        debug_assert!(value.has_canonical_inline_padding());
+        debug_assert!(value.is_inlined() || !unsafe { value.payload.pointer }.is_null());
         value
     }
 
@@ -269,8 +341,15 @@ impl StringView {
     /// value, the caller must ensure that the backing owner outlives the cell.
     #[inline]
     pub unsafe fn write_cell(&self, dst: *mut u8) {
-        debug_assert!(self.has_canonical_inline_padding());
         unsafe { std::ptr::write_unaligned(dst.cast::<Self>(), *self) };
+    }
+
+    /// Read the fixed-width length and prefix head as one machine word.
+    #[inline]
+    fn head(&self) -> u64 {
+        // SAFETY: the compile-time layout and alignment assertions guarantee
+        // that the first eight bytes are initialized and aligned for `u64`.
+        unsafe { std::ptr::read(std::ptr::from_ref(self).cast::<u64>()) }
     }
 
     #[inline]
@@ -278,21 +357,6 @@ impl StringView {
         debug_assert!(self.is_inlined());
         // SAFETY: the inline representation is active by the length invariant.
         unsafe { self.payload.inline }
-    }
-
-    #[inline]
-    fn has_canonical_inline_padding(&self) -> bool {
-        if !self.is_inlined() {
-            return true;
-        }
-
-        let len = self.len();
-        let suffix = self.inline_suffix();
-        if len < PREFIX_LEN {
-            self.prefix[len..].iter().all(|byte| *byte == 0) && suffix.iter().all(|byte| *byte == 0)
-        } else {
-            suffix[len - PREFIX_LEN..].iter().all(|byte| *byte == 0)
-        }
     }
 }
 
@@ -307,12 +371,12 @@ impl Default for StringView {
 impl PartialEq for StringView {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        if self.length != other.length || self.prefix != other.prefix {
+        if self.head() != other.head() {
             return false;
         }
 
         if self.is_inlined() {
-            self.inline_suffix() == other.inline_suffix()
+            u64::from_ne_bytes(self.inline_suffix()) == u64::from_ne_bytes(other.inline_suffix())
         } else {
             // Prefix and length already match, so compare only the remaining
             // bytes. This is the single variable-width equality read.
@@ -335,18 +399,24 @@ impl Ord for StringView {
     fn cmp(&self, other: &Self) -> Ordering {
         let self_len = self.len();
         let other_len = other.len();
-        let min_len = self_len.min(other_len);
+        let prefix_ordering =
+            u32::from_be_bytes(self.prefix).cmp(&u32::from_be_bytes(other.prefix));
+        if prefix_ordering != Ordering::Equal {
+            return prefix_ordering;
+        }
 
-        let content_ordering = if min_len >= PREFIX_LEN {
-            let prefix_ordering =
-                u32::from_be_bytes(self.prefix).cmp(&u32::from_be_bytes(other.prefix));
-            if prefix_ordering != Ordering::Equal {
-                return prefix_ordering;
-            }
-            self.as_bytes()[PREFIX_LEN..min_len].cmp(&other.as_bytes()[PREFIX_LEN..min_len])
-        } else {
-            self.prefix[..min_len].cmp(&other.prefix[..min_len])
-        };
+        if self.is_inlined() && other.is_inlined() {
+            let suffix_ordering = u64::from_be_bytes(self.inline_suffix())
+                .cmp(&u64::from_be_bytes(other.inline_suffix()));
+            return suffix_ordering.then_with(|| self_len.cmp(&other_len));
+        }
+
+        let min_len = self_len.min(other_len);
+        if min_len <= PREFIX_LEN {
+            return self_len.cmp(&other_len);
+        }
+        let content_ordering =
+            self.as_bytes()[PREFIX_LEN..min_len].cmp(&other.as_bytes()[PREFIX_LEN..min_len]);
 
         if content_ordering == Ordering::Equal {
             self_len.cmp(&other_len)
@@ -525,16 +595,47 @@ mod tests {
 
     #[test]
     fn test_cell_roundtrip_preserves_canonical_layout() {
-        let value = view("hi");
-        let mut cell = [0xff; StringView::SIZE];
-        // SAFETY: `cell` is writable for one complete view.
-        unsafe { value.write_cell(cell.as_mut_ptr()) };
-        assert!(cell[4 + value.len()..].iter().all(|byte| *byte == 0));
+        for bytes in [b"hi".as_slice(), b"this value is out of line".as_slice()] {
+            let value = view_bytes(bytes);
+            let mut cell = [0xff; StringView::SIZE];
+            // SAFETY: `cell` is writable for one complete view.
+            unsafe { value.write_cell(cell.as_mut_ptr()) };
+            if value.is_inlined() {
+                assert!(cell[LENGTH_LEN + value.len()..]
+                    .iter()
+                    .all(|byte| *byte == 0));
+            }
 
-        // SAFETY: the cell was just initialized by `write_cell` and contains
-        // only inline bytes, so it has no external lifetime dependency.
+            // SAFETY: the cell was just initialized by `write_cell`; any
+            // pointer refers to immutable static test data.
+            let decoded = unsafe { StringView::from_cell(cell.as_ptr()) };
+            assert_eq!(decoded, value);
+            assert_eq!(decoded.as_bytes(), bytes);
+        }
+    }
+
+    #[test]
+    fn test_cell_pointer_relocation_updates_only_pointer() {
+        let original = b"this value is out of line".to_vec();
+        let relocated = original.clone();
+        assert_ne!(original.as_ptr(), relocated.as_ptr());
+        // SAFETY: `original` remains alive and immutable until all uses of the
+        // view and row cell below have completed.
+        let value = unsafe {
+            StringView::from_raw_parts(original.as_ptr(), original.len().try_into().unwrap())
+        };
+        let mut cell = [0u8; StringView::SIZE];
+        // SAFETY: the cell is writable and both vectors contain the same
+        // immutable byte sequence for the full cell lifetime.
+        unsafe {
+            value.write_cell(cell.as_mut_ptr());
+            assert_eq!(StringView::cell_len(cell.as_ptr()), original.len());
+            assert_eq!(StringView::cell_heap_ptr(cell.as_ptr()), original.as_ptr());
+            StringView::set_cell_heap_ptr(cell.as_mut_ptr(), relocated.as_ptr());
+            assert_eq!(StringView::cell_heap_ptr(cell.as_ptr()), relocated.as_ptr());
+        }
         let decoded = unsafe { StringView::from_cell(cell.as_ptr()) };
-        assert_eq!(decoded, value);
+        assert_eq!(decoded.as_bytes(), relocated);
     }
 
     #[test]
@@ -702,6 +803,10 @@ mod tests {
         const VALUES: &[&[u8]] = &[
             b"",
             b"a",
+            b"a\0",
+            b"a\0\0",
+            b"ab",
+            b"ab\0",
             b"abcd",
             b"abcd0",
             b"abcdefghijkl",
@@ -713,9 +818,16 @@ mod tests {
 
         for left in VALUES {
             for right in VALUES {
+                let left_view = view_bytes(left);
+                let right_view = view_bytes(right);
                 assert_eq!(
-                    view_bytes(left).cmp(&view_bytes(right)),
+                    left_view.cmp(&right_view),
                     left.cmp(right),
+                    "left={left:?}, right={right:?}"
+                );
+                assert_eq!(
+                    left_view == right_view,
+                    left == right,
                     "left={left:?}, right={right:?}"
                 );
             }

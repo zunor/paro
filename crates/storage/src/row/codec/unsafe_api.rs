@@ -404,7 +404,7 @@ unsafe fn write_varlen_bytes(
     } else {
         let heap_ptr = heap.store_bytes(bytes)?;
         // SAFETY: the row heap owns the initialized bytes for the row lifetime.
-        unsafe { StringView::from_raw_parts(heap_ptr, len) }
+        unsafe { StringView::from_out_of_line(bytes, heap_ptr, len) }
     };
     // SAFETY: `cell_ptr` addresses a writable StringView-sized row cell.
     unsafe { value.write_cell(cell_ptr) };

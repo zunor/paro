@@ -320,16 +320,7 @@ impl Vector {
         &mut self,
         count: usize,
     ) -> (*mut StringView, &mut ValidityMask, &mut StringHeap) {
-        debug_assert!(matches!(
-            self.logical_type,
-            LogicalType::Varchar
-                | LogicalType::VarcharCollation(_)
-                | LogicalType::TsVector
-                | LogicalType::TsQuery
-                | LogicalType::Json
-                | LogicalType::Jsonb
-                | LogicalType::Blob
-        ));
+        debug_assert!(self.logical_type.is_utf8_varlen() || self.logical_type == LogicalType::Blob);
 
         self.make_exclusive();
         self.set_len(count);

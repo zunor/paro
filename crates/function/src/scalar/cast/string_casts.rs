@@ -48,13 +48,12 @@ where
     T: std::str::FromStr + Copy + Default + 'static,
 {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            // SAFETY: this cast accepts a VARCHAR source.
-            let source = unsafe { view.str_unchecked(row) };
+            let source = view.str(row);
             match source.trim().parse::<T>() {
                 Ok(value) => {
                     unsafe { result.set_flat::<T>(row, value) };
@@ -85,13 +84,12 @@ pub fn varchar_to_uuid_cast(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            // SAFETY: this cast accepts a VARCHAR source.
-            let source = unsafe { view.str_unchecked(row) };
+            let source = view.str(row);
             match parse_uuid_str(source) {
                 Ok(value) => {
                     unsafe { result.set_flat::<u128>(row, value) };
@@ -147,13 +145,12 @@ fn varchar_to_json_like_cast(
     type_name: &str,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     let mut writer = VarcharResultWriter::new(result, count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            // SAFETY: JSON-like casts accept a VARCHAR source.
-            let source = unsafe { view.str_unchecked(row) };
+            let source = view.str(row);
             if serde_json::from_str::<JsonValue>(source).is_ok() {
                 writer.write_str(row, source)?;
             } else if ctx.try_cast {

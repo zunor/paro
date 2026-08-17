@@ -350,6 +350,9 @@ impl Vector {
 
     /// Get string value at index. Returns None if null.
     pub fn get_string(&self, idx: usize) -> Option<&str> {
+        if !self.logical_type.is_utf8_varlen() {
+            return None;
+        }
         if self.is_null(idx) {
             return None;
         }
@@ -365,7 +368,9 @@ impl Vector {
                     let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
-                inline_str.as_str().ok()
+                // SAFETY: textual vector write paths validate or accept only
+                // UTF-8, and unsafe decoders must uphold the same invariant.
+                Some(unsafe { inline_str.as_str_unchecked() })
             }
             VectorType::Dictionary => {
                 let physical_idx = self.selection().physical_index(idx);
@@ -707,6 +712,12 @@ impl Vector {
     /// For short strings (≤12 bytes), data is stored inline in StringView.
     /// For longer strings, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_string(&mut self, idx: usize, val: &str) -> Result<()> {
+        if !self.logical_type.is_utf8_varlen() {
+            return Err(paro_error::type_mismatch(format!(
+                "string write requires a textual varlen vector, got {:?}",
+                self.logical_type
+            )));
+        }
         self.try_set_varlen(idx, val.as_bytes())
     }
 
@@ -724,6 +735,12 @@ impl Vector {
     /// For short blobs (≤12 bytes), data is stored inline in StringView.
     /// For longer blobs, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_blob(&mut self, idx: usize, val: &[u8]) -> Result<()> {
+        if self.logical_type != LogicalType::Blob {
+            return Err(paro_error::type_mismatch(format!(
+                "blob write requires a BLOB vector, got {:?}",
+                self.logical_type
+            )));
+        }
         self.try_set_varlen(idx, val)
     }
 

@@ -182,8 +182,8 @@ fn execute_regexp(
     let pattern_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing pattern column".to_string()))?;
-    let text_view = text_vec.try_to_varlen_view(count)?;
-    let pattern_view = pattern_vec.try_to_varlen_view(count)?;
+    let text_view = text_vec.try_to_utf8_view(count)?;
+    let pattern_view = pattern_vec.try_to_utf8_view(count)?;
 
     result.set_count(count);
     let local_pattern = regexp_local_state(state).map(|data| &data.pattern);
@@ -193,16 +193,14 @@ fn execute_regexp(
         if !text_view.is_valid(row) || !pattern_view.is_valid(row) {
             result.set_null(row, true);
         } else {
-            // SAFETY: both inputs are bound as VARCHAR by this scalar function.
-            let text = unsafe { text_view.str_unchecked(row) };
+            let text = text_view.str(row);
             let matched = match local_pattern {
                 Some(BoundRegexp::Compiled(regex)) => regex.is_match(text),
                 Some(BoundRegexp::Invalid) => false,
                 None => {
                     let pattern = match bound_pattern {
                         Some(bind) => bind.pattern.as_str(),
-                        // SAFETY: the pattern input is bound as VARCHAR.
-                        None => unsafe { pattern_view.str_unchecked(row) },
+                        None => pattern_view.str(row),
                     };
                     match compile_regex(pattern, case_insensitive) {
                         Ok(regex) => regex.is_match(text),

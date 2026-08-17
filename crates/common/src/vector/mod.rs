@@ -44,7 +44,7 @@ pub(crate) use vector_buffer::VectorBuffer;
 pub use vector_type::VectorType;
 pub use view::{
     ArrayView, DataRef, DecodedVectorOwned, DecodedVectorRef, DecodedVectorTree, SelectionRef,
-    ValidityRef, VarlenView, VectorView,
+    Utf8View, ValidityRef, VarlenView, VectorView,
 };
 
 /// Default vector size (number of rows per vector).

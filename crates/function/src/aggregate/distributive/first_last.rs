@@ -286,15 +286,15 @@ mod first_string {
         states: &AggregateStateInput,
         count: usize,
     ) {
-        let input = inputs[0];
+        let input = inputs[0]
+            .try_to_utf8_view(count)
+            .expect("first(VARCHAR) expects textual input");
         for row in 0..count {
             let state = &mut *states.state_ptr(row).cast::<State>();
-            if !state.is_set {
-                if let Some(value) = input.get_string(row) {
-                    state.value.clear();
-                    state.value.push_str(value);
-                    state.is_set = true;
-                }
+            if !state.is_set && input.is_valid(row) {
+                state.value.clear();
+                state.value.push_str(input.str(row));
+                state.is_set = true;
             }
         }
     }
@@ -309,11 +309,13 @@ mod first_string {
         if state.is_set {
             return;
         }
-        let input = inputs[0];
+        let input = inputs[0]
+            .try_to_utf8_view(count)
+            .expect("first(VARCHAR) expects textual input");
         for row in 0..count {
-            if let Some(value) = input.get_string(row) {
+            if input.is_valid(row) {
                 state.value.clear();
-                state.value.push_str(value);
+                state.value.push_str(input.str(row));
                 state.is_set = true;
                 return;
             }

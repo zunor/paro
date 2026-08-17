@@ -107,8 +107,8 @@ impl StringHeap {
         }
 
         // SAFETY: the bytes were fully initialized above and remain owned by
-        // this arena. The caller accepts the returned view's owner contract.
-        Ok(unsafe { StringView::from_raw_parts(ptr, len) })
+        // this arena. `bytes` is the source of the identical retained prefix.
+        Ok(unsafe { StringView::from_out_of_line(bytes, ptr, len) })
     }
 
     /// Total bytes used in the heap.

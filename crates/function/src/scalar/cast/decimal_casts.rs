@@ -290,7 +290,7 @@ pub fn varchar_to_decimal_cast(
 ) -> Result<bool> {
     let (precision, scale) = decimal_params(result.logical_type())?;
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -299,8 +299,7 @@ pub fn varchar_to_decimal_cast(
             continue;
         }
 
-        // SAFETY: this cast accepts a VARCHAR source.
-        let s = unsafe { view.str_unchecked(row) };
+        let s = view.str(row);
 
         let (raw_value, raw_scale) = match parse_decimal_string(s) {
             Ok(v) => v,

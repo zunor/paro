@@ -521,7 +521,7 @@ fn compute_string_within_collection_heap_sizes(
             unsafe {
                 let string_t = &*source_data.add(source_idx);
                 let str_len = string_t.len();
-                if str_len > StringView::INLINE_CAPACITY {
+                if !string_t.is_inlined() {
                     *heap_size += str_len;
                 }
             }
@@ -678,7 +678,7 @@ fn compute_single_collection_heap_size(
                 unsafe {
                     let string_t = &*source_data.add(source_idx);
                     let str_len = string_t.len();
-                    if str_len > StringView::INLINE_CAPACITY {
+                    if !string_t.is_inlined() {
                         heap_size += str_len;
                     }
                 }
@@ -1540,7 +1540,7 @@ fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
                     heap_locations[i] = heap_ptr.add(len);
                     // SAFETY: the copied bytes are initialized in row-owned
                     // storage that outlives the target cell.
-                    StringView::from_raw_parts(heap_ptr, len as u32)
+                    StringView::from_out_of_line(bytes, heap_ptr, len as u32)
                 };
                 // SAFETY: `dst` is a writable varlen cell in this row.
                 row_value.write_cell(dst);

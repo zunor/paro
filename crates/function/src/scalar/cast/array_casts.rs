@@ -252,7 +252,7 @@ pub fn varchar_to_array_cast(
     let child_count = count
         .checked_mul(target_size)
         .ok_or_else(|| paro_error::internal("ARRAY child count overflow"))?;
-    let source_view = source.try_to_varlen_view(count)?;
+    let source_view = source.try_to_utf8_view(count)?;
     let mut parsed_child = Vector::try_new(
         LogicalType::Float,
         child_count.max(1),
@@ -273,8 +273,7 @@ pub fn varchar_to_array_cast(
             continue;
         }
 
-        // SAFETY: this parser is reached only for a VARCHAR source.
-        let s = unsafe { source_view.str_unchecked(row) };
+        let s = source_view.str(row);
 
         match parse_vector_literal(s) {
             Ok(values) => {

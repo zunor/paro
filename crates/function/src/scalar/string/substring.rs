@@ -209,7 +209,7 @@ fn substring_2_varchar(
     let start_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing start column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let start_view = start_vec.try_to_view(count)?;
     let bound_start = substring_bind_data(state).and_then(|data| data.start);
     let mut writer = VarcharResultWriter::new(result, count);
@@ -220,8 +220,7 @@ fn substring_2_varchar(
             continue;
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
-        // SAFETY: the input is bound as VARCHAR.
-        let value = unsafe { str_view.str_unchecked(row) };
+        let value = str_view.str(row);
         let sub = substring_unicode(value, start, None);
         writer.write_str(row, sub)?;
     }
@@ -245,7 +244,7 @@ fn substring_3_varchar(
     let len_vec = input
         .column(2)
         .ok_or_else(|| paro_common::error::internal("Missing length column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let start_view = start_vec.try_to_view(count)?;
     let len_view = len_vec.try_to_view(count)?;
     let bind_data = substring_bind_data(state);
@@ -260,8 +259,7 @@ fn substring_3_varchar(
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
         let length = bound_length.unwrap_or_else(|| len_view.get_i64(row));
-        // SAFETY: the input is bound as VARCHAR.
-        let value = unsafe { str_view.str_unchecked(row) };
+        let value = str_view.str(row);
         let sub = substring_unicode(value, start, Some(length));
         writer.write_str(row, sub)?;
     }
@@ -278,7 +276,7 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
     let mut writer = VarcharResultWriter::new(result, count);
@@ -288,8 +286,7 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
             writer.set_null(row);
             continue;
         }
-        // SAFETY: the input is bound as VARCHAR.
-        let value = unsafe { str_view.str_unchecked(row) };
+        let value = str_view.str(row);
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
         let sub = if n >= 0 {
             value.chars().take(n as usize).collect::<String>()
@@ -313,7 +310,7 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
     let mut writer = VarcharResultWriter::new(result, count);
@@ -323,8 +320,7 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
             writer.set_null(row);
             continue;
         }
-        // SAFETY: the input is bound as VARCHAR.
-        let value = unsafe { str_view.str_unchecked(row) };
+        let value = str_view.str(row);
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
 
         let chars: Vec<char> = value.chars().collect();

@@ -111,13 +111,12 @@ pub fn varchar_to_bool(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            // SAFETY: this cast accepts a VARCHAR source.
-            let source = unsafe { view.str_unchecked(row) };
+            let source = view.str(row);
             if let Some(value) = parse_bool_literal(source) {
                 result.set_bool(row, value);
             } else if ctx.try_cast {

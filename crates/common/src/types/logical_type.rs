@@ -677,6 +677,21 @@ impl LogicalType {
         )
     }
 
+    /// Returns true when the physical varlen bytes are guaranteed to be UTF-8.
+    #[inline]
+    pub fn is_utf8_varlen(&self) -> bool {
+        matches!(
+            self,
+            LogicalType::Varchar
+                | LogicalType::VarcharCollation(_)
+                | LogicalType::TsVector
+                | LogicalType::TsQuery
+                | LogicalType::Json
+                | LogicalType::Jsonb
+                | LogicalType::StringLiteral
+        )
+    }
+
     /// Serialize the logical type to a writer
     pub fn serialize<W: Write>(&self, w: &mut W) -> Result<()> {
         self.write_to(w)
@@ -1083,6 +1098,23 @@ mod tests {
             LogicalType::Struct(vec![("a".to_string(), LogicalType::Integer)]).physical_type(),
             PhysicalType::Struct
         );
+    }
+
+    #[test]
+    fn utf8_varlen_classification_excludes_binary_storage() {
+        for logical_type in [
+            LogicalType::Varchar,
+            LogicalType::VarcharCollation("C".to_string()),
+            LogicalType::TsVector,
+            LogicalType::TsQuery,
+            LogicalType::Json,
+            LogicalType::Jsonb,
+            LogicalType::StringLiteral,
+        ] {
+            assert!(logical_type.is_utf8_varlen(), "{logical_type:?}");
+        }
+        assert!(!LogicalType::Blob.is_utf8_varlen());
+        assert!(!LogicalType::Integer.is_utf8_varlen());
     }
 
     #[test]
