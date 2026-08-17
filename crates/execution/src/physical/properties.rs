@@ -178,6 +178,19 @@ impl Placement {
             (Self::Local, Self::Local) => Self::Local,
         }
     }
+
+    /// Whether this placement is no more restrictive than `baseline`.
+    /// `Local` can run wherever the scheduler chooses, while single-task and
+    /// partitioned placements carry constraints that only dominate the same
+    /// constraint class.
+    pub fn dominates(self, baseline: Self) -> bool {
+        match (self, baseline) {
+            (Self::Local, _) => true,
+            (Self::SingleTask, Self::SingleTask) => true,
+            (Self::Partitioned(left), Self::Partitioned(right)) => left.is_compatible_with(right),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -229,7 +242,6 @@ pub enum NullOrdering {
 pub enum PartitioningProperty {
     None,
     BatchIndex,
-    Columns(Vec<ColumnId>),
     Morsel(MorselPartitioning),
 }
 
@@ -238,8 +250,6 @@ pub enum PartitioningRequirement {
     Any,
     SingleTask,
     BatchIndex,
-    Columns(Vec<ColumnId>),
-    CompatibleWith(MorselPartitioning),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -391,6 +401,12 @@ impl PropertyRepair {
     pub fn is_empty(&self) -> bool {
         self.repairs.is_empty()
     }
+
+    fn push(&mut self, repair: PropertyRepairKind) {
+        if !self.repairs.contains(&repair) {
+            self.repairs.push(repair);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -398,7 +414,6 @@ pub enum PropertyRepairKind {
     Sort(OrderingSpec),
     BatchIndexAdapter,
     SingleTaskFallback,
-    MaterializationAdapter,
 }
 
 pub struct PhysicalPropertySolver;
@@ -418,15 +433,13 @@ impl PhysicalPropertySolver {
                     provided.ordering,
                     OrderingProperty::Unordered | OrderingProperty::Any
                 ) {
-                    repair
-                        .repairs
-                        .push(PropertyRepairKind::MaterializationAdapter);
+                    repair.push(PropertyRepairKind::SingleTaskFallback);
                 }
             }
             OrderingRequirement::Fixed(spec) => {
                 if !matches!(&provided.ordering, OrderingProperty::Fixed(existing) if existing == spec)
                 {
-                    repair.repairs.push(PropertyRepairKind::Sort(spec.clone()));
+                    repair.push(PropertyRepairKind::Sort(spec.clone()));
                 }
             }
         }
@@ -435,28 +448,12 @@ impl PhysicalPropertySolver {
             PartitioningRequirement::Any => {}
             PartitioningRequirement::SingleTask => {
                 if capabilities.parallelism.max != 1 {
-                    repair.repairs.push(PropertyRepairKind::SingleTaskFallback);
+                    repair.push(PropertyRepairKind::SingleTaskFallback);
                 }
             }
             PartitioningRequirement::BatchIndex => {
                 if !matches!(provided.partitioning, PartitioningProperty::BatchIndex) {
-                    repair.repairs.push(PropertyRepairKind::BatchIndexAdapter);
-                }
-            }
-            PartitioningRequirement::Columns(columns) => {
-                if !matches!(&provided.partitioning, PartitioningProperty::Columns(existing) if existing == columns)
-                {
-                    repair
-                        .repairs
-                        .push(PropertyRepairKind::MaterializationAdapter);
-                }
-            }
-            PartitioningRequirement::CompatibleWith(partitioning) => {
-                if !matches!(&provided.partitioning, PartitioningProperty::Morsel(existing) if existing == partitioning)
-                {
-                    repair
-                        .repairs
-                        .push(PropertyRepairKind::MaterializationAdapter);
+                    repair.push(PropertyRepairKind::BatchIndexAdapter);
                 }
             }
         }
@@ -467,7 +464,7 @@ impl PhysicalPropertySolver {
                 .repairs
                 .contains(&PropertyRepairKind::BatchIndexAdapter)
         {
-            repair.repairs.push(PropertyRepairKind::BatchIndexAdapter);
+            repair.push(PropertyRepairKind::BatchIndexAdapter);
         }
 
         repair
@@ -505,5 +502,35 @@ mod tests {
             Placement::Partitioned(left).merge(Placement::SingleTask),
             Placement::SingleTask
         );
+    }
+
+    #[test]
+    fn placement_domination_compares_actual_scheduler_constraints() {
+        let partitioning = MorselPartitioning::rowset_segments();
+        assert!(Placement::Local.dominates(Placement::SingleTask));
+        assert!(Placement::Local.dominates(Placement::Partitioned(partitioning)));
+        assert!(
+            Placement::Partitioned(partitioning).dominates(Placement::Partitioned(partitioning))
+        );
+        assert!(!Placement::SingleTask.dominates(Placement::Local));
+        assert!(!Placement::Partitioned(partitioning).dominates(Placement::Local));
+    }
+
+    #[test]
+    fn preserve_input_repairs_parallel_interleaving_with_one_reader() {
+        let required = RequiredProperties {
+            ordering: OrderingRequirement::PreserveInput,
+            ..Default::default()
+        };
+        let provided = ProvidedProperties {
+            ordering: OrderingProperty::Unordered,
+            ..Default::default()
+        };
+        let repair = PhysicalPropertySolver::reconcile(
+            &required,
+            &provided,
+            &ExecutionCapabilities::default(),
+        );
+        assert_eq!(repair.repairs, vec![PropertyRepairKind::SingleTaskFallback]);
     }
 }

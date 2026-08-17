@@ -47,7 +47,8 @@ use super::graph::{
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
 use super::properties::{
-    repair_transform, source_supports_parallel_probe_fusion, PipelinePropertyAccumulator,
+    emit_source_supports_parallel_probe_fusion, repair_transform, EmitSourceKind,
+    PipelinePropertyAccumulator,
 };
 
 pub struct PipelineLowerer<'a> {

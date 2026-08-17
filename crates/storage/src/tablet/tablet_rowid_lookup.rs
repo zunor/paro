@@ -5,7 +5,7 @@ use super::tablet_reader::TabletReader;
 use super::tablet_runtime::TabletRef;
 use super::tablet_schema::TabletSchemaRef;
 use crate::rowid_resolver;
-use crate::rowset::RowsetSharedPtr;
+use crate::rowset::{RowsetSharedPtr, SegmentRowId};
 use crate::tablet::ColumnId;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
@@ -282,7 +282,7 @@ fn try_get_single_segment_by_rowids(
         };
         sorted_to_unique.push(unique_index);
     }
-    let batches = segment.read_by_rowids(column_ids, &row_offsets)?;
+    let batches = segment.read_by_rowids(column_ids, SegmentRowId::as_raw_slice(&row_offsets))?;
     let mut sorted_to_original = vec![0u32; locations.len()];
     for (sorted_index, (_, original_index)) in locations.iter().enumerate() {
         sorted_to_original[*original_index] = u32::try_from(sorted_to_unique[sorted_index])

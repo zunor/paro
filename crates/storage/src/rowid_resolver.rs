@@ -64,7 +64,7 @@ where
         entries.push((
             location.rowset_id,
             location.segment_id,
-            location.row_offset,
+            location.row_offset.get(),
             idx,
         ));
     }

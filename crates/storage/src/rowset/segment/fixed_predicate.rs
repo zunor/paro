@@ -398,7 +398,7 @@ impl FixedComparisonValues {
     }
 }
 
-trait SimdInteger: FixedPhysical {
+trait BoundedInteger: FixedPhysical {
     const MIN: Self;
     const MAX: Self;
 
@@ -406,7 +406,7 @@ trait SimdInteger: FixedPhysical {
     fn checked_decrement(self) -> Option<Self>;
 }
 
-impl SimdInteger for i32 {
+impl BoundedInteger for i32 {
     const MIN: Self = i32::MIN;
     const MAX: Self = i32::MAX;
 
@@ -419,7 +419,7 @@ impl SimdInteger for i32 {
     }
 }
 
-impl SimdInteger for i64 {
+impl BoundedInteger for i64 {
     const MIN: Self = i64::MIN;
     const MAX: Self = i64::MAX;
 
@@ -432,26 +432,71 @@ impl SimdInteger for i64 {
     }
 }
 
+impl BoundedInteger for i128 {
+    const MIN: Self = i128::MIN;
+    const MAX: Self = i128::MAX;
+
+    fn checked_increment(self) -> Option<Self> {
+        self.checked_add(1)
+    }
+
+    fn checked_decrement(self) -> Option<Self> {
+        self.checked_sub(1)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InclusiveBounds<T> {
+    Empty,
+    All,
+    Lower(T),
+    Upper(T),
+    Between(T, T),
+}
+
+impl<T: BoundedInteger> InclusiveBounds<T> {
+    fn closed_range(self) -> Option<(T, T)> {
+        match self {
+            Self::Empty => None,
+            Self::All => Some((T::MIN, T::MAX)),
+            Self::Lower(lower) => Some((lower, T::MAX)),
+            Self::Upper(upper) => Some((T::MIN, upper)),
+            Self::Between(lower, upper) => Some((lower, upper)),
+        }
+    }
+}
+
 /// Normalize every open/closed, one/two-sided integer range to one inclusive
-/// shape. Width-specific SIMD code therefore implements only lane loading and
-/// comparison; adding a bound shape cannot create an architecture/type hole.
-fn inclusive_simd_bounds<T: SimdInteger>(kernel: &FixedConjunction<T>) -> Option<Option<(T, T)>> {
+/// shape. Scalar and width-specific SIMD code therefore share one boundary
+/// definition; adding a bound shape cannot create an execution-path hole.
+fn inclusive_bounds<T: BoundedInteger>(kernel: &FixedConjunction<T>) -> Option<InclusiveBounds<T>> {
     match kernel.execution_shape() {
         FixedKernelShape::Bounds { lower, upper } => {
             let lower = match lower {
-                None => Some(T::MIN),
+                None => None,
                 Some(lower) if lower.inclusive => Some(lower.value),
-                Some(lower) => lower.value.checked_increment(),
+                Some(lower) => match lower.value.checked_increment() {
+                    Some(lower) => Some(lower),
+                    None => return Some(InclusiveBounds::Empty),
+                },
             };
             let upper = match upper {
-                None => Some(T::MAX),
+                None => None,
                 Some(upper) if upper.inclusive => Some(upper.value),
-                Some(upper) => upper.value.checked_decrement(),
+                Some(upper) => match upper.value.checked_decrement() {
+                    Some(upper) => Some(upper),
+                    None => return Some(InclusiveBounds::Empty),
+                },
             };
-            let (Some(lower), Some(upper)) = (lower, upper) else {
-                return Some(None);
-            };
-            Some((lower <= upper).then_some((lower, upper)))
+            Some(match (lower, upper) {
+                (None, None) => InclusiveBounds::All,
+                (Some(lower), None) => InclusiveBounds::Lower(lower),
+                (None, Some(upper)) => InclusiveBounds::Upper(upper),
+                (Some(lower), Some(upper)) if lower <= upper => {
+                    InclusiveBounds::Between(lower, upper)
+                }
+                (Some(_), Some(_)) => InclusiveBounds::Empty,
+            })
         }
         _ => None,
     }
@@ -470,10 +515,10 @@ fn try_filter_seed_i64_batch(
     if !seed || batch.nulls.is_some() {
         return false;
     }
-    let Some(bounds) = inclusive_simd_bounds(kernel) else {
+    let Some(bounds) = inclusive_bounds(kernel) else {
         return false;
     };
-    let Some((lower, upper)) = bounds else {
+    let Some((lower, upper)) = bounds.closed_range() else {
         selection.clear();
         return true;
     };
@@ -586,7 +631,7 @@ static AVX2_COMPACTION_TABLE: [[i32; 8]; 256] = avx2_compaction_table();
 /// the lanes selected by `matched_mask`.
 #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
 #[target_feature(enable = "avx2")]
-#[inline]
+#[inline(always)]
 unsafe fn compact_ordinals_avx2(
     matched_mask: u32,
     ordinals: core::arch::x86_64::__m256i,
@@ -734,10 +779,10 @@ fn try_filter_seed_i32_batch(
         return false;
     }
 
-    let Some(bounds) = inclusive_simd_bounds(kernel) else {
+    let Some(bounds) = inclusive_bounds(kernel) else {
         return false;
     };
-    let Some((lower, upper)) = bounds else {
+    let Some((lower, upper)) = bounds.closed_range() else {
         selection.clear();
         return true;
     };
@@ -882,7 +927,7 @@ unsafe fn filter_i32_range_inclusive_avx2(
     true
 }
 
-fn filter_fixed_batch<T: FixedPhysical>(
+fn filter_fixed_batch<T: BoundedInteger>(
     batch: &PredicateColumnBatch,
     kernel: &FixedConjunction<T>,
     rows: usize,
@@ -952,7 +997,7 @@ fn dispatch_fixed_kernel<T, L, V>(
     load: L,
     valid: V,
 ) where
-    T: FixedPhysical,
+    T: BoundedInteger,
     L: Fn(usize) -> T + Copy,
     V: Fn(usize) -> bool + Copy,
 {
@@ -985,38 +1030,23 @@ fn dispatch_fixed_kernel<T, L, V>(
                 kernel.matches(value)
             });
         }
-        FixedKernelShape::Bounds { lower, upper } => match (lower, upper) {
-            (None, None) => filter_selection(rows, selection, seed, load, valid, |_| true),
-            (Some(lower), None) if lower.inclusive => {
-                filter_selection(rows, selection, seed, load, valid, |value| {
-                    value >= lower.value
-                })
+        FixedKernelShape::Bounds { .. } => match inclusive_bounds(kernel) {
+            Some(InclusiveBounds::Empty) => selection.clear(),
+            Some(InclusiveBounds::All) => {
+                filter_selection(rows, selection, seed, load, valid, |_| true);
             }
-            (Some(lower), None) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value > lower.value
-            }),
-            (None, Some(upper)) if upper.inclusive => {
-                filter_selection(rows, selection, seed, load, valid, |value| {
-                    value <= upper.value
-                })
+            Some(InclusiveBounds::Lower(lower)) => {
+                filter_selection(rows, selection, seed, load, valid, |value| value >= lower);
             }
-            (None, Some(upper)) => filter_selection(rows, selection, seed, load, valid, |value| {
-                value < upper.value
-            }),
-            (Some(lower), Some(upper)) => match (lower.inclusive, upper.inclusive) {
-                (true, true) => filter_selection(rows, selection, seed, load, valid, |value| {
-                    value >= lower.value && value <= upper.value
-                }),
-                (true, false) => filter_selection(rows, selection, seed, load, valid, |value| {
-                    value >= lower.value && value < upper.value
-                }),
-                (false, true) => filter_selection(rows, selection, seed, load, valid, |value| {
-                    value > lower.value && value <= upper.value
-                }),
-                (false, false) => filter_selection(rows, selection, seed, load, valid, |value| {
-                    value > lower.value && value < upper.value
-                }),
-            },
+            Some(InclusiveBounds::Upper(upper)) => {
+                filter_selection(rows, selection, seed, load, valid, |value| value <= upper);
+            }
+            Some(InclusiveBounds::Between(lower, upper)) => {
+                filter_selection(rows, selection, seed, load, valid, |value| {
+                    value >= lower && value <= upper
+                });
+            }
+            None => unreachable!("bounds execution shape must normalize as bounds"),
         },
     }
 }
@@ -1066,6 +1096,31 @@ fn filter_selection<T, L, V, P>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_i128_bounds_share_inclusive_normalization() {
+        let mut kernel = FixedConjunction::new(ComparisonOperator::GreaterThan, 0_i128);
+        kernel.add(ComparisonOperator::LessThan, 4);
+        assert_eq!(
+            inclusive_bounds(&kernel),
+            Some(InclusiveBounds::Between(1, 3))
+        );
+
+        let values = [-1_i128, 0, 1, 2, 3, 4];
+        let mut selection = Vec::new();
+        dispatch_fixed_kernel(
+            &kernel,
+            values.len(),
+            &mut selection,
+            true,
+            |row| values[row],
+            |_| true,
+        );
+        assert_eq!(selection, [2, 3, 4]);
+
+        let impossible = FixedConjunction::new(ComparisonOperator::GreaterThan, i128::MAX);
+        assert_eq!(inclusive_bounds(&impossible), Some(InclusiveBounds::Empty));
+    }
 
     #[test]
     fn simd_compaction_matches_scalar_for_partial_and_full_vectors() {

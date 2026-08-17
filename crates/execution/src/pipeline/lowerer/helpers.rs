@@ -161,17 +161,45 @@ pub(crate) fn aggregate_emit_source_spec(
     handle: BreakerHandleId,
     spec: AggregateSpec,
 ) -> SourceSpec {
+    match aggregate_emit_kind(&spec) {
+        AggregateEmitKind::Ungrouped => {
+            SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec { handle, spec })
+        }
+        AggregateEmitKind::PerfectHash => {
+            SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
+                handle,
+                spec,
+            })
+        }
+        AggregateEmitKind::Hash => {
+            SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec { handle, spec })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateEmitKind {
+    Hash,
+    Ungrouped,
+    PerfectHash,
+}
+
+impl AggregateEmitKind {
+    pub(crate) fn source_kind(self) -> EmitSourceKind {
+        match self {
+            Self::Hash => EmitSourceKind::HashAggregate,
+            Self::Ungrouped => EmitSourceKind::UngroupedAggregate,
+            Self::PerfectHash => EmitSourceKind::PerfectHashAggregate,
+        }
+    }
+}
+
+pub(crate) fn aggregate_emit_kind(spec: &AggregateSpec) -> AggregateEmitKind {
     if spec.grouping_key_count == 0 {
-        return SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
-            handle,
-            spec,
-        });
+        AggregateEmitKind::Ungrouped
+    } else if spec.perfect_hash.is_some() {
+        AggregateEmitKind::PerfectHash
+    } else {
+        AggregateEmitKind::Hash
     }
-    if spec.perfect_hash.is_some() {
-        return SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
-            handle,
-            spec,
-        });
-    }
-    SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec { handle, spec })
 }

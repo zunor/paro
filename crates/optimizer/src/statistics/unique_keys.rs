@@ -19,7 +19,6 @@ use paro_planner::operator::{ColumnBinding, Get, JoinComparisonType, JoinConditi
 #[derive(Debug, Clone)]
 pub(crate) struct NullRejectedKeyProof {
     conditions: Box<[JoinCondition]>,
-    bindings: Box<[ColumnBinding]>,
 }
 
 impl NullRejectedKeyProof {
@@ -31,21 +30,24 @@ impl NullRejectedKeyProof {
         {
             return None;
         }
-        let bindings = conditions
+        conditions
             .iter()
-            .map(|condition| match &condition.right {
-                Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding),
+            .try_for_each(|condition| match &condition.right {
+                Expression::ColumnRef(column) if column.depth == 0 => Some(()),
                 _ => None,
-            })
-            .collect::<Option<Box<[_]>>>()?;
+            })?;
         Some(Self {
             conditions: conditions.into(),
-            bindings,
         })
     }
 
-    pub(crate) fn bindings(&self) -> &[ColumnBinding] {
-        &self.bindings
+    pub(crate) fn bindings(&self) -> impl Iterator<Item = ColumnBinding> + '_ {
+        self.conditions.iter().map(|condition| {
+            let Expression::ColumnRef(column) = &condition.right else {
+                unreachable!("NULL-rejection proof validates every right key")
+            };
+            column.binding
+        })
     }
 
     /// Return the exact ordinary-equality conditions from which this proof
@@ -63,10 +65,10 @@ pub(crate) struct DeclaredUniqueKey {
 }
 
 impl DeclaredUniqueKey {
-    pub(crate) fn is_covered_by(&self, candidates: &[ColumnBinding]) -> bool {
+    pub(crate) fn is_unique_with_nulls_rejected(&self, proof: &NullRejectedKeyProof) -> bool {
         self.bindings
             .iter()
-            .all(|binding| candidates.contains(binding))
+            .all(|binding| proof.bindings().any(|candidate| candidate == *binding))
     }
 
     /// Whether the declared key remains unique when NULL tuples compare equal,
@@ -148,5 +150,22 @@ mod tests {
             JoinComparisonType::NotDistinctFrom,
         );
         assert!(NullRejectedKeyProof::from_equal_right_keys(&[null_safe]).is_none());
+    }
+
+    #[test]
+    fn nullable_unique_key_requires_its_typed_null_rejection_proof() {
+        let key = DeclaredUniqueKey {
+            bindings: vec![ColumnBinding::new(2, 0), ColumnBinding::new(2, 1)],
+            primary_key: false,
+        };
+        let conditions = [
+            JoinCondition::new(column(1, 0), column(2, 0), JoinComparisonType::Equal),
+            JoinCondition::new(column(1, 1), column(2, 1), JoinComparisonType::Equal),
+        ];
+        let complete = NullRejectedKeyProof::from_equal_right_keys(&conditions).unwrap();
+        assert!(key.is_unique_with_nulls_rejected(&complete));
+
+        let incomplete = NullRejectedKeyProof::from_equal_right_keys(&conditions[..1]).unwrap();
+        assert!(!key.is_unique_with_nulls_rejected(&incomplete));
     }
 }

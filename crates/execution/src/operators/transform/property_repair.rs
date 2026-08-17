@@ -20,7 +20,7 @@ impl PropertyRepairTransformExec {
             PropertyRepairKind::BatchIndexAdapter | PropertyRepairKind::SingleTaskFallback => {
                 Ok(Self { kind })
             }
-            PropertyRepairKind::Sort(_) | PropertyRepairKind::MaterializationAdapter => {
+            PropertyRepairKind::Sort(_) => {
                 Err(paro_error::internal(
                     "blocking property repair must be lowered into breaker pipelines before program build",
                 ))
@@ -54,11 +54,9 @@ impl PropertyRepairTransformExec {
                 output.reference(input);
                 Ok(TransformPoll::Output)
             }
-            PropertyRepairKind::Sort(_) | PropertyRepairKind::MaterializationAdapter => {
-                Err(paro_error::internal(
-                    "blocking property repair must be lowered into breaker pipelines before runtime",
-                ))
-            }
+            PropertyRepairKind::Sort(_) => Err(paro_error::internal(
+                "blocking property repair must be lowered into breaker pipelines before runtime",
+            )),
         }
     }
 

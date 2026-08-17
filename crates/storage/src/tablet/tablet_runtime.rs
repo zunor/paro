@@ -34,7 +34,9 @@ use crate::primary_key::{
     PERSISTENT_INDEX_FORMAT_VERSION,
 };
 use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
-use crate::rowset::{Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentsOverlap};
+use crate::rowset::{
+    Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
+};
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
@@ -71,11 +73,11 @@ pub struct TabletIdentity {
 pub struct PhysicalRowRef {
     pub rowset_id: u64,
     pub segment_id: u32,
-    pub row_offset: u32,
+    pub row_offset: SegmentRowId,
 }
 
 impl PhysicalRowRef {
-    pub const fn new(rowset_id: u64, segment_id: u32, row_offset: u32) -> Self {
+    pub const fn new(rowset_id: u64, segment_id: u32, row_offset: SegmentRowId) -> Self {
         Self {
             rowset_id,
             segment_id,
@@ -88,13 +90,13 @@ impl PhysicalRowRef {
     }
 }
 
-impl From<(u64, u32, u32)> for PhysicalRowRef {
-    fn from(value: (u64, u32, u32)) -> Self {
+impl From<(u64, u32, SegmentRowId)> for PhysicalRowRef {
+    fn from(value: (u64, u32, SegmentRowId)) -> Self {
         Self::new(value.0, value.1, value.2)
     }
 }
 
-impl From<PhysicalRowRef> for (u64, u32, u32) {
+impl From<PhysicalRowRef> for (u64, u32, SegmentRowId) {
     fn from(value: PhysicalRowRef) -> Self {
         (value.rowset_id, value.segment_id, value.row_offset)
     }
@@ -1078,7 +1080,7 @@ impl Tablet {
                     self.tablet_id(),
                     location.rowset_id,
                     location.segment_id,
-                    location.row_offset,
+                    location.row_offset.get(),
                 ),
                 LockMode::X,
             )
@@ -1896,11 +1898,12 @@ impl Tablet {
         locations: &[(u64, u32, u32)],
         delete_version: i64,
     ) -> Result<()> {
-        let physical_locations: Vec<_> = locations
+        let physical_locations = locations
             .iter()
-            .copied()
-            .map(PhysicalRowRef::from)
-            .collect();
+            .map(|&(rowset_id, segment_id, row_offset)| {
+                PhysicalRowRef::new(rowset_id, segment_id, SegmentRowId::from_raw(row_offset))
+            })
+            .collect::<Vec<_>>();
         self.apply_row_id_delete_refs_internal(&physical_locations, delete_version, true, true)
     }
 
@@ -1978,7 +1981,7 @@ impl Tablet {
             )?;
             match pending.entry(key) {
                 std::collections::hash_map::Entry::Occupied(mut o) => {
-                    if o.get().is_deleted(location.row_offset) {
+                    if o.get().is_deleted(location.row_offset.get()) {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -1990,11 +1993,11 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    o.get_mut().mark_deleted(location.row_offset);
+                    o.get_mut().mark_deleted(location.row_offset.get());
                 }
                 std::collections::hash_map::Entry::Vacant(v) => {
                     let mut dv = DeleteVector::with_version(version);
-                    if dv.is_deleted(location.row_offset) {
+                    if dv.is_deleted(location.row_offset.get()) {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -2006,10 +2009,9 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    if existing
-                        .as_ref()
-                        .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset))
-                    {
+                    if existing.as_ref().is_some_and(|delete_vector| {
+                        delete_vector.is_deleted(location.row_offset.get())
+                    }) {
                         if ignore_already_deleted {
                             continue;
                         }
@@ -2021,7 +2023,7 @@ impl Tablet {
                             location.row_offset
                         )));
                     }
-                    dv.mark_deleted(location.row_offset);
+                    dv.mark_deleted(location.row_offset.get());
                     v.insert(dv);
                 }
             }
@@ -2170,7 +2172,7 @@ impl Tablet {
                 out.push(PhysicalRowRef::new(
                     rowset.rowset_id(),
                     seg.segment_id(),
-                    row_id,
+                    SegmentRowId::from_raw(row_id),
                 ));
             }
         }
@@ -3017,7 +3019,7 @@ impl Tablet {
                     location.rowset_id, location.segment_id
                 ))
             })?;
-        Ok(RowID::new(rssid, location.row_offset))
+        Ok(RowID::new(rssid, location.row_offset.get()))
     }
 
     pub fn decode_row_id(&self, row_id: RowID) -> Result<PhysicalRowRef> {
@@ -3034,7 +3036,7 @@ impl Tablet {
         Ok(PhysicalRowRef::new(
             rowset_id,
             segment_id,
-            row_id.row_offset(),
+            SegmentRowId::from_raw(row_id.row_offset()),
         ))
     }
 

@@ -425,7 +425,7 @@ fn blocking_property_repair_lowers_to_breaker_pipeline() {
             !matches!(
                 transform,
                 TransformSpec::PropertyRepair(crate::pipeline::graph::PropertyRepairSpec {
-                    kind: PropertyRepairKind::Sort(_) | PropertyRepairKind::MaterializationAdapter
+                    kind: PropertyRepairKind::Sort(_)
                 })
             )
         })

@@ -794,7 +794,7 @@ impl Transaction {
                     .pending_delete_vectors
                     .entry(location.segment_key())
                     .or_insert_with(crate::primary_key::DeleteVector::new)
-                    .mark_deleted(location.row_offset);
+                    .mark_deleted(location.row_offset.get());
             }
         }
         Ok(())
@@ -841,7 +841,7 @@ impl Transaction {
             let deleted = primary_update
                 .pending_delete_vectors
                 .get(&location.segment_key())
-                .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset));
+                .is_some_and(|delete_vector| delete_vector.is_deleted(location.row_offset.get()));
             if !deleted {
                 return Ok(false);
             }
@@ -967,7 +967,7 @@ impl Transaction {
             by_segment
                 .entry(location.segment_key())
                 .or_default()
-                .push(location.row_offset);
+                .push(location.row_offset.get());
         }
 
         let mut by_rowset: BTreeMap<u64, Vec<DeletePatchSegment>> = BTreeMap::new();
@@ -1067,7 +1067,16 @@ impl Transaction {
             let tablet_id = pending.tablet.tablet_id();
             data_ops.push(PreparedDataOp::RowIdDelete {
                 tablet_id,
-                locations: locations.iter().copied().map(Into::into).collect(),
+                locations: locations
+                    .iter()
+                    .map(|location| {
+                        (
+                            location.rowset_id,
+                            location.segment_id,
+                            location.row_offset.get(),
+                        )
+                    })
+                    .collect(),
             });
             if !locations.is_empty() {
                 Self::push_storage_mutation(

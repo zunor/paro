@@ -128,13 +128,16 @@ impl PipelinePropertyAccumulator {
             PropertyRepairKind::SingleTaskFallback => {
                 self.capabilities.parallelism = Parallelism::single();
                 self.placement = self.placement.merge(Placement::SingleTask);
-            }
-            PropertyRepairKind::MaterializationAdapter => {
-                // Parallel readers dynamically claim materialized batches.
-                // They preserve row contents, not a global consumption order.
-                self.current.ordering = OrderingProperty::Unordered;
+                if matches!(
+                    self.current.ordering,
+                    OrderingProperty::Any | OrderingProperty::Unordered
+                ) {
+                    // A single reader observes one stable source sequence. It
+                    // does not manufacture a fixed sort order, but it does
+                    // remove parallel batch interleaving.
+                    self.current.ordering = OrderingProperty::Preserved;
+                }
                 self.current.partitioning = PartitioningProperty::None;
-                self.memory.class = self.memory.class.max(MemoryClass::Blocking);
             }
         }
     }
@@ -148,6 +151,66 @@ struct SourceProperties {
     placement: Placement,
 }
 
+impl SourceProperties {
+    fn validated(self) -> Self {
+        debug_assert!(
+            self.capabilities.parallelism.max == 1
+                || !matches!(self.provided.ordering, OrderingProperty::Preserved),
+            "a multi-task source cannot preserve one global consumption order"
+        );
+        debug_assert!(
+            !matches!(self.provided.ordering, OrderingProperty::Unordered)
+                || !self.capabilities.preserves_order,
+            "an unordered source cannot advertise order-preserving execution"
+        );
+        self
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitSourceKind {
+    HashAggregate,
+    UngroupedAggregate,
+    PerfectHashAggregate,
+    TopN,
+    Sort,
+    Window,
+    PartitionAggregateWindow,
+    SetOperation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceScheduling {
+    SingleTask,
+    ParallelLocal,
+    ParallelPartitioned(MorselPartitioning),
+}
+
+impl SourceScheduling {
+    fn apply(self, properties: &mut SourceProperties) {
+        match self {
+            Self::SingleTask => {
+                properties.provided.ordering = OrderingProperty::Preserved;
+                properties.capabilities.parallelism = Parallelism::single();
+                properties.capabilities.preserves_order = true;
+                properties.placement = Placement::SingleTask;
+            }
+            Self::ParallelLocal => {
+                properties.provided.ordering = OrderingProperty::Unordered;
+                properties.capabilities.parallelism = Parallelism::unbounded();
+                properties.capabilities.preserves_order = false;
+                properties.placement = Placement::Local;
+            }
+            Self::ParallelPartitioned(partitioning) => {
+                properties.provided.ordering = OrderingProperty::Unordered;
+                properties.capabilities.parallelism = Parallelism::unbounded();
+                properties.capabilities.preserves_order = false;
+                properties.placement = Placement::Partitioned(partitioning);
+            }
+        }
+    }
+}
+
 fn default_source_properties() -> SourceProperties {
     SourceProperties {
         provided: ProvidedProperties::default(),
@@ -159,24 +222,40 @@ fn default_source_properties() -> SourceProperties {
 
 fn materialized_source_properties() -> SourceProperties {
     let mut properties = default_source_properties();
-    properties.provided.ordering = OrderingProperty::Unordered;
-    properties.capabilities.parallelism = Parallelism::unbounded();
+    SourceScheduling::ParallelLocal.apply(&mut properties);
     properties.memory.class = MemoryClass::Blocking;
-    properties
+    properties.validated()
+}
+
+fn emit_source_scheduling(kind: EmitSourceKind) -> SourceScheduling {
+    match kind {
+        EmitSourceKind::HashAggregate
+        | EmitSourceKind::UngroupedAggregate
+        | EmitSourceKind::PerfectHashAggregate
+        | EmitSourceKind::PartitionAggregateWindow => SourceScheduling::ParallelLocal,
+        EmitSourceKind::TopN
+        | EmitSourceKind::Sort
+        | EmitSourceKind::Window
+        | EmitSourceKind::SetOperation => SourceScheduling::SingleTask,
+    }
+}
+
+fn scheduling_properties(scheduling: SourceScheduling) -> SourceProperties {
+    let mut properties = default_source_properties();
+    scheduling.apply(&mut properties);
+    properties.validated()
 }
 
 fn source_properties(source: &SourceSpec) -> SourceProperties {
     let mut properties = default_source_properties();
 
-    match source {
+    let scheduling = match source {
         SourceSpec::Rowset(_) => {
-            properties.provided.partitioning =
-                PartitioningProperty::Morsel(MorselPartitioning::rowset_segments());
-            properties.provided.ordering = OrderingProperty::Any;
+            let partitioning = MorselPartitioning::rowset_segments();
+            properties.provided.partitioning = PartitioningProperty::Morsel(partitioning);
             properties.capabilities.morsel = MorselCapability::Source;
-            properties.capabilities.parallelism = Parallelism::unbounded();
             properties.capabilities.supports_late_materialization = true;
-            properties.placement = Placement::Partitioned(MorselPartitioning::rowset_segments());
+            SourceScheduling::ParallelPartitioned(partitioning)
         }
         SourceSpec::Values(_)
         | SourceSpec::Dummy(_)
@@ -187,74 +266,66 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
         | SourceSpec::VectorSearch(_)
         | SourceSpec::SparseVectorSearch(_)
         | SourceSpec::FullTextSearch(_)
-        | SourceSpec::AdaptiveSearch(_)
-        | SourceSpec::GraphScan(_) => {
-            properties.provided.ordering = OrderingProperty::Preserved;
-            properties.capabilities.parallelism = if matches!(source, SourceSpec::GraphScan(_)) {
-                Parallelism::unbounded()
-            } else {
-                Parallelism::single()
-            };
-            properties.placement = if matches!(source, SourceSpec::GraphScan(_)) {
-                Placement::Local
-            } else {
-                Placement::SingleTask
-            };
-        }
+        | SourceSpec::AdaptiveSearch(_) => SourceScheduling::SingleTask,
+        SourceSpec::GraphScan(_) => SourceScheduling::ParallelLocal,
         SourceSpec::Materialized(_) => {
-            properties = materialized_source_properties();
+            properties.memory.class = MemoryClass::Blocking;
+            SourceScheduling::ParallelLocal
         }
         SourceSpec::NljUnmatched(_)
         | SourceSpec::ClassicIeJoin(_)
         | SourceSpec::HashJoinSpillReplay(_)
         | SourceSpec::HashJoinUnmatched(_)
-        | SourceSpec::HashAggregateEmit(_)
-        | SourceSpec::UngroupedAggregateEmit(_)
-        | SourceSpec::PerfectHashAggregateEmit(_)
         | SourceSpec::CteScan(_)
         | SourceSpec::DelimScan(_)
         | SourceSpec::RecursiveTableScan(_)
         | SourceSpec::ExternalTable(_) => {
-            properties.provided.ordering = OrderingProperty::Preserved;
-            properties.capabilities.parallelism = Parallelism::unbounded();
             properties.memory.class = MemoryClass::Blocking;
+            SourceScheduling::ParallelLocal
+        }
+        SourceSpec::HashAggregateEmit(_) => {
+            properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::HashAggregate)
+        }
+        SourceSpec::UngroupedAggregateEmit(_) => {
+            properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::UngroupedAggregate)
+        }
+        SourceSpec::PerfectHashAggregateEmit(_) => {
+            properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::PerfectHashAggregate)
         }
         SourceSpec::PartitionAggregateWindowEmit(_) => {
-            // Retained batches are claimed dynamically by parallel workers;
-            // the detail rows are complete but have no physical order.
-            properties.provided.ordering = OrderingProperty::Unordered;
-            properties.capabilities.parallelism = Parallelism::unbounded();
-            properties.capabilities.preserves_order = false;
             properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::PartitionAggregateWindow)
         }
         SourceSpec::WindowEmit(_) => {
-            properties.provided.ordering = OrderingProperty::Preserved;
-            properties.capabilities.parallelism = Parallelism::single();
-            properties.placement = Placement::SingleTask;
             properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::Window)
         }
         SourceSpec::SetOperationEmit(_) => {
-            properties.provided.ordering = OrderingProperty::Preserved;
-            properties.capabilities.parallelism = Parallelism::single();
-            properties.placement = Placement::SingleTask;
             properties.memory.class = MemoryClass::Blocking;
+            emit_source_scheduling(EmitSourceKind::SetOperation)
         }
         SourceSpec::SortEmit(spec) => {
-            properties.provided.ordering = OrderingProperty::Fixed(spec.ordering.clone());
-            properties.capabilities.parallelism = Parallelism::single();
-            properties.placement = Placement::SingleTask;
             properties.memory.class = MemoryClass::Blocking;
+            let scheduling = emit_source_scheduling(EmitSourceKind::Sort);
+            scheduling.apply(&mut properties);
+            properties.provided.ordering = OrderingProperty::Fixed(spec.ordering.clone());
+            return properties.validated();
         }
         SourceSpec::TopNEmit(spec) => {
+            properties.memory.class = MemoryClass::Blocking;
+            let scheduling = emit_source_scheduling(EmitSourceKind::TopN);
+            scheduling.apply(&mut properties);
             properties.provided.ordering =
                 OrderingProperty::Fixed(ordering_spec_from_topn(&spec.spec.orders));
-            properties.capabilities.parallelism = Parallelism::single();
-            properties.placement = Placement::SingleTask;
-            properties.memory.class = MemoryClass::Blocking;
+            return properties.validated();
         }
-    }
+    };
+    scheduling.apply(&mut properties);
 
-    properties
+    properties.validated()
 }
 
 /// Whether replacing a Materialized probe source with this native source
@@ -264,15 +335,14 @@ fn source_properties(source: &SourceSpec) -> SourceProperties {
 /// unbounded and can restore parallelism after a single-task breaker emit.
 /// Keep this decision next to the authoritative source property table so a
 /// source's scheduling contract cannot drift from lowering eligibility.
-pub(crate) fn source_supports_parallel_probe_fusion(source: &SourceSpec) -> bool {
-    let properties = source_properties(source);
+pub(crate) fn emit_source_supports_parallel_probe_fusion(kind: EmitSourceKind) -> bool {
+    let properties = scheduling_properties(emit_source_scheduling(kind));
     let materialized = materialized_source_properties();
     properties
         .capabilities
         .parallelism
         .dominates(materialized.capabilities.parallelism)
-        && (materialized.placement == Placement::SingleTask
-            || properties.placement != Placement::SingleTask)
+        && properties.placement.dominates(materialized.placement)
 }
 
 fn ordering_spec_from_topn(orders: &[paro_planner::binder::ir::OrderByNode]) -> OrderingSpec {
@@ -329,21 +399,59 @@ mod tests {
             properties.capabilities.parallelism,
             Parallelism::unbounded()
         );
-        assert!(source_supports_parallel_probe_fusion(&source));
+        assert!(!properties.capabilities.preserves_order);
     }
 
     #[test]
-    fn materialization_repair_drops_global_order() {
+    fn every_parallel_scheduling_profile_is_explicitly_unordered() {
+        for scheduling in [
+            SourceScheduling::ParallelLocal,
+            SourceScheduling::ParallelPartitioned(MorselPartitioning::rowset_segments()),
+        ] {
+            let properties = scheduling_properties(scheduling);
+            assert_eq!(properties.provided.ordering, OrderingProperty::Unordered);
+            assert_eq!(
+                properties.capabilities.parallelism,
+                Parallelism::unbounded()
+            );
+            assert!(!properties.capabilities.preserves_order);
+        }
+    }
+
+    #[test]
+    fn emit_probe_fusion_is_derived_from_emit_source_scheduling() {
+        for kind in [
+            EmitSourceKind::HashAggregate,
+            EmitSourceKind::UngroupedAggregate,
+            EmitSourceKind::PerfectHashAggregate,
+            EmitSourceKind::PartitionAggregateWindow,
+        ] {
+            assert!(emit_source_supports_parallel_probe_fusion(kind));
+        }
+        for kind in [
+            EmitSourceKind::TopN,
+            EmitSourceKind::Sort,
+            EmitSourceKind::Window,
+            EmitSourceKind::SetOperation,
+        ] {
+            assert!(!emit_source_supports_parallel_probe_fusion(kind));
+        }
+    }
+
+    #[test]
+    fn single_task_repair_removes_parallel_interleaving() {
         let mut accumulator = PipelinePropertyAccumulator {
             current: ProvidedProperties {
-                ordering: OrderingProperty::Fixed(OrderingSpec::new(Vec::new())),
+                ordering: OrderingProperty::Unordered,
                 ..Default::default()
             },
             capabilities: ExecutionCapabilities::default(),
             memory: MemoryRequirement::default(),
             placement: Placement::Local,
         };
-        accumulator.apply_repair(&PropertyRepairKind::MaterializationAdapter);
-        assert_eq!(accumulator.current.ordering, OrderingProperty::Unordered);
+        accumulator.apply_repair(&PropertyRepairKind::SingleTaskFallback);
+        assert_eq!(accumulator.current.ordering, OrderingProperty::Preserved);
+        assert_eq!(accumulator.capabilities.parallelism, Parallelism::single());
+        assert_eq!(accumulator.placement, Placement::SingleTask);
     }
 }

@@ -38,6 +38,17 @@ impl BatchRowOrdinal {
         self.0
     }
 
+    #[inline]
+    pub(crate) fn checked_sub(self, base: Self) -> Option<Self> {
+        self.0.checked_sub(base.0).map(Self)
+    }
+
+    #[inline]
+    pub(crate) fn checked_add(self, base: Self) -> Option<Self> {
+        let ordinal = self.0.checked_add(base.0)?;
+        (ordinal < VECTOR_SIZE as u32).then_some(Self(ordinal))
+    }
+
     /// Convert an owned typed selection to the common vector selection ABI.
     ///
     /// SAFETY is centralized here: `repr(transparent)` guarantees identical
@@ -74,6 +85,7 @@ impl CandidateIndex {
     }
 }
 
+#[cfg(test)]
 impl PartialEq<u32> for BatchRowOrdinal {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other
@@ -121,6 +133,14 @@ impl SegmentRowId {
     pub(crate) fn as_raw_slice(values: &[Self]) -> &[u32] {
         unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u32>(), values.len()) }
     }
+
+    /// Borrow the typed segment-row domain without copying an existing storage
+    /// ABI slice. `repr(transparent)` guarantees the element layout and every
+    /// `u32` bit pattern is a valid segment row ID.
+    #[cfg(test)]
+    pub(crate) fn from_raw_slice(values: &[u32]) -> &[Self] {
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<Self>(), values.len()) }
+    }
 }
 
 impl std::fmt::Display for SegmentRowId {
@@ -129,6 +149,7 @@ impl std::fmt::Display for SegmentRowId {
     }
 }
 
+#[cfg(test)]
 impl PartialEq<u32> for SegmentRowId {
     fn eq(&self, other: &u32) -> bool {
         self.0 == *other

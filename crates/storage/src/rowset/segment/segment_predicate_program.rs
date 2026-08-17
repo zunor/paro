@@ -79,6 +79,24 @@ pub(super) struct PredicateStageScratch {
     gathered_matches: Vec<BatchRowOrdinal>,
 }
 
+fn rebase_stage_matches(matches: &mut [BatchRowOrdinal], first: BatchRowOrdinal) -> Result<()> {
+    for row in matches {
+        *row = row.checked_sub(first).ok_or_else(|| {
+            paro_error::data_corrupted("predicate selection precedes its witnessed first row")
+        })?;
+    }
+    Ok(())
+}
+
+fn restore_stage_matches(matches: &mut [BatchRowOrdinal], first: BatchRowOrdinal) -> Result<()> {
+    for row in matches {
+        *row = row.checked_add(first).ok_or_else(|| {
+            paro_error::data_corrupted("predicate stage result exceeds its batch ordinal domain")
+        })?;
+    }
+    Ok(())
+}
+
 impl CompiledPredicateProgram {
     pub(super) fn new(tree: CompiledPredicateTree, allow_staged_access: bool) -> Self {
         let compiled = allow_staged_access
@@ -253,17 +271,9 @@ impl PredicateEvaluator {
                     self.read_stage_sequential(stage.column_idx, stage_start, span)?;
                 stats.add_sequential(stage_idx, rows_read);
                 if rows_read == span {
-                    for row in matches.iter_mut() {
-                        *row = BatchRowOrdinal::from_index(
-                            row.index()
-                                .checked_sub(first.index())
-                                .expect("selection starts at the witnessed first row"),
-                        );
-                    }
+                    rebase_stage_matches(matches, first)?;
                     self.filter_stage(stage, &batch, span, matches, false)?;
-                    for row in matches.iter_mut() {
-                        *row = BatchRowOrdinal::from_index(row.index() + first.index());
-                    }
+                    restore_stage_matches(matches, first)?;
                 } else {
                     // `ColumnIterator::next_batch` promises at most `span`
                     // rows, not an exact count. A page-aware implementation may
@@ -480,5 +490,40 @@ impl PredicateEvaluator {
                 ))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use paro_common::vector::VECTOR_SIZE;
+
+    use super::*;
+
+    #[test]
+    fn stage_match_rebase_round_trips_without_changing_domains() {
+        let matches = [
+            BatchRowOrdinal::from_index(7),
+            BatchRowOrdinal::from_index(9),
+            BatchRowOrdinal::from_index(12),
+        ];
+        let first = matches[0];
+        let mut rebased = matches;
+        rebase_stage_matches(&mut rebased, first).unwrap();
+        assert_eq!(rebased, [0, 2, 5]);
+
+        restore_stage_matches(&mut rebased, first).unwrap();
+        assert_eq!(rebased, matches);
+    }
+
+    #[test]
+    fn stage_match_rebase_rejects_invalid_coordinate_changes() {
+        let mut underflow = [BatchRowOrdinal::from_index(2)];
+        assert!(rebase_stage_matches(&mut underflow, BatchRowOrdinal::from_index(3)).is_err());
+
+        let mut overflow = [BatchRowOrdinal::from_index(1)];
+        assert!(
+            restore_stage_matches(&mut overflow, BatchRowOrdinal::from_index(VECTOR_SIZE - 1),)
+                .is_err()
+        );
     }
 }

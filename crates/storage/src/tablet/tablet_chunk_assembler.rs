@@ -71,13 +71,14 @@ impl TabletReader {
         rowset_id: u64,
         segment_id: u32,
     ) -> Result<Chunk> {
-        let rowids = rowids
-            .iter()
-            .copied()
-            .map(SegmentRowId::from_raw)
-            .collect::<Vec<_>>();
         self.build_chunk_with_owned_selection(
-            batch, rows, rows, None, &rowids, rowset_id, segment_id,
+            batch,
+            rows,
+            rows,
+            None,
+            SegmentRowId::from_raw_slice(rowids),
+            rowset_id,
+            segment_id,
         )
     }
 
@@ -243,11 +244,8 @@ impl TabletReader {
     ) -> Result<Vector> {
         let mut vector = Vector::try_new(LogicalType::BigInt, rows, allocator)?;
         for (idx, row_offset) in rowids.iter().copied().enumerate() {
-            let row_id = tablet.encode_row_location(PhysicalRowRef::new(
-                rowset_id,
-                segment_id,
-                row_offset.get(),
-            ))?;
+            let row_id = tablet
+                .encode_row_location(PhysicalRowRef::new(rowset_id, segment_id, row_offset))?;
             vector.set_i64(idx, row_id.to_raw() as i64);
         }
         vector.set_count(rows);

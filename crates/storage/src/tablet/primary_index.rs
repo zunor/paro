@@ -361,11 +361,11 @@ impl Tablet {
                 .or_insert_with(DeleteVector::new);
             let source_row_id = self.encode_row_location(candidate.source_location)?;
             let Some(current_row_id) = self.lookup_primary_key(&candidate.key)? else {
-                output_entry.mark_deleted(candidate.output_location.row_offset);
+                output_entry.mark_deleted(candidate.output_location.row_offset.get());
                 continue;
             };
             if current_row_id != source_row_id {
-                output_entry.mark_deleted(candidate.output_location.row_offset);
+                output_entry.mark_deleted(candidate.output_location.row_offset.get());
                 continue;
             }
             pairs.push((
@@ -456,7 +456,7 @@ impl Tablet {
                     let expected = self.encode_row_location(PhysicalRowRef::new(
                         rowset.rowset_id(),
                         segment.segment_id(),
-                        row_id.get(),
+                        row_id,
                     ))?;
                     let actual = self.lookup_primary_key(&key)?.ok_or_else(|| {
                         paro_error::internal(format!(
@@ -525,7 +525,9 @@ impl Tablet {
             let output_deleted = update
                 .pending_delete_vectors
                 .get(&row_location.segment_key())
-                .is_some_and(|delete_vector| delete_vector.is_deleted(row_location.row_offset));
+                .is_some_and(|delete_vector| {
+                    delete_vector.is_deleted(row_location.row_offset.get())
+                });
             if output_deleted {
                 if let Some(prev) = latest.remove(&key) {
                     let prev = self.decode_row_id(prev)?;
@@ -533,7 +535,7 @@ impl Tablet {
                         .pending_delete_vectors
                         .entry(prev.segment_key())
                         .or_insert_with(DeleteVector::new);
-                    entry.mark_deleted(prev.row_offset);
+                    entry.mark_deleted(prev.row_offset.get());
                 }
                 if let Some(current_row_id) = current_row_id {
                     let old_loc = self.decode_row_id(current_row_id)?;
@@ -541,7 +543,7 @@ impl Tablet {
                         .pending_delete_vectors
                         .entry(old_loc.segment_key())
                         .or_insert_with(DeleteVector::new);
-                    entry.mark_deleted(old_loc.row_offset);
+                    entry.mark_deleted(old_loc.row_offset.get());
                 }
                 tombstones.insert(key);
                 continue;
@@ -554,7 +556,7 @@ impl Tablet {
                     .pending_delete_vectors
                     .entry(prev.segment_key())
                     .or_insert_with(DeleteVector::new);
-                entry.mark_deleted(prev.row_offset);
+                entry.mark_deleted(prev.row_offset.get());
             }
 
             if let Some(current_row_id) = current_row_id {
@@ -563,7 +565,7 @@ impl Tablet {
                     .pending_delete_vectors
                     .entry(old_loc.segment_key())
                     .or_insert_with(DeleteVector::new);
-                entry.mark_deleted(old_loc.row_offset);
+                entry.mark_deleted(old_loc.row_offset.get());
             }
         }
 
@@ -663,7 +665,7 @@ impl Tablet {
             let entry = pending
                 .entry(loc.segment_key())
                 .or_insert_with(DeleteVector::new);
-            entry.mark_deleted(loc.row_offset);
+            entry.mark_deleted(loc.row_offset.get());
         }
         self.persist_delete_vectors_with_publish_advance(
             version,
@@ -742,7 +744,7 @@ impl Tablet {
                 let entry = pending
                     .entry(location.segment_key())
                     .or_insert_with(DeleteVector::new);
-                entry.mark_deleted(location.row_offset);
+                entry.mark_deleted(location.row_offset.get());
             }
 
             tombstones.push(key);
@@ -843,11 +845,7 @@ impl Tablet {
                             .map(|dv| dv.is_deleted(row_id.get()))
                             .unwrap_or(false);
                         occurrences.push((
-                            PhysicalRowRef::new(
-                                rowset.rowset_id(),
-                                segment.segment_id(),
-                                row_id.get(),
-                            ),
+                            PhysicalRowRef::new(rowset.rowset_id(), segment.segment_id(), row_id),
                             is_deleted,
                         ));
                     }
@@ -1020,7 +1018,7 @@ impl Tablet {
                         let row_id = self.encode_row_location(PhysicalRowRef::new(
                             rowset.rowset_id(),
                             segment.segment_id(),
-                            row_id.get(),
+                            row_id,
                         ))?;
                         pairs.push((key, row_id));
                     }

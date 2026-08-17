@@ -20,19 +20,10 @@ pub(crate) enum BreakerDispatch {
     ExternalTable(ExternalTableSpec),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BreakerRole {
-    /// The native emit source is at least as parallel as Materialized and can
-    /// directly drive a downstream probe chain.
-    ParallelEmit,
-    /// The native emit source is single-task. Materialization is the explicit
-    /// scheduling adapter that restores downstream probe parallelism.
-    MaterializedEmit,
-    /// A blocking operator without a probe-fusible emit path.
-    Tail,
-    /// A subtree-owning control region lowered by its dedicated entry point.
-    Control,
-}
+/// Owned breaker dispatch whose native emit source has already been proven at
+/// least as schedulable as `Materialized`. The private field prevents probe
+/// lowering from bypassing the authoritative source-property check.
+pub(crate) struct ProbeFusibleBreakerDispatch(BreakerDispatch);
 
 enum BreakerRef<'a> {
     TopN(&'a TopNSpec),
@@ -78,21 +69,23 @@ impl<'a> BreakerRef<'a> {
         })
     }
 
-    fn role(&self) -> BreakerRole {
+    fn emit_source_kind(&self) -> Option<EmitSourceKind> {
         match self {
-            Self::Aggregate(_) | Self::PartitionAggregateWindow(_) => BreakerRole::ParallelEmit,
-            Self::TopN(_) | Self::Sort(_) | Self::SetOperation(_) | Self::Window(_) => {
-                BreakerRole::MaterializedEmit
-            }
+            Self::Aggregate(spec) => Some(aggregate_emit_kind(spec).source_kind()),
+            Self::PartitionAggregateWindow(_) => Some(EmitSourceKind::PartitionAggregateWindow),
+            Self::TopN(_) => Some(EmitSourceKind::TopN),
+            Self::Sort(_) => Some(EmitSourceKind::Sort),
+            Self::SetOperation(_) => Some(EmitSourceKind::SetOperation),
+            Self::Window(_) => Some(EmitSourceKind::Window),
             Self::HashJoin(_)
             | Self::NestedLoopJoin(_)
             | Self::SortRangeJoin(_)
             | Self::ClassicIeJoin(_)
             | Self::CrossProduct(_)
-            | Self::ExternalTable(_) => BreakerRole::Tail,
-            Self::MaterializedCteControl | Self::DelimJoinControl | Self::RecursiveCteControl => {
-                BreakerRole::Control
-            }
+            | Self::ExternalTable(_)
+            | Self::MaterializedCteControl
+            | Self::DelimJoinControl
+            | Self::RecursiveCteControl => None,
         }
     }
 
@@ -197,7 +190,6 @@ impl<'a> PipelineLowerer<'a> {
         &mut self,
         root: PhysicalPlanNodeId,
         breaker: BreakerDispatch,
-        require_parallel_probe: bool,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
@@ -210,11 +202,6 @@ impl<'a> PipelineLowerer<'a> {
             .handles
             .register(build.handle_kind(), output.clone(), Default::default());
         let source = build.source(handle, &output);
-        if require_parallel_probe && !source_supports_parallel_probe_fusion(&source) {
-            return Err(paro_error::internal(
-                "parallel emit-breaker classification drifted from source properties",
-            ));
-        }
         let pending = match build {
             EmitBreakerBuild::Aggregate(spec) => {
                 let child = self.only_child(root)?;
@@ -380,11 +367,11 @@ impl<'a> PipelineLowerer<'a> {
     pub(crate) fn lower_breaker_to_probe_source(
         &mut self,
         root: PhysicalPlanNodeId,
-        breaker: BreakerDispatch,
+        breaker: ProbeFusibleBreakerDispatch,
         pipelines: &mut Vec<PipelineSpec>,
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<Option<BreakerProbeSource>> {
-        self.lower_emit_breaker_source(root, breaker, true, pipelines, dependencies)
+        self.lower_emit_breaker_source(root, breaker.0, pipelines, dependencies)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -400,7 +387,7 @@ impl<'a> PipelineLowerer<'a> {
         dependencies: &mut Vec<PipelineDependency>,
     ) -> Result<PipelineId> {
         let probe_source = self
-            .lower_emit_breaker_source(root, breaker, false, pipelines, dependencies)?
+            .lower_emit_breaker_source(root, breaker, pipelines, dependencies)?
             .ok_or_else(|| paro_error::internal("requested emit source for a non-emit breaker"))?;
         let pushed = self.push_pipeline(
             probe_source.source,
@@ -442,8 +429,15 @@ impl<'a> PipelineLowerer<'a> {
         BreakerRef::from_kind(kind).is_some_and(|breaker| breaker.is_tail_boundary())
     }
 
-    pub(crate) fn breaker_role(kind: &PhysicalNodeKind) -> Option<BreakerRole> {
-        BreakerRef::from_kind(kind).map(|breaker| breaker.role())
+    pub(crate) fn probe_fusible_breaker_dispatch(
+        kind: &PhysicalNodeKind,
+    ) -> Option<ProbeFusibleBreakerDispatch> {
+        let breaker = BreakerRef::from_kind(kind)?;
+        let source_kind = breaker.emit_source_kind()?;
+        emit_source_supports_parallel_probe_fusion(source_kind)
+            .then(|| breaker.to_dispatch())
+            .flatten()
+            .map(ProbeFusibleBreakerDispatch)
     }
 
     #[allow(clippy::too_many_arguments)]

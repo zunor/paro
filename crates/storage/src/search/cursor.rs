@@ -377,13 +377,17 @@ impl PhysicalRowRef {
 
 impl From<crate::tablet::PhysicalRowRef> for PhysicalRowRef {
     fn from(value: crate::tablet::PhysicalRowRef) -> Self {
-        Self::new(value.rowset_id, value.segment_id, value.row_offset)
+        Self::new(value.rowset_id, value.segment_id, value.row_offset.get())
     }
 }
 
 impl From<PhysicalRowRef> for crate::tablet::PhysicalRowRef {
     fn from(value: PhysicalRowRef) -> Self {
-        Self::new(value.rowset_id, value.segment_id, value.row_id)
+        Self::new(
+            value.rowset_id,
+            value.segment_id,
+            crate::rowset::SegmentRowId::from_raw(value.row_id),
+        )
     }
 }
 

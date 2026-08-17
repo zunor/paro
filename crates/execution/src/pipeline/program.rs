@@ -1241,14 +1241,13 @@ mod tests {
     #[test]
     fn blocking_property_repair_transform_fails_program_build() {
         let output = row_type(&["a"], &[LogicalType::Integer]);
-        let blocking_repairs = [
-            PropertyRepairKind::Sort(OrderingSpec::new(vec![OrderingColumn {
+        let blocking_repairs = [PropertyRepairKind::Sort(OrderingSpec::new(vec![
+            OrderingColumn {
                 column: 0,
                 direction: OrderingDirection::Asc,
                 nulls: NullOrdering::Last,
-            }])),
-            PropertyRepairKind::MaterializationAdapter,
-        ];
+            },
+        ]))];
 
         for repair in blocking_repairs {
             let spec = PipelineSpec {

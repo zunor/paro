@@ -512,14 +512,13 @@ fn prove_null_rejected_preserved_unique_key(
             LogicalOperator::Get(get) => {
                 if null_rejection
                     .bindings()
-                    .iter()
                     .any(|key| key.table_index != get.table_index)
                 {
                     return None;
                 }
                 declared_unique_keys(get)
                     .iter()
-                    .any(|key| key.is_covered_by(null_rejection.bindings()))
+                    .any(|key| key.is_unique_with_nulls_rejected(null_rejection))
                     .then_some(())
             }
             LogicalOperator::Filter(filter) => recurse(&filter.child, null_rejection),

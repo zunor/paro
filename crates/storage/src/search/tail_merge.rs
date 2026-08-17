@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::index::PredicateTree;
+use crate::rowset::SegmentRowId;
 use crate::search::cursor::{
     PhysicalRowRef as SearchPhysicalRowRef, SearchReadSnapshot, VisibleSegment,
 };
@@ -56,7 +57,7 @@ pub(crate) fn resolve_logical_rows(
                 .encode_row_location(PhysicalRowRef::new(
                     segment.rowset_id,
                     segment.segment_id,
-                    row_id,
+                    SegmentRowId::from_raw(row_id),
                 ))
                 .map(|row_id| row_id.to_raw())
         })

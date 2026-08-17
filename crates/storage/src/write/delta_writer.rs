@@ -957,7 +957,7 @@ impl DeltaWriter {
             .pending_delete_vectors
             .entry(loc.segment_key())
             .or_default();
-        entry.mark_deleted(loc.row_offset);
+        entry.mark_deleted(loc.row_offset.get());
         Ok(())
     }
 

@@ -11,7 +11,7 @@ use crate::compaction::publish::record::{
 };
 use crate::primary_key::{DeleteVector, PrimaryKeySerializer};
 use crate::rowid_resolver;
-use crate::rowset::{Rowset, RowsetSharedPtr, RowsetWriterBuilder, SegmentIterator};
+use crate::rowset::{Rowset, RowsetSharedPtr, RowsetWriterBuilder, SegmentIterator, SegmentRowId};
 use crate::search::SearchInlineBuilderSet;
 use crate::tablet::{tablet_schema::KeysType, ColumnId, PhysicalRowRef, Tablet};
 use paro_common::allocator::Allocator;
@@ -126,7 +126,7 @@ impl PrimaryKeyMerger {
                                 .encode_row_location(PhysicalRowRef::new(
                                     rowset.rowset_id(),
                                     segment.segment_id(),
-                                    row_offset.get(),
+                                    row_offset,
                                 ))
                                 .map(|rowid| rowid.to_raw())
                         })
@@ -168,7 +168,7 @@ impl PrimaryKeyMerger {
                         source_locations.push(PhysicalRowRef::new(
                             rowset.rowset_id(),
                             segment.segment_id(),
-                            row_id.get(),
+                            row_id,
                         ));
                     }
                 }
@@ -201,7 +201,7 @@ impl PrimaryKeyMerger {
         {
             if let Some((prev_out, _prev_src)) = latest.insert(key, (loc, src_loc)) {
                 let entry = delete_vectors.entry(prev_out.segment_id).or_default();
-                entry.mark_deleted(prev_out.row_offset);
+                entry.mark_deleted(prev_out.row_offset.get());
             }
         }
 
@@ -247,7 +247,7 @@ fn row_locations_for_rowset(rowset: &Rowset) -> Result<Vec<PhysicalRowRef>> {
             out.push(PhysicalRowRef::new(
                 rowset.rowset_id(),
                 seg.segment_id(),
-                row_id,
+                SegmentRowId::from_raw(row_id),
             ));
         }
     }

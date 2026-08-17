@@ -96,45 +96,6 @@ impl<'a> PipelineLowerer<'a> {
                         kind: DependencyKind::FinalizeBeforeEmit,
                     });
                 }
-                PropertyRepairKind::MaterializationAdapter => {
-                    let handle = self.handles.register(
-                        BreakerHandleKind::Materialized,
-                        output.clone(),
-                        Default::default(),
-                    );
-                    let producer_sink = SinkSpec::Materialize(MaterializeSinkSpec {
-                        handle,
-                        required: Default::default(),
-                    });
-                    let producer_build =
-                        self.build_pipeline_properties(&source, &transforms, &producer_sink);
-                    let producer = self.push_pipeline_unrepaired(
-                        source,
-                        transforms,
-                        producer_sink,
-                        SinkSharing::Exclusive,
-                        output.clone(),
-                        producer_build.properties,
-                        pipelines,
-                    );
-                    if entry.is_none() {
-                        entry = Some(producer);
-                    }
-                    self.attach_pending_repair_source(
-                        pending_repair_source.take(),
-                        producer,
-                        dependencies,
-                    )?;
-                    self.handles.set_producer(handle, producer)?;
-
-                    source = SourceSpec::Materialized(MaterializedSourceSpec { handle });
-                    transforms = Vec::new();
-                    pending_repair_source = Some(PendingRepairSource {
-                        handle,
-                        producer,
-                        kind: DependencyKind::MaterializeBeforeRead,
-                    });
-                }
             }
             output = source.output_row_type(&output);
         }
