@@ -279,16 +279,7 @@ impl CostModel {
                         LikePatternShape::MatchAll => 1.0,
                         LikePatternShape::Exact => self
                             .estimate_exact_like_selectivity(operator.children.first(), resolver),
-                        LikePatternShape::Prefix => self.defaults.like_prefix,
-                        LikePatternShape::Contains | LikePatternShape::Suffix => {
-                            self.defaults.like_contains
-                        }
-                        LikePatternShape::OrderedContains(literal_fragments) => {
-                            ordered_contains_selectivity(
-                                self.defaults.like_contains,
-                                literal_fragments,
-                            )
-                        }
+                        LikePatternShape::Wildcard(pattern) => pattern.selectivity(&self.defaults),
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
                 ),
@@ -299,16 +290,7 @@ impl CostModel {
                         // comparison domain, so the raw column NDV is not a sound
                         // denominator for an exact ILIKE pattern.
                         LikePatternShape::Exact => self.defaults.equality,
-                        LikePatternShape::Prefix => self.defaults.like_prefix,
-                        LikePatternShape::Contains | LikePatternShape::Suffix => {
-                            self.defaults.like_contains
-                        }
-                        LikePatternShape::OrderedContains(literal_fragments) => {
-                            ordered_contains_selectivity(
-                                self.defaults.like_contains,
-                                literal_fragments,
-                            )
-                        }
+                        LikePatternShape::Wildcard(pattern) => pattern.selectivity(&self.defaults),
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
                 ),
@@ -986,28 +968,46 @@ fn ordered_float_value(value: &Value) -> Option<f64> {
 enum LikePatternShape {
     MatchAll,
     Exact,
-    Prefix,
-    Suffix,
-    Contains,
-    /// Several non-empty literals separated by `%`, with wildcards at both
-    /// ends. Every literal must occur in order, so model each occurrence as an
-    /// additional contains predicate rather than falling back to the generic
-    /// (and usually very high) predicate selectivity.
-    OrderedContains(usize),
+    Wildcard(WildcardLikePattern),
     Generic,
 }
 
-/// Estimate several ordered literal occurrences on one string domain.
+/// Semantic shape of a `%`-only wildcard pattern after consecutive wildcards
+/// have been normalized away.
 ///
-/// Treating fragments as independent (`contains^n`) becomes too confident for
-/// correlated text. Apply the same exponential backoff used for conjunctions
-/// over several columns of one relation: the first literal has full weight and
-/// each later literal contributes half the previous exponent. Even a long
-/// fragment list therefore claims no more than two independent occurrences.
-fn ordered_contains_selectivity(contains: f64, literal_fragments: usize) -> f64 {
-    let bounded_fragments = literal_fragments.min(i32::MAX as usize) as i32;
-    let exponent = 2.0 * (1.0 - 0.5f64.powi(bounded_fragments));
-    contains.powf(exponent)
+/// Wildcard count is deliberately absent: `%%needle%` and `%needle%` have the
+/// same language and therefore must receive the same estimate. Anchors and
+/// non-empty literal fragments are the properties that strengthen a pattern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WildcardLikePattern {
+    anchored_start: bool,
+    anchored_end: bool,
+    literal_fragments: usize,
+}
+
+impl WildcardLikePattern {
+    fn selectivity(self, defaults: &SelectivityDefaults) -> f64 {
+        let base = match (self.anchored_start, self.anchored_end) {
+            (true, false) => defaults.like_prefix,
+            (false, true) | (false, false) => defaults.like_contains,
+            // An internally wildcarded pattern anchored at both ends is at
+            // least as selective as either one-ended form.
+            (true, true) => defaults.like_prefix.min(defaults.like_contains),
+        };
+
+        // Ordered fragments overlap on one string value and are consequently
+        // more correlated than independent same-column predicates. Give each
+        // additional fragment half the previous weight, saturating at the
+        // equivalent of two independent occurrences. The finite bound avoids
+        // converting an arbitrarily long SQL literal into an integer exponent.
+        let remaining_weight = if self.literal_fragments >= 64 {
+            0.0
+        } else {
+            0.5f64.powi(self.literal_fragments as i32)
+        };
+        let exponent = 2.0 * (1.0 - remaining_weight);
+        base.powf(exponent)
+    }
 }
 
 fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
@@ -1020,28 +1020,21 @@ fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
     if value.contains('_') || value.contains('\\') {
         return LikePatternShape::Generic;
     }
-    if !value.is_empty() && value.bytes().all(|byte| byte == b'%') {
+    if !value.contains('%') {
+        return LikePatternShape::Exact;
+    }
+    let literal_fragments = value
+        .split('%')
+        .filter(|fragment| !fragment.is_empty())
+        .count();
+    if literal_fragments == 0 {
         return LikePatternShape::MatchAll;
     }
-    let wildcard_count = value.bytes().filter(|byte| *byte == b'%').count();
-    match wildcard_count {
-        0 => LikePatternShape::Exact,
-        1 if value.ends_with('%') => LikePatternShape::Prefix,
-        1 if value.starts_with('%') => LikePatternShape::Suffix,
-        2 if value.starts_with('%') && value.ends_with('%') => LikePatternShape::Contains,
-        _ if value.starts_with('%') && value.ends_with('%') => {
-            let literal_fragments = value
-                .split('%')
-                .filter(|fragment| !fragment.is_empty())
-                .count();
-            if literal_fragments >= 2 {
-                LikePatternShape::OrderedContains(literal_fragments)
-            } else {
-                LikePatternShape::Generic
-            }
-        }
-        _ => LikePatternShape::Generic,
-    }
+    LikePatternShape::Wildcard(WildcardLikePattern {
+        anchored_start: !value.starts_with('%'),
+        anchored_end: !value.ends_with('%'),
+        literal_fragments,
+    })
 }
 
 #[cfg(test)]
@@ -1356,6 +1349,23 @@ mod tests {
         assert_eq!(
             model.estimate_selectivity(&like("%Customer%Complaints%"), &HashMap::new()),
             0.05f64.powf(1.5)
+        );
+        assert_eq!(
+            model.estimate_selectivity(&like("%%green%"), &HashMap::new()),
+            model.estimate_selectivity(&like("%green%"), &HashMap::new()),
+            "consecutive percent wildcards do not change the pattern language"
+        );
+        assert!(
+            model.estimate_selectivity(&like("%a%b"), &HashMap::new())
+                <= model.estimate_selectivity(&like("%b"), &HashMap::new())
+        );
+        assert!(
+            model.estimate_selectivity(&like("a%b%"), &HashMap::new())
+                <= model.estimate_selectivity(&like("a%"), &HashMap::new())
+        );
+        assert!(
+            model.estimate_selectivity(&like("a%b%c"), &HashMap::new())
+                <= model.estimate_selectivity(&like("%b%"), &HashMap::new())
         );
         assert_eq!(model.estimate_selectivity(&like("%"), &HashMap::new()), 1.0);
         assert_eq!(

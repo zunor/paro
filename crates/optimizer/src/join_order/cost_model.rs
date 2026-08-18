@@ -3,22 +3,11 @@
 
 //! Join-order cost model based on cardinality estimates.
 
-use std::sync::Arc;
-
 use crate::join_order::cardinality::CardinalityEstimator;
-use crate::join_order::query_graph::FilterInfo;
+use crate::join_order::query_graph::{JoinEdgeOrientation, JoinPredicateSet};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::RelationStats;
-
-/// Predicates evaluated at one cut in the chosen join tree.
-///
-/// Query-graph adjacency can expose several independent edges across the same
-/// cut. The physical join must evaluate all of them, so the DP plan stores a
-/// predicate set rather than one arbitrarily selected graph neighbor.
-#[derive(Debug, Clone)]
-pub struct JoinPredicateSet {
-    pub filters: Vec<Arc<FilterInfo>>,
-}
+use std::sync::Arc;
 
 /// A node in the dynamic programming join plan.
 ///
@@ -81,28 +70,75 @@ impl DPJoinNode {
 
 /// The CostModel computes the cost of join plans.
 ///
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct CostModel {
     /// Cardinality estimator used to calculate cost.
     pub cardinality_estimator: CardinalityEstimator,
     relation_widths: Vec<usize>,
+    units: JoinCostUnits,
+}
+
+/// Tunable work units used by join-order enumeration.
+///
+/// Materialization is byte-weighted. Hash build and probe are row-weighted
+/// because their dominant fixed work is hashing, bucket traversal, and build
+/// state maintenance rather than copying the complete output payload.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinCostUnits {
+    pub hash_build_row: f64,
+    pub hash_probe_row: f64,
+    pub materialized_byte: f64,
+}
+
+impl Default for JoinCostUnits {
+    fn default() -> Self {
+        Self {
+            hash_build_row: 12.0,
+            hash_probe_row: 4.0,
+            materialized_byte: 1.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct JoinCostBreakdown {
+    build: f64,
+    probe: f64,
+    materialization: f64,
+    children: f64,
+}
+
+impl JoinCostBreakdown {
+    fn total(self) -> f64 {
+        self.build + self.probe + self.materialization + self.children
+    }
+}
+
+impl Default for CostModel {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl CostModel {
-    /// Work unit for one hash-table input row.
-    ///
-    /// The existing materialization cost is byte-weighted. One machine word
-    /// gives reduction joins a matching, deliberately conservative charge for
-    /// hashing/building or probing a key without pretending that the complete
-    /// retained payload is copied into the hash table.
-    const HASH_ROW_WORK_BYTES: usize = std::mem::size_of::<u64>();
-
     /// Create a new CostModel.
     pub fn new() -> Self {
+        Self::with_units(JoinCostUnits::default())
+    }
+
+    /// Create a cost model with explicit tuning units.
+    pub fn with_units(units: JoinCostUnits) -> Self {
         Self {
             cardinality_estimator: CardinalityEstimator::new(),
             relation_widths: Vec::new(),
+            units,
         }
+    }
+
+    /// Clear query-local estimates without discarding calibrated work units.
+    pub fn reset(&mut self) {
+        self.cardinality_estimator = CardinalityEstimator::new();
+        self.relation_widths.clear();
     }
 
     /// Initialize the cost model with relation statistics.
@@ -128,8 +164,9 @@ impl CostModel {
     /// Compute the cost of joining two nodes.
     ///
     /// The cost is computed as:
-    /// cost = join_cardinality * intermediate_row_width
-    ///      + reduction_input_rows * hash_row_work
+    /// cost = build_rows * hash_build_row
+    ///      + probe_rows * hash_probe_row
+    ///      + join_cardinality * intermediate_row_width * materialized_byte
     ///      + cost(left) + cost(right)
     ///
     /// The row width is the combined projected payload plus one intermediate
@@ -142,10 +179,18 @@ impl CostModel {
         set_manager: &mut JoinRelationSetManager,
         predicates: Option<&JoinPredicateSet>,
     ) -> f64 {
-        // Get the combined relation set
-        let combination = set_manager.union(&left.set, &right.set);
+        self.compute_cost_breakdown(left, right, set_manager, predicates)
+            .total()
+    }
 
-        // Estimate the cardinality of the join
+    fn compute_cost_breakdown(
+        &mut self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        set_manager: &mut JoinRelationSetManager,
+        predicates: Option<&JoinPredicateSet>,
+    ) -> JoinCostBreakdown {
+        let combination = set_manager.union(&left.set, &right.set);
         let join_cardinality = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
@@ -161,46 +206,45 @@ impl CostModel {
             .map(|relation| self.relation_widths.get(*relation).copied().unwrap_or(0))
             .sum::<usize>();
         let row_width = 8usize.saturating_add(payload_width).max(1);
-        let reduction_work = Self::reduction_inputs(left, right, predicates).map_or(
-            0.0,
-            |(preserved, filtering)| {
-                (preserved.cardinality + filtering.cardinality) * Self::HASH_ROW_WORK_BYTES as f64
-            },
-        );
-        join_cardinality * row_width as f64 + reduction_work + left.cost + right.cost
+        let (build_rows, probe_rows) = Self::hash_input_rows(left, right, predicates);
+        JoinCostBreakdown {
+            build: build_rows * self.units.hash_build_row,
+            probe: probe_rows * self.units.hash_probe_row,
+            materialization: join_cardinality * row_width as f64 * self.units.materialized_byte,
+            children: left.cost + right.cost,
+        }
     }
 
-    /// Resolve the fixed reduction-join roles for one DP cut. SEMI/ANTI
-    /// predicates preserve their logical left side even
-    /// when enumeration presents that side as the right child.
-    fn reduction_inputs<'a>(
-        left: &'a DPJoinNode,
-        right: &'a DPJoinNode,
+    /// Resolve physical hash inputs for one DP cut.
+    ///
+    /// SEMI/ANTI predicates have directional semantics: their filtering input
+    /// is the hash build and their preserved input is the probe. Other joins
+    /// are freely invertible by `BuildProbeSideOptimizer`, so enumeration
+    /// charges the cheaper row-count orientation that lowering will select.
+    fn hash_input_rows(
+        left: &DPJoinNode,
+        right: &DPJoinNode,
         predicates: Option<&JoinPredicateSet>,
-    ) -> Option<(&'a DPJoinNode, &'a DPJoinNode)> {
-        let reduction_filter = predicates.and_then(|predicates| {
-            predicates.filters.iter().find(|filter| {
-                matches!(
-                    filter.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                )
-            })
-        });
-        reduction_filter.and_then(|filter| {
-            let preserved = filter.left_set.as_ref()?;
-            let filtering = filter.right_set.as_ref()?;
-            if JoinRelationSet::is_subset(&left.set, preserved)
-                && JoinRelationSet::is_subset(&right.set, filtering)
-            {
-                Some((left, right))
-            } else if JoinRelationSet::is_subset(&right.set, preserved)
-                && JoinRelationSet::is_subset(&left.set, filtering)
-            {
-                Some((right, left))
-            } else {
-                None
-            }
-        })
+    ) -> (f64, f64) {
+        if let Some(roles) = predicates.and_then(JoinPredicateSet::reduction_roles) {
+            return match roles.orientation_across(&left.set, &right.set) {
+                Some(JoinEdgeOrientation::Forward) => (right.cardinality, left.cardinality),
+                Some(JoinEdgeOrientation::Inverted) => (left.cardinality, right.cardinality),
+                None => {
+                    debug_assert!(false, "reduction roles must span the enumerated join cut");
+                    Self::cheapest_hash_orientation(left.cardinality, right.cardinality)
+                }
+            };
+        }
+        Self::cheapest_hash_orientation(left.cardinality, right.cardinality)
+    }
+
+    fn cheapest_hash_orientation(left_rows: f64, right_rows: f64) -> (f64, f64) {
+        if left_rows <= right_rows {
+            (left_rows, right_rows)
+        } else {
+            (right_rows, left_rows)
+        }
     }
 
     /// Compute the cost and create a new DPJoinNode.
@@ -238,7 +282,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::join_order::query_graph::FilterInfo;
+    use crate::join_order::query_graph::{FilterInfo, JoinPredicateSet};
     use crate::join_order::relation_manager::DistinctCount;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
@@ -326,6 +370,10 @@ mod tests {
             filtering_table,
         );
         Arc::new(filter)
+    }
+
+    fn predicate_set(filters: &[Arc<FilterInfo>]) -> JoinPredicateSet {
+        JoinPredicateSet::from_filters(filters.iter()).expect("non-empty join predicate set")
     }
 
     #[test]
@@ -614,34 +662,26 @@ mod tests {
             &partsupp,
             &supplier,
             &mut sets,
-            Some(JoinPredicateSet {
-                filters: vec![supplier_exclusion.clone()],
-            }),
+            Some(predicate_set(&[supplier_exclusion.clone()])),
         );
         let anti_then_part = model.compute_cost_and_create_node(
             &anti_first,
             &part,
             &mut sets,
-            Some(JoinPredicateSet {
-                filters: vec![part_filter.clone()],
-            }),
+            Some(predicate_set(&[part_filter.clone()])),
         );
 
         let part_first = model.compute_cost_and_create_node(
             &partsupp,
             &part,
             &mut sets,
-            Some(JoinPredicateSet {
-                filters: vec![part_filter],
-            }),
+            Some(predicate_set(&[part_filter])),
         );
         let part_then_anti = model.compute_cost_and_create_node(
             &part_first,
             &supplier,
             &mut sets,
-            Some(JoinPredicateSet {
-                filters: vec![supplier_exclusion],
-            }),
+            Some(predicate_set(&[supplier_exclusion])),
         );
 
         assert!(
@@ -650,6 +690,42 @@ mod tests {
             part_then_anti.cost,
             anti_then_part.cost
         );
+    }
+
+    #[test]
+    fn hash_input_costs_are_asymmetric_and_apply_to_every_join() {
+        let mut sets = JoinRelationSetManager::new();
+        let inner_filter = create_equality_filter(&mut sets, 0, 0, 1, 0, 0);
+        let reduction_filter = create_reduction_filter(&mut sets, 0, 0, 1, 0, 1, JoinType::Anti);
+        let mut left = DPJoinNode::leaf(sets.get_relation(0));
+        left.cardinality = 10.0;
+        let mut right = DPJoinNode::leaf(sets.get_relation(1));
+        right.cardinality = 100.0;
+        let units = JoinCostUnits {
+            hash_build_row: 12.0,
+            hash_probe_row: 4.0,
+            materialized_byte: 0.0,
+        };
+        let mut model = CostModel::with_units(units);
+        model.init_cost_model(
+            &mut sets,
+            &[
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(100),
+            ],
+        );
+
+        let inner = predicate_set(&[inner_filter]);
+        let inner_cost = model.compute_cost_breakdown(&left, &right, &mut sets, Some(&inner));
+        assert_eq!(inner_cost.build, 10.0 * units.hash_build_row);
+        assert_eq!(inner_cost.probe, 100.0 * units.hash_probe_row);
+
+        let reduction = predicate_set(&[reduction_filter]);
+        let reduction_cost =
+            model.compute_cost_breakdown(&left, &right, &mut sets, Some(&reduction));
+        assert_eq!(reduction_cost.build, 100.0 * units.hash_build_row);
+        assert_eq!(reduction_cost.probe, 10.0 * units.hash_probe_row);
+        assert_ne!(inner_cost.total(), reduction_cost.total());
     }
 
     #[test]

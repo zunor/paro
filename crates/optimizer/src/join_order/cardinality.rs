@@ -660,7 +660,7 @@ impl CardinalityEstimator {
         let mut result = Vec::new();
         for relation_2_tdom in &self.relation_set_stats {
             for filter in &relation_2_tdom.filters {
-                if JoinRelationSet::is_subset(requested_set, &filter.set) {
+                if requested_set.contains_all(&filter.set) {
                     result.push(FilterInfoWithTotalDomains::new(
                         filter.clone(),
                         relation_2_tdom,
@@ -924,12 +924,12 @@ impl CardinalityEstimator {
     fn edge_connects(edge: &FilterInfoWithTotalDomains, subgraph: &Subgraph2Denominator) -> bool {
         if let Some(ref relations) = subgraph.relations {
             if let Some(ref left_set) = edge.filter_info.left_set {
-                if JoinRelationSet::is_subset(relations, left_set) {
+                if relations.contains_all(left_set) {
                     return true;
                 }
             }
             if let Some(ref right_set) = edge.filter_info.right_set {
-                if JoinRelationSet::is_subset(relations, right_set) {
+                if relations.contains_all(right_set) {
                     return true;
                 }
             }
@@ -978,8 +978,8 @@ impl CardinalityEstimator {
                 {
                     if let Some(ref right_rels) = right.relations {
                         if let Some(ref filter_right) = filter.filter_info.right_set {
-                            if JoinRelationSet::is_subset(left_rels, filter_left)
-                                && JoinRelationSet::is_subset(right_rels, filter_right)
+                            if left_rels.contains_all(filter_left)
+                                && right_rels.contains_all(filter_right)
                             {
                                 return left.numerator_relations.clone().unwrap();
                             }
@@ -1036,8 +1036,8 @@ impl CardinalityEstimator {
                 {
                     if let Some(ref right_rels) = right.relations {
                         if let Some(ref filter_right) = filter.filter_info.right_set {
-                            if JoinRelationSet::is_subset(left_rels, filter_left)
-                                && JoinRelationSet::is_subset(right_rels, filter_right)
+                            if left_rels.contains_all(filter_left)
+                                && right_rels.contains_all(filter_right)
                             {
                                 return left.denom / output_fraction;
                             }
@@ -1202,7 +1202,7 @@ impl CardinalityEstimator {
                 // Check if right is already in left
                 if let Some(ref left_rels) = subgraphs[idx].relations {
                     if let Some(ref right_rels) = right_subgraph.relations {
-                        if JoinRelationSet::is_subset(left_rels, right_rels) {
+                        if left_rels.contains_all(right_rels) {
                             right_subgraph.relations = edge.filter_info.left_set.clone();
                             right_subgraph.numerator_relations = edge.filter_info.left_set.clone();
                         }
@@ -1215,9 +1215,7 @@ impl CardinalityEstimator {
                     &edge.filter_info.left_set,
                     &edge.filter_info.right_set,
                 ) {
-                    if JoinRelationSet::is_subset(left_rels, filter_left)
-                        && JoinRelationSet::is_subset(left_rels, filter_right)
-                    {
+                    if left_rels.contains_all(filter_left) && left_rels.contains_all(filter_right) {
                         // Edge connects same subgraph, skip
                         continue;
                     }
@@ -1310,7 +1308,7 @@ impl CardinalityEstimator {
                         .filter_map(|rel_index| {
                             let relation_id = set.relations()[rel_index];
                             let rel = self.set_manager.get_relation(relation_id);
-                            if !JoinRelationSet::is_subset(&rels, &rel) {
+                            if !rels.contains_all(&rel) {
                                 Some(rel)
                             } else {
                                 None

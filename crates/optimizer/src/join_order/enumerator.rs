@@ -9,8 +9,8 @@ use std::sync::Arc;
 use paro_common::logging::targets;
 use tracing::debug;
 
-use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
-use crate::join_order::query_graph::{NeighborInfo, QueryGraphEdges};
+use crate::join_order::cost_model::{CostModel, DPJoinNode};
+use crate::join_order::query_graph::{JoinPredicateSet, NeighborInfo, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 
 /// Threshold to switch from exact to approximate join order optimization.
@@ -358,30 +358,11 @@ impl<'a> PlanEnumerator<'a> {
     }
 
     fn collect_cut_predicates(connections: &[NeighborInfo]) -> Option<JoinPredicateSet> {
-        let boundary_join_type = connections
-            .iter()
-            .flat_map(|connection| &connection.filters)
-            .find_map(|filter| {
-                matches!(
-                    filter.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                )
-                .then_some(filter.join_type)
-            });
-        let mut seen = HashSet::new();
-        let mut filters = Vec::new();
-        for filter in connections
-            .iter()
-            .flat_map(|connection| &connection.filters)
-        {
-            if boundary_join_type.is_some_and(|join_type| filter.join_type != join_type) {
-                continue;
-            }
-            if seen.insert(filter.filter_index) {
-                filters.push(Arc::clone(filter));
-            }
-        }
-        (!filters.is_empty()).then_some(JoinPredicateSet { filters })
+        JoinPredicateSet::from_filters(
+            connections
+                .iter()
+                .flat_map(|connection| &connection.filters),
+        )
     }
 
     /// Solve join order approximately using a greedy algorithm.
@@ -578,9 +559,9 @@ mod tests {
         let predicates = PlanEnumerator::collect_cut_predicates(&connections)
             .expect("join cut should contain predicates");
 
-        assert_eq!(predicates.filters.len(), 2);
-        assert_eq!(predicates.filters[0].filter_index, 0);
-        assert_eq!(predicates.filters[1].filter_index, 1);
+        assert_eq!(predicates.filters().len(), 2);
+        assert_eq!(predicates.filters()[0].filter_index, 0);
+        assert_eq!(predicates.filters()[1].filter_index, 1);
     }
 
     #[test]

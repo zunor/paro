@@ -41,6 +41,122 @@ pub struct FilterInfo {
     pub right_binding: Option<JoinKeyBinding>,
 }
 
+/// Orientation of a logical join edge across a candidate tree cut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinEdgeOrientation {
+    Forward,
+    Inverted,
+}
+
+/// Logical roles carried by a reduction-join edge.
+///
+/// These are resolved once when the cut predicate set is built. Costing and
+/// plan reconstruction must consume this same witness rather than independently
+/// rediscovering which child is preserved by SEMI/ANTI semantics.
+#[derive(Debug, Clone)]
+pub(crate) struct ReductionJoinRoles {
+    preserved: Arc<JoinRelationSet>,
+    filtering: Arc<JoinRelationSet>,
+}
+
+impl ReductionJoinRoles {
+    fn new(filter: &FilterInfo) -> Option<Self> {
+        Some(Self {
+            preserved: Arc::clone(filter.left_set.as_ref()?),
+            filtering: Arc::clone(filter.right_set.as_ref()?),
+        })
+    }
+
+    pub(crate) fn orientation_across(
+        &self,
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> Option<JoinEdgeOrientation> {
+        edge_orientation(left, right, &self.preserved, &self.filtering)
+    }
+}
+
+/// Predicates and authoritative logical semantics for one join-tree cut.
+#[derive(Debug, Clone)]
+pub struct JoinPredicateSet {
+    filters: Box<[Arc<FilterInfo>]>,
+    join_type: JoinType,
+    anti_join_mode: AntiJoinMode,
+    reduction_roles: Option<ReductionJoinRoles>,
+}
+
+impl JoinPredicateSet {
+    /// Build a cut predicate set, resolving reduction semantics once.
+    ///
+    /// A SEMI/ANTI boundary owns the cut: predicates with other join types are
+    /// not folded into that reduction operator. Duplicate graph edges are
+    /// collapsed by their stable filter index.
+    pub fn from_filters<'a>(
+        filters: impl IntoIterator<Item = &'a Arc<FilterInfo>>,
+    ) -> Option<Self> {
+        let candidates = filters.into_iter().collect::<Vec<_>>();
+        let boundary_join_type = candidates.iter().find_map(|filter| {
+            matches!(filter.join_type, JoinType::Semi | JoinType::Anti).then_some(filter.join_type)
+        });
+        let mut seen = HashSet::new();
+        let filters = candidates
+            .into_iter()
+            .filter(|filter| {
+                boundary_join_type.is_none_or(|join_type| filter.join_type == join_type)
+            })
+            .filter(|filter| seen.insert(filter.filter_index))
+            .map(Arc::clone)
+            .collect::<Vec<_>>();
+        if filters.is_empty() {
+            return None;
+        }
+
+        let semantic_filter = filters
+            .iter()
+            .find(|filter| matches!(filter.join_type, JoinType::Semi | JoinType::Anti))
+            .or_else(|| {
+                filters
+                    .iter()
+                    .find(|filter| filter.join_type != JoinType::Invalid)
+            });
+        let (join_type, anti_join_mode) = semantic_filter
+            .map_or((JoinType::Inner, AntiJoinMode::Regular), |filter| {
+                (filter.join_type, filter.anti_join_mode)
+            });
+        let reduction_roles = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            filters
+                .iter()
+                .filter(|filter| filter.join_type == join_type)
+                .find_map(|filter| ReductionJoinRoles::new(filter))
+        } else {
+            None
+        };
+
+        Some(Self {
+            filters: filters.into_boxed_slice(),
+            join_type,
+            anti_join_mode,
+            reduction_roles,
+        })
+    }
+
+    pub(crate) fn join_type(&self) -> JoinType {
+        self.join_type
+    }
+
+    pub(crate) fn filters(&self) -> &[Arc<FilterInfo>] {
+        &self.filters
+    }
+
+    pub(crate) fn anti_join_mode(&self) -> AntiJoinMode {
+        self.anti_join_mode
+    }
+
+    pub(crate) fn reduction_roles(&self) -> Option<&ReductionJoinRoles> {
+        self.reduction_roles.as_ref()
+    }
+}
+
 /// A direct equality key and the join-order relation that owns it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct JoinKeyBinding {
@@ -147,6 +263,35 @@ impl FilterInfo {
             "reduction-join filtering binding must belong to its right relation set"
         );
         Some(bindings)
+    }
+
+    /// Resolve this predicate's expression orientation across a tree cut.
+    pub(crate) fn orientation_across(
+        &self,
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> Option<JoinEdgeOrientation> {
+        edge_orientation(
+            left,
+            right,
+            self.left_set.as_ref()?,
+            self.right_set.as_ref()?,
+        )
+    }
+}
+
+fn edge_orientation(
+    left: &JoinRelationSet,
+    right: &JoinRelationSet,
+    edge_left: &JoinRelationSet,
+    edge_right: &JoinRelationSet,
+) -> Option<JoinEdgeOrientation> {
+    if left.contains_all(edge_left) && right.contains_all(edge_right) {
+        Some(JoinEdgeOrientation::Forward)
+    } else if left.contains_all(edge_right) && right.contains_all(edge_left) {
+        Some(JoinEdgeOrientation::Inverted)
+    } else {
+        None
     }
 }
 
@@ -269,7 +414,7 @@ impl QueryGraphEdges {
     ) -> Vec<NeighborInfo> {
         let mut connections = Vec::new();
         self.enumerate_neighbors(node, |info| {
-            if JoinRelationSet::is_subset(other, &info.neighbor) {
+            if other.contains_all(&info.neighbor) {
                 connections.push(info.clone());
             }
             false // Continue enumeration
@@ -483,6 +628,41 @@ mod tests {
                 preserved: ColumnBinding::new(6, 2),
                 filtering: ColumnBinding::new(8, 3),
             })
+        );
+    }
+
+    #[test]
+    fn predicate_set_resolves_roles_from_a_later_valid_reduction_edge() {
+        let mut manager = JoinRelationSetManager::new();
+        let preserved = manager.get_relation(0);
+        let filtering = manager.get_relation(1);
+        let joined = manager.union(&preserved, &filtering);
+        let expression = Expression::Constant(ConstantExpression {
+            value: Value::Boolean(true),
+            return_type: LogicalType::Boolean,
+        });
+        let missing_roles = Arc::new(FilterInfo::new(
+            expression.clone(),
+            joined.clone(),
+            0,
+            JoinType::Anti,
+            AntiJoinMode::Regular,
+        ));
+        let mut valid_roles =
+            FilterInfo::new(expression, joined, 1, JoinType::Anti, AntiJoinMode::Regular);
+        valid_roles.set_left_set(preserved.clone());
+        valid_roles.set_right_set(filtering.clone());
+        let valid_roles = Arc::new(valid_roles);
+
+        let predicates = JoinPredicateSet::from_filters([&missing_roles, &valid_roles])
+            .expect("reduction cut should retain its predicates");
+        assert_eq!(predicates.join_type(), JoinType::Anti);
+        assert_eq!(predicates.filters().len(), 2);
+        assert_eq!(
+            predicates
+                .reduction_roles()
+                .and_then(|roles| roles.orientation_across(&preserved, &filtering)),
+            Some(JoinEdgeOrientation::Forward)
         );
     }
 

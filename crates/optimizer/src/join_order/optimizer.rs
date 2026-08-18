@@ -17,16 +17,16 @@ use paro_planner::expression::{
     ComparisonType, ConjunctionExpression, ConjunctionType, Expression,
 };
 use paro_planner::operator::{
-    AntiJoinMode, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType,
-    JoinCondition, JoinType, LogicalOperator,
+    ColumnBinding, ComparisonJoin, CrossProduct, Filter, Join, JoinComparisonType, JoinCondition,
+    JoinType, LogicalOperator,
 };
 use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan};
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 use crate::cost_model::CostModel as LogicalCostModel;
-use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinPredicateSet};
+use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinCostUnits};
 use crate::join_order::enumerator::PlanEnumerator;
-use crate::join_order::query_graph::{FilterInfo, QueryGraphEdges};
+use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
     DistinctCount, ExtractedFilter, RelationManager, RelationStats,
@@ -139,11 +139,16 @@ pub struct JoinOrderOptimizer {
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new() -> Self {
+        Self::with_cost_units(JoinCostUnits::default())
+    }
+
+    /// Create a join-order optimizer with explicit cost calibration.
+    pub fn with_cost_units(units: JoinCostUnits) -> Self {
         Self {
             relation_manager: RelationManager::new(),
             set_manager: JoinRelationSetManager::new(),
             query_graph: QueryGraphEdges::new(),
-            cost_model: CostModel::new(),
+            cost_model: CostModel::with_units(units),
             filter_infos: Vec::new(),
             plans: HashMap::new(),
             column_stats: HashMap::new(),
@@ -250,7 +255,7 @@ impl JoinOrderOptimizer {
         self.relation_manager = RelationManager::new();
         self.set_manager = JoinRelationSetManager::new();
         self.query_graph = QueryGraphEdges::new();
-        self.cost_model = CostModel::new();
+        self.cost_model.reset();
         self.filter_infos.clear();
         self.plans.clear();
         self.relation_plans.clear();
@@ -656,68 +661,40 @@ impl JoinOrderOptimizer {
             let mut right_plan = self.reconstruct_plan(bind_context, right_node, used_filters)?;
 
             let result = if let Some(predicates) = &node.predicates {
-                if predicates.filters.is_empty() {
-                    {
-                        let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
-                            CrossProduct {
-                                left: Box::new(left_plan),
-                                right: Box::new(right_plan),
-                            },
-                        )));
-                        plan.stats.estimated_cardinality =
-                            Some(Self::join_cardinality_estimate(node.cardinality));
-                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                        plan
+                let chosen_join_type = predicates.join_type();
+                if predicates.reduction_roles().is_some_and(|roles| {
+                    roles.orientation_across(&left_set, &right_set)
+                        == Some(JoinEdgeOrientation::Inverted)
+                }) {
+                    std::mem::swap(&mut left_plan, &mut right_plan);
+                    std::mem::swap(&mut left_set, &mut right_set);
+                }
+
+                let mut join = ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
+                join.anti_join_mode = predicates.anti_join_mode();
+                for filter in predicates.filters() {
+                    if self.append_join_conditions(&mut join, filter, &left_set, &right_set) {
+                        used_filters.insert(filter.filter_index);
                     }
+                }
+
+                if join.conditions.is_empty() {
+                    let mut plan =
+                        LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
+                            left: join.left,
+                            right: join.right,
+                        })));
+                    plan.stats.estimated_cardinality =
+                        Some(Self::join_cardinality_estimate(node.cardinality));
+                    plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+                    plan
                 } else {
-                    let (chosen_join_type, chosen_anti_join_mode) =
-                        Self::choose_join_semantics(predicates);
-                    if matches!(chosen_join_type, JoinType::Semi | JoinType::Anti)
-                        && Self::edge_is_inverted(
-                            &left_set,
-                            &right_set,
-                            predicates
-                                .filters
-                                .first()
-                                .and_then(|filter| filter.left_set.as_ref()),
-                            predicates
-                                .filters
-                                .first()
-                                .and_then(|filter| filter.right_set.as_ref()),
-                        )
-                    {
-                        std::mem::swap(&mut left_plan, &mut right_plan);
-                        std::mem::swap(&mut left_set, &mut right_set);
-                    }
-
-                    let mut join =
-                        ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
-                    join.anti_join_mode = chosen_anti_join_mode;
-                    for filter in &predicates.filters {
-                        if self.append_join_conditions(&mut join, filter, &left_set, &right_set) {
-                            used_filters.insert(filter.filter_index);
-                        }
-                    }
-
-                    if join.conditions.is_empty() {
-                        let mut plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
-                            CrossProduct {
-                                left: join.left,
-                                right: join.right,
-                            },
-                        )));
-                        plan.stats.estimated_cardinality =
-                            Some(Self::join_cardinality_estimate(node.cardinality));
-                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                        plan
-                    } else {
-                        let mut plan =
-                            LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
-                        plan.stats.estimated_cardinality =
-                            Some(Self::join_cardinality_estimate(node.cardinality));
-                        plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
-                        plan
-                    }
+                    let mut plan =
+                        LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
+                    plan.stats.estimated_cardinality =
+                        Some(Self::join_cardinality_estimate(node.cardinality));
+                    plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+                    plan
                 }
             } else {
                 let mut plan =
@@ -770,7 +747,7 @@ impl JoinOrderOptimizer {
             if used_filters.contains(&filter.filter_index) {
                 continue;
             }
-            if filter.set.count() > 0 && JoinRelationSet::is_subset(result_set, &filter.set) {
+            if filter.set.count() > 0 && result_set.contains_all(&filter.set) {
                 expressions.push(filter.filter.clone());
                 filter_indexes.push(filter.filter_index);
             }
@@ -857,10 +834,8 @@ impl JoinOrderOptimizer {
         left_set: &Arc<JoinRelationSet>,
         right_set: &Arc<JoinRelationSet>,
     ) -> Option<JoinCondition> {
-        let filter_left = filter.left_set.as_ref()?;
-        let filter_right = filter.right_set.as_ref()?;
         let invert =
-            Self::edge_is_inverted(left_set, right_set, Some(filter_left), Some(filter_right));
+            filter.orientation_across(left_set, right_set)? == JoinEdgeOrientation::Inverted;
         let comparison_type = Self::to_join_comparison_type(comparison.comparison_type)?;
         Some(JoinCondition::new(
             if invert {
@@ -879,36 +854,6 @@ impl JoinOrderOptimizer {
                 comparison_type
             },
         ))
-    }
-
-    fn choose_join_semantics(predicates: &JoinPredicateSet) -> (JoinType, AntiJoinMode) {
-        let filter = predicates
-            .filters
-            .iter()
-            .find(|filter| matches!(filter.join_type, JoinType::Semi | JoinType::Anti))
-            .or_else(|| {
-                predicates
-                    .filters
-                    .iter()
-                    .find(|filter| filter.join_type != JoinType::Invalid)
-            })
-            .map(Arc::as_ref);
-        filter.map_or((JoinType::Inner, AntiJoinMode::Regular), |filter| {
-            (filter.join_type, filter.anti_join_mode)
-        })
-    }
-
-    fn edge_is_inverted(
-        left_set: &Arc<JoinRelationSet>,
-        right_set: &Arc<JoinRelationSet>,
-        filter_left: Option<&Arc<JoinRelationSet>>,
-        filter_right: Option<&Arc<JoinRelationSet>>,
-    ) -> bool {
-        let (Some(filter_left), Some(filter_right)) = (filter_left, filter_right) else {
-            return false;
-        };
-        JoinRelationSet::is_subset(left_set, filter_right)
-            && JoinRelationSet::is_subset(right_set, filter_left)
     }
 
     fn to_comparison_type(comparison: JoinComparisonType) -> ComparisonType {
@@ -961,7 +906,9 @@ mod tests {
     use paro_planner::expression::{
         ColumnRefExpression, ConstantExpression, FunctionExpression, ReferenceExpression,
     };
-    use paro_planner::operator::{AnyJoin, ColumnBinding, ExpressionGet, Get, Projection};
+    use paro_planner::operator::{
+        AntiJoinMode, AnyJoin, ColumnBinding, ExpressionGet, Get, Projection,
+    };
     use paro_planner::plan::{CardinalityEstimate, NodeStats};
     use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
