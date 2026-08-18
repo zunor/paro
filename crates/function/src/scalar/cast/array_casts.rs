@@ -368,7 +368,7 @@ pub fn array_to_varchar_cast(
 ) -> Result<bool> {
     let array = source.try_to_array_view(count)?;
     let child = ArrayVector::get_entry(source);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !array.is_valid(row) {

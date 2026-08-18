@@ -148,6 +148,11 @@ impl Vector {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
+        if logical_type == LogicalType::Unknown {
+            return Err(paro_error::invalid_input(
+                "cannot allocate a physical vector for unresolved UNKNOWN type",
+            ));
+        }
         let element_size = logical_type.type_size();
         let mut vec = Self {
             vector_type: VectorType::Flat,
@@ -316,14 +321,14 @@ impl Vector {
     }
 
     /// Prepare a varlen result vector for direct row-wise writes.
-    pub fn begin_varlen_write(
+    pub fn try_begin_varlen_write(
         &mut self,
         count: usize,
-    ) -> (*mut StringView, &mut ValidityMask, &mut StringHeap) {
+    ) -> Result<(*mut StringView, &mut ValidityMask, &mut StringHeap)> {
         debug_assert!(self.logical_type.is_utf8_varlen() || self.logical_type == LogicalType::Blob);
 
         self.make_exclusive();
-        self.set_len(count);
+        self.try_set_len(count)?;
 
         let allocator = self.allocator().clone();
         let heap_arc = self.string_heap.get_or_insert_with(|| {
@@ -337,7 +342,7 @@ impl Vector {
 
         let entries = self.buffer.data() as *mut StringView;
         let validity = &mut self.validity;
-        (entries, validity, heap)
+        Ok((entries, validity, heap))
     }
 
     /// Create a shallow reference to this vector (Zero-copy).

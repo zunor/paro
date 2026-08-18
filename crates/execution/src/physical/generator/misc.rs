@@ -21,7 +21,7 @@ impl PhysicalPlanGenerator {
         for expression in &window.expressions {
             expression.verify_bound_contract()?;
         }
-        let child = self.generate_node(window.child.as_ref())?;
+        let mut child = self.generate_node(window.child.as_ref())?;
         let input_width = window.child.types().len();
         let mut output_names = align_output_names(
             window.child.output_names(),
@@ -35,9 +35,44 @@ impl PhysicalPlanGenerator {
                 vec![child],
             ));
         }
+        let mut expressions = window.expressions.clone();
+        let mut input_expressions = window
+            .child
+            .types()
+            .into_iter()
+            .enumerate()
+            .map(|(index, ty)| Expression::Reference(ReferenceExpression::new(index, ty)))
+            .collect::<Vec<_>>();
+        materialize_window_inputs(&mut expressions, &mut input_expressions);
+        if input_expressions.len() > input_width {
+            let mut input_names = align_output_names(
+                window.child.output_names(),
+                input_width,
+                "window input projection",
+            )?;
+            input_names.extend(
+                (input_width..input_expressions.len())
+                    .map(|index| format!("__window_input_{index}")),
+            );
+            let input_types = input_expressions
+                .iter()
+                .map(Expression::return_type)
+                .collect::<Vec<_>>();
+            let projection = ProjectSpec {
+                expressions: input_expressions.into_boxed_slice(),
+                output_names: input_names.clone().into_boxed_slice(),
+            };
+            child = self.push_node(
+                PhysicalNodeKind::Project(projection),
+                RowType::new(input_names, input_types),
+                vec![child],
+                OperatorLabel::new(window.child.id, "WINDOW_INPUT"),
+                window.child.stats.estimated_cardinality,
+            );
+        }
         let spec = WindowSpec {
             window_index: window.window_index,
-            expressions: window.expressions.clone().into_boxed_slice(),
+            expressions: expressions.into_boxed_slice(),
             input_width,
             output_names: output_names.into_boxed_slice(),
             output_types: window.get_types().into_boxed_slice(),
@@ -92,6 +127,61 @@ impl PhysicalPlanGenerator {
         };
         (PhysicalNodeKind::DelimScan(spec), Vec::new())
     }
+}
+
+fn materialize_window_inputs(
+    expressions: &mut [WindowExpression],
+    input_expressions: &mut Vec<Expression>,
+) {
+    for expression in expressions {
+        for partition in &mut expression.partitions {
+            materialize_window_input(partition, input_expressions);
+        }
+        for order in &mut expression.orders {
+            materialize_window_input(&mut order.expression, input_expressions);
+        }
+        for argument in expression.arguments_mut() {
+            materialize_window_input(argument, input_expressions);
+        }
+        if let WindowInvocation::Aggregate(aggregate) = &mut expression.invocation {
+            if let Some(filter) = &mut aggregate.filter {
+                materialize_window_input(filter, input_expressions);
+            }
+            for order in &mut aggregate.order_bys {
+                materialize_window_input(&mut order.expression, input_expressions);
+            }
+        }
+        if let WindowFrameBound::Offset(offset) = &mut expression.frame.start_bound {
+            materialize_window_input(offset, input_expressions);
+        }
+        if let WindowFrameBound::Offset(offset) = &mut expression.frame.end_bound {
+            materialize_window_input(offset, input_expressions);
+        }
+    }
+}
+
+fn materialize_window_input(expression: &mut Expression, inputs: &mut Vec<Expression>) {
+    if matches!(
+        expression,
+        Expression::Constant(_) | Expression::Reference(_) | Expression::ColumnRef(_)
+    ) {
+        return;
+    }
+    let index = expression
+        .evaluation_properties()
+        .can_share_evaluation()
+        .then(|| {
+            inputs
+                .iter()
+                .position(|candidate| candidate.equals(expression))
+        })
+        .flatten()
+        .unwrap_or_else(|| {
+            let index = inputs.len();
+            inputs.push(expression.clone());
+            index
+        });
+    *expression = Expression::Reference(ReferenceExpression::new(index, expression.return_type()));
 }
 
 /// Lower complete-partition aggregate windows to a sort-free breaker.

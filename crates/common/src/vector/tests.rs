@@ -1901,6 +1901,20 @@ fn test_try_set_len_rejects_flat_capacity_overflow() {
 }
 
 #[test]
+fn direct_varlen_writer_reports_capacity_overflow() {
+    let mut vector =
+        Vector::try_new(LogicalType::Varchar, 1, Arc::new(DefaultAllocator::new())).unwrap();
+
+    let error = match vector.try_begin_varlen_write(2) {
+        Ok(_) => panic!("varlen writer exceeded its vector capacity"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("vector length exceeds capacity"));
+    assert_eq!(vector.len(), 0);
+}
+
+#[test]
 fn string_literal_vectors_use_owned_varlen_storage() {
     let allocator = Arc::new(DefaultAllocator::new());
     let mut source = Vector::try_new(LogicalType::StringLiteral, 1, allocator.clone()).unwrap();
@@ -1922,6 +1936,12 @@ fn string_literal_vectors_use_owned_varlen_storage() {
         destination.get_string(0),
         Some("a string literal longer than the inline payload")
     );
+}
+
+#[test]
+fn unresolved_unknown_type_has_no_physical_vector_layout() {
+    let result = Vector::try_new(LogicalType::Unknown, 1, Arc::new(DefaultAllocator::new()));
+    assert!(result.is_err());
 }
 
 #[test]

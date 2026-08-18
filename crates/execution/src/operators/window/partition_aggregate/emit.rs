@@ -94,7 +94,7 @@ impl PartitionAggregateWindowEmitSourceExec {
                 }
                 let batch_index = global.claim_batch();
                 if let Some((payload, aggregates)) = snapshot.global_batch(batch_index) {
-                    prepare_detail_output(&self.spec, payload, output)?;
+                    prepare_projected_detail_output(&self.spec, payload, output)?;
                     append_global_aggregates(&self.spec, aggregates, output)?;
                     return Ok(SourcePoll::Output);
                 }
@@ -180,7 +180,7 @@ fn prepare_projected_detail_output(
     output.try_reset_writable_suffix(spec.detail_column_count(), output.allocator().clone())?;
     if payload.column_count() != spec.detail_column_count() {
         return Err(paro_error::internal(
-            "global external detail payload width mismatch",
+            "global aggregate detail payload width mismatch",
         ));
     }
     for (target, source) in output.data.iter_mut().zip(&payload.data) {

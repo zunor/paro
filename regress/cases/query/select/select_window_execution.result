@@ -23,6 +23,17 @@ A	3	3
 B	7	1
 C	4	2
 
+SELECT
+    x,
+    sum(x) FILTER (WHERE keep) OVER () AS kept_sum,
+    count(x) FILTER (WHERE keep) OVER () AS kept_count
+FROM (VALUES (1, true), (2, false), (3, true)) AS global_aggregate_input(x, keep)
+ORDER BY x;
+x	kept_sum	kept_count
+1	4	2
+2	4	2
+3	4	2
+
 EXPLAIN SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)
 QUALIFY row_number() OVER (ORDER BY x) <= 2

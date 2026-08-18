@@ -92,6 +92,7 @@ pub struct OptimizationContext {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizerInvalidations {
     late_materialization: bool,
+    scan_projection: bool,
 }
 
 impl OptimizerInvalidations {
@@ -105,6 +106,18 @@ impl OptimizerInvalidations {
 
     pub fn consume_late_materialization(&mut self) {
         self.late_materialization = false;
+    }
+
+    pub fn mark_scan_projection(&mut self) {
+        self.scan_projection = true;
+    }
+
+    pub fn scan_projection_pending(self) -> bool {
+        self.scan_projection
+    }
+
+    pub fn consume_scan_projection(&mut self) {
+        self.scan_projection = false;
     }
 }
 

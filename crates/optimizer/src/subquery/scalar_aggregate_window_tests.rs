@@ -3,6 +3,8 @@
 
 use paro_planner::operator::LogicalOperator;
 use paro_planner::planner::Planner;
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use super::partition_aggregate_tests::setup_session;
 use crate::optimizer::Optimizer;
@@ -61,21 +63,88 @@ fn subset_filtered_scalar_aggregate_reuses_detail_scan() {
 }
 
 #[test]
-fn matched_prefix_rejects_any_other_source_value_use() {
+fn matched_prefix_has_an_independent_binding_from_the_stored_value() {
     for sql in [
         "SELECT substring(c_phone FROM 1 FOR 2) \
          FROM customer \
          WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31') \
            AND c_phone > '13'",
-        "SELECT substring(c_phone FROM 1 FOR 2) \
-         FROM customer \
-         WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31') \
-            OR c_acctbal > 0",
         "SELECT substring(c_phone FROM 1 FOR 2), c_phone \
          FROM customer \
          WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31')",
     ] {
         let session = setup_session();
+        let statement = paro_parser::parse_one(sql)
+            .expect("parse rejected prefix proof shape")
+            .stmt;
+        let mut planner = Planner::new(session.clone());
+        planner
+            .create_plan(statement)
+            .expect("plan rejected prefix proof shape");
+        let plan = planner.take_plan().expect("logical plan");
+        let mut optimizer = Optimizer::new(planner.binder.clone(), session);
+        let optimized = optimizer.optimize(plan).expect("optimize prefix query");
+
+        optimized
+            .try_visit_pre_order(|plan| {
+                if let LogicalOperator::Get(get) = &plan.operator {
+                    let matched = get
+                        .column_projections
+                        .iter()
+                        .position(|projection| {
+                            matches!(
+                                projection,
+                                paro_planner::operator::GetColumnProjection::MatchedUtf8Prefix {
+                                    byte_width: 2
+                                }
+                            )
+                        })
+                        .expect("independent matched-prefix output");
+                    let source_id = get.column_ids[matched];
+                    assert!(get
+                        .column_ids
+                        .iter()
+                        .enumerate()
+                        .any(|(index, &column_id)| {
+                            column_id == source_id
+                                && index != matched
+                                && matches!(
+                                    get.column_projections[index],
+                                    paro_planner::operator::GetColumnProjection::Stored
+                                )
+                        }));
+                }
+                Ok(())
+            })
+            .expect("inspect prefix query");
+    }
+}
+
+#[test]
+fn matched_prefix_requires_a_direct_pushdown_witness() {
+    for (sql, pushdown_enabled) in [
+        (
+            "SELECT substring(c_phone FROM 1 FOR 2) \
+             FROM customer \
+             WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31') \
+                OR c_acctbal > 0",
+            true,
+        ),
+        (
+            "SELECT substring(c_phone FROM 1 FOR 2) \
+             FROM customer \
+             WHERE substring(c_phone FROM 1 FOR 2) IN ('13', '31')",
+            false,
+        ),
+    ] {
+        let mut session = setup_session();
+        if !pushdown_enabled {
+            Arc::get_mut(&mut session).expect("fresh session").settings =
+                Arc::new(paro_context::EffectiveSettings::new(HashMap::from([(
+                    "rowset_scan_pushdown".to_string(),
+                    paro_common::runtime_value::Value::Boolean(false),
+                )])));
+        }
         let statement = paro_parser::parse_one(sql)
             .expect("parse rejected prefix proof shape")
             .stmt;

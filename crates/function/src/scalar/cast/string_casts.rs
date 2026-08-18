@@ -19,7 +19,7 @@ pub fn numeric_to_varchar_cast<T: std::fmt::Display + Copy>(
 ) -> Result<bool> {
     let view = input.try_to_view(count)?;
     let data = view.get_data::<T>();
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
@@ -123,7 +123,7 @@ pub fn uuid_to_varchar_cast(
     let data = view
         .get_data::<u128>()
         .expect("uuid cast requires pointer data");
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
@@ -146,7 +146,7 @@ fn varchar_to_json_like_cast(
 ) -> Result<bool> {
     let mut all_success = true;
     let view = input.try_to_utf8_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {

@@ -130,9 +130,10 @@ pub unsafe fn read_row_value(layout: &RowLayout, row_ptr: *const u8, col_idx: us
         | paro_common::types::LogicalType::StringLiteral => {
             // SAFETY: `data_ptr` addresses a live canonical row varlen cell.
             let value = unsafe { StringView::from_cell(data_ptr) };
-            // SAFETY: typed row writers preserve the UTF-8 invariant for each
-            // textual logical type accepted by this branch.
-            Value::Varchar(unsafe { value.as_str_unchecked() }.to_owned())
+            // This legacy scalar accessor cannot return a decoding error. Keep
+            // it memory-safe for corrupted rows; fallible bulk gather paths
+            // validate and report the malformed value instead.
+            Value::Varchar(String::from_utf8_lossy(value.as_bytes()).into_owned())
         }
         paro_common::types::LogicalType::Blob => {
             // SAFETY: `data_ptr` addresses a live canonical row varlen cell.

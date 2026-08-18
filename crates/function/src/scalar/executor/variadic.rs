@@ -14,7 +14,7 @@ pub fn execute_concat(input: &Chunk, result: &mut Vector) -> Result<()> {
         .iter()
         .map(|vector| vector.try_to_utf8_view(count))
         .collect::<Result<Vec<_>>>()?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         let capacity = views
@@ -46,7 +46,7 @@ pub fn execute_concat_ws(input: &Chunk, result: &mut Vector) -> Result<()> {
         .skip(1)
         .map(|vector| vector.try_to_utf8_view(count))
         .collect::<Result<Vec<_>>>()?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !separator.is_valid(row) {

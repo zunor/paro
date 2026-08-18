@@ -29,11 +29,9 @@ pub fn optimize_plan(
     plan: LogicalPlan,
     bind_context: &BindContext,
     cost_model: &CostModel,
-    enable_matched_prefix: bool,
 ) -> Result<(LogicalPlan, bool)> {
     plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
-        let (plan, node_changed) =
-            rewrite_node(plan, bind_context, cost_model, enable_matched_prefix)?;
+        let (plan, node_changed) = rewrite_node(plan, bind_context, cost_model)?;
         Ok((
             plan,
             node_changed || child_changes.into_iter().any(|changed| changed),
@@ -45,13 +43,7 @@ fn rewrite_node(
     plan: LogicalPlan,
     bind_context: &BindContext,
     cost_model: &CostModel,
-    enable_matched_prefix: bool,
 ) -> Result<(LogicalPlan, bool)> {
-    if enable_matched_prefix {
-        if let Some(proof) = prove_matched_prefix_candidate(&plan) {
-            return Ok((apply_matched_prefix_rewrite(plan, proof)?, true));
-        }
-    }
     if let Some(proof) = prove_selective_projection_candidate(&plan, cost_model) {
         return Ok((
             apply_selective_projection_rewrite(plan, proof, bind_context)?,
@@ -68,6 +60,22 @@ fn rewrite_node(
             None => Ok((plan, false)),
         },
     }
+}
+
+/// Lower exact leading-substring expressions to derived scan outputs. This is
+/// a separate optimizer lifecycle from late row fetching: it neither creates
+/// row IDs nor changes where stored payload is materialized.
+pub fn optimize_matched_prefix_plan(plan: LogicalPlan) -> Result<(LogicalPlan, bool)> {
+    plan.try_fold_post_order(|plan, child_changes: Vec<bool>| {
+        let (plan, node_changed) = match prove_matched_prefix_candidate(&plan) {
+            Some(proof) => (apply_matched_prefix_rewrite(plan, proof)?, true),
+            None => (plan, false),
+        };
+        Ok((
+            plan,
+            node_changed || child_changes.into_iter().any(|changed| changed),
+        ))
+    })
 }
 
 #[derive(Debug)]
@@ -139,23 +147,7 @@ fn prove_matched_prefix_candidate(plan: &LogicalPlan) -> Option<MatchedPrefixCan
             Some(_) => return None,
         }
     }
-    let candidate = candidate?;
-    // Replacing the scan value changes every binding use, including sibling
-    // expressions in this output projection. Only the exact substring roots
-    // recorded above are semantically interchangeable with the compact scan
-    // value; any other root must retain the stored VARCHAR.
-    if output
-        .expressions
-        .iter()
-        .enumerate()
-        .any(|(index, expression)| {
-            !candidate.output_indices.contains(&index)
-                && expression_references_binding(expression, candidate.source_binding)
-        })
-    {
-        return None;
-    }
-    Some(candidate)
+    candidate
 }
 
 fn prove_matched_prefix_use_path(
@@ -169,84 +161,44 @@ fn prove_matched_prefix_use_path(
             (get.table_index == source_binding.table_index).then_some(false)
         }
         LogicalOperator::Filter(filter) => {
-            let mut witnessed = prove_matched_prefix_use_path(
-                filter.child.as_ref(),
-                source_binding,
-                kernel,
-                byte_width,
-            )?;
-            for expression in &filter.expressions {
-                witnessed |=
-                    prove_prefix_filter_expression(expression, source_binding, kernel, byte_width)?;
+            if matches!(&filter.child.operator, LogicalOperator::Get(get)
+                if get.table_index == source_binding.table_index)
+            {
+                return Some(filter.expressions.iter().any(|expression| {
+                    prove_prefix_filter_expression(expression, source_binding, kernel, byte_width)
+                }));
             }
-            Some(witnessed)
+            prove_matched_prefix_use_path(filter.child.as_ref(), source_binding, kernel, byte_width)
         }
         LogicalOperator::Window(window) => {
-            if window.expressions.iter().any(|expression| {
-                expression_references_binding(
-                    &Expression::Window(expression.clone()),
-                    source_binding,
-                )
-            }) {
-                return None;
-            }
             prove_matched_prefix_use_path(window.child.as_ref(), source_binding, kernel, byte_width)
         }
         LogicalOperator::Order(order) => {
-            if order
-                .orders
-                .iter()
-                .any(|order| expression_references_binding(&order.expression, source_binding))
-            {
-                return None;
-            }
             prove_matched_prefix_use_path(order.child.as_ref(), source_binding, kernel, byte_width)
         }
         LogicalOperator::Limit(limit) => {
-            if limit
-                .limit
-                .iter()
-                .chain(limit.offset.iter())
-                .any(|expression| expression_references_binding(expression, source_binding))
-            {
-                return None;
-            }
             prove_matched_prefix_use_path(limit.child.as_ref(), source_binding, kernel, byte_width)
+        }
+        LogicalOperator::TopN(topn) => {
+            prove_matched_prefix_use_path(topn.child.as_ref(), source_binding, kernel, byte_width)
         }
         LogicalOperator::EmptyResult(empty) => {
             prove_matched_prefix_use_path(empty.child.as_ref(), source_binding, kernel, byte_width)
         }
-        LogicalOperator::Join(Join::Comparison(join)) => {
-            if join.conditions.iter().any(|condition| {
-                expression_references_binding(&condition.left, source_binding)
-                    || expression_references_binding(&condition.right, source_binding)
-            }) || join
-                .duplicate_eliminated_columns
-                .iter()
-                .any(|expression| expression_references_binding(expression, source_binding))
-            {
-                return None;
-            }
-            prove_prefix_join_child(
-                join.left.as_ref(),
-                join.right.as_ref(),
-                source_binding,
-                kernel,
-                byte_width,
-            )
-        }
-        LogicalOperator::Join(Join::Any(join)) => {
-            if expression_references_binding(&join.condition, source_binding) {
-                return None;
-            }
-            prove_prefix_join_child(
-                join.left.as_ref(),
-                join.right.as_ref(),
-                source_binding,
-                kernel,
-                byte_width,
-            )
-        }
+        LogicalOperator::Join(Join::Comparison(join)) => prove_prefix_join_child(
+            join.left.as_ref(),
+            join.right.as_ref(),
+            source_binding,
+            kernel,
+            byte_width,
+        ),
+        LogicalOperator::Join(Join::Any(join)) => prove_prefix_join_child(
+            join.left.as_ref(),
+            join.right.as_ref(),
+            source_binding,
+            kernel,
+            byte_width,
+        ),
         LogicalOperator::Join(Join::Cross(join)) => prove_prefix_join_child(
             join.left.as_ref(),
             join.right.as_ref(),
@@ -280,32 +232,23 @@ fn prove_prefix_filter_expression(
     source_binding: ColumnBinding,
     kernel: &paro_function::scalar::BoundScalarFunction,
     byte_width: usize,
-) -> Option<bool> {
-    if !expression_references_binding(expression, source_binding) {
-        return Some(false);
-    }
+) -> bool {
     if let Expression::Conjunction(conjunction) = expression {
-        // A witness in one OR branch says nothing about rows produced by the
-        // other branches. Keep the proof intentionally one-way: every use in
-        // an AND term may add a witness, while any source use below OR makes
-        // scan-time truncation ineligible.
         if conjunction.conjunction_type != ConjunctionType::And {
-            return None;
+            return false;
         }
-        let mut witnessed = false;
-        for child in &conjunction.children {
-            witnessed |= prove_prefix_filter_expression(child, source_binding, kernel, byte_width)?;
-        }
-        return Some(witnessed);
+        return conjunction.children.iter().any(|child| {
+            prove_prefix_filter_expression(child, source_binding, kernel, byte_width)
+        });
     }
     let Expression::Operator(operator) = expression else {
-        return None;
+        return false;
     };
     if operator.operator_type != OperatorType::In || operator.children.len() < 2 {
-        return None;
+        return false;
     }
     let Expression::Function(projected) = &operator.children[0] else {
-        return None;
+        return false;
     };
     let Some(ScalarPredicateProjection::Utf8Substring {
         source_argument,
@@ -313,7 +256,7 @@ fn prove_prefix_filter_expression(
         length: Some(length),
     }) = projected.function.predicate_projection.as_ref()
     else {
-        return None;
+        return false;
     };
     if usize::try_from(*length).ok() != Some(byte_width)
         || !scalar_kernels_equal(&projected.function, kernel)
@@ -328,21 +271,9 @@ fn prove_prefix_filter_expression(
                     if value.is_ascii() && value.len() == byte_width))
         })
     {
-        return None;
+        return false;
     }
-    Some(true)
-}
-
-fn expression_references_binding(expression: &Expression, binding: ColumnBinding) -> bool {
-    let mut found = false;
-    visit_expression(expression, &mut |candidate| {
-        if matches!(candidate, Expression::ColumnRef(column)
-            if column.depth == 0 && column.binding == binding)
-        {
-            found = true;
-        }
-    });
-    found
+    true
 }
 
 fn apply_matched_prefix_rewrite(
@@ -352,23 +283,20 @@ fn apply_matched_prefix_rewrite(
     let LogicalOperator::Projection(output) = &mut plan.operator else {
         return Err(rewrite_invariant("matched-prefix root is not Projection"));
     };
-    if !set_get_matched_prefix_projection(
+    let derived_binding = append_get_matched_prefix_projection(
         output.child.as_mut(),
         candidate.source_table_index,
-        candidate.source_binding.column_index,
+        candidate.source_binding,
         candidate.byte_width,
-    ) {
-        return Err(rewrite_invariant(
-            "matched-prefix source Get no longer matches its proof",
-        ));
-    }
+    )
+    .ok_or_else(|| rewrite_invariant("matched-prefix source Get no longer matches its proof"))?;
     for output_index in candidate.output_indices {
         let expression = output
             .expressions
             .get_mut(output_index)
             .ok_or_else(|| rewrite_invariant("matched-prefix output ordinal is stale"))?;
         *expression = Expression::ColumnRef(ColumnRefExpression::new(
-            candidate.source_binding,
+            derived_binding,
             LogicalType::Varchar,
         ));
     }
@@ -380,33 +308,154 @@ fn apply_matched_prefix_rewrite(
     Ok(plan)
 }
 
-fn set_get_matched_prefix_projection(
+fn append_get_matched_prefix_projection(
     plan: &mut LogicalPlan,
     table_index: usize,
-    column_index: usize,
+    source_binding: ColumnBinding,
     byte_width: usize,
-) -> bool {
+) -> Option<ColumnBinding> {
     if let LogicalOperator::Get(get) = &mut plan.operator {
         if get.table_index != table_index {
-            return false;
+            return None;
         }
-        let Some(projection) = get.column_projections.get_mut(column_index) else {
-            return false;
-        };
-        if *projection != GetColumnProjection::Stored {
-            return false;
+        if get.column_projections.get(source_binding.column_index)
+            != Some(&GetColumnProjection::Stored)
+        {
+            return None;
         }
-        *projection = GetColumnProjection::MatchedUtf8Prefix { byte_width };
-        return true;
+        let column_id = *get.column_ids.get(source_binding.column_index)?;
+        let column_type = get.column_types.get(source_binding.column_index)?.clone();
+        return Some(get.append_output(
+            format!("__ascii_prefix_{column_id}_{byte_width}"),
+            LogicalType::Varchar,
+            column_id,
+            column_type,
+            GetColumnProjection::MatchedUtf8Prefix { byte_width },
+        ));
     }
-    let mut matches = 0usize;
-    let _ = plan.visit_children_mut(|child| {
-        if set_get_matched_prefix_projection(child, table_index, column_index, byte_width) {
-            matches += 1;
+    append_prefix_through_operator(plan, table_index, source_binding, byte_width)
+}
+
+fn append_prefix_through_operator(
+    plan: &mut LogicalPlan,
+    table_index: usize,
+    source_binding: ColumnBinding,
+    byte_width: usize,
+) -> Option<ColumnBinding> {
+    match &mut plan.operator {
+        LogicalOperator::Filter(filter) => {
+            let binding = append_get_matched_prefix_projection(
+                filter.child.as_mut(),
+                table_index,
+                source_binding,
+                byte_width,
+            )?;
+            let child_index = filter
+                .child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            filter.projection_map.include(child_index);
+            Some(binding)
         }
-        std::ops::ControlFlow::Continue(())
-    });
-    matches == 1
+        LogicalOperator::Window(window) => append_get_matched_prefix_projection(
+            window.child.as_mut(),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::Order(order) => {
+            let binding = append_get_matched_prefix_projection(
+                order.child.as_mut(),
+                table_index,
+                source_binding,
+                byte_width,
+            )?;
+            let child_index = order
+                .child
+                .get_column_bindings()
+                .iter()
+                .position(|candidate| *candidate == binding)?;
+            order.projection_map.include(child_index);
+            Some(binding)
+        }
+        LogicalOperator::Limit(limit) => append_get_matched_prefix_projection(
+            limit.child.as_mut(),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::TopN(topn) => append_get_matched_prefix_projection(
+            topn.child.as_mut(),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::EmptyResult(empty) => append_get_matched_prefix_projection(
+            empty.child.as_mut(),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::Join(Join::Comparison(join)) => append_prefix_join_child(
+            join.left.as_mut(),
+            join.right.as_mut(),
+            Some(&mut join.left_projection_map),
+            Some(&mut join.right_projection_map),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::Join(Join::Any(join)) => append_prefix_join_child(
+            join.left.as_mut(),
+            join.right.as_mut(),
+            Some(&mut join.left_projection_map),
+            Some(&mut join.right_projection_map),
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        LogicalOperator::Join(Join::Cross(join)) => append_prefix_join_child(
+            join.left.as_mut(),
+            join.right.as_mut(),
+            None,
+            None,
+            table_index,
+            source_binding,
+            byte_width,
+        ),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_prefix_join_child(
+    left: &mut LogicalPlan,
+    right: &mut LogicalPlan,
+    left_projection: Option<&mut paro_planner::operator::ProjectionMap>,
+    right_projection: Option<&mut paro_planner::operator::ProjectionMap>,
+    table_index: usize,
+    source_binding: ColumnBinding,
+    byte_width: usize,
+) -> Option<ColumnBinding> {
+    let (child, projection) = match (
+        count_source_gets(left, table_index),
+        count_source_gets(right, table_index),
+    ) {
+        (1, 0) => (left, left_projection),
+        (0, 1) => (right, right_projection),
+        _ => return None,
+    };
+    let binding =
+        append_get_matched_prefix_projection(child, table_index, source_binding, byte_width)?;
+    if let Some(projection) = projection {
+        let child_index = child
+            .get_column_bindings()
+            .iter()
+            .position(|candidate| *candidate == binding)?;
+        projection.include(child_index);
+    }
+    Some(binding)
 }
 
 #[derive(Debug)]
@@ -473,9 +522,26 @@ fn prove_selective_projection_candidate(
     {
         return None;
     }
-    let fetched_rows = output.child.stats.estimated_cardinality?.expected;
+    // A late fetch is paid after the whole rowid path, where join fanout and
+    // correlated selectivity errors have already accumulated. Planning it
+    // from the expected cardinality makes the decision optimistically
+    // irreversible: an underestimated join creates one random lookup per
+    // actual row. Charge the interval's upper bound for that lookup frontier,
+    // while the eager side below remains based on observed source work.
+    let fetched_rows = output.child.stats.estimated_cardinality?.max;
+    // An exact scan-derived value is a cheaper alternative than carrying a
+    // rowid and re-reading the full stored payload. Keep those output uses in
+    // the carrier so the later, independently profiled scan-projection pass
+    // can assign them a compact derived binding. This is a cost choice, not a
+    // correctness prerequisite for either rewrite.
+    let scan_projected_outputs = prove_matched_prefix_candidate(plan)
+        .map(|candidate| candidate.output_indices.into_iter().collect::<HashSet<_>>())
+        .unwrap_or_default();
     let mut by_source = HashMap::<usize, SelectiveProjectionSource>::new();
-    for expression in &output.expressions {
+    for (output_index, expression) in output.expressions.iter().enumerate() {
+        if scan_projected_outputs.contains(&output_index) {
+            continue;
+        }
         let mut valid = true;
         visit_expression(expression, &mut |candidate| {
             let Expression::ColumnRef(column) = candidate else {
@@ -503,8 +569,7 @@ fn prove_selective_projection_candidate(
             if get.column_projections.get(column.binding.column_index)
                 != Some(&GetColumnProjection::Stored)
             {
-                // The scan already produces a compact semantic projection;
-                // fetching the stored source column would undo that contract.
+                valid = false;
                 return;
             }
             if table
@@ -513,13 +578,6 @@ fn prove_selective_projection_candidate(
                 .is_none_or(|definition| definition.logical_type != column.return_type)
             {
                 valid = false;
-                return;
-            }
-            // Selective row fetch pays a page/gather cost per requested
-            // column. Its first proof domain is genuinely wide payload;
-            // fixed-width values remain cheaper to carry across this short
-            // frontier and avoid an unnecessary second storage access.
-            if !matches!(column.return_type, LogicalType::Varchar | LogicalType::Blob) {
                 return;
             }
             by_source
@@ -546,7 +604,14 @@ fn prove_selective_projection_candidate(
                 source.source_table_index,
                 RowIdPathPolicy::RowPreserving,
             )?;
-            if !rowid_path.contains_window() {
+            // The current sparse fetch frontier has a direct-scan locality
+            // model. Once a rowid crosses a join, physical lookups are paid
+            // after fanout, while join cardinality intervals do not yet carry
+            // a uniqueness/locality bound strong enough to price that work.
+            // Keep semantic rowid propagation broader than lowering
+            // eligibility, but require a cost proof before enabling post-join
+            // fetch rather than treating an optimistic estimate as exact.
+            if rowid_path.crosses_join() {
                 return None;
             }
             let carrier_rows =
@@ -637,15 +702,15 @@ impl RowIdPath {
         }
     }
 
-    fn contains_window(&self) -> bool {
+    fn crosses_join(&self) -> bool {
         match self {
-            Self::Window(_) => true,
             Self::Get => false,
             Self::Filter(child)
+            | Self::Window(child)
             | Self::Order(child)
             | Self::Limit(child)
-            | Self::EmptyResult(child)
-            | Self::Join { child, .. } => child.contains_window(),
+            | Self::EmptyResult(child) => child.crosses_join(),
+            Self::Join { .. } => true,
         }
     }
 }
@@ -749,6 +814,11 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
                     return None;
                 };
                 if column.depth != 0 || column.binding.table_index != source_table_index {
+                    return None;
+                }
+                if get.column_projections.get(column.binding.column_index)
+                    != Some(&GetColumnProjection::Stored)
+                {
                     return None;
                 }
                 let catalog_column = *get.column_ids.get(column.binding.column_index)?;
@@ -856,6 +926,11 @@ fn prove_row_preserving_candidate(
         if table.get_storage().is_none() {
             continue;
         }
+        if get.column_projections.get(column.binding.column_index)
+            != Some(&GetColumnProjection::Stored)
+        {
+            return None;
+        }
         let catalog_column = *get.column_ids.get(column.binding.column_index)?;
         if catalog_column >= table.columns.len()
             || table.columns[catalog_column].logical_type != column.return_type
@@ -956,6 +1031,11 @@ fn prove_rowid_path(
         return None;
     }
     prove_unique_rowid_path(plan, source_table_index, policy)
+}
+
+#[cfg(test)]
+pub(super) fn proves_row_preserving_path(plan: &LogicalPlan, source_table_index: usize) -> bool {
+    prove_rowid_path(plan, source_table_index, RowIdPathPolicy::RowPreserving).is_some()
 }
 
 fn prove_unique_rowid_path(
@@ -1802,13 +1882,13 @@ fn append_virtual_rowid(
             {
                 return Some(ColumnBinding::new(table_index, output_index));
             }
-            let output_index = get.returned_types.len();
-            get.names.push("rowid".to_string());
-            get.returned_types.push(LogicalType::BigInt);
-            get.column_ids.push(virtual_column_id);
-            get.column_types.push(LogicalType::BigInt);
-            get.column_projections.push(GetColumnProjection::Stored);
-            Some(ColumnBinding::new(table_index, output_index))
+            Some(get.append_output(
+                "rowid".to_string(),
+                LogicalType::BigInt,
+                virtual_column_id,
+                LogicalType::BigInt,
+                GetColumnProjection::Stored,
+            ))
         }
         RowIdPath::Filter(child_path) => {
             let LogicalOperator::Filter(filter) = &mut plan.operator else {

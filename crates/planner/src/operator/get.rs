@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use crate::expression::Expression;
+use crate::operator::ColumnBinding;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -62,6 +63,30 @@ pub struct Get {
 }
 
 impl Get {
+    /// Append one scan output atomically across the physical-column and
+    /// logical-output metadata. Derived outputs may share a catalog column id
+    /// with a stored output, but receive their own binding and value semantics.
+    pub fn append_output(
+        &mut self,
+        name: String,
+        returned_type: LogicalType,
+        column_id: usize,
+        column_type: LogicalType,
+        projection: GetColumnProjection,
+    ) -> ColumnBinding {
+        let output_index = self.returned_types.len();
+        debug_assert_eq!(self.names.len(), output_index);
+        debug_assert_eq!(self.column_ids.len(), output_index);
+        debug_assert_eq!(self.column_types.len(), output_index);
+        debug_assert_eq!(self.column_projections.len(), output_index);
+        self.names.push(name);
+        self.returned_types.push(returned_type);
+        self.column_ids.push(column_id);
+        self.column_types.push(column_type);
+        self.column_projections.push(projection);
+        ColumnBinding::new(self.table_index, output_index)
+    }
+
     /// Create a new Get with a reference to the table catalog entry.
     ///
     /// # Arguments

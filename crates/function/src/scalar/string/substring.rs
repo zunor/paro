@@ -212,7 +212,7 @@ fn substring_2_varchar(
     let str_view = str_vec.try_to_utf8_view(count)?;
     let start_view = start_vec.try_to_view(count)?;
     let bound_start = substring_bind_data(state).and_then(|data| data.start);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !start_view.is_valid(row) {
@@ -250,7 +250,7 @@ fn substring_3_varchar(
     let bind_data = substring_bind_data(state);
     let bound_start = bind_data.and_then(|data| data.start);
     let bound_length = bind_data.and_then(|data| data.length);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !start_view.is_valid(row) || !len_view.is_valid(row) {
@@ -279,7 +279,7 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
     let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !n_view.is_valid(row) {
@@ -313,7 +313,7 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
     let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !n_view.is_valid(row) {

@@ -98,6 +98,11 @@ impl<F: RowFormat> RowStoreSpillWriter<F> {
     pub fn count(&self) -> u64 {
         self.builder.count()
     }
+
+    #[inline]
+    pub fn size_in_bytes(&self) -> usize {
+        self.builder.size_in_bytes()
+    }
 }
 
 impl<F: RowFormat> RowSpillWriter<F> for RowStoreSpillWriter<F> {

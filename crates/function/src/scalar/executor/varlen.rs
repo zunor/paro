@@ -12,14 +12,14 @@ pub struct VarcharResultWriter<'a> {
 }
 
 impl<'a> VarcharResultWriter<'a> {
-    pub fn new(result: &'a mut Vector, count: usize) -> Self {
+    pub fn try_new(result: &'a mut Vector, count: usize) -> Result<Self> {
         debug_assert!(result.logical_type().is_utf8_varlen());
-        let (entries, validity, heap) = result.begin_varlen_write(count);
-        Self {
+        let (entries, validity, heap) = result.try_begin_varlen_write(count)?;
+        Ok(Self {
             entries,
             validity,
             heap,
-        }
+        })
     }
 
     #[inline]
@@ -52,7 +52,7 @@ where
     F: FnMut(&str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
     let view = input.try_to_utf8_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !view.is_valid(row) {
@@ -150,7 +150,7 @@ where
 {
     let left = left.try_to_utf8_view(count)?;
     let right = right.try_to_utf8_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !left.is_valid(row) || !right.is_valid(row) {
@@ -177,7 +177,7 @@ where
     let first = first.try_to_utf8_view(count)?;
     let second = second.try_to_utf8_view(count)?;
     let third = third.try_to_utf8_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !first.is_valid(row) || !second.is_valid(row) || !third.is_valid(row) {

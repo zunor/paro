@@ -38,7 +38,8 @@ pub(crate) enum PartitionAggregateLocalOutput {
 
 #[derive(Debug)]
 pub(crate) enum PartitionAggregateSnapshot {
-    /// Zero-key aggregate result paired with the original detail batches.
+    /// Zero-key aggregate result paired with detail-projected batches. Both
+    /// in-memory and external payloads use this exact output-order layout.
     /// Every emitted row observes the same finalized aggregate values, so no
     /// lookup index or per-row selection vector exists in this domain.
     Global {

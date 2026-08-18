@@ -371,9 +371,7 @@ impl Rewriter for UnusedColumnsPass {
 
 pub struct ColumnLifetimePass;
 
-pub struct LatePayloadFetchPass {
-    pub enable_matched_prefix: bool,
-}
+pub struct LatePayloadFetchPass;
 
 impl Rewriter for LatePayloadFetchPass {
     fn optimizer_type(&self) -> OptimizerType {
@@ -381,14 +379,33 @@ impl Rewriter for LatePayloadFetchPass {
     }
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        let (plan, changed) = late_payload::optimize_plan(
-            plan,
-            &ctx.bind_context,
-            &ctx.cost_model,
-            self.enable_matched_prefix,
-        )?;
+        let (plan, changed) =
+            late_payload::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
         if changed {
             ctx.invalidations.mark_late_materialization();
+        }
+        Ok(plan)
+    }
+}
+
+/// Produces a derived scan binding for an exact ASCII prefix that is already
+/// proven by the directly fused scan predicate. This is deliberately not a
+/// late-materialization pass: no stored value changes identity and no row
+/// fetch is introduced.
+pub struct MatchedPrefixScanProjectionPass;
+
+impl Rewriter for MatchedPrefixScanProjectionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::MatchedPrefixScanProjection
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        if !ctx.session.settings.rowset_scan_pushdown() {
+            return Ok(plan);
+        }
+        let (plan, changed) = late_payload::optimize_matched_prefix_plan(plan)?;
+        if changed {
+            ctx.invalidations.mark_scan_projection();
         }
         Ok(plan)
     }

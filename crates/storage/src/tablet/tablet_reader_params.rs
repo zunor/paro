@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::tablet_reader::TabletReader;
+pub use crate::codec::vector_decoder::ColumnValueProjection;
 
 #[derive(Debug, Clone)]
 pub struct TabletReaderParams {
@@ -38,12 +39,6 @@ pub struct ColumnProjection {
     read_columns: Vec<usize>,
     output_to_read: Vec<usize>,
     value_projections: Vec<ColumnValueProjection>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ColumnValueProjection {
-    Stored,
-    MatchedUtf8Prefix { byte_width: usize },
 }
 
 impl ColumnProjection {

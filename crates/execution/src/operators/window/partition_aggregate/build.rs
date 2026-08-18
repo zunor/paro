@@ -31,7 +31,7 @@ use crate::operators::aggregate::payload_spill::{
 };
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::ungrouped::build::{
-    consume_ungrouped_sink_local, create_ungrouped_sink_local,
+    consume_ungrouped_sink_local, create_regular_ungrouped_sink_local,
 };
 use crate::operators::sort::build::query_has_temporary_directory;
 use crate::physical::properties::MemoryClass;
@@ -95,10 +95,9 @@ fn global_detail_spill_writer(
 ) -> Result<RowStoreSpillWriter<GlobalPartitionAggregateDetailFormat>> {
     let types = global_detail_types(spec)?;
     let owner: Arc<dyn paro_common::memory::MemoryOwner> = ctx.memory.clone();
-    Ok(RowStoreSpillWriter::new(
+    Ok(new_global_detail_spill_writer(
         ctx.session.buffer_pool().clone(),
-        GlobalPartitionAggregateDetailFormat::new(&types),
-        MemoryTag::Window,
+        &types,
         MemoryAccountingContext::from_owner(
             owner,
             MemoryDomain::Host,
@@ -108,17 +107,170 @@ fn global_detail_spill_writer(
     ))
 }
 
+fn new_global_detail_spill_writer(
+    buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+    detail_types: &[paro_common::types::LogicalType],
+    memory: MemoryAccountingContext,
+) -> RowStoreSpillWriter<GlobalPartitionAggregateDetailFormat> {
+    RowStoreSpillWriter::new(
+        buffer_pool,
+        GlobalPartitionAggregateDetailFormat::new(detail_types),
+        MemoryTag::Window,
+        memory,
+    )
+}
+
 fn externalize_global_payloads(
-    spec: &PartitionAggregateWindowSpec,
     payloads: &RetainedChunkVec,
     current: Option<&Chunk>,
-    ctx: &crate::runtime::context::QueryRuntimeContext,
+    mut writer: RowStoreSpillWriter<GlobalPartitionAggregateDetailFormat>,
 ) -> Result<RowStoreSpillWriter<GlobalPartitionAggregateDetailFormat>> {
-    let mut writer = global_detail_spill_writer(spec, ctx)?;
     for payload in payloads.iter().chain(current) {
-        writer.append_chunk(&global_detail_chunk(spec, payload)?)?;
+        writer.append_chunk(payload)?;
     }
     Ok(writer)
+}
+
+#[derive(Debug)]
+struct GlobalAggregateLocalSpillReclaimer {
+    name: String,
+    backing: Arc<parking_lot::Mutex<GlobalAggregatePayloadBacking>>,
+    buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+    detail_types: Box<[paro_common::types::LogicalType]>,
+    memory: MemoryAccountingContext,
+}
+
+impl GlobalAggregateLocalSpillReclaimer {
+    fn name_for(handle: &PartitionAggregateWindowHandle, local_id: u64) -> String {
+        format!(
+            "global_aggregate_window_local_spill:{}:{local_id}",
+            handle.metadata().id.index()
+        )
+    }
+}
+
+impl Reclaimer for GlobalAggregateLocalSpillReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        self.backing
+            .try_lock()
+            .map_or(0, |backing| match &*backing {
+                GlobalAggregatePayloadBacking::Columnar(payloads) => payloads.retained_bytes(),
+                GlobalAggregatePayloadBacking::External(_)
+                | GlobalAggregatePayloadBacking::Merged => 0,
+            })
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let Some(mut backing) = self.backing.try_lock() else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        let GlobalAggregatePayloadBacking::Columnar(payloads) = &*backing else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        let before = payloads.retained_bytes();
+        if before == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+
+        // Construct the complete replacement before publishing it. A failed
+        // append drops only the unpublished spill writer and leaves the live
+        // columnar payload intact.
+        let writer = new_global_detail_spill_writer(
+            Arc::clone(&self.buffer_pool),
+            &self.detail_types,
+            self.memory.clone(),
+        );
+        let writer = externalize_global_payloads(payloads, None, writer)
+            .map_err(|error| paro_common::memory::MemoryError::reclaim_failed(error.to_string()))?;
+        let spilled_bytes = writer.size_in_bytes();
+        let old = std::mem::replace(
+            &mut *backing,
+            GlobalAggregatePayloadBacking::External(writer),
+        );
+        drop(old);
+        Ok(ReclaimStats::new(target_bytes, before, spilled_bytes))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
+    }
+}
+
+#[derive(Debug)]
+struct GlobalAggregatePendingSpillReclaimer {
+    name: String,
+    state: Arc<parking_lot::Mutex<GlobalAggregateBuildState>>,
+    buffer_pool: Arc<paro_storage::buffer::BufferPool>,
+    detail_types: Box<[paro_common::types::LogicalType]>,
+    memory: MemoryAccountingContext,
+}
+
+impl GlobalAggregatePendingSpillReclaimer {
+    fn name_for(handle: &PartitionAggregateWindowHandle) -> String {
+        format!(
+            "global_aggregate_window_pending_spill:{}",
+            handle.metadata().id.index()
+        )
+    }
+}
+
+impl Reclaimer for GlobalAggregatePendingSpillReclaimer {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn reclaimable_bytes(&self) -> usize {
+        self.state.try_lock().map_or(0, |state| {
+            state.payload_memory.iter().map(|lease| lease.bytes()).sum()
+        })
+    }
+
+    fn reclaim_sync(&self, target_bytes: usize) -> paro_common::memory::MemoryResult<ReclaimStats> {
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let Some(mut state) = self.state.try_lock() else {
+            return Ok(ReclaimStats::empty(target_bytes));
+        };
+        let before = state
+            .payload_memory
+            .iter()
+            .map(|lease| lease.bytes())
+            .sum::<usize>();
+        if before == 0 || state.payloads.is_empty() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+
+        let mut writer = new_global_detail_spill_writer(
+            Arc::clone(&self.buffer_pool),
+            &self.detail_types,
+            self.memory.clone(),
+        );
+        for payload in &state.payloads {
+            writer.append_chunk(payload).map_err(|error| {
+                paro_common::memory::MemoryError::reclaim_failed(error.to_string())
+            })?;
+        }
+        let store = writer
+            .finish()
+            .map_err(|error| paro_common::memory::MemoryError::reclaim_failed(error.to_string()))?;
+        let spilled_bytes = store.size_in_bytes();
+        state.external_payloads.push(store);
+        state.payloads.clear();
+        state.payload_memory.clear();
+        Ok(ReclaimStats::new(target_bytes, before, spilled_bytes))
+    }
+
+    fn spill_cost(&self) -> SpillCost {
+        SpillCost::SpillToDisk
+    }
 }
 
 #[derive(Debug)]
@@ -280,17 +432,38 @@ impl PartitionAggregateWindowBuildSinkExec {
             ));
         }
         let global = if self.spec.domain == PartitionAggregateDomain::Global {
-            Some(parking_lot::Mutex::new(GlobalAggregateBuildState {
-                accumulator: create_ungrouped_runtime_state(
+            let state = Arc::new(parking_lot::Mutex::new(GlobalAggregateBuildState {
+                accumulator: Some(create_ungrouped_runtime_state(
                     &self.spec.aggregate,
                     ctx.query.allocator(MemoryTag::HashTable),
                     ctx.query.session.buffer_pool().clone(),
                     query_modifier_memory(ctx.query),
-                )?,
+                )?),
                 payloads: Vec::new(),
                 payload_memory: Vec::new(),
                 external_payloads: Vec::new(),
-            }))
+            }));
+            if query_has_temporary_directory(ctx.query)
+                && !ctx.query.session.limits.force_external
+                && !partition_aggregate_preemptive_spill_enabled(ctx.query)
+            {
+                let owner: Arc<dyn paro_common::memory::MemoryOwner> = ctx.query.memory.clone();
+                ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                    GlobalAggregatePendingSpillReclaimer {
+                        name: GlobalAggregatePendingSpillReclaimer::name_for(&handle),
+                        state: Arc::clone(&state),
+                        buffer_pool: ctx.query.session.buffer_pool().clone(),
+                        detail_types: global_detail_types(&self.spec)?,
+                        memory: MemoryAccountingContext::from_owner(
+                            owner,
+                            MemoryDomain::Host,
+                            MemoryTag::Window,
+                            MemoryAccountingClass::Spill,
+                        ),
+                    },
+                ));
+            }
+            Some(state)
         } else {
             None
         };
@@ -306,10 +479,11 @@ impl PartitionAggregateWindowBuildSinkExec {
         _global: &SinkGlobal,
     ) -> Result<SinkLocal> {
         if self.spec.domain == PartitionAggregateDomain::Global {
+            let handle = ctx.handles.get(self.handle)?;
             let spillable = query_has_temporary_directory(ctx.query);
             let force_external = ctx.query.session.limits.force_external
                 || partition_aggregate_preemptive_spill_enabled(ctx.query);
-            let payloads = if spillable && force_external {
+            let payloads = Arc::new(parking_lot::Mutex::new(if spillable && force_external {
                 GlobalAggregatePayloadBacking::External(global_detail_spill_writer(
                     &self.spec, ctx.query,
                 )?)
@@ -319,13 +493,41 @@ impl PartitionAggregateWindowBuildSinkExec {
                         ctx.query.memory.clone(),
                         MemoryDomain::Host,
                         MemoryTag::Window,
-                        MemoryAccountingClass::NonRevocable,
+                        if spillable {
+                            MemoryAccountingClass::Revocable
+                        } else {
+                            MemoryAccountingClass::NonRevocable
+                        },
                     ),
                 ))
+            }));
+            let (local_reclaimer_name, query_memory) = if spillable && !force_external {
+                let local_id = NEXT_PARTITION_AGGREGATE_LOCAL_ID.fetch_add(1, Ordering::Relaxed);
+                let name = GlobalAggregateLocalSpillReclaimer::name_for(&handle, local_id);
+                let owner: Arc<dyn paro_common::memory::MemoryOwner> = ctx.query.memory.clone();
+                ctx.query.memory.register_reclaimer_once_by_name(Arc::new(
+                    GlobalAggregateLocalSpillReclaimer {
+                        name: name.clone(),
+                        backing: Arc::clone(&payloads),
+                        buffer_pool: ctx.query.session.buffer_pool().clone(),
+                        detail_types: global_detail_types(&self.spec)?,
+                        memory: MemoryAccountingContext::from_owner(
+                            owner,
+                            MemoryDomain::Host,
+                            MemoryTag::Window,
+                            MemoryAccountingClass::Spill,
+                        ),
+                    },
+                ));
+                (Some(name), Some(Arc::clone(&ctx.query.memory)))
+            } else {
+                (None, None)
             };
             return Ok(SinkLocal::Dyn(Box::new(GlobalAggregateWindowBuildLocal {
-                accumulator: create_ungrouped_sink_local(&self.spec.aggregate, ctx)?,
+                accumulator: create_regular_ungrouped_sink_local(&self.spec.aggregate, ctx)?,
                 payloads,
+                local_reclaimer_name,
+                query_memory,
             })));
         }
         let handle = ctx.handles.get(self.handle)?;
@@ -432,18 +634,23 @@ impl PartitionAggregateWindowBuildSinkExec {
         if self.spec.domain == PartitionAggregateDomain::Global {
             let local = global_build_local_mut(local)?;
             let spillable = query_has_temporary_directory(ctx.query);
+            // Global payloads have one representation in memory and on disk:
+            // the detail projection in output order. The vectors are merely
+            // referenced here; no row or string payload is copied.
+            let detail = global_detail_chunk(&self.spec, input)?;
+            let payload_backing = Arc::clone(&local.payloads);
+            let mut payload_backing = payload_backing.lock();
             let mut columnar_append = false;
-            let transition = match &mut local.payloads {
+            let transition = match &mut *payload_backing {
                 GlobalAggregatePayloadBacking::Columnar(payloads) => {
-                    if let Err(error) = payloads.push(input.clone_referencing_vectors()) {
+                    if let Err(error) = payloads.push(detail.clone_referencing_vectors()) {
                         if !spillable {
                             return Err(error.into());
                         }
                         Some(externalize_global_payloads(
-                            &self.spec,
                             payloads,
-                            Some(input),
-                            ctx.query,
+                            Some(&detail),
+                            global_detail_spill_writer(&self.spec, ctx.query)?,
                         )?)
                     } else {
                         columnar_append = true;
@@ -451,7 +658,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                     }
                 }
                 GlobalAggregatePayloadBacking::External(writer) => {
-                    writer.append_chunk(&global_detail_chunk(&self.spec, input)?)?;
+                    writer.append_chunk(&detail)?;
                     None
                 }
                 GlobalAggregatePayloadBacking::Merged => {
@@ -462,7 +669,7 @@ impl PartitionAggregateWindowBuildSinkExec {
             };
             if let Some(writer) = transition {
                 let old = std::mem::replace(
-                    &mut local.payloads,
+                    &mut *payload_backing,
                     GlobalAggregatePayloadBacking::External(writer),
                 );
                 drop(old);
@@ -474,7 +681,7 @@ impl PartitionAggregateWindowBuildSinkExec {
                 input,
             ) {
                 if columnar_append {
-                    let GlobalAggregatePayloadBacking::Columnar(payloads) = &mut local.payloads
+                    let GlobalAggregatePayloadBacking::Columnar(payloads) = &mut *payload_backing
                     else {
                         return Err(paro_error::internal(
                             "global aggregate payload backing changed during rollback",
@@ -578,13 +785,18 @@ impl PartitionAggregateWindowBuildSinkExec {
         let global = build_global(global)?;
         if self.spec.domain == PartitionAggregateDomain::Global {
             let local = global_build_local_mut(local)?;
-            let payloads =
-                std::mem::replace(&mut local.payloads, GlobalAggregatePayloadBacking::Merged);
+            let payloads = std::mem::replace(
+                &mut *local.payloads.lock(),
+                GlobalAggregatePayloadBacking::Merged,
+            );
             let aggregate = global.global.as_ref().ok_or_else(|| {
                 paro_error::internal("global aggregate window accumulator is missing")
             })?;
             let mut aggregate = aggregate.lock();
-            combine_ungrouped_states(&mut aggregate.accumulator, &mut local.accumulator)?;
+            let accumulator = aggregate.accumulator.as_mut().ok_or_else(|| {
+                paro_error::internal("global aggregate window was finalized before local merge")
+            })?;
+            combine_ungrouped_states(accumulator, &mut local.accumulator)?;
             destroy_ungrouped_local(&mut local.accumulator)?;
             match payloads {
                 GlobalAggregatePayloadBacking::Columnar(mut payloads) => {
@@ -601,6 +813,8 @@ impl PartitionAggregateWindowBuildSinkExec {
                     ));
                 }
             }
+            drop(aggregate);
+            local.unregister_reclaimer();
             return Ok(MergePoll::Done);
         }
         let local = build_local_mut(local)?;
@@ -666,14 +880,17 @@ impl PartitionAggregateWindowBuildSinkExec {
         let global = build_global(global)?;
         let handle = &global.handle;
         if self.spec.domain == PartitionAggregateDomain::Global {
+            let aggregate = global.global.as_ref().ok_or_else(|| {
+                paro_error::internal("global aggregate window accumulator is missing")
+            })?;
+            let mut aggregate = aggregate.lock();
             if !handle.is_sealed() {
-                let aggregate = global.global.as_ref().ok_or_else(|| {
-                    paro_error::internal("global aggregate window accumulator is missing")
+                let mut accumulator = aggregate.accumulator.take().ok_or_else(|| {
+                    paro_error::internal("global aggregate window was finalized more than once")
                 })?;
-                let mut aggregate = aggregate.lock();
                 let values = finalize_global_aggregate(
                     &self.spec,
-                    &mut aggregate.accumulator,
+                    &mut accumulator,
                     ctx.query.allocator(MemoryTag::Window),
                 )?;
                 let external_payloads = std::mem::take(&mut aggregate.external_payloads);
@@ -693,6 +910,10 @@ impl PartitionAggregateWindowBuildSinkExec {
                 };
                 handle.publish_snapshot(snapshot)?;
             }
+            drop(aggregate);
+            ctx.query.memory.unregister_reclaimer_by_name(
+                &GlobalAggregatePendingSpillReclaimer::name_for(handle),
+            );
             record_partition_aggregate_spill(handle, ctx)?;
             return Ok(FinishPoll::Done);
         }

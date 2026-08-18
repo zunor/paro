@@ -20,6 +20,15 @@ FROM (
 GROUP BY category
 ORDER BY category;
 
+-- A zero-key aggregate window retains detail rows while sharing one complete
+-- aggregate state. FILTER belongs to that shared state, not to detail replay.
+SELECT
+    x,
+    sum(x) FILTER (WHERE keep) OVER () AS kept_sum,
+    count(x) FILTER (WHERE keep) OVER () AS kept_count
+FROM (VALUES (1, true), (2, false), (3, true)) AS global_aggregate_input(x, keep)
+ORDER BY x;
+
 -- Equal windows shared by SELECT and QUALIFY should have one window-runtime output.
 EXPLAIN SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)

@@ -514,7 +514,7 @@ impl TupleLayout {
         result.validity_mut().try_set_all_valid(count)?;
 
         if self.varlen_groups[group_idx] {
-            let (entries, validity, heap) = result.begin_varlen_write(count);
+            let (entries, validity, heap) = result.try_begin_varlen_write(count)?;
             for row_idx in 0..count {
                 // SAFETY: guaranteed by this method's caller contract.
                 let row_ptr = unsafe { row_base.add(row_idx * row_stride) };

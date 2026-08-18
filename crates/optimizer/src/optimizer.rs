@@ -25,9 +25,9 @@ use crate::pipeline_passes::{
     ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
     GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
     JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
-    MixedJoinPredicatePass, ReorderFilterPass, ScalarAggregateWindowPass, SearchOptimizationPass,
-    SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass, TopNPass,
-    UnusedColumnsPass,
+    MatchedPrefixScanProjectionPass, MixedJoinPredicatePass, ReorderFilterPass,
+    ScalarAggregateWindowPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
+    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -55,6 +55,7 @@ struct ConditionalSegment {
 #[derive(Clone, Copy)]
 enum PipelineCondition {
     LateMaterializationInvalidated,
+    ScanProjectionInvalidated,
 }
 
 impl PipelineCondition {
@@ -63,6 +64,7 @@ impl PipelineCondition {
             Self::LateMaterializationInvalidated => {
                 ctx.invalidations.late_materialization_pending()
             }
+            Self::ScanProjectionInvalidated => ctx.invalidations.scan_projection_pending(),
         }
     }
 
@@ -71,6 +73,7 @@ impl PipelineCondition {
             Self::LateMaterializationInvalidated => {
                 ctx.invalidations.consume_late_materialization();
             }
+            Self::ScanProjectionInvalidated => ctx.invalidations.consume_scan_projection(),
         }
     }
 }
@@ -251,7 +254,7 @@ impl Optimizer {
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
         let late_payload_binder = binder.clone();
-        let scalar_late_payload_binder = binder.clone();
+        let scan_projection_binder = binder.clone();
         vec![
             pass(GraphStartSelectionPass),
             pass(GraphMatchDecomposePass),
@@ -312,9 +315,7 @@ impl Optimizer {
             // stable rowid and fetch it only after a bounded TopN. Dependency
             // proofs are populated by statistics propagation immediately
             // above; pruning is performed atomically inside this pass.
-            pass(LatePayloadFetchPass {
-                enable_matched_prefix: false,
-            }),
+            pass(LatePayloadFetchPass),
             // Late payload changes scan widths, join projection maps and
             // serialized build costs. Express that invalidation as a visible,
             // conditionally executed pipeline segment so every pass retains
@@ -337,17 +338,18 @@ impl Optimizer {
             // Fold a subset-filtered scalar aggregate into its matching detail
             // stream as a complete-partition aggregate window.
             pass(ScalarAggregateWindowPass),
-            // The shared scan deliberately creates a blocking full-partition
-            // window. A pushed ASCII prefix predicate can produce its exact
-            // leading substring directly from raw scan bytes; other wide
-            // payload is gathered by stable rowid only for surviving rows.
-            pass(LatePayloadFetchPass {
-                enable_matched_prefix: true,
-            }),
+            // A directly fused ASCII prefix predicate may expose an exact
+            // derived scan output with its own binding. Stored source columns
+            // retain their original identity and remain eligible for row fetch.
+            pass(MatchedPrefixScanProjectionPass),
+            // The predicate still addresses the stored source binding below
+            // the fused Filter, while ancestors only need the new derived
+            // output. Recompute widths now so the stored value is not decoded,
+            // retained, or replayed above that physical witness boundary.
             PipelineStep::Conditional(ConditionalSegment {
-                condition: PipelineCondition::LateMaterializationInvalidated,
+                condition: PipelineCondition::ScanProjectionInvalidated,
                 passes: vec![Box::new(UnusedColumnsPass {
-                    binder: scalar_late_payload_binder,
+                    binder: scan_projection_binder,
                 })],
             }),
             // Projection maps are positional annotations over the final logical

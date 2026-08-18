@@ -82,6 +82,8 @@ pub enum OptimizerType {
     SumRewriter,
     /// Delays materialization for efficiency.
     LateMaterialization,
+    /// Emits an exact predicate-proven ASCII prefix as a derived scan column.
+    MatchedPrefixScanProjection,
     /// Inlines CTEs when beneficial.
     CteInlining,
     /// Eliminates common subplans.
@@ -99,7 +101,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 43] = [
+    pub const ALL: [OptimizerType; 44] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -136,6 +138,7 @@ impl OptimizerType {
         OptimizerType::MaterializedCte,
         OptimizerType::SumRewriter,
         OptimizerType::LateMaterialization,
+        OptimizerType::MatchedPrefixScanProjection,
         OptimizerType::CteInlining,
         OptimizerType::CommonSubplan,
         OptimizerType::JoinElimination,
@@ -187,6 +190,7 @@ impl OptimizerType {
             OptimizerType::MaterializedCte => "materialized_cte",
             OptimizerType::SumRewriter => "sum_rewriter",
             OptimizerType::LateMaterialization => "late_materialization",
+            OptimizerType::MatchedPrefixScanProjection => "matched_prefix_scan_projection",
             OptimizerType::CteInlining => "cte_inlining",
             OptimizerType::CommonSubplan => "common_subplan",
             OptimizerType::JoinElimination => "join_elimination",
@@ -245,6 +249,7 @@ impl FromStr for OptimizerType {
             "materialized_cte" => Ok(OptimizerType::MaterializedCte),
             "sum_rewriter" => Ok(OptimizerType::SumRewriter),
             "late_materialization" => Ok(OptimizerType::LateMaterialization),
+            "matched_prefix_scan_projection" => Ok(OptimizerType::MatchedPrefixScanProjection),
             "cte_inlining" => Ok(OptimizerType::CteInlining),
             "common_subplan" => Ok(OptimizerType::CommonSubplan),
             "join_elimination" => Ok(OptimizerType::JoinElimination),

@@ -281,12 +281,12 @@ pub unsafe fn read_value(
             if logical_type == &LogicalType::Blob {
                 Ok(Value::Blob(value.as_bytes().to_vec()))
             } else {
-                // SAFETY: raw-row writers only accept textual vectors or
-                // `Value::Varchar`, so a textual cell carries the UTF-8
-                // invariant of its logical type.
-                Ok(Value::Varchar(
-                    unsafe { value.as_str_unchecked() }.to_owned(),
-                ))
+                let value = std::str::from_utf8(value.as_bytes()).map_err(|error| {
+                    paro_error::data_corrupted(format!(
+                        "textual raw-row value is not UTF-8: {error}"
+                    ))
+                })?;
+                Ok(Value::Varchar(value.to_owned()))
             }
         }
 
@@ -531,7 +531,7 @@ fn gather_string_internal<const ALL_VALID: bool>(
     // entries directly. Besides avoiding one COW/type-dispatch check per row,
     // copying bytes preserves the raw-row UTF-8 invariant without lossy
     // substitutions.
-    let (entries, validity, heap) = vector.begin_varlen_write(count);
+    let (entries, validity, heap) = vector.try_begin_varlen_write(count)?;
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
         let is_valid = if ALL_VALID {
@@ -543,13 +543,17 @@ fn gather_string_internal<const ALL_VALID: bool>(
         if is_valid {
             // SAFETY: `row_ptr + offset` addresses a live canonical row cell.
             let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
+            // RawRowCollection is populated from a vector of the same logical
+            // type. Text validity is established at that typed input boundary;
+            // this hot path preserves it by copying bytes without constructing
+            // an unchecked `str` or rescanning the payload.
             // SAFETY: the destination vector retains this heap with the entry.
             let copied = unsafe { heap.try_add_blob(value.as_bytes()) }?;
-            // SAFETY: `begin_varlen_write(count)` returned `count` writable entries.
+            // SAFETY: `try_begin_varlen_write(count)` returned `count` writable entries.
             unsafe { entries.add(i).write(copied) };
             validity.try_set_valid(i)?;
         } else {
-            // SAFETY: `begin_varlen_write(count)` returned `count` writable entries.
+            // SAFETY: `try_begin_varlen_write(count)` returned `count` writable entries.
             unsafe { entries.add(i).write(StringView::empty()) };
             validity.try_set_invalid(i)?;
         }
@@ -774,9 +778,12 @@ fn gather_string_with_sel(
             if vector.logical_type() == &LogicalType::Blob {
                 vector.try_set_blob(dst_idx, value.as_bytes())?;
             } else {
-                // SAFETY: textual raw-row cells inherit the UTF-8 invariant
-                // from the typed vector/value writer that created them.
-                vector.try_set_string(dst_idx, unsafe { value.as_str_unchecked() })?;
+                let value = std::str::from_utf8(value.as_bytes()).map_err(|error| {
+                    paro_error::data_corrupted(format!(
+                        "textual raw-row value is not UTF-8: {error}"
+                    ))
+                })?;
+                vector.try_set_string(dst_idx, value)?;
             }
             vector.try_set_null(dst_idx, false)?;
         } else {
@@ -879,9 +886,12 @@ unsafe fn gather_collection_payload(
                 if matches!(logical_type, LogicalType::Blob) {
                     child_vector.try_set_blob(child_idx, bytes)?;
                 } else {
-                    // SAFETY: textual collection payloads are emitted only
-                    // from typed textual child vectors.
-                    child_vector.try_set_string(child_idx, unsafe { string.as_str_unchecked() })?;
+                    let value = std::str::from_utf8(bytes).map_err(|error| {
+                        paro_error::data_corrupted(format!(
+                            "textual collection value is not UTF-8: {error}"
+                        ))
+                    })?;
+                    child_vector.try_set_string(child_idx, value)?;
                 }
                 if !string.is_inlined() && !string.is_empty() && elem_i < source_count {
                     heap_bytes = heap_bytes.saturating_add(string.len());

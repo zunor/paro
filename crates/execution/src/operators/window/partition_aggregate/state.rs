@@ -59,7 +59,10 @@ pub(crate) const GLOBAL_AGGREGATE_WINDOW_BUILD_LOCAL: DynStateTypeId =
 
 #[derive(Debug)]
 pub(crate) struct GlobalAggregateBuildState {
-    pub accumulator: UngroupedAggregateRuntimeState,
+    /// Ownership is consumed exactly once by finalization. Keeping the state
+    /// in an `Option` makes a second finalize attempt impossible before any
+    /// aggregate destructor runs.
+    pub accumulator: Option<UngroupedAggregateRuntimeState>,
     pub payloads: Vec<Chunk>,
     pub payload_memory: Vec<Arc<RetainedMemoryHandle>>,
     pub external_payloads: Vec<RowStore>,
@@ -77,7 +80,7 @@ pub(crate) struct PartitionAggregateBuildGlobal {
     pub handle: Arc<PartitionAggregateWindowHandle>,
     /// Present only for the zero-key execution domain. Keyed windows publish
     /// sink-local hash tables through the runtime handle instead.
-    pub global: Option<Mutex<GlobalAggregateBuildState>>,
+    pub global: Option<Arc<Mutex<GlobalAggregateBuildState>>>,
 }
 
 impl DynGlobalState for PartitionAggregateBuildGlobal {
@@ -143,12 +146,30 @@ impl DynLocalState for PartitionAggregateBuildLocal {
 /// Task-local state for a complete, unpartitioned aggregate window.
 ///
 /// The accumulator is exactly the scalar-aggregate state used by the ordinary
-/// ungrouped aggregate operator. Detail batches retain their existing vectors;
-/// no projected payload or row copy is created.
+/// ungrouped aggregate operator. Detail projection only retains references to
+/// the selected vectors, so no row or variable-length payload copy is created.
 #[derive(Debug)]
 pub(crate) struct GlobalAggregateWindowBuildLocal {
     pub accumulator: UngroupedAggregateSinkLocal,
-    pub payloads: GlobalAggregatePayloadBacking,
+    pub payloads: Arc<Mutex<GlobalAggregatePayloadBacking>>,
+    pub local_reclaimer_name: Option<String>,
+    pub query_memory: Option<Arc<QueryMemoryPool>>,
+}
+
+impl GlobalAggregateWindowBuildLocal {
+    pub(crate) fn unregister_reclaimer(&mut self) {
+        if let (Some(memory), Some(name)) =
+            (self.query_memory.as_ref(), self.local_reclaimer_name.take())
+        {
+            memory.unregister_reclaimer_by_name(&name);
+        }
+    }
+}
+
+impl Drop for GlobalAggregateWindowBuildLocal {
+    fn drop(&mut self) {
+        self.unregister_reclaimer();
+    }
 }
 
 impl DynLocalState for GlobalAggregateWindowBuildLocal {

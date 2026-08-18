@@ -12,7 +12,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::{
     ColumnRefExpression, ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
-    ExpressionIterator, ReferenceExpression,
+    ExpressionIterator, ReferenceExpression, WindowExpression, WindowFrameBound, WindowInvocation,
 };
 use paro_planner::operator::join::{
     AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,

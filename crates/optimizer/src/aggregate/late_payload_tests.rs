@@ -11,8 +11,8 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Get, Join, JoinComparisonType,
-    JoinCondition, JoinType, LogicalOperator, Projection, TopN,
+    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Get, GetColumnProjection, Join,
+    JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection, TopN,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::table::table_factory::TableFactory;
@@ -177,11 +177,97 @@ fn candidate_with_null_extended_source() -> LogicalPlan {
     plan
 }
 
+fn selective_projection_candidate(projection: GetColumnProjection) -> LogicalPlan {
+    let table = source_table();
+    let mut get = Get::new(
+        SOURCE,
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        table
+            .columns
+            .iter()
+            .map(|column| column.logical_type.clone())
+            .collect(),
+        table,
+    );
+    get.column_projections[1] = projection;
+    let mut get = LogicalPlan::synthetic(LogicalOperator::Get(get));
+    get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    let mut filter = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(get, vec![])));
+    filter.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100));
+    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        OUTPUT,
+        filter,
+        vec![column(SOURCE, 1, LogicalType::Varchar)],
+    )))
+}
+
+fn selective_join_projection_candidate(join_type: JoinType, source_on_left: bool) -> LogicalPlan {
+    let table = source_table();
+    let mut source = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+        SOURCE,
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        table
+            .columns
+            .iter()
+            .map(|column| column.logical_type.clone())
+            .collect(),
+        table,
+    )));
+    source.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    let dimension = LogicalPlan::synthetic(LogicalOperator::Get(Get::new_without_table(
+        11,
+        vec!["key".to_string()],
+        vec![LogicalType::BigInt],
+    )));
+    let (left, right, left_key, right_key) = if source_on_left {
+        (
+            source,
+            dimension,
+            column(SOURCE, 0, LogicalType::BigInt),
+            column(11, 0, LogicalType::BigInt),
+        )
+    } else {
+        (
+            dimension,
+            source,
+            column(11, 0, LogicalType::BigInt),
+            column(SOURCE, 0, LogicalType::BigInt),
+        )
+    };
+    let mut join = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+        ComparisonJoin::new(
+            join_type,
+            left,
+            right,
+            vec![JoinCondition::new(
+                left_key,
+                right_key,
+                JoinComparisonType::Equal,
+            )],
+        ),
+    )));
+    join.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100));
+    LogicalPlan::synthetic(LogicalOperator::Projection(Projection::new(
+        OUTPUT,
+        join,
+        vec![column(SOURCE, 1, LogicalType::Varchar)],
+    )))
+}
+
 #[test]
 fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
     let context = BindContext::new();
     let (optimized, changed) =
-        optimize_plan(candidate(false), &context, &CostModel::default(), false).unwrap();
+        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
     assert!(changed);
     let LogicalOperator::Projection(output) = &optimized.operator else {
         panic!("expected late row-fetch projection")
@@ -214,7 +300,7 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
 fn verifier_rejects_materialized_column_type_drift() {
     let context = BindContext::new();
     let (mut optimized, changed) =
-        optimize_plan(candidate(false), &context, &CostModel::default(), false).unwrap();
+        optimize_plan(candidate(false), &context, &CostModel::default()).unwrap();
     assert!(changed);
     crate::verify::verify_logical_plan(&context, &optimized).expect("valid rewrite");
 
@@ -248,7 +334,7 @@ fn verifier_rejects_materialized_column_type_drift() {
 fn ordering_by_delayed_payload_keeps_preserving_plan() {
     let context = BindContext::new();
     let (optimized, changed) =
-        optimize_plan(candidate(true), &context, &CostModel::default(), false).unwrap();
+        optimize_plan(candidate(true), &context, &CostModel::default()).unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
 }
@@ -260,11 +346,116 @@ fn null_extended_source_rowid_keeps_preserving_plan() {
         candidate_with_null_extended_source(),
         &context,
         &CostModel::default(),
-        false,
     )
     .unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
+}
+
+#[test]
+fn selective_projection_fetches_only_surviving_wide_payload() {
+    let context = BindContext::new();
+    let (optimized, changed) = optimize_plan(
+        selective_projection_candidate(GetColumnProjection::Stored),
+        &context,
+        &CostModel::default(),
+    )
+    .unwrap();
+    assert!(changed);
+    let LogicalOperator::Projection(output) = &optimized.operator else {
+        panic!("expected output projection")
+    };
+    let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+        panic!("expected selective RowFetch")
+    };
+    assert_eq!(fetch.sources.len(), 1);
+    assert_eq!(fetch.sources[0].needed_columns.as_ref(), [1]);
+}
+
+#[test]
+fn selective_projection_never_refetches_a_derived_scan_value() {
+    let context = BindContext::new();
+    let (optimized, changed) = optimize_plan(
+        selective_projection_candidate(GetColumnProjection::MatchedUtf8Prefix { byte_width: 2 }),
+        &context,
+        &CostModel::default(),
+    )
+    .unwrap();
+    assert!(!changed);
+    assert!(matches!(optimized.operator, LogicalOperator::Projection(_)));
+}
+
+#[test]
+fn selective_projection_prices_uncertain_fanout_at_its_upper_bound() {
+    let context = BindContext::new();
+    let mut plan = selective_projection_candidate(GetColumnProjection::Stored);
+    let LogicalOperator::Projection(output) = &mut plan.operator else {
+        unreachable!()
+    };
+    output.child.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate {
+        min: 0,
+        expected: 100,
+        max: 100_000,
+    });
+
+    let (optimized, changed) = optimize_plan(plan, &context, &CostModel::default()).unwrap();
+    assert!(!changed);
+    assert!(matches!(optimized.operator, LogicalOperator::Projection(_)));
+}
+
+#[test]
+fn selective_projection_join_matrix_tracks_the_non_null_output_side() {
+    for (join_type, source_on_left, expected) in [
+        (JoinType::Inner, true, true),
+        (JoinType::Left, true, true),
+        (JoinType::Semi, true, true),
+        (JoinType::Anti, true, true),
+        (JoinType::Mark, true, true),
+        (JoinType::Single, true, true),
+        (JoinType::Right, true, false),
+        (JoinType::Inner, false, true),
+        (JoinType::Right, false, true),
+        (JoinType::RightSemi, false, true),
+        (JoinType::RightAnti, false, true),
+        (JoinType::Left, false, false),
+    ] {
+        let plan = selective_join_projection_candidate(join_type, source_on_left);
+        let LogicalOperator::Projection(output) = &plan.operator else {
+            unreachable!()
+        };
+        let proven = super::late_payload::proves_row_preserving_path(output.child.as_ref(), SOURCE);
+        assert_eq!(
+            proven, expected,
+            "join_type={join_type:?}, source_on_left={source_on_left}"
+        );
+    }
+
+    let mut cross = selective_join_projection_candidate(JoinType::Inner, true);
+    let LogicalOperator::Projection(output) = &mut cross.operator else {
+        unreachable!()
+    };
+    let join = std::mem::replace(&mut output.child.operator, LogicalOperator::DummyScan);
+    let LogicalOperator::Join(Join::Comparison(join)) = join else {
+        unreachable!()
+    };
+    output.child.operator =
+        LogicalOperator::Join(Join::Cross(CrossProduct::new(*join.left, *join.right)));
+    let LogicalOperator::Projection(output) = &cross.operator else {
+        unreachable!()
+    };
+    assert!(
+        super::late_payload::proves_row_preserving_path(output.child.as_ref(), SOURCE),
+        "cross products preserve a non-null source rowid"
+    );
+}
+
+#[test]
+fn selective_projection_requires_a_post_join_fetch_cost_proof() {
+    let context = BindContext::new();
+    let plan = selective_join_projection_candidate(JoinType::Inner, true);
+    let (optimized, changed) = optimize_plan(plan, &context, &CostModel::default()).unwrap();
+    assert!(!changed);
+    assert!(matches!(optimized.operator, LogicalOperator::Projection(_)));
 }
 
 #[test]

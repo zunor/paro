@@ -376,7 +376,7 @@ pub fn decimal_to_varchar_cast(
     _ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let (precision, scale) = decimal_params(input.logical_type())?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if input.is_null(row) {

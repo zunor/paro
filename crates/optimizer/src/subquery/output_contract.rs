@@ -153,7 +153,7 @@ fn extend_stored_projection(
     }
     let bindings = child.get_column_bindings();
     let Some(indices) = projection.as_columns() else {
-        return true;
+        return false;
     };
     let Some(selected) = indices
         .iter()

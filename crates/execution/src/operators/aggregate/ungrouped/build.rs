@@ -217,6 +217,21 @@ pub(crate) fn create_ungrouped_sink_local(
     })
 }
 
+/// Construct the regular, merge-by-combine subset of the ungrouped aggregate
+/// lifecycle. Operators using this constructor must not silently allocate and
+/// then omit the distinct or ordered merge/finalize protocols.
+pub(crate) fn create_regular_ungrouped_sink_local(
+    spec: &AggregateSpec,
+    ctx: &mut PipelineInitContext,
+) -> Result<UngroupedAggregateSinkLocal> {
+    if has_aggregate_distinct(spec) || has_aggregate_ordered(spec) {
+        return Err(paro_error::internal(
+            "regular ungrouped aggregate lifecycle does not support distinct or ordered states",
+        ));
+    }
+    create_ungrouped_sink_local(spec, ctx)
+}
+
 pub(crate) fn consume_ungrouped_sink_local(
     spec: &AggregateSpec,
     ctx: &mut OperatorCallContext,

@@ -6,6 +6,7 @@ use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
 use crate::rowset::encoding::{
     BinaryPlainPageBuilder, BinaryPlainPageDecoder, BinaryPlainPageSlice,
 };
+use crate::rowset::BatchRowOrdinal;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
@@ -17,6 +18,15 @@ use paro_common::vector::{
 };
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Value semantics requested from the column decoder. Derived scan values get
+/// an explicit identity at the tablet projection layer; the decoder owns the
+/// encoding-specific transformation needed to produce them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnValueProjection {
+    Stored,
+    MatchedUtf8Prefix { byte_width: usize },
+}
 
 /// A bounded, reader-local cache for the decoded domain of storage dictionary
 /// batches. Storage scans can emit several logical batches backed by the same
@@ -82,6 +92,225 @@ impl StorageDictionaryDecoderCache {
         );
         Ok((child, dictionary_len))
     }
+}
+
+pub(crate) fn decode_column_batch_with_projection(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    physical_rows: usize,
+    selection: Option<&[BatchRowOrdinal]>,
+    rows: usize,
+    projection: ColumnValueProjection,
+    allocator: Arc<dyn Allocator>,
+    storage_provenance_id: Option<u64>,
+) -> Result<Vector> {
+    match projection {
+        ColumnValueProjection::Stored => {
+            let vector = decode_column_batch(
+                logical_type,
+                batch,
+                physical_rows,
+                Arc::clone(&allocator),
+                storage_provenance_id,
+            )?;
+            let Some(selection) = selection else {
+                if rows != physical_rows {
+                    return Err(paro_error::internal(
+                        "stored column projection row domain is inconsistent",
+                    ));
+                }
+                return Ok(vector);
+            };
+            if selection.len() != rows {
+                return Err(paro_error::internal(
+                    "stored column projection selection width is inconsistent",
+                ));
+            }
+            let selection = SelectionVector::try_from_indices(
+                selection.iter().map(|row| row.get()).collect(),
+                allocator,
+            )?;
+            let selection = ValidatedVectorSelection::try_new(selection, physical_rows)
+                .map_err(|error| paro_error::data_corrupted(error.to_string()))?;
+            Vector::try_dictionary_from_validated(Arc::new(vector), selection)
+        }
+        ColumnValueProjection::MatchedUtf8Prefix { byte_width } => {
+            if !logical_type.is_utf8_varlen() {
+                return Err(paro_error::internal(
+                    "matched UTF-8 prefix projection requires a textual source column",
+                ));
+            }
+            decode_matched_utf8_prefix_batch(
+                batch,
+                physical_rows,
+                selection,
+                rows,
+                byte_width,
+                allocator,
+            )
+        }
+    }
+}
+
+fn decode_matched_utf8_prefix_batch(
+    batch: &ColumnBatch,
+    physical_rows: usize,
+    selection: Option<&[BatchRowOrdinal]>,
+    rows: usize,
+    byte_width: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    if byte_width == 0 || selection.is_some_and(|selection| selection.len() != rows) {
+        return Err(paro_error::internal(
+            "invalid matched UTF-8 prefix projection contract",
+        ));
+    }
+    if batch
+        .nulls
+        .as_ref()
+        .is_some_and(|nulls| nulls.len() < physical_rows)
+    {
+        return Err(paro_error::data_corrupted(
+            "matched-prefix null bitmap is shorter than its row domain",
+        ));
+    }
+    let physical_index = |output_index: usize| {
+        selection.map_or(output_index, |selection| selection[output_index].index())
+    };
+    if (0..rows).any(|index| physical_index(index) >= physical_rows)
+        || (1..rows).any(|index| physical_index(index - 1) >= physical_index(index))
+    {
+        return Err(paro_error::data_corrupted(
+            "matched-prefix selection is not strictly increasing within the batch",
+        ));
+    }
+    let mut output = Vector::try_new(LogicalType::Varchar, rows, allocator)?;
+    let (entries, _validity, heap) = output.try_begin_varlen_write(rows)?;
+    let validate_utf8 = !batch.has_verified_utf8();
+    let mut write_value = |output_index: usize, value: &[u8]| -> Result<()> {
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        let prefix = value.get(..byte_width).ok_or_else(|| {
+            paro_error::data_corrupted("matched string is shorter than its prefix witness")
+        })?;
+        if !prefix.is_ascii() {
+            return Err(paro_error::data_corrupted(
+                "matched string contradicts its ASCII prefix witness",
+            ));
+        }
+        // SAFETY: the output vector owns `heap`, and the fallible setup exposed
+        // exactly `rows` writable entries.
+        let entry = unsafe { heap.try_add_blob(prefix) }?;
+        unsafe { entries.add(output_index).write(entry) };
+        Ok(())
+    };
+    let is_null = |row: usize| {
+        batch
+            .nulls
+            .as_ref()
+            .is_some_and(|nulls| nulls.get(row).is_some_and(|flag| *flag != 0))
+    };
+
+    if let Some(dictionary_batch) = &batch.storage_dictionary {
+        if dictionary_batch.codes.len()
+            != physical_rows
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("matched-prefix dictionary cardinality overflow")
+                })?
+        {
+            return Err(paro_error::data_corrupted(
+                "matched-prefix dictionary code cardinality is inconsistent",
+            ));
+        }
+        let mut dictionary = BinaryPlainPageDecoder::new(dictionary_batch.dictionary.clone());
+        dictionary.init()?;
+        for output_index in 0..rows {
+            let row = physical_index(output_index);
+            if is_null(row) {
+                return Err(paro_error::data_corrupted(
+                    "NULL row escaped a matched-prefix predicate",
+                ));
+            }
+            let code_offset = row * std::mem::size_of::<u32>();
+            let code_end = code_offset + std::mem::size_of::<u32>();
+            let code = u32::from_le_bytes(
+                dictionary_batch
+                    .codes
+                    .get(code_offset..code_end)
+                    .ok_or_else(|| paro_error::data_corrupted("dictionary code is truncated"))?
+                    .try_into()
+                    .expect("validated u32 code width"),
+            );
+            let value = dictionary.value_ref_at(code).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix dictionary code is out of range")
+            })?;
+            write_value(output_index, value)?;
+        }
+    } else if let Some(storage) = &batch.storage_binary_plain {
+        if storage.rows() != physical_rows {
+            return Err(paro_error::data_corrupted(
+                "matched-prefix BinaryPlain cardinality is inconsistent",
+            ));
+        }
+        for output_index in 0..rows {
+            let row = physical_index(output_index);
+            if is_null(row) {
+                return Err(paro_error::data_corrupted(
+                    "NULL row escaped a matched-prefix predicate",
+                ));
+            }
+            let value = storage.row_value_ref(row).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix BinaryPlain row is missing")
+            })?;
+            write_value(output_index, value)?;
+        }
+    } else {
+        let mut offset = 0usize;
+        let mut output_index = 0usize;
+        for row in 0..physical_rows {
+            let length_end = offset
+                .checked_add(std::mem::size_of::<u32>())
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("matched-prefix length offset overflow")
+                })?;
+            let length = u32::from_le_bytes(
+                batch
+                    .data
+                    .get(offset..length_end)
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted("matched-prefix length is truncated")
+                    })?
+                    .try_into()
+                    .expect("validated u32 length width"),
+            ) as usize;
+            let value_end = length_end.checked_add(length).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix value offset overflow")
+            })?;
+            let value = batch.data.get(length_end..value_end).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix value exceeds the column batch")
+            })?;
+            if output_index < rows && physical_index(output_index) == row {
+                if is_null(row) {
+                    return Err(paro_error::data_corrupted(
+                        "NULL row escaped a matched-prefix predicate",
+                    ));
+                }
+                write_value(output_index, value)?;
+                output_index += 1;
+            }
+            offset = value_end;
+        }
+        if offset != batch.data.len() || output_index != rows {
+            return Err(paro_error::data_corrupted(
+                "matched-prefix column batch cardinality is inconsistent",
+            ));
+        }
+    }
+    output.try_set_count(rows)?;
+    Ok(output)
 }
 
 pub(crate) fn build_vector_from_bytes(
@@ -518,7 +747,7 @@ fn decode_storage_binary_plain_batch(
         ));
     }
     let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-    let (entries, _validity, heap) = vector.begin_varlen_write(rows);
+    let (entries, _validity, heap) = vector.try_begin_varlen_write(rows)?;
     for row_idx in 0..rows {
         let value = batch
             .row_value_ref(row_idx)
@@ -529,7 +758,7 @@ fn decode_storage_binary_plain_batch(
         }
         // SAFETY: the target vector retains this heap with the decoded entry.
         let entry = unsafe { heap.try_add_blob(value) }?;
-        // SAFETY: begin_varlen_write returned exactly `rows` writable entries.
+        // SAFETY: try_begin_varlen_write returned exactly `rows` writable entries.
         unsafe { entries.add(row_idx).write(entry) };
     }
     Ok(vector)
@@ -736,7 +965,7 @@ fn build_varlen_vector(
     validate_utf8: bool,
 ) -> Result<Vector> {
     let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-    let (entries, _validity, heap) = vector.begin_varlen_write(rows);
+    let (entries, _validity, heap) = vector.try_begin_varlen_write(rows)?;
     let mut offset = 0usize;
     for row_idx in 0..rows {
         let length_end = offset
@@ -762,7 +991,7 @@ fn build_varlen_vector(
         }
         // SAFETY: the target vector retains this heap with the decoded entry.
         let entry = unsafe { heap.try_add_blob(value) }?;
-        // SAFETY: `begin_varlen_write(rows)` returns a `StringView` array
+        // SAFETY: `try_begin_varlen_write(rows)` returns a `StringView` array
         // with exactly `rows` writable entries and `row_idx < rows`.
         unsafe { entries.add(row_idx).write(entry) };
         offset = value_end;

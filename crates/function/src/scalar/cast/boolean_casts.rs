@@ -90,7 +90,7 @@ pub fn bool_to_varchar(
     let data = view
         .get_data::<bool>()
         .expect("bool cast requires pointer data");
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {

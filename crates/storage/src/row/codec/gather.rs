@@ -135,7 +135,7 @@ where
     F: FnMut(usize) -> *const u8,
 {
     let offset = layout.offsets()[column_idx];
-    let (entries, validity, heap) = output.begin_varlen_write(count);
+    let (entries, validity, heap) = output.try_begin_varlen_write(count)?;
     validity.try_set_all_valid(count)?;
 
     for row_idx in 0..count {
@@ -153,6 +153,10 @@ where
         // SAFETY: `cell` is a live row varlen cell and the row owner keeps any
         // referenced allocation alive for this gather operation.
         let value = unsafe { StringView::from_cell(cell) };
+        // RowLayout only accepts a vector whose logical type exactly matches
+        // this output. Text enters such vectors through UTF-8 checked APIs;
+        // gathering preserves that already-established invariant by copying
+        // bytes and never constructing an unchecked `str`.
         if value.is_inlined() {
             unsafe { ptr::write(entries.add(row_idx), value) };
             continue;

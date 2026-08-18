@@ -645,7 +645,7 @@ fn decode_packed_rows<T: PackedWord>(
     let source = source.try_decode_ref(count)?;
     let source_data = source.get_data::<T>();
     {
-        let (entries, validity, heap) = target.begin_varlen_write(count);
+        let (entries, validity, heap) = target.try_begin_varlen_write(count)?;
         validity.try_set_all_valid(count)?;
         for row_idx in 0..count {
             let source_idx = source.physical_index(row_idx);
