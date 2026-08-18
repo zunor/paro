@@ -734,14 +734,14 @@ impl<'a> JoinGraph<'a> {
                 if get.table.is_none()
                     || get.scan_order.is_some()
                     || !get.runtime_filter_expressions.iter().all(is_movable)
-                    || get.column_ids.len() != get.column_types.len()
-                    || get.column_ids.len() != get.returned_types.len()
+                    || get.column_sources.len() != get.column_types.len()
+                    || get.column_sources.len() != get.returned_types.len()
                     || !pending_filters.iter().all(|filter| is_movable(filter))
                 {
                     return None;
                 }
                 let id = RelationId(self.relations.len());
-                for column_index in 0..get.column_ids.len() {
+                for column_index in 0..get.column_sources.len() {
                     self.binding_relations
                         .insert(ColumnBinding::new(get.table_index, column_index), id);
                 }
@@ -994,7 +994,7 @@ fn prove_partition_keyed_extension(
         if column.depth != 0 || column.binding.table_index != relation.get.table_index {
             return None;
         }
-        equality_columns.insert(*relation.get.column_ids.get(column.binding.column_index)?);
+        equality_columns.insert(relation.get.stored_column(column.binding.column_index)?);
         key_pairs.push((common_expression, dimension_expression));
     }
     if key_pairs.len() != partitions.len() {
@@ -1345,11 +1345,11 @@ fn bind_scan_columns(inner: &Get, outer: &Get, bindings: &mut BindingMap) -> Opt
     if table_identity(inner)? != table_identity(outer)? {
         return None;
     }
-    for (inner_idx, physical_id) in inner.column_ids.iter().enumerate() {
+    for (inner_idx, source) in inner.column_sources.iter().enumerate() {
         let outer_idx = outer
-            .column_ids
+            .column_sources
             .iter()
-            .position(|candidate| candidate == physical_id)?;
+            .position(|candidate| candidate == source)?;
         if inner.column_types.get(inner_idx) != outer.column_types.get(outer_idx)
             || inner.returned_types.get(inner_idx) != outer.returned_types.get(outer_idx)
             || !bindings.bind(

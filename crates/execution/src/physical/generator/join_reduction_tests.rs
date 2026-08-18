@@ -59,12 +59,11 @@ fn declared_unique_get(ctx: &BindContext) -> LogicalPlan {
             names: vec!["payload".to_string(), "id".to_string()],
             relation_name: Some("unique_build".to_string()),
             relation_alias: None,
-            column_ids: vec![0, 1],
-            column_types: vec![LogicalType::Varchar, LogicalType::BigInt],
-            column_projections: vec![
-                paro_planner::operator::GetColumnProjection::Stored,
-                paro_planner::operator::GetColumnProjection::Stored,
+            column_sources: vec![
+                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
             ],
+            column_types: vec![LogicalType::Varchar, LogicalType::BigInt],
             table: Some(table),
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

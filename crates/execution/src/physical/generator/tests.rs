@@ -1440,16 +1440,15 @@ pub(super) fn test_get() -> Get {
         names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         relation_name: Some("scan_t".to_string()),
         relation_alias: None,
-        column_ids: vec![0, 1, 2],
+        column_sources: vec![
+            paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+            paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+            paro_planner::operator::GetColumnSource::Stored { column_id: 2 },
+        ],
         column_types: vec![
             LogicalType::Integer,
             LogicalType::Integer,
             LogicalType::Varchar,
-        ],
-        column_projections: vec![
-            paro_planner::operator::GetColumnProjection::Stored,
-            paro_planner::operator::GetColumnProjection::Stored,
-            paro_planner::operator::GetColumnProjection::Stored,
         ],
         table: Some(table),
         scan_order: None,

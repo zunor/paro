@@ -65,6 +65,15 @@ impl BatchRowOrdinal {
             )
         }
     }
+
+    /// Borrow a typed batch-ordinal view over the vector selection ABI.
+    ///
+    /// The caller must already have validated the indices against this exact
+    /// vector-sized child domain. `repr(transparent)` makes the view zero-cost.
+    pub(crate) fn from_validated_raw_slice(values: &[u32]) -> &[Self] {
+        debug_assert!(values.iter().all(|value| *value < VECTOR_SIZE as u32));
+        unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<Self>(), values.len()) }
+    }
 }
 
 /// Index into a compact candidate array. Predicate evaluation of a gathered

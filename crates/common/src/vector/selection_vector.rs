@@ -373,6 +373,16 @@ impl ValidatedVectorSelection {
     pub fn is_empty(&self) -> bool {
         self.selection.is_empty()
     }
+
+    /// Borrow materialized indices from the validated mapping without copying.
+    /// Callers that require a domain-specific index type can build a typed view
+    /// over this single authoritative allocation.
+    #[inline]
+    pub fn materialized_indices(&self) -> Option<&[u32]> {
+        self.selection
+            .as_materialized()
+            .map(SelectionVector::as_slice)
+    }
 }
 
 impl VectorSelection {

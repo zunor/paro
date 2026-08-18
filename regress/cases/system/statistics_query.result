@@ -47,6 +47,7 @@ PROJECTION  (rows=1)
   Output Schema: s.id INTEGER, b.payload VARCHAR
   ->  HASH_JOIN  (rows=1)
     Join Type: INNER
+    Build Index: integer_build_time
     Join Condition: #0 = #0
     Cardinality: [1, 1, 1]
     Output Schema: payload VARCHAR, id INTEGER

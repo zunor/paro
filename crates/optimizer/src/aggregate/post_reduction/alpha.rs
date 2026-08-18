@@ -191,12 +191,10 @@ impl AlphaBindings {
         if detail_table.base.base.catalog != scalar_table.base.base.catalog
             || detail_table.base.schema_name != scalar_table.base.schema_name
             || detail_table.base.base.object_id != scalar_table.base.base.object_id
-            || detail.column_ids.len() != detail.column_types.len()
-            || detail.column_ids.len() != detail.returned_types.len()
-            || detail.column_ids.len() != detail.column_projections.len()
-            || scalar.column_ids.len() != scalar.column_types.len()
-            || scalar.column_ids.len() != scalar.returned_types.len()
-            || scalar.column_ids.len() != scalar.column_projections.len()
+            || detail.column_sources.len() != detail.column_types.len()
+            || detail.column_sources.len() != detail.returned_types.len()
+            || scalar.column_sources.len() != scalar.column_types.len()
+            || scalar.column_sources.len() != scalar.returned_types.len()
             || detail.scan_order.is_some()
             || scalar.scan_order.is_some()
             || !detail.runtime_filter_expressions.is_empty()
@@ -206,21 +204,19 @@ impl AlphaBindings {
         }
 
         scalar
-            .column_ids
+            .column_sources
             .iter()
             .enumerate()
-            .all(|(scalar_idx, id)| {
+            .all(|(scalar_idx, source)| {
                 let Some(detail_idx) = detail
-                    .column_ids
+                    .column_sources
                     .iter()
-                    .position(|candidate| candidate == id)
+                    .position(|candidate| candidate == source)
                 else {
                     return false;
                 };
                 detail.column_types[detail_idx] == scalar.column_types[scalar_idx]
                     && detail.returned_types[detail_idx] == scalar.returned_types[scalar_idx]
-                    && detail.column_projections[detail_idx]
-                        == scalar.column_projections[scalar_idx]
                     && self.bind(
                         ColumnBinding::new(detail.table_index, detail_idx),
                         ColumnBinding::new(scalar.table_index, scalar_idx),

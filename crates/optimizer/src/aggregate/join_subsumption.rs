@@ -228,10 +228,9 @@ impl AggregateJoinSubsumption {
                     return Some(DetailScan {
                         table: detail_get.table.as_ref()?.clone(),
                         table_index: detail_get.table_index,
-                        key_column_id: *detail_get.column_ids.get(detail_key.column_index)?,
-                        value_column_id: *detail_get
-                            .column_ids
-                            .get(outer_sum.input_binding.column_index)?,
+                        key_column_id: detail_get.stored_column(detail_key.column_index)?,
+                        value_column_id: detail_get
+                            .stored_column(outer_sum.input_binding.column_index)?,
                     });
                 }
             }
@@ -310,10 +309,8 @@ impl AggregateJoinSubsumption {
         let detail_get = Self::direct_detail_get(detail_plan, outer_sum)?;
         let (detail_key, preserved_key) =
             Self::detail_join_keys(&join.conditions[0], detail_get.table_index)?;
-        let key_column_id = *detail_get.column_ids.get(detail_key.column_index)?;
-        let value_column_id = *detail_get
-            .column_ids
-            .get(outer_sum.input_binding.column_index)?;
+        let key_column_id = detail_get.stored_column(detail_key.column_index)?;
+        let value_column_id = detail_get.stored_column(outer_sum.input_binding.column_index)?;
         let scan = DetailScan {
             table: detail_get.table.as_ref()?.clone(),
             table_index: detail_get.table_index,
@@ -545,7 +542,7 @@ impl AggregateJoinSubsumption {
                 .table
                 .as_ref()
                 .is_some_and(|table| Arc::ptr_eq(table, &detail.table))
-            || *get.column_ids.get(group_key.binding.column_index)? != detail.key_column_id
+            || get.stored_column(group_key.binding.column_index)? != detail.key_column_id
         {
             return None;
         }
@@ -566,8 +563,7 @@ impl AggregateJoinSubsumption {
                 };
                 if value.depth != 0
                     || value.binding.table_index != get.table_index
-                    || get.column_ids.get(value.binding.column_index).copied()
-                        != Some(detail.value_column_id)
+                    || get.stored_column(value.binding.column_index) != Some(detail.value_column_id)
                 {
                     return None;
                 }

@@ -311,6 +311,11 @@ impl Optimizer {
             // lifecycle phase from the cost inputs gathered before join order.
             pass(StatisticsGatheringPass),
             pass(StatisticsPropagationPass),
+            // Establish predicate-derived scan bindings before late-payload
+            // arbitration. A disabled scan-projection pass therefore leaves
+            // the stored expression visible for ordinary late fetching rather
+            // than requiring one pass to predict another pass's decision.
+            pass(MatchedPrefixScanProjectionPass),
             // Replace functionally-dependent wide aggregate payload with a
             // stable rowid and fetch it only after a bounded TopN. Dependency
             // proofs are populated by statistics propagation immediately

@@ -103,3 +103,15 @@ WHERE o.threshold > (
 ORDER BY o.key_a, o.key_b, o.threshold;
 o.key_a	o.key_b	o.threshold
 1	1	10
+
+SELECT c.id, c.balance
+FROM subquery_scalar_window_input AS c
+WHERE c.balance < 100000
+  AND c.balance > (
+    SELECT AVG(s.balance)
+    FROM subquery_scalar_window_input AS s
+    WHERE s.balance < 100000 AND 0 < s.balance
+  )
+ORDER BY c.id;
+c.id	c.balance
+3	20

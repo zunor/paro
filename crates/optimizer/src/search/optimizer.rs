@@ -376,7 +376,7 @@ fn build_topk_request(
         table_id,
         mode: SearchRequestMode::TopK { limit },
         predicate: None,
-        projections: projection_spec(get, matches!(intent, SearchIntent::FullText(_))),
+        projections: projection_spec(get, matches!(intent, SearchIntent::FullText(_)))?,
         intents: vec![intent],
         fusion: None,
     };
@@ -393,7 +393,7 @@ fn build_filter_request(
         table_id,
         mode: SearchRequestMode::Filter,
         predicate: None,
-        projections: projection_spec(get, false),
+        projections: projection_spec(get, false)?,
         intents: vec![intent],
         fusion: None,
     };
@@ -401,15 +401,21 @@ fn build_filter_request(
     Ok(request)
 }
 
-fn projection_spec(get: &Get, include_score: bool) -> ProjectionSpec {
-    ProjectionSpec {
-        columns: get
-            .column_ids
-            .iter()
-            .map(|&column_id| column_id as u32)
-            .collect(),
+fn projection_spec(get: &Get, include_score: bool) -> Result<ProjectionSpec> {
+    Ok(ProjectionSpec {
+        columns: (0..get.returned_types.len())
+            .map(|output| {
+                get.stored_column(output)
+                    .map(|column_id| column_id as u32)
+                    .ok_or_else(|| {
+                        paro_common::error::internal(
+                            "search projection cannot expose a derived scan output as stored",
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?,
         include_score,
-    }
+    })
 }
 
 fn get_search_storage(
@@ -554,7 +560,7 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
 }
 
 fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     let column_type = &get.column_types[column_idx];
@@ -562,7 +568,7 @@ fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
     {
         return None;
     }
-    Some(get.column_ids[column_idx] as u32)
+    Some(get.stored_column(column_idx)? as u32)
 }
 
 fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
@@ -700,11 +706,15 @@ fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIn
 }
 
 fn resolve_sparse_column(get: &Get, column_idx: usize) -> Option<u32> {
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx] as u32)
+        .then(|| {
+            get.stored_column(column_idx)
+                .map(|column_id| column_id as u32)
+        })
+        .flatten()
 }
 
 fn extract_query_sparse_vector(
@@ -921,11 +931,15 @@ fn extract_tsquery_source(
 
 fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<u32> {
     let column_idx = column_idx?;
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx] as u32)
+        .then(|| {
+            get.stored_column(column_idx)
+                .map(|column_id| column_id as u32)
+        })
+        .flatten()
 }
 
 fn extract_scan_col_idx(expr: &Expression) -> Option<usize> {

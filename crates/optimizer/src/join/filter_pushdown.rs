@@ -291,7 +291,7 @@ impl JoinFilterPushdown {
                 if binding.table_index != get.table_index {
                     return None;
                 }
-                let physical_column_id = *get.column_ids.get(binding.column_index)?;
+                let physical_column_id = get.stored_column(binding.column_index)?;
                 let logical_type = get.column_types.get(binding.column_index)?.clone();
                 Some(ResolvedGetBinding {
                     table_index: get.table_index,
@@ -335,7 +335,7 @@ impl JoinFilterPushdown {
     ) -> Option<ResolvedGetBinding> {
         match op {
             LogicalOperator::Get(get) => {
-                let physical_column_id = *get.column_ids.get(output_idx)?;
+                let physical_column_id = get.stored_column(output_idx)?;
                 let logical_type = get.column_types.get(output_idx)?.clone();
                 Some(ResolvedGetBinding {
                     table_index: get.table_index,

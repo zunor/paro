@@ -28,6 +28,35 @@ pub enum ColumnValueProjection {
     MatchedUtf8Prefix { byte_width: usize },
 }
 
+/// One validated selection with both the common vector proof and a typed
+/// storage-domain view over the same allocation.
+///
+/// The wrapper prevents the stored and derived decoder paths from receiving
+/// two independently supplied mappings while keeping matched-prefix row
+/// lookup as a direct newtype slice access in the hot loop.
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnBatchSelection<'a> {
+    ordinals: &'a [BatchRowOrdinal],
+    vector: &'a ValidatedVectorSelection,
+}
+
+impl<'a> ColumnBatchSelection<'a> {
+    pub(crate) fn try_from_validated(vector: &'a ValidatedVectorSelection) -> Result<Self> {
+        let raw = vector
+            .materialized_indices()
+            .ok_or_else(|| paro_error::internal("column batch selection must be materialized"))?;
+        Ok(Self {
+            ordinals: BatchRowOrdinal::from_validated_raw_slice(raw),
+            vector,
+        })
+    }
+
+    #[inline]
+    fn len(self) -> usize {
+        self.ordinals.len()
+    }
+}
+
 /// A bounded, reader-local cache for the decoded domain of storage dictionary
 /// batches. Storage scans can emit several logical batches backed by the same
 /// physical dictionary page. The code stream changes between those batches,
@@ -98,20 +127,24 @@ pub(crate) fn decode_column_batch_with_projection(
     logical_type: &LogicalType,
     batch: &ColumnBatch,
     physical_rows: usize,
-    selection: Option<&[BatchRowOrdinal]>,
+    selection: Option<ColumnBatchSelection<'_>>,
     rows: usize,
     projection: ColumnValueProjection,
     allocator: Arc<dyn Allocator>,
     storage_provenance_id: Option<u64>,
+    cache: &StorageDictionaryDecoderCache,
+    cache_slot: u64,
 ) -> Result<Vector> {
     match projection {
         ColumnValueProjection::Stored => {
-            let vector = decode_column_batch(
+            let vector = decode_column_batch_cached(
                 logical_type,
                 batch,
                 physical_rows,
                 Arc::clone(&allocator),
                 storage_provenance_id,
+                cache,
+                cache_slot,
             )?;
             let Some(selection) = selection else {
                 if rows != physical_rows {
@@ -126,13 +159,7 @@ pub(crate) fn decode_column_batch_with_projection(
                     "stored column projection selection width is inconsistent",
                 ));
             }
-            let selection = SelectionVector::try_from_indices(
-                selection.iter().map(|row| row.get()).collect(),
-                allocator,
-            )?;
-            let selection = ValidatedVectorSelection::try_new(selection, physical_rows)
-                .map_err(|error| paro_error::data_corrupted(error.to_string()))?;
-            Vector::try_dictionary_from_validated(Arc::new(vector), selection)
+            Vector::try_dictionary_from_validated(Arc::new(vector), selection.vector.clone())
         }
         ColumnValueProjection::MatchedUtf8Prefix { byte_width } => {
             if !logical_type.is_utf8_varlen() {
@@ -143,13 +170,48 @@ pub(crate) fn decode_column_batch_with_projection(
             decode_matched_utf8_prefix_batch(
                 batch,
                 physical_rows,
-                selection,
+                selection.map(|selection| selection.ordinals),
                 rows,
                 byte_width,
                 allocator,
             )
         }
     }
+}
+
+/// Project an already materialized textual vector when the source column was
+/// synthesized (schema fill/base-row resolution) rather than decoded from the
+/// current batch. Raw page encodings remain the decoder's responsibility;
+/// this fallback only operates on canonical vector values.
+pub(crate) fn project_matched_utf8_prefix_vector(
+    input: &Vector,
+    rows: usize,
+    byte_width: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    let view = input.try_to_varlen_view(rows)?;
+    let mut output = Vector::try_new(LogicalType::Varchar, rows, allocator)?;
+    let (entries, _validity, heap) = output.try_begin_varlen_write(rows)?;
+    for row in 0..rows {
+        if !view.is_valid(row) {
+            return Err(paro_error::data_corrupted(
+                "NULL row escaped a matched-prefix predicate",
+            ));
+        }
+        let prefix = view.bytes(row).get(..byte_width).ok_or_else(|| {
+            paro_error::data_corrupted("matched string is shorter than its prefix witness")
+        })?;
+        if !prefix.is_ascii() {
+            return Err(paro_error::data_corrupted(
+                "matched string contradicts its ASCII prefix witness",
+            ));
+        }
+        // SAFETY: the output vector owns the heap and exposes `rows` entries.
+        let entry = unsafe { heap.try_add_blob(prefix) }?;
+        unsafe { entries.add(row).write(entry) };
+    }
+    output.try_set_count(rows)?;
+    Ok(output)
 }
 
 fn decode_matched_utf8_prefix_batch(
@@ -268,30 +330,8 @@ fn decode_matched_utf8_prefix_batch(
             write_value(output_index, value)?;
         }
     } else {
-        let mut offset = 0usize;
         let mut output_index = 0usize;
-        for row in 0..physical_rows {
-            let length_end = offset
-                .checked_add(std::mem::size_of::<u32>())
-                .ok_or_else(|| {
-                    paro_error::data_corrupted("matched-prefix length offset overflow")
-                })?;
-            let length = u32::from_le_bytes(
-                batch
-                    .data
-                    .get(offset..length_end)
-                    .ok_or_else(|| {
-                        paro_error::data_corrupted("matched-prefix length is truncated")
-                    })?
-                    .try_into()
-                    .expect("validated u32 length width"),
-            ) as usize;
-            let value_end = length_end.checked_add(length).ok_or_else(|| {
-                paro_error::data_corrupted("matched-prefix value offset overflow")
-            })?;
-            let value = batch.data.get(length_end..value_end).ok_or_else(|| {
-                paro_error::data_corrupted("matched-prefix value exceeds the column batch")
-            })?;
+        for_each_length_prefixed_value(&batch.data, physical_rows, |row, value| {
             if output_index < rows && physical_index(output_index) == row {
                 if is_null(row) {
                     return Err(paro_error::data_corrupted(
@@ -301,9 +341,9 @@ fn decode_matched_utf8_prefix_batch(
                 write_value(output_index, value)?;
                 output_index += 1;
             }
-            offset = value_end;
-        }
-        if offset != batch.data.len() || output_index != rows {
+            Ok(())
+        })?;
+        if output_index != rows {
             return Err(paro_error::data_corrupted(
                 "matched-prefix column batch cardinality is inconsistent",
             ));
@@ -966,25 +1006,7 @@ fn build_varlen_vector(
 ) -> Result<Vector> {
     let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
     let (entries, _validity, heap) = vector.try_begin_varlen_write(rows)?;
-    let mut offset = 0usize;
-    for row_idx in 0..rows {
-        let length_end = offset
-            .checked_add(std::mem::size_of::<u32>())
-            .ok_or_else(|| paro_error::data_corrupted("Variable-length column offset overflow"))?;
-        let length_bytes = data.get(offset..length_end).ok_or_else(|| {
-            paro_error::data_corrupted("Variable-length column length prefix is truncated")
-        })?;
-        let length = u32::from_le_bytes(
-            length_bytes
-                .try_into()
-                .expect("varlen length slice was checked"),
-        ) as usize;
-        let value_end = length_end.checked_add(length).ok_or_else(|| {
-            paro_error::data_corrupted("Variable-length column value offset overflow")
-        })?;
-        let value = data
-            .get(length_end..value_end)
-            .ok_or_else(|| paro_error::data_corrupted("Variable-length value exceeds buffer"))?;
+    for_each_length_prefixed_value(data, rows, |row_idx, value| {
         if validate_utf8 {
             std::str::from_utf8(value)
                 .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
@@ -994,14 +1016,47 @@ fn build_varlen_vector(
         // SAFETY: `try_begin_varlen_write(rows)` returns a `StringView` array
         // with exactly `rows` writable entries and `row_idx < rows`.
         unsafe { entries.add(row_idx).write(entry) };
+        Ok(())
+    })?;
+    Ok(vector)
+}
+
+/// Walk the canonical length-prefixed varlen encoding once. Stored decoding
+/// and derived projections share this parser so encoding validation cannot
+/// drift between the two paths.
+fn for_each_length_prefixed_value(
+    data: &Bytes,
+    rows: usize,
+    mut visit: impl FnMut(usize, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    for row in 0..rows {
+        let length_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("variable-length column offset overflow"))?;
+        let length = u32::from_le_bytes(
+            data.get(offset..length_end)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("variable-length column length prefix is truncated")
+                })?
+                .try_into()
+                .expect("validated u32 length width"),
+        ) as usize;
+        let value_end = length_end.checked_add(length).ok_or_else(|| {
+            paro_error::data_corrupted("variable-length column value offset overflow")
+        })?;
+        let value = data.get(length_end..value_end).ok_or_else(|| {
+            paro_error::data_corrupted("variable-length value exceeds encoded buffer")
+        })?;
+        visit(row, value)?;
         offset = value_end;
     }
     if offset != data.len() {
         return Err(paro_error::data_corrupted(
-            "Variable-length column contains trailing bytes",
+            "variable-length column contains trailing bytes",
         ));
     }
-    Ok(vector)
+    Ok(())
 }
 
 fn build_bool_vector(data: &Bytes, rows: usize, allocator: Arc<dyn Allocator>) -> Result<Vector> {

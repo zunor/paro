@@ -9,6 +9,37 @@
 
 use std::cmp::Ordering;
 use std::fmt;
+
+/// Bytes whose UTF-8 validity was established at an earlier typed boundary.
+///
+/// This witness lets storage and execution copy canonical textual payloads
+/// without rescanning them or constructing an unchecked `str`. It carries no
+/// allocation and is intentionally constructible from raw bytes only through
+/// an unsafe contract.
+#[derive(Clone, Copy)]
+pub struct VerifiedUtf8Bytes<'a>(&'a [u8]);
+
+impl<'a> VerifiedUtf8Bytes<'a> {
+    /// # Safety
+    ///
+    /// `bytes` must contain valid UTF-8 for the complete lifetime `'a`.
+    #[inline]
+    pub unsafe fn from_bytes_unchecked(bytes: &'a [u8]) -> Self {
+        Self(bytes)
+    }
+
+    #[inline]
+    pub fn as_bytes(self) -> &'a [u8] {
+        self.0
+    }
+}
+
+impl<'a> From<&'a str> for VerifiedUtf8Bytes<'a> {
+    #[inline]
+    fn from(value: &'a str) -> Self {
+        Self(value.as_bytes())
+    }
+}
 use std::hash::{Hash, Hasher};
 
 const LENGTH_LEN: usize = std::mem::size_of::<u32>();

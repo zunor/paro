@@ -56,3 +56,38 @@ SELECT id FROM rowset_pushdown_case ORDER BY score ASC LIMIT 5;
 
 DROP TABLE rowset_pushdown_dim;
 DROP TABLE rowset_pushdown_case;
+
+-- A derived matched-prefix scan output must remain distinct from its stored
+-- source across optimizer, physical predicate witnessing, and page decoding.
+DROP TABLE IF EXISTS matched_prefix_projection_case;
+CREATE TABLE matched_prefix_projection_case(id INT, phone VARCHAR, note VARCHAR);
+INSERT INTO matched_prefix_projection_case VALUES
+    (1, '13alpha', 'keep'),
+    (2, '31beta', 'keep'),
+    (3, '13', 'keep'),
+    (4, '1', 'short'),
+    (5, 'éclair', 'non-ascii'),
+    (6, NULL, 'null'),
+    (7, '44gamma', 'other');
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+
+SET rowset_scan_pushdown = false;
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+SET rowset_scan_pushdown = DEFAULT;
+
+-- The prefix witness may coexist with a residual expression that cannot be
+-- represented by the rowset predicate tree.
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+  AND id % 2 = 1
+ORDER BY id;
+
+DROP TABLE matched_prefix_projection_case;

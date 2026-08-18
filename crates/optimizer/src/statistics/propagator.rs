@@ -510,10 +510,13 @@ impl StatisticsPropagator {
                     let _txn = ctx.catalog_txn_view();
                     if !used_catalog {
                         if let Some(storage) = table.get_storage() {
-                            for (out_idx, &col_id) in get.column_ids.iter().enumerate() {
+                            for out_idx in 0..get.column_sources.len() {
                                 if out_idx >= get.column_types.len() {
                                     break;
                                 }
+                                let Some(col_id) = get.stored_column(out_idx) else {
+                                    continue;
+                                };
                                 if let Some(storage_stats) = storage.column_statistics(col_id) {
                                     let binding = ColumnBinding {
                                         table_index: get.table_index,

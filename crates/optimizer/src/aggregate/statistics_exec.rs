@@ -252,7 +252,7 @@ impl AggregateStatisticsExecutor {
                     if current_binding.table_index != get.table_index {
                         return None;
                     }
-                    let column_id = *get.column_ids.get(current_binding.column_index)?;
+                    let column_id = get.stored_column(current_binding.column_index)?;
                     let table = get.table.as_ref()?;
                     let storage = table.get_storage()?;
                     return Some(Arc::new(storage.column_statistics(column_id)?));

@@ -493,21 +493,14 @@ impl StatisticsGathering {
         let Some(storage) = table.get_storage() else {
             return unknown_stats_for_types(&get.returned_types);
         };
-        get.column_ids
+        get.returned_types
             .iter()
             .enumerate()
-            .map(|(idx, &column_id)| {
-                storage
-                    .column_statistics(column_id)
+            .map(|(idx, return_type)| {
+                get.stored_column(idx)
+                    .and_then(|column_id| storage.column_statistics(column_id))
                     .map(Arc::new)
-                    .unwrap_or_else(|| {
-                        ColumnStatistics::create_unknown(
-                            get.returned_types
-                                .get(idx)
-                                .cloned()
-                                .unwrap_or(LogicalType::Integer),
-                        )
-                    })
+                    .unwrap_or_else(|| ColumnStatistics::create_unknown(return_type.clone()))
             })
             .collect()
     }

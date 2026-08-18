@@ -638,59 +638,51 @@ impl PartitionAggregateWindowBuildSinkExec {
             // the detail projection in output order. The vectors are merely
             // referenced here; no row or string payload is copied.
             let detail = global_detail_chunk(&self.spec, input)?;
-            let payload_backing = Arc::clone(&local.payloads);
-            let mut payload_backing = payload_backing.lock();
-            let mut columnar_append = false;
-            let transition = match &mut *payload_backing {
-                GlobalAggregatePayloadBacking::Columnar(payloads) => {
-                    if let Err(error) = payloads.push(detail.clone_referencing_vectors()) {
-                        if !spillable {
-                            return Err(error.into());
+            {
+                let payload_backing = Arc::clone(&local.payloads);
+                let mut payload_backing = payload_backing.lock();
+                let transition = match &mut *payload_backing {
+                    GlobalAggregatePayloadBacking::Columnar(payloads) => {
+                        if let Err(error) = payloads.push(detail.clone_referencing_vectors()) {
+                            if !spillable {
+                                return Err(error.into());
+                            }
+                            Some(externalize_global_payloads(
+                                payloads,
+                                Some(&detail),
+                                global_detail_spill_writer(&self.spec, ctx.query)?,
+                            )?)
+                        } else {
+                            None
                         }
-                        Some(externalize_global_payloads(
-                            payloads,
-                            Some(&detail),
-                            global_detail_spill_writer(&self.spec, ctx.query)?,
-                        )?)
-                    } else {
-                        columnar_append = true;
+                    }
+                    GlobalAggregatePayloadBacking::External(writer) => {
+                        writer.append_chunk(&detail)?;
                         None
                     }
-                }
-                GlobalAggregatePayloadBacking::External(writer) => {
-                    writer.append_chunk(&detail)?;
-                    None
-                }
-                GlobalAggregatePayloadBacking::Merged => {
-                    return Err(paro_error::internal(
-                        "global aggregate window consumed rows after local merge",
-                    ));
-                }
-            };
-            if let Some(writer) = transition {
-                let old = std::mem::replace(
-                    &mut *payload_backing,
-                    GlobalAggregatePayloadBacking::External(writer),
-                );
-                drop(old);
-            }
-            if let Err(error) = consume_ungrouped_sink_local(
-                &self.spec.aggregate,
-                ctx,
-                &mut local.accumulator,
-                input,
-            ) {
-                if columnar_append {
-                    let GlobalAggregatePayloadBacking::Columnar(payloads) = &mut *payload_backing
-                    else {
+                    GlobalAggregatePayloadBacking::Merged => {
                         return Err(paro_error::internal(
-                            "global aggregate payload backing changed during rollback",
+                            "global aggregate window consumed rows after local merge",
                         ));
-                    };
-                    let _ = payloads.pop();
+                    }
+                };
+                if let Some(writer) = transition {
+                    let old = std::mem::replace(
+                        &mut *payload_backing,
+                        GlobalAggregatePayloadBacking::External(writer),
+                    );
+                    drop(old);
                 }
-                return Err(error);
             }
+
+            // Release the detail lock before aggregate evaluation. Besides
+            // allowing the local memory reclaimer to externalize retained
+            // detail under pressure, this makes the failure contract honest:
+            // detail rows are not a replay log for computed aggregate inputs,
+            // FILTER expressions, or order-sensitive state. An aggregate
+            // update error therefore aborts the query; rolling back only the
+            // detail append would create a half-committed operator state.
+            consume_ungrouped_sink_local(&self.spec.aggregate, ctx, &mut local.accumulator, input)?;
             return Ok(SinkPoll::NeedMoreInput);
         }
         let local = build_local_mut(local)?;

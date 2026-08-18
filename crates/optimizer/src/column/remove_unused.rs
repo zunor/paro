@@ -147,13 +147,13 @@ impl<'a> RemoveUnusedColumns<'a> {
 
     /// Clear unused columns from a Get.
     fn remove_columns_from_get(&mut self, get: &mut paro_planner::operator::Get) {
-        let mut new_column_ids = Vec::new();
+        let mut new_column_sources = Vec::new();
         let mut new_column_types = Vec::new();
-        let mut new_column_projections = Vec::new();
+        let mut new_returned_types = Vec::new();
         let mut new_names = Vec::new();
         let mut new_col_idx = 0usize;
 
-        for (old_idx, &col_id) in get.column_ids.iter().enumerate() {
+        for old_idx in 0..get.column_sources.len() {
             let binding = ColumnBinding::new(get.table_index, old_idx);
             if self.is_referenced(&binding) || self.everything_referenced {
                 // Column is referenced, keep it
@@ -163,9 +163,9 @@ impl<'a> RemoveUnusedColumns<'a> {
                     self.replacements
                         .push(ReplacementBinding::new(binding, new_binding));
                 }
-                new_column_ids.push(col_id);
+                new_column_sources.push(get.column_sources[old_idx]);
                 new_column_types.push(get.column_types[old_idx].clone());
-                new_column_projections.push(get.column_projections[old_idx]);
+                new_returned_types.push(get.returned_types[old_idx].clone());
                 if old_idx < get.names.len() {
                     new_names.push(get.names[old_idx].clone());
                 }
@@ -173,10 +173,9 @@ impl<'a> RemoveUnusedColumns<'a> {
             }
         }
 
-        get.column_ids = new_column_ids;
-        get.column_types = new_column_types.clone();
-        get.column_projections = new_column_projections;
-        get.returned_types = new_column_types;
+        get.column_sources = new_column_sources;
+        get.column_types = new_column_types;
+        get.returned_types = new_returned_types;
         get.names = new_names;
     }
 
@@ -1140,7 +1139,7 @@ mod tests {
         let LogicalOperator::Get(get) = &join.left.operator else {
             panic!("expected left get");
         };
-        assert_eq!(get.column_ids, vec![1]);
+        assert_eq!(get.stored_column(0), Some(1));
         assert_eq!(
             binding(&join.duplicate_eliminated_columns[0]),
             ColumnBinding::new(10, 0)
@@ -1234,10 +1233,48 @@ mod tests {
         let LogicalOperator::Get(get) = &projection.child.operator else {
             panic!("expected scan");
         };
-        assert_eq!(get.column_ids, vec![0, 3]);
+        assert_eq!(get.stored_column(0), Some(0));
+        assert_eq!(get.stored_column(1), Some(3));
         assert_eq!(
             binding(&get.runtime_filter_expressions[0]),
             ColumnBinding::new(10, 1)
         );
+    }
+
+    #[test]
+    fn pruning_preserves_get_returned_type_independently_of_source_type() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let mut get = Get::new_without_table(
+            10,
+            vec!["unused".into(), "text".into()],
+            vec![LogicalType::Integer, LogicalType::Varchar],
+        );
+        get.column_types[1] = LogicalType::VarcharCollation("C".into());
+        get.returned_types[1] = LogicalType::Varchar;
+        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let text = Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(10, 1),
+            LogicalType::Varchar,
+        ));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, scan, vec![text])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Get(get) = &projection.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(
+            get.column_types,
+            vec![LogicalType::VarcharCollation("C".into())]
+        );
+        assert_eq!(get.returned_types, vec![LogicalType::Varchar]);
     }
 }

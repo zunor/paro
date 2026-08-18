@@ -67,9 +67,16 @@ fn declared_unique_keys(plan: &LogicalPlan) -> Vec<Vec<ColumnBinding>> {
                 .columns
                 .iter()
                 .map(|column_id| {
-                    get.column_ids
+                    get.column_sources
                         .iter()
-                        .position(|candidate| candidate == column_id)
+                        .position(|source| {
+                            matches!(
+                                source,
+                                paro_planner::operator::GetColumnSource::Stored {
+                                    column_id: candidate
+                                } if candidate == column_id
+                            )
+                        })
                         .map(|column_index| ColumnBinding::new(get.table_index, column_index))
                 })
                 .collect::<Option<Vec<_>>>()
@@ -1272,7 +1279,10 @@ mod tests {
             types.clone(),
             restored,
         );
-        get.column_ids = vec![2, 0, 1];
+        get.column_sources = vec![2, 0, 1]
+            .into_iter()
+            .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
+            .collect();
         let bind_context = BindContext::new();
         let plan = LogicalPlan {
             id: bind_context.next_plan_id(),

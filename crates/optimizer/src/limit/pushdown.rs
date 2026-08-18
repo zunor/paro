@@ -149,12 +149,11 @@ mod tests {
             names: vec!["id".to_string(), "name".to_string()],
             relation_name: None,
             relation_alias: None,
-            column_ids: vec![0, 1],
-            column_types: vec![LogicalType::Integer, LogicalType::Varchar],
-            column_projections: vec![
-                paro_planner::operator::GetColumnProjection::Stored,
-                paro_planner::operator::GetColumnProjection::Stored,
+            column_sources: vec![
+                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
             ],
+            column_types: vec![LogicalType::Integer, LogicalType::Varchar],
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

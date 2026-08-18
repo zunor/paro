@@ -190,6 +190,7 @@ PROJECTION  (rows=5)
   Output Schema: l.k INTEGER, r.payload VARCHAR
   ->  HASH_JOIN  (rows=5)
     Join Type: LEFT
+    Build Index: integer_build_time
     Join Condition: #0 = #0
     Cardinality: [5, 5, 5]
     Output Schema: k INTEGER, payload VARCHAR

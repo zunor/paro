@@ -89,29 +89,35 @@ fn matched_prefix_has_an_independent_binding_from_the_stored_value() {
             .try_visit_pre_order(|plan| {
                 if let LogicalOperator::Get(get) = &plan.operator {
                     let matched = get
-                        .column_projections
+                        .column_sources
                         .iter()
-                        .position(|projection| {
+                        .position(|source| {
                             matches!(
-                                projection,
-                                paro_planner::operator::GetColumnProjection::MatchedUtf8Prefix {
+                                source,
+                                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                    source_column: _,
                                     byte_width: 2
                                 }
                             )
                         })
                         .expect("independent matched-prefix output");
-                    let source_id = get.column_ids[matched];
+                    let paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                        source_column,
+                        ..
+                    } = get.column_sources[matched]
+                    else {
+                        unreachable!()
+                    };
                     assert!(get
-                        .column_ids
+                        .column_sources
                         .iter()
                         .enumerate()
-                        .any(|(index, &column_id)| {
-                            column_id == source_id
-                                && index != matched
-                                && matches!(
-                                    get.column_projections[index],
-                                    paro_planner::operator::GetColumnProjection::Stored
-                                )
+                        .any(|(index, source)| {
+                            matches!(
+                                source,
+                                paro_planner::operator::GetColumnSource::Stored { column_id }
+                                    if *column_id == source_column
+                            ) && index != matched
                         }));
                 }
                 Ok(())
@@ -159,9 +165,9 @@ fn matched_prefix_requires_a_direct_pushdown_witness() {
         optimized
             .try_visit_pre_order(|plan| {
                 if let LogicalOperator::Get(get) = &plan.operator {
-                    assert!(get.column_projections.iter().all(|projection| matches!(
-                        projection,
-                        paro_planner::operator::GetColumnProjection::Stored
+                    assert!(get.column_sources.iter().all(|source| matches!(
+                        source,
+                        paro_planner::operator::GetColumnSource::Stored { .. }
                     )));
                 }
                 Ok(())
@@ -209,12 +215,13 @@ fn tpch_q22_uses_one_customer_scan_inner() {
                 {
                     customer_gets += 1;
                     matched_prefix_outputs += get
-                        .column_projections
+                        .column_sources
                         .iter()
-                        .filter(|projection| {
+                        .filter(|source| {
                             matches!(
-                                projection,
-                                paro_planner::operator::GetColumnProjection::MatchedUtf8Prefix {
+                                source,
+                                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                    source_column: _,
                                     byte_width: 2
                                 }
                             )

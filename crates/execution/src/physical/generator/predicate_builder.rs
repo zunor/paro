@@ -155,8 +155,8 @@ fn build_comparison_predicate(
         _ => return Ok(None),
     };
 
-    let column_id = match get.column_ids.get(col_idx) {
-        Some(id) => *id as u32,
+    let column_id = match get.stored_column(col_idx) {
+        Some(id) => id as u32,
         None => return Ok(None),
     };
 
@@ -262,13 +262,13 @@ fn build_column_comparison_predicate(
         ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => return Ok(None),
     };
     let (Some(left_column_id), Some(right_column_id)) =
-        (get.column_ids.get(left_col), get.column_ids.get(right_col))
+        (get.stored_column(left_col), get.stored_column(right_col))
     else {
         return Ok(None);
     };
     Ok(Some(PredicateTree::Leaf(Predicate::ColumnComparison {
-        left_column_id: *left_column_id as u32,
-        right_column_id: *right_column_id as u32,
+        left_column_id: left_column_id as u32,
+        right_column_id: right_column_id as u32,
         comparison,
     })))
 }
@@ -312,8 +312,8 @@ fn build_operator_predicate(
                 Some(idx) => idx,
                 None => return Ok(None),
             };
-            let column_id = match get.column_ids.get(col_idx) {
-                Some(id) => *id as u32,
+            let column_id = match get.stored_column(col_idx) {
+                Some(id) => id as u32,
                 None => return Ok(None),
             };
             let predicate = match op.operator_type {
@@ -341,8 +341,8 @@ fn build_operator_predicate(
                 };
                 values.push(value);
             }
-            let column_id = match get.column_ids.get(col_idx) {
-                Some(id) => *id as u32,
+            let column_id = match get.stored_column(col_idx) {
+                Some(id) => id as u32,
                 None => return Ok(None),
             };
             Ok(Some(PredicateTree::Leaf(Predicate::In {
@@ -404,11 +404,11 @@ fn build_projected_prefix_membership(
     }
     prefixes.sort_unstable();
     prefixes.dedup();
-    let Some(column_id) = get.column_ids.get(col_idx) else {
+    let Some(column_id) = get.stored_column(col_idx) else {
         return Ok(None);
     };
     Ok(Some(PredicateTree::leaf(Predicate::StringPrefixIn {
-        column_id: *column_id as u32,
+        column_id: column_id as u32,
         prefixes,
     })))
 }
@@ -430,10 +430,10 @@ fn build_like_predicate(
     let Some(Value::Varchar(pattern)) = evaluate_bound_constant(pattern)? else {
         return Ok(None);
     };
-    let Some(column_id) = get.column_ids.get(col_idx) else {
+    let Some(column_id) = get.stored_column(col_idx) else {
         return Ok(None);
     };
-    let column_id = *column_id as u32;
+    let column_id = column_id as u32;
     if let Some(prefix) = extract_like_prefix(&pattern) {
         return Ok(Some(PredicateTree::leaf(Predicate::StringPrefix {
             column_id,

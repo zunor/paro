@@ -479,7 +479,7 @@ fn projected_child_index(
 
 fn sort_range_get_column_stats(get: &Get, output_idx: usize) -> Option<SortRangeColumnStats> {
     let table = get.table.as_ref()?;
-    let column_id = *get.column_ids.get(output_idx)?;
+    let column_id = get.stored_column(output_idx)?;
     if column_id >= table.columns.len() {
         return None;
     }

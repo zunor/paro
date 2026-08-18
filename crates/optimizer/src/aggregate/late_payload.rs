@@ -14,8 +14,8 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, Get, GetColumnProjection, Join, JoinType, LogicalOperator,
-    Projection, RowFetch, RowFetchSource,
+    Aggregate, ColumnBinding, Get, GetColumnSource, Join, JoinType, LogicalOperator, Projection,
+    RowFetch, RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -116,10 +116,8 @@ fn prove_matched_prefix_candidate(plan: &LogicalPlan) -> Option<MatchedPrefixCan
             continue;
         }
         let get = unique_get(output.child.as_ref(), source.binding.table_index)?;
-        let column_id = *get.column_ids.get(source.binding.column_index)?;
+        let column_id = get.stored_column(source.binding.column_index)?;
         if column_id >= get.table.as_ref()?.columns.len()
-            || get.column_projections.get(source.binding.column_index)
-                != Some(&GetColumnProjection::Stored)
             || !prove_matched_prefix_use_path(
                 output.child.as_ref(),
                 source.binding,
@@ -288,8 +286,7 @@ fn apply_matched_prefix_rewrite(
         candidate.source_table_index,
         candidate.source_binding,
         candidate.byte_width,
-    )
-    .ok_or_else(|| rewrite_invariant("matched-prefix source Get no longer matches its proof"))?;
+    )?;
     for output_index in candidate.output_indices {
         let expression = output
             .expressions
@@ -313,24 +310,29 @@ fn append_get_matched_prefix_projection(
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
-) -> Option<ColumnBinding> {
+) -> Result<ColumnBinding> {
     if let LogicalOperator::Get(get) = &mut plan.operator {
         if get.table_index != table_index {
-            return None;
+            return Err(rewrite_invariant(
+                "matched-prefix source Get no longer matches its proof",
+            ));
         }
-        if get.column_projections.get(source_binding.column_index)
-            != Some(&GetColumnProjection::Stored)
-        {
-            return None;
-        }
-        let column_id = *get.column_ids.get(source_binding.column_index)?;
-        let column_type = get.column_types.get(source_binding.column_index)?.clone();
-        return Some(get.append_output(
+        let column_id = get
+            .stored_column(source_binding.column_index)
+            .ok_or_else(|| rewrite_invariant("matched-prefix source is no longer stored"))?;
+        let column_type = get
+            .column_types
+            .get(source_binding.column_index)
+            .cloned()
+            .ok_or_else(|| rewrite_invariant("matched-prefix source type is missing"))?;
+        return Ok(get.append_output(
             format!("__ascii_prefix_{column_id}_{byte_width}"),
             LogicalType::Varchar,
-            column_id,
             column_type,
-            GetColumnProjection::MatchedUtf8Prefix { byte_width },
+            GetColumnSource::MatchedUtf8Prefix {
+                source_column: column_id,
+                byte_width,
+            },
         ));
     }
     append_prefix_through_operator(plan, table_index, source_binding, byte_width)
@@ -341,7 +343,7 @@ fn append_prefix_through_operator(
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
-) -> Option<ColumnBinding> {
+) -> Result<ColumnBinding> {
     match &mut plan.operator {
         LogicalOperator::Filter(filter) => {
             let binding = append_get_matched_prefix_projection(
@@ -354,9 +356,10 @@ fn append_prefix_through_operator(
                 .child
                 .get_column_bindings()
                 .iter()
-                .position(|candidate| *candidate == binding)?;
+                .position(|candidate| *candidate == binding)
+                .ok_or_else(|| rewrite_invariant("Filter hid an appended prefix binding"))?;
             filter.projection_map.include(child_index);
-            Some(binding)
+            Ok(binding)
         }
         LogicalOperator::Window(window) => append_get_matched_prefix_projection(
             window.child.as_mut(),
@@ -375,9 +378,10 @@ fn append_prefix_through_operator(
                 .child
                 .get_column_bindings()
                 .iter()
-                .position(|candidate| *candidate == binding)?;
+                .position(|candidate| *candidate == binding)
+                .ok_or_else(|| rewrite_invariant("Order hid an appended prefix binding"))?;
             order.projection_map.include(child_index);
-            Some(binding)
+            Ok(binding)
         }
         LogicalOperator::Limit(limit) => append_get_matched_prefix_projection(
             limit.child.as_mut(),
@@ -424,7 +428,9 @@ fn append_prefix_through_operator(
             source_binding,
             byte_width,
         ),
-        _ => None,
+        _ => Err(rewrite_invariant(
+            "matched-prefix source path no longer matches its proof",
+        )),
     }
 }
 
@@ -437,14 +443,18 @@ fn append_prefix_join_child(
     table_index: usize,
     source_binding: ColumnBinding,
     byte_width: usize,
-) -> Option<ColumnBinding> {
+) -> Result<ColumnBinding> {
     let (child, projection) = match (
         count_source_gets(left, table_index),
         count_source_gets(right, table_index),
     ) {
         (1, 0) => (left, left_projection),
         (0, 1) => (right, right_projection),
-        _ => return None,
+        _ => {
+            return Err(rewrite_invariant(
+                "matched-prefix join side no longer matches its proof",
+            ));
+        }
     };
     let binding =
         append_get_matched_prefix_projection(child, table_index, source_binding, byte_width)?;
@@ -452,10 +462,11 @@ fn append_prefix_join_child(
         let child_index = child
             .get_column_bindings()
             .iter()
-            .position(|candidate| *candidate == binding)?;
+            .position(|candidate| *candidate == binding)
+            .ok_or_else(|| rewrite_invariant("Join hid an appended prefix binding"))?;
         projection.include(child_index);
     }
-    Some(binding)
+    Ok(binding)
 }
 
 #[derive(Debug)]
@@ -529,19 +540,8 @@ fn prove_selective_projection_candidate(
     // actual row. Charge the interval's upper bound for that lookup frontier,
     // while the eager side below remains based on observed source work.
     let fetched_rows = output.child.stats.estimated_cardinality?.max;
-    // An exact scan-derived value is a cheaper alternative than carrying a
-    // rowid and re-reading the full stored payload. Keep those output uses in
-    // the carrier so the later, independently profiled scan-projection pass
-    // can assign them a compact derived binding. This is a cost choice, not a
-    // correctness prerequisite for either rewrite.
-    let scan_projected_outputs = prove_matched_prefix_candidate(plan)
-        .map(|candidate| candidate.output_indices.into_iter().collect::<HashSet<_>>())
-        .unwrap_or_default();
     let mut by_source = HashMap::<usize, SelectiveProjectionSource>::new();
-    for (output_index, expression) in output.expressions.iter().enumerate() {
-        if scan_projected_outputs.contains(&output_index) {
-            continue;
-        }
+    for expression in &output.expressions {
         let mut valid = true;
         visit_expression(expression, &mut |candidate| {
             let Expression::ColumnRef(column) = candidate else {
@@ -562,16 +562,10 @@ fn prove_selective_projection_candidate(
                 valid = false;
                 return;
             };
-            let Some(&catalog_column) = get.column_ids.get(column.binding.column_index) else {
+            let Some(catalog_column) = get.stored_column(column.binding.column_index) else {
                 valid = false;
                 return;
             };
-            if get.column_projections.get(column.binding.column_index)
-                != Some(&GetColumnProjection::Stored)
-            {
-                valid = false;
-                return;
-            }
             if table
                 .columns
                 .get(catalog_column)
@@ -816,12 +810,7 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
                 if column.depth != 0 || column.binding.table_index != source_table_index {
                     return None;
                 }
-                if get.column_projections.get(column.binding.column_index)
-                    != Some(&GetColumnProjection::Stored)
-                {
-                    return None;
-                }
-                let catalog_column = *get.column_ids.get(column.binding.column_index)?;
+                let catalog_column = get.stored_column(column.binding.column_index)?;
                 if catalog_column >= table.columns.len() {
                     return None;
                 }
@@ -926,12 +915,7 @@ fn prove_row_preserving_candidate(
         if table.get_storage().is_none() {
             continue;
         }
-        if get.column_projections.get(column.binding.column_index)
-            != Some(&GetColumnProjection::Stored)
-        {
-            return None;
-        }
-        let catalog_column = *get.column_ids.get(column.binding.column_index)?;
+        let catalog_column = get.stored_column(column.binding.column_index)?;
         if catalog_column >= table.columns.len()
             || table.columns[catalog_column].logical_type != column.return_type
         {
@@ -1210,7 +1194,6 @@ fn apply_rewrite(
         aggregate.child.as_mut(),
         &candidate.rowid_path,
         candidate.source_table_index,
-        candidate.table.columns.len(),
         &required_output_bindings,
     )
     .ok_or_else(|| rewrite_invariant("rowid witness no longer matches aggregate source"))?;
@@ -1429,7 +1412,6 @@ fn apply_row_preserving_rewrite(
                 output.child.as_mut(),
                 &source.rowid_path,
                 source.source_table_index,
-                source.table.columns.len(),
                 &required_output_bindings,
             )
             .ok_or_else(|| rewrite_invariant("rowid witness no longer matches detail source"))?;
@@ -1727,7 +1709,6 @@ fn apply_selective_projection_rewrite(
                 output.child.as_mut(),
                 &source.rowid_path,
                 source.source_table_index,
-                source.table.columns.len(),
                 &required_output_bindings,
             )
             .ok_or_else(|| {
@@ -1864,7 +1845,6 @@ fn append_virtual_rowid(
     plan: &mut LogicalPlan,
     path: &RowIdPath,
     table_index: usize,
-    virtual_column_id: usize,
     required_output_bindings: &HashSet<ColumnBinding>,
 ) -> Option<ColumnBinding> {
     match path {
@@ -1875,20 +1855,7 @@ fn append_virtual_rowid(
             if get.table_index != table_index {
                 return None;
             }
-            if let Some(output_index) = get
-                .column_ids
-                .iter()
-                .position(|column_id| *column_id == virtual_column_id)
-            {
-                return Some(ColumnBinding::new(table_index, output_index));
-            }
-            Some(get.append_output(
-                "rowid".to_string(),
-                LogicalType::BigInt,
-                virtual_column_id,
-                LogicalType::BigInt,
-                GetColumnProjection::Stored,
-            ))
+            Some(get.append_virtual_rowid("rowid"))
         }
         RowIdPath::Filter(child_path) => {
             let LogicalOperator::Filter(filter) = &mut plan.operator else {
@@ -1898,7 +1865,6 @@ fn append_virtual_rowid(
                 &mut filter.child,
                 child_path,
                 table_index,
-                virtual_column_id,
                 required_output_bindings,
             )?;
             let child_index = filter
@@ -1917,7 +1883,6 @@ fn append_virtual_rowid(
                 &mut window.child,
                 child_path,
                 table_index,
-                virtual_column_id,
                 required_output_bindings,
             )
         }
@@ -1929,7 +1894,6 @@ fn append_virtual_rowid(
                 &mut order.child,
                 child_path,
                 table_index,
-                virtual_column_id,
                 required_output_bindings,
             )?;
             let child_index = order
@@ -1948,7 +1912,6 @@ fn append_virtual_rowid(
                 &mut limit.child,
                 child_path,
                 table_index,
-                virtual_column_id,
                 required_output_bindings,
             )
         }
@@ -1960,7 +1923,6 @@ fn append_virtual_rowid(
                 &mut empty.child,
                 child_path,
                 table_index,
-                virtual_column_id,
                 required_output_bindings,
             )
         }
@@ -1977,7 +1939,6 @@ fn append_virtual_rowid(
                     *side,
                     child,
                     table_index,
-                    virtual_column_id,
                     required_output_bindings,
                 ),
                 (RowIdJoinKind::Any, Join::Any(join)) => append_projected_join_rowid(
@@ -1988,7 +1949,6 @@ fn append_virtual_rowid(
                     *side,
                     child,
                     table_index,
-                    virtual_column_id,
                     required_output_bindings,
                 ),
                 (RowIdJoinKind::Cross, Join::Cross(join)) => match side {
@@ -1996,14 +1956,12 @@ fn append_virtual_rowid(
                         &mut join.left,
                         child,
                         table_index,
-                        virtual_column_id,
                         required_output_bindings,
                     ),
                     RowIdJoinSide::Right => append_virtual_rowid(
                         &mut join.right,
                         child,
                         table_index,
-                        virtual_column_id,
                         required_output_bindings,
                     ),
                 },
@@ -2022,18 +1980,12 @@ fn append_projected_join_rowid(
     side: RowIdJoinSide,
     path: &RowIdPath,
     table_index: usize,
-    virtual_column_id: usize,
     required_output_bindings: &HashSet<ColumnBinding>,
 ) -> Option<ColumnBinding> {
     let binding = match side {
         RowIdJoinSide::Left => {
-            let binding = append_virtual_rowid(
-                left.as_mut(),
-                path,
-                table_index,
-                virtual_column_id,
-                required_output_bindings,
-            )?;
+            let binding =
+                append_virtual_rowid(left.as_mut(), path, table_index, required_output_bindings)?;
             let child_index = left
                 .get_column_bindings()
                 .iter()
@@ -2042,13 +1994,8 @@ fn append_projected_join_rowid(
             binding
         }
         RowIdJoinSide::Right => {
-            let binding = append_virtual_rowid(
-                right.as_mut(),
-                path,
-                table_index,
-                virtual_column_id,
-                required_output_bindings,
-            )?;
+            let binding =
+                append_virtual_rowid(right.as_mut(), path, table_index, required_output_bindings)?;
             let child_index = right
                 .get_column_bindings()
                 .iter()

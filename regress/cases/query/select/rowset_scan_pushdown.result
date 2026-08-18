@@ -147,6 +147,7 @@ PROJECTION  (rows=1)
     Output Schema: aggr_0 BIGINT
     ->  HASH_JOIN  (rows=19)
       Join Type: INNER
+      Build Index: integer_build_time
       Join Condition: #0 = #0
       Cardinality: [19, 19, 19]
       Output Schema: (none)
@@ -186,4 +187,56 @@ DROP TABLE rowset_pushdown_dim;
 DROP TABLE
 
 DROP TABLE rowset_pushdown_case;
+DROP TABLE
+
+DROP TABLE IF EXISTS matched_prefix_projection_case;
+DROP TABLE
+
+CREATE TABLE matched_prefix_projection_case(id INT, phone VARCHAR, note VARCHAR);
+CREATE TABLE
+
+INSERT INTO matched_prefix_projection_case VALUES
+    (1, '13alpha', 'keep'),
+    (2, '31beta', 'keep'),
+    (3, '13', 'keep'),
+    (4, '1', 'short'),
+    (5, 'éclair', 'non-ascii'),
+    (6, NULL, 'null'),
+    (7, '44gamma', 'other');
+INSERT 0 7
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+id	prefix
+1	13
+2	31
+3	13
+
+SET rowset_scan_pushdown = false;
+SET
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id;
+id	prefix
+1	13
+2	31
+3	13
+
+SET rowset_scan_pushdown = DEFAULT;
+SET
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix
+FROM matched_prefix_projection_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+  AND id % 2 = 1
+ORDER BY id;
+id	prefix
+1	13
+3	13
+
+DROP TABLE matched_prefix_projection_case;
 DROP TABLE

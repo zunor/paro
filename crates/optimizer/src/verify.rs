@@ -104,46 +104,70 @@ impl Verifier {
             LogicalOperator::Get(get) => {
                 let len = get.returned_types.len();
                 if get.names.len() != len
-                    || get.column_ids.len() != len
+                    || get.column_sources.len() != len
                     || get.column_types.len() != len
-                    || get.column_projections.len() != len
                 {
                     return Err(paro_error::internal(format!(
-                        "Get output mismatch: returned_types={}, names={}, column_ids={}, column_types={}, column_projections={}",
+                        "Get output mismatch: returned_types={}, names={}, column_sources={}, column_types={}",
                         get.returned_types.len(),
                         get.names.len(),
-                        get.column_ids.len(),
-                        get.column_types.len(),
-                        get.column_projections.len()
+                        get.column_sources.len(),
+                        get.column_types.len()
                     )));
                 }
 
                 if let Some(table) = &get.table {
                     let table_col_count = table.columns.len();
-                    for (idx, &col_id) in get.column_ids.iter().enumerate() {
-                        let is_virtual_rowid = col_id == table_col_count
-                            && matches!(
-                                get.column_types.get(idx),
-                                Some(paro_common::types::LogicalType::BigInt)
-                            );
-                        if col_id > table_col_count
-                            || (col_id == table_col_count && !is_virtual_rowid)
-                        {
-                            return Err(paro_error::internal(format!(
-                                "Get column id {} out of range (table columns={})",
-                                col_id, table_col_count
-                            )));
+                    let mut virtual_rowids = 0usize;
+                    for (idx, source) in get.column_sources.iter().enumerate() {
+                        match source {
+                            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                                if *column_id >= table_col_count {
+                                    return Err(paro_error::internal(format!(
+                                        "Get stored column id {column_id} out of range (table columns={table_col_count})"
+                                    )));
+                                }
+                                if get.column_types[idx] != table.columns[*column_id].logical_type {
+                                    return Err(paro_error::internal(
+                                        "Get stored output physical type differs from its catalog source",
+                                    ));
+                                }
+                            }
+                            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                source_column,
+                                byte_width,
+                            } => {
+                                if *source_column >= table_col_count
+                                    || *byte_width == 0
+                                    || !table.columns[*source_column].logical_type.is_utf8_varlen()
+                                    || get.column_types[idx]
+                                        != table.columns[*source_column].logical_type
+                                    || !get.column_types[idx].is_utf8_varlen()
+                                    || get.returned_types[idx]
+                                        != paro_common::types::LogicalType::Varchar
+                                {
+                                    return Err(paro_error::internal(
+                                        "Get matched-prefix source requires a stored VARCHAR column, positive width, and VARCHAR output",
+                                    ));
+                                }
+                            }
+                            paro_planner::operator::GetColumnSource::VirtualRowId => {
+                                virtual_rowids += 1;
+                                if get.column_types[idx] != paro_common::types::LogicalType::BigInt
+                                    || get.returned_types[idx]
+                                        != paro_common::types::LogicalType::BigInt
+                                {
+                                    return Err(paro_error::internal(
+                                        "Get virtual row id requires BIGINT physical and returned types",
+                                    ));
+                                }
+                            }
                         }
-                        if !matches!(
-                            get.column_projections[idx],
-                            paro_planner::operator::GetColumnProjection::Stored
-                        ) && (col_id >= table_col_count
-                            || get.column_types[idx] != paro_common::types::LogicalType::Varchar)
-                        {
-                            return Err(paro_error::internal(
-                                "Get matched-prefix projection requires a stored VARCHAR column",
-                            ));
-                        }
+                    }
+                    if virtual_rowids > 1 {
+                        return Err(paro_error::internal(
+                            "Get may expose at most one virtual row id",
+                        ));
                     }
                 }
             }

@@ -387,28 +387,24 @@ impl PhysicalPlanGenerator {
                     .iter()
                     .chain(branch.get.runtime_filter_expressions.iter())
                     .any(|expression| !expression.evaluation_properties().can_share_evaluation())
-                || branch.get.column_projections.iter().any(|projection| {
-                    !matches!(
-                        projection,
-                        paro_planner::operator::GetColumnProjection::Stored
-                    )
-                })
         }) {
             return Ok(None);
         }
 
         let mut merged_column_ids = Vec::new();
         for branch in &branches {
-            for column_id in branch.get.column_ids.iter().copied() {
+            for column_id in branch.filter_column_ids.iter().copied() {
                 if !merged_column_ids.contains(&column_id) {
                     merged_column_ids.push(column_id);
                 }
             }
         }
         let mut merged_get = branches[0].get.clone();
-        merged_get.column_ids = merged_column_ids.clone();
-        merged_get.column_projections =
-            vec![paro_planner::operator::GetColumnProjection::Stored; merged_column_ids.len()];
+        merged_get.column_sources = merged_column_ids
+            .iter()
+            .copied()
+            .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
+            .collect();
         merged_get.names = merged_column_ids
             .iter()
             .map(|&column_id| first_table.columns[column_id].name.clone())
@@ -926,6 +922,8 @@ struct ReductionScanBranch<'a> {
     get: &'a Get,
     /// Base-table column id for each column exposed to the reduction join.
     output_column_ids: Vec<usize>,
+    /// Base-table column id for each column bound directly against the Get.
+    filter_column_ids: Vec<usize>,
     /// Predicates local to this logical alias, still bound to the Get input.
     filters: Vec<Expression>,
 }
@@ -933,11 +931,17 @@ struct ReductionScanBranch<'a> {
 impl<'a> ReductionScanBranch<'a> {
     fn inspect(plan: &'a LogicalPlan) -> Option<Self> {
         match &plan.operator {
-            LogicalOperator::Get(get) => Some(Self {
-                get,
-                output_column_ids: get.column_ids.clone(),
-                filters: Vec::new(),
-            }),
+            LogicalOperator::Get(get) => {
+                let output_column_ids = (0..get.returned_types.len())
+                    .map(|index| get.stored_column(index))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Self {
+                    get,
+                    filter_column_ids: output_column_ids.clone(),
+                    output_column_ids,
+                    filters: Vec::new(),
+                })
+            }
             LogicalOperator::Filter(filter) => {
                 let LogicalOperator::Get(get) = &filter.child.operator else {
                     return None;
@@ -946,11 +950,15 @@ impl<'a> ReductionScanBranch<'a> {
                     .projection_map
                     .to_indices(get.returned_types.len())
                     .into_iter()
-                    .map(|index| get.column_ids.get(index).copied())
+                    .map(|index| get.stored_column(index))
+                    .collect::<Option<Vec<_>>>()?;
+                let filter_column_ids = (0..get.returned_types.len())
+                    .map(|index| get.stored_column(index))
                     .collect::<Option<Vec<_>>>()?;
                 Some(Self {
                     get,
                     output_column_ids,
+                    filter_column_ids,
                     filters: filter.expressions.clone(),
                 })
             }
@@ -965,7 +973,7 @@ impl<'a> ReductionScanBranch<'a> {
 
     /// Column ids for expressions stored directly on the underlying Get.
     fn filter_column_ids(&self) -> &[usize] {
-        &self.get.column_ids
+        &self.filter_column_ids
     }
 }
 
@@ -1332,7 +1340,7 @@ fn resolve_base_get_output(
     output_index: usize,
 ) -> Option<(&paro_planner::operator::Get, usize)> {
     match &build.operator {
-        LogicalOperator::Get(get) => Some((get, *get.column_ids.get(output_index)?)),
+        LogicalOperator::Get(get) => Some((get, get.stored_column(output_index)?)),
         LogicalOperator::Filter(filter) => {
             let child_index = filter
                 .projection_map
@@ -1367,7 +1375,7 @@ fn resolve_bound_get_column(
 ) -> Option<(&paro_planner::operator::Get, usize)> {
     match &build.operator {
         LogicalOperator::Get(get) if get.table_index == table_index => {
-            Some((get, *get.column_ids.get(column_index)?))
+            Some((get, get.stored_column(column_index)?))
         }
         LogicalOperator::Filter(filter) => {
             resolve_bound_get_column(&filter.child, table_index, column_index)

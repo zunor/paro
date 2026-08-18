@@ -103,9 +103,11 @@ pub(crate) fn declared_unique_keys(get: &Get) -> Vec<DeclaredUniqueKey> {
     let Some(table) = &get.table else {
         return Vec::new();
     };
-    let mut column_indices = HashMap::with_capacity(get.column_ids.len());
-    for (column_index, &column_id) in get.column_ids.iter().enumerate() {
-        column_indices.entry(column_id).or_insert(column_index);
+    let mut column_indices = HashMap::with_capacity(get.column_sources.len());
+    for column_index in 0..get.column_sources.len() {
+        if let Some(column_id) = get.stored_column(column_index) {
+            column_indices.entry(column_id).or_insert(column_index);
+        }
     }
     table
         .constraints()

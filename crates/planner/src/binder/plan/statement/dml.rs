@@ -7,7 +7,6 @@ use crate::binder::ir::statement::{BoundDeleteInfo, BoundInsertInfo, BoundUpdate
 use crate::binder::Binder;
 use crate::operator::{Delete, Filter, Get, Insert, LogicalOperator, Update};
 use paro_common::error::Result;
-use paro_common::types::LogicalType;
 
 impl Binder {
     pub(crate) fn plan_insert(&mut self, info: BoundInsertInfo) -> Result<LogicalOperator> {
@@ -31,17 +30,13 @@ impl Binder {
             .iter()
             .map(|c| c.logical_type.clone())
             .collect();
-        let mut column_names = column_names;
-        let mut column_types = column_types;
-        column_names.push("rowid".to_string());
-        column_types.push(LogicalType::BigInt);
-
-        let scan = Get::new(
+        let mut scan = Get::new(
             info.table_index,
             column_names,
             column_types,
             info.table.clone(),
         );
+        scan.append_virtual_rowid("rowid");
         let mut root = LogicalOperator::Get(scan);
 
         if let Some(condition) = info.condition {
@@ -68,17 +63,13 @@ impl Binder {
             .iter()
             .map(|c| c.logical_type.clone())
             .collect();
-        let mut column_names = column_names;
-        let mut column_types = column_types;
-        column_names.push("rowid".to_string());
-        column_types.push(LogicalType::BigInt);
-
-        let scan = Get::new(
+        let mut scan = Get::new(
             info.table_index,
             column_names,
             column_types,
             info.table.clone(),
         );
+        scan.append_virtual_rowid("rowid");
         let mut root = LogicalOperator::Get(scan);
 
         if let Some(condition) = info.condition {

@@ -11,17 +11,22 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
 
-/// Value projection applied while a physical base-table column is decoded.
+/// Physical source and value semantics of one Get output.
 ///
-/// Most outputs expose the stored value unchanged.  A matched UTF-8 prefix is
-/// narrower: it may only be installed when an exact pushed predicate proves
-/// that every emitted value begins with `byte_width` ASCII bytes.  Keeping the
-/// proof-bearing projection on the scan output prevents later operators from
-/// mistaking a storage optimization for general substring semantics.
+/// `Stored` is the only variant that denotes equality with a catalog column.
+/// Derived values carry their source explicitly and therefore cannot be
+/// mistaken for the stored value by statistics, runtime-filter, or row-fetch
+/// consumers. A virtual row id has no catalog column at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GetColumnProjection {
-    Stored,
-    MatchedUtf8Prefix { byte_width: usize },
+pub enum GetColumnSource {
+    Stored {
+        column_id: usize,
+    },
+    MatchedUtf8Prefix {
+        source_column: usize,
+        byte_width: usize,
+    },
+    VirtualRowId,
 }
 
 /// Get represents a scan operation on a table.
@@ -41,12 +46,10 @@ pub struct Get {
     pub relation_name: Option<String>,
     /// Optional user-visible alias.
     pub relation_alias: Option<String>,
-    /// The column ids to read from the table.
-    pub column_ids: Vec<usize>,
-    /// The logical types of the columns in `column_ids`.
+    /// Physical source and value semantics for each output.
+    pub column_sources: Vec<GetColumnSource>,
+    /// The physical logical type read for each output source.
     pub column_types: Vec<LogicalType>,
-    /// Per-output value projections, parallel to `column_ids`.
-    pub column_projections: Vec<GetColumnProjection>,
     /// Reference to the table catalog entry.
     /// This provides access to table metadata and storage (segments) during
     /// physical plan generation.
@@ -63,28 +66,57 @@ pub struct Get {
 }
 
 impl Get {
-    /// Append one scan output atomically across the physical-column and
-    /// logical-output metadata. Derived outputs may share a catalog column id
-    /// with a stored output, but receive their own binding and value semantics.
+    /// Append one scan output atomically across its source and logical metadata.
     pub fn append_output(
         &mut self,
         name: String,
         returned_type: LogicalType,
-        column_id: usize,
         column_type: LogicalType,
-        projection: GetColumnProjection,
+        source: GetColumnSource,
     ) -> ColumnBinding {
         let output_index = self.returned_types.len();
         debug_assert_eq!(self.names.len(), output_index);
-        debug_assert_eq!(self.column_ids.len(), output_index);
+        debug_assert_eq!(self.column_sources.len(), output_index);
         debug_assert_eq!(self.column_types.len(), output_index);
-        debug_assert_eq!(self.column_projections.len(), output_index);
         self.names.push(name);
         self.returned_types.push(returned_type);
-        self.column_ids.push(column_id);
+        self.column_sources.push(source);
         self.column_types.push(column_type);
-        self.column_projections.push(projection);
         ColumnBinding::new(self.table_index, output_index)
+    }
+
+    /// Append the storage row-location output used by DML and late fetch.
+    /// A row id is a scan capability, never a catalog column sentinel.
+    pub fn append_virtual_rowid(&mut self, name: impl Into<String>) -> ColumnBinding {
+        if let Some(output_index) = self
+            .column_sources
+            .iter()
+            .position(|source| matches!(source, GetColumnSource::VirtualRowId))
+        {
+            return ColumnBinding::new(self.table_index, output_index);
+        }
+        self.append_output(
+            name.into(),
+            LogicalType::BigInt,
+            LogicalType::BigInt,
+            GetColumnSource::VirtualRowId,
+        )
+    }
+
+    /// Return the catalog column only when this output is the stored value
+    /// itself. Derived values deliberately return `None` even when they read
+    /// bytes from the same physical column.
+    #[inline]
+    pub fn stored_column(&self, output_index: usize) -> Option<usize> {
+        match self.column_sources.get(output_index)? {
+            GetColumnSource::Stored { column_id } => Some(*column_id),
+            GetColumnSource::MatchedUtf8Prefix { .. } | GetColumnSource::VirtualRowId => None,
+        }
+    }
+
+    #[inline]
+    pub fn column_source(&self, output_index: usize) -> Option<GetColumnSource> {
+        self.column_sources.get(output_index).copied()
     }
 
     /// Create a new Get with a reference to the table catalog entry.
@@ -100,17 +132,17 @@ impl Get {
         types: Vec<LogicalType>,
         table: Arc<TableCatalogEntry>,
     ) -> Self {
-        let column_ids: Vec<usize> = (0..types.len()).collect();
-        let column_projections = vec![GetColumnProjection::Stored; types.len()];
+        let column_sources = (0..types.len())
+            .map(|column_id| GetColumnSource::Stored { column_id })
+            .collect();
         Self {
             table_index,
             returned_types: types.clone(),
             names,
             relation_name: None,
             relation_alias: None,
-            column_ids,
+            column_sources,
             column_types: types,
-            column_projections,
             table: Some(table),
             scan_order: None,
             runtime_filter_expressions: Vec::new(),
@@ -126,17 +158,17 @@ impl Get {
         names: Vec<String>,
         types: Vec<LogicalType>,
     ) -> Self {
-        let column_ids: Vec<usize> = (0..types.len()).collect();
-        let column_projections = vec![GetColumnProjection::Stored; types.len()];
+        let column_sources = (0..types.len())
+            .map(|column_id| GetColumnSource::Stored { column_id })
+            .collect();
         Self {
             table_index,
             returned_types: types.clone(),
             names,
             relation_name: None,
             relation_alias: None,
-            column_ids,
+            column_sources,
             column_types: types,
-            column_projections,
             table: None,
             scan_order: None,
             runtime_filter_expressions: Vec::new(),

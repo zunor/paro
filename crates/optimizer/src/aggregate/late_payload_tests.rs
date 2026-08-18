@@ -11,7 +11,7 @@ use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::{AggregateExpression, ColumnRefExpression, Expression};
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Get, GetColumnProjection, Join,
+    Aggregate, ColumnBinding, ComparisonJoin, CrossProduct, Filter, Get, GetColumnSource, Join,
     JoinComparisonType, JoinCondition, JoinType, LogicalOperator, Projection, TopN,
 };
 use paro_planner::plan::LogicalPlan;
@@ -177,7 +177,7 @@ fn candidate_with_null_extended_source() -> LogicalPlan {
     plan
 }
 
-fn selective_projection_candidate(projection: GetColumnProjection) -> LogicalPlan {
+fn selective_projection_candidate(source: GetColumnSource) -> LogicalPlan {
     let table = source_table();
     let mut get = Get::new(
         SOURCE,
@@ -193,7 +193,7 @@ fn selective_projection_candidate(projection: GetColumnProjection) -> LogicalPla
             .collect(),
         table,
     );
-    get.column_projections[1] = projection;
+    get.column_sources[1] = source;
     let mut get = LogicalPlan::synthetic(LogicalOperator::Get(get));
     get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
     let mut filter = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(get, vec![])));
@@ -290,10 +290,10 @@ fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
     assert_eq!(aggregate.groups.len(), 2, "key and rowid only");
     let get =
         super::late_payload::unique_get(aggregate.child.as_ref(), SOURCE).expect("source Get");
-    assert_eq!(
-        get.column_ids.last().copied(),
-        Some(get.table.as_ref().unwrap().columns.len())
-    );
+    assert!(matches!(
+        get.column_sources.last(),
+        Some(GetColumnSource::VirtualRowId)
+    ));
 }
 
 #[test]
@@ -356,7 +356,7 @@ fn null_extended_source_rowid_keeps_preserving_plan() {
 fn selective_projection_fetches_only_surviving_wide_payload() {
     let context = BindContext::new();
     let (optimized, changed) = optimize_plan(
-        selective_projection_candidate(GetColumnProjection::Stored),
+        selective_projection_candidate(GetColumnSource::Stored { column_id: 1 }),
         &context,
         &CostModel::default(),
     )
@@ -376,7 +376,10 @@ fn selective_projection_fetches_only_surviving_wide_payload() {
 fn selective_projection_never_refetches_a_derived_scan_value() {
     let context = BindContext::new();
     let (optimized, changed) = optimize_plan(
-        selective_projection_candidate(GetColumnProjection::MatchedUtf8Prefix { byte_width: 2 }),
+        selective_projection_candidate(GetColumnSource::MatchedUtf8Prefix {
+            source_column: 1,
+            byte_width: 2,
+        }),
         &context,
         &CostModel::default(),
     )
@@ -388,7 +391,7 @@ fn selective_projection_never_refetches_a_derived_scan_value() {
 #[test]
 fn selective_projection_prices_uncertain_fanout_at_its_upper_bound() {
     let context = BindContext::new();
-    let mut plan = selective_projection_candidate(GetColumnProjection::Stored);
+    let mut plan = selective_projection_candidate(GetColumnSource::Stored { column_id: 1 });
     let LogicalOperator::Projection(output) = &mut plan.operator else {
         unreachable!()
     };

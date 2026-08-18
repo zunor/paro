@@ -103,7 +103,6 @@ impl TabletReader {
                 "Column batch selection length does not match logical rows",
             ));
         }
-        let physical_selection = selection.as_deref();
         let mut stored_reads = vec![false; self.projection.len()];
         for (&read_idx, projection) in self.output_to_read.iter().zip(&self.value_projections) {
             if matches!(
@@ -117,7 +116,6 @@ impl TabletReader {
         let mut raw_batches = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
         let selection = selection
-            .clone()
             .map(BatchRowOrdinal::into_raw_vec)
             .map(|indices| SelectionVector::try_from_owned_indices(indices, allocator.clone()))
             .transpose()?
@@ -128,6 +126,10 @@ impl TabletReader {
                     ))
                 })
             })
+            .transpose()?;
+        let decoder_selection = selection
+            .as_ref()
+            .map(vector_decoder::ColumnBatchSelection::try_from_validated)
             .transpose()?;
         let mut batch_hint = 0usize;
 
@@ -142,15 +144,20 @@ impl TabletReader {
                 let storage_provenance = col_batch.storage_dictionary.as_ref().map(|_| {
                     vector_decoder::storage_dictionary_provenance_id(rowset_id, segment_id, *col_id)
                 });
-                read_vectors.push(Some(Arc::new(vector_decoder::decode_column_batch_cached(
-                    ty,
-                    col_batch,
-                    physical_rows,
-                    allocator.clone(),
-                    storage_provenance,
-                    &self.storage_dictionary_cache,
-                    u64::from(*col_id),
-                )?)));
+                read_vectors.push(Some(Arc::new(
+                    vector_decoder::decode_column_batch_with_projection(
+                        ty,
+                        col_batch,
+                        physical_rows,
+                        decoder_selection,
+                        rows,
+                        vector_decoder::ColumnValueProjection::Stored,
+                        allocator.clone(),
+                        storage_provenance,
+                        &self.storage_dictionary_cache,
+                        u64::from(*col_id),
+                    )?,
+                )));
                 continue;
             }
             raw_batches.push(None);
@@ -176,10 +183,16 @@ impl TabletReader {
         }
 
         if let Some(selection) = &selection {
-            for vector in &mut read_vectors {
+            for (read_idx, vector) in read_vectors.iter_mut().enumerate() {
                 let Some(vector) = vector else {
                     continue;
                 };
+                // Raw stored batches were decoded directly into the logical
+                // row domain above. Only synthesized schema/base-row vectors
+                // still need the shared selection applied here.
+                if raw_batches[read_idx].is_some() {
+                    continue;
+                }
                 if vector.len() == physical_rows {
                     *vector = Arc::new(Vector::try_dictionary_from_validated(
                         vector.clone(),
@@ -215,13 +228,15 @@ impl TabletReader {
                             &self.read_types[read_idx],
                             batch,
                             physical_rows,
-                            physical_selection,
+                            decoder_selection,
                             rows,
                             vector_decoder::ColumnValueProjection::MatchedUtf8Prefix {
                                 byte_width: *byte_width,
                             },
                             allocator.clone(),
                             storage_provenance,
+                            &self.storage_dictionary_cache,
+                            u64::from(self.projection[read_idx]),
                         )?)
                     } else {
                         let vector = read_vectors
@@ -230,7 +245,7 @@ impl TabletReader {
                             .ok_or_else(|| {
                                 paro_error::internal("Matched-prefix source mapping is unavailable")
                             })?;
-                        Arc::new(project_matched_utf8_prefix_vector(
+                        Arc::new(vector_decoder::project_matched_utf8_prefix_vector(
                             vector,
                             rows,
                             *byte_width,
@@ -311,37 +326,6 @@ impl TabletReader {
         vector.set_count(rows);
         Ok(vector)
     }
-}
-
-fn project_matched_utf8_prefix_vector(
-    input: &Vector,
-    rows: usize,
-    byte_width: usize,
-    allocator: Arc<dyn Allocator>,
-) -> Result<Vector> {
-    let view = input.try_to_varlen_view(rows)?;
-    let mut output = Vector::try_new(LogicalType::Varchar, rows, allocator)?;
-    let (entries, _validity, heap) = output.try_begin_varlen_write(rows)?;
-    for row in 0..rows {
-        if !view.is_valid(row) {
-            return Err(paro_error::data_corrupted(
-                "NULL row escaped a matched-prefix predicate",
-            ));
-        }
-        let prefix = view.bytes(row).get(..byte_width).ok_or_else(|| {
-            paro_error::data_corrupted("matched string is shorter than its prefix witness")
-        })?;
-        if !prefix.is_ascii() {
-            return Err(paro_error::data_corrupted(
-                "matched string contradicts its ASCII prefix witness",
-            ));
-        }
-        // SAFETY: the output vector owns the heap and exposes `rows` entries.
-        let entry = unsafe { heap.try_add_blob(prefix) }?;
-        unsafe { entries.add(row).write(entry) };
-    }
-    output.set_count(rows);
-    Ok(output)
 }
 
 fn find_column_batch<'a>(

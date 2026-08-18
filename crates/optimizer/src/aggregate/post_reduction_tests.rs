@@ -269,8 +269,8 @@ fn source_equivalence_maps_compacted_ordinals_by_physical_column_id() {
     let LogicalOperator::Get(scalar_get) = &mut scalar.operator else {
         panic!("scalar Get");
     };
-    scalar_get.column_ids = vec![1];
-    scalar_get.column_projections = vec![paro_planner::operator::GetColumnProjection::Stored];
+    scalar_get.column_sources =
+        vec![paro_planner::operator::GetColumnSource::Stored { column_id: 1 }];
     scalar_get.column_types = vec![LogicalType::Integer];
     scalar_get.returned_types = vec![LogicalType::Integer];
     scalar_get.names = vec!["value".to_string()];

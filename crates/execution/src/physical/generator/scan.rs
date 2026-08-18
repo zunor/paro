@@ -40,25 +40,27 @@ impl PhysicalPlanGenerator {
                 "base table metadata is not available for rowset scan",
             ));
         };
-        let table_column_count = table.columns.len();
-        let mut column_ids = Vec::with_capacity(get.column_ids.len());
-        let mut value_projections = Vec::with_capacity(get.column_ids.len());
+        let mut column_ids = Vec::with_capacity(get.column_sources.len());
+        let mut value_projections = Vec::with_capacity(get.column_sources.len());
         let mut emit_row_id = false;
-        for (idx, column_id) in get.column_ids.iter().copied().enumerate() {
-            if column_id < table_column_count {
-                column_ids.push(column_id);
-                value_projections.push(rowset_value_projection(get, idx, predicate.as_ref())?);
-            } else if column_id == table_column_count
-                && get
-                    .names
-                    .get(idx)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("rowid"))
-            {
-                emit_row_id = true;
-            } else {
-                return Err(paro_error::internal(format!(
-                    "column id {column_id} is out of range for table with {table_column_count} columns"
-                )));
+        for source in &get.column_sources {
+            match source {
+                paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                    column_ids.push(*column_id);
+                    value_projections.push(RowsetColumnValueProjection::Stored);
+                }
+                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                    source_column,
+                    byte_width,
+                } => {
+                    column_ids.push(*source_column);
+                    value_projections.push(rowset_value_projection(
+                        *source_column,
+                        *byte_width,
+                        predicate.as_ref(),
+                    )?);
+                }
+                paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
             }
         }
 
@@ -504,7 +506,7 @@ fn direct_projection_column(expr: &Expression, get: &Get) -> Option<usize> {
         Expression::ColumnRef(column) => column.binding.column_index,
         _ => return None,
     };
-    get.column_ids.get(source_index).copied()
+    get.stored_column(source_index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -587,7 +589,6 @@ fn project_rowset_scan_spec(
     get: &Get,
     projection_map: &[usize],
 ) -> Result<()> {
-    let table_column_count = spec.table.columns.len();
     let mut output_names = Vec::with_capacity(projection_map.len());
     let mut returned_types = Vec::with_capacity(projection_map.len());
     let mut column_ids = Vec::with_capacity(projection_map.len());
@@ -608,31 +609,34 @@ fn project_rowset_scan_spec(
                 get.returned_types.len()
             ))
         })?;
-        let column_id = *get.column_ids.get(idx).ok_or_else(|| {
+        let source = get.column_source(idx).ok_or_else(|| {
             paro_error::internal(format!(
-                "filter projection column index {idx} is out of range for rowset output with {} columns",
-                get.column_ids.len()
+                "filter projection source index {idx} is out of range for rowset output with {} columns",
+                get.column_sources.len()
             ))
         })?;
 
         output_names.push(name);
         returned_types.push(returned_type);
-        if column_id < table_column_count {
-            column_ids.push(column_id);
-            value_projections.push(rowset_value_projection(get, idx, spec.predicate.as_ref())?);
-            let column_type = get.column_types.get(idx).cloned().ok_or_else(|| {
-                paro_error::internal(format!(
-                    "filter projection column type index {idx} is out of range for rowset output with {} columns",
-                    get.column_types.len()
-                ))
-            })?;
-            column_types.push(column_type);
-        } else if column_id == table_column_count {
-            emit_row_id = true;
-        } else {
-            return Err(paro_error::internal(format!(
-                "filter projection column id {column_id} is out of range for table with {table_column_count} columns"
-            )));
+        match source {
+            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                column_ids.push(column_id);
+                value_projections.push(RowsetColumnValueProjection::Stored);
+                column_types.push(get.column_types[idx].clone());
+            }
+            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                source_column,
+                byte_width,
+            } => {
+                column_ids.push(source_column);
+                value_projections.push(rowset_value_projection(
+                    source_column,
+                    byte_width,
+                    spec.predicate.as_ref(),
+                )?);
+                column_types.push(get.column_types[idx].clone());
+            }
+            paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
         }
     }
 
@@ -646,35 +650,19 @@ fn project_rowset_scan_spec(
 }
 
 fn rowset_value_projection(
-    get: &Get,
-    output_index: usize,
+    source_column: usize,
+    byte_width: usize,
     predicate: Option<&PredicateTree>,
 ) -> Result<RowsetColumnValueProjection> {
-    let projection = get
-        .column_projections
-        .get(output_index)
-        .ok_or_else(|| paro_error::internal("Get value projection is missing for rowset output"))?;
-    match projection {
-        paro_planner::operator::GetColumnProjection::Stored => {
-            Ok(RowsetColumnValueProjection::Stored)
-        }
-        paro_planner::operator::GetColumnProjection::MatchedUtf8Prefix { byte_width } => {
-            let column_id = *get.column_ids.get(output_index).ok_or_else(|| {
-                paro_error::internal("matched-prefix output has no physical column")
-            })? as u32;
-            if *byte_width == 0
-                || !predicate
-                    .is_some_and(|tree| tree.proves_ascii_prefix_width(column_id, *byte_width))
-            {
-                return Err(paro_error::internal(
-                    "matched-prefix scan output lacks its exact pushed predicate witness",
-                ));
-            }
-            Ok(RowsetColumnValueProjection::MatchedUtf8Prefix {
-                byte_width: *byte_width,
-            })
-        }
+    let column_id = source_column as u32;
+    if byte_width == 0
+        || !predicate.is_some_and(|tree| tree.proves_ascii_prefix_width(column_id, byte_width))
+    {
+        return Err(paro_error::internal(
+            "matched-prefix scan output lacks its exact pushed predicate witness",
+        ));
     }
+    Ok(RowsetColumnValueProjection::MatchedUtf8Prefix { byte_width })
 }
 
 fn estimated_filter_selectivity(

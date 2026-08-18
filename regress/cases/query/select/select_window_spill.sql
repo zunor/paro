@@ -89,6 +89,28 @@ SELECT
     ROW_NUMBER() OVER (PARTITION BY part ORDER BY id ASC) AS rn
 FROM window_large_partition_test;
 
+-- Global aggregate windows retain detail rows for emission. Force the detail
+-- stream external and verify multiple aggregates, FILTER, and NULL semantics.
+SET force_external = true;
+
+SELECT
+    id,
+    SUM(score) FILTER (WHERE score >= 80) OVER () AS high_score_sum,
+    COUNT(score) OVER () AS non_null_scores,
+    AVG(score) OVER () AS average_score
+FROM (
+    VALUES (1, 10), (2, NULL), (3, 30), (4, 90)
+) AS global_window_input(id, score)
+ORDER BY id;
+
+-- An empty detail domain emits no rows and must still finalize cleanly.
+SELECT id, SUM(score) OVER () AS total
+FROM (VALUES (1, 10)) AS empty_global_window_input(id, score)
+WHERE false
+ORDER BY id;
+
+SET force_external = DEFAULT;
+
 -- @teardown
 DROP TABLE IF EXISTS window_spill_test;
 
