@@ -581,7 +581,7 @@ fn apply_rewrite(
         WindowExpression::aggregate(rewrite.aggregate, Vec::new(), Vec::new(), frame);
     window_expression.verify_bound_contract()?;
     let path_is_empty = rewrite.detail_path.is_empty();
-    let mut rewritten_detail = install_scalar_window(
+    let mut installed_detail = install_scalar_window(
         detail,
         rewrite.detail_path.as_ref(),
         window_index,
@@ -591,13 +591,35 @@ fn apply_rewrite(
         bind_context,
     )?;
     if !path_is_empty {
-        apply_detail_projection(&mut rewritten_detail, &rewrite.detail_projection)?;
+        let preserved_input_width = installed_detail.preserved_input_width.ok_or_else(|| {
+            paro_error::internal(
+                "scalar aggregate nested detail installation omitted its width witness",
+            )
+        })?;
+        apply_detail_projection(
+            &mut installed_detail.plan,
+            &rewrite.detail_projection,
+            preserved_input_width,
+        )?;
     }
     Ok(LogicalPlan {
         id,
         stats,
-        operator: rewritten_detail.operator,
+        operator: installed_detail.plan.operator,
     })
+}
+
+/// Result of installing the window in a detail carrier.
+///
+/// `output_width` is the exact visible width of `plan`. For a reduction carrier,
+/// `preserved_input_width` records the child domain over which the carrier's
+/// positional projection map was built. Keeping that value next to the rewrite
+/// eliminates the previous cross-function assumption that the window column
+/// happened to be hidden by an identity-looking filter projection.
+struct InstalledScalarWindow {
+    plan: LogicalPlan,
+    output_width: usize,
+    preserved_input_width: Option<usize>,
 }
 
 fn install_scalar_window(
@@ -608,7 +630,7 @@ fn install_scalar_window(
     predicates: Vec<Expression>,
     output_projection: Option<&ProjectionMap>,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Result<InstalledScalarWindow> {
     let Some((step, remaining)) = path.split_first() else {
         let detail_width = plan.types().len();
         let detail_stats = plan.stats.clone();
@@ -624,7 +646,12 @@ fn install_scalar_window(
         );
         let mut result = LogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
         result.stats = detail_stats;
-        return Ok(result);
+        let output_width = result.types().len();
+        return Ok(InstalledScalarWindow {
+            plan: result,
+            output_width,
+            preserved_input_width: None,
+        });
     };
 
     let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
@@ -658,7 +685,7 @@ fn install_scalar_window(
         child.as_mut(),
         LogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
-    **child = install_scalar_window(
+    let installed_child = install_scalar_window(
         owned_child,
         remaining,
         window_index,
@@ -667,16 +694,27 @@ fn install_scalar_window(
         output_projection,
         bind_context,
     )?;
-    Ok(plan)
+    let preserved_input_width = installed_child.output_width;
+    **child = installed_child.plan;
+    let output_width = plan.types().len();
+    Ok(InstalledScalarWindow {
+        plan,
+        output_width,
+        preserved_input_width: Some(preserved_input_width),
+    })
 }
 
-fn apply_detail_projection(plan: &mut LogicalPlan, projection: &ProjectionMap) -> Result<()> {
+fn apply_detail_projection(
+    plan: &mut LogicalPlan,
+    projection: &ProjectionMap,
+    witnessed_child_width: usize,
+) -> Result<()> {
     let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
         return Err(paro_error::internal(
             "scalar aggregate nested detail root is not a reduction join",
         ));
     };
-    let (child_width, preserved_projection) = match join.join_type {
+    let (actual_child_width, preserved_projection) = match join.join_type {
         JoinType::Semi | JoinType::Anti => (join.left.types().len(), &mut join.left_projection_map),
         JoinType::RightSemi | JoinType::RightAnti => {
             (join.right.types().len(), &mut join.right_projection_map)
@@ -687,7 +725,12 @@ fn apply_detail_projection(plan: &mut LogicalPlan, projection: &ProjectionMap) -
             ));
         }
     };
-    let existing = preserved_projection.to_indices(child_width);
+    if actual_child_width != witnessed_child_width {
+        return Err(paro_error::internal(
+            "scalar aggregate detail carrier changed its witnessed child width",
+        ));
+    }
+    let existing = preserved_projection.to_indices(witnessed_child_width);
     let requested = projection.to_indices(existing.len());
     let Some(composed) = requested
         .into_iter()
