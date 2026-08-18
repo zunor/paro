@@ -3,12 +3,8 @@
 
 //! Named [`Rewriter`] implementations for the default optimization pipeline.
 
-use std::collections::HashMap;
-
 use paro_common::error::Result;
-use paro_planner::binder::deep_copy::duplicate_plan_preserving_indices;
 use paro_planner::binder::Binder;
-use paro_planner::operator::LogicalOperator;
 use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
@@ -270,9 +266,7 @@ impl Rewriter for JoinEliminationPass {
     }
 }
 
-pub struct JoinOrderPass {
-    pub binder: Binder,
-}
+pub struct JoinOrderPass;
 
 impl Rewriter for JoinOrderPass {
     fn optimizer_type(&self) -> OptimizerType {
@@ -280,42 +274,12 @@ impl Rewriter for JoinOrderPass {
     }
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        // Width-sensitive costing needs the columns that survive the complete
-        // ancestor contract, while join enumeration must retain the original
-        // bindings and statistics domain. Run the authoritative pruning pass
-        // on a binding-preserving shadow tree and consume only its per-source
-        // widths; mutating the costed tree here would invalidate NDV bindings.
-        let mut width_plan =
-            duplicate_plan_preserving_indices(&plan, ctx.bind_context.shared().as_ref());
-        RemoveUnusedColumns::optimize(&mut width_plan, &self.binder, ctx.session.as_ref(), true);
-        let mut live_source_widths = HashMap::new();
-        collect_live_source_widths(&width_plan, &mut live_source_widths);
-
-        JoinOrderOptimizer::new().optimize_plan_with_live_source_widths(
+        JoinOrderOptimizer::new().optimize_plan(
             ctx.session.as_ref(),
             plan,
             &ctx.column_stats,
             &ctx.bind_context,
-            &live_source_widths,
         )
-    }
-}
-
-fn collect_live_source_widths(plan: &LogicalPlan, widths: &mut HashMap<usize, usize>) {
-    let get = match &plan.operator {
-        LogicalOperator::Get(get) => Some(get),
-        LogicalOperator::FullTextFilterScan(scan) => Some(&scan.get),
-        _ => None,
-    };
-    if let Some(get) = get {
-        let width = crate::join::build_probe_side::estimate_row_payload_width(&get.returned_types);
-        widths
-            .entry(get.table_index)
-            .and_modify(|existing| *existing = (*existing).max(width))
-            .or_insert(width);
-    }
-    for child in plan.children() {
-        collect_live_source_widths(child, widths);
     }
 }
 

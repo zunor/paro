@@ -129,12 +129,9 @@ pub struct JoinOrderOptimizer {
     /// Filter metadata extracted from the original join tree.
     filter_infos: Vec<Arc<FilterInfo>>,
     /// DP plans keyed by relation-set string for recursive reconstruction.
-    plans: HashMap<String, DPJoinNode>,
+    plans: HashMap<Arc<JoinRelationSet>, DPJoinNode>,
     /// Output-column statistics gathered earlier in the pipeline.
     column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-    /// Payload widths derived from an authoritative column-pruned shadow plan,
-    /// keyed by stable source table index.
-    live_source_widths: HashMap<usize, usize>,
     /// Original base-relation subplans keyed by relation id for reconstruction.
     relation_plans: Vec<LogicalPlan>,
 }
@@ -150,7 +147,6 @@ impl JoinOrderOptimizer {
             filter_infos: Vec::new(),
             plans: HashMap::new(),
             column_stats: HashMap::new(),
-            live_source_widths: HashMap::new(),
             relation_plans: Vec::new(),
         }
     }
@@ -182,25 +178,7 @@ impl JoinOrderOptimizer {
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
         bind_context: &BindContext,
     ) -> Result<LogicalPlan> {
-        self.optimize_plan_with_live_source_widths(
-            ctx,
-            plan,
-            column_stats,
-            bind_context,
-            &HashMap::new(),
-        )
-    }
-
-    pub(crate) fn optimize_plan_with_live_source_widths(
-        &mut self,
-        ctx: &StatementContext,
-        plan: LogicalPlan,
-        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-        bind_context: &BindContext,
-        live_source_widths: &HashMap<usize, usize>,
-    ) -> Result<LogicalPlan> {
         self.column_stats = column_stats.clone();
-        self.live_source_widths = live_source_widths.clone();
         plan.try_fold_post_order(|plan, child_states: Vec<bool>| {
             let contains_control_region_reference = child_states.into_iter().any(|state| state)
                 || matches!(plan.operator, LogicalOperator::CTERef(_));
@@ -294,6 +272,16 @@ impl JoinOrderOptimizer {
             return Ok(None);
         };
         let filter_infos = extracted_predicates.graph_filters;
+        if filter_infos
+            .iter()
+            .any(|filter| !filter.has_valid_reduction_roles())
+        {
+            // The source tree remains available to the post-order driver.
+            // Invalid reduction metadata makes this region ineligible for
+            // reordering; it must never turn a valid statement into an
+            // optimizer-internal query failure.
+            return Ok(None);
+        }
         self.apply_relation_local_selectivity(&filter_infos);
         self.filter_infos = filter_infos.clone();
 
@@ -356,7 +344,7 @@ impl JoinOrderOptimizer {
         enumerator.init_leaf_plans();
 
         // Solve join order
-        if !enumerator.solve_join_order()? {
+        if !enumerator.solve_join_order() {
             // Timed out or failed
             return Ok(None);
         }
@@ -372,8 +360,11 @@ impl JoinOrderOptimizer {
         drop(enumerator);
 
         // Reconstruct the logical plan
-        let reconstructed =
-            self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?;
+        let Some(reconstructed) =
+            self.reconstruct_plan(bind_context, &final_plan, &mut HashSet::new())?
+        else {
+            return Ok(None);
+        };
 
         Ok(Some(self.attach_filter_expressions(
             reconstructed,
@@ -571,9 +562,8 @@ impl JoinOrderOptimizer {
     ) {
         let cardinality = self.estimate_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
-        stats.estimated_payload_width = self.live_payload_width(plan).unwrap_or_else(|| {
-            crate::join::build_probe_side::estimate_row_payload_width(&plan.types())
-        });
+        stats.estimated_payload_width =
+            crate::join::build_probe_side::estimate_row_payload_width(&plan.types());
         stats.contains_control_region =
             crate::join::build_probe_side::contains_control_region_boundary(plan);
         stats.unique_keys = declared_unique_keys(plan);
@@ -614,18 +604,6 @@ impl JoinOrderOptimizer {
             plan,
             bind_context.shared().as_ref(),
         ));
-    }
-
-    fn live_payload_width(&self, plan: &LogicalPlan) -> Option<usize> {
-        let table_index = match &plan.operator {
-            LogicalOperator::Get(get) => Some(get.table_index),
-            LogicalOperator::FullTextFilterScan(scan) => Some(scan.get.table_index),
-            LogicalOperator::Filter(filter) => return self.live_payload_width(&filter.child),
-            LogicalOperator::Limit(limit) => return self.live_payload_width(&limit.child),
-            LogicalOperator::Order(order) => return self.live_payload_width(&order.child),
-            _ => None,
-        }?;
-        self.live_source_widths.get(&table_index).copied()
     }
 
     /// Estimate the cardinality of a base relation.
@@ -671,7 +649,7 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         node: &DPJoinNode,
         used_filters: &mut HashSet<usize>,
-    ) -> Result<LogicalPlan> {
+    ) -> Result<Option<LogicalPlan>> {
         if node.is_leaf {
             // This is a base relation
             let relation_id = node.set.relations()[0];
@@ -679,30 +657,30 @@ impl JoinOrderOptimizer {
                 paro_common::error::internal(format!("Relation {} not found", relation_id))
             })?;
 
-            Ok(self.attach_remaining_filters(
+            Ok(Some(self.attach_remaining_filters(
                 duplicate_plan_preserving_indices(relation, bind_context.shared().as_ref()),
                 &node.set,
                 used_filters,
-            ))
+            )))
         } else {
             let left_node = self.lookup_plan(&node.left_set)?;
             let right_node = self.lookup_plan(&node.right_set)?;
             let mut left_set = node.left_set.clone();
             let mut right_set = node.right_set.clone();
-            let mut left_plan = self.reconstruct_plan(bind_context, left_node, used_filters)?;
-            let mut right_plan = self.reconstruct_plan(bind_context, right_node, used_filters)?;
+            let Some(mut left_plan) =
+                self.reconstruct_plan(bind_context, left_node, used_filters)?
+            else {
+                return Ok(None);
+            };
+            let Some(mut right_plan) =
+                self.reconstruct_plan(bind_context, right_node, used_filters)?
+            else {
+                return Ok(None);
+            };
 
             let result = if let Some(predicates) = &node.predicates {
                 let chosen_join_type = predicates.join_type();
-                if let Some(roles) = predicates.reduction_roles() {
-                    let orientation =
-                        roles
-                            .orientation_across(&left_set, &right_set)
-                            .ok_or_else(|| {
-                                paro_common::error::internal(
-                                    "reduction join roles do not span the selected DP cut",
-                                )
-                            })?;
+                if let Some(orientation) = predicates.reduction_orientation() {
                     if orientation == JoinEdgeOrientation::Inverted {
                         std::mem::swap(&mut left_plan, &mut right_plan);
                         std::mem::swap(&mut left_set, &mut right_set);
@@ -711,20 +689,21 @@ impl JoinOrderOptimizer {
 
                 let mut join = ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
                 join.anti_join_mode = predicates.anti_join_mode();
-                for filter in predicates.filters() {
-                    let appended =
-                        self.append_join_conditions(&mut join, filter, &left_set, &right_set);
+                for predicate in predicates.predicates() {
+                    let appended = self.append_join_conditions(&mut join, predicate);
                     if appended {
-                        used_filters.insert(filter.filter_index);
-                    } else if predicates.reduction_roles().is_some() {
-                        return Err(paro_common::error::internal(
-                            "reduction join predicate could not be reconstructed across its DP cut",
-                        ));
+                        used_filters.insert(predicate.filter().filter_index);
+                    } else if predicates.reduction_orientation().is_some() {
+                        // The original logical tree is still owned by the
+                        // caller. A graph witness that no longer reconstructs
+                        // makes this region ineligible for reordering; it must
+                        // never turn a valid statement into an internal error.
+                        return Ok(None);
                     }
                 }
 
                 if join.conditions.is_empty() {
-                    debug_assert!(predicates.reduction_roles().is_none());
+                    debug_assert!(predicates.reduction_orientation().is_none());
                     let mut plan =
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                             left: join.left,
@@ -754,16 +733,16 @@ impl JoinOrderOptimizer {
                 plan
             };
 
-            Ok(self.attach_remaining_filters(
+            Ok(Some(self.attach_remaining_filters(
                 duplicate_plan_preserving_indices(&result, bind_context.shared().as_ref()),
                 &node.set,
                 used_filters,
-            ))
+            )))
         }
     }
 
     fn lookup_plan(&self, set: &Arc<JoinRelationSet>) -> Result<&DPJoinNode> {
-        self.plans.get(&set.to_string()).ok_or_else(|| {
+        self.plans.get(set).ok_or_else(|| {
             paro_common::error::internal(format!(
                 "Join order optimizer could not find plan for set {}",
                 set
@@ -844,16 +823,13 @@ impl JoinOrderOptimizer {
     fn append_join_conditions(
         &self,
         join: &mut ComparisonJoin,
-        filter: &FilterInfo,
-        left_set: &Arc<JoinRelationSet>,
-        right_set: &Arc<JoinRelationSet>,
+        predicate: &crate::join_order::query_graph::OrientedJoinPredicate,
     ) -> bool {
+        let filter = predicate.filter();
         let start_len = join.conditions.len();
         match &filter.filter {
             Expression::Comparison(comp) => {
-                if let Some(condition) =
-                    Self::comparison_to_join_condition(comp, filter, left_set, right_set)
-                {
+                if let Some(condition) = Self::comparison_to_join_condition(comp, predicate) {
                     join.conditions.push(condition);
                 }
             }
@@ -862,9 +838,7 @@ impl JoinOrderOptimizer {
                     let Expression::Comparison(comp) = child else {
                         continue;
                     };
-                    if let Some(condition) =
-                        Self::comparison_to_join_condition(comp, filter, left_set, right_set)
-                    {
+                    if let Some(condition) = Self::comparison_to_join_condition(comp, predicate) {
                         join.conditions.push(condition);
                     }
                 }
@@ -876,12 +850,9 @@ impl JoinOrderOptimizer {
 
     fn comparison_to_join_condition(
         comparison: &paro_planner::expression::ComparisonExpression,
-        filter: &FilterInfo,
-        left_set: &Arc<JoinRelationSet>,
-        right_set: &Arc<JoinRelationSet>,
+        predicate: &crate::join_order::query_graph::OrientedJoinPredicate,
     ) -> Option<JoinCondition> {
-        let invert =
-            filter.orientation_across(left_set, right_set)? == JoinEdgeOrientation::Inverted;
+        let invert = predicate.orientation()? == JoinEdgeOrientation::Inverted;
         let comparison_type = Self::to_join_comparison_type(comparison.comparison_type)?;
         Some(JoinCondition::new(
             if invert {
@@ -941,6 +912,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+    use crate::join::build_probe_side::BuildProbeSideOptimizer;
     use crate::join_order::cardinality::CardinalityEstimator;
     use paro_catalog::entry::{
         CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
@@ -1781,6 +1753,32 @@ mod tests {
         let optimized = optimizer
             .optimize_plan(&session, plan, &column_stats, &bind_context)
             .expect("join order optimization should succeed");
+
+        let enumerated_build_tables = match &optimized.operator {
+            LogicalOperator::Join(Join::Comparison(root)) => root
+                .right
+                .get_column_bindings()
+                .into_iter()
+                .map(|binding| binding.table_index)
+                .collect::<HashSet<_>>(),
+            other => panic!("expected comparison join root, got {other:?}"),
+        };
+        let physically_oriented = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(
+            duplicate_plan_preserving_indices(&optimized, bind_context.shared().as_ref()),
+        );
+        let physical_build_tables = match &physically_oriented.operator {
+            LogicalOperator::Join(Join::Comparison(root)) => root
+                .right
+                .get_column_bindings()
+                .into_iter()
+                .map(|binding| binding.table_index)
+                .collect::<HashSet<_>>(),
+            other => panic!("expected comparison join root, got {other:?}"),
+        };
+        assert_eq!(
+            physical_build_tables, enumerated_build_tables,
+            "final build/probe orientation must retain the side priced by DP"
+        );
 
         let LogicalOperator::Join(Join::Comparison(root)) = optimized.operator else {
             panic!("expected comparison join root");

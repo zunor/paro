@@ -7,7 +7,6 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
-use paro_common::error::{internal, Result};
 use paro_planner::expression::Expression;
 use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
@@ -40,6 +39,8 @@ pub struct FilterInfo {
     /// Direct equality key from the right expression, including its optimizer
     /// relation ID. Table indexes and relation IDs are separate namespaces.
     pub right_binding: Option<JoinKeyBinding>,
+    /// Logical preserved/filtering roles resolved once after edge extraction.
+    reduction_roles: Option<ReductionJoinRoles>,
 }
 
 /// Orientation of a logical join edge across a candidate tree cut.
@@ -80,10 +81,41 @@ impl ReductionJoinRoles {
 /// Predicates and authoritative logical semantics for one join-tree cut.
 #[derive(Debug, Clone)]
 pub(crate) struct JoinPredicateSet {
-    filters: Box<[Arc<FilterInfo>]>,
+    predicates: Box<[OrientedJoinPredicate]>,
     join_type: JoinType,
     anti_join_mode: AntiJoinMode,
-    reduction_roles: Option<ReductionJoinRoles>,
+    reduction_orientation: Option<JoinEdgeOrientation>,
+}
+
+/// One selected filter with its expression orientation resolved for this cut.
+///
+/// `None` means the expression cannot be represented as a binary join
+/// condition across the cut and must remain a residual filter.
+#[derive(Debug, Clone)]
+pub(crate) struct OrientedJoinPredicate {
+    filter: Arc<FilterInfo>,
+    orientation: Option<JoinEdgeOrientation>,
+}
+
+impl OrientedJoinPredicate {
+    pub(crate) fn filter(&self) -> &FilterInfo {
+        self.filter.as_ref()
+    }
+
+    pub(crate) fn orientation(&self) -> Option<JoinEdgeOrientation> {
+        self.orientation
+    }
+}
+
+/// Outcome of resolving the predicates attached to one candidate DP cut.
+///
+/// Invalid reduction metadata makes the whole join region ineligible for
+/// reordering. It is deliberately not an execution error: the caller still
+/// owns the original logical tree and can retain it unchanged.
+#[derive(Debug, Clone)]
+pub(crate) enum CutPredicateResolution {
+    Resolved(Option<JoinPredicateSet>),
+    Ineligible,
 }
 
 impl JoinPredicateSet {
@@ -94,7 +126,9 @@ impl JoinPredicateSet {
     /// collapsed by their stable filter index.
     pub(crate) fn from_filters<'a>(
         filters: impl IntoIterator<Item = &'a Arc<FilterInfo>>,
-    ) -> Result<Option<Self>> {
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> CutPredicateResolution {
         // Cut predicate sets are tiny in practice. A single linear-deduplicated
         // vector avoids both the temporary candidate allocation and a hash
         // table on every DP pair while retaining stable predicate order.
@@ -118,7 +152,7 @@ impl JoinPredicateSet {
         }
         let filters = selected;
         if filters.is_empty() {
-            return Ok(None);
+            return CutPredicateResolution::Resolved(None);
         }
 
         let semantic_filter = filters
@@ -133,27 +167,46 @@ impl JoinPredicateSet {
             .map_or((JoinType::Inner, AntiJoinMode::Regular), |filter| {
                 (filter.join_type, filter.anti_join_mode)
             });
-        let reduction_roles = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-            Some(
-                filters
-                    .iter()
-                    .filter(|filter| filter.join_type == join_type)
-                    .find_map(|filter| ReductionJoinRoles::new(filter))
-                    .ok_or_else(|| {
-                        internal(
-                            "reduction join predicate set has no preserved/filtering role witness",
-                        )
-                    })?,
-            )
+        let reduction_orientation = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            if filters
+                .iter()
+                .filter(|filter| filter.join_type == join_type)
+                .any(|filter| filter.reduction_roles.is_none())
+            {
+                return CutPredicateResolution::Ineligible;
+            }
+            let mut role_orientations = filters
+                .iter()
+                .filter(|filter| filter.join_type == join_type)
+                .map(|filter| {
+                    filter
+                        .reduction_roles
+                        .as_ref()
+                        .and_then(|roles| roles.orientation_across(left, right))
+                });
+            let Some(Some(orientation)) = role_orientations.next() else {
+                return CutPredicateResolution::Ineligible;
+            };
+            if role_orientations.any(|candidate| candidate != Some(orientation)) {
+                return CutPredicateResolution::Ineligible;
+            }
+            Some(orientation)
         } else {
             None
         };
 
-        Ok(Some(Self {
-            filters: filters.into_boxed_slice(),
+        let predicates = filters
+            .into_iter()
+            .map(|filter| OrientedJoinPredicate {
+                orientation: filter.orientation_across(left, right),
+                filter,
+            })
+            .collect();
+        CutPredicateResolution::Resolved(Some(Self {
+            predicates,
             join_type,
             anti_join_mode,
-            reduction_roles,
+            reduction_orientation,
         }))
     }
 
@@ -161,16 +214,16 @@ impl JoinPredicateSet {
         self.join_type
     }
 
-    pub(crate) fn filters(&self) -> &[Arc<FilterInfo>] {
-        &self.filters
+    pub(crate) fn predicates(&self) -> &[OrientedJoinPredicate] {
+        &self.predicates
     }
 
     pub(crate) fn anti_join_mode(&self) -> AntiJoinMode {
         self.anti_join_mode
     }
 
-    pub(crate) fn reduction_roles(&self) -> Option<&ReductionJoinRoles> {
-        self.reduction_roles.as_ref()
+    pub(crate) fn reduction_orientation(&self) -> Option<JoinEdgeOrientation> {
+        self.reduction_orientation
     }
 }
 
@@ -212,6 +265,7 @@ impl FilterInfo {
             right_set: None,
             left_binding: None,
             right_binding: None,
+            reduction_roles: None,
         }
     }
 
@@ -229,11 +283,23 @@ impl FilterInfo {
     /// Set the left relation set.
     pub fn set_left_set(&mut self, left_set: Arc<JoinRelationSet>) {
         self.left_set = Some(left_set);
+        self.refresh_reduction_roles();
     }
 
     /// Set the right relation set.
     pub fn set_right_set(&mut self, right_set: Arc<JoinRelationSet>) {
         self.right_set = Some(right_set);
+        self.refresh_reduction_roles();
+    }
+
+    fn refresh_reduction_roles(&mut self) {
+        self.reduction_roles = matches!(self.join_type, JoinType::Semi | JoinType::Anti)
+            .then(|| ReductionJoinRoles::new(self))
+            .flatten();
+    }
+
+    pub(crate) fn has_valid_reduction_roles(&self) -> bool {
+        !matches!(self.join_type, JoinType::Semi | JoinType::Anti) || self.reduction_roles.is_some()
     }
 
     /// Set the left column binding.
@@ -649,7 +715,7 @@ mod tests {
     }
 
     #[test]
-    fn predicate_set_resolves_roles_from_a_later_valid_reduction_edge() {
+    fn predicate_set_rejects_any_reduction_edge_without_roles() {
         let mut manager = JoinRelationSetManager::new();
         let preserved = manager.get_relation(0);
         let filtering = manager.get_relation(1);
@@ -671,17 +737,10 @@ mod tests {
         valid_roles.set_right_set(filtering.clone());
         let valid_roles = Arc::new(valid_roles);
 
-        let predicates = JoinPredicateSet::from_filters([&missing_roles, &valid_roles])
-            .expect("valid reduction role witness")
-            .expect("reduction cut should retain its predicates");
-        assert_eq!(predicates.join_type(), JoinType::Anti);
-        assert_eq!(predicates.filters().len(), 2);
-        assert_eq!(
-            predicates
-                .reduction_roles()
-                .and_then(|roles| roles.orientation_across(&preserved, &filtering)),
-            Some(JoinEdgeOrientation::Forward)
-        );
+        assert!(matches!(
+            JoinPredicateSet::from_filters([&missing_roles, &valid_roles], &preserved, &filtering),
+            CutPredicateResolution::Ineligible
+        ));
     }
 
     #[test]
@@ -699,9 +758,12 @@ mod tests {
             AntiJoinMode::Regular,
         ));
 
-        let error = JoinPredicateSet::from_filters([&missing_roles])
-            .expect_err("malformed reduction metadata must fail before costing");
-        assert!(error.to_string().contains("role witness"));
+        let left = manager.get_relation(0);
+        let right = manager.get_relation(1);
+        assert!(matches!(
+            JoinPredicateSet::from_filters([&missing_roles], &left, &right),
+            CutPredicateResolution::Ineligible
+        ));
     }
 
     #[test]

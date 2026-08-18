@@ -83,15 +83,12 @@ fn pass(rewriter: impl Rewriter + 'static) -> PipelineStep {
 }
 
 fn late_materialization_repair(binder: Binder) -> PipelineStep {
-    let join_order_binder = binder.clone();
     PipelineStep::Conditional(ConditionalSegment {
         condition: PipelineCondition::LateMaterializationInvalidated,
         passes: vec![
             Box::new(UnusedColumnsPass { binder }),
             Box::new(StatisticsGatheringPass),
-            Box::new(JoinOrderPass {
-                binder: join_order_binder,
-            }),
+            Box::new(JoinOrderPass),
             Box::new(BuildProbeSidePass),
             Box::new(JoinFilterPushdownPass),
         ],
@@ -269,7 +266,6 @@ impl Optimizer {
 
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
-        let join_order_binder = binder.clone();
         let late_payload_binder = binder.clone();
         let final_late_payload_binder = binder.clone();
         let scan_projection_binder = binder.clone();
@@ -308,16 +304,17 @@ impl Optimizer {
             // Remove redundant detail scans while their semantic join edge is
             // still explicit, before cost-based ordering sees the graph.
             pass(AggregateJoinSubsumptionPass),
-            // The rewrite changes both row production and the
-            // statistics-visible HAVING shape. Re-derive cost inputs so join
-            // ordering optimizes the reduced graph rather than a stale tree.
-            pass(StatisticsGatheringPass),
-            pass(JoinOrderPass {
-                binder: join_order_binder,
-            }),
+            // Establish the exact output schema before the authoritative
+            // statistics pass. Join ordering and final build/probe selection
+            // then price the same projection maps and binding domain.
             pass(UnusedColumnsPass {
                 binder: unused_columns_binder,
             }),
+            // The rewrites above and column compaction change both row
+            // production and statistics-visible bindings. Re-derive cost
+            // inputs over that settled schema before join enumeration.
+            pass(StatisticsGatheringPass),
+            pass(JoinOrderPass),
             pass(BuildProbeSidePass),
             pass(JoinFilterPushdownPass),
             pass(TopNPass),

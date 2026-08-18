@@ -351,7 +351,7 @@ pub struct CardinalityEstimator {
     relation_unique_keys: HashMap<usize, Vec<Vec<ColumnBinding>>>,
     relation_cardinalities: HashMap<usize, usize>,
     /// Cached cardinalities for relation sets.
-    relation_set_2_cardinality: HashMap<String, CardinalityHelper>,
+    relation_set_2_cardinality: HashMap<JoinRelationSet, CardinalityHelper>,
     /// Set manager for creating/looking up relation sets.
     set_manager: JoinRelationSetManager,
 }
@@ -396,7 +396,7 @@ impl CardinalityEstimator {
         let relation_cardinality = stats.cardinality as f64;
         let card_helper = CardinalityHelper::new(relation_cardinality);
         self.relation_set_2_cardinality
-            .insert(set.to_string(), card_helper);
+            .insert(set.as_ref().clone(), card_helper);
 
         self.binding_stats
             .extend(stats.column_distinct_count.iter().map(|(binding, count)| {
@@ -441,8 +441,7 @@ impl CardinalityEstimator {
     /// Estimate cardinality for a join relation set.
     pub fn estimate_cardinality(&mut self, new_set: &JoinRelationSet) -> f64 {
         self.ensure_equality_graphs();
-        let key = new_set.to_string();
-        if let Some(helper) = self.relation_set_2_cardinality.get(&key) {
+        if let Some(helper) = self.relation_set_2_cardinality.get(new_set) {
             return helper.cardinality_before_filters;
         }
 
@@ -451,7 +450,8 @@ impl CardinalityEstimator {
 
         let result = numerator / denom_info.denominator;
         let new_entry = CardinalityHelper::new(result);
-        self.relation_set_2_cardinality.insert(key, new_entry);
+        self.relation_set_2_cardinality
+            .insert(new_set.clone(), new_entry);
         result
     }
 
@@ -640,19 +640,13 @@ impl CardinalityEstimator {
     /// Get the numerator for cardinality calculation.
     fn get_numerator(&self, set: &JoinRelationSet) -> f64 {
         let mut numerator = 1.0;
-        for i in 0..set.count() {
-            let single_node_set = self.set_manager_get_relation(set.relations()[i]);
-            if let Some(card_helper) = self.relation_set_2_cardinality.get(&single_node_set) {
-                let card = card_helper.cardinality_before_filters;
+        for relation in set.relations() {
+            if let Some(cardinality) = self.relation_cardinalities.get(relation) {
+                let card = *cardinality as f64;
                 numerator *= if card == 0.0 { 1.0 } else { card };
             }
         }
         numerator
-    }
-
-    /// Helper to get a relation set string.
-    fn set_manager_get_relation(&self, index: usize) -> String {
-        format!("[{}]", index)
     }
 
     /// Get edges (filters) that are subsets of the requested set.
@@ -1163,7 +1157,7 @@ impl CardinalityEstimator {
             // Check if we've already connected all relations
             if subgraphs.len() == 1 {
                 if let Some(ref rels) = subgraphs[0].relations {
-                    if rels.to_string() == set.to_string() {
+                    if rels.as_ref() == set {
                         // All relations connected, skip remaining edges
                         if edge.has_distinct_count_hll {
                             unused_edge_tdoms.insert(edge.distinct_count_hll);
@@ -1559,8 +1553,10 @@ mod tests {
         estimator.init_cardinality_estimator_props(&set0, &stats0);
 
         // Check that cardinality was stored
-        assert!(estimator.relation_set_2_cardinality.contains_key("[0]"));
-        let helper = &estimator.relation_set_2_cardinality["[0]"];
+        assert!(estimator
+            .relation_set_2_cardinality
+            .contains_key(set0.as_ref()));
+        let helper = &estimator.relation_set_2_cardinality[set0.as_ref()];
         assert_eq!(helper.cardinality_before_filters, 1000.0);
     }
 

@@ -6,12 +6,13 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use paro_common::error::Result;
 use paro_common::logging::targets;
 use tracing::debug;
 
 use crate::join_order::cost_model::{CostModel, DPJoinNode};
-use crate::join_order::query_graph::{JoinPredicateSet, NeighborInfo, QueryGraphEdges};
+use crate::join_order::query_graph::{
+    CutPredicateResolution, JoinPredicateSet, NeighborInfo, QueryGraphEdges,
+};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 
 /// Threshold to switch from exact to approximate join order optimization.
@@ -32,7 +33,7 @@ pub(crate) struct PlanEnumerator<'a> {
     /// Number of relations in the query.
     num_relations: usize,
     /// The optimal plans found for each relation set.
-    plans: HashMap<String, DPJoinNode>,
+    plans: HashMap<Arc<JoinRelationSet>, DPJoinNode>,
     /// The total number of join pairs considered.
     pairs: usize,
 }
@@ -59,23 +60,23 @@ impl<'a> PlanEnumerator<'a> {
     pub fn init_leaf_plans(&mut self) {
         for i in 0..self.num_relations {
             let set = self.set_manager.get_relation(i);
-            let mut node =
-                DPJoinNode::leaf(set.clone(), self.cost_model.payload_width(set.as_ref()));
+            let cardinality = self.cost_model.get_cardinality(&set);
+            let node = DPJoinNode::leaf(
+                set.clone(),
+                self.cost_model.payload_width(set.as_ref()),
+                cardinality,
+            );
 
-            // Get cardinality from cost model
-            node.cardinality = self.cost_model.get_cardinality(&set);
-
-            self.plans.insert(set.to_string(), node);
+            self.plans.insert(set, node);
         }
     }
 
     /// Solve the join order using dynamic programming.
     ///
     /// Returns true if completed successfully (did not time out).
-    pub fn solve_join_order(&mut self) -> Result<bool> {
+    pub fn solve_join_order(&mut self) -> bool {
         // For small graphs, try exact algorithm first
-        if self.num_relations < THRESHOLD_TO_SWAP_TO_APPROXIMATE
-            && self.solve_join_order_exactly()?
+        if self.num_relations < THRESHOLD_TO_SWAP_TO_APPROXIMATE && self.solve_join_order_exactly()
         {
             // Check if we got a final plan
             let mut all_relations = HashSet::new();
@@ -84,7 +85,7 @@ impl<'a> PlanEnumerator<'a> {
             }
             let total_set = self.set_manager.get_relation_from_set(&all_relations);
 
-            if let Some(final_plan) = self.plans.get(&total_set.to_string()) {
+            if let Some(final_plan) = self.plans.get(&total_set) {
                 debug!(
                     target: targets::OPTIMIZER,
                     relations = self.num_relations,
@@ -95,7 +96,7 @@ impl<'a> PlanEnumerator<'a> {
                     cost = final_plan.cost,
                     "Completed exact join-order enumeration"
                 );
-                return Ok(true);
+                return true;
             }
         }
 
@@ -106,12 +107,11 @@ impl<'a> PlanEnumerator<'a> {
             exact_pairs = self.pairs,
             "Falling back to greedy join-order enumeration"
         );
-        self.solve_join_order_approximately()?;
-        Ok(true)
+        self.solve_join_order_approximately()
     }
 
     /// Get the optimal plans.
-    pub fn get_plans(&self) -> &HashMap<String, DPJoinNode> {
+    pub fn get_plans(&self) -> &HashMap<Arc<JoinRelationSet>, DPJoinNode> {
         &self.plans
     }
 
@@ -122,20 +122,20 @@ impl<'a> PlanEnumerator<'a> {
             all_relations.insert(i);
         }
         let total_set = self.set_manager.get_relation_from_set(&all_relations);
-        self.plans.get(&total_set.to_string())
+        self.plans.get(&total_set)
     }
 
     // Private methods
 
     /// Solve join order exactly using dynamic programming.
-    fn solve_join_order_exactly(&mut self) -> Result<bool> {
+    fn solve_join_order_exactly(&mut self) -> bool {
         // Enumerate over all possible pairs in the neighborhood
         for i in (1..=self.num_relations).rev() {
             let start_node = self.set_manager.get_relation(i - 1);
 
             // Emit the start node
-            if !self.emit_csg(&start_node)? {
-                return Ok(false);
+            if !self.emit_csg(&start_node) {
+                return false;
             }
 
             // Initialize exclusion set as all nodes with number below this
@@ -145,17 +145,17 @@ impl<'a> PlanEnumerator<'a> {
             }
 
             // Recursively search for neighbors not in exclusion set
-            if !self.enumerate_csg_recursive(&start_node, &mut exclusion_set)? {
-                return Ok(false);
+            if !self.enumerate_csg_recursive(&start_node, &mut exclusion_set) {
+                return false;
             }
         }
-        Ok(true)
+        true
     }
 
     /// Emit a connected subgraph (CSG).
-    fn emit_csg(&mut self, node: &Arc<JoinRelationSet>) -> Result<bool> {
+    fn emit_csg(&mut self, node: &Arc<JoinRelationSet>) -> bool {
         if node.count() == self.num_relations {
-            return Ok(true);
+            return true;
         }
 
         // Create exclusion set as everything inside the subgraph and anything below it
@@ -170,7 +170,7 @@ impl<'a> PlanEnumerator<'a> {
         // Find neighbors given this exclusion set
         let neighbors = self.query_graph.get_neighbors(node, &exclusion_set);
         if neighbors.is_empty() {
-            return Ok(true);
+            return true;
         }
 
         // Neighbors should be in reverse order
@@ -189,19 +189,19 @@ impl<'a> PlanEnumerator<'a> {
             // Check if connected
             let connections = self.query_graph.get_connections(node, &neighbor_relation);
             if !connections.is_empty()
-                && !self.try_emit_pair(node, &neighbor_relation, &connections)?
+                && !self.try_emit_pair(node, &neighbor_relation, &connections)
             {
-                return Ok(false);
+                return false;
             }
 
-            if !self.enumerate_cmp_recursive(node, &neighbor_relation, &mut new_exclusion_set)? {
-                return Ok(false);
+            if !self.enumerate_cmp_recursive(node, &neighbor_relation, &mut new_exclusion_set) {
+                return false;
             }
 
             new_exclusion_set.remove(&neighbor_idx);
         }
 
-        Ok(true)
+        true
     }
 
     /// Enumerate connected subgraphs recursively.
@@ -209,11 +209,11 @@ impl<'a> PlanEnumerator<'a> {
         &mut self,
         node: &Arc<JoinRelationSet>,
         exclusion_set: &mut HashSet<usize>,
-    ) -> Result<bool> {
+    ) -> bool {
         // Find neighbors of S under the exclusion set
         let neighbors = self.query_graph.get_neighbors(node, exclusion_set);
         if neighbors.is_empty() {
-            return Ok(true);
+            return true;
         }
 
         let all_subsets = get_all_neighbor_sets(neighbors.clone());
@@ -224,10 +224,10 @@ impl<'a> PlanEnumerator<'a> {
             let new_set = self.set_manager.union(node, &neighbor);
 
             if new_set.count() > node.count()
-                && self.plans.contains_key(&new_set.to_string())
-                && !self.emit_csg(&new_set)?
+                && self.plans.contains_key(&new_set)
+                && !self.emit_csg(&new_set)
             {
-                return Ok(false);
+                return false;
             }
             union_sets.push(new_set);
         }
@@ -238,12 +238,12 @@ impl<'a> PlanEnumerator<'a> {
         }
 
         for union_set in union_sets {
-            if !self.enumerate_csg_recursive(&union_set, &mut new_exclusion_set)? {
-                return Ok(false);
+            if !self.enumerate_csg_recursive(&union_set, &mut new_exclusion_set) {
+                return false;
             }
         }
 
-        Ok(true)
+        true
     }
 
     /// Enumerate complement pairs recursively.
@@ -252,11 +252,11 @@ impl<'a> PlanEnumerator<'a> {
         left: &Arc<JoinRelationSet>,
         right: &Arc<JoinRelationSet>,
         exclusion_set: &mut HashSet<usize>,
-    ) -> Result<bool> {
+    ) -> bool {
         // Get neighbors of the second relation under the exclusion set
         let neighbors = self.query_graph.get_neighbors(right, exclusion_set);
         if neighbors.is_empty() {
-            return Ok(true);
+            return true;
         }
 
         let all_subsets = get_all_neighbor_sets(neighbors.clone());
@@ -268,12 +268,11 @@ impl<'a> PlanEnumerator<'a> {
 
             debug_assert!(combined_set.count() > right.count());
 
-            if self.plans.contains_key(&combined_set.to_string()) {
+            if self.plans.contains_key(&combined_set) {
                 let connections = self.query_graph.get_connections(left, &combined_set);
-                if !connections.is_empty()
-                    && !self.try_emit_pair(left, &combined_set, &connections)?
+                if !connections.is_empty() && !self.try_emit_pair(left, &combined_set, &connections)
                 {
-                    return Ok(false);
+                    return false;
                 }
             }
             union_sets.push(combined_set);
@@ -285,12 +284,12 @@ impl<'a> PlanEnumerator<'a> {
         }
 
         for union_set in union_sets {
-            if !self.enumerate_cmp_recursive(left, &union_set, &mut new_exclusion_set)? {
-                return Ok(false);
+            if !self.enumerate_cmp_recursive(left, &union_set, &mut new_exclusion_set) {
+                return false;
             }
         }
 
-        Ok(true)
+        true
     }
 
     /// Try to emit a pair of relations.
@@ -301,14 +300,13 @@ impl<'a> PlanEnumerator<'a> {
         left: &Arc<JoinRelationSet>,
         right: &Arc<JoinRelationSet>,
         connections: &[NeighborInfo],
-    ) -> Result<bool> {
+    ) -> bool {
         self.pairs += 1;
         if self.pairs >= MAX_PAIRS {
-            return Ok(false);
+            return false;
         }
 
-        self.emit_pair(left, right, connections)?;
-        Ok(true)
+        self.emit_pair(left, right, connections)
     }
 
     /// Emit a pair of relations and create a join node.
@@ -317,37 +315,35 @@ impl<'a> PlanEnumerator<'a> {
         left: &Arc<JoinRelationSet>,
         right: &Arc<JoinRelationSet>,
         connections: &[NeighborInfo],
-    ) -> Result<()> {
+    ) -> bool {
         // Get the left and right plans
-        let left_key = left.to_string();
-        let right_key = right.to_string();
-
-        let left_plan = match self.plans.get(&left_key) {
+        let left_plan = match self.plans.get(left) {
             Some(plan) => plan.clone(),
-            None => return Ok(()),
+            None => return true,
         };
 
-        let right_plan = match self.plans.get(&right_key) {
+        let right_plan = match self.plans.get(right) {
             Some(plan) => plan.clone(),
-            None => return Ok(()),
+            None => return true,
         };
 
         // Create the join node
         let new_set = self.set_manager.union(left, right);
-        let new_node = self.create_join_tree(&left_plan, &right_plan, connections)?;
+        let Some(new_node) = self.create_join_tree(&left_plan, &right_plan, connections) else {
+            return false;
+        };
 
         // Check if this is the best plan for this set
-        let new_key = new_set.to_string();
-        let should_update = if let Some(existing) = self.plans.get(&new_key) {
+        let should_update = if let Some(existing) = self.plans.get(&new_set) {
             new_node.cost < existing.cost
         } else {
             true
         };
 
         if should_update {
-            self.plans.insert(new_key, new_node);
+            self.plans.insert(new_set, new_node);
         }
-        Ok(())
+        true
     }
 
     fn create_join_tree(
@@ -355,23 +351,36 @@ impl<'a> PlanEnumerator<'a> {
         left: &DPJoinNode,
         right: &DPJoinNode,
         connections: &[NeighborInfo],
-    ) -> Result<DPJoinNode> {
-        let predicates = Self::collect_cut_predicates(connections)?;
+    ) -> Option<DPJoinNode> {
+        let predicates = match Self::collect_cut_predicates(connections, &left.set, &right.set) {
+            CutPredicateResolution::Resolved(predicates) => predicates,
+            CutPredicateResolution::Ineligible => return None,
+        };
 
-        self.cost_model
-            .compute_cost_and_create_node(left, right, self.set_manager, predicates)
+        Some(self.cost_model.compute_cost_and_create_node(
+            left,
+            right,
+            self.set_manager,
+            predicates,
+        ))
     }
 
-    fn collect_cut_predicates(connections: &[NeighborInfo]) -> Result<Option<JoinPredicateSet>> {
+    fn collect_cut_predicates(
+        connections: &[NeighborInfo],
+        left: &JoinRelationSet,
+        right: &JoinRelationSet,
+    ) -> CutPredicateResolution {
         JoinPredicateSet::from_filters(
             connections
                 .iter()
                 .flat_map(|connection| &connection.filters),
+            left,
+            right,
         )
     }
 
     /// Solve join order approximately using a greedy algorithm.
-    fn solve_join_order_approximately(&mut self) -> Result<()> {
+    fn solve_join_order_approximately(&mut self) -> bool {
         // Start with all base relations
         let mut join_relations: Vec<Arc<JoinRelationSet>> = (0..self.num_relations)
             .map(|i| self.set_manager.get_relation(i))
@@ -391,12 +400,14 @@ impl<'a> PlanEnumerator<'a> {
                         .get_connections(&join_relations[i], &join_relations[j]);
 
                     if !connections.is_empty() {
-                        self.emit_pair(&join_relations[i], &join_relations[j], &connections)?;
+                        if !self.emit_pair(&join_relations[i], &join_relations[j], &connections) {
+                            return false;
+                        }
 
                         let combined = self
                             .set_manager
                             .union(&join_relations[i], &join_relations[j]);
-                        if let Some(node) = self.plans.get(&combined.to_string()) {
+                        if let Some(node) = self.plans.get(&combined) {
                             if node.cost < best_cost {
                                 best_cost = node.cost;
                                 best_left = i;
@@ -412,7 +423,9 @@ impl<'a> PlanEnumerator<'a> {
                 // Fallback: just pick first two
                 best_left = 0;
                 best_right = 1;
-                self.emit_pair(&join_relations[best_left], &join_relations[best_right], &[])?;
+                if !self.emit_pair(&join_relations[best_left], &join_relations[best_right], &[]) {
+                    return false;
+                }
             }
 
             // Ensure best_right > best_left for removal
@@ -428,7 +441,7 @@ impl<'a> PlanEnumerator<'a> {
             join_relations.remove(best_left);
             join_relations.push(new_set);
         }
-        Ok(())
+        true
     }
 }
 
@@ -562,13 +575,17 @@ mod tests {
             },
         ];
 
-        let predicates = PlanEnumerator::collect_cut_predicates(&connections)
-            .expect("valid cut predicates")
-            .expect("join cut should contain predicates");
+        let left = set_manager.get_relation(0);
+        let right = set_manager.get_relation_from_vec(vec![1, 2]);
+        let CutPredicateResolution::Resolved(Some(predicates)) =
+            PlanEnumerator::collect_cut_predicates(&connections, &left, &right)
+        else {
+            panic!("join cut should contain valid predicates")
+        };
 
-        assert_eq!(predicates.filters().len(), 2);
-        assert_eq!(predicates.filters()[0].filter_index, 0);
-        assert_eq!(predicates.filters()[1].filter_index, 1);
+        assert_eq!(predicates.predicates().len(), 2);
+        assert_eq!(predicates.predicates()[0].filter().filter_index, 0);
+        assert_eq!(predicates.predicates()[1].filter().filter_index, 1);
     }
 
     #[test]
@@ -623,10 +640,7 @@ mod tests {
         assert_eq!(enumerator.plans.len(), 2);
 
         // Get the key before borrowing enumerator
-        let set0_key = {
-            let set0 = enumerator.set_manager.get_relation(0);
-            set0.to_string()
-        };
+        let set0_key = enumerator.set_manager.get_relation(0);
 
         let plan0 = enumerator.plans.get(&set0_key).unwrap();
         assert!(plan0.is_leaf);
@@ -663,7 +677,7 @@ mod tests {
         let mut enumerator =
             PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
         enumerator.init_leaf_plans();
-        enumerator.solve_join_order().unwrap();
+        assert!(enumerator.solve_join_order());
 
         // Should have plans for both single relations and the join
         assert!(enumerator.plans.len() >= 2);
@@ -716,7 +730,7 @@ mod tests {
         let mut enumerator =
             PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 3);
         enumerator.init_leaf_plans();
-        enumerator.solve_join_order().unwrap();
+        assert!(enumerator.solve_join_order());
 
         // Check final plan exists
         let final_plan = enumerator.get_final_plan();
@@ -744,7 +758,7 @@ mod tests {
         let mut enumerator =
             PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
         enumerator.init_leaf_plans();
-        enumerator.solve_join_order().unwrap();
+        assert!(enumerator.solve_join_order());
 
         // Should still produce a final plan (via cross product)
         let final_plan = enumerator.get_final_plan();
@@ -777,6 +791,6 @@ mod tests {
         enumerator.init_leaf_plans();
 
         let result = enumerator.solve_join_order();
-        assert!(result.unwrap());
+        assert!(result);
     }
 }

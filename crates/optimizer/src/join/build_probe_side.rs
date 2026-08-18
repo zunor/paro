@@ -75,26 +75,6 @@ impl BuildProbeSideOptimizer {
             return;
         };
 
-        let force_flip_for_control_region = match join.join_type {
-            JoinType::Semi | JoinType::Anti => {
-                if contains_control_region_boundary(join.right.as_ref()) {
-                    // The semantic filtering input is already the build side.
-                    // Moving its control region onto the probe side would
-                    // require a qualitatively different materialization.
-                    return;
-                }
-                false
-            }
-            JoinType::RightSemi | JoinType::RightAnti => {
-                // Right-preserving reductions place their semantic filtering
-                // input on the physical probe side. Normalize a filtering
-                // control region back onto the build side even when raw byte
-                // cost alone would prefer the current orientation.
-                contains_control_region_boundary(join.left.as_ref())
-            }
-            _ => false,
-        };
-
         let left_cost = self.comparison_build_cost(
             join.left.as_ref(),
             &join.left_projection_map,
@@ -105,7 +85,18 @@ impl BuildProbeSideOptimizer {
             &join.right_projection_map,
             join.conditions.iter().map(|condition| &condition.right),
         );
-        if !force_flip_for_control_region && right_cost <= left_cost {
+        let build_side = choose_hash_build_side(
+            join.join_type,
+            HashBuildCandidate {
+                serialized_work: left_cost,
+                contains_control_region: contains_control_region_boundary(join.left.as_ref()),
+            },
+            HashBuildCandidate {
+                serialized_work: right_cost,
+                contains_control_region: contains_control_region_boundary(join.right.as_ref()),
+            },
+        );
+        if build_side == HashBuildSide::Right {
             return;
         }
 
@@ -143,8 +134,8 @@ impl BuildProbeSideOptimizer {
         plan: &LogicalPlan,
         projection: &ProjectionMap,
         condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
-    ) -> u128 {
-        let cardinality = self.estimated_cardinality(plan) as u128;
+    ) -> f64 {
+        let cardinality = self.estimated_cardinality(plan) as f64;
         let plan_types = plan.types();
         let projected_types = projection
             .to_indices(plan_types.len())
@@ -164,8 +155,8 @@ impl BuildProbeSideOptimizer {
         // `BuildRowLayout`; projected key columns deliberately remain in the
         // payload because the join may expose them above the operator.
         let row_width =
-            estimate_hash_build_row_width(projected_payload_width, condition_payload_width) as u128;
-        cardinality.saturating_mul(row_width.max(1))
+            estimate_hash_build_row_width(projected_payload_width, condition_payload_width) as f64;
+        cardinality * row_width.max(1.0)
     }
 
     fn estimated_cardinality(&self, plan: &LogicalPlan) -> usize {
@@ -200,10 +191,54 @@ pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
             .any(|child| contains_control_region_boundary(child))
 }
 
+/// Physical side selected as the hash-table build input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HashBuildSide {
+    Left,
+    Right,
+}
+
+/// Inputs to the shared hash-build orientation policy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HashBuildCandidate {
+    /// Cost of serializing this input into the physical build-row layout.
+    pub serialized_work: f64,
+    /// Whether moving this subtree to the probe side crosses a control region.
+    pub contains_control_region: bool,
+}
+
+/// Choose the physical hash build side for one comparison join.
+///
+/// Both DP enumeration and final build/probe lowering call this function. A
+/// reduction's filtering control region must remain a materialized build
+/// producer; otherwise the smaller serialized build input wins, with the
+/// current right-build convention breaking ties.
+pub(crate) fn choose_hash_build_side(
+    join_type: JoinType,
+    left: HashBuildCandidate,
+    right: HashBuildCandidate,
+) -> HashBuildSide {
+    let filtering_side = match join_type {
+        JoinType::Semi | JoinType::Anti => Some(HashBuildSide::Right),
+        JoinType::RightSemi | JoinType::RightAnti => Some(HashBuildSide::Left),
+        _ => None,
+    };
+    if filtering_side == Some(HashBuildSide::Left) && left.contains_control_region {
+        return HashBuildSide::Left;
+    }
+    if filtering_side == Some(HashBuildSide::Right) && right.contains_control_region {
+        return HashBuildSide::Right;
+    }
+    if right.serialized_work <= left.serialized_work {
+        HashBuildSide::Right
+    } else {
+        HashBuildSide::Left
+    }
+}
+
 /// Estimate the bytes carried by one intermediate execution row.
 ///
-/// This is shared by join-order enumeration and final build/probe orientation
-/// so both optimizers assign the same cost to wide and variable-length rows.
+/// Used by the final build/probe pass for cross products and tests.
 pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
     8 + estimate_row_payload_width(types)
 }
@@ -225,21 +260,6 @@ pub(crate) fn estimate_hash_build_row_width(
         .saturating_add(projected_payload_width)
         .saturating_add(condition_payload_width)
         .saturating_add(HASH_BUILD_RUNTIME_BYTES)
-}
-
-/// Byte-equivalent work for evaluating and hashing one probe key tuple.
-pub(crate) fn estimate_hash_probe_row_width(condition_payload_width: usize) -> usize {
-    // The generic probe path writes the hash, reads one packed HtEntry, and
-    // records the matched build pointer plus probe-row ordinal. Collision-chain
-    // and result-emission work is charged per accepted match by join ordering.
-    // HtEntry access is random: charge the cache line transferred, not the
-    // eight-byte field eventually consumed by the CPU.
-    const HASH_BUCKET_CACHE_LINE_BYTES: usize = 64;
-    const HASH_PROBE_RUNTIME_BYTES: usize = std::mem::size_of::<u64>()
-        + HASH_BUCKET_CACHE_LINE_BYTES
-        + std::mem::size_of::<usize>()
-        + std::mem::size_of::<u32>();
-    condition_payload_width.saturating_add(HASH_PROBE_RUNTIME_BYTES)
 }
 
 /// Estimate the schema-dependent bytes without a row-container header.
