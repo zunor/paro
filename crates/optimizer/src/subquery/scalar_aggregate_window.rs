@@ -24,8 +24,8 @@ use paro_planner::expression::{
     WindowFrameType,
 };
 use paro_planner::operator::{
-    Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Filter, Get, Join, LogicalOperator,
-    MarkJoinSemantics, ProjectionMap, Window,
+    Aggregate, AntiJoinMode, ColumnBinding, ComparisonJoin, Filter, Get, Join, JoinType,
+    LogicalOperator, MarkJoinSemantics, ProjectionMap, Window,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -63,6 +63,7 @@ fn optimize_node(
 
 struct Rewrite {
     detail_projection: ProjectionMap,
+    detail_path: Box<[DetailPathStep]>,
     scalar_binding: ColumnBinding,
     scalar_source_binding: ColumnBinding,
     scalar_expression: Expression,
@@ -81,6 +82,13 @@ struct ScalarBranch<'a> {
 struct DetailBranch<'a> {
     filter: &'a Filter,
     get: &'a Get,
+    path: Box<[DetailPathStep]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DetailPathStep {
+    LeftReduction,
+    RightReduction,
 }
 
 fn recognize(plan: &LogicalPlan, output_contract: Option<&OutputContract>) -> Option<Rewrite> {
@@ -178,6 +186,7 @@ fn recognize_detail_left_scalar_right(
 
     Some(Rewrite {
         detail_projection: join.left_projection_map.clone(),
+        detail_path: detail.path,
         scalar_binding,
         scalar_source_binding: ColumnBinding::new(scalar.aggregate_index, 0),
         scalar_expression: scalar.scalar_expression.clone(),
@@ -186,14 +195,49 @@ fn recognize_detail_left_scalar_right(
 }
 
 fn peel_detail_branch(plan: &LogicalPlan) -> Option<DetailBranch<'_>> {
-    let LogicalOperator::Filter(filter) = &plan.operator else {
-        return None;
-    };
-    let LogicalOperator::Get(get) = &filter.child.operator else {
-        return None;
-    };
-    (!filter.expressions.is_empty() && filter.expressions.iter().all(is_movable))
-        .then_some(DetailBranch { filter, get })
+    let mut current = plan;
+    let mut path = Vec::new();
+    loop {
+        match &current.operator {
+            LogicalOperator::Filter(filter) => {
+                let LogicalOperator::Get(get) = &filter.child.operator else {
+                    return None;
+                };
+                return (!filter.expressions.is_empty()
+                    && filter.expressions.iter().all(is_movable))
+                .then_some(DetailBranch {
+                    filter,
+                    get,
+                    path: path.into_boxed_slice(),
+                });
+            }
+            LogicalOperator::Join(Join::Comparison(join)) if plain_reduction_carrier(join) => {
+                match join.join_type {
+                    JoinType::Semi | JoinType::Anti => {
+                        path.push(DetailPathStep::LeftReduction);
+                        current = join.left.as_ref();
+                    }
+                    JoinType::RightSemi | JoinType::RightAnti => {
+                        path.push(DetailPathStep::RightReduction);
+                        current = join.right.as_ref();
+                    }
+                    _ => return None,
+                }
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn plain_reduction_carrier(join: &ComparisonJoin) -> bool {
+    matches!(
+        join.join_type,
+        JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti
+    ) && join.mark_index.is_none()
+        && join.mark_semantics == MarkJoinSemantics::NotMark
+        && join.duplicate_eliminated_columns.is_empty()
+        && !join.delim_flipped
+        && !join.conditions.is_empty()
 }
 
 fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
@@ -484,8 +528,6 @@ fn apply_rewrite(
         &mut *join.left,
         LogicalPlan::synthetic(LogicalOperator::DummyScan),
     );
-    let detail_width = detail.types().len();
-    let detail_stats = detail.stats.clone();
     let window_index = bind_context.generate_table_index();
     let window_binding = ColumnBinding::new(window_index, 0);
     let window_type = rewrite.aggregate.return_type.clone();
@@ -496,15 +538,6 @@ fn apply_rewrite(
         end_bound: WindowFrameBound::Unbounded,
         end_is_preceding: false,
     };
-    let window_expression =
-        WindowExpression::aggregate(rewrite.aggregate, Vec::new(), Vec::new(), frame);
-    window_expression.verify_bound_contract()?;
-    let mut window = LogicalPlan::new(
-        bind_context,
-        LogicalOperator::Window(Window::new(window_index, vec![window_expression], detail)),
-    );
-    window.stats = detail_stats;
-
     let scalar = rewrite.scalar_expression.replace_column_ref(&|column| {
         (column.depth == 0 && column.binding == rewrite.scalar_source_binding).then(|| {
             Expression::ColumnRef(ColumnRefExpression::new(
@@ -544,11 +577,127 @@ fn apply_rewrite(
         ));
     }
 
-    let mut filter = Filter::new(window, predicates);
-    filter.projection_map = ProjectionMap::new(rewrite.detail_projection.to_indices(detail_width));
+    let window_expression =
+        WindowExpression::aggregate(rewrite.aggregate, Vec::new(), Vec::new(), frame);
+    window_expression.verify_bound_contract()?;
+    let path_is_empty = rewrite.detail_path.is_empty();
+    let mut rewritten_detail = install_scalar_window(
+        detail,
+        rewrite.detail_path.as_ref(),
+        window_index,
+        window_expression,
+        predicates,
+        path_is_empty.then_some(&rewrite.detail_projection),
+        bind_context,
+    )?;
+    if !path_is_empty {
+        apply_detail_projection(&mut rewritten_detail, &rewrite.detail_projection)?;
+    }
     Ok(LogicalPlan {
         id,
         stats,
-        operator: LogicalOperator::Filter(filter),
+        operator: rewritten_detail.operator,
     })
+}
+
+fn install_scalar_window(
+    mut plan: LogicalPlan,
+    path: &[DetailPathStep],
+    window_index: usize,
+    window_expression: WindowExpression,
+    predicates: Vec<Expression>,
+    output_projection: Option<&ProjectionMap>,
+    bind_context: &BindContext,
+) -> Result<LogicalPlan> {
+    let Some((step, remaining)) = path.split_first() else {
+        let detail_width = plan.types().len();
+        let detail_stats = plan.stats.clone();
+        let mut window = LogicalPlan::new(
+            bind_context,
+            LogicalOperator::Window(Window::new(window_index, vec![window_expression], plan)),
+        );
+        window.stats = detail_stats.clone();
+        let mut filter = Filter::new(window, predicates);
+        filter.projection_map = output_projection.map_or_else(
+            || ProjectionMap::new((0..detail_width).collect()),
+            |projection| ProjectionMap::new(projection.to_indices(detail_width)),
+        );
+        let mut result = LogicalPlan::new(bind_context, LogicalOperator::Filter(filter));
+        result.stats = detail_stats;
+        return Ok(result);
+    };
+
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
+        return Err(paro_error::internal(
+            "scalar aggregate detail path no longer points to a comparison join",
+        ));
+    };
+    if !plain_reduction_carrier(join) {
+        return Err(paro_error::internal(
+            "scalar aggregate detail path no longer points to a clean reduction join",
+        ));
+    }
+    let child = match step {
+        DetailPathStep::LeftReduction
+            if matches!(join.join_type, JoinType::Semi | JoinType::Anti) =>
+        {
+            &mut join.left
+        }
+        DetailPathStep::RightReduction
+            if matches!(join.join_type, JoinType::RightSemi | JoinType::RightAnti) =>
+        {
+            &mut join.right
+        }
+        _ => {
+            return Err(paro_error::internal(
+                "scalar aggregate detail path changed preserved side",
+            ));
+        }
+    };
+    let owned_child = std::mem::replace(
+        child.as_mut(),
+        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+    );
+    **child = install_scalar_window(
+        owned_child,
+        remaining,
+        window_index,
+        window_expression,
+        predicates,
+        output_projection,
+        bind_context,
+    )?;
+    Ok(plan)
+}
+
+fn apply_detail_projection(plan: &mut LogicalPlan, projection: &ProjectionMap) -> Result<()> {
+    let LogicalOperator::Join(Join::Comparison(join)) = &mut plan.operator else {
+        return Err(paro_error::internal(
+            "scalar aggregate nested detail root is not a reduction join",
+        ));
+    };
+    let (child_width, preserved_projection) = match join.join_type {
+        JoinType::Semi | JoinType::Anti => (join.left.types().len(), &mut join.left_projection_map),
+        JoinType::RightSemi | JoinType::RightAnti => {
+            (join.right.types().len(), &mut join.right_projection_map)
+        }
+        _ => {
+            return Err(paro_error::internal(
+                "scalar aggregate nested detail root changed join type",
+            ));
+        }
+    };
+    let existing = preserved_projection.to_indices(child_width);
+    let requested = projection.to_indices(existing.len());
+    let Some(composed) = requested
+        .into_iter()
+        .map(|index| existing.get(index).copied())
+        .collect::<Option<Vec<_>>>()
+    else {
+        return Err(paro_error::internal(
+            "scalar aggregate detail projection escaped the reduction output",
+        ));
+    };
+    *preserved_projection = ProjectionMap::new(composed);
+    Ok(())
 }

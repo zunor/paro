@@ -7,6 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
 
+use paro_common::error::{internal, Result};
 use paro_planner::expression::Expression;
 use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
@@ -78,7 +79,7 @@ impl ReductionJoinRoles {
 
 /// Predicates and authoritative logical semantics for one join-tree cut.
 #[derive(Debug, Clone)]
-pub struct JoinPredicateSet {
+pub(crate) struct JoinPredicateSet {
     filters: Box<[Arc<FilterInfo>]>,
     join_type: JoinType,
     anti_join_mode: AntiJoinMode,
@@ -91,24 +92,33 @@ impl JoinPredicateSet {
     /// A SEMI/ANTI boundary owns the cut: predicates with other join types are
     /// not folded into that reduction operator. Duplicate graph edges are
     /// collapsed by their stable filter index.
-    pub fn from_filters<'a>(
+    pub(crate) fn from_filters<'a>(
         filters: impl IntoIterator<Item = &'a Arc<FilterInfo>>,
-    ) -> Option<Self> {
-        let candidates = filters.into_iter().collect::<Vec<_>>();
-        let boundary_join_type = candidates.iter().find_map(|filter| {
-            matches!(filter.join_type, JoinType::Semi | JoinType::Anti).then_some(filter.join_type)
-        });
-        let mut seen = HashSet::new();
-        let filters = candidates
-            .into_iter()
-            .filter(|filter| {
-                boundary_join_type.is_none_or(|join_type| filter.join_type == join_type)
-            })
-            .filter(|filter| seen.insert(filter.filter_index))
-            .map(Arc::clone)
-            .collect::<Vec<_>>();
+    ) -> Result<Option<Self>> {
+        // Cut predicate sets are tiny in practice. A single linear-deduplicated
+        // vector avoids both the temporary candidate allocation and a hash
+        // table on every DP pair while retaining stable predicate order.
+        let mut boundary_join_type = None;
+        let mut selected = Vec::<Arc<FilterInfo>>::new();
+        for filter in filters {
+            if boundary_join_type.is_none()
+                && matches!(filter.join_type, JoinType::Semi | JoinType::Anti)
+            {
+                boundary_join_type = Some(filter.join_type);
+                selected.retain(|candidate| candidate.join_type == filter.join_type);
+            }
+            if boundary_join_type.is_some_and(|join_type| filter.join_type != join_type)
+                || selected
+                    .iter()
+                    .any(|candidate| candidate.filter_index == filter.filter_index)
+            {
+                continue;
+            }
+            selected.push(Arc::clone(filter));
+        }
+        let filters = selected;
         if filters.is_empty() {
-            return None;
+            return Ok(None);
         }
 
         let semantic_filter = filters
@@ -124,20 +134,27 @@ impl JoinPredicateSet {
                 (filter.join_type, filter.anti_join_mode)
             });
         let reduction_roles = if matches!(join_type, JoinType::Semi | JoinType::Anti) {
-            filters
-                .iter()
-                .filter(|filter| filter.join_type == join_type)
-                .find_map(|filter| ReductionJoinRoles::new(filter))
+            Some(
+                filters
+                    .iter()
+                    .filter(|filter| filter.join_type == join_type)
+                    .find_map(|filter| ReductionJoinRoles::new(filter))
+                    .ok_or_else(|| {
+                        internal(
+                            "reduction join predicate set has no preserved/filtering role witness",
+                        )
+                    })?,
+            )
         } else {
             None
         };
 
-        Some(Self {
+        Ok(Some(Self {
             filters: filters.into_boxed_slice(),
             join_type,
             anti_join_mode,
             reduction_roles,
-        })
+        }))
     }
 
     pub(crate) fn join_type(&self) -> JoinType {
@@ -655,6 +672,7 @@ mod tests {
         let valid_roles = Arc::new(valid_roles);
 
         let predicates = JoinPredicateSet::from_filters([&missing_roles, &valid_roles])
+            .expect("valid reduction role witness")
             .expect("reduction cut should retain its predicates");
         assert_eq!(predicates.join_type(), JoinType::Anti);
         assert_eq!(predicates.filters().len(), 2);
@@ -664,6 +682,26 @@ mod tests {
                 .and_then(|roles| roles.orientation_across(&preserved, &filtering)),
             Some(JoinEdgeOrientation::Forward)
         );
+    }
+
+    #[test]
+    fn predicate_set_rejects_reduction_without_a_role_witness() {
+        let mut manager = JoinRelationSetManager::new();
+        let joined = manager.get_relation_from_vec(vec![0, 1]);
+        let missing_roles = Arc::new(FilterInfo::new(
+            Expression::Constant(ConstantExpression {
+                value: Value::Boolean(true),
+                return_type: LogicalType::Boolean,
+            }),
+            joined,
+            0,
+            JoinType::Anti,
+            AntiJoinMode::Regular,
+        ));
+
+        let error = JoinPredicateSet::from_filters([&missing_roles])
+            .expect_err("malformed reduction metadata must fail before costing");
+        assert!(error.to_string().contains("role witness"));
     }
 
     #[test]

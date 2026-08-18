@@ -59,6 +59,9 @@ pub struct RelationStats {
     pub cardinality: usize,
     /// Estimated schema-dependent bytes carried by one row after projection pruning.
     pub estimated_payload_width: usize,
+    /// Whether this atomic relation owns a control-region boundary that cannot
+    /// be moved onto a reduction join's probe side without materialization.
+    pub contains_control_region: bool,
     /// Declared unique keys that remain visible in this relation.
     pub unique_keys: Vec<Vec<ColumnBinding>>,
     /// Filter strength (selectivity factor).
@@ -74,6 +77,7 @@ impl RelationStats {
             column_distinct_count: HashMap::new(),
             cardinality: 1,
             estimated_payload_width: 1,
+            contains_control_region: false,
             unique_keys: Vec::new(),
             filter_strength: 1.0,
             stats_initialized: false,

@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_planner::operator::{Join, JoinComparisonType, JoinType, LogicalOperator, ProjectionMap};
+use paro_planner::operator::{Join, JoinType, LogicalOperator, ProjectionMap};
 use paro_planner::plan::LogicalPlan;
 
 /// Choose a cheaper build side for joins.
@@ -75,32 +75,37 @@ impl BuildProbeSideOptimizer {
             return;
         };
 
-        if matches!(
-            join.join_type,
-            JoinType::Semi | JoinType::Anti | JoinType::RightSemi | JoinType::RightAnti
-        ) && contains_control_region_boundary(join.right.as_ref())
-        {
-            // Swapping always moves the current right child onto the probe
-            // side. A control region can feed that side only through a full
-            // materialization boundary, which is qualitatively different from
-            // choosing the cheaper in-memory hash build. Keep the region as a
-            // build producer and let join ordering optimize inside it.
-            return;
-        }
+        let force_flip_for_control_region = match join.join_type {
+            JoinType::Semi | JoinType::Anti => {
+                if contains_control_region_boundary(join.right.as_ref()) {
+                    // The semantic filtering input is already the build side.
+                    // Moving its control region onto the probe side would
+                    // require a qualitatively different materialization.
+                    return;
+                }
+                false
+            }
+            JoinType::RightSemi | JoinType::RightAnti => {
+                // Right-preserving reductions place their semantic filtering
+                // input on the physical probe side. Normalize a filtering
+                // control region back onto the build side even when raw byte
+                // cost alone would prefer the current orientation.
+                contains_control_region_boundary(join.left.as_ref())
+            }
+            _ => false,
+        };
 
         let left_cost = self.comparison_build_cost(
             join.left.as_ref(),
             &join.left_projection_map,
             join.conditions.iter().map(|condition| &condition.left),
-            join.conditions.iter().map(|condition| condition.comparison),
         );
         let right_cost = self.comparison_build_cost(
             join.right.as_ref(),
             &join.right_projection_map,
             join.conditions.iter().map(|condition| &condition.right),
-            join.conditions.iter().map(|condition| condition.comparison),
         );
-        if right_cost <= left_cost {
+        if !force_flip_for_control_region && right_cost <= left_cost {
             return;
         }
 
@@ -138,7 +143,6 @@ impl BuildProbeSideOptimizer {
         plan: &LogicalPlan,
         projection: &ProjectionMap,
         condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
-        comparisons: impl Iterator<Item = JoinComparisonType>,
     ) -> u128 {
         let cardinality = self.estimated_cardinality(plan) as u128;
         let plan_types = plan.types();
@@ -146,24 +150,11 @@ impl BuildProbeSideOptimizer {
             .to_indices(plan_types.len())
             .into_iter()
             .filter_map(|index| plan_types.get(index).cloned());
-        let condition_types = condition_expressions
-            .zip(comparisons)
-            .map(|(expression, comparison)| (expression.return_type(), comparison));
-        let mut stored_types = projected_types.collect::<Vec<_>>();
-        let mut keys = Vec::new();
-        let mut residuals = Vec::new();
-        for (ty, comparison) in condition_types {
-            if matches!(
-                comparison,
-                JoinComparisonType::Equal | JoinComparisonType::NotDistinctFrom
-            ) {
-                keys.push(ty);
-            } else {
-                residuals.push(ty);
-            }
-        }
-        keys.append(&mut stored_types);
-        keys.append(&mut residuals);
+        let condition_types = condition_expressions.map(|expression| expression.return_type());
+        let projected_payload_width =
+            estimate_row_payload_width(&projected_types.collect::<Vec<_>>());
+        let condition_payload_width =
+            estimate_row_payload_width(&condition_types.collect::<Vec<_>>());
 
         // Hash build rows store equality keys independently of the visible
         // payload, followed by hash, next-pointer, and match-mask state. The
@@ -172,9 +163,8 @@ impl BuildProbeSideOptimizer {
         // relations. Charge the actual serialized shape used by
         // `BuildRowLayout`; projected key columns deliberately remain in the
         // payload because the join may expose them above the operator.
-        const HASH_BUILD_RUNTIME_BYTES: usize =
-            std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + std::mem::size_of::<u8>();
-        let row_width = estimate_row_width(&keys).saturating_add(HASH_BUILD_RUNTIME_BYTES) as u128;
+        let row_width =
+            estimate_hash_build_row_width(projected_payload_width, condition_payload_width) as u128;
         cardinality.saturating_mul(row_width.max(1))
     }
 
@@ -194,7 +184,7 @@ impl BuildProbeSideOptimizer {
     }
 }
 
-fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
+pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
     let owns_region = matches!(
         &plan.operator,
         LogicalOperator::Join(Join::Comparison(join))
@@ -216,6 +206,40 @@ fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
 /// so both optimizers assign the same cost to wide and variable-length rows.
 pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
     8 + estimate_row_payload_width(types)
+}
+
+/// Estimate one serialized comparison-hash-build row from its visible payload
+/// and independently stored condition values.
+///
+/// Join-order enumeration has relation payload widths rather than a completed
+/// logical join. Sharing this byte model keeps its build-side choice aligned
+/// with the final build/probe pass while allowing the latter to use the exact
+/// projected and condition types.
+pub(crate) fn estimate_hash_build_row_width(
+    projected_payload_width: usize,
+    condition_payload_width: usize,
+) -> usize {
+    const HASH_BUILD_RUNTIME_BYTES: usize =
+        std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + std::mem::size_of::<u8>();
+    8usize
+        .saturating_add(projected_payload_width)
+        .saturating_add(condition_payload_width)
+        .saturating_add(HASH_BUILD_RUNTIME_BYTES)
+}
+
+/// Byte-equivalent work for evaluating and hashing one probe key tuple.
+pub(crate) fn estimate_hash_probe_row_width(condition_payload_width: usize) -> usize {
+    // The generic probe path writes the hash, reads one packed HtEntry, and
+    // records the matched build pointer plus probe-row ordinal. Collision-chain
+    // and result-emission work is charged per accepted match by join ordering.
+    // HtEntry access is random: charge the cache line transferred, not the
+    // eight-byte field eventually consumed by the CPU.
+    const HASH_BUCKET_CACHE_LINE_BYTES: usize = 64;
+    const HASH_PROBE_RUNTIME_BYTES: usize = std::mem::size_of::<u64>()
+        + HASH_BUCKET_CACHE_LINE_BYTES
+        + std::mem::size_of::<usize>()
+        + std::mem::size_of::<u32>();
+    condition_payload_width.saturating_add(HASH_PROBE_RUNTIME_BYTES)
 }
 
 /// Estimate the schema-dependent bytes without a row-container header.
@@ -251,7 +275,7 @@ fn type_penalty(ty: &LogicalType) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::BuildProbeSideOptimizer;
+    use super::{contains_control_region_boundary, BuildProbeSideOptimizer};
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::binder::context::BindContext;
@@ -481,6 +505,59 @@ mod tests {
             panic!("expected comparison join");
         };
         assert_eq!(join.join_type, JoinType::Semi);
+        assert_eq!(join.left.stats.estimated_cardinality.unwrap().expected, 1);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
+    }
+
+    #[test]
+    fn build_probe_normalizes_right_reduction_control_region_onto_build_side() {
+        let ctx = BindContext::new();
+        let dependent_left = expression_get(0, 64, vec![LogicalType::Integer]);
+        let dependent_right = expression_get(1, 1, vec![LogicalType::Integer]);
+        let mut dependent = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, dependent_left, 64),
+            plan_with_cardinality(&ctx, dependent_right, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer),
+        )];
+        let preserved = expression_get(2, 1, vec![LogicalType::Integer]);
+        let join = ComparisonJoin::new(
+            JoinType::RightSemi,
+            plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
+            plan_with_cardinality(&ctx, preserved, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(2, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Semi);
+        assert!(contains_control_region_boundary(join.right.as_ref()));
         assert_eq!(join.left.stats.estimated_cardinality.unwrap().expected, 1);
         assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
     }

@@ -24,7 +24,7 @@ use paro_planner::plan::{CardinalityEstimate, CardinalityProvenance, LogicalPlan
 use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 use crate::cost_model::CostModel as LogicalCostModel;
-use crate::join_order::cost_model::{CostModel, DPJoinNode, JoinCostUnits};
+use crate::join_order::cost_model::{CostModel, DPJoinNode};
 use crate::join_order::enumerator::PlanEnumerator;
 use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
@@ -132,6 +132,9 @@ pub struct JoinOrderOptimizer {
     plans: HashMap<String, DPJoinNode>,
     /// Output-column statistics gathered earlier in the pipeline.
     column_stats: HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+    /// Payload widths derived from an authoritative column-pruned shadow plan,
+    /// keyed by stable source table index.
+    live_source_widths: HashMap<usize, usize>,
     /// Original base-relation subplans keyed by relation id for reconstruction.
     relation_plans: Vec<LogicalPlan>,
 }
@@ -139,19 +142,15 @@ pub struct JoinOrderOptimizer {
 impl JoinOrderOptimizer {
     /// Create a new JoinOrderOptimizer.
     pub fn new() -> Self {
-        Self::with_cost_units(JoinCostUnits::default())
-    }
-
-    /// Create a join-order optimizer with explicit cost calibration.
-    pub fn with_cost_units(units: JoinCostUnits) -> Self {
         Self {
             relation_manager: RelationManager::new(),
             set_manager: JoinRelationSetManager::new(),
             query_graph: QueryGraphEdges::new(),
-            cost_model: CostModel::with_units(units),
+            cost_model: CostModel::new(),
             filter_infos: Vec::new(),
             plans: HashMap::new(),
             column_stats: HashMap::new(),
+            live_source_widths: HashMap::new(),
             relation_plans: Vec::new(),
         }
     }
@@ -183,7 +182,25 @@ impl JoinOrderOptimizer {
         column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
         bind_context: &BindContext,
     ) -> Result<LogicalPlan> {
+        self.optimize_plan_with_live_source_widths(
+            ctx,
+            plan,
+            column_stats,
+            bind_context,
+            &HashMap::new(),
+        )
+    }
+
+    pub(crate) fn optimize_plan_with_live_source_widths(
+        &mut self,
+        ctx: &StatementContext,
+        plan: LogicalPlan,
+        column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
+        bind_context: &BindContext,
+        live_source_widths: &HashMap<usize, usize>,
+    ) -> Result<LogicalPlan> {
         self.column_stats = column_stats.clone();
+        self.live_source_widths = live_source_widths.clone();
         plan.try_fold_post_order(|plan, child_states: Vec<bool>| {
             let contains_control_region_reference = child_states.into_iter().any(|state| state)
                 || matches!(plan.operator, LogicalOperator::CTERef(_));
@@ -339,7 +356,7 @@ impl JoinOrderOptimizer {
         enumerator.init_leaf_plans();
 
         // Solve join order
-        if !enumerator.solve_join_order() {
+        if !enumerator.solve_join_order()? {
             // Timed out or failed
             return Ok(None);
         }
@@ -554,8 +571,11 @@ impl JoinOrderOptimizer {
     ) {
         let cardinality = self.estimate_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
-        stats.estimated_payload_width =
-            crate::join::build_probe_side::estimate_row_payload_width(&plan.types());
+        stats.estimated_payload_width = self.live_payload_width(plan).unwrap_or_else(|| {
+            crate::join::build_probe_side::estimate_row_payload_width(&plan.types())
+        });
+        stats.contains_control_region =
+            crate::join::build_probe_side::contains_control_region_boundary(plan);
         stats.unique_keys = declared_unique_keys(plan);
         stats.column_distinct_count = plan
             .get_column_bindings()
@@ -594,6 +614,18 @@ impl JoinOrderOptimizer {
             plan,
             bind_context.shared().as_ref(),
         ));
+    }
+
+    fn live_payload_width(&self, plan: &LogicalPlan) -> Option<usize> {
+        let table_index = match &plan.operator {
+            LogicalOperator::Get(get) => Some(get.table_index),
+            LogicalOperator::FullTextFilterScan(scan) => Some(scan.get.table_index),
+            LogicalOperator::Filter(filter) => return self.live_payload_width(&filter.child),
+            LogicalOperator::Limit(limit) => return self.live_payload_width(&limit.child),
+            LogicalOperator::Order(order) => return self.live_payload_width(&order.child),
+            _ => None,
+        }?;
+        self.live_source_widths.get(&table_index).copied()
     }
 
     /// Estimate the cardinality of a base relation.
@@ -662,23 +694,37 @@ impl JoinOrderOptimizer {
 
             let result = if let Some(predicates) = &node.predicates {
                 let chosen_join_type = predicates.join_type();
-                if predicates.reduction_roles().is_some_and(|roles| {
-                    roles.orientation_across(&left_set, &right_set)
-                        == Some(JoinEdgeOrientation::Inverted)
-                }) {
-                    std::mem::swap(&mut left_plan, &mut right_plan);
-                    std::mem::swap(&mut left_set, &mut right_set);
+                if let Some(roles) = predicates.reduction_roles() {
+                    let orientation =
+                        roles
+                            .orientation_across(&left_set, &right_set)
+                            .ok_or_else(|| {
+                                paro_common::error::internal(
+                                    "reduction join roles do not span the selected DP cut",
+                                )
+                            })?;
+                    if orientation == JoinEdgeOrientation::Inverted {
+                        std::mem::swap(&mut left_plan, &mut right_plan);
+                        std::mem::swap(&mut left_set, &mut right_set);
+                    }
                 }
 
                 let mut join = ComparisonJoin::new(chosen_join_type, left_plan, right_plan, vec![]);
                 join.anti_join_mode = predicates.anti_join_mode();
                 for filter in predicates.filters() {
-                    if self.append_join_conditions(&mut join, filter, &left_set, &right_set) {
+                    let appended =
+                        self.append_join_conditions(&mut join, filter, &left_set, &right_set);
+                    if appended {
                         used_filters.insert(filter.filter_index);
+                    } else if predicates.reduction_roles().is_some() {
+                        return Err(paro_common::error::internal(
+                            "reduction join predicate could not be reconstructed across its DP cut",
+                        ));
                     }
                 }
 
                 if join.conditions.is_empty() {
+                    debug_assert!(predicates.reduction_roles().is_none());
                     let mut plan =
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                             left: join.left,
@@ -1692,7 +1738,7 @@ mod tests {
     }
 
     #[test]
-    fn optimize_plan_prefers_smaller_intermediate_when_plan_stats_are_available() {
+    fn optimize_plan_uses_build_width_when_intermediate_cardinalities_tie() {
         let session = make_test_session();
         let bind_context = BindContext::new();
 
@@ -1760,6 +1806,9 @@ mod tests {
                 tables
             })
             .collect();
-        assert_eq!(nested_tables, HashSet::from([1usize, 2usize]));
+        // Both first joins are estimated at ten rows. Joining A-B first leaves
+        // the single-column C relation as the final hash build instead of the
+        // wider B-C intermediate.
+        assert_eq!(nested_tables, HashSet::from([0usize, 1usize]));
     }
 }

@@ -161,7 +161,11 @@ impl Default for SelectivityDefaults {
             equality: 0.1,
             range: 0.3,
             predicate: 0.75,
-            like_prefix: 0.25,
+            // Prefix anchoring is materially more selective than an
+            // unanchored substring search. This is also the ordering required
+            // by the LIKE language lattice: `literal%` is a subset of
+            // `%literal%`.
+            like_prefix: 0.02,
             like_contains: 0.05,
             fulltext_match: 0.1,
             vector_topk_fraction: 0.001,
@@ -987,12 +991,16 @@ struct WildcardLikePattern {
 
 impl WildcardLikePattern {
     fn selectivity(self, defaults: &SelectivityDefaults) -> f64 {
+        // Enforce the semantic ordering here as well as in the defaults so a
+        // caller cannot install a calibration that makes adding a start
+        // anchor increase the estimated result set.
+        let start_anchored = defaults.like_prefix.min(defaults.like_contains);
         let base = match (self.anchored_start, self.anchored_end) {
-            (true, false) => defaults.like_prefix,
+            (true, false) => start_anchored,
             (false, true) | (false, false) => defaults.like_contains,
             // An internally wildcarded pattern anchored at both ends is at
             // least as selective as either one-ended form.
-            (true, true) => defaults.like_prefix.min(defaults.like_contains),
+            (true, true) => start_anchored,
         };
 
         // Ordered fragments overlap on one string value and are consequently
@@ -1336,7 +1344,7 @@ mod tests {
         );
         assert_eq!(
             model.estimate_selectivity(&like("green%"), &HashMap::new()),
-            0.25
+            0.02
         );
         assert_eq!(
             model.estimate_selectivity(&like("%green"), &HashMap::new()),
@@ -1366,6 +1374,23 @@ mod tests {
         assert!(
             model.estimate_selectivity(&like("a%b%c"), &HashMap::new())
                 <= model.estimate_selectivity(&like("%b%"), &HashMap::new())
+        );
+        assert!(
+            model.estimate_selectivity(&like("green%"), &HashMap::new())
+                <= model.estimate_selectivity(&like("%green%"), &HashMap::new()),
+            "adding a start anchor must not increase selectivity"
+        );
+        assert!(
+            model.estimate_selectivity(&like("a%b%"), &HashMap::new())
+                <= model.estimate_selectivity(&like("%a%b%"), &HashMap::new()),
+            "anchor monotonicity must hold for multi-fragment patterns"
+        );
+        let mut misordered_calibration = model.clone();
+        misordered_calibration.defaults.like_prefix = 0.5;
+        assert!(
+            misordered_calibration.estimate_selectivity(&like("green%"), &HashMap::new())
+                <= misordered_calibration.estimate_selectivity(&like("%green%"), &HashMap::new()),
+            "calibration cannot violate the anchor lattice"
         );
         assert_eq!(model.estimate_selectivity(&like("%"), &HashMap::new()), 1.0);
         assert_eq!(

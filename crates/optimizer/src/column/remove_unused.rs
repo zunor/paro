@@ -404,6 +404,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
             }
             LogicalOperator::Filter(filter) => {
                 // Filters don't produce new columns, just pass through
+                let projection_was_all = filter.projection_map.is_all();
+                let mut projected_bindings =
+                    Self::projected_bindings(filter.child.as_ref(), &filter.projection_map);
                 let mut child_optimizer =
                     RemoveUnusedColumns::new(self.binder, self.session, self.everything_referenced);
 
@@ -424,6 +427,16 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 for replacement in &child_optimizer.replacements {
                     child_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);
+                }
+                // A stored projection map is a positional annotation over the
+                // pre-pruning child layout. Rebuild it by binding after child
+                // compaction; leaving the old ordinals in place can silently
+                // select a different column or go out of bounds.
+                if !projection_was_all {
+                    Self::remap_bindings(&mut projected_bindings, &child_optimizer.replacements);
+                    filter.projection_map =
+                        Self::rebuild_projection_map(filter.child.as_ref(), &projected_bindings)
+                            .into();
                 }
                 // No need to propagate replacements up - already updated via raw pointers
             }
@@ -976,8 +989,9 @@ mod tests {
         ReferenceExpression,
     };
     use paro_planner::operator::{
-        Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType,
-        JoinCondition, JoinType, LogicalOperator, PostAggregateReduction, Projection,
+        Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Get, Join,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, PostAggregateReduction,
+        Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -1276,5 +1290,55 @@ mod tests {
             vec![LogicalType::VarcharCollation("C".into())]
         );
         assert_eq!(get.returned_types, vec![LogicalType::Varchar]);
+    }
+
+    #[test]
+    fn pruning_rebuilds_frozen_filter_projection_by_binding() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let scan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec!["key".into(), "dead".into(), "value".into()],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                ],
+            )),
+        );
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            int_column(10, 0),
+            int_column(10, 0),
+        ));
+        let mut filter = Filter::new(scan, vec![predicate]);
+        filter.projection_map = vec![0, 2].into();
+        let filtered = LogicalPlan::new(ctx, LogicalOperator::Filter(filter));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, filtered, vec![int_column(10, 2)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        assert_eq!(
+            binding(&projection.expressions[0]),
+            ColumnBinding::new(10, 1)
+        );
+        let LogicalOperator::Filter(filter) = &projection.child.operator else {
+            panic!("expected filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[0, 1][..]));
+        let LogicalOperator::Get(get) = &filter.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(get.stored_column(0), Some(0));
+        assert_eq!(get.stored_column(1), Some(2));
     }
 }
