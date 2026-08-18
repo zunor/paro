@@ -364,7 +364,7 @@ fn scalar_wrapper_output_that_escapes_the_boundary_prevents_rewrite() {
         .expressions
         .push(column(WRAPPER_PROJECTION, 0, LogicalType::BigInt));
     output.returned_types.push(LogicalType::BigInt);
-    output.output_names.push("scalar_value".to_string());
+    output.visible_names.push("scalar_value".to_string());
 
     let optimized = optimize_plan(plan, &BindContext::new());
     let LogicalOperator::Projection(output) = &optimized.operator else {

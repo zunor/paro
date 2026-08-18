@@ -202,7 +202,7 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     };
     if wrapper_projection.expressions.len() != 1
         || wrapper_projection.returned_types.len() != 1
-        || wrapper_projection.output_names.len() != 1
+        || wrapper_projection.visible_names.len() != 1
     {
         return None;
     }
@@ -259,7 +259,7 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     };
     if scalar_projection.expressions.len() != 1
         || scalar_projection.returned_types.len() != 1
-        || scalar_projection.output_names.len() != 1
+        || scalar_projection.visible_names.len() != 1
     {
         return None;
     }

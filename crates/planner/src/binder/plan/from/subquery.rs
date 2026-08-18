@@ -37,7 +37,7 @@ impl Binder {
 
             let projection =
                 Projection::new(sub_ref.subquery_index, self.wrap_plan(child), expressions)
-                    .with_output_names(sub_ref.column_names.clone());
+                    .with_visible_names(sub_ref.column_names.clone());
             Ok(LogicalOperator::Projection(projection))
         } else {
             Ok(child)

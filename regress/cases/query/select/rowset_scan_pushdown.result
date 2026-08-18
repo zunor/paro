@@ -240,3 +240,104 @@ id	prefix
 
 DROP TABLE matched_prefix_projection_case;
 DROP TABLE
+
+DROP TABLE IF EXISTS matched_prefix_late_payload_case;
+DROP TABLE
+
+CREATE TABLE matched_prefix_late_payload_case(
+    id INT,
+    phone VARCHAR,
+    wide VARCHAR
+);
+CREATE TABLE
+
+INSERT INTO matched_prefix_late_payload_case
+SELECT
+    g,
+    CASE WHEN g % 3 = 0 THEN '44z' WHEN g % 2 = 0 THEN '31y' ELSE '13x' END,
+    'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww'
+        || CAST(g AS VARCHAR)
+FROM generate_series(1, 5000) AS t(g);
+INSERT 0 5000
+
+EXPLAIN (VERBOSE)
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+QUERY PLAN
+PROJECTION  (rows=3)
+  Output: phone, wide
+  Cardinality: [3, 3, 3]
+  Output Schema: phone VARCHAR, wide VARCHAR
+  ->  ROW_FETCH  (rows=3)
+    Output: phone, wide
+    Sources: 1
+    Cardinality: [3, 3, 3]
+    Output Schema: phone VARCHAR, wide VARCHAR
+    ->  TOP_N  (rows=3)
+      Sort Key: #0 ASC NULLS LAST
+      Limit: 3
+      Cardinality: [3, 3, 3]
+      Output Schema: __paro_hidden_2 INTEGER, __late_rowid_6 BIGINT
+      ->  PROJECTION  (rows=3333)
+        Output: __paro_hidden_2, __late_rowid_6
+        Cardinality: [1666, 3333, 5000]
+        Output Schema: __paro_hidden_2 INTEGER, __late_rowid_6 BIGINT
+        ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=3333)
+          Columns: id, rowid
+          Pushed Predicate: col#1 IN ('13x', '31y')
+          Cardinality: [1666, 3333, 5000]
+          Output Schema: id INTEGER, rowid BIGINT
+
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+phone	wide
+13x	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww1
+31y	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww2
+31y	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww4
+
+EXPLAIN (VERBOSE)
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+QUERY PLAN
+ROW_FETCH  (rows=3)
+  Output: id, prefix, wide
+  Sources: 1
+  Cardinality: [3, 3, 3]
+  Output Schema: id INTEGER, prefix VARCHAR, wide VARCHAR
+  ->  TOP_N  (rows=3)
+    Sort Key: #0 ASC NULLS LAST
+    Limit: 3
+    Cardinality: [3, 3, 3]
+    Output Schema: id INTEGER, prefix VARCHAR, __late_rowid_6 BIGINT
+    ->  PROJECTION  (rows=1000)
+      Output: id, prefix, __late_rowid_6
+      Cardinality: [500, 1000, 1501]
+      Output Schema: id INTEGER, prefix VARCHAR, __late_rowid_6 BIGINT
+      ->  ROWSET_SCAN on public.matched_prefix_late_payload_case  (rows=1000)
+        Columns: id, __ascii_prefix_1_2, rowid
+        Pushed Predicate: col#1 HAS PREFIX IN ("13", "31")
+        Late Materialize: auto
+        Cardinality: [500, 1000, 1501]
+        Output Schema: id INTEGER, __ascii_prefix_1_2 VARCHAR, rowid BIGINT
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+id	prefix	wide
+1	13	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww1
+2	31	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww2
+4	31	wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww4
+
+DROP TABLE matched_prefix_late_payload_case;
+DROP TABLE

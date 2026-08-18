@@ -280,7 +280,7 @@ impl Binder {
             self.wrap_plan(root),
             node.select_list.clone(),
         )
-        .with_output_names(node.names.clone());
+        .with_visible_names(node.names.clone());
         root = LogicalOperator::Projection(projection);
 
         // =================================================================

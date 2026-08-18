@@ -4,7 +4,7 @@
 use super::{StringHeap, Vector, VectorBuffer, VectorType};
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{LogicalType, StringView, VerifiedUtf8Bytes};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -724,18 +724,21 @@ impl Vector {
         self.try_set_varlen(idx, val.as_bytes())
     }
 
-    /// Set a textual value whose UTF-8 validity is carried by a typed witness.
+    /// Copy canonical textual bytes without rescanning UTF-8.
     ///
-    /// This is the zero-rescan boundary for canonical row/page formats. Callers
-    /// handling untrusted bytes must validate them and use `try_set_string`.
-    pub fn try_set_verified_utf8(&mut self, idx: usize, val: VerifiedUtf8Bytes<'_>) -> Result<()> {
+    /// # Safety
+    ///
+    /// `val` must be valid UTF-8. This is reserved for typed storage formats
+    /// whose write boundary accepted `&str` and whose persistence layer proves
+    /// byte-for-byte integrity before returning the payload.
+    pub unsafe fn try_set_canonical_utf8_bytes(&mut self, idx: usize, val: &[u8]) -> Result<()> {
         if !self.logical_type.is_utf8_varlen() {
             return Err(paro_error::type_mismatch(format!(
-                "verified UTF-8 write requires a textual varlen vector, got {:?}",
+                "canonical UTF-8 write requires a textual varlen vector, got {:?}",
                 self.logical_type
             )));
         }
-        self.try_set_varlen(idx, val.as_bytes())
+        self.try_set_varlen(idx, val)
     }
 
     /// Set blob value at index.

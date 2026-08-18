@@ -58,7 +58,7 @@ fn lowers_late_row_fetch_with_resolved_carrier_rowid() {
             )),
         ],
     )
-    .with_output_names(vec!["key".into(), "payload".into()]);
+    .with_visible_names(vec!["key".into(), "payload".into()]);
     let mut logical = LogicalPlan::new(&ctx, LogicalOperator::Projection(projection));
     crate::column_binding_resolver::ColumnBindingResolver::resolve(&mut logical.operator)
         .expect("late row-fetch bindings resolve");

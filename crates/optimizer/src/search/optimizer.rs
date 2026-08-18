@@ -112,8 +112,11 @@ impl SearchOptimizer {
                 filter_selectivity,
                 topn.hnsw_ef_hint,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -148,8 +151,11 @@ impl SearchOptimizer {
                 intent.query_vector.len(),
                 filter_selectivity,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -185,8 +191,11 @@ impl SearchOptimizer {
                 intent.score_mode,
                 filter_selectivity,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -258,7 +267,9 @@ impl SearchOptimizer {
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 continue;
             };
-            let request = build_filter_request(table_id, get, search_intent)?;
+            let Some(request) = build_filter_request(table_id, get, search_intent)? else {
+                continue;
+            };
 
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
@@ -304,7 +315,7 @@ fn build_search_scan(
                 pattern.topn.orders[0].ascending,
                 pattern.topn.limit,
             )
-            .with_output_names(pattern.projection.output_names.clone()),
+            .with_output_names(pattern.projection.visible_names.clone()),
         ),
     }
 }
@@ -371,49 +382,48 @@ fn build_topk_request(
     get: &Get,
     limit: usize,
     intent: SearchIntent,
-) -> Result<NormalizedSearchRequest> {
+) -> Result<Option<NormalizedSearchRequest>> {
+    let Some(projections) = projection_spec(get, matches!(intent, SearchIntent::FullText(_)))
+    else {
+        return Ok(None);
+    };
     let request = NormalizedSearchRequest {
         table_id,
         mode: SearchRequestMode::TopK { limit },
         predicate: None,
-        projections: projection_spec(get, matches!(intent, SearchIntent::FullText(_)))?,
+        projections,
         intents: vec![intent],
         fusion: None,
     };
     request.validate()?;
-    Ok(request)
+    Ok(Some(request))
 }
 
 fn build_filter_request(
     table_id: u64,
     get: &Get,
     intent: SearchIntent,
-) -> Result<NormalizedSearchRequest> {
+) -> Result<Option<NormalizedSearchRequest>> {
+    let Some(projections) = projection_spec(get, false) else {
+        return Ok(None);
+    };
     let request = NormalizedSearchRequest {
         table_id,
         mode: SearchRequestMode::Filter,
         predicate: None,
-        projections: projection_spec(get, false)?,
+        projections,
         intents: vec![intent],
         fusion: None,
     };
     request.validate()?;
-    Ok(request)
+    Ok(Some(request))
 }
 
-fn projection_spec(get: &Get, include_score: bool) -> Result<ProjectionSpec> {
-    Ok(ProjectionSpec {
+fn projection_spec(get: &Get, include_score: bool) -> Option<ProjectionSpec> {
+    Some(ProjectionSpec {
         columns: (0..get.returned_types.len())
-            .map(|output| {
-                get.stored_column(output)
-                    .map(|column_id| column_id as u32)
-                    .ok_or_else(|| {
-                        paro_common::error::internal(
-                            "search projection cannot expose a derived scan output as stored",
-                        )
-                    })
-            })
-            .collect::<Result<Vec<_>>>()?,
+            .map(|output| get.stored_column(output).map(|column_id| column_id as u32))
+            .collect::<Option<Vec<_>>>()?,
         include_score,
     })
 }
@@ -988,7 +998,7 @@ fn rebuild_topn_from_search(search: &SearchScan) -> LogicalOperator {
         child,
         search.projections.clone(),
     )
-    .with_output_names(search.output_names.clone());
+    .with_visible_names(search.output_names.clone());
     let projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
     let order = OrderByNode {
         expression: Expression::Reference(ReferenceExpression::new(
@@ -1196,5 +1206,13 @@ mod tests {
             Expression::Reference(reference) => assert_eq!(reference.index, 1),
             other => panic!("expected reference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derived_scan_output_declines_stored_search_projection() {
+        let mut get =
+            Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
+        get.append_matched_utf8_prefix(0, 2, LogicalType::Varchar);
+        assert!(projection_spec(&get, false).is_none());
     }
 }

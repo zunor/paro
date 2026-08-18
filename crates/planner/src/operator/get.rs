@@ -103,6 +103,38 @@ impl Get {
         )
     }
 
+    /// Reuse or append one exact prefix derived from a stored textual column.
+    /// Optimizer pipelines may revisit scan projection after a structural
+    /// rewrite; the physical value identity, not pass count, determines the
+    /// output binding.
+    pub fn append_matched_utf8_prefix(
+        &mut self,
+        source_column: usize,
+        byte_width: usize,
+        column_type: LogicalType,
+    ) -> ColumnBinding {
+        if let Some(output_index) = self.column_sources.iter().position(|source| {
+            matches!(
+                source,
+                GetColumnSource::MatchedUtf8Prefix {
+                    source_column: candidate,
+                    byte_width: candidate_width,
+                } if *candidate == source_column && *candidate_width == byte_width
+            )
+        }) {
+            return ColumnBinding::new(self.table_index, output_index);
+        }
+        self.append_output(
+            format!("__ascii_prefix_{source_column}_{byte_width}"),
+            LogicalType::Varchar,
+            column_type,
+            GetColumnSource::MatchedUtf8Prefix {
+                source_column,
+                byte_width,
+            },
+        )
+    }
+
     /// Return the catalog column only when this output is the stored value
     /// itself. Derived values deliberately return `None` even when they read
     /// bytes from the same physical column.

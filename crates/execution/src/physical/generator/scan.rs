@@ -294,7 +294,7 @@ impl PhysicalPlanGenerator {
         let spec = ProjectSpec {
             expressions: project.expressions.clone().into_boxed_slice(),
             output_names: align_output_names(
-                project.output_names.clone(),
+                project.visible_names.clone(),
                 project.expressions.len(),
                 "project output",
             )?

@@ -137,7 +137,7 @@ impl PhysicalPlanGenerator {
             build_graph_chain_layout(project.child.as_ref())?.output_table_index;
         let filters = collect_graph_filters_from_logical(project.child.as_ref());
         let output_names = align_output_names(
-            project.output_names.clone(),
+            project.visible_names.clone(),
             project.expressions.len(),
             "graph project output",
         )?;

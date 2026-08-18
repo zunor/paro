@@ -115,6 +115,16 @@ impl Verifier {
                         get.column_types.len()
                     )));
                 }
+                if get
+                    .returned_types
+                    .iter()
+                    .zip(&get.column_types)
+                    .any(|(returned, source)| returned.physical_type() != source.physical_type())
+                {
+                    return Err(paro_error::internal(
+                        "Get returned and source types require the same physical representation",
+                    ));
+                }
 
                 if let Some(table) = &get.table {
                     let table_col_count = table.columns.len();
@@ -172,6 +182,13 @@ impl Verifier {
                 }
             }
             LogicalOperator::Projection(proj) => {
+                if proj.visible_names.len() > proj.expressions.len() {
+                    return Err(paro_error::internal(format!(
+                        "Projection visible-name prefix exceeds outputs: visible_names={}, expressions={}",
+                        proj.visible_names.len(),
+                        proj.expressions.len()
+                    )));
+                }
                 if proj.returned_types.len() != proj.expressions.len() {
                     return Err(paro_error::internal(format!(
                         "Projection returned_types mismatch: returned_types={}, expressions={}",

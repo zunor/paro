@@ -228,7 +228,11 @@ impl Reclaimer for GlobalAggregatePendingSpillReclaimer {
 
     fn reclaimable_bytes(&self) -> usize {
         self.state.try_lock().map_or(0, |state| {
-            state.payload_memory.iter().map(|lease| lease.bytes()).sum()
+            if state.payloads.is_empty() {
+                0
+            } else {
+                state.payload_memory.iter().map(|lease| lease.bytes()).sum()
+            }
         })
     }
 

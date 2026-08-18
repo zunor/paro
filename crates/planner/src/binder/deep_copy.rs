@@ -236,7 +236,7 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::Projection(ProjNode {
                     table_index,
                     expressions: p.expressions.clone(),
-                    output_names: p.output_names.clone(),
+                    visible_names: p.visible_names.clone(),
                     returned_types: p.returned_types.clone(),
                     child: Box::new(child),
                 })
@@ -867,7 +867,7 @@ mod tests {
                         LogicalType::Integer,
                     ))],
                 )
-                .with_output_names(vec!["alias_v".to_string()]),
+                .with_visible_names(vec!["alias_v".to_string()]),
             ),
         };
 
@@ -879,7 +879,7 @@ mod tests {
         let LogicalOperator::Projection(proj) = copy.operator else {
             panic!("expected projection");
         };
-        assert_eq!(proj.output_names, vec!["alias_v".to_string()]);
+        assert_eq!(proj.visible_names, vec!["alias_v".to_string()]);
         assert_ne!(proj.table_index, 11);
 
         let LogicalOperator::ExpressionGet(expr_get) = &proj.child.operator else {

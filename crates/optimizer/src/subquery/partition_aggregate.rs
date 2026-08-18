@@ -489,7 +489,7 @@ fn peel_scalar_branch(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     let expected_projection_width = aggregate.groups.len().checked_add(1)?;
     if projection.expressions.len() != expected_projection_width
         || projection.returned_types.len() != expected_projection_width
-        || projection.output_names.len() != expected_projection_width
+        || projection.visible_names.len() != expected_projection_width
     {
         return None;
     }

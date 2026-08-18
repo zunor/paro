@@ -82,6 +82,19 @@ fn pass(rewriter: impl Rewriter + 'static) -> PipelineStep {
     PipelineStep::Pass(Box::new(rewriter))
 }
 
+fn late_materialization_repair(binder: Binder) -> PipelineStep {
+    PipelineStep::Conditional(ConditionalSegment {
+        condition: PipelineCondition::LateMaterializationInvalidated,
+        passes: vec![
+            Box::new(UnusedColumnsPass { binder }),
+            Box::new(StatisticsGatheringPass),
+            Box::new(JoinOrderPass),
+            Box::new(BuildProbeSidePass),
+            Box::new(JoinFilterPushdownPass),
+        ],
+    })
+}
+
 fn run_pass(
     rewriter: &mut dyn Rewriter,
     plan: LogicalPlan,
@@ -254,6 +267,7 @@ impl Optimizer {
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
         let late_payload_binder = binder.clone();
+        let final_late_payload_binder = binder.clone();
         let scan_projection_binder = binder.clone();
         vec![
             pass(GraphStartSelectionPass),
@@ -325,28 +339,25 @@ impl Optimizer {
             // serialized build costs. Express that invalidation as a visible,
             // conditionally executed pipeline segment so every pass retains
             // its own verification and profiling boundary.
-            PipelineStep::Conditional(ConditionalSegment {
-                condition: PipelineCondition::LateMaterializationInvalidated,
-                passes: vec![
-                    Box::new(UnusedColumnsPass {
-                        binder: late_payload_binder,
-                    }),
-                    Box::new(StatisticsGatheringPass),
-                    Box::new(JoinOrderPass),
-                    Box::new(BuildProbeSidePass),
-                    Box::new(JoinFilterPushdownPass),
-                ],
-            }),
+            late_materialization_repair(late_payload_binder),
             // Publish the settled tree's exact output contracts before asking
             // whether a scalar aggregate branch is implementation-only.
             pass(ColumnLifetimePass),
             // Fold a subset-filtered scalar aggregate into its matching detail
             // stream as a complete-partition aggregate window.
             pass(ScalarAggregateWindowPass),
-            // A directly fused ASCII prefix predicate may expose an exact
-            // derived scan output with its own binding. Stored source columns
-            // retain their original identity and remain eligible for row fetch.
+            // ScalarAggregateWindow can remove the duplicate source branch
+            // that previously made a prefix witness ambiguous (Q22 is this
+            // shape). Revisit projection after that structural rewrite. Get
+            // deduplicates derived value identities, so this is an explicit
+            // second proof phase rather than a pass-count-dependent append.
             pass(MatchedPrefixScanProjectionPass),
+            // The same structural rewrite can expose a new row-preserving
+            // TopN carrier. Run late payload after the second projection proof
+            // as well; otherwise candidates created in this phase would bypass
+            // the arbitration performed above.
+            pass(LatePayloadFetchPass),
+            late_materialization_repair(final_late_payload_binder),
             // The predicate still addresses the stored source binding below
             // the fused Filter, while ancestors only need the new derived
             // output. Recompute widths now so the stored value is not decoded,

@@ -676,7 +676,7 @@ impl DependentJoinFlattener {
             .collect::<Result<Vec<_>>>()?;
 
         Ok(binder.wrap_plan(LogicalOperator::Projection(
-            Projection::new(table_index, child, expressions).with_output_names(output_names),
+            Projection::new(table_index, child, expressions).with_visible_names(output_names),
         )))
     }
 
@@ -934,7 +934,7 @@ impl DependentJoinFlattener {
                     .iter()
                     .map(|expr| expr.return_type())
                     .collect();
-                proj.output_names.extend(self.internal_output_names());
+                proj.visible_names.extend(self.internal_output_names());
                 proj.child = Box::new(child);
                 Ok(PushDownResult {
                     plan: LogicalPlan {

@@ -8,8 +8,6 @@
 //! `u32`, but they are not interchangeable. Transparent wrappers preserve the
 //! compact representation while keeping domain conversions explicit.
 
-use std::mem::ManuallyDrop;
-
 use paro_common::error::{self as paro_error, Result};
 use paro_common::vector::VECTOR_SIZE;
 
@@ -49,21 +47,6 @@ impl BatchRowOrdinal {
     pub(crate) fn checked_add(self, base: Self) -> Option<Self> {
         let ordinal = self.0.checked_add(base.0)?;
         (ordinal < VECTOR_SIZE as u32).then_some(Self(ordinal))
-    }
-
-    /// Convert an owned typed selection to the common vector selection ABI.
-    ///
-    /// SAFETY is centralized here: `repr(transparent)` guarantees identical
-    /// element layout and every `u32` bit pattern is valid for both types.
-    pub(crate) fn into_raw_vec(values: Vec<Self>) -> Vec<u32> {
-        let mut values = ManuallyDrop::new(values);
-        unsafe {
-            Vec::from_raw_parts(
-                values.as_mut_ptr().cast::<u32>(),
-                values.len(),
-                values.capacity(),
-            )
-        }
     }
 
     /// Borrow a typed batch-ordinal view over the vector selection ABI.
@@ -207,17 +190,5 @@ mod tests {
         assert_eq!(std::mem::align_of::<BatchRowOrdinal>(), 4);
         assert_eq!(std::mem::size_of::<SegmentRowId>(), 4);
         assert_eq!(std::mem::align_of::<SegmentRowId>(), 4);
-    }
-
-    #[test]
-    fn owned_abi_conversion_reuses_the_allocation() {
-        let values = vec![
-            BatchRowOrdinal::from_validated_index(1),
-            BatchRowOrdinal::from_validated_index(3),
-        ];
-        let pointer = values.as_ptr().cast::<u32>();
-        let raw = BatchRowOrdinal::into_raw_vec(values);
-        assert_eq!(raw, vec![1, 3]);
-        assert_eq!(raw.as_ptr(), pointer);
     }
 }

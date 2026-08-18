@@ -41,7 +41,7 @@ impl PhysicalPlanGenerator {
         let projection = project
             .map(|project| {
                 let output_names = align_output_names(
-                    project.output_names.clone(),
+                    project.visible_names.clone(),
                     project.expressions.len(),
                     "row-fetch project output",
                 )?;

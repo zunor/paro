@@ -67,7 +67,7 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, filter, vec![project_expr]).with_output_names(vec!["a".into()]),
+            Projection::new(1, filter, vec![project_expr]).with_visible_names(vec!["a".into()]),
         ),
     );
     let limit = LogicalPlan::new(
@@ -94,7 +94,8 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, vec![project_expr]).with_output_names(vec!["b".to_string()]),
+            Projection::new(1, values, vec![project_expr])
+                .with_visible_names(vec!["b".to_string()]),
         ),
     );
 
@@ -540,7 +541,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["lv".to_string()]),
+            .with_visible_names(vec!["lv".to_string()]),
         ),
     );
 
@@ -708,7 +709,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["ak".to_string()]),
+            .with_visible_names(vec!["ak".to_string()]),
         ),
     );
     let condition = JoinCondition::equality(
@@ -884,7 +885,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["node".to_string()]),
+            .with_visible_names(vec!["node".to_string()]),
         ),
     );
     let cte = LogicalPlan::new(
@@ -918,7 +919,7 @@ fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["v".to_string()]),
+            .with_visible_names(vec!["v".to_string()]),
         ),
     );
 
@@ -1054,7 +1055,7 @@ fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["projected_capture".to_string()]),
+            .with_visible_names(vec!["projected_capture".to_string()]),
         ),
     );
     let build = LogicalPlan::new(
@@ -1158,7 +1159,7 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["lv".to_string()]),
+            .with_visible_names(vec!["lv".to_string()]),
         ),
     );
 
@@ -1248,7 +1249,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
                     Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
                 ],
             )
-            .with_output_names(vec!["a".to_string()]),
+            .with_visible_names(vec!["a".to_string()]),
         ),
     );
     let order = paro_planner::binder::ir::OrderByNode {
@@ -1271,7 +1272,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["a".to_string()]),
+            .with_visible_names(vec!["a".to_string()]),
         ),
     );
 

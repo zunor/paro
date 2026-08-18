@@ -287,7 +287,7 @@ fn peel_cte_scalar_max(plan: &LogicalPlan, cte_index: usize) -> Option<CteScalar
     };
     if scalar_projection.expressions.len() != 1
         || scalar_projection.returned_types.len() != 1
-        || scalar_projection.output_names.len() != 1
+        || scalar_projection.visible_names.len() != 1
     {
         return None;
     }
@@ -369,7 +369,7 @@ struct ScalarWrapperPrefix<'a> {
 fn peel_scalar_wrapper_prefix(projection: &Projection) -> Option<ScalarWrapperPrefix<'_>> {
     if projection.expressions.len() != 1
         || projection.returned_types.len() != 1
-        || projection.output_names.len() != 1
+        || projection.visible_names.len() != 1
     {
         return None;
     }
@@ -794,7 +794,7 @@ fn recognize(plan: &LogicalPlan, bind_context: &BindContext) -> Option<Rewrite> 
     };
     if output.expressions.is_empty()
         || output.returned_types.len() != output.expressions.len()
-        || output.output_names.len() != output.expressions.len()
+        || output.visible_names.len() != output.expressions.len()
     {
         return None;
     }
@@ -990,7 +990,7 @@ fn peel_scalar_wrapper(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     };
     if wrapper_projection.expressions.len() != 1
         || wrapper_projection.returned_types.len() != 1
-        || wrapper_projection.output_names.len() != 1
+        || wrapper_projection.visible_names.len() != 1
     {
         return None;
     }
@@ -1067,7 +1067,7 @@ fn peel_scalar_wrapper(plan: &LogicalPlan) -> Option<ScalarBranch<'_>> {
     };
     if scalar_projection.expressions.len() != 1
         || scalar_projection.returned_types.len() != 1
-        || scalar_projection.output_names.len() != 1
+        || scalar_projection.visible_names.len() != 1
     {
         return None;
     }

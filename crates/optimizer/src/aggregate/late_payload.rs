@@ -14,8 +14,8 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, Get, GetColumnSource, Join, JoinType, LogicalOperator, Projection,
-    RowFetch, RowFetchSource,
+    Aggregate, ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, RowFetch,
+    RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -325,15 +325,7 @@ fn append_get_matched_prefix_projection(
             .get(source_binding.column_index)
             .cloned()
             .ok_or_else(|| rewrite_invariant("matched-prefix source type is missing"))?;
-        return Ok(get.append_output(
-            format!("__ascii_prefix_{column_id}_{byte_width}"),
-            LogicalType::Varchar,
-            column_type,
-            GetColumnSource::MatchedUtf8Prefix {
-                source_column: column_id,
-                byte_width,
-            },
-        ));
+        return Ok(get.append_matched_utf8_prefix(column_id, byte_width, column_type));
     }
     append_prefix_through_operator(plan, table_index, source_binding, byte_width)
 }
@@ -915,7 +907,13 @@ fn prove_row_preserving_candidate(
         if table.get_storage().is_none() {
             continue;
         }
-        let catalog_column = get.stored_column(column.binding.column_index)?;
+        // Derived scan outputs already carry their compact value and have no
+        // catalog payload to fetch. They remain ordinary carrier columns; one
+        // such output must not disqualify unrelated wide stored outputs from
+        // late materialization.
+        let Some(catalog_column) = get.stored_column(column.binding.column_index) else {
+            continue;
+        };
         if catalog_column >= table.columns.len()
             || table.columns[catalog_column].logical_type != column.return_type
         {
@@ -1319,7 +1317,7 @@ fn apply_rewrite(
         operator: LogicalOperator::Aggregate(aggregate),
     };
     let carrier = Projection::new(carrier_table_index, aggregate_plan, carrier_expressions)
-        .with_output_names(carrier_names);
+        .with_visible_names(carrier_names);
     topn.child = Box::new(LogicalPlan::synthetic(LogicalOperator::Projection(carrier)));
     let topn_plan = LogicalPlan {
         id: topn_id,
@@ -1429,6 +1427,13 @@ fn apply_row_preserving_rewrite(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let output_names = (0..output.expressions.len())
+        .map(|output_index| {
+            output
+                .name_at(output_index)
+                .ok_or_else(|| rewrite_invariant("projection output ordinal is stale"))
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     // The first carrier crosses joins/window/filter with only columns required
     // before either row-fetch frontier plus one stable rowid per source.
@@ -1450,7 +1455,7 @@ fn apply_row_preserving_rewrite(
         }
         let narrow_index = narrow_expressions.len();
         narrow_expressions.push(expression.clone());
-        narrow_names.push(output.output_names[output_index].clone());
+        narrow_names.push(output_names[output_index].clone());
         output_to_narrow[output_index] = Some(narrow_index);
     }
     for source in &mut sources {
@@ -1462,7 +1467,7 @@ fn apply_row_preserving_rewrite(
         narrow_names.push(format!("__late_rowid_{}", source.source.source_table_index));
     }
     let narrow = Projection::new(narrow_table_index, *output.child, narrow_expressions)
-        .with_output_names(narrow_names);
+        .with_visible_names(narrow_names);
 
     // Fetch ordering payload only after the selective child has completed, but
     // before TopN needs those values. Output-only payload remains delayed.
@@ -1489,13 +1494,7 @@ fn apply_row_preserving_rewrite(
                 ColumnBinding::new(materialized_table_index, catalog_column),
                 expression.return_type(),
             )));
-            topn_names.push(
-                output
-                    .output_names
-                    .get(output_index)
-                    .cloned()
-                    .ok_or_else(|| rewrite_invariant("projection output name is missing"))?,
-            );
+            topn_names.push(output_names[output_index].clone());
             output_to_topn[output_index] = Some(topn_index);
             continue;
         }
@@ -1517,13 +1516,7 @@ fn apply_row_preserving_rewrite(
             ColumnBinding::new(narrow_table_index, narrow_output),
             expression.return_type(),
         )));
-        topn_names.push(
-            output
-                .output_names
-                .get(output_index)
-                .cloned()
-                .ok_or_else(|| rewrite_invariant("projection output name is missing"))?,
-        );
+        topn_names.push(output_names[output_index].clone());
         output_to_topn[output_index] = Some(topn_index);
     }
     for source in &mut sources {
@@ -1572,7 +1565,7 @@ fn apply_row_preserving_rewrite(
         )))
     };
     let topn_carrier = Projection::new(topn_table_index, topn_carrier_child, topn_expressions)
-        .with_output_names(topn_names);
+        .with_visible_names(topn_names);
 
     for order in &mut topn.orders {
         let Expression::ColumnRef(column) = &mut order.expression else {
@@ -1807,7 +1800,7 @@ fn apply_selective_projection_rewrite(
     );
     let child_stats = child.stats.clone();
     let carrier = Projection::new(carrier_table_index, child, carrier_expressions)
-        .with_output_names(carrier_names);
+        .with_visible_names(carrier_names);
     let mut carrier = LogicalPlan::synthetic(LogicalOperator::Projection(carrier));
     carrier.stats = child_stats;
     let fetch_sources = sources

@@ -263,6 +263,70 @@ fn selective_join_projection_candidate(join_type: JoinType, source_on_left: bool
     )))
 }
 
+fn row_preserving_candidate(include_derived_prefix: bool, hidden_order_key: bool) -> LogicalPlan {
+    let table = source_table();
+    let mut get = Get::new(
+        SOURCE,
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        table
+            .columns
+            .iter()
+            .map(|column| column.logical_type.clone())
+            .collect(),
+        table,
+    );
+    let derived =
+        include_derived_prefix.then(|| get.append_matched_utf8_prefix(1, 2, LogicalType::Varchar));
+    let mut get = LogicalPlan::synthetic(LogicalOperator::Get(get));
+    get.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+
+    let expressions = if let Some(derived) = derived {
+        vec![
+            column(SOURCE, 0, LogicalType::BigInt),
+            column(
+                derived.table_index,
+                derived.column_index,
+                LogicalType::Varchar,
+            ),
+            column(SOURCE, 2, LogicalType::Varchar),
+        ]
+    } else {
+        vec![
+            column(SOURCE, 1, LogicalType::Varchar),
+            column(SOURCE, 2, LogicalType::Varchar),
+            column(SOURCE, 0, LogicalType::BigInt),
+        ]
+    };
+    let visible_names = if hidden_order_key {
+        vec!["name".to_string(), "address".to_string()]
+    } else {
+        vec![
+            "key".to_string(),
+            "prefix".to_string(),
+            "address".to_string(),
+        ]
+    };
+    let order_index = if hidden_order_key { 2 } else { 0 };
+    let projection = Projection::new(OUTPUT, get, expressions).with_visible_names(visible_names);
+    let mut projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
+    projection.stats.estimated_cardinality =
+        Some(paro_planner::plan::CardinalityEstimate::exact(100_000));
+    LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
+        projection,
+        vec![OrderByNode {
+            expression: column(OUTPUT, order_index, LogicalType::BigInt),
+            ascending: true,
+            nulls_first: false,
+        }],
+        3,
+        0,
+    )))
+}
+
 #[test]
 fn bounded_topn_replaces_wide_dependent_groups_with_rowid() {
     let context = BindContext::new();
@@ -337,6 +401,43 @@ fn ordering_by_delayed_payload_keeps_preserving_plan() {
         optimize_plan(candidate(true), &context, &CostModel::default()).unwrap();
     assert!(!changed);
     assert!(matches!(optimized.operator, LogicalOperator::TopN(_)));
+}
+
+#[test]
+fn hidden_order_key_has_an_internal_name_during_row_preserving_rewrite() {
+    let context = BindContext::new();
+    let (optimized, changed) = optimize_plan(
+        row_preserving_candidate(false, true),
+        &context,
+        &CostModel::default(),
+    )
+    .expect("hidden execution columns must not index the visible-name prefix");
+    assert!(changed);
+    let LogicalOperator::Projection(output) = &optimized.operator else {
+        panic!("expected rewritten output projection")
+    };
+    assert_eq!(output.visible_names, ["name", "address"]);
+    assert_eq!(output.expressions.len(), 3);
+}
+
+#[test]
+fn derived_prefix_keeps_unrelated_wide_output_eligible_for_row_fetch() {
+    let context = BindContext::new();
+    let (optimized, changed) = optimize_plan(
+        row_preserving_candidate(true, false),
+        &context,
+        &CostModel::default(),
+    )
+    .expect("derived carrier rewrite");
+    assert!(changed);
+    let LogicalOperator::Projection(output) = &optimized.operator else {
+        panic!("expected rewritten output projection")
+    };
+    let LogicalOperator::RowFetch(fetch) = &output.child.operator else {
+        panic!("wide stored output should be fetched after TopN")
+    };
+    assert_eq!(fetch.sources.len(), 1);
+    assert_eq!(fetch.sources[0].needed_columns.as_ref(), [2]);
 }
 
 #[test]
@@ -490,4 +591,54 @@ fn three_matching_gets_never_restore_false_uniqueness() {
     ))));
 
     assert!(super::late_payload::unique_get(&three, SOURCE).is_none());
+}
+
+#[test]
+fn matched_prefix_identity_is_idempotent_across_optimizer_phases() {
+    let table = source_table();
+    let mut get = Get::new(
+        SOURCE,
+        table
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        table
+            .columns
+            .iter()
+            .map(|column| column.logical_type.clone())
+            .collect(),
+        table,
+    );
+    let original_width = get.column_sources.len();
+    let first = get.append_matched_utf8_prefix(1, 2, LogicalType::Varchar);
+    let second = get.append_matched_utf8_prefix(1, 2, LogicalType::Varchar);
+    assert_eq!(first, second);
+    assert_eq!(get.column_sources.len(), original_width + 1);
+}
+
+#[test]
+fn verifier_rejects_projection_name_and_get_physical_layout_drift() {
+    let context = BindContext::new();
+    let mut get = Get::new_without_table(
+        SOURCE,
+        vec!["value".to_string()],
+        vec![LogicalType::Integer],
+    );
+    get.returned_types[0] = LogicalType::Varchar;
+    let plan = LogicalPlan::synthetic(LogicalOperator::Get(get));
+    let error = crate::verify::verify_logical_plan(&context, &plan)
+        .expect_err("physical Get layout drift must be rejected");
+    assert!(error.to_string().contains("physical representation"));
+
+    let mut projection = Projection::new(
+        OUTPUT,
+        LogicalPlan::synthetic(LogicalOperator::DummyScan),
+        vec![],
+    );
+    projection.visible_names.push("impossible".to_string());
+    let plan = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
+    let error = crate::verify::verify_logical_plan(&context, &plan)
+        .expect_err("visible-name prefix beyond output width must be rejected");
+    assert!(error.to_string().contains("visible-name prefix"));
 }

@@ -180,7 +180,7 @@ mod tests {
                     return_type: LogicalType::Integer,
                 }),
             ],
-            output_names: vec!["id".to_string(), "name".to_string()],
+            visible_names: vec!["id".to_string(), "name".to_string()],
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
             child: Box::new(LogicalPlan::synthetic(child)),
         })

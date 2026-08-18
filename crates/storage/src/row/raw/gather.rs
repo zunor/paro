@@ -2,13 +2,20 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Gather columnar chunks back out of the raw row backend.
+//!
+//! Text cells have one provenance: `scatter` copies them from a textual
+//! [`Vector`], whose public writers accept `&str` and whose storage decoders
+//! validate untrusted bytes. Managed row/heap blocks retain that proof across
+//! eviction because temporary spill reload verifies a checksum over the full
+//! uncompressed block before exposing it. Gather may therefore copy canonical
+//! text bytes without an O(total text bytes) second validation pass.
 
 use std::sync::Arc;
 
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::{LogicalType, StringView, VerifiedUtf8Bytes};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{SelectionVector, Vector};
 
 use super::{
@@ -281,12 +288,11 @@ pub unsafe fn read_value(
             if logical_type == &LogicalType::Blob {
                 Ok(Value::Blob(value.as_bytes().to_vec()))
             } else {
-                let value = std::str::from_utf8(value.as_bytes()).map_err(|error| {
-                    paro_error::data_corrupted(format!(
-                        "textual raw-row value is not UTF-8: {error}"
-                    ))
-                })?;
-                Ok(Value::Varchar(value.to_owned()))
+                // SAFETY: module-level canonical text provenance covers every
+                // textual cell read from a RawRowCollection.
+                Ok(Value::Varchar(unsafe {
+                    String::from_utf8_unchecked(value.as_bytes().to_vec())
+                }))
             }
         }
 
@@ -531,7 +537,6 @@ fn gather_string_internal<const ALL_VALID: bool>(
     // entries directly. Besides avoiding one COW/type-dispatch check per row,
     // copying bytes preserves the raw-row UTF-8 invariant without lossy
     // substitutions.
-    let is_blob = vector.logical_type() == &LogicalType::Blob;
     let (entries, validity, heap) = vector.try_begin_varlen_write(count)?;
 
     for (i, &row_ptr) in row_locations.iter().enumerate().take(count) {
@@ -544,19 +549,8 @@ fn gather_string_internal<const ALL_VALID: bool>(
         if is_valid {
             // SAFETY: `row_ptr + offset` addresses a live canonical row cell.
             let value = unsafe { StringView::from_cell(row_ptr.add(offset)) };
-            // RawRowCollection is populated from a vector of the same logical
-            // type. Text validity is established at that typed input boundary;
-            // this hot path preserves it by copying bytes without constructing
-            // an unchecked `str` or rescanning the payload.
             // SAFETY: the destination vector retains this heap with the entry.
-            let bytes = if is_blob {
-                value.as_bytes()
-            } else {
-                // SAFETY: canonical textual raw rows are populated only from
-                // typed vectors; the witness preserves that boundary across
-                // the byte-oriented layout without constructing `&str`.
-                unsafe { VerifiedUtf8Bytes::from_bytes_unchecked(value.as_bytes()) }.as_bytes()
-            };
+            let bytes = value.as_bytes();
             let copied = unsafe { heap.try_add_blob(bytes) }?;
             // SAFETY: `try_begin_varlen_write(count)` returned `count` writable entries.
             unsafe { entries.add(i).write(copied) };
@@ -787,10 +781,11 @@ fn gather_string_with_sel(
             if vector.logical_type() == &LogicalType::Blob {
                 vector.try_set_blob(dst_idx, value.as_bytes())?;
             } else {
-                // SAFETY: canonical textual raw rows are populated from typed
-                // vectors, which establish UTF-8 before row serialization.
-                let value = unsafe { VerifiedUtf8Bytes::from_bytes_unchecked(value.as_bytes()) };
-                vector.try_set_verified_utf8(dst_idx, value)?;
+                // SAFETY: module-level canonical text provenance covers every
+                // textual cell read from a RawRowCollection.
+                unsafe {
+                    vector.try_set_canonical_utf8_bytes(dst_idx, value.as_bytes())?;
+                }
             }
             vector.try_set_null(dst_idx, false)?;
         } else {
@@ -893,10 +888,9 @@ unsafe fn gather_collection_payload(
                 if matches!(logical_type, LogicalType::Blob) {
                     child_vector.try_set_blob(child_idx, bytes)?;
                 } else {
-                    // SAFETY: collection payloads are serialized from typed
-                    // child vectors and retain their textual validity.
-                    let value = unsafe { VerifiedUtf8Bytes::from_bytes_unchecked(bytes) };
-                    child_vector.try_set_verified_utf8(child_idx, value)?;
+                    // SAFETY: nested text is serialized from the same typed
+                    // vector boundary and retained inside checksummed blocks.
+                    child_vector.try_set_canonical_utf8_bytes(child_idx, bytes)?;
                 }
                 if !string.is_inlined() && !string.is_empty() && elem_i < source_count {
                     heap_bytes = heap_bytes.saturating_add(string.len());

@@ -91,3 +91,48 @@ WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
 ORDER BY id;
 
 DROP TABLE matched_prefix_projection_case;
+
+-- Hidden ORDER BY columns are an execution-only suffix, not malformed
+-- projection metadata. A compact derived prefix must also coexist with late
+-- fetching of an unrelated wide stored value.
+DROP TABLE IF EXISTS matched_prefix_late_payload_case;
+CREATE TABLE matched_prefix_late_payload_case(
+    id INT,
+    phone VARCHAR,
+    wide VARCHAR
+);
+INSERT INTO matched_prefix_late_payload_case
+SELECT
+    g,
+    CASE WHEN g % 3 = 0 THEN '44z' WHEN g % 2 = 0 THEN '31y' ELSE '13x' END,
+    'wwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwwww'
+        || CAST(g AS VARCHAR)
+FROM generate_series(1, 5000) AS t(g);
+
+EXPLAIN (VERBOSE)
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+
+SELECT phone, wide
+FROM matched_prefix_late_payload_case
+WHERE phone IN ('13x', '31y')
+ORDER BY id
+LIMIT 3;
+
+EXPLAIN (VERBOSE)
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+
+SELECT id, substring(phone FROM 1 FOR 2) AS prefix, wide
+FROM matched_prefix_late_payload_case
+WHERE substring(phone FROM 1 FOR 2) IN ('13', '31')
+ORDER BY id
+LIMIT 3;
+
+DROP TABLE matched_prefix_late_payload_case;

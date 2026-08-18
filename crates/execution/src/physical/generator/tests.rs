@@ -161,7 +161,7 @@ fn arena_generator_builds_streaming_subset_without_runtime_objects() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, filter, vec![project_expr]).with_output_names(vec!["a".into()]),
+            Projection::new(1, filter, vec![project_expr]).with_visible_names(vec!["a".into()]),
         ),
     );
     let limit = LogicalPlan::new(
@@ -895,7 +895,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
                     LogicalType::UBigInt,
                 ))],
             )
-            .with_output_names(vec!["src".to_string()]),
+            .with_visible_names(vec!["src".to_string()]),
         ),
     );
 
@@ -1052,7 +1052,7 @@ fn arena_generator_names_hidden_order_columns() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, exprs).with_output_names(vec!["a".into()]),
+            Projection::new(1, values, exprs).with_visible_names(vec!["a".into()]),
         ),
     );
     let order = LogicalPlan::new(&ctx, LogicalOperator::Order(Order::new(project, vec![])));
@@ -1101,7 +1101,7 @@ fn arena_generator_names_hidden_window_child_columns() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, exprs).with_output_names(vec!["visible".into()]),
+            Projection::new(1, values, exprs).with_visible_names(vec!["visible".into()]),
         ),
     );
     let row_number = WindowFunction::row_number();
@@ -1311,7 +1311,7 @@ fn arena_generator_lowers_row_literal_union_all_to_values() {
                         LogicalType::Integer,
                     ))],
                 )
-                .with_output_names(vec!["v".to_string()]),
+                .with_visible_names(vec!["v".to_string()]),
             ),
         )
     };

@@ -10,7 +10,7 @@ use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, ValidatedVectorSelection, Vector};
+use paro_common::vector::Vector;
 use std::sync::Arc;
 
 impl TabletReader {
@@ -115,21 +115,14 @@ impl TabletReader {
         let mut read_vectors: Vec<Option<Arc<Vector>>> = Vec::with_capacity(self.projection.len());
         let mut raw_batches = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
-        let selection = selection
-            .map(BatchRowOrdinal::into_raw_vec)
-            .map(|indices| SelectionVector::try_from_owned_indices(indices, allocator.clone()))
-            .transpose()?
-            .map(|selection| {
-                ValidatedVectorSelection::try_new(selection, physical_rows).map_err(|error| {
-                    paro_error::data_corrupted(format!(
-                        "invalid column batch selection for {physical_rows} rows: {error}"
-                    ))
-                })
-            })
-            .transpose()?;
         let decoder_selection = selection
-            .as_ref()
-            .map(vector_decoder::ColumnBatchSelection::try_from_validated)
+            .map(|selection| {
+                vector_decoder::ColumnBatchSelection::try_new(
+                    selection,
+                    physical_rows,
+                    allocator.clone(),
+                )
+            })
             .transpose()?;
         let mut batch_hint = 0usize;
 
@@ -149,7 +142,7 @@ impl TabletReader {
                         ty,
                         col_batch,
                         physical_rows,
-                        decoder_selection,
+                        decoder_selection.as_ref(),
                         rows,
                         vector_decoder::ColumnValueProjection::Stored,
                         allocator.clone(),
@@ -182,7 +175,7 @@ impl TabletReader {
             }
         }
 
-        if let Some(selection) = &selection {
+        if let Some(selection) = &decoder_selection {
             for (read_idx, vector) in read_vectors.iter_mut().enumerate() {
                 let Some(vector) = vector else {
                     continue;
@@ -196,7 +189,7 @@ impl TabletReader {
                 if vector.len() == physical_rows {
                     *vector = Arc::new(Vector::try_dictionary_from_validated(
                         vector.clone(),
-                        selection.clone(),
+                        selection.validated_vector().clone(),
                     )?);
                 } else if vector.len() != rows {
                     return Err(paro_error::data_corrupted(format!(
@@ -228,7 +221,7 @@ impl TabletReader {
                             &self.read_types[read_idx],
                             batch,
                             physical_rows,
-                            decoder_selection,
+                            decoder_selection.as_ref(),
                             rows,
                             vector_decoder::ColumnValueProjection::MatchedUtf8Prefix {
                                 byte_width: *byte_width,

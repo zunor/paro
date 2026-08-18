@@ -130,7 +130,7 @@ impl LogicalOperator {
                 let child_names = op.child.output_names();
                 project_names(&child_names, &op.projection_map)
             }
-            LogicalOperator::Projection(op) => op.output_names.clone(),
+            LogicalOperator::Projection(op) => op.visible_names.clone(),
             LogicalOperator::RowFetch(op) => op.output_names(),
             LogicalOperator::ExternalProject(op) => op.output_names.clone(),
             LogicalOperator::ExternalTable(op) => op.output_columns.clone(),

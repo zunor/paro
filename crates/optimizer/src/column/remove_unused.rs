@@ -313,14 +313,14 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
             }
             LogicalOperator::Projection(proj) => {
                 let carries_external_arguments = proj
-                    .output_names
+                    .visible_names
                     .iter()
                     .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
                 if !self.everything_referenced && !carries_external_arguments {
                     self.clear_unused_expressions(
                         &mut proj.expressions,
-                        Some(&mut proj.output_names),
+                        Some(&mut proj.visible_names),
                         proj.table_index,
                     );
 
@@ -331,7 +331,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                                 value: paro_common::runtime_value::Value::Integer(42),
                                 return_type: paro_common::types::LogicalType::Integer,
                             }));
-                        proj.output_names = vec!["42".to_string()];
+                        proj.visible_names = vec!["42".to_string()];
                     }
 
                     // Update returned types
@@ -1173,7 +1173,7 @@ mod tests {
             scan,
             vec![int_column(10, 0), int_column(10, 2), int_column(10, 1)],
         );
-        correlation_projection.output_names =
+        correlation_projection.visible_names =
             vec!["payload_0".into(), "payload_1".into(), "__corr_1".into()];
         let correlation_projection =
             LogicalPlan::new(ctx, LogicalOperator::Projection(correlation_projection));
@@ -1195,7 +1195,7 @@ mod tests {
         let LogicalOperator::Projection(correlation) = &root.child.operator else {
             panic!("expected correlation projection");
         };
-        assert_eq!(correlation.output_names, vec!["__corr_1"]);
+        assert_eq!(correlation.visible_names, vec!["__corr_1"]);
         assert_eq!(correlation.expressions.len(), 1);
         let LogicalOperator::Get(scan) = &correlation.child.operator else {
             panic!("expected scan");

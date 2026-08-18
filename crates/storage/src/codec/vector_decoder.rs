@@ -34,26 +34,59 @@ pub enum ColumnValueProjection {
 /// The wrapper prevents the stored and derived decoder paths from receiving
 /// two independently supplied mappings while keeping matched-prefix row
 /// lookup as a direct newtype slice access in the hot loop.
-#[derive(Clone, Copy)]
-pub(crate) struct ColumnBatchSelection<'a> {
-    ordinals: &'a [BatchRowOrdinal],
-    vector: &'a ValidatedVectorSelection,
+pub(crate) struct ColumnBatchSelection {
+    vector: ValidatedVectorSelection,
 }
 
-impl<'a> ColumnBatchSelection<'a> {
-    pub(crate) fn try_from_validated(vector: &'a ValidatedVectorSelection) -> Result<Self> {
-        let raw = vector
-            .materialized_indices()
-            .ok_or_else(|| paro_error::internal("column batch selection must be materialized"))?;
-        Ok(Self {
-            ordinals: BatchRowOrdinal::from_validated_raw_slice(raw),
-            vector,
-        })
+struct OwnedBatchOrdinals(Vec<BatchRowOrdinal>);
+
+impl AsRef<[u8]> for OwnedBatchOrdinals {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: BatchRowOrdinal is repr(transparent) over u32, every element
+        // is initialized, and Bytes retains this typed owner unchanged.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.0.as_ptr().cast::<u8>(),
+                self.0.len() * std::mem::size_of::<u32>(),
+            )
+        }
+    }
+}
+
+impl ColumnBatchSelection {
+    pub(crate) fn try_new(
+        ordinals: Vec<BatchRowOrdinal>,
+        child_count: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let count = ordinals.len();
+        let selection = SelectionVector::try_from_native_bytes(
+            Bytes::from_owner(OwnedBatchOrdinals(ordinals)),
+            count,
+            allocator,
+        )?;
+        let vector = ValidatedVectorSelection::try_new(selection, child_count)
+            .map_err(|error| paro_error::data_corrupted(error.to_string()))?;
+        Ok(Self { vector })
     }
 
     #[inline]
-    fn len(self) -> usize {
-        self.ordinals.len()
+    fn ordinals(&self) -> &[BatchRowOrdinal] {
+        BatchRowOrdinal::from_validated_raw_slice(
+            self.vector
+                .materialized_indices()
+                .expect("column batch selection is always materialized"),
+        )
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.vector.len()
+    }
+
+    #[inline]
+    pub(crate) fn validated_vector(&self) -> &ValidatedVectorSelection {
+        &self.vector
     }
 }
 
@@ -76,6 +109,40 @@ struct CachedStorageDictionary {
     utf8_verified: bool,
     dictionary_len: usize,
     child: Arc<Vector>,
+}
+
+/// A cardinality-checked view over the storage dictionary code stream.
+///
+/// Stored-vector decode, sparse localization, and derived projections all use
+/// this one parser so code-width and row-domain validation cannot drift.
+#[derive(Clone, Copy)]
+struct ValidatedDictionaryCodes<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ValidatedDictionaryCodes<'a> {
+    fn try_new(bytes: &'a [u8], rows: usize) -> Result<Self> {
+        let expected = rows
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("storage dictionary cardinality overflow"))?;
+        if bytes.len() != expected {
+            return Err(paro_error::data_corrupted(
+                "storage dictionary code count does not match row count",
+            ));
+        }
+        Ok(Self { bytes })
+    }
+
+    #[inline]
+    fn code_at(self, row: usize) -> u32 {
+        debug_assert!(row < self.bytes.len() / std::mem::size_of::<u32>());
+        let offset = row * std::mem::size_of::<u32>();
+        u32::from_le_bytes(
+            self.bytes[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("validated dictionary code width"),
+        )
+    }
 }
 
 impl StorageDictionaryDecoderCache {
@@ -127,7 +194,7 @@ pub(crate) fn decode_column_batch_with_projection(
     logical_type: &LogicalType,
     batch: &ColumnBatch,
     physical_rows: usize,
-    selection: Option<ColumnBatchSelection<'_>>,
+    selection: Option<&ColumnBatchSelection>,
     rows: usize,
     projection: ColumnValueProjection,
     allocator: Arc<dyn Allocator>,
@@ -170,7 +237,7 @@ pub(crate) fn decode_column_batch_with_projection(
             decode_matched_utf8_prefix_batch(
                 batch,
                 physical_rows,
-                selection.map(|selection| selection.ordinals),
+                selection.map(ColumnBatchSelection::ordinals),
                 rows,
                 byte_width,
                 allocator,
@@ -276,17 +343,8 @@ fn decode_matched_utf8_prefix_batch(
     };
 
     if let Some(dictionary_batch) = &batch.storage_dictionary {
-        if dictionary_batch.codes.len()
-            != physical_rows
-                .checked_mul(std::mem::size_of::<u32>())
-                .ok_or_else(|| {
-                    paro_error::data_corrupted("matched-prefix dictionary cardinality overflow")
-                })?
-        {
-            return Err(paro_error::data_corrupted(
-                "matched-prefix dictionary code cardinality is inconsistent",
-            ));
-        }
+        let codes =
+            ValidatedDictionaryCodes::try_new(dictionary_batch.codes.as_ref(), physical_rows)?;
         let mut dictionary = BinaryPlainPageDecoder::new(dictionary_batch.dictionary.clone());
         dictionary.init()?;
         for output_index in 0..rows {
@@ -296,16 +354,7 @@ fn decode_matched_utf8_prefix_batch(
                     "NULL row escaped a matched-prefix predicate",
                 ));
             }
-            let code_offset = row * std::mem::size_of::<u32>();
-            let code_end = code_offset + std::mem::size_of::<u32>();
-            let code = u32::from_le_bytes(
-                dictionary_batch
-                    .codes
-                    .get(code_offset..code_end)
-                    .ok_or_else(|| paro_error::data_corrupted("dictionary code is truncated"))?
-                    .try_into()
-                    .expect("validated u32 code width"),
-            );
+            let code = codes.code_at(row);
             let value = dictionary.value_ref_at(code).ok_or_else(|| {
                 paro_error::data_corrupted("matched-prefix dictionary code is out of range")
             })?;
@@ -578,16 +627,7 @@ fn decode_storage_dictionary_batch(
     };
     let unique_len = child.len();
 
-    if batch.codes.len() % std::mem::size_of::<u32>() != 0 {
-        return Err(paro_error::data_corrupted(
-            "Storage dictionary codes are not aligned to u32",
-        ));
-    }
-    if batch.codes.len() / std::mem::size_of::<u32>() != rows {
-        return Err(paro_error::data_corrupted(
-            "Storage dictionary code count does not match row count",
-        ));
-    }
+    let codes = ValidatedDictionaryCodes::try_new(batch.codes.as_ref(), rows)?;
     if let Some(nulls) = nulls {
         if nulls.len() < rows {
             return Err(paro_error::data_corrupted(
@@ -615,12 +655,7 @@ fn decode_storage_dictionary_batch(
 
     let mut selection = Vec::with_capacity(rows);
     for row_idx in 0..rows {
-        let code_offset = row_idx * std::mem::size_of::<u32>();
-        let mut code = u32::from_le_bytes(
-            batch.codes[code_offset..code_offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .expect("u32-aligned storage dictionary codes"),
-        );
+        let mut code = codes.code_at(row_idx);
         if nulls.is_some_and(|flags| flags[row_idx] != 0) {
             code = null_index;
         } else if code as usize >= dictionary_len {
@@ -695,11 +730,7 @@ fn localize_storage_dictionary(
     nulls: Option<&[u8]>,
     rows: usize,
 ) -> Result<Option<StorageDictionaryBatch>> {
-    if batch.codes.len() != rows.saturating_mul(std::mem::size_of::<u32>()) {
-        return Err(paro_error::data_corrupted(
-            "Storage dictionary code count does not match sparse row count",
-        ));
-    }
+    let codes = ValidatedDictionaryCodes::try_new(batch.codes.as_ref(), rows)?;
     if nulls.is_some_and(|flags| flags.len() < rows) {
         return Err(paro_error::data_corrupted(
             "Null map shorter than sparse dictionary row count",
@@ -721,12 +752,7 @@ fn localize_storage_dictionary(
         if nulls.is_some_and(|flags| flags[row_idx] != 0) {
             continue;
         }
-        let start = row_idx * std::mem::size_of::<u32>();
-        let code = u32::from_le_bytes(
-            batch.codes[start..start + std::mem::size_of::<u32>()]
-                .try_into()
-                .expect("validated sparse dictionary code width"),
-        );
+        let code = codes.code_at(row_idx);
         if code as usize >= dictionary_len {
             return Err(paro_error::data_corrupted(format!(
                 "storage dictionary code {code} out of range {dictionary_len}"
@@ -755,12 +781,7 @@ fn localize_storage_dictionary(
         let local_code = if nulls.is_some_and(|flags| flags[row_idx] != 0) {
             0
         } else {
-            let start = row_idx * std::mem::size_of::<u32>();
-            let code = u32::from_le_bytes(
-                batch.codes[start..start + std::mem::size_of::<u32>()]
-                    .try_into()
-                    .expect("validated sparse dictionary code width"),
-            );
+            let code = codes.code_at(row_idx);
             u32::try_from(referenced_codes.binary_search(&code).map_err(|_| {
                 paro_error::internal("referenced dictionary code missing from localized domain")
             })?)
