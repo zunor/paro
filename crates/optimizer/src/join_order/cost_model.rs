@@ -89,6 +89,14 @@ pub struct CostModel {
 }
 
 impl CostModel {
+    /// Work unit for one hash-table input row.
+    ///
+    /// The existing materialization cost is byte-weighted. One machine word
+    /// gives reduction joins a matching, deliberately conservative charge for
+    /// hashing/building or probing a key without pretending that the complete
+    /// retained payload is copied into the hash table.
+    const HASH_ROW_WORK_BYTES: usize = std::mem::size_of::<u64>();
+
     /// Create a new CostModel.
     pub fn new() -> Self {
         Self {
@@ -120,7 +128,9 @@ impl CostModel {
     /// Compute the cost of joining two nodes.
     ///
     /// The cost is computed as:
-    /// cost = cardinality(left ⋈ right) * row_width + cost(left) + cost(right)
+    /// cost = join_cardinality * intermediate_row_width
+    ///      + reduction_input_rows * hash_row_work
+    ///      + cost(left) + cost(right)
     ///
     /// The row width is the combined projected payload plus one intermediate
     /// row header, so wide retained values are charged without duplicating the
@@ -130,6 +140,7 @@ impl CostModel {
         left: &DPJoinNode,
         right: &DPJoinNode,
         set_manager: &mut JoinRelationSetManager,
+        predicates: Option<&JoinPredicateSet>,
     ) -> f64 {
         // Get the combined relation set
         let combination = set_manager.union(&left.set, &right.set);
@@ -150,7 +161,46 @@ impl CostModel {
             .map(|relation| self.relation_widths.get(*relation).copied().unwrap_or(0))
             .sum::<usize>();
         let row_width = 8usize.saturating_add(payload_width).max(1);
-        join_cardinality * row_width as f64 + left.cost + right.cost
+        let reduction_work = Self::reduction_inputs(left, right, predicates).map_or(
+            0.0,
+            |(preserved, filtering)| {
+                (preserved.cardinality + filtering.cardinality) * Self::HASH_ROW_WORK_BYTES as f64
+            },
+        );
+        join_cardinality * row_width as f64 + reduction_work + left.cost + right.cost
+    }
+
+    /// Resolve the fixed reduction-join roles for one DP cut. SEMI/ANTI
+    /// predicates preserve their logical left side even
+    /// when enumeration presents that side as the right child.
+    fn reduction_inputs<'a>(
+        left: &'a DPJoinNode,
+        right: &'a DPJoinNode,
+        predicates: Option<&JoinPredicateSet>,
+    ) -> Option<(&'a DPJoinNode, &'a DPJoinNode)> {
+        let reduction_filter = predicates.and_then(|predicates| {
+            predicates.filters.iter().find(|filter| {
+                matches!(
+                    filter.join_type,
+                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
+                )
+            })
+        });
+        reduction_filter.and_then(|filter| {
+            let preserved = filter.left_set.as_ref()?;
+            let filtering = filter.right_set.as_ref()?;
+            if JoinRelationSet::is_subset(&left.set, preserved)
+                && JoinRelationSet::is_subset(&right.set, filtering)
+            {
+                Some((left, right))
+            } else if JoinRelationSet::is_subset(&right.set, preserved)
+                && JoinRelationSet::is_subset(&left.set, filtering)
+            {
+                Some((right, left))
+            } else {
+                None
+            }
+        })
     }
 
     /// Compute the cost and create a new DPJoinNode.
@@ -162,7 +212,7 @@ impl CostModel {
         predicates: Option<JoinPredicateSet>,
     ) -> DPJoinNode {
         let combination = set_manager.union(&left.set, &right.set);
-        let cost = self.compute_cost(left, right, set_manager);
+        let cost = self.compute_cost(left, right, set_manager, predicates.as_ref());
         let cardinality = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
@@ -192,7 +242,7 @@ mod tests {
     use crate::join_order::relation_manager::DistinctCount;
     use paro_common::types::LogicalType;
     use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
-    use paro_planner::operator::ColumnBinding;
+    use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
     fn column_distinct_counts(
         table_index: usize,
@@ -243,6 +293,38 @@ mod tests {
         filter.set_left_binding(ColumnBinding::new(left_table, left_col), left_table);
         filter.set_right_binding(ColumnBinding::new(right_table, right_col), right_table);
 
+        Arc::new(filter)
+    }
+
+    fn create_reduction_filter(
+        set_manager: &mut JoinRelationSetManager,
+        preserved_table: usize,
+        preserved_col: usize,
+        filtering_table: usize,
+        filtering_col: usize,
+        filter_index: usize,
+        join_type: JoinType,
+    ) -> Arc<FilterInfo> {
+        assert!(matches!(join_type, JoinType::Semi | JoinType::Anti));
+        let expr = paro_planner::expression::Expression::Comparison(ComparisonExpression {
+            left: Box::new(create_column_ref(preserved_table, preserved_col)),
+            right: Box::new(create_column_ref(filtering_table, filtering_col)),
+            comparison_type: ComparisonType::Equal,
+        });
+        let set = set_manager.get_relation_from_vec(vec![preserved_table, filtering_table]);
+        let preserved_set = set_manager.get_relation(preserved_table);
+        let filtering_set = set_manager.get_relation(filtering_table);
+        let mut filter = FilterInfo::new(expr, set, filter_index, join_type, AntiJoinMode::Regular);
+        filter.set_left_set(preserved_set);
+        filter.set_right_set(filtering_set);
+        filter.set_left_binding(
+            ColumnBinding::new(preserved_table, preserved_col),
+            preserved_table,
+        );
+        filter.set_right_binding(
+            ColumnBinding::new(filtering_table, filtering_col),
+            filtering_table,
+        );
         Arc::new(filter)
     }
 
@@ -337,7 +419,7 @@ mod tests {
         let right = DPJoinNode::leaf(set_manager.get_relation(1));
 
         // Compute cost
-        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager, None);
 
         // Cost should be join cardinality + 0 + 0 (leaf costs are 0)
         // Join cardinality = (1000 * 500) / max(100, 50) = 5000
@@ -389,7 +471,7 @@ mod tests {
         };
 
         // Compute cost
-        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager, None);
 
         // Cost should include left.cost + right.cost
         assert!(cost >= 150.0); // At least the sum of child costs
@@ -484,6 +566,90 @@ mod tests {
         // Both should have valid costs
         assert!(ab_c.cost > 0.0);
         assert!(a_bc.cost > 0.0);
+    }
+
+    #[test]
+    fn weak_anti_reduction_follows_selective_inner_join() {
+        // TPC-H Q16 shape: partsupp is first narrowed by a selective part
+        // predicate; a tiny supplier exclusion then probes only those rows.
+        // ANTI-first barely reduces the fact input and must not win merely on
+        // the smaller cardinality of that first intermediate.
+        let mut sets = JoinRelationSetManager::new();
+        let part_filter = create_equality_filter(&mut sets, 0, 0, 1, 0, 0);
+        let supplier_exclusion = create_reduction_filter(&mut sets, 0, 1, 2, 0, 1, JoinType::Anti);
+        let filters = vec![part_filter.clone(), supplier_exclusion.clone()];
+
+        let mut partsupp_stats = RelationStats::with_cardinality(800_000);
+        partsupp_stats.estimated_payload_width = 16;
+        partsupp_stats.column_distinct_count = column_distinct_counts(
+            0,
+            [
+                DistinctCount::new(200_000, true),
+                DistinctCount::new(10_000, true),
+            ],
+        );
+        let mut part_stats = RelationStats::with_cardinality(30_000);
+        part_stats.estimated_payload_width = 40;
+        part_stats.column_distinct_count =
+            column_distinct_counts(1, [DistinctCount::new(30_000, true)]);
+        let mut supplier_stats = RelationStats::with_cardinality(112);
+        supplier_stats.estimated_payload_width = 8;
+        supplier_stats.column_distinct_count =
+            column_distinct_counts(2, [DistinctCount::new(112, true)]);
+
+        let mut model = CostModel::new();
+        model
+            .cardinality_estimator
+            .init_equivalent_relations(&filters);
+        model.init_cost_model(&mut sets, &[partsupp_stats, part_stats, supplier_stats]);
+
+        let mut partsupp = DPJoinNode::leaf(sets.get_relation(0));
+        partsupp.cardinality = model.get_cardinality(&partsupp.set);
+        let mut part = DPJoinNode::leaf(sets.get_relation(1));
+        part.cardinality = model.get_cardinality(&part.set);
+        let mut supplier = DPJoinNode::leaf(sets.get_relation(2));
+        supplier.cardinality = model.get_cardinality(&supplier.set);
+
+        let anti_first = model.compute_cost_and_create_node(
+            &partsupp,
+            &supplier,
+            &mut sets,
+            Some(JoinPredicateSet {
+                filters: vec![supplier_exclusion.clone()],
+            }),
+        );
+        let anti_then_part = model.compute_cost_and_create_node(
+            &anti_first,
+            &part,
+            &mut sets,
+            Some(JoinPredicateSet {
+                filters: vec![part_filter.clone()],
+            }),
+        );
+
+        let part_first = model.compute_cost_and_create_node(
+            &partsupp,
+            &part,
+            &mut sets,
+            Some(JoinPredicateSet {
+                filters: vec![part_filter],
+            }),
+        );
+        let part_then_anti = model.compute_cost_and_create_node(
+            &part_first,
+            &supplier,
+            &mut sets,
+            Some(JoinPredicateSet {
+                filters: vec![supplier_exclusion],
+            }),
+        );
+
+        assert!(
+            part_then_anti.cost < anti_then_part.cost,
+            "selective inner first: {}, weak anti first: {}",
+            part_then_anti.cost,
+            anti_then_part.cost
+        );
     }
 
     #[test]
@@ -645,7 +811,7 @@ mod tests {
         let left = DPJoinNode::leaf(set_manager.get_relation(0));
         let right = DPJoinNode::leaf(set_manager.get_relation(1));
 
-        let cost = cost_model.compute_cost(&left, &right, &mut set_manager);
+        let cost = cost_model.compute_cost(&left, &right, &mut set_manager, None);
 
         // Cross product cost should be high (100 * 50 = 5000)
         assert!(cost >= 5000.0);

@@ -283,6 +283,12 @@ impl CostModel {
                         LikePatternShape::Contains | LikePatternShape::Suffix => {
                             self.defaults.like_contains
                         }
+                        LikePatternShape::OrderedContains(literal_fragments) => {
+                            ordered_contains_selectivity(
+                                self.defaults.like_contains,
+                                literal_fragments,
+                            )
+                        }
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
                 ),
@@ -296,6 +302,12 @@ impl CostModel {
                         LikePatternShape::Prefix => self.defaults.like_prefix,
                         LikePatternShape::Contains | LikePatternShape::Suffix => {
                             self.defaults.like_contains
+                        }
+                        LikePatternShape::OrderedContains(literal_fragments) => {
+                            ordered_contains_selectivity(
+                                self.defaults.like_contains,
+                                literal_fragments,
+                            )
                         }
                         LikePatternShape::Generic => self.defaults.predicate,
                     },
@@ -977,7 +989,25 @@ enum LikePatternShape {
     Prefix,
     Suffix,
     Contains,
+    /// Several non-empty literals separated by `%`, with wildcards at both
+    /// ends. Every literal must occur in order, so model each occurrence as an
+    /// additional contains predicate rather than falling back to the generic
+    /// (and usually very high) predicate selectivity.
+    OrderedContains(usize),
     Generic,
+}
+
+/// Estimate several ordered literal occurrences on one string domain.
+///
+/// Treating fragments as independent (`contains^n`) becomes too confident for
+/// correlated text. Apply the same exponential backoff used for conjunctions
+/// over several columns of one relation: the first literal has full weight and
+/// each later literal contributes half the previous exponent. Even a long
+/// fragment list therefore claims no more than two independent occurrences.
+fn ordered_contains_selectivity(contains: f64, literal_fragments: usize) -> f64 {
+    let bounded_fragments = literal_fragments.min(i32::MAX as usize) as i32;
+    let exponent = 2.0 * (1.0 - 0.5f64.powi(bounded_fragments));
+    contains.powf(exponent)
 }
 
 fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
@@ -999,6 +1029,17 @@ fn like_pattern_shape(pattern: Option<&Expression>) -> LikePatternShape {
         1 if value.ends_with('%') => LikePatternShape::Prefix,
         1 if value.starts_with('%') => LikePatternShape::Suffix,
         2 if value.starts_with('%') && value.ends_with('%') => LikePatternShape::Contains,
+        _ if value.starts_with('%') && value.ends_with('%') => {
+            let literal_fragments = value
+                .split('%')
+                .filter(|fragment| !fragment.is_empty())
+                .count();
+            if literal_fragments >= 2 {
+                LikePatternShape::OrderedContains(literal_fragments)
+            } else {
+                LikePatternShape::Generic
+            }
+        }
         _ => LikePatternShape::Generic,
     }
 }
@@ -1311,6 +1352,10 @@ mod tests {
         assert_eq!(
             model.estimate_selectivity(&like("%green%"), &HashMap::new()),
             0.05
+        );
+        assert_eq!(
+            model.estimate_selectivity(&like("%Customer%Complaints%"), &HashMap::new()),
+            0.05f64.powf(1.5)
         );
         assert_eq!(model.estimate_selectivity(&like("%"), &HashMap::new()), 1.0);
         assert_eq!(
