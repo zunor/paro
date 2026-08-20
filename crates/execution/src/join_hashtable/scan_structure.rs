@@ -730,6 +730,70 @@ impl ScanStructure {
         )
     }
 
+    /// Emit a payload-free inner join directly from an exact unique-key probe.
+    ///
+    /// The integer index has already compared the complete key and published
+    /// the matching probe ordinals in `sel_vector`. With no duplicate build
+    /// rows, residual predicate, right-side output, or unmatched-row tracking,
+    /// the ordinary inner-join drain would only copy those ordinals through
+    /// the pending-match buffers and prepare an empty build dictionary.
+    pub fn next_exact_unique_left_only_inner_join(
+        &mut self,
+        left: &paro_common::chunk::Chunk,
+        result: &mut paro_common::chunk::Chunk,
+        left_projection_map: &[usize],
+    ) -> Result<usize> {
+        debug_assert!(self.exact_key_matches);
+        debug_assert!(!self.has_long_chains);
+        if self.finished {
+            result.set_cardinality(0);
+            return Ok(0);
+        }
+
+        let count = self.count;
+        let selection = &self.sel_vector;
+        if result.column_count() != left_projection_map.len() {
+            return Err(paro_common::error::internal(format!(
+                "left-only join output has {} columns but its projection has {} entries",
+                result.column_count(),
+                left_projection_map.len()
+            )));
+        }
+        let selection_is_identity = count == left.size()
+            && selection
+                .as_slice()
+                .iter()
+                .enumerate()
+                .all(|(row_idx, &selected)| selected as usize == row_idx);
+        let result_column_count = result.column_count();
+        for (output_idx, &left_idx) in left_projection_map.iter().enumerate() {
+            let left_column = left.data.get(left_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "join left projection index {left_idx} is out of range for {} columns",
+                    left.column_count()
+                ))
+            })?;
+            let output = result.data.get_mut(output_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "join left output index {output_idx} is out of range for {} columns",
+                    result_column_count
+                ))
+            })?;
+            *output = if selection_is_identity {
+                Arc::clone(left_column)
+            } else {
+                Arc::new(Vector::try_dictionary(
+                    Arc::clone(left_column),
+                    selection.clone(),
+                )?)
+            };
+        }
+        result.try_set_cardinality(count)?;
+        self.count = 0;
+        self.finished = true;
+        Ok(count)
+    }
+
     /// Scan results for an inner join with an additional residual filter.
     pub fn next_inner_join_with_filter<F>(
         &mut self,

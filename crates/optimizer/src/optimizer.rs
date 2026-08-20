@@ -19,15 +19,16 @@ use crate::context::OptimizationContext;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
-    AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, AggregatePostReductionPass,
-    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CorrelatedPartitionAggregatePass,
-    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
-    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
-    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
-    MatchedPrefixScanProjectionPass, MixedJoinPredicatePass, ReorderFilterPass,
-    ScalarAggregateWindowPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
-    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    AggregateDimensionDeferralPass, AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass,
+    AggregatePostReductionPass, BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass,
+    CorrelatedPartitionAggregatePass, CteFilterPusherPass, CteInliningPass,
+    DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass, FilterPullupPass,
+    FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
+    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
+    JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass, MatchedPrefixScanProjectionPass,
+    MixedJoinPredicatePass, ReorderFilterPass, ScalarAggregateWindowPass, SearchOptimizationPass,
+    SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass, TopNPass,
+    UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -266,6 +267,7 @@ impl Optimizer {
 
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
+        let dimension_deferral_binder = binder.clone();
         let late_payload_binder = binder.clone();
         let final_late_payload_binder = binder.clone();
         let scan_projection_binder = binder.clone();
@@ -315,6 +317,15 @@ impl Optimizer {
             // inputs over that settled schema before join enumeration.
             pass(StatisticsGatheringPass),
             pass(JoinOrderPass),
+            // Group fact rows by compact equality keys before attaching a
+            // wide descriptive dimension payload. A second schema/statistics
+            // settlement makes the new partial aggregate authoritative for
+            // physical build/probe selection.
+            pass(AggregateDimensionDeferralPass),
+            pass(UnusedColumnsPass {
+                binder: dimension_deferral_binder,
+            }),
+            pass(StatisticsGatheringPass),
             pass(BuildProbeSidePass),
             pass(JoinFilterPushdownPass),
             pass(TopNPass),

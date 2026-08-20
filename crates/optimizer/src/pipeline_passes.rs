@@ -8,6 +8,7 @@ use paro_planner::binder::Binder;
 use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
+use crate::aggregate::dimension_deferral;
 use crate::aggregate::join_preaggregation;
 use crate::aggregate::join_subsumption;
 use crate::aggregate::late_payload;
@@ -312,6 +313,18 @@ impl Rewriter for AggregateJoinPreaggregationPass {
             &ctx.bind_context,
             &ctx.column_stats,
         ))
+    }
+}
+
+pub struct AggregateDimensionDeferralPass;
+
+impl Rewriter for AggregateDimensionDeferralPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateDimensionDeferral
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        dimension_deferral::optimize_plan(plan, &ctx.bind_context)
     }
 }
 

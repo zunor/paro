@@ -516,13 +516,25 @@ fn try_filter_seed_i64_batch(
     if !seed || batch.nulls.is_some() {
         return false;
     }
-    let FixedKernelShape::Bounds { lower, upper } = kernel.execution_shape() else {
-        return false;
-    };
-    let bounds = inclusive_bounds(lower, upper);
-    let Some((lower, upper)) = bounds.closed_range() else {
-        selection.clear();
-        return true;
+    let (lower, upper) = match kernel.execution_shape() {
+        FixedKernelShape::Membership(FixedMembershipView::Dense { base, span, bits }) => {
+            return try_filter_seed_dense_membership(
+                batch.data.as_ptr(),
+                base,
+                span,
+                bits,
+                rows,
+                selection,
+            );
+        }
+        FixedKernelShape::Bounds { lower, upper } => {
+            let Some(bounds) = inclusive_bounds(lower, upper).closed_range() else {
+                selection.clear();
+                return true;
+            };
+            bounds
+        }
+        _ => return false,
     };
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -592,18 +604,196 @@ unsafe fn compact_ordinals_neon(
     output: *mut BatchRowOrdinal,
     written: usize,
 ) -> usize {
-    use core::arch::aarch64::{
-        vaddvq_u32, vandq_u32, vld1q_u32, vld1q_u8, vqtbl1q_u8, vreinterpretq_u32_u8,
-        vreinterpretq_u8_u32, vst1q_u32,
-    };
+    use core::arch::aarch64::{vaddvq_u32, vandq_u32, vld1q_u32};
 
     let weights = unsafe { vld1q_u32([1u32, 2, 4, 8].as_ptr()) };
     let mask = unsafe { vaddvq_u32(vandq_u32(matched, weights)) } as usize;
+    unsafe { compact_ordinals_mask_neon(mask, ordinals, output, written) }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+#[inline(always)]
+unsafe fn compact_ordinals_mask_neon(
+    mask: usize,
+    ordinals: core::arch::aarch64::uint32x4_t,
+    output: *mut BatchRowOrdinal,
+    written: usize,
+) -> usize {
+    use core::arch::aarch64::{
+        vld1q_u8, vqtbl1q_u8, vreinterpretq_u32_u8, vreinterpretq_u8_u32, vst1q_u32,
+    };
+
+    let mask = mask & 0x0f;
     let shuffle = unsafe { vld1q_u8(NEON_COMPACTION_TABLE[mask].as_ptr()) };
     let packed =
         unsafe { vreinterpretq_u32_u8(vqtbl1q_u8(vreinterpretq_u8_u32(ordinals), shuffle)) };
     unsafe { vst1q_u32(output.add(written).cast::<u32>(), packed) };
     mask.count_ones() as usize
+}
+
+#[inline(always)]
+fn dense_membership_contains<T: FixedPhysical>(
+    value: T,
+    base: T,
+    span: usize,
+    bits: &[u64],
+) -> bool {
+    let Some(offset) = value.offset_from(base).filter(|offset| *offset < span) else {
+        return false;
+    };
+    bits[offset / u64::BITS as usize] & (1_u64 << (offset % u64::BITS as usize)) != 0
+}
+
+/// Compact a dense fixed-width membership predicate without a per-row output
+/// branch. Dense domains back analytical runtime filters: the bit lookup is
+/// scalar because NEON has no general gather, while the selection write is
+/// shared with the range kernels' table compaction.
+fn try_filter_seed_dense_membership<T: FixedPhysical>(
+    input: *const u8,
+    base: T,
+    span: usize,
+    bits: &[u64],
+    rows: usize,
+    selection: &mut Vec<BatchRowOrdinal>,
+) -> bool {
+    #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+    {
+        unsafe { filter_dense_membership_neon(input, base, span, bits, rows, selection) }
+    }
+
+    #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+    {
+        if std::arch::is_x86_feature_detected!("avx2") {
+            return unsafe {
+                filter_dense_membership_avx2(input, base, span, bits, rows, selection)
+            };
+        }
+        false
+    }
+
+    #[cfg(not(any(
+        all(target_arch = "aarch64", target_endian = "little"),
+        all(target_arch = "x86_64", target_endian = "little")
+    )))]
+    {
+        let _ = (input, base, span, bits, rows, selection);
+        false
+    }
+}
+
+#[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+unsafe fn filter_dense_membership_neon<T: FixedPhysical>(
+    input: *const u8,
+    base: T,
+    span: usize,
+    bits: &[u64],
+    rows: usize,
+    selection: &mut Vec<BatchRowOrdinal>,
+) -> bool {
+    use core::arch::aarch64::{vaddq_u32, vdupq_n_u32, vld1q_u32};
+
+    selection.reserve(rows + 4);
+    let start = selection.len();
+    let output = selection
+        .spare_capacity_mut()
+        .as_mut_ptr()
+        .cast::<BatchRowOrdinal>();
+    let mut ordinals = unsafe { vld1q_u32([0u32, 1, 2, 3].as_ptr()) };
+    let ordinal_step = unsafe { vdupq_n_u32(4) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 4 <= rows {
+        let mut mask = 0usize;
+        for lane in 0..4 {
+            let value = T::from_le(unsafe {
+                input
+                    .add((row + lane) * std::mem::size_of::<T>())
+                    .cast::<T>()
+                    .read_unaligned()
+            });
+            mask |= usize::from(dense_membership_contains(value, base, span, bits)) << lane;
+        }
+        written += unsafe { compact_ordinals_mask_neon(mask, ordinals, output, written) };
+        ordinals = unsafe { vaddq_u32(ordinals, ordinal_step) };
+        row += 4;
+    }
+    while row < rows {
+        let value = T::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<T>())
+                .cast::<T>()
+                .read_unaligned()
+        });
+        if dense_membership_contains(value, base, span, bits) {
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
+}
+
+#[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+#[target_feature(enable = "avx2")]
+unsafe fn filter_dense_membership_avx2<T: FixedPhysical>(
+    input: *const u8,
+    base: T,
+    span: usize,
+    bits: &[u64],
+    rows: usize,
+    selection: &mut Vec<BatchRowOrdinal>,
+) -> bool {
+    use core::arch::x86_64::{_mm256_add_epi32, _mm256_loadu_si256, _mm256_set1_epi32};
+
+    selection.reserve(rows + 8);
+    let start = selection.len();
+    let output = selection
+        .spare_capacity_mut()
+        .as_mut_ptr()
+        .cast::<BatchRowOrdinal>();
+    let mut ordinals = unsafe { _mm256_loadu_si256([0i32, 1, 2, 3, 4, 5, 6, 7].as_ptr().cast()) };
+    let ordinal_step = unsafe { _mm256_set1_epi32(8) };
+    let mut row = 0usize;
+    let mut written = 0usize;
+    while row + 8 <= rows {
+        let mut mask = 0u32;
+        for lane in 0..8 {
+            let value = T::from_le(unsafe {
+                input
+                    .add((row + lane) * std::mem::size_of::<T>())
+                    .cast::<T>()
+                    .read_unaligned()
+            });
+            mask |= u32::from(dense_membership_contains(value, base, span, bits)) << lane;
+        }
+        written += unsafe { compact_ordinals_avx2(mask, ordinals, output, written) };
+        ordinals = unsafe { _mm256_add_epi32(ordinals, ordinal_step) };
+        row += 8;
+    }
+    while row < rows {
+        let value = T::from_le(unsafe {
+            input
+                .add(row * std::mem::size_of::<T>())
+                .cast::<T>()
+                .read_unaligned()
+        });
+        if dense_membership_contains(value, base, span, bits) {
+            unsafe {
+                output
+                    .add(written)
+                    .write(BatchRowOrdinal::from_validated_index(row))
+            };
+            written += 1;
+        }
+        row += 1;
+    }
+    unsafe { selection.set_len(start + written) };
+    true
 }
 
 #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
@@ -789,13 +979,25 @@ fn try_filter_seed_i32_batch(
         return false;
     }
 
-    let FixedKernelShape::Bounds { lower, upper } = kernel.execution_shape() else {
-        return false;
-    };
-    let bounds = inclusive_bounds(lower, upper);
-    let Some((lower, upper)) = bounds.closed_range() else {
-        selection.clear();
-        return true;
+    let (lower, upper) = match kernel.execution_shape() {
+        FixedKernelShape::Membership(FixedMembershipView::Dense { base, span, bits }) => {
+            return try_filter_seed_dense_membership(
+                batch.data.as_ptr(),
+                base,
+                span,
+                bits,
+                rows,
+                selection,
+            );
+        }
+        FixedKernelShape::Bounds { lower, upper } => {
+            let Some(bounds) = inclusive_bounds(lower, upper).closed_range() else {
+                selection.clear();
+                return true;
+            };
+            bounds
+        }
+        _ => return false,
     };
 
     #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
@@ -1194,6 +1396,54 @@ mod tests {
             )))]
             let actual = expected.clone();
 
+            assert_eq!(actual, expected, "row count {rows}");
+        }
+    }
+
+    #[test]
+    fn dense_membership_seed_compaction_matches_scalar() {
+        const BASE: i64 = -64;
+        const SPAN: usize = 257;
+        const MEMBERS: [i64; 8] = [-64, -1, 0, 1, 63, 64, 128, 192];
+        const PROBES: [i64; 16] = [
+            -65, -64, -63, -1, 0, 1, 2, 63, 64, 65, 127, 128, 129, 191, 192, 193,
+        ];
+
+        let mut bits = vec![0u64; SPAN.div_ceil(u64::BITS as usize)];
+        for member in MEMBERS {
+            let offset = member.offset_from(BASE).expect("member lies above base");
+            bits[offset / u64::BITS as usize] |= 1_u64 << (offset % u64::BITS as usize);
+        }
+
+        for rows in [0usize, 1, 2, 3, 4, 5, 7, 8, 999, 1000] {
+            let values = (0..rows)
+                .map(|row| PROBES[row % PROBES.len()])
+                .collect::<Vec<_>>();
+            let input = values
+                .iter()
+                .copied()
+                .flat_map(i64::to_le_bytes)
+                .collect::<Vec<_>>();
+            let expected = values
+                .iter()
+                .enumerate()
+                .filter_map(|(row, value)| {
+                    MEMBERS
+                        .contains(value)
+                        .then_some(BatchRowOrdinal::from_validated_index(row))
+                })
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            if !try_filter_seed_dense_membership(
+                input.as_ptr(),
+                BASE,
+                SPAN,
+                &bits,
+                rows,
+                &mut actual,
+            ) {
+                return;
+            }
             assert_eq!(actual, expected, "row count {rows}");
         }
     }

@@ -212,7 +212,7 @@ fn assert_tpch_rewrites() {
     }
 }
 
-pub(super) fn setup_session() -> Arc<paro_context::StatementContext> {
+pub(crate) fn setup_session() -> Arc<paro_context::StatementContext> {
     let mut session = TestStatementContextBuilder::minimal()
         .with_current_database("paro")
         .with_search_path(vec![

@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::hash::{combine_hash, hash_i64, HASH_SEED};
 use paro_common::memory::{GrantBuffer, MemoryAccountingContext};
 use paro_common::vector::{Vector, VectorView};
 use paro_storage::row::codec::unsafe_api;
@@ -137,7 +136,14 @@ impl ExactI64PairJoinIndex {
 
 #[inline]
 fn pair_hash(left: i64, right: i64) -> u64 {
-    combine_hash(combine_hash(HASH_SEED, hash_i64(left)), hash_i64(right))
+    // Power-of-two open addressing consumes the low bits, so both physical
+    // keys must reach that domain before masking. One odd multiplicative mix
+    // plus a high-half fold has substantially less dependency latency than a
+    // general 128-bit hash combiner; exact row-key comparison still resolves
+    // every collision, so this is a placement function rather than an
+    // equality witness.
+    let mixed = (left as u64).wrapping_add((right as u64).wrapping_mul(0x9e37_79b1_85eb_ca87));
+    mixed ^ (mixed >> 32)
 }
 
 #[inline]

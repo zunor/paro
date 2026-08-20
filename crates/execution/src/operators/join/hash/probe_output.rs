@@ -93,6 +93,13 @@ pub(crate) fn scan_hash_join_results(
         };
     }
     match join_type {
+        JoinType::Inner
+            if scan_structure.exact_key_matches
+                && !scan_structure.has_long_chains
+                && hash_table.build_output_count() == 0 =>
+        {
+            scan_structure.next_exact_unique_left_only_inner_join(input, output, left_projection)
+        }
         JoinType::Inner | JoinType::Right => {
             scan_structure.next_inner_join(probe_keys, input, output, hash_table, left_projection)
         }

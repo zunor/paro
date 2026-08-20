@@ -558,6 +558,28 @@ fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
 }
 
 #[test]
+fn exact_unique_left_only_inner_join_reuses_index_selection() {
+    let ht = build_hash_table(JoinType::Inner, &[1, 2], &[10, 20]);
+    let (mut scan, _keys, left) = prepare_probe(&ht, &[1, 3, 2]);
+    // The dedicated method is selected only after an exact index probe. Keep
+    // the unit test independent of which integer-index strategy the small
+    // fixture's statistics admit.
+    scan.exact_key_matches = true;
+    scan.has_long_chains = false;
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
+
+    let count = scan
+        .next_exact_unique_left_only_inner_join(&left, &mut result, &[0])
+        .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(result.data[0].get_value(0), Value::Integer(1));
+    assert_eq!(result.data[0].get_value(1), Value::Integer(2));
+    assert!(scan.finished);
+    assert_eq!(scan.count, 0);
+}
+
+#[test]
 fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
     let ht = build_string_hash_table(&[1, 2], &["shared-build-value", "other"]);
     let (mut scan, keys, left) = prepare_probe(&ht, &[1, 1, 1]);

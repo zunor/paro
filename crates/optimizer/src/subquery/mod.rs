@@ -10,6 +10,6 @@ pub mod partition_aggregate;
 pub mod scalar_aggregate_window;
 
 #[cfg(test)]
-mod partition_aggregate_tests;
+pub(crate) mod partition_aggregate_tests;
 #[cfg(test)]
 mod scalar_aggregate_window_tests;
