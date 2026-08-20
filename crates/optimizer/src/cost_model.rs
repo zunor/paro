@@ -142,6 +142,51 @@ fn disjunction_estimate(
 pub struct CostModel {
     pub defaults: SelectivityDefaults,
     pub scan_access: paro_storage::rowset::scan_cost::ScanAccessCostModel,
+    pub aggregate: AggregateCostModel,
+}
+
+/// Byte-work calibration for aggregate rewrites that add physical pipeline
+/// frontiers. Keeping these values beside the other cost-model inputs makes
+/// their units and ownership explicit instead of burying policy in a rewrite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AggregateCostModel {
+    hash_group_row_bookkeeping_bytes: usize,
+    pipeline_frontier_startup_cost: usize,
+}
+
+impl Default for AggregateCostModel {
+    fn default() -> Self {
+        Self::try_new(
+            std::mem::size_of::<u64>() + std::mem::size_of::<usize>(),
+            VECTOR_SIZE * std::mem::size_of::<usize>(),
+        )
+        .expect("built-in aggregate costs must satisfy public validation")
+    }
+}
+
+impl AggregateCostModel {
+    pub fn try_new(
+        hash_group_row_bookkeeping_bytes: usize,
+        pipeline_frontier_startup_cost: usize,
+    ) -> paro_common::error::Result<Self> {
+        if hash_group_row_bookkeeping_bytes == 0 || pipeline_frontier_startup_cost == 0 {
+            return Err(paro_common::error::invalid_input(
+                "aggregate byte-work costs must be positive",
+            ));
+        }
+        Ok(Self {
+            hash_group_row_bookkeeping_bytes,
+            pipeline_frontier_startup_cost,
+        })
+    }
+
+    pub fn hash_group_row_bookkeeping_bytes(self) -> usize {
+        self.hash_group_row_bookkeeping_bytes
+    }
+
+    pub fn pipeline_frontier_startup_cost(self) -> usize {
+        self.pipeline_frontier_startup_cost
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,17 +276,10 @@ impl CostModel {
         payload_types: &[LogicalType],
         aggregate_state_types: &[LogicalType],
     ) -> bool {
-        // A hash-group row owns a hash/fingerprint word and a state pointer in
-        // addition to its serialized key. Expressing this from concrete
-        // machine fields keeps every term in byte-work units.
-        const HASH_GROUP_ROW_BOOKKEEPING_BYTES: u64 =
-            (std::mem::size_of::<u64>() + std::mem::size_of::<usize>()) as u64;
         // The rewrite adds one aggregate, one dimension-scan, and one compact
-        // join frontier. Charge one vector of row handles for each rather than
-        // approximating their startup cost with a minimum-row threshold.
+        // join frontier. Charge the configured startup cost for each rather
+        // than approximating their fixed work with a minimum-row threshold.
         const EXTRA_PIPELINE_FRONTIERS: u64 = 3;
-        const EXTRA_PIPELINE_STARTUP_BYTES: u64 =
-            VECTOR_SIZE as u64 * std::mem::size_of::<usize>() as u64 * EXTRA_PIPELINE_FRONTIERS;
 
         fn work(rows: u64, width: u64) -> u64 {
             rows.saturating_mul(width)
@@ -263,14 +301,12 @@ impl CostModel {
             return false;
         }
 
-        let eager_group_work = work(
-            carrier_rows,
-            payload_width.saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
-        );
-        let partial_group_work = work(
-            carrier_rows,
-            key_width.saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
-        );
+        // Both alternatives insert the same number of carrier rows into one
+        // hash aggregate, so their per-row hash/fingerprint bookkeeping
+        // cancels. Only the rewritten final merge adds another hash-group row.
+        let hash_group_row_bookkeeping = self.aggregate.hash_group_row_bookkeeping_bytes() as u64;
+        let eager_group_work = work(carrier_rows, payload_width);
+        let partial_group_work = work(carrier_rows, key_width);
         let dimension_rescan_and_build =
             work(dimension_rows, key_width.saturating_add(payload_width));
         let compact_join_probe = work(partial_group_rows, key_width);
@@ -278,13 +314,15 @@ impl CostModel {
             partial_group_rows,
             payload_width
                 .saturating_add(aggregate_state_width)
-                .saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
+                .saturating_add(hash_group_row_bookkeeping),
         );
+        let extra_pipeline_startup = (self.aggregate.pipeline_frontier_startup_cost() as u64)
+            .saturating_mul(EXTRA_PIPELINE_FRONTIERS);
         let deferred_work = partial_group_work
             .saturating_add(dimension_rescan_and_build)
             .saturating_add(compact_join_probe)
             .saturating_add(final_merge_work)
-            .saturating_add(EXTRA_PIPELINE_STARTUP_BYTES);
+            .saturating_add(extra_pipeline_startup);
         deferred_work < eager_group_work
     }
 

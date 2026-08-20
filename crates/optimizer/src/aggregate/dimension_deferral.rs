@@ -16,14 +16,15 @@ use std::collections::{HashMap, HashSet};
 
 use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::deep_copy::{deep_copy_plan, duplicate_plan_preserving_indices};
+use paro_planner::binder::deep_copy::deep_copy_plan;
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator, ProjectionMap,
+    Aggregate, ColumnBinding, ComparisonJoin, Join, JoinComparisonType, JoinType, LogicalOperator,
+    ProjectionMap,
 };
-use paro_planner::plan::{CardinalityProvenance, LogicalPlan};
+use paro_planner::plan::{CardinalityProvenance, LogicalPlan, NodeStats, PlanNodeId};
 
 use crate::cost_model::CostModel;
 use crate::expression::traversal::visit_expression;
@@ -55,13 +56,36 @@ enum ExpressionDomain {
 }
 
 struct DimensionDeferral {
-    expanded_groups: Vec<Expression>,
+    projection_depth: usize,
+    partial_groups: Vec<Expression>,
+    outer_groups: Vec<DeferredOuterGroup>,
     partial_aggregates: Vec<Expression>,
     merge_functions: Vec<paro_function::aggregate::AggregateFunction>,
-    fact_group_indices: Vec<usize>,
-    dimension_group_indices: HashSet<usize>,
-    fact_join_keys: Vec<Expression>,
-    fact_condition_left: Vec<bool>,
+    fact_conditions: Vec<FactConditionRewrite>,
+}
+
+enum DeferredOuterGroup {
+    Partial { ordinal: usize },
+    Dimension(Box<Expression>),
+}
+
+struct FactConditionRewrite {
+    key_ordinal: usize,
+    fact_on_left: bool,
+}
+
+struct PreparedDimension {
+    plan: LogicalPlan,
+    binding_map: HashMap<ColumnBinding, ColumnBinding>,
+}
+
+struct DimensionRewriteInput {
+    root_id: PlanNodeId,
+    root_stats: NodeStats,
+    aggregate: Aggregate,
+    join_id: PlanNodeId,
+    join_stats: NodeStats,
+    join: ComparisonJoin,
 }
 
 fn rewrite_node(
@@ -72,14 +96,15 @@ fn rewrite_node(
     let Some(witness) = recognize(&plan, cost_model) else {
         return Ok((plan, false));
     };
-    // Recognition and mutation remain independently defensive. A binding-
-    // identical snapshot preserves the original query if a future plan-shape
-    // change invalidates an assumption while the witness is being consumed.
-    let fallback = duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref());
-    Ok(match apply(plan, witness, bind_context) {
-        Some(plan) => (plan, true),
-        None => (fallback, false),
-    })
+    let Some(dimension) = prepare_dimension_copy(&plan, witness.projection_depth, bind_context)
+    else {
+        return Ok((plan, false));
+    };
+    let input = match DimensionRewriteInput::from_plan(plan, witness.projection_depth) {
+        Ok(input) => input,
+        Err(plan) => return Ok((*plan, false)),
+    };
+    Ok((apply(input, witness, dimension, bind_context), true))
 }
 
 fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDeferral> {
@@ -132,7 +157,7 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
     }
 
     let mut fact_join_keys: Vec<Expression> = Vec::with_capacity(join.conditions.len());
-    let mut fact_condition_left = Vec::with_capacity(join.conditions.len());
+    let mut fact_conditions = Vec::with_capacity(join.conditions.len());
     for condition in &join.conditions {
         let (fact_key, dimension_key, fact_on_left) = match (
             expression_domain(&condition.left, &fact_bindings, &dimension_bindings),
@@ -151,17 +176,25 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
         {
             return None;
         }
-        if !fact_join_keys.iter().any(|key| key.equals(fact_key)) {
-            fact_join_keys.push(fact_key.clone());
-        }
-        fact_condition_left.push(fact_on_left);
+        let key_ordinal = fact_join_keys
+            .iter()
+            .position(|key| key.equals(fact_key))
+            .unwrap_or_else(|| {
+                let ordinal = fact_join_keys.len();
+                fact_join_keys.push(fact_key.clone());
+                ordinal
+            });
+        fact_conditions.push(FactConditionRewrite {
+            key_ordinal,
+            fact_on_left,
+        });
     }
     let canonical_conditions = join
         .conditions
         .iter()
-        .zip(fact_condition_left.iter().copied())
-        .map(|(condition, fact_on_left)| {
-            if fact_on_left {
+        .zip(&fact_conditions)
+        .map(|(condition, rewrite)| {
+            if rewrite.fact_on_left {
                 paro_planner::operator::JoinCondition::equality(
                     condition.left.clone(),
                     condition.right.clone(),
@@ -186,28 +219,37 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
         .iter()
         .map(|expression| inline_projections(expression, &projections))
         .collect::<Option<Vec<_>>>()?;
-    let mut fact_group_indices = Vec::new();
-    let mut dimension_group_indices = HashSet::new();
+    let fact_join_key_count = fact_join_keys.len();
+    let mut partial_groups = fact_join_keys;
+    let mut outer_groups = Vec::with_capacity(expanded_groups.len());
     let mut deferred_payload_types = Vec::new();
-    for (group_index, group) in expanded_groups.iter().enumerate() {
-        match expression_domain(group, &fact_bindings, &dimension_bindings) {
+    for group in expanded_groups {
+        match expression_domain(&group, &fact_bindings, &dimension_bindings) {
             ExpressionDomain::Fact | ExpressionDomain::Constant => {
                 if !group.evaluation_properties().can_share_evaluation() {
                     return None;
                 }
-                fact_group_indices.push(group_index);
+                let ordinal = partial_groups
+                    .iter()
+                    .position(|existing| existing.equals(&group))
+                    .unwrap_or_else(|| {
+                        let ordinal = partial_groups.len();
+                        partial_groups.push(group);
+                        ordinal
+                    });
+                outer_groups.push(DeferredOuterGroup::Partial { ordinal });
             }
             ExpressionDomain::Dimension => {
                 if !group.evaluation_properties().can_share_evaluation() {
                     return None;
                 }
                 deferred_payload_types.push(group.return_type());
-                dimension_group_indices.insert(group_index);
+                outer_groups.push(DeferredOuterGroup::Dimension(Box::new(group)));
             }
             ExpressionDomain::Mixed | ExpressionDomain::Invalid => return None,
         }
     }
-    if dimension_group_indices.is_empty() {
+    if deferred_payload_types.is_empty() {
         return None;
     }
 
@@ -258,13 +300,16 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
         estimated_partial_input_rows.max(carrier_work_upper_bound(join.left.as_ref()));
     let group_estimate = plan.stats.estimated_cardinality?.expected.max(1);
     let dimension_rows = join.right.stats.estimated_cardinality?.expected;
-    // Different declared keys may share one SQL payload value, so the final
-    // group estimate can be smaller than the partial key domain. Price at
-    // least one partial per dimension row as a conservative cost proxy rather
-    // than assuming that the descriptive payload is itself unique.
-    let partial_group_rows = group_estimate.max(dimension_rows);
-    let key_types = fact_join_keys
+    // Every final (payload, fact-group) tuple can represent up to one partial
+    // per dimension key because SQL payloads need not be unique. Without
+    // cross-column NDV statistics, use that conservative upper bound and cap
+    // it at the carrier cardinality. This deliberately overprices, rather than
+    // underprices, the compact join and final merge when fact groups exist.
+    let partial_group_rows =
+        partial_group_work_upper_bound(carrier_rows, group_estimate, dimension_rows);
+    let key_types = partial_groups
         .iter()
+        .take(fact_join_key_count)
         .map(Expression::return_type)
         .collect::<Vec<_>>();
     let aggregate_state_types = partial_aggregates
@@ -283,80 +328,165 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
     }
 
     Some(DimensionDeferral {
-        expanded_groups,
+        projection_depth: projections.len(),
+        partial_groups,
+        outer_groups,
         partial_aggregates,
         merge_functions,
-        fact_group_indices,
-        dimension_group_indices,
-        fact_join_keys,
-        fact_condition_left,
+        fact_conditions,
+    })
+}
+
+pub(super) fn partial_group_work_upper_bound(
+    carrier_rows: u64,
+    final_group_rows: u64,
+    dimension_rows: u64,
+) -> u64 {
+    carrier_rows.min(final_group_rows.saturating_mul(dimension_rows))
+}
+
+impl DimensionRewriteInput {
+    /// Consume the exact operator spine recognized above without cloning it.
+    /// A future recognizer drift reconstructs and returns the original plan;
+    /// the successful representation contains no fallible shape decisions.
+    fn from_plan(
+        plan: LogicalPlan,
+        projection_depth: usize,
+    ) -> std::result::Result<Self, Box<LogicalPlan>> {
+        let LogicalPlan {
+            id: root_id,
+            stats: root_stats,
+            operator,
+        } = plan;
+        let LogicalOperator::Aggregate(mut aggregate) = operator else {
+            return Err(Box::new(LogicalPlan {
+                id: root_id,
+                stats: root_stats,
+                operator,
+            }));
+        };
+        let child = *std::mem::replace(
+            &mut aggregate.child,
+            Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        );
+        match take_join_below_projections(child, projection_depth) {
+            Ok((join_id, join_stats, join)) => Ok(Self {
+                root_id,
+                root_stats,
+                aggregate,
+                join_id,
+                join_stats,
+                join,
+            }),
+            Err(child) => {
+                aggregate.child = child;
+                Err(Box::new(LogicalPlan {
+                    id: root_id,
+                    stats: root_stats,
+                    operator: LogicalOperator::Aggregate(aggregate),
+                }))
+            }
+        }
+    }
+}
+
+fn take_join_below_projections(
+    plan: LogicalPlan,
+    projection_depth: usize,
+) -> std::result::Result<(PlanNodeId, NodeStats, ComparisonJoin), Box<LogicalPlan>> {
+    let LogicalPlan {
+        id,
+        stats,
+        operator,
+    } = plan;
+    if projection_depth == 0 {
+        return match operator {
+            LogicalOperator::Join(Join::Comparison(join)) => Ok((id, stats, join)),
+            operator => Err(Box::new(LogicalPlan {
+                id,
+                stats,
+                operator,
+            })),
+        };
+    }
+    let LogicalOperator::Projection(mut projection) = operator else {
+        return Err(Box::new(LogicalPlan {
+            id,
+            stats,
+            operator,
+        }));
+    };
+    match take_join_below_projections(*projection.child, projection_depth - 1) {
+        Ok(join) => Ok(join),
+        Err(child) => {
+            projection.child = child;
+            Err(Box::new(LogicalPlan {
+                id,
+                stats,
+                operator: LogicalOperator::Projection(projection),
+            }))
+        }
+    }
+}
+
+fn prepare_dimension_copy(
+    plan: &LogicalPlan,
+    projection_depth: usize,
+    bind_context: &BindContext,
+) -> Option<PreparedDimension> {
+    let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
+        return None;
+    };
+    let mut child = aggregate.child.as_ref();
+    for _ in 0..projection_depth {
+        let LogicalOperator::Projection(projection) = &child.operator else {
+            return None;
+        };
+        child = projection.child.as_ref();
+    }
+    let LogicalOperator::Join(Join::Comparison(join)) = &child.operator else {
+        return None;
+    };
+    let old_bindings = join.right.get_column_bindings();
+    let copied = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
+    let new_bindings = copied.get_column_bindings();
+    if old_bindings.len() != new_bindings.len() {
+        return None;
+    }
+    let binding_map = old_bindings
+        .into_iter()
+        .zip(new_bindings)
+        .collect::<HashMap<_, _>>();
+    if binding_map.iter().any(|(old, new)| old == new) {
+        return None;
+    }
+    Some(PreparedDimension {
+        plan: copied,
+        binding_map,
     })
 }
 
 fn apply(
-    plan: LogicalPlan,
+    input: DimensionRewriteInput,
     witness: DimensionDeferral,
+    dimension: PreparedDimension,
     bind_context: &BindContext,
-) -> Option<LogicalPlan> {
-    let LogicalPlan {
-        id,
-        stats,
-        operator: LogicalOperator::Aggregate(mut aggregate),
-    } = plan
-    else {
-        return None;
-    };
-    let mut join_plan = *aggregate.child;
-    loop {
-        join_plan = match join_plan.operator {
-            LogicalOperator::Projection(projection) => *projection.child,
-            _ => break,
-        };
-    }
-    let LogicalPlan {
-        id: join_id,
-        stats: join_stats,
-        operator: LogicalOperator::Join(Join::Comparison(mut join)),
-    } = join_plan
-    else {
-        return None;
-    };
-
+) -> LogicalPlan {
+    let DimensionRewriteInput {
+        root_id,
+        root_stats,
+        mut aggregate,
+        join_id,
+        join_stats,
+        mut join,
+    } = input;
     let partial_group_index = bind_context.generate_table_index();
     let partial_aggregate_index = bind_context.generate_table_index();
     let partial_groupings_index = bind_context.generate_table_index();
-    let mut partial_groups = witness.fact_join_keys.clone();
-    let mut outer_fact_group_ordinals = Vec::with_capacity(witness.fact_group_indices.len());
-    for &group_index in &witness.fact_group_indices {
-        let group = witness.expanded_groups[group_index].clone();
-        let ordinal = partial_groups
-            .iter()
-            .position(|existing| existing.equals(&group))
-            .unwrap_or_else(|| {
-                let ordinal = partial_groups.len();
-                partial_groups.push(group);
-                ordinal
-            });
-        outer_fact_group_ordinals.push((group_index, ordinal));
-    }
-
     let mut final_conditions = join.conditions.clone();
-    let old_dimension_bindings = join.right.get_column_bindings();
-    let final_dimension = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
-    let new_dimension_bindings = final_dimension.get_column_bindings();
-    if old_dimension_bindings.len() != new_dimension_bindings.len() {
-        return None;
-    }
-    let dimension_binding_map = old_dimension_bindings
-        .into_iter()
-        .zip(new_dimension_bindings)
-        .collect::<HashMap<_, _>>();
-    if dimension_binding_map.iter().any(|(old, new)| old == new) {
-        return None;
-    }
     for condition in &mut final_conditions {
-        condition.left = remap_bindings(condition.left.clone(), &dimension_binding_map);
-        condition.right = remap_bindings(condition.right.clone(), &dimension_binding_map);
+        condition.left = remap_bindings(condition.left.clone(), &dimension.binding_map);
+        condition.right = remap_bindings(condition.right.clone(), &dimension.binding_map);
     }
     // Preserve the original inner join below the partial aggregate so fact
     // expressions retain their SQL error/evaluation domain. The declared key
@@ -376,53 +506,46 @@ fn apply(
             partial_aggregate_index,
             partial_groupings_index,
             filtered_fact,
-            partial_groups.clone(),
+            witness.partial_groups.clone(),
             vec![],
             witness.partial_aggregates,
             vec![],
         )),
     );
-    let mut final_join = paro_planner::operator::ComparisonJoin::new(
-        JoinType::Inner,
-        partial,
-        final_dimension,
-        final_conditions,
-    );
+    let mut final_join =
+        ComparisonJoin::new(JoinType::Inner, partial, dimension.plan, final_conditions);
 
-    for (condition, fact_on_left) in final_join
+    for (condition, rewrite) in final_join
         .conditions
         .iter_mut()
-        .zip(witness.fact_condition_left.iter().copied())
+        .zip(&witness.fact_conditions)
     {
-        let fact_expression = if fact_on_left {
+        let fact_expression = if rewrite.fact_on_left {
             &mut condition.left
         } else {
             &mut condition.right
         };
-        let key_ordinal = witness
-            .fact_join_keys
-            .iter()
-            .position(|key| key.equals(fact_expression))?;
         *fact_expression = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(partial_group_index, key_ordinal),
+            ColumnBinding::new(partial_group_index, rewrite.key_ordinal),
             fact_expression.return_type(),
         ));
     }
 
-    let mut outer_groups = Vec::with_capacity(witness.expanded_groups.len());
-    for (group_index, group) in witness.expanded_groups.into_iter().enumerate() {
-        if witness.dimension_group_indices.contains(&group_index) {
-            outer_groups.push(remap_bindings(group, &dimension_binding_map));
-            continue;
-        }
-        let ordinal = outer_fact_group_ordinals
-            .iter()
-            .find_map(|(old, ordinal)| (*old == group_index).then_some(*ordinal))?;
-        outer_groups.push(Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(partial_group_index, ordinal),
-            partial_groups[ordinal].return_type(),
-        )));
-    }
+    let outer_groups = witness
+        .outer_groups
+        .into_iter()
+        .map(|group| match group {
+            DeferredOuterGroup::Dimension(expression) => {
+                remap_bindings(*expression, &dimension.binding_map)
+            }
+            DeferredOuterGroup::Partial { ordinal } => {
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(partial_group_index, ordinal),
+                    witness.partial_groups[ordinal].return_type(),
+                ))
+            }
+        })
+        .collect();
     let outer_aggregates = witness
         .merge_functions
         .into_iter()
@@ -448,11 +571,11 @@ fn apply(
     aggregate.aggregates = outer_aggregates;
     aggregate.grouping_sets.clear();
     aggregate.recompute_returned_types();
-    Some(LogicalPlan {
-        id,
-        stats,
+    LogicalPlan {
+        id: root_id,
+        stats: root_stats,
         operator: LogicalOperator::Aggregate(aggregate),
-    })
+    }
 }
 
 fn inline_projection(
@@ -539,13 +662,16 @@ fn combine_domains(left: ExpressionDomain, right: ExpressionDomain) -> Expressio
     }
 }
 
-/// Conservative carrier-work bound that trusts tree-local statistics and
-/// looks through join-graph estimates. A join-graph estimate can include
-/// reductions that physical runtime filters have not applied before this
-/// carrier is materialized; every other provenance describes the concrete
-/// subtree boundary, independently of its operator kind.
+/// Conservative carrier-work bound that trusts physically materialized
+/// operator boundaries and looks through join-graph joins. A reordered join's
+/// estimate can include runtime-filter reductions not applied before its
+/// carrier is materialized. A Filter is different: even when join ordering
+/// assigned its estimate, that physical operator executes the reduction before
+/// the carrier reaches the aggregate.
 pub(super) fn carrier_work_upper_bound(plan: &LogicalPlan) -> u64 {
-    if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
+    if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph
+        || !matches!(plan.operator, LogicalOperator::Join(_))
+    {
         return plan
             .stats
             .estimated_cardinality

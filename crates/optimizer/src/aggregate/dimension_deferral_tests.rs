@@ -205,22 +205,51 @@ fn selective_fact_subtree_does_not_use_unfiltered_leaf_cardinality() {
 }
 
 #[test]
-fn carrier_work_stops_at_tree_local_reduction_statistics() {
+fn carrier_work_trusts_a_physical_join_graph_filter() {
     let mut leaf = LogicalPlan::synthetic(LogicalOperator::DummyScan);
     leaf.stats.estimated_cardinality = Some(CardinalityEstimate::exact(600_000_000));
     let mut reduced = LogicalPlan::synthetic(LogicalOperator::Filter(
         paro_planner::operator::Filter::new(leaf, vec![]),
     ));
     reduced.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
-    let mut join_graph_boundary = LogicalPlan::synthetic(LogicalOperator::Filter(
-        paro_planner::operator::Filter::new(reduced, vec![]),
-    ));
-    join_graph_boundary.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
-    join_graph_boundary.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+    reduced.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
 
     assert_eq!(
-        dimension_deferral::carrier_work_upper_bound(&join_graph_boundary),
+        dimension_deferral::carrier_work_upper_bound(&reduced),
         1_000
+    );
+}
+
+#[test]
+fn carrier_work_looks_through_a_join_graph_join() {
+    let mut left = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+    left.stats.estimated_cardinality = Some(CardinalityEstimate::exact(600_000_000));
+    let mut right = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+    right.stats.estimated_cardinality = Some(CardinalityEstimate::exact(25));
+    let mut join = LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(
+        paro_planner::operator::CrossProduct {
+            left: Box::new(left),
+            right: Box::new(right),
+        },
+    )));
+    join.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
+    join.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+
+    assert_eq!(
+        dimension_deferral::carrier_work_upper_bound(&join),
+        600_000_000
+    );
+}
+
+#[test]
+fn partial_group_work_prices_fact_groups_per_dimension_key() {
+    assert_eq!(
+        dimension_deferral::partial_group_work_upper_bound(1_000_000, 1_000, 4),
+        4_000
+    );
+    assert_eq!(
+        dimension_deferral::partial_group_work_upper_bound(2_000, 1_000, 4),
+        2_000
     );
 }
 
