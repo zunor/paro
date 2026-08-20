@@ -102,7 +102,7 @@ mod empty_table_tests {
         let table = Arc::new(create_table(&types));
 
         // Table should be empty
-        assert_eq!(table.total_rows(), 0);
+        assert_eq!(table.total_rows().unwrap(), 0);
         assert_eq!(table.index_count(), 0);
     }
 
@@ -112,7 +112,7 @@ mod empty_table_tests {
         let table = create_table(&types);
 
         // Scanning empty table should work
-        assert_eq!(table.total_rows(), 0);
+        assert_eq!(table.total_rows().unwrap(), 0);
     }
 }
 
@@ -132,7 +132,7 @@ mod data_table_tests {
         let chunk = create_test_chunk_multi(&[1, 2, 3, 4, 5], &[100, 200, 300, 400, 500]);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 5);
+        assert_eq!(table.total_rows().unwrap(), 5);
     }
 
     #[test]
@@ -145,7 +145,7 @@ mod data_table_tests {
         let chunk = create_test_chunk_i32(&values);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 10000);
+        assert_eq!(table.total_rows().unwrap(), 10000);
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod data_table_tests {
             table.append(&chunk).unwrap();
         }
 
-        assert_eq!(table.total_rows(), 1000);
+        assert_eq!(table.total_rows().unwrap(), 1000);
     }
 }
 
@@ -189,7 +189,7 @@ mod concurrent_tests {
             let t = Arc::clone(&table_reader);
             let handle = thread::spawn(move || {
                 for _ in 0..100 {
-                    let count = t.total_rows();
+                    let count = t.total_rows().unwrap();
                     assert!(count >= 1000, "Should see at least initial rows");
                 }
             });
@@ -201,7 +201,7 @@ mod concurrent_tests {
             handle.join().expect("Reader thread should complete");
         }
 
-        assert_eq!(table.total_rows(), 1000);
+        assert_eq!(table.total_rows().unwrap(), 1000);
     }
 
     #[test]
@@ -232,7 +232,7 @@ mod concurrent_tests {
         writer_handle.join().expect("Writer should complete");
         reader_handle.join().expect("Reader should complete");
 
-        assert_eq!(table.total_rows(), 1000);
+        assert_eq!(table.total_rows().unwrap(), 1000);
     }
 }
 
@@ -270,7 +270,7 @@ mod edge_case_tests {
         let chunk = create_test_chunk_i32(&[1, 2, 3]);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 3);
+        assert_eq!(table.total_rows().unwrap(), 3);
     }
 
     #[test]
@@ -282,7 +282,7 @@ mod edge_case_tests {
         let chunk = create_test_chunk_i32(&[1, 1, 1, 2, 2, 3]);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 6);
+        assert_eq!(table.total_rows().unwrap(), 6);
     }
 
     #[test]
@@ -293,7 +293,7 @@ mod edge_case_tests {
         let chunk = create_test_chunk_i32(&[-100, -50, 0, 50, 100]);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 5);
+        assert_eq!(table.total_rows().unwrap(), 5);
     }
 
     #[test]
@@ -304,6 +304,6 @@ mod edge_case_tests {
         let chunk = create_test_chunk_i64(&[i64::MIN, -1, 0, 1, i64::MAX]);
         table.append(&chunk).unwrap();
 
-        assert_eq!(table.total_rows(), 5);
+        assert_eq!(table.total_rows().unwrap(), 5);
     }
 }

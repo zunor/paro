@@ -204,10 +204,9 @@ pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &Logic
                 .table
                 .as_ref()
                 .and_then(|table| table.get_storage())
-                .map(|storage| storage.total_rows())
-                .filter(|rows| *rows > 0)
+                .and_then(|storage| storage.total_rows().ok())
             {
-                return rows;
+                return rows.max(1);
             }
             default_cardinality(session)
         }
@@ -355,16 +354,20 @@ fn type_penalty(ty: &LogicalType) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{contains_control_region_boundary, BuildProbeSideOptimizer};
+    use super::{
+        contains_control_region_boundary, estimate_plan_cardinality, BuildProbeSideOptimizer,
+    };
+    use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
+        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
         JoinType, LogicalOperator,
     };
     use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+    use paro_storage::table::table_factory::TableFactory;
     use std::sync::Arc;
 
     fn plan_with_cardinality(
@@ -406,6 +409,33 @@ mod tests {
             (0..types.len()).map(|idx| format!("c{idx}")).collect(),
             types,
         ))
+    }
+
+    #[test]
+    fn empty_stored_relation_is_estimated_as_one_row_not_session_default() {
+        let storage = Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer])
+                .unwrap(),
+        );
+        assert_eq!(storage.total_rows().unwrap(), 0);
+        let table = Arc::new(TableCatalogEntry::new(
+            "paro".to_string(),
+            "public".to_string(),
+            "empty_build_input".to_string(),
+            vec![ColumnDefinition::new("k".to_string(), LogicalType::Integer)],
+            storage,
+            CatalogObjectId::from_raw(90_001),
+            0,
+        ));
+        let get = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+            0,
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+            table,
+        )));
+
+        assert_eq!(estimate_plan_cardinality(&make_test_session(), &get), 1);
     }
 
     #[test]

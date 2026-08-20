@@ -156,7 +156,7 @@ impl AggregateStatisticsExecutor {
                 }
                 Some(AggregateResult {
                     aggregate_type: StatisticsAggregate::CountStar,
-                    value: Self::visible_rows_value(scan),
+                    value: Self::visible_rows_value(scan)?,
                 })
             }
             "count" => {
@@ -165,7 +165,7 @@ impl AggregateStatisticsExecutor {
                 }
                 Some(AggregateResult {
                     aggregate_type: StatisticsAggregate::CountStar,
-                    value: Self::visible_rows_value(scan),
+                    value: Self::visible_rows_value(scan)?,
                 })
             }
             "min" | "max" => {
@@ -190,23 +190,14 @@ impl AggregateStatisticsExecutor {
         }
     }
 
-    fn visible_rows_value(scan: &SimpleScanInfo) -> Value {
-        let visible_rows = scan
-            .storage
-            .tablet()
-            .statistics()
-            .map(|stats| {
-                stats
-                    .num_rows
-                    .saturating_sub(stats.delete_stats.num_deleted_rows) as usize
-            })
-            .unwrap_or_else(|_| {
-                scan.storage
-                    .total_rows()
-                    .saturating_sub(scan.storage.deleted_row_count())
-            });
+    fn visible_rows_value(scan: &SimpleScanInfo) -> Option<Value> {
+        let visible_rows = scan.storage.tablet().statistics().ok().map(|stats| {
+            stats
+                .num_rows
+                .saturating_sub(stats.delete_stats.num_deleted_rows) as usize
+        })?;
         let count = i64::try_from(visible_rows).unwrap_or(i64::MAX);
-        Value::BigInt(count)
+        Some(Value::BigInt(count))
     }
 
     fn resolve_simple_scan(plan: &LogicalPlan) -> Option<SimpleScanInfo> {

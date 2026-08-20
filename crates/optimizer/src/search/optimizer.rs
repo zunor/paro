@@ -455,7 +455,8 @@ fn base_rows(get_plan: &LogicalPlan, get: &Get) -> u64 {
         .or_else(|| {
             get.get_table()
                 .and_then(|table| table.get_storage())
-                .map(|storage| storage.total_rows() as u64)
+                .and_then(|storage| storage.total_rows().ok())
+                .map(|rows| rows as u64)
         })
         .unwrap_or(1000)
 }

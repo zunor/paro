@@ -417,7 +417,7 @@ impl JoinOrderOptimizer {
     ) -> Result<()> {
         match &plan.operator {
             LogicalOperator::Join(Join::Comparison(join))
-                if matches!(join.join_type, JoinType::Semi | JoinType::Anti) =>
+                if RelationManager::reduction_join_is_reorderable(join) =>
             {
                 if at_region_root {
                     if matches!(
@@ -501,7 +501,9 @@ impl JoinOrderOptimizer {
         join: &ComparisonJoin,
         filters: &mut Vec<ExtractedFilter>,
     ) {
-        debug_assert!(RelationManager::reduction_join_is_reorderable(join));
+        // Every entry is validated by the root match or the recursive child
+        // guard below. Invalid reductions remain atomic relations at their
+        // caller, preserving existential multiplicity in every build mode.
         if let LogicalOperator::Join(Join::Comparison(child)) = &join.left.operator {
             if RelationManager::reduction_join_is_reorderable(child) {
                 self.extract_reduction_cascade(ctx, bind_context, child, filters);
@@ -651,17 +653,20 @@ impl JoinOrderOptimizer {
                     let appended = self.append_join_conditions(&mut join, predicate);
                     if appended {
                         used_filters.insert(predicate.filter().filter_index);
-                    } else if predicates.reduction_orientation().is_some() {
+                    } else if predicate.orientation().is_some() {
                         // The original logical tree is still owned by the
-                        // caller. A graph witness that no longer reconstructs
-                        // makes this region ineligible for reordering; it must
-                        // never turn a valid statement into an internal error.
+                        // caller. An oriented graph witness that no longer
+                        // reconstructs makes this region ineligible for
+                        // reordering; it must never silently become a cross
+                        // product in release builds.
                         return Ok(None);
                     }
                 }
 
                 if join.conditions.is_empty() {
-                    debug_assert!(predicates.reduction_orientation().is_none());
+                    if predicates.has_join_conditions() {
+                        return Ok(None);
+                    }
                     let mut plan =
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Cross(CrossProduct {
                             left: join.left,
@@ -672,6 +677,7 @@ impl JoinOrderOptimizer {
                     plan.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
                     plan
                 } else {
+                    debug_assert!(predicates.has_join_conditions());
                     let mut plan =
                         LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(join)));
                     plan.stats.estimated_cardinality =
@@ -880,7 +886,8 @@ mod tests {
     use paro_function::scalar::FunctionStability;
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{
-        ColumnRefExpression, ConstantExpression, FunctionExpression, ReferenceExpression,
+        ColumnRefExpression, ConstantExpression, FunctionExpression, OperatorExpression,
+        OperatorType, ReferenceExpression,
     };
     use paro_planner::operator::{
         AntiJoinMode, AnyJoin, ColumnBinding, ExpressionGet, Get, Projection,
@@ -1319,6 +1326,40 @@ mod tests {
     }
 
     #[test]
+    fn multi_relation_residual_is_costed_and_rebuilt_as_filtered_cross_product() {
+        let comparison = |table_index| {
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::GreaterThan,
+                column_ref(table_index, 0),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Integer(0),
+                    LogicalType::Integer,
+                )),
+            ))
+        };
+        let residual = Expression::Operator(OperatorExpression::new(
+            OperatorType::Coalesce,
+            vec![comparison(0), comparison(1)],
+            LogicalType::Boolean,
+        ));
+        let plan =
+            LogicalOperator::Filter(Filter::new(cross_product(0, 1), vec![residual.clone()]));
+
+        let optimized = JoinOrderOptimizer::new()
+            .optimize(&make_test_session(), &BindContext::new(), plan)
+            .unwrap();
+        let LogicalOperator::Filter(filter) = optimized else {
+            panic!("unoriented predicate must remain a residual filter")
+        };
+        assert_eq!(filter.expressions.len(), 1);
+        assert!(filter.expressions[0].equals(&residual));
+        assert!(matches!(
+            filter.child.operator,
+            LogicalOperator::Join(Join::Cross(_))
+        ));
+    }
+
+    #[test]
     fn optimizer_keeps_original_tree_for_unmapped_or_bound_references() {
         let session = make_test_session();
         let plans = [
@@ -1373,6 +1414,21 @@ mod tests {
             vec![join_condition(JoinComparisonType::Equal, 0, 1)],
         )));
         assert!(!JoinOrderOptimizer::new().can_optimize_join(&surrounding_join, false));
+
+        let volatile_preserved = LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+            LogicalPlan::synthetic(create_scan(0)),
+            vec![volatile_boolean()],
+        )));
+        let reduction = ComparisonJoin::new(
+            JoinType::Semi,
+            volatile_preserved,
+            LogicalPlan::synthetic(create_scan(1)),
+            vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+        );
+        assert!(
+            !RelationManager::reduction_join_is_reorderable(&reduction),
+            "specialized reduction extraction must honor the same subtree fence as general join ordering"
+        );
     }
 
     #[test]
@@ -1674,6 +1730,101 @@ mod tests {
         };
         assert_eq!(atomic.join_type, JoinType::Semi);
         assert!(matches!(atomic.conditions[0].left, Expression::Constant(_)));
+    }
+
+    #[test]
+    fn roleless_reduction_at_region_root_remains_fully_atomic() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let valid_inner_reduction = LogicalPlan::synthetic(LogicalOperator::Join(
+            Join::Comparison(ComparisonJoin::new(
+                JoinType::Semi,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            )),
+        ));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Semi,
+                valid_inner_reduction,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![paro_planner::operator::JoinCondition::new(
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(5),
+                        LogicalType::Integer,
+                    )),
+                    column_ref(2, 0),
+                    JoinComparisonType::Equal,
+                )],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        assert!(
+            !optimizer.can_optimize_join(&plan.operator, false),
+            "a role-less root reduction must stop before graph extraction"
+        );
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 1);
+        assert!(filters.is_empty());
+        let LogicalOperator::Join(Join::Comparison(root)) = &optimizer.relation_plans[0].operator
+        else {
+            panic!("role-less root reduction must remain one atomic relation")
+        };
+        assert_eq!(root.join_type, JoinType::Semi);
+        assert!(matches!(root.conditions[0].left, Expression::Constant(_)));
+        assert!(matches!(
+            root.left.operator,
+            LogicalOperator::Join(Join::Comparison(_))
+        ));
+    }
+
+    #[test]
+    fn single_roleless_root_reduction_does_not_expose_its_preserved_join() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let preserved = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Inner,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ),
+        )));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Anti,
+                preserved,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![paro_planner::operator::JoinCondition::new(
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(5),
+                        LogicalType::Integer,
+                    )),
+                    column_ref(2, 0),
+                    JoinComparisonType::Equal,
+                )],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 1);
+        assert!(filters.is_empty());
+        assert!(matches!(
+            optimizer.relation_plans[0].operator,
+            LogicalOperator::Join(Join::Comparison(_))
+        ));
     }
 
     #[test]

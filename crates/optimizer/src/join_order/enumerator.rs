@@ -27,12 +27,13 @@ pub(crate) enum EnumerationOutcome {
     Complete,
     PairBudgetExhausted,
     Ineligible,
+    MissingSubplan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum PairEmission {
     Emitted(Arc<JoinRelationSet>),
-    Deferred,
+    MissingInput,
     Ineligible,
 }
 
@@ -115,6 +116,9 @@ impl<'a> PlanEnumerator<'a> {
                     }
                 }
                 EnumerationOutcome::Ineligible => return EnumerationOutcome::Ineligible,
+                EnumerationOutcome::MissingSubplan => {
+                    return EnumerationOutcome::MissingSubplan;
+                }
                 EnumerationOutcome::PairBudgetExhausted => {}
             }
         }
@@ -340,7 +344,11 @@ impl<'a> PlanEnumerator<'a> {
         }
 
         match self.emit_pair(left, right, connections) {
-            PairEmission::Emitted(_) | PairEmission::Deferred => EnumerationOutcome::Complete,
+            PairEmission::Emitted(_) => EnumerationOutcome::Complete,
+            // Exact DP can discover a connected cut before both component
+            // plans have been emitted. That pair is deferred, not rejected;
+            // later CSG/CMP traversal may revisit it once its inputs exist.
+            PairEmission::MissingInput => EnumerationOutcome::Complete,
             PairEmission::Ineligible => EnumerationOutcome::Ineligible,
         }
     }
@@ -355,12 +363,12 @@ impl<'a> PlanEnumerator<'a> {
         // Get the left and right plans
         let left_plan = match self.plans.get(left) {
             Some(plan) => plan.clone(),
-            None => return PairEmission::Deferred,
+            None => return PairEmission::MissingInput,
         };
 
         let right_plan = match self.plans.get(right) {
             Some(plan) => plan.clone(),
-            None => return PairEmission::Deferred,
+            None => return PairEmission::MissingInput,
         };
 
         // Costing owns the canonical union and cardinality estimate for this
@@ -438,10 +446,16 @@ impl<'a> PlanEnumerator<'a> {
                         .get_connections(&join_relations[i], &join_relations[j]);
 
                     if !connections.is_empty() {
-                        let PairEmission::Emitted(combined) =
-                            self.emit_pair(&join_relations[i], &join_relations[j], &connections)
-                        else {
-                            return EnumerationOutcome::Ineligible;
+                        let combined = match self.emit_pair(
+                            &join_relations[i],
+                            &join_relations[j],
+                            &connections,
+                        ) {
+                            PairEmission::Emitted(combined) => combined,
+                            PairEmission::MissingInput => {
+                                return EnumerationOutcome::MissingSubplan;
+                            }
+                            PairEmission::Ineligible => return EnumerationOutcome::Ineligible,
                         };
                         if let Some(node) = self.plans.get(&combined) {
                             if node.cost < best_cost {
@@ -460,10 +474,14 @@ impl<'a> PlanEnumerator<'a> {
                 // Fallback: just pick first two
                 best_left = 0;
                 best_right = 1;
-                let PairEmission::Emitted(combined) =
-                    self.emit_pair(&join_relations[best_left], &join_relations[best_right], &[])
-                else {
-                    return EnumerationOutcome::Ineligible;
+                let combined = match self.emit_pair(
+                    &join_relations[best_left],
+                    &join_relations[best_right],
+                    &[],
+                ) {
+                    PairEmission::Emitted(combined) => combined,
+                    PairEmission::MissingInput => return EnumerationOutcome::MissingSubplan,
+                    PairEmission::Ineligible => return EnumerationOutcome::Ineligible,
                 };
                 best_set = Some(combined);
             }
@@ -475,7 +493,7 @@ impl<'a> PlanEnumerator<'a> {
 
             // Update join_relations
             let Some(new_set) = best_set else {
-                return EnumerationOutcome::Ineligible;
+                return EnumerationOutcome::MissingSubplan;
             };
             join_relations.remove(best_right);
             join_relations.remove(best_left);
@@ -745,6 +763,30 @@ mod tests {
         let plan0 = enumerator.plans.get(&set0_key).unwrap();
         assert!(plan0.is_leaf);
         assert_eq!(plan0.cardinality, 1000.0);
+    }
+
+    #[test]
+    fn greedy_missing_input_is_not_reported_as_semantic_ineligibility() {
+        let mut set_manager = JoinRelationSetManager::new();
+        let mut cost_model = CostModel::new();
+        let query_graph = QueryGraphEdges::new();
+        cost_model.init_cost_model(
+            &mut set_manager,
+            &[
+                RelationStats::with_cardinality(10),
+                RelationStats::with_cardinality(10),
+            ],
+        );
+        let mut enumerator =
+            PlanEnumerator::new(&query_graph, &mut set_manager, &mut cost_model, 2);
+        enumerator.init_leaf_plans();
+        let missing = enumerator.set_manager.get_relation(1);
+        enumerator.plans.remove(&missing);
+
+        assert_eq!(
+            enumerator.solve_join_order_approximately(),
+            EnumerationOutcome::MissingSubplan
+        );
     }
 
     #[test]

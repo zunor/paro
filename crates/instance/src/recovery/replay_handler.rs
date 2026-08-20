@@ -2500,7 +2500,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(target_storage.rowset_count(), 1);
-        assert_eq!(target_storage.total_rows(), 3);
+        assert_eq!(target_storage.total_rows().unwrap(), 3);
 
         // Rowset commit replay is idempotent for the same rowset_id.
         handler
@@ -2513,7 +2513,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(target_storage.rowset_count(), 1);
-        assert_eq!(target_storage.total_rows(), 3);
+        assert_eq!(target_storage.total_rows().unwrap(), 3);
     }
 
     #[test]
@@ -2578,7 +2578,7 @@ mod tests {
         assert_eq!(summary.max_lsn, 8);
         assert_eq!(summary.max_commit_id, 11);
         assert_eq!(target_storage.rowset_count(), 1);
-        assert_eq!(target_storage.total_rows(), 3);
+        assert_eq!(target_storage.total_rows().unwrap(), 3);
     }
 
     #[test]

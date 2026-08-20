@@ -12,7 +12,9 @@ use paro_planner::operator::{
     AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
 };
 
-use crate::expression::join_tree_has_evaluation_fence;
+use crate::expression::{
+    comparison_join_tree_has_evaluation_fence, join_tree_has_evaluation_fence,
+};
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::JoinRelationSetManager;
 use tracing::debug;
@@ -358,25 +360,21 @@ impl RelationManager {
 
     /// Check if a join is reorderable.
     pub fn join_is_reorderable(join: &Join) -> bool {
-        if join_tree_has_evaluation_fence(join) {
-            return false;
-        }
-
         match join {
-            Join::Cross(_) => true,
-            Join::Comparison(cj) => {
-                if !cj.duplicate_eliminated_columns.is_empty() {
-                    return false;
-                }
-                match cj.join_type {
-                    JoinType::Inner | JoinType::Semi | JoinType::Anti => {
-                        Self::comparison_has_binary_edge(cj)
-                    }
-                    _ => false,
-                }
-            }
+            Join::Cross(_) => !join_tree_has_evaluation_fence(join),
+            Join::Comparison(join) => Self::comparison_join_is_reorderable(join),
             Join::Any(_) => false,
         }
+    }
+
+    fn comparison_join_is_reorderable(join: &paro_planner::operator::ComparisonJoin) -> bool {
+        !comparison_join_tree_has_evaluation_fence(join)
+            && join.duplicate_eliminated_columns.is_empty()
+            && matches!(
+                join.join_type,
+                JoinType::Inner | JoinType::Semi | JoinType::Anti
+            )
+            && Self::comparison_has_binary_edge(join)
     }
 
     /// Whether this reduction can be detached from its current preserved
@@ -390,12 +388,7 @@ impl RelationManager {
         join: &paro_planner::operator::ComparisonJoin,
     ) -> bool {
         matches!(join.join_type, JoinType::Semi | JoinType::Anti)
-            && join.duplicate_eliminated_columns.is_empty()
-            && !join.conditions.iter().any(|condition| {
-                condition.left.evaluation_properties().is_reorder_fence()
-                    || condition.right.evaluation_properties().is_reorder_fence()
-            })
-            && Self::comparison_has_binary_edge(join)
+            && Self::comparison_join_is_reorderable(join)
     }
 
     fn comparison_has_binary_edge(join: &paro_planner::operator::ComparisonJoin) -> bool {

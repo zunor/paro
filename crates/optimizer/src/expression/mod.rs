@@ -8,14 +8,11 @@ pub mod in_clause;
 pub mod rewriter;
 pub(crate) mod traversal;
 
-use paro_planner::operator::{Join, LogicalOperator};
+use paro_planner::operator::{ComparisonJoin, Join, LogicalOperator};
 
 pub(crate) fn join_has_evaluation_fence(join: &Join) -> bool {
     match join {
-        Join::Comparison(join) => join.conditions.iter().any(|condition| {
-            condition.left.evaluation_properties().is_reorder_fence()
-                || condition.right.evaluation_properties().is_reorder_fence()
-        }),
+        Join::Comparison(join) => comparison_join_has_evaluation_fence(join),
         Join::Any(join) => join.condition.evaluation_properties().is_reorder_fence(),
         Join::Cross(_) => false,
     }
@@ -24,10 +21,35 @@ pub(crate) fn join_has_evaluation_fence(join: &Join) -> bool {
 /// Whether the join/filter region that join-order optimization would extract owns an evaluation
 /// fence. Operators that become atomic relations deliberately stop the traversal.
 pub(crate) fn join_tree_has_evaluation_fence(join: &Join) -> bool {
-    join_has_evaluation_fence(join)
-        || [join.left(), join.right()]
+    match join {
+        Join::Comparison(join) => comparison_join_tree_has_evaluation_fence(join),
+        Join::Any(_) | Join::Cross(_) => {
+            join_has_evaluation_fence(join)
+                || [join.left(), join.right()]
+                    .into_iter()
+                    .any(|child| join_region_has_evaluation_fence(&child.operator))
+        }
+    }
+}
+
+/// Whether the comparison-join region extracted by join ordering owns an
+/// evaluation fence.
+///
+/// Keeping this entry point on the borrowed concrete join lets specialized
+/// eligibility checks share the complete region proof without cloning a
+/// logical tree merely to wrap it in [`Join::Comparison`].
+pub(crate) fn comparison_join_tree_has_evaluation_fence(join: &ComparisonJoin) -> bool {
+    comparison_join_has_evaluation_fence(join)
+        || [&join.left, &join.right]
             .into_iter()
             .any(|child| join_region_has_evaluation_fence(&child.operator))
+}
+
+fn comparison_join_has_evaluation_fence(join: &ComparisonJoin) -> bool {
+    join.conditions.iter().any(|condition| {
+        condition.left.evaluation_properties().is_reorder_fence()
+            || condition.right.evaluation_properties().is_reorder_fence()
+    })
 }
 
 fn join_region_has_evaluation_fence(operator: &LogicalOperator) -> bool {

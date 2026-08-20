@@ -94,12 +94,16 @@ impl TableHandle {
         Ok(())
     }
 
-    /// Total rows (sum of rowset metas).
-    pub fn total_rows(&self) -> usize {
+    /// Total rows from the authoritative tablet statistics.
+    ///
+    /// A successful zero is a real empty table. Statistics acquisition can
+    /// fail independently and must not be encoded as zero: callers that only
+    /// need an estimate can then choose an explicit unknown-cardinality
+    /// fallback without making empty inputs look non-selective.
+    pub fn total_rows(&self) -> Result<usize> {
         self.tablet()
             .statistics()
             .map(|stats| stats.num_rows as usize)
-            .unwrap_or(0)
     }
 
     /// Rowset count.

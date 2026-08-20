@@ -643,7 +643,7 @@ fn append_and_scan_roundtrip() {
     let chunk = test_chunk_from_vectors(vec![vec]);
 
     table.append(&chunk).unwrap();
-    assert_eq!(table.total_rows(), 3);
+    assert_eq!(table.total_rows().unwrap(), 3);
     assert_eq!(table.rowset_count(), 1);
 
     let mut out = test_empty_data_chunk();

@@ -509,7 +509,8 @@ impl StatisticsGathering {
         get.table
             .as_ref()
             .and_then(|table| table.get_storage())
-            .map(|storage| storage.total_rows().max(1))
+            .and_then(|storage| storage.total_rows().ok())
+            .map(|rows| rows.max(1))
             .unwrap_or_else(|| default_table_cardinality(ctx))
     }
 }

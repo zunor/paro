@@ -85,6 +85,7 @@ pub(crate) struct JoinPredicateSet {
     join_type: JoinType,
     anti_join_mode: AntiJoinMode,
     reduction_orientation: Option<JoinEdgeOrientation>,
+    has_join_conditions: bool,
 }
 
 /// One selected filter with its expression orientation resolved for this cut.
@@ -195,18 +196,22 @@ impl JoinPredicateSet {
             None
         };
 
-        let predicates = filters
+        let predicates: Box<[_]> = filters
             .into_iter()
             .map(|filter| OrientedJoinPredicate {
                 orientation: filter.orientation_across(left, right),
                 filter,
             })
             .collect();
+        let has_join_conditions = predicates
+            .iter()
+            .any(|predicate| predicate.orientation.is_some());
         CutPredicateResolution::Resolved(Some(Self {
             predicates,
             join_type,
             anti_join_mode,
             reduction_orientation,
+            has_join_conditions,
         }))
     }
 
@@ -224,6 +229,16 @@ impl JoinPredicateSet {
 
     pub(crate) fn reduction_orientation(&self) -> Option<JoinEdgeOrientation> {
         self.reduction_orientation
+    }
+
+    /// Whether reconstruction can materialize at least one binary comparison
+    /// condition on this cut.
+    ///
+    /// Multi-relation residual expressions still create query-graph
+    /// connectivity, but they lower as a cross product followed by a filter.
+    /// Costing and reconstruction consume this same resolved witness.
+    pub(crate) fn has_join_conditions(&self) -> bool {
+        self.has_join_conditions
     }
 }
 

@@ -103,7 +103,16 @@ struct JoinCostBreakdown {
 struct CostedJoin {
     combination: Arc<JoinRelationSet>,
     cardinality: f64,
+    output_payload_width: usize,
     breakdown: JoinCostBreakdown,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct JoinConditionProfile {
+    left_payload_width: usize,
+    right_payload_width: usize,
+    has_join_conditions: bool,
+    has_hash_key: bool,
 }
 
 /// `ScanStructure` records every accepted hash match as a probe-row ordinal
@@ -271,10 +280,18 @@ impl CostModel {
         let join_rows = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
-        let breakdown = self.cost_breakdown_for_cardinality(left, right, predicates, join_rows);
+        let output_payload_width = Self::output_payload_width(left, right, predicates);
+        let breakdown = self.cost_breakdown_for_cardinality(
+            left,
+            right,
+            predicates,
+            join_rows,
+            output_payload_width,
+        );
         CostedJoin {
             combination,
             cardinality: join_rows,
+            output_payload_width,
             breakdown,
         }
     }
@@ -285,13 +302,13 @@ impl CostModel {
         right: &DPJoinNode,
         predicates: Option<&JoinPredicateSet>,
         join_rows: f64,
+        output_payload_width: usize,
     ) -> JoinCostBreakdown {
         let left_rows = left.cardinality;
         let right_rows = right.cardinality;
-        let (left_condition_width, right_condition_width, has_hash_key) =
-            Self::condition_payload_widths(predicates);
+        let conditions = Self::condition_profile(predicates);
         let filtering_side = Self::reduction_filtering_side(predicates);
-        if !has_hash_key {
+        if !conditions.has_hash_key {
             let left_work =
                 left_rows * estimate_row_width_from_payload(left.output_payload_width) as f64;
             let right_work =
@@ -313,7 +330,7 @@ impl CostModel {
                 JoinBuildSide::Left => left_work,
                 JoinBuildSide::Right => right_work,
             };
-            if predicates.is_none() {
+            if !conditions.has_join_conditions {
                 return JoinCostBreakdown {
                     build,
                     probe: left_rows * right_rows * CROSS_PRODUCT_SELECTION_BYTES as f64,
@@ -321,8 +338,9 @@ impl CostModel {
                     children: left.cost + right.cost,
                 };
             }
-            let pair_width = left_condition_width
-                .saturating_add(right_condition_width)
+            let pair_width = conditions
+                .left_payload_width
+                .saturating_add(conditions.right_payload_width)
                 .saturating_add(NESTED_LOOP_CURSOR_BYTES);
             return JoinCostBreakdown {
                 build,
@@ -330,23 +348,21 @@ impl CostModel {
                 // General NLJ writes accepted values into flat vectors rather
                 // than returning dictionary references like cross/hash joins.
                 match_output: join_rows
-                    * estimate_row_width_from_payload(Self::output_payload_width(
-                        left, right, predicates,
-                    )) as f64,
+                    * estimate_row_width_from_payload(output_payload_width) as f64,
                 children: left.cost + right.cost,
             };
         }
         let left_input = HashInputEstimate {
             rows: left_rows,
             projected_payload_width: left.output_payload_width,
-            condition_payload_width: left_condition_width,
+            condition_payload_width: conditions.left_payload_width,
             contains_control_region: filtering_side == Some(JoinBuildSide::Left)
                 && self.contains_control_region(&left.set),
         };
         let right_input = HashInputEstimate {
             rows: right_rows,
             projected_payload_width: right.output_payload_width,
-            condition_payload_width: right_condition_width,
+            condition_payload_width: conditions.right_payload_width,
             contains_control_region: filtering_side == Some(JoinBuildSide::Right)
                 && self.contains_control_region(&right.set),
         };
@@ -404,9 +420,9 @@ impl CostModel {
 
     /// Estimate the condition values stored or evaluated on each side of a
     /// cut and report whether at least one equality supports a hash table.
-    fn condition_payload_widths(predicates: Option<&JoinPredicateSet>) -> (usize, usize, bool) {
+    fn condition_profile(predicates: Option<&JoinPredicateSet>) -> JoinConditionProfile {
         let Some(predicates) = predicates else {
-            return (0, 0, false);
+            return JoinConditionProfile::default();
         };
         let mut left_width = 0usize;
         let mut right_width = 0usize;
@@ -449,7 +465,12 @@ impl CostModel {
                 _ => {}
             }
         }
-        (left_width, right_width, has_hash_key)
+        JoinConditionProfile {
+            left_payload_width: left_width,
+            right_payload_width: right_width,
+            has_join_conditions: predicates.has_join_conditions(),
+            has_hash_key,
+        }
     }
 
     /// Apply the same physical orientation policy as `BuildProbeSideOptimizer`.
@@ -487,7 +508,6 @@ impl CostModel {
         set_manager: &mut JoinRelationSetManager,
         predicates: Option<JoinPredicateSet>,
     ) -> DPJoinNode {
-        let output_payload_width = Self::output_payload_width(left, right, predicates.as_ref());
         let estimate = self.estimate_join(left, right, set_manager, predicates.as_ref());
 
         DPJoinNode::intermediate(
@@ -497,7 +517,7 @@ impl CostModel {
             right.set.clone(),
             estimate.breakdown.total(),
             estimate.cardinality,
-            output_payload_width,
+            estimate.output_payload_width,
         )
     }
 
@@ -512,10 +532,12 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
-    use crate::join_order::query_graph::{FilterInfo, JoinPredicateSet};
+    use crate::join_order::query_graph::{CutPredicateResolution, FilterInfo, JoinPredicateSet};
     use crate::join_order::relation_manager::DistinctCount;
     use paro_common::types::LogicalType;
-    use paro_planner::expression::{ColumnRefExpression, ComparisonExpression, ComparisonType};
+    use paro_planner::expression::{
+        ColumnRefExpression, ComparisonExpression, ComparisonType, OperatorExpression, OperatorType,
+    };
     use paro_planner::operator::{AntiJoinMode, ColumnBinding, JoinType};
 
     fn column_distinct_counts(
@@ -1256,5 +1278,47 @@ mod tests {
                 + 100.0 * 50.0 * CROSS_PRODUCT_SELECTION_BYTES as f64,
             "cross product materializes the smaller input and emits one repeated-row ordinal per pair"
         );
+    }
+
+    #[test]
+    fn unoriented_graph_predicate_uses_cross_product_cost_contract() {
+        let mut sets = JoinRelationSetManager::new();
+        let left_set = sets.get_relation(0);
+        let right_set = sets.get_relation(1);
+        let full_set = sets.union(&left_set, &right_set);
+        let residual = Arc::new(FilterInfo::new_inner(
+            Expression::Operator(OperatorExpression::new(
+                OperatorType::Coalesce,
+                vec![create_column_ref(0, 0), create_column_ref(1, 0)],
+                LogicalType::Boolean,
+            )),
+            full_set,
+            0,
+        ));
+        let CutPredicateResolution::Resolved(Some(predicates)) =
+            JoinPredicateSet::from_filters([&residual], &left_set, &right_set)
+        else {
+            panic!("multi-relation residual should form a cut predicate set")
+        };
+        assert!(!predicates.has_join_conditions());
+
+        let mut model = CostModel::new();
+        model.init_cost_model(
+            &mut sets,
+            &[
+                RelationStats::with_cardinality(100),
+                RelationStats::with_cardinality(50),
+            ],
+        );
+        let left = leaf(&mut model, left_set);
+        let right = leaf(&mut model, right_set);
+        let cost = model.compute_cost_breakdown(&left, &right, &mut sets, Some(&predicates));
+
+        assert_eq!(cost.build, 50.0 * estimate_row_width_from_payload(1) as f64);
+        assert_eq!(
+            cost.probe,
+            100.0 * 50.0 * CROSS_PRODUCT_SELECTION_BYTES as f64
+        );
+        assert_eq!(cost.match_output, 0.0);
     }
 }
