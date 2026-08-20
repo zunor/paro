@@ -14,16 +14,16 @@
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::Result;
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::deep_copy::deep_copy_plan;
+use paro_planner::binder::deep_copy::{deep_copy_plan, duplicate_plan_preserving_indices};
 use paro_planner::expression::{
     AggregateExpression, AggregateType, ColumnRefExpression, Expression,
 };
 use paro_planner::operator::{
     Aggregate, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator, ProjectionMap,
 };
-use paro_planner::plan::LogicalPlan;
+use paro_planner::plan::{CardinalityProvenance, LogicalPlan};
 
 use crate::cost_model::CostModel;
 use crate::expression::traversal::visit_expression;
@@ -72,7 +72,14 @@ fn rewrite_node(
     let Some(witness) = recognize(&plan, cost_model) else {
         return Ok((plan, false));
     };
-    apply(plan, witness, bind_context).map(|plan| (plan, true))
+    // Recognition and mutation remain independently defensive. A binding-
+    // identical snapshot preserves the original query if a future plan-shape
+    // change invalidates an assumption while the witness is being consumed.
+    let fallback = duplicate_plan_preserving_indices(&plan, bind_context.shared().as_ref());
+    Ok(match apply(plan, witness, bind_context) {
+        Some(plan) => (plan, true),
+        None => (fallback, false),
+    })
 }
 
 fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDeferral> {
@@ -251,12 +258,29 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
         estimated_partial_input_rows.max(carrier_work_upper_bound(join.left.as_ref()));
     let group_estimate = plan.stats.estimated_cardinality?.expected.max(1);
     let dimension_rows = join.right.stats.estimated_cardinality?.expected;
-    cost_model.dimension_deferral_benefit(
+    // Different declared keys may share one SQL payload value, so the final
+    // group estimate can be smaller than the partial key domain. Price at
+    // least one partial per dimension row as a conservative cost proxy rather
+    // than assuming that the descriptive payload is itself unique.
+    let partial_group_rows = group_estimate.max(dimension_rows);
+    let key_types = fact_join_keys
+        .iter()
+        .map(Expression::return_type)
+        .collect::<Vec<_>>();
+    let aggregate_state_types = partial_aggregates
+        .iter()
+        .map(Expression::return_type)
+        .collect::<Vec<_>>();
+    if !cost_model.dimension_deferral_is_cheaper(
         carrier_rows,
-        group_estimate,
+        partial_group_rows,
         dimension_rows,
-        deferred_payload_types,
-    )?;
+        &key_types,
+        &deferred_payload_types,
+        &aggregate_state_types,
+    ) {
+        return None;
+    }
 
     Some(DimensionDeferral {
         expanded_groups,
@@ -273,16 +297,14 @@ fn apply(
     plan: LogicalPlan,
     witness: DimensionDeferral,
     bind_context: &BindContext,
-) -> Result<LogicalPlan> {
+) -> Option<LogicalPlan> {
     let LogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Aggregate(mut aggregate),
     } = plan
     else {
-        return Err(paro_error::internal(
-            "dimension deferral witness does not own an Aggregate root",
-        ));
+        return None;
     };
     let mut join_plan = *aggregate.child;
     loop {
@@ -297,9 +319,7 @@ fn apply(
         operator: LogicalOperator::Join(Join::Comparison(mut join)),
     } = join_plan
     else {
-        return Err(paro_error::internal(
-            "dimension deferral witness does not own a comparison join",
-        ));
+        return None;
     };
 
     let partial_group_index = bind_context.generate_table_index();
@@ -325,18 +345,14 @@ fn apply(
     let final_dimension = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
     let new_dimension_bindings = final_dimension.get_column_bindings();
     if old_dimension_bindings.len() != new_dimension_bindings.len() {
-        return Err(paro_error::internal(
-            "dimension deferral copy changed the dimension output arity",
-        ));
+        return None;
     }
     let dimension_binding_map = old_dimension_bindings
         .into_iter()
         .zip(new_dimension_bindings)
         .collect::<HashMap<_, _>>();
     if dimension_binding_map.iter().any(|(old, new)| old == new) {
-        return Err(paro_error::internal(
-            "dimension deferral copy reused the original binding namespace",
-        ));
+        return None;
     }
     for condition in &mut final_conditions {
         condition.left = remap_bindings(condition.left.clone(), &dimension_binding_map);
@@ -386,10 +402,7 @@ fn apply(
         let key_ordinal = witness
             .fact_join_keys
             .iter()
-            .position(|key| key.equals(fact_expression))
-            .ok_or_else(|| {
-                paro_error::internal("dimension deferral witness did not map a final equality key")
-            })?;
+            .position(|key| key.equals(fact_expression))?;
         *fact_expression = Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(partial_group_index, key_ordinal),
             fact_expression.return_type(),
@@ -404,10 +417,7 @@ fn apply(
         }
         let ordinal = outer_fact_group_ordinals
             .iter()
-            .find_map(|(old, ordinal)| (*old == group_index).then_some(*ordinal))
-            .ok_or_else(|| {
-                paro_error::internal("dimension deferral witness did not map a fact group")
-            })?;
+            .find_map(|(old, ordinal)| (*old == group_index).then_some(*ordinal))?;
         outer_groups.push(Expression::ColumnRef(ColumnRefExpression::new(
             ColumnBinding::new(partial_group_index, ordinal),
             partial_groups[ordinal].return_type(),
@@ -438,7 +448,7 @@ fn apply(
     aggregate.aggregates = outer_aggregates;
     aggregate.grouping_sets.clear();
     aggregate.recompute_returned_types();
-    Ok(LogicalPlan {
+    Some(LogicalPlan {
         id,
         stats,
         operator: LogicalOperator::Aggregate(aggregate),
@@ -529,20 +539,13 @@ fn combine_domains(left: ExpressionDomain, right: ExpressionDomain) -> Expressio
     }
 }
 
-/// Conservative carrier-work bound that stops at an already-estimated row
-/// reduction. Raw leaf cardinality would ignore a selective fact Filter, while
-/// a join-graph output estimate can include reductions that physical runtime
-/// filters have not applied before this carrier is materialized.
-fn carrier_work_upper_bound(plan: &LogicalPlan) -> u64 {
-    if matches!(
-        plan.operator,
-        LogicalOperator::Filter(_)
-            | LogicalOperator::Limit(_)
-            | LogicalOperator::TopN(_)
-            | LogicalOperator::Aggregate(_)
-            | LogicalOperator::Distinct(_)
-            | LogicalOperator::EmptyResult(_)
-    ) {
+/// Conservative carrier-work bound that trusts tree-local statistics and
+/// looks through join-graph estimates. A join-graph estimate can include
+/// reductions that physical runtime filters have not applied before this
+/// carrier is materialized; every other provenance describes the concrete
+/// subtree boundary, independently of its operator kind.
+pub(super) fn carrier_work_upper_bound(plan: &LogicalPlan) -> u64 {
+    if plan.stats.cardinality_provenance != CardinalityProvenance::JoinGraph {
         return plan
             .stats
             .estimated_cardinality

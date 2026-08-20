@@ -48,6 +48,20 @@ JOIN agg_defer_dimension AS d
 GROUP BY d.payload
 ORDER BY d.payload NULLS LAST;
 
+-- A fact-side grouping column exercises the partial group ordinal mapping;
+-- it must remain independent of the compact dimension equality keys.
+SELECT
+    d.payload,
+    f.keep,
+    count(*) AS row_count,
+    sum(f.amount) AS total_amount,
+    sum(f.amount) FILTER (WHERE f.keep) AS kept_amount
+FROM agg_defer_fact AS f
+JOIN agg_defer_dimension AS d
+  ON f.key_a = d.key_a AND f.key_b = d.key_b
+GROUP BY d.payload, f.keep
+ORDER BY d.payload NULLS LAST, f.keep;
+
 -- @teardown
 DROP TABLE IF EXISTS agg_defer_fact;
 DROP TABLE IF EXISTS agg_defer_dimension;

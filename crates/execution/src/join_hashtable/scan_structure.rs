@@ -1304,8 +1304,6 @@ fn prepare_left_join_output(
         // observed.
         result.try_reset(result.allocator().clone())?;
     }
-    result.set_cardinality(count);
-
     let mut selection = selection.clone();
     selection.set_len(count);
     let selection_is_identity = count == left.size()
@@ -1331,6 +1329,7 @@ fn prepare_left_join_output(
             )?)
         };
     }
+    result.try_set_cardinality(count)?;
     Ok(())
 }
 

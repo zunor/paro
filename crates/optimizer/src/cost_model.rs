@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::VECTOR_SIZE;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConjunctionType, Expression, ExpressionIterator,
@@ -211,36 +212,80 @@ impl<'a> StatisticsResolver<'a> {
 }
 
 impl CostModel {
-    /// Estimate the payload bytes avoided by grouping a fact carrier on compact
-    /// unique-dimension keys and attaching descriptive values only to partial
-    /// groups. The minimum carrier and reduction ratio price the extra
-    /// aggregate lifecycle; the dimension scan itself is charged explicitly.
-    pub(crate) fn dimension_deferral_benefit(
+    /// Compare the incremental byte-work of grouping a fact carrier by a
+    /// descriptive dimension payload with grouping by its compact unique key
+    /// and attaching the payload to partial groups.
+    ///
+    /// The original and rewritten plans share the first dimension join, fact
+    /// expressions, and fact-side grouping columns, so those costs cancel.
+    /// The rewritten side explicitly pays for its partial hash key, a second
+    /// dimension scan, the compact key join, and the final merge aggregate.
+    /// This keeps the decision sensitive to key, payload, and aggregate-state
+    /// widths without hiding executor work behind cardinality thresholds.
+    pub(crate) fn dimension_deferral_is_cheaper(
         &self,
         carrier_rows: u64,
-        group_rows: u64,
+        partial_group_rows: u64,
         dimension_rows: u64,
-        payload_types: impl IntoIterator<Item = LogicalType>,
-    ) -> Option<f64> {
-        const MIN_CARRIER_ROWS: u64 = 4_096;
-        const MIN_REDUCTION_FACTOR: u64 = 8;
-        const MIN_PAYLOAD_BYTES: usize = 16;
+        key_types: &[LogicalType],
+        payload_types: &[LogicalType],
+        aggregate_state_types: &[LogicalType],
+    ) -> bool {
+        // A hash-group row owns a hash/fingerprint word and a state pointer in
+        // addition to its serialized key. Expressing this from concrete
+        // machine fields keeps every term in byte-work units.
+        const HASH_GROUP_ROW_BOOKKEEPING_BYTES: u64 =
+            (std::mem::size_of::<u64>() + std::mem::size_of::<usize>()) as u64;
+        // The rewrite adds one aggregate, one dimension-scan, and one compact
+        // join frontier. Charge one vector of row handles for each rather than
+        // approximating their startup cost with a minimum-row threshold.
+        const EXTRA_PIPELINE_FRONTIERS: u64 = 3;
+        const EXTRA_PIPELINE_STARTUP_BYTES: u64 =
+            VECTOR_SIZE as u64 * std::mem::size_of::<usize>() as u64 * EXTRA_PIPELINE_FRONTIERS;
 
-        let group_rows = group_rows.max(1);
-        let payload_width = payload_types
-            .into_iter()
-            .map(|ty| self.scan_access.estimated_width(&ty))
-            .sum::<usize>();
-        if carrier_rows < MIN_CARRIER_ROWS
-            || carrier_rows < group_rows.saturating_mul(MIN_REDUCTION_FACTOR)
-            || payload_width < MIN_PAYLOAD_BYTES
-        {
-            return None;
+        fn work(rows: u64, width: u64) -> u64 {
+            rows.saturating_mul(width)
         }
-        let eager_bytes = carrier_rows as f64 * payload_width as f64;
-        let deferred_bytes =
-            group_rows.saturating_add(dimension_rows) as f64 * payload_width as f64;
-        (eager_bytes > deferred_bytes).then_some(eager_bytes - deferred_bytes)
+
+        let key_width = key_types
+            .iter()
+            .map(|ty| self.scan_access.estimated_width(ty) as u64)
+            .sum::<u64>();
+        let payload_width = payload_types
+            .iter()
+            .map(|ty| self.scan_access.estimated_width(ty) as u64)
+            .sum::<u64>();
+        let aggregate_state_width = aggregate_state_types
+            .iter()
+            .map(|ty| self.scan_access.estimated_width(ty) as u64)
+            .sum::<u64>();
+        if carrier_rows == 0 || key_width == 0 || payload_width == 0 {
+            return false;
+        }
+
+        let eager_group_work = work(
+            carrier_rows,
+            payload_width.saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
+        );
+        let partial_group_work = work(
+            carrier_rows,
+            key_width.saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
+        );
+        let dimension_rescan_and_build =
+            work(dimension_rows, key_width.saturating_add(payload_width));
+        let compact_join_probe = work(partial_group_rows, key_width);
+        let final_merge_work = work(
+            partial_group_rows,
+            payload_width
+                .saturating_add(aggregate_state_width)
+                .saturating_add(HASH_GROUP_ROW_BOOKKEEPING_BYTES),
+        );
+        let deferred_work = partial_group_work
+            .saturating_add(dimension_rescan_and_build)
+            .saturating_add(compact_join_probe)
+            .saturating_add(final_merge_work)
+            .saturating_add(EXTRA_PIPELINE_STARTUP_BYTES);
+        deferred_work < eager_group_work
     }
 
     /// Compare carrying payload through a row-preserving operator path with
@@ -1087,28 +1132,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dimension_deferral_prices_carrier_reduction_and_payload_width() {
+    fn dimension_deferral_prices_every_incremental_operator() {
         let model = CostModel::default();
-        assert!(model
-            .dimension_deferral_benefit(1_000_000, 100, 25, [LogicalType::Varchar])
-            .is_some());
-        assert!(model
-            .dimension_deferral_benefit(1_000, 100, 25, [LogicalType::Varchar])
-            .is_none());
-        assert!(model
-            .dimension_deferral_benefit(1_000_000, 200_000, 25, [LogicalType::Varchar])
-            .is_none());
-        assert!(model
-            .dimension_deferral_benefit(1_000_000, 100, 25, [LogicalType::BigInt])
-            .is_none());
-        assert!(model
-            .dimension_deferral_benefit(
-                1_000_000,
-                100,
-                25,
-                [LogicalType::BigInt, LogicalType::BigInt],
-            )
-            .is_some());
+        assert!(model.dimension_deferral_is_cheaper(
+            1_000_000,
+            100,
+            25,
+            &[LogicalType::Integer],
+            &[LogicalType::Varchar],
+            &[LogicalType::BigInt],
+        ));
+        assert!(!model.dimension_deferral_is_cheaper(
+            4_096,
+            512,
+            3_000,
+            &[LogicalType::BigInt],
+            &[LogicalType::Varchar],
+            &[LogicalType::BigInt],
+        ));
+        assert!(!model.dimension_deferral_is_cheaper(
+            1_000_000,
+            100,
+            25,
+            &[LogicalType::BigInt],
+            &[LogicalType::BigInt],
+            &[LogicalType::BigInt],
+        ));
+        assert!(model.dimension_deferral_is_cheaper(
+            1_000_000,
+            100,
+            25,
+            &[LogicalType::Integer],
+            &[LogicalType::BigInt, LogicalType::BigInt],
+            &[LogicalType::BigInt],
+        ));
     }
 
     #[test]

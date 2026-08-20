@@ -204,6 +204,26 @@ fn selective_fact_subtree_does_not_use_unfiltered_leaf_cardinality() {
     assert!(!changed);
 }
 
+#[test]
+fn carrier_work_stops_at_tree_local_reduction_statistics() {
+    let mut leaf = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+    leaf.stats.estimated_cardinality = Some(CardinalityEstimate::exact(600_000_000));
+    let mut reduced = LogicalPlan::synthetic(LogicalOperator::Filter(
+        paro_planner::operator::Filter::new(leaf, vec![]),
+    ));
+    reduced.stats.estimated_cardinality = Some(CardinalityEstimate::exact(1_000));
+    let mut join_graph_boundary = LogicalPlan::synthetic(LogicalOperator::Filter(
+        paro_planner::operator::Filter::new(reduced, vec![]),
+    ));
+    join_graph_boundary.stats.estimated_cardinality = Some(CardinalityEstimate::exact(100));
+    join_graph_boundary.stats.cardinality_provenance = CardinalityProvenance::JoinGraph;
+
+    assert_eq!(
+        dimension_deferral::carrier_work_upper_bound(&join_graph_boundary),
+        1_000
+    );
+}
+
 fn collect_bindings(
     expression: &paro_planner::expression::Expression,
     bindings: &mut Vec<paro_planner::operator::ColumnBinding>,

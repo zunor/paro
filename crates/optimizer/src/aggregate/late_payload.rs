@@ -728,6 +728,9 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
     let LogicalOperator::Aggregate(aggregate) = &output.child.operator else {
         return None;
     };
+    // Scalar aggregates produce at most one row, so a TopN cannot amortize a
+    // late payload frontier. The shared plain-domain predicate intentionally
+    // excludes that shape rather than treating it as a grouping-set detail.
     if aggregate.post_reduction.is_some() || !aggregate.has_plain_grouping_domain() {
         return None;
     }

@@ -3,14 +3,127 @@
 
 use super::*;
 use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+use paro_common::allocator::{Allocator, DefaultAllocator};
 use paro_common::chunk::Chunk;
+use paro_common::error::{self as paro_error, Result as CommonResult};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 use paro_planner::expression::{ConstantExpression, Expression};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+#[derive(Debug)]
+struct ToggleAllocator {
+    inner: DefaultAllocator,
+    fail: AtomicBool,
+}
+
+impl ToggleAllocator {
+    fn new() -> Self {
+        Self {
+            inner: DefaultAllocator::new(),
+            fail: AtomicBool::new(false),
+        }
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl Allocator for ToggleAllocator {
+    fn allocate(&self, size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate(size)
+    }
+
+    fn allocate_zeroed(&self, size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate_zeroed(size)
+    }
+
+    fn free(&self, ptr: *mut u8, size: usize) {
+        self.inner.free(ptr, size);
+    }
+
+    fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {new_size} bytes"
+            )));
+        }
+        self.inner.reallocate(ptr, old_size, new_size)
+    }
+
+    fn name(&self) -> &'static str {
+        "ToggleAllocator"
+    }
+}
+
+#[test]
+fn left_only_output_replaces_shared_vectors_before_cardinality_change() {
+    let allocator = Arc::new(ToggleAllocator::new());
+    let left_first = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 3], allocator.clone()),
+        )],
+        allocator.clone(),
+    );
+    let left_second = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(&[4, 5], allocator.clone()),
+        )],
+        allocator.clone(),
+    );
+    let mut result = Chunk::try_initialize(&[LogicalType::Integer], 3, allocator.clone()).unwrap();
+    let first_selection = SelectionVector::try_incremental(
+        left_first.size(),
+        paro_common::test_utils::test_allocator(),
+    )
+    .unwrap();
+    let second_selection = SelectionVector::try_incremental(
+        left_second.size(),
+        paro_common::test_utils::test_allocator(),
+    )
+    .unwrap();
+
+    prepare_left_join_output(
+        &left_first,
+        &mut result,
+        left_first.size(),
+        &[0],
+        &first_selection,
+        &[],
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&result.data[0], &left_first.data[0]));
+
+    // Changing the next batch's cardinality would have to materialize the old
+    // shared vector if the helper touched it before installing the new one.
+    allocator.set_fail(true);
+    prepare_left_join_output(
+        &left_second,
+        &mut result,
+        left_second.size(),
+        &[0],
+        &second_selection,
+        &[],
+    )
+    .expect("left-only batch replacement must not allocate");
+    assert!(Arc::ptr_eq(&result.data[0], &left_second.data[0]));
+    assert_eq!(result.size(), 2);
+}
 
 #[test]
 fn existence_output_rejects_zero_capacity_without_advancing() {

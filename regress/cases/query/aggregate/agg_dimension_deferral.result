@@ -63,5 +63,22 @@ other	2000	10000	10000
 same	4000	60000	20000
 NULL	2000	NULL	NULL
 
+SELECT
+    d.payload,
+    f.keep,
+    count(*) AS row_count,
+    sum(f.amount) AS total_amount,
+    sum(f.amount) FILTER (WHERE f.keep) AS kept_amount
+FROM agg_defer_fact AS f
+JOIN agg_defer_dimension AS d
+  ON f.key_a = d.key_a AND f.key_b = d.key_b
+GROUP BY d.payload, f.keep
+ORDER BY d.payload NULLS LAST, f.keep;
+d.payload	f.keep	row_count	total_amount	kept_amount
+other	true	2000	10000	10000
+same	false	2000	40000	NULL
+same	true	2000	20000	20000
+NULL	true	2000	NULL	NULL
+
 DROP TABLE IF EXISTS agg_defer_dimension;
 DROP TABLE
