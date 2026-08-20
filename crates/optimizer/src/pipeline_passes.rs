@@ -324,7 +324,12 @@ impl Rewriter for AggregateDimensionDeferralPass {
     }
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        dimension_deferral::optimize_plan(plan, &ctx.bind_context)
+        let (plan, changed) =
+            dimension_deferral::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
+        if changed {
+            ctx.invalidations.mark_dimension_deferral();
+        }
+        Ok(plan)
     }
 }
 

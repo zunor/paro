@@ -1409,6 +1409,16 @@ mod tests {
             -65, -64, -63, -1, 0, 1, 2, 63, 64, 65, 127, 128, 129, 191, 192, 193,
         ];
 
+        #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
+        let simd_supported = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(all(target_arch = "aarch64", target_endian = "little"))]
+        let simd_supported = true;
+        #[cfg(not(any(
+            all(target_arch = "aarch64", target_endian = "little"),
+            all(target_arch = "x86_64", target_endian = "little")
+        )))]
+        let simd_supported = false;
+
         let mut bits = vec![0u64; SPAN.div_ceil(u64::BITS as usize)];
         for member in MEMBERS {
             let offset = member.offset_from(BASE).expect("member lies above base");
@@ -1433,17 +1443,27 @@ mod tests {
                         .then_some(BatchRowOrdinal::from_validated_index(row))
                 })
                 .collect::<Vec<_>>();
+            let scalar = values
+                .iter()
+                .enumerate()
+                .filter_map(|(row, &value)| {
+                    dense_membership_contains(value, BASE, SPAN, &bits)
+                        .then_some(BatchRowOrdinal::from_validated_index(row))
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(scalar, expected, "scalar row count {rows}");
+            if !simd_supported {
+                continue;
+            }
             let mut actual = Vec::new();
-            if !try_filter_seed_dense_membership(
+            assert!(try_filter_seed_dense_membership(
                 input.as_ptr(),
                 BASE,
                 SPAN,
                 &bits,
                 rows,
                 &mut actual,
-            ) {
-                return;
-            }
+            ));
             assert_eq!(actual, expected, "row count {rows}");
         }
     }

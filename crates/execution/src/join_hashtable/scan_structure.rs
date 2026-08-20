@@ -751,44 +751,14 @@ impl ScanStructure {
         }
 
         let count = self.count;
-        let selection = &self.sel_vector;
-        if result.column_count() != left_projection_map.len() {
-            return Err(paro_common::error::internal(format!(
-                "left-only join output has {} columns but its projection has {} entries",
-                result.column_count(),
-                left_projection_map.len()
-            )));
-        }
-        let selection_is_identity = count == left.size()
-            && selection
-                .as_slice()
-                .iter()
-                .enumerate()
-                .all(|(row_idx, &selected)| selected as usize == row_idx);
-        let result_column_count = result.column_count();
-        for (output_idx, &left_idx) in left_projection_map.iter().enumerate() {
-            let left_column = left.data.get(left_idx).ok_or_else(|| {
-                paro_common::error::internal(format!(
-                    "join left projection index {left_idx} is out of range for {} columns",
-                    left.column_count()
-                ))
-            })?;
-            let output = result.data.get_mut(output_idx).ok_or_else(|| {
-                paro_common::error::internal(format!(
-                    "join left output index {output_idx} is out of range for {} columns",
-                    result_column_count
-                ))
-            })?;
-            *output = if selection_is_identity {
-                Arc::clone(left_column)
-            } else {
-                Arc::new(Vector::try_dictionary(
-                    Arc::clone(left_column),
-                    selection.clone(),
-                )?)
-            };
-        }
-        result.try_set_cardinality(count)?;
+        prepare_left_join_output(
+            left,
+            result,
+            count,
+            left_projection_map,
+            &self.sel_vector,
+            &[],
+        )?;
         self.count = 0;
         self.finished = true;
         Ok(count)
@@ -1209,86 +1179,14 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
     ) -> Result<()> {
-        let expected_column_count = left_projection_map.len() + hash_table.build_output_count();
-        let left_layout_matches =
-            left_projection_map
-                .iter()
-                .enumerate()
-                .all(|(out_idx, &left_idx)| {
-                    left.data
-                        .get(left_idx)
-                        .zip(result.data.get(out_idx))
-                        .is_some_and(|(left_column, result_column)| {
-                            left_column.logical_type() == result_column.logical_type()
-                        })
-                });
-        let right_layout_matches =
-            hash_table
-                .build_output_types()
-                .iter()
-                .enumerate()
-                .all(|(build_idx, build_type)| {
-                    result
-                        .data
-                        .get(left_projection_map.len() + build_idx)
-                        .is_some_and(|column| column.logical_type() == build_type)
-                });
-        if result.column_count() != expected_column_count
-            || result.capacity() < count
-            || !left_layout_matches
-            || !right_layout_matches
-        {
-            let mut expected_types = Vec::with_capacity(expected_column_count);
-            for &left_idx in left_projection_map {
-                let left_column = left.data.get(left_idx).ok_or_else(|| {
-                    paro_common::error::internal(format!(
-                        "join left projection index {left_idx} is out of range for {} columns",
-                        left.column_count()
-                    ))
-                })?;
-                expected_types.push(left_column.logical_type().clone());
-            }
-            expected_types.extend(hash_table.build_output_types().iter().cloned());
-            *result = paro_common::chunk::Chunk::try_initialize(
-                &expected_types,
-                VECTOR_SIZE.max(count),
-                result.allocator().clone(),
-            )?;
-        } else {
-            result.try_reset(result.allocator().clone())?;
-        }
-        result.set_cardinality(count);
-        let mut lhs_sel = self.lhs_sel.clone();
-        lhs_sel.set_len(count);
-        let lhs_is_identity = count == left.size()
-            && lhs_sel
-                .as_slice()
-                .iter()
-                .take(count)
-                .enumerate()
-                .all(|(row_idx, &selected)| selected as usize == row_idx);
-
-        // 1. Copy projected LHS columns
-        for (out_idx, left_idx) in left_projection_map.iter().enumerate() {
-            let left_column = left.data.get(*left_idx).ok_or_else(|| {
-                paro_common::error::internal(format!(
-                    "join left projection index {left_idx} is out of range for {} columns",
-                    left.column_count()
-                ))
-            })?;
-            result.data[out_idx] = if lhs_is_identity {
-                // A total, order-preserving match needs no dictionary wrapper.
-                // This is common for foreign-key joins after an exact runtime
-                // filter and prevents downstream joins from composing chains
-                // of identity selections batch after batch.
-                Arc::clone(left_column)
-            } else {
-                Arc::new(Vector::try_dictionary(
-                    Arc::clone(left_column),
-                    lhs_sel.clone(),
-                )?)
-            };
-        }
+        prepare_left_join_output(
+            left,
+            result,
+            count,
+            left_projection_map,
+            &self.lhs_sel,
+            hash_table.build_output_types(),
+        )?;
 
         // 2. Gather projected RHS columns
         let right_result_offset = left_projection_map.len();
@@ -1336,6 +1234,104 @@ impl ScanStructure {
         }
         Ok(self.rhs_unique_pointers.len())
     }
+}
+
+/// Establish one authoritative join-output layout and project the selected
+/// probe rows. Exact left-only joins and the general build-payload gather share
+/// this contract so capacity, logical types, and identity dictionaries cannot
+/// drift between paths.
+fn prepare_left_join_output(
+    left: &paro_common::chunk::Chunk,
+    result: &mut paro_common::chunk::Chunk,
+    count: usize,
+    left_projection_map: &[usize],
+    selection: &SelectionVector,
+    build_output_types: &[LogicalType],
+) -> Result<()> {
+    if selection.len() < count {
+        return Err(paro_common::error::internal(format!(
+            "join selection has {} rows but output requires {count}",
+            selection.len()
+        )));
+    }
+    let expected_column_count = left_projection_map.len() + build_output_types.len();
+    let left_layout_matches = left_projection_map
+        .iter()
+        .enumerate()
+        .all(|(out_idx, &left_idx)| {
+            left.data
+                .get(left_idx)
+                .zip(result.data.get(out_idx))
+                .is_some_and(|(left_column, result_column)| {
+                    left_column.logical_type() == result_column.logical_type()
+                })
+        });
+    let right_layout_matches =
+        build_output_types
+            .iter()
+            .enumerate()
+            .all(|(build_idx, build_type)| {
+                result
+                    .data
+                    .get(left_projection_map.len() + build_idx)
+                    .is_some_and(|column| column.logical_type() == build_type)
+            });
+    if result.column_count() != expected_column_count
+        || result.capacity() < count
+        || !left_layout_matches
+        || !right_layout_matches
+    {
+        let mut expected_types = Vec::with_capacity(expected_column_count);
+        for &left_idx in left_projection_map {
+            let left_column = left.data.get(left_idx).ok_or_else(|| {
+                paro_common::error::internal(format!(
+                    "join left projection index {left_idx} is out of range for {} columns",
+                    left.column_count()
+                ))
+            })?;
+            expected_types.push(left_column.logical_type().clone());
+        }
+        expected_types.extend(build_output_types.iter().cloned());
+        *result = paro_common::chunk::Chunk::try_initialize(
+            &expected_types,
+            VECTOR_SIZE.max(count),
+            result.allocator().clone(),
+        )?;
+    } else if !build_output_types.is_empty() {
+        // Build columns are filled into existing vectors, so clear their old
+        // validity and varlen state. A left-only output replaces every vector
+        // below and deliberately avoids paying for a reset that cannot be
+        // observed.
+        result.try_reset(result.allocator().clone())?;
+    }
+    result.set_cardinality(count);
+
+    let mut selection = selection.clone();
+    selection.set_len(count);
+    let selection_is_identity = count == left.size()
+        && selection
+            .as_slice()
+            .iter()
+            .enumerate()
+            .all(|(row_idx, &selected)| selected as usize == row_idx);
+    for (output_idx, &left_idx) in left_projection_map.iter().enumerate() {
+        let left_column = left.data.get(left_idx).ok_or_else(|| {
+            paro_common::error::internal(format!(
+                "join left projection index {left_idx} is out of range for {} columns",
+                left.column_count()
+            ))
+        })?;
+        result.data[output_idx] = if selection_is_identity {
+            // A total, order-preserving match needs no dictionary wrapper.
+            Arc::clone(left_column)
+        } else {
+            Arc::new(Vector::try_dictionary(
+                Arc::clone(left_column),
+                selection.clone(),
+            )?)
+        };
+    }
+    Ok(())
 }
 
 fn collect_existence_output<const MATCH: bool>(

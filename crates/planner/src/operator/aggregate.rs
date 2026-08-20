@@ -164,6 +164,25 @@ impl Aggregate {
         self
     }
 
+    /// Whether all rows belong to one ordinary, non-empty grouping domain.
+    ///
+    /// Logical rewrites and physical lowering share this definition so a new
+    /// grouping-set representation cannot silently widen one consumer while
+    /// another rejects it.
+    pub fn has_plain_grouping_domain(&self) -> bool {
+        !self.groups.is_empty()
+            && self.grouping_functions.is_empty()
+            && (self.grouping_sets.is_empty()
+                || (self.grouping_sets.len() == 1
+                    && self.grouping_sets[0].expressions.len() == self.groups.len()
+                    && self.grouping_sets[0]
+                        .expressions
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::HashSet<_>>()
+                        == (0..self.groups.len()).collect()))
+    }
+
     /// Verify the correctness-bearing local expression domains of the optional
     /// post-aggregate reduction annotation.
     pub fn verify_post_reduction(&self) -> Result<()> {
@@ -178,18 +197,7 @@ impl Aggregate {
                 "Post-aggregate reduction must own an independent table index".to_string(),
             ));
         }
-        let plain_grouping_domain = !self.groups.is_empty()
-            && self.grouping_functions.is_empty()
-            && (self.grouping_sets.is_empty()
-                || (self.grouping_sets.len() == 1
-                    && self.grouping_sets[0].expressions.len() == self.groups.len()
-                    && self.grouping_sets[0]
-                        .expressions
-                        .iter()
-                        .copied()
-                        .collect::<std::collections::HashSet<_>>()
-                        == (0..self.groups.len()).collect()));
-        if !plain_grouping_domain {
+        if !self.has_plain_grouping_domain() {
             return Err(paro_error::internal(
                 "Post-aggregate reduction requires one plain, non-empty grouping domain"
                     .to_string(),

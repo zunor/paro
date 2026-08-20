@@ -1,0 +1,67 @@
+DROP TABLE IF EXISTS agg_defer_dimension;
+DROP TABLE
+
+CREATE TABLE agg_defer_dimension (
+    key_a BIGINT,
+    key_b BIGINT,
+    payload VARCHAR,
+    PRIMARY KEY (key_a, key_b)
+);
+CREATE TABLE
+
+CREATE TABLE agg_defer_fact (
+    key_a BIGINT,
+    key_b BIGINT,
+    amount BIGINT,
+    keep BOOLEAN
+);
+CREATE TABLE
+
+INSERT INTO agg_defer_dimension VALUES
+    (1, 1, 'same'),
+    (2, 2, 'same'),
+    (3, 3, NULL),
+    (4, 4, 'other');
+INSERT 0 4
+
+INSERT INTO agg_defer_fact
+SELECT 1, 1, 10, true FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+INSERT INTO agg_defer_fact
+SELECT 2, 2, 20, false FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+INSERT INTO agg_defer_fact
+SELECT 3, 3, NULL, true FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+INSERT INTO agg_defer_fact
+SELECT 4, 4, 5, true FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+INSERT INTO agg_defer_fact
+SELECT NULL, NULL, 100, true FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+INSERT INTO agg_defer_fact
+SELECT 9, 9, 200, true FROM generate_series(1, 2000) AS generated(i);
+INSERT 0 2000
+
+SELECT
+    d.payload,
+    count(*) AS row_count,
+    sum(f.amount) AS total_amount,
+    sum(f.amount) FILTER (WHERE f.keep) AS kept_amount
+FROM agg_defer_fact AS f
+JOIN agg_defer_dimension AS d
+  ON f.key_a = d.key_a AND f.key_b = d.key_b
+GROUP BY d.payload
+ORDER BY d.payload NULLS LAST;
+d.payload	row_count	total_amount	kept_amount
+other	2000	10000	10000
+same	4000	60000	20000
+NULL	2000	NULL	NULL
+
+DROP TABLE IF EXISTS agg_defer_dimension;
+DROP TABLE

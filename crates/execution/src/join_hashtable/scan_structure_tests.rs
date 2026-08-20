@@ -566,13 +566,17 @@ fn exact_unique_left_only_inner_join_reuses_index_selection() {
     // fixture's statistics admit.
     scan.exact_key_matches = true;
     scan.has_long_chains = false;
-    let mut result = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
+    // The shared output-layout contract must rebuild both a mismatched type
+    // and insufficient capacity before installing dictionary vectors.
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], 1);
 
     let count = scan
         .next_exact_unique_left_only_inner_join(&left, &mut result, &[0])
         .unwrap();
 
     assert_eq!(count, 2);
+    assert_eq!(result.capacity(), VECTOR_SIZE);
+    assert_eq!(result.data[0].logical_type(), &LogicalType::Integer);
     assert_eq!(result.data[0].get_value(0), Value::Integer(1));
     assert_eq!(result.data[0].get_value(1), Value::Integer(2));
     assert!(scan.finished);

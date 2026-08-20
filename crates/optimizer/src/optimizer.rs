@@ -55,26 +55,29 @@ struct ConditionalSegment {
 
 #[derive(Clone, Copy)]
 enum PipelineCondition {
-    LateMaterializationInvalidated,
-    ScanProjectionInvalidated,
+    DimensionDeferral,
+    LateMaterialization,
+    ScanProjection,
 }
 
 impl PipelineCondition {
     fn is_pending(self, ctx: &OptimizationContext) -> bool {
         match self {
-            Self::LateMaterializationInvalidated => {
-                ctx.invalidations.late_materialization_pending()
-            }
-            Self::ScanProjectionInvalidated => ctx.invalidations.scan_projection_pending(),
+            Self::DimensionDeferral => ctx.invalidations.dimension_deferral_pending(),
+            Self::LateMaterialization => ctx.invalidations.late_materialization_pending(),
+            Self::ScanProjection => ctx.invalidations.scan_projection_pending(),
         }
     }
 
     fn consume(self, ctx: &mut OptimizationContext) {
         match self {
-            Self::LateMaterializationInvalidated => {
+            Self::DimensionDeferral => {
+                ctx.invalidations.consume_dimension_deferral();
+            }
+            Self::LateMaterialization => {
                 ctx.invalidations.consume_late_materialization();
             }
-            Self::ScanProjectionInvalidated => ctx.invalidations.consume_scan_projection(),
+            Self::ScanProjection => ctx.invalidations.consume_scan_projection(),
         }
     }
 }
@@ -85,7 +88,7 @@ fn pass(rewriter: impl Rewriter + 'static) -> PipelineStep {
 
 fn late_materialization_repair(binder: Binder) -> PipelineStep {
     PipelineStep::Conditional(ConditionalSegment {
-        condition: PipelineCondition::LateMaterializationInvalidated,
+        condition: PipelineCondition::LateMaterialization,
         passes: vec![
             Box::new(UnusedColumnsPass { binder }),
             Box::new(StatisticsGatheringPass),
@@ -318,14 +321,20 @@ impl Optimizer {
             pass(StatisticsGatheringPass),
             pass(JoinOrderPass),
             // Group fact rows by compact equality keys before attaching a
-            // wide descriptive dimension payload. A second schema/statistics
-            // settlement makes the new partial aggregate authoritative for
-            // physical build/probe selection.
+            // wide descriptive dimension payload. Only a successful rewrite
+            // requests the schema/statistics settlement that makes its new
+            // partial aggregate authoritative for physical build/probe
+            // selection.
             pass(AggregateDimensionDeferralPass),
-            pass(UnusedColumnsPass {
-                binder: dimension_deferral_binder,
+            PipelineStep::Conditional(ConditionalSegment {
+                condition: PipelineCondition::DimensionDeferral,
+                passes: vec![
+                    Box::new(UnusedColumnsPass {
+                        binder: dimension_deferral_binder,
+                    }),
+                    Box::new(StatisticsGatheringPass),
+                ],
             }),
-            pass(StatisticsGatheringPass),
             pass(BuildProbeSidePass),
             pass(JoinFilterPushdownPass),
             pass(TopNPass),
@@ -373,7 +382,7 @@ impl Optimizer {
             // output. Recompute widths now so the stored value is not decoded,
             // retained, or replayed above that physical witness boundary.
             PipelineStep::Conditional(ConditionalSegment {
-                condition: PipelineCondition::ScanProjectionInvalidated,
+                condition: PipelineCondition::ScanProjection,
                 passes: vec![Box::new(UnusedColumnsPass {
                     binder: scan_projection_binder,
                 })],

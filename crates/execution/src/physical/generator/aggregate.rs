@@ -74,7 +74,7 @@ struct DependentGroupLayout {
 fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupLayout> {
     if aggregate.groups.len() < 2
         || !aggregate.grouping_functions.is_empty()
-        || !plain_grouping_set(aggregate)
+        || !aggregate.has_plain_grouping_domain()
         // Post-reduction positional domains address the SQL aggregate list.
         // Do not append hidden dependent-group states until that representation
         // carries an explicit source/output map for the reduction runtime.
@@ -155,18 +155,6 @@ fn plan_dependent_groups(aggregate: &LogicalAggregate) -> Option<DependentGroupL
         dependent_functions,
         state_output_projection,
     })
-}
-
-fn plain_grouping_set(aggregate: &LogicalAggregate) -> bool {
-    aggregate.grouping_sets.is_empty()
-        || (aggregate.grouping_sets.len() == 1
-            && aggregate.grouping_sets[0].expressions.len() == aggregate.groups.len()
-            && aggregate.grouping_sets[0]
-                .expressions
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>()
-                == (0..aggregate.groups.len()).collect())
 }
 
 /// Drop physical encodings that do not reduce the aligned group-key prefix.

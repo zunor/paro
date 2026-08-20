@@ -639,6 +639,67 @@ fn bigint_pair_build_uses_exact_index_and_preserves_duplicate_chains() {
 }
 
 #[test]
+fn bigint_pair_index_adapts_to_clustered_build_keys() {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        bigint_pair_equality_conditions(),
+        vec![],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    let left = (0..256)
+        .map(|value| Some(i64::from(value) * 256))
+        .collect::<Vec<_>>();
+    let right = vec![Some(7_i64); left.len()];
+    let keys = chunk_from_optional_i64_columns(&[left.as_slice(), right.as_slice()]);
+    let mut payload =
+        Chunk::try_initialize(&[], VECTOR_SIZE, paro_common::test_utils::test_allocator())
+            .expect("empty build payload");
+    payload.set_cardinality(keys.size());
+
+    ht.build(&keys, &payload)
+        .expect("build clustered pair keys");
+    ht.finalize().expect("adapt pair index placement");
+
+    assert!(ht.has_pair_integer_index());
+    assert!(ht.pair_integer_index_uses_stride_resistant_hash());
+    let mut scan = ht.create_scan_structure().expect("scan state");
+    ht.probe(&keys, &mut scan, None, keys.size())
+        .expect("probe rebuilt pair index");
+    assert_eq!(scan.count, keys.size());
+}
+
+#[test]
+fn bigint_pair_index_keeps_low_latency_hash_for_dense_keys() {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        bigint_pair_equality_conditions(),
+        vec![],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    let left = (0..256)
+        .map(|value| Some(i64::from(value)))
+        .collect::<Vec<_>>();
+    let right = (0..256)
+        .map(|value| Some(i64::from(value % 7) + 1))
+        .collect::<Vec<_>>();
+    let keys = chunk_from_optional_i64_columns(&[left.as_slice(), right.as_slice()]);
+    let mut payload =
+        Chunk::try_initialize(&[], VECTOR_SIZE, paro_common::test_utils::test_allocator())
+            .expect("empty build payload");
+    payload.set_cardinality(keys.size());
+
+    ht.build(&keys, &payload).expect("build dense pair keys");
+    ht.finalize().expect("finalize dense pair index");
+
+    assert!(ht.has_pair_integer_index());
+    assert!(!ht.pair_integer_index_uses_stride_resistant_hash());
+}
+
+#[test]
 fn sparse_integer_build_falls_back_to_hash_index() {
     let ht = JoinHashTable::new(
         create_test_buffer_pool(),

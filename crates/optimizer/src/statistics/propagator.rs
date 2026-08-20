@@ -72,10 +72,7 @@ fn window_output_statistics(expression: &WindowExpression) -> BaseStatistics {
 }
 
 fn derive_group_dependencies(aggregate: &Aggregate) -> Vec<GroupDependency> {
-    if aggregate.groups.len() < 2
-        || !aggregate.grouping_functions.is_empty()
-        || !plain_grouping_set(aggregate)
-    {
+    if aggregate.groups.len() < 2 || !aggregate.has_plain_grouping_domain() {
         return Vec::new();
     }
 
@@ -95,18 +92,6 @@ fn derive_group_dependencies(aggregate: &Aggregate) -> Vec<GroupDependency> {
         &mut dependencies,
     );
     dependencies
-}
-
-fn plain_grouping_set(aggregate: &Aggregate) -> bool {
-    aggregate.grouping_sets.is_empty()
-        || (aggregate.grouping_sets.len() == 1
-            && aggregate.grouping_sets[0].expressions.len() == aggregate.groups.len()
-            && aggregate.grouping_sets[0]
-                .expressions
-                .iter()
-                .copied()
-                .collect::<std::collections::HashSet<_>>()
-                == (0..aggregate.groups.len()).collect())
 }
 
 fn collect_group_dependencies(

@@ -14,8 +14,7 @@ use paro_function::scalar::ScalarPredicateProjection;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, RowFetch,
-    RowFetchSource,
+    ColumnBinding, Get, Join, JoinType, LogicalOperator, Projection, RowFetch, RowFetchSource,
 };
 use paro_planner::plan::LogicalPlan;
 
@@ -729,10 +728,7 @@ fn prove_candidate(plan: &LogicalPlan, cost_model: &CostModel) -> Option<Candida
     let LogicalOperator::Aggregate(aggregate) = &output.child.operator else {
         return None;
     };
-    if aggregate.post_reduction.is_some()
-        || !aggregate.grouping_functions.is_empty()
-        || !is_plain_grouping_domain(aggregate)
-    {
+    if aggregate.post_reduction.is_some() || !aggregate.has_plain_grouping_domain() {
         return None;
     }
 
@@ -986,18 +982,6 @@ fn prove_row_preserving_candidate(
         })
         .collect::<Vec<_>>();
     (!sources.is_empty()).then_some(RowPreservingCandidate { sources })
-}
-
-fn is_plain_grouping_domain(aggregate: &Aggregate) -> bool {
-    aggregate.grouping_sets.is_empty()
-        || (aggregate.grouping_sets.len() == 1
-            && aggregate.grouping_sets[0].expressions.len() == aggregate.groups.len()
-            && aggregate.grouping_sets[0]
-                .expressions
-                .iter()
-                .copied()
-                .collect::<HashSet<_>>()
-                == (0..aggregate.groups.len()).collect())
 }
 
 /// Return a structural witness from this operator to one unique base-table

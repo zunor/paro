@@ -19,12 +19,28 @@ use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
 
 const MAX_PAIR_INDEX_SLOTS: usize = 4 * 1024 * 1024;
+const MAX_FAST_PAIR_AVERAGE_PROBES: usize = 2;
+const MAX_FAST_PAIR_PROBE_CHAIN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PairHashMode {
+    /// One multiply on the usually low-cardinality right component. This is
+    /// nearly collision-free for dense `(id, ordinal)` keys.
+    LowLatency,
+    /// Independent multiplication makes low-bit strides on either component
+    /// reach the table mask before open addressing.
+    StrideResistant,
+}
 
 #[derive(Debug)]
 pub(super) struct ExactI64PairJoinIndex {
     slots: GrantBuffer,
     capacity: usize,
     mask: usize,
+    hash_mode: PairHashMode,
+    inserted_rows: usize,
+    total_probe_steps: usize,
+    max_probe_steps: usize,
 }
 
 impl ExactI64PairJoinIndex {
@@ -47,6 +63,10 @@ impl ExactI64PairJoinIndex {
             slots: memory.allocate_zeroed_buffer(allocator, bytes)?,
             capacity,
             mask: capacity - 1,
+            hash_mode: PairHashMode::LowLatency,
+            inserted_rows: 0,
+            total_probe_steps: 0,
+            max_probe_steps: 0,
         }))
     }
 
@@ -66,18 +86,20 @@ impl ExactI64PairJoinIndex {
         }
         let left = read_row_i64(layout, row_ptr, 0);
         let right = read_row_i64(layout, row_ptr, 1);
-        let mut slot = pair_hash(left, right) as usize & self.mask;
-        for _ in 0..self.capacity {
+        let mut slot = pair_hash(self.hash_mode, left, right) as usize & self.mask;
+        for probe_steps in 1..=self.capacity {
             let slot_ptr = unsafe { self.slots.as_ptr().cast::<usize>().add(slot) };
             let existing = unsafe { std::ptr::read(slot_ptr) };
             if existing == 0 {
                 unsafe { std::ptr::write(slot_ptr, row_ptr) };
+                self.record_probe_steps(probe_steps);
                 return Ok(None);
             }
             if read_row_i64(layout, existing, 0) == left
                 && read_row_i64(layout, existing, 1) == right
             {
                 unsafe { std::ptr::write(slot_ptr, row_ptr) };
+                self.record_probe_steps(probe_steps);
                 return Ok(Some(existing));
             }
             slot = (slot + 1) & self.mask;
@@ -85,6 +107,42 @@ impl ExactI64PairJoinIndex {
         Err(paro_error::internal(
             "pair integer join index exceeded its admitted load factor",
         ))
+    }
+
+    /// Switch once from the fast placement to the stride-resistant placement
+    /// when the actual build keys prove that the fast assumption is false.
+    /// Finalization owns every build row, so this one-time rebuild stays off
+    /// the probe path and the selected mode becomes immutable at publication.
+    pub(super) fn strengthen_hash_if_clustered(&mut self) -> bool {
+        let average_is_clustered = self
+            .inserted_rows
+            .checked_mul(MAX_FAST_PAIR_AVERAGE_PROBES)
+            .is_some_and(|budget| self.total_probe_steps > budget);
+        if self.hash_mode != PairHashMode::LowLatency
+            || (!average_is_clustered && self.max_probe_steps <= MAX_FAST_PAIR_PROBE_CHAIN)
+        {
+            return false;
+        }
+        // SAFETY: `slots` owns exactly `size()` writable bytes for the entire
+        // mutable lifetime of this unpublished index.
+        unsafe { std::ptr::write_bytes(self.slots.as_ptr(), 0, self.slots.size()) };
+        self.hash_mode = PairHashMode::StrideResistant;
+        self.inserted_rows = 0;
+        self.total_probe_steps = 0;
+        self.max_probe_steps = 0;
+        true
+    }
+
+    #[cfg(test)]
+    pub(super) fn uses_stride_resistant_hash(&self) -> bool {
+        self.hash_mode == PairHashMode::StrideResistant
+    }
+
+    #[inline]
+    fn record_probe_steps(&mut self, probe_steps: usize) {
+        self.inserted_rows += 1;
+        self.total_probe_steps = self.total_probe_steps.saturating_add(probe_steps);
+        self.max_probe_steps = self.max_probe_steps.max(probe_steps);
     }
 
     pub(super) fn lookup_vector_rows(
@@ -118,7 +176,7 @@ impl ExactI64PairJoinIndex {
     }
 
     fn lookup(&self, layout: &RowLayout, left: i64, right: i64) -> Option<usize> {
-        let mut slot = pair_hash(left, right) as usize & self.mask;
+        let mut slot = pair_hash(self.hash_mode, left, right) as usize & self.mask;
         for _ in 0..self.capacity {
             let pointer = unsafe { std::ptr::read(self.slots.as_ptr().cast::<usize>().add(slot)) };
             if pointer == 0 {
@@ -135,14 +193,16 @@ impl ExactI64PairJoinIndex {
 }
 
 #[inline]
-fn pair_hash(left: i64, right: i64) -> u64 {
-    // Power-of-two open addressing consumes the low bits, so both physical
-    // keys must reach that domain before masking. One odd multiplicative mix
-    // plus a high-half fold has substantially less dependency latency than a
-    // general 128-bit hash combiner; exact row-key comparison still resolves
-    // every collision, so this is a placement function rather than an
-    // equality witness.
-    let mixed = (left as u64).wrapping_add((right as u64).wrapping_mul(0x9e37_79b1_85eb_ca87));
+fn pair_hash(mode: PairHashMode, left: i64, right: i64) -> u64 {
+    let mixed = match mode {
+        PairHashMode::LowLatency => {
+            (left as u64).wrapping_add((right as u64).wrapping_mul(0x9e37_79b1_85eb_ca87))
+        }
+        PairHashMode::StrideResistant => {
+            (left as u64).wrapping_mul(0x9e37_79b1_85eb_ca87)
+                ^ (right as u64).wrapping_mul(0xff51_afd7_ed55_8ccd)
+        }
+    };
     mixed ^ (mixed >> 32)
 }
 
@@ -168,5 +228,38 @@ fn read_row_i64(layout: &RowLayout, row_ptr: usize, column: usize) -> i64 {
                 .add(layout.offsets()[column])
                 .cast::<i64>(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{pair_hash, PairHashMode};
+
+    #[test]
+    fn pair_placement_breaks_aligned_low_bit_strides_on_both_keys() {
+        const CAPACITY: u64 = 512;
+        const KEY_COUNT: usize = 256;
+        for pairs in [
+            (0..KEY_COUNT)
+                .map(|value| ((value * 256) as i64, 7))
+                .collect::<Vec<_>>(),
+            (0..KEY_COUNT)
+                .map(|value| (3, (value * 86_400) as i64))
+                .collect::<Vec<_>>(),
+        ] {
+            let occupied = pairs
+                .into_iter()
+                .map(|(left, right)| {
+                    pair_hash(PairHashMode::StrideResistant, left, right) & (CAPACITY - 1)
+                })
+                .collect::<HashSet<_>>()
+                .len();
+            assert!(
+                occupied >= KEY_COUNT * 3 / 4,
+                "aligned composite keys occupied only {occupied} initial slots"
+            );
+        }
     }
 }

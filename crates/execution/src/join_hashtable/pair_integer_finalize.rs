@@ -30,16 +30,23 @@ impl JoinHashTable {
         };
 
         let store = self.build_store.lock().unwrap();
-        let mut has_long_chains = false;
-        for block in store.block_ranges() {
-            for row_idx in 0..block.row_count() {
-                let row_ptr = unsafe { block.row_ptr(row_idx) };
-                if let Some(previous) = index.insert(self.build_row_layout.base(), row_ptr)? {
-                    self.build_row_layout
-                        .set_next(row_ptr as *mut u8, previous as *const u8);
-                    has_long_chains = true;
+        let populate_index = |index: &mut ExactI64PairJoinIndex| -> Result<bool> {
+            let mut has_long_chains = false;
+            for block in store.block_ranges() {
+                for row_idx in 0..block.row_count() {
+                    let row_ptr = unsafe { block.row_ptr(row_idx) };
+                    if let Some(previous) = index.insert(self.build_row_layout.base(), row_ptr)? {
+                        self.build_row_layout
+                            .set_next(row_ptr as *mut u8, previous as *const u8);
+                        has_long_chains = true;
+                    }
                 }
             }
+            Ok(has_long_chains)
+        };
+        let mut has_long_chains = populate_index(&mut index)?;
+        if index.strengthen_hash_if_clustered() {
+            has_long_chains = populate_index(&mut index)?;
         }
         drop(store);
 
@@ -88,5 +95,13 @@ impl JoinHashTable {
             .load()
             .as_ref()
             .map_or(0, |index| index.size_in_bytes())
+    }
+
+    #[cfg(test)]
+    pub(super) fn pair_integer_index_uses_stride_resistant_hash(&self) -> bool {
+        self.pair_integer_index
+            .load()
+            .as_ref()
+            .is_some_and(|index| index.uses_stride_resistant_hash())
     }
 }

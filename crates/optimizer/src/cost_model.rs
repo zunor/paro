@@ -211,6 +211,38 @@ impl<'a> StatisticsResolver<'a> {
 }
 
 impl CostModel {
+    /// Estimate the payload bytes avoided by grouping a fact carrier on compact
+    /// unique-dimension keys and attaching descriptive values only to partial
+    /// groups. The minimum carrier and reduction ratio price the extra
+    /// aggregate lifecycle; the dimension scan itself is charged explicitly.
+    pub(crate) fn dimension_deferral_benefit(
+        &self,
+        carrier_rows: u64,
+        group_rows: u64,
+        dimension_rows: u64,
+        payload_types: impl IntoIterator<Item = LogicalType>,
+    ) -> Option<f64> {
+        const MIN_CARRIER_ROWS: u64 = 4_096;
+        const MIN_REDUCTION_FACTOR: u64 = 8;
+        const MIN_PAYLOAD_BYTES: usize = 16;
+
+        let group_rows = group_rows.max(1);
+        let payload_width = payload_types
+            .into_iter()
+            .map(|ty| self.scan_access.estimated_width(&ty))
+            .sum::<usize>();
+        if carrier_rows < MIN_CARRIER_ROWS
+            || carrier_rows < group_rows.saturating_mul(MIN_REDUCTION_FACTOR)
+            || payload_width < MIN_PAYLOAD_BYTES
+        {
+            return None;
+        }
+        let eager_bytes = carrier_rows as f64 * payload_width as f64;
+        let deferred_bytes =
+            group_rows.saturating_add(dimension_rows) as f64 * payload_width as f64;
+        (eager_bytes > deferred_bytes).then_some(eager_bytes - deferred_bytes)
+    }
+
     /// Compare carrying payload through a row-preserving operator path with
     /// carrying one stable rowid and gathering the payload at a later
     /// frontier. The stage count makes blocking/serialized intermediates an
@@ -1053,6 +1085,31 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn dimension_deferral_prices_carrier_reduction_and_payload_width() {
+        let model = CostModel::default();
+        assert!(model
+            .dimension_deferral_benefit(1_000_000, 100, 25, [LogicalType::Varchar])
+            .is_some());
+        assert!(model
+            .dimension_deferral_benefit(1_000, 100, 25, [LogicalType::Varchar])
+            .is_none());
+        assert!(model
+            .dimension_deferral_benefit(1_000_000, 200_000, 25, [LogicalType::Varchar])
+            .is_none());
+        assert!(model
+            .dimension_deferral_benefit(1_000_000, 100, 25, [LogicalType::BigInt])
+            .is_none());
+        assert!(model
+            .dimension_deferral_benefit(
+                1_000_000,
+                100,
+                25,
+                [LogicalType::BigInt, LogicalType::BigInt],
+            )
+            .is_some());
+    }
 
     #[test]
     fn sparse_fetch_requires_enough_work_to_amortize_its_frontier() {
