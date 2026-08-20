@@ -49,10 +49,10 @@ impl EqualityClassGraph {
         let mut edges = Vec::new();
 
         for filter in &stats.filters {
-            if filter.join_type != JoinType::Inner || !is_equality(&filter.filter) {
+            if filter.join_type() != JoinType::Inner || !is_equality(&filter.filter) {
                 continue;
             }
-            let (Some(left_set), Some(right_set)) = (&filter.left_set, &filter.right_set) else {
+            let (Some(left_set), Some(right_set)) = (filter.left_set(), filter.right_set()) else {
                 continue;
             };
             if left_set.count() != 1 || right_set.count() != 1 {

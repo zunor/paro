@@ -4,8 +4,8 @@
 //! Join-order cost model based on cardinality estimates.
 
 use crate::join::build_probe_side::{
-    choose_hash_build_side, estimate_hash_build_row_width, estimate_row_payload_width,
-    HashBuildCandidate, HashBuildSide,
+    choose_join_build_side, estimate_hash_build_row_width, estimate_row_payload_width,
+    estimate_row_width_from_payload, JoinBuildCandidate, JoinBuildSide,
 };
 use crate::join_order::cardinality::CardinalityEstimator;
 use crate::join_order::query_graph::{JoinEdgeOrientation, JoinPredicateSet};
@@ -100,6 +100,12 @@ struct JoinCostBreakdown {
     children: f64,
 }
 
+struct CostedJoin {
+    combination: Arc<JoinRelationSet>,
+    cardinality: f64,
+    breakdown: JoinCostBreakdown,
+}
+
 /// `ScanStructure` records every accepted hash match as a probe-row ordinal
 /// plus a build-row pointer, then copies that identity into its emit buffers.
 /// Model those two concrete passes without pretending that a fused probe also
@@ -112,8 +118,15 @@ const HASH_MATCH_ROW_BYTES: usize = 2 * (std::mem::size_of::<u32>() + std::mem::
 /// dominate narrow builds.
 const HASH_BUCKET_CACHE_LINE_BYTES: usize = 64;
 
-/// Selection-vector identity recorded for one nested-loop candidate pair.
-const NESTED_LOOP_PAIR_BYTES: usize = 2 * std::mem::size_of::<u32>();
+/// A cross product emits dictionary vectors: the repeated probe ordinal is one
+/// `u32` per output while the contiguous build range is implicit. This is
+/// intentionally cheaper than `HASH_MATCH_ROW_BYTES`, whose scan structure
+/// stages both an ordinal and a pointer twice.
+const CROSS_PRODUCT_SELECTION_BYTES: usize = std::mem::size_of::<u32>();
+
+/// A general nested-loop comparison advances one probe/build cursor pair for
+/// every candidate before copying accepted values into flat output vectors.
+const NESTED_LOOP_CURSOR_BYTES: usize = 2 * std::mem::size_of::<usize>();
 
 fn estimate_hash_probe_row_width(condition_payload_width: usize) -> usize {
     const HASH_PROBE_RUNTIME_BYTES: usize = std::mem::size_of::<u64>()
@@ -222,17 +235,20 @@ impl CostModel {
     /// logical join output as materialized work would double-count a fused
     /// probe chain. The serialized payload is charged exactly when a subtree
     /// becomes a build input to a parent join.
-    pub fn compute_cost(
+    #[cfg(test)]
+    fn compute_cost(
         &mut self,
         left: &DPJoinNode,
         right: &DPJoinNode,
         set_manager: &mut JoinRelationSetManager,
         predicates: Option<&JoinPredicateSet>,
     ) -> f64 {
-        self.compute_cost_breakdown(left, right, set_manager, predicates)
+        self.estimate_join(left, right, set_manager, predicates)
+            .breakdown
             .total()
     }
 
+    #[cfg(test)]
     fn compute_cost_breakdown(
         &mut self,
         left: &DPJoinNode,
@@ -240,41 +256,101 @@ impl CostModel {
         set_manager: &mut JoinRelationSetManager,
         predicates: Option<&JoinPredicateSet>,
     ) -> JoinCostBreakdown {
-        // Keep the cardinality estimator warm for the union even though this
-        // node's probe output is not itself materialized. The estimate is also
-        // consumed when the selected DP node is created below.
+        self.estimate_join(left, right, set_manager, predicates)
+            .breakdown
+    }
+
+    fn estimate_join(
+        &mut self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        set_manager: &mut JoinRelationSetManager,
+        predicates: Option<&JoinPredicateSet>,
+    ) -> CostedJoin {
         let combination = set_manager.union(&left.set, &right.set);
         let join_rows = self
             .cardinality_estimator
             .estimate_cardinality(&combination);
+        let breakdown = self.cost_breakdown_for_cardinality(left, right, predicates, join_rows);
+        CostedJoin {
+            combination,
+            cardinality: join_rows,
+            breakdown,
+        }
+    }
+
+    fn cost_breakdown_for_cardinality(
+        &self,
+        left: &DPJoinNode,
+        right: &DPJoinNode,
+        predicates: Option<&JoinPredicateSet>,
+        join_rows: f64,
+    ) -> JoinCostBreakdown {
         let left_rows = left.cardinality;
         let right_rows = right.cardinality;
         let (left_condition_width, right_condition_width, has_hash_key) =
             Self::condition_payload_widths(predicates);
+        let filtering_side = Self::reduction_filtering_side(predicates);
+        if !has_hash_key {
+            let left_work =
+                left_rows * estimate_row_width_from_payload(left.output_payload_width) as f64;
+            let right_work =
+                right_rows * estimate_row_width_from_payload(right.output_payload_width) as f64;
+            let build_side = choose_join_build_side(
+                filtering_side,
+                JoinBuildCandidate {
+                    serialized_work: left_work,
+                    contains_control_region: filtering_side == Some(JoinBuildSide::Left)
+                        && self.contains_control_region(&left.set),
+                },
+                JoinBuildCandidate {
+                    serialized_work: right_work,
+                    contains_control_region: filtering_side == Some(JoinBuildSide::Right)
+                        && self.contains_control_region(&right.set),
+                },
+            );
+            let build = match build_side {
+                JoinBuildSide::Left => left_work,
+                JoinBuildSide::Right => right_work,
+            };
+            if predicates.is_none() {
+                return JoinCostBreakdown {
+                    build,
+                    probe: left_rows * right_rows * CROSS_PRODUCT_SELECTION_BYTES as f64,
+                    match_output: 0.0,
+                    children: left.cost + right.cost,
+                };
+            }
+            let pair_width = left_condition_width
+                .saturating_add(right_condition_width)
+                .saturating_add(NESTED_LOOP_CURSOR_BYTES);
+            return JoinCostBreakdown {
+                build,
+                probe: left_rows * right_rows * pair_width as f64,
+                // General NLJ writes accepted values into flat vectors rather
+                // than returning dictionary references like cross/hash joins.
+                match_output: join_rows
+                    * estimate_row_width_from_payload(Self::output_payload_width(
+                        left, right, predicates,
+                    )) as f64,
+                children: left.cost + right.cost,
+            };
+        }
         let left_input = HashInputEstimate {
             rows: left_rows,
             projected_payload_width: left.output_payload_width,
             condition_payload_width: left_condition_width,
-            contains_control_region: self.contains_control_region(&left.set),
+            contains_control_region: filtering_side == Some(JoinBuildSide::Left)
+                && self.contains_control_region(&left.set),
         };
         let right_input = HashInputEstimate {
             rows: right_rows,
             projected_payload_width: right.output_payload_width,
             condition_payload_width: right_condition_width,
-            contains_control_region: self.contains_control_region(&right.set),
+            contains_control_region: filtering_side == Some(JoinBuildSide::Right)
+                && self.contains_control_region(&right.set),
         };
-        if !has_hash_key {
-            let pair_width = left_condition_width
-                .saturating_add(right_condition_width)
-                .saturating_add(NESTED_LOOP_PAIR_BYTES);
-            return JoinCostBreakdown {
-                build: 0.0,
-                probe: left_rows * right_rows * pair_width as f64,
-                match_output: 0.0,
-                children: left.cost + right.cost,
-            };
-        }
-        let (build, probe) = Self::hash_orientation(left_input, right_input, predicates);
+        let (build, probe) = Self::hash_orientation(left_input, right_input, filtering_side);
         JoinCostBreakdown {
             build: build.execution_build_work(),
             probe: probe.probe_work(),
@@ -283,6 +359,14 @@ impl CostModel {
             // therefore never pay this hash-match buffer cost.
             match_output: join_rows * HASH_MATCH_ROW_BYTES as f64,
             children: left.cost + right.cost,
+        }
+    }
+
+    fn reduction_filtering_side(predicates: Option<&JoinPredicateSet>) -> Option<JoinBuildSide> {
+        match predicates.and_then(JoinPredicateSet::reduction_orientation) {
+            Some(JoinEdgeOrientation::Forward) => Some(JoinBuildSide::Right),
+            Some(JoinEdgeOrientation::Inverted) => Some(JoinBuildSide::Left),
+            None => None,
         }
     }
 
@@ -376,38 +460,22 @@ impl CostModel {
     fn hash_orientation(
         left: HashInputEstimate,
         right: HashInputEstimate,
-        predicates: Option<&JoinPredicateSet>,
+        filtering_side: Option<JoinBuildSide>,
     ) -> (HashInputEstimate, HashInputEstimate) {
-        let mut join_type = predicates.map_or(paro_planner::operator::JoinType::Inner, |set| {
-            set.join_type()
-        });
-        if predicates.and_then(JoinPredicateSet::reduction_orientation)
-            == Some(JoinEdgeOrientation::Inverted)
-        {
-            join_type = match join_type {
-                paro_planner::operator::JoinType::Semi => {
-                    paro_planner::operator::JoinType::RightSemi
-                }
-                paro_planner::operator::JoinType::Anti => {
-                    paro_planner::operator::JoinType::RightAnti
-                }
-                other => other,
-            };
-        }
-        let selected = choose_hash_build_side(
-            join_type,
-            HashBuildCandidate {
+        let selected = choose_join_build_side(
+            filtering_side,
+            JoinBuildCandidate {
                 serialized_work: left.serialized_build_work(),
                 contains_control_region: left.contains_control_region,
             },
-            HashBuildCandidate {
+            JoinBuildCandidate {
                 serialized_work: right.serialized_build_work(),
                 contains_control_region: right.contains_control_region,
             },
         );
         match selected {
-            HashBuildSide::Left => (left, right),
-            HashBuildSide::Right => (right, left),
+            JoinBuildSide::Left => (left, right),
+            JoinBuildSide::Right => (right, left),
         }
     }
 
@@ -419,20 +487,16 @@ impl CostModel {
         set_manager: &mut JoinRelationSetManager,
         predicates: Option<JoinPredicateSet>,
     ) -> DPJoinNode {
-        let combination = set_manager.union(&left.set, &right.set);
         let output_payload_width = Self::output_payload_width(left, right, predicates.as_ref());
-        let cost = self.compute_cost(left, right, set_manager, predicates.as_ref());
-        let cardinality = self
-            .cardinality_estimator
-            .estimate_cardinality(&combination);
+        let estimate = self.estimate_join(left, right, set_manager, predicates.as_ref());
 
         DPJoinNode::intermediate(
-            combination,
+            estimate.combination,
             predicates,
             left.set.clone(),
             right.set.clone(),
-            cost,
-            cardinality,
+            estimate.breakdown.total(),
+            estimate.cardinality,
             output_payload_width,
         )
     }
@@ -563,8 +627,8 @@ mod tests {
         let crate::join_order::query_graph::CutPredicateResolution::Resolved(Some(predicates)) =
             JoinPredicateSet::from_filters(
                 filters.iter(),
-                filter.left_set.as_deref().unwrap_or(filter.set.as_ref()),
-                filter.right_set.as_deref().unwrap_or(filter.set.as_ref()),
+                filter.left_set().map_or(filter.set.as_ref(), Arc::as_ref),
+                filter.right_set().map_or(filter.set.as_ref(), Arc::as_ref),
             )
         else {
             panic!("expected a valid non-empty join predicate set")
@@ -980,15 +1044,20 @@ mod tests {
         let left = leaf(&mut model, sets.get_relation(0));
         let right = leaf(&mut model, sets.get_relation(1));
         let predicates = predicate_set(&[filter]);
+        let combination = sets.union(&left.set, &right.set);
+        let join_rows = model.get_cardinality(&combination);
 
         let cost = model.compute_cost_breakdown(&left, &right, &mut sets, Some(&predicates));
         let condition_width = estimate_row_payload_width(&[LogicalType::Integer]);
-        assert_eq!(cost.build, 0.0);
-        assert_eq!(cost.match_output, 0.0);
+        assert_eq!(cost.build, 10.0 * estimate_row_width_from_payload(1) as f64);
+        assert_eq!(
+            cost.match_output,
+            join_rows * estimate_row_width_from_payload(2) as f64
+        );
         assert_eq!(
             cost.probe,
-            10.0 * 1_000.0 * (2 * condition_width + NESTED_LOOP_PAIR_BYTES) as f64,
-            "range joins evaluate candidate pairs without hash-table work"
+            10.0 * 1_000.0 * (2 * condition_width + NESTED_LOOP_CURSOR_BYTES) as f64,
+            "range joins materialize one side, evaluate every pair, and copy accepted rows"
         );
     }
 
@@ -1181,7 +1250,11 @@ mod tests {
 
         let cost = cost_model.compute_cost(&left, &right, &mut set_manager, None);
 
-        // Cross product cost should be high (100 * 50 = 5000)
-        assert!(cost >= 5000.0);
+        assert_eq!(
+            cost,
+            50.0 * estimate_row_width_from_payload(1) as f64
+                + 100.0 * 50.0 * CROSS_PRODUCT_SELECTION_BYTES as f64,
+            "cross product materializes the smaller input and emits one repeated-row ordinal per pair"
+        );
     }
 }

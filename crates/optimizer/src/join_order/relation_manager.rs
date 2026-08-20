@@ -370,21 +370,39 @@ impl RelationManager {
                 }
                 match cj.join_type {
                     JoinType::Inner | JoinType::Semi | JoinType::Anti => {
-                        // Check if conditions reference columns from both sides
-                        for cond in &cj.conditions {
-                            if Self::expression_contains_column_ref(&cond.left)
-                                && Self::expression_contains_column_ref(&cond.right)
-                            {
-                                return true;
-                            }
-                        }
-                        false
+                        Self::comparison_has_binary_edge(cj)
                     }
                     _ => false,
                 }
             }
             Join::Any(_) => false,
         }
+    }
+
+    /// Whether this reduction can be detached from its current preserved
+    /// input and represented as a query-graph edge.
+    ///
+    /// A comparison with a constant on one side still has valid SEMI/ANTI
+    /// execution semantics, but it does not identify both graph roles. Such a
+    /// join must remain an atomic relation; converting it to a root predicate
+    /// would lose its existential multiplicity contract.
+    pub(crate) fn reduction_join_is_reorderable(
+        join: &paro_planner::operator::ComparisonJoin,
+    ) -> bool {
+        matches!(join.join_type, JoinType::Semi | JoinType::Anti)
+            && join.duplicate_eliminated_columns.is_empty()
+            && !join.conditions.iter().any(|condition| {
+                condition.left.evaluation_properties().is_reorder_fence()
+                    || condition.right.evaluation_properties().is_reorder_fence()
+            })
+            && Self::comparison_has_binary_edge(join)
+    }
+
+    fn comparison_has_binary_edge(join: &paro_planner::operator::ComparisonJoin) -> bool {
+        join.conditions.iter().any(|condition| {
+            Self::expression_contains_column_ref(&condition.left)
+                && Self::expression_contains_column_ref(&condition.right)
+        })
     }
 
     /// Check if an expression contains a column reference.
@@ -798,9 +816,9 @@ mod tests {
         assert!(extracted.root_filters.is_empty());
         // First filter references both relations
         assert_eq!(filters[0].set.count(), 2);
-        assert_eq!(filters[0].join_type, JoinType::Inner);
-        assert!(filters[0].left_set.is_some());
-        assert!(filters[0].right_set.is_some());
+        assert_eq!(filters[0].join_type(), JoinType::Inner);
+        assert!(filters[0].left_set().is_some());
+        assert!(filters[0].right_set().is_some());
         // Second filter references only one relation
         assert_eq!(filters[1].set.count(), 1);
     }
@@ -832,7 +850,7 @@ mod tests {
             .graph_filters;
 
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].join_type, JoinType::Anti);
+        assert_eq!(filters[0].join_type(), JoinType::Anti);
         assert_eq!(filters[0].anti_join_mode, AntiJoinMode::NullAware);
         assert_eq!(
             filters[0].left_binding.map(|key| key.column),
@@ -844,8 +862,8 @@ mod tests {
             Some(ColumnBinding::new(1, 0))
         );
         assert_eq!(filters[0].right_binding.map(|key| key.relation), Some(1));
-        assert!(filters[0].left_set.is_some());
-        assert!(filters[0].right_set.is_some());
+        assert!(filters[0].left_set().is_some());
+        assert!(filters[0].right_set().is_some());
     }
 
     #[test]

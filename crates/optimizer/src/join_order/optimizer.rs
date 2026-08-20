@@ -25,7 +25,7 @@ use paro_storage::statistics::{ColumnStatistics, NumericStats};
 
 use crate::cost_model::CostModel as LogicalCostModel;
 use crate::join_order::cost_model::{CostModel, DPJoinNode};
-use crate::join_order::enumerator::PlanEnumerator;
+use crate::join_order::enumerator::{EnumerationOutcome, PlanEnumerator};
 use crate::join_order::query_graph::{FilterInfo, JoinEdgeOrientation, QueryGraphEdges};
 use crate::join_order::relation::{JoinRelationSet, JoinRelationSetManager};
 use crate::join_order::relation_manager::{
@@ -272,16 +272,6 @@ impl JoinOrderOptimizer {
             return Ok(None);
         };
         let filter_infos = extracted_predicates.graph_filters;
-        if filter_infos
-            .iter()
-            .any(|filter| !filter.has_valid_reduction_roles())
-        {
-            // The source tree remains available to the post-order driver.
-            // Invalid reduction metadata makes this region ineligible for
-            // reordering; it must never turn a valid statement into an
-            // optimizer-internal query failure.
-            return Ok(None);
-        }
         self.apply_relation_local_selectivity(&filter_infos);
         self.filter_infos = filter_infos.clone();
 
@@ -293,10 +283,9 @@ impl JoinOrderOptimizer {
         // Build query graph
         for filter_info in &filter_infos {
             // Get the left and right sets from the filter
-            if let (Some(left_set), Some(right_set)) = (
-                filter_info.left_set.as_ref(),
-                filter_info.right_set.as_ref(),
-            ) {
+            if let (Some(left_set), Some(right_set)) =
+                (filter_info.left_set(), filter_info.right_set())
+            {
                 self.query_graph.create_edge(
                     left_set,
                     right_set.clone(),
@@ -344,8 +333,9 @@ impl JoinOrderOptimizer {
         enumerator.init_leaf_plans();
 
         // Solve join order
-        if !enumerator.solve_join_order() {
-            // Timed out or failed
+        if enumerator.solve_join_order() != EnumerationOutcome::Complete {
+            // The original tree remains authoritative when pair enumeration
+            // is exhausted or a cut cannot preserve its logical semantics.
             return Ok(None);
         }
 
@@ -386,7 +376,7 @@ impl JoinOrderOptimizer {
     fn apply_relation_local_selectivity(&mut self, filters: &[Arc<FilterInfo>]) {
         let mut filters_by_relation = HashMap::<usize, Vec<Expression>>::new();
         for filter in filters {
-            if filter.join_type == JoinType::Inner && filter.set.count() == 1 {
+            if filter.join_type() == JoinType::Inner && filter.set.count() == 1 {
                 filters_by_relation
                     .entry(filter.set.relations()[0])
                     .or_default()
@@ -511,10 +501,15 @@ impl JoinOrderOptimizer {
         join: &ComparisonJoin,
         filters: &mut Vec<ExtractedFilter>,
     ) {
+        debug_assert!(RelationManager::reduction_join_is_reorderable(join));
         if let LogicalOperator::Join(Join::Comparison(child)) = &join.left.operator {
-            if matches!(child.join_type, JoinType::Semi | JoinType::Anti) {
+            if RelationManager::reduction_join_is_reorderable(child) {
                 self.extract_reduction_cascade(ctx, bind_context, child, filters);
             } else {
+                // A reduction whose predicate does not identify both inputs
+                // (for example `5 = rhs.key`) is valid SQL but not a graph
+                // edge. Keep the complete subtree atomic so its existential
+                // semantics survive while outer reductions remain reorderable.
                 self.add_relation_plan(ctx, bind_context, &join.left);
             }
         } else {
@@ -560,7 +555,7 @@ impl JoinOrderOptimizer {
         bind_context: &BindContext,
         plan: &LogicalPlan,
     ) {
-        let cardinality = self.estimate_cardinality(ctx, plan);
+        let cardinality = crate::join::build_probe_side::estimate_plan_cardinality(ctx, plan);
         let mut stats = RelationStats::with_cardinality(cardinality);
         stats.estimated_payload_width =
             crate::join::build_probe_side::estimate_row_payload_width(&plan.types());
@@ -604,43 +599,6 @@ impl JoinOrderOptimizer {
             plan,
             bind_context.shared().as_ref(),
         ));
-    }
-
-    /// Estimate the cardinality of a base relation.
-    fn estimate_cardinality(&self, ctx: &StatementContext, plan: &LogicalPlan) -> usize {
-        if let Some(estimate) = plan.stats.estimated_cardinality {
-            return estimate.expected.max(1) as usize;
-        }
-
-        match &plan.operator {
-            LogicalOperator::Get(get) => {
-                if let Some(table) = &get.table {
-                    if let Some(storage) = table.get_storage() {
-                        let rows = storage.total_rows();
-                        if rows == 0 {
-                            return 1;
-                        }
-                        return rows;
-                    }
-                }
-
-                match ctx.get_setting("default_table_cardinality") {
-                    Some(paro_common::runtime_value::Value::BigInt(v)) if *v > 0 => *v as usize,
-                    Some(paro_common::runtime_value::Value::Integer(v)) if *v > 0 => *v as usize,
-                    _ => 1000,
-                }
-            }
-            LogicalOperator::ExpressionGet(get) => get.expressions.len().max(1),
-            LogicalOperator::TableFunctionGet(_) => {
-                // Table functions may have cardinality estimates
-                // For now, use a default
-                100
-            }
-            _ => {
-                // Default estimate
-                1000
-            }
-        }
     }
 
     /// Reconstruct a logical plan from a DP join node.
@@ -1674,6 +1632,51 @@ mod tests {
     }
 
     #[test]
+    fn reduction_without_two_graph_roles_is_an_atomic_preserved_input() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let constant_key_reduction = LogicalPlan::synthetic(LogicalOperator::Join(
+            Join::Comparison(ComparisonJoin::new(
+                JoinType::Semi,
+                LogicalPlan::synthetic(create_scan(0)),
+                LogicalPlan::synthetic(create_scan(1)),
+                vec![paro_planner::operator::JoinCondition::new(
+                    Expression::Constant(ConstantExpression::new(
+                        Value::Integer(5),
+                        LogicalType::Integer,
+                    )),
+                    column_ref(1, 0),
+                    JoinComparisonType::Equal,
+                )],
+            )),
+        ));
+        let plan = LogicalPlan::synthetic(LogicalOperator::Join(Join::Comparison(
+            ComparisonJoin::new(
+                JoinType::Semi,
+                constant_key_reduction,
+                LogicalPlan::synthetic(create_scan(2)),
+                vec![join_condition(JoinComparisonType::Equal, 0, 2)],
+            ),
+        )));
+        let mut optimizer = JoinOrderOptimizer::new();
+        let mut filters = Vec::new();
+
+        optimizer
+            .extract_join_relations(&session, &bind_context, &plan, &mut filters, true)
+            .unwrap();
+
+        assert_eq!(optimizer.relation_manager.num_relations(), 2);
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].join_type, JoinType::Semi);
+        let LogicalOperator::Join(Join::Comparison(atomic)) = &optimizer.relation_plans[0].operator
+        else {
+            panic!("role-less reduction must remain an atomic relation")
+        };
+        assert_eq!(atomic.join_type, JoinType::Semi);
+        assert!(matches!(atomic.conditions[0].left, Expression::Constant(_)));
+    }
+
+    #[test]
     fn extraction_treats_any_join_as_an_atomic_relation() {
         let session = make_test_session();
         let bind_context = BindContext::new();
@@ -1808,5 +1811,82 @@ mod tests {
         // the single-column C relation as the final hash build instead of the
         // wider B-C intermediate.
         assert_eq!(nested_tables, HashSet::from([0usize, 1usize]));
+    }
+
+    #[test]
+    fn reduction_control_region_orientation_survives_physical_side_selection() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let preserved = projection_relation(&bind_context, 100, 0, 1);
+        let dependent_left = projection_relation(&bind_context, 101, 1, 64);
+        let dependent_right = projection_relation(&bind_context, 102, 2, 64);
+        let mut dependent = ComparisonJoin::new(
+            JoinType::Inner,
+            dependent_left,
+            dependent_right,
+            vec![join_condition(JoinComparisonType::Equal, 1, 2)],
+        );
+        dependent.duplicate_eliminated_columns = vec![column_ref(1, 0)];
+        let dependent = LogicalPlan {
+            id: bind_context.next_plan_id(),
+            stats: NodeStats {
+                estimated_cardinality: Some(CardinalityEstimate::exact(64)),
+                ..NodeStats::default()
+            },
+            operator: LogicalOperator::Join(Join::Comparison(dependent)),
+        };
+        let plan = LogicalPlan {
+            id: bind_context.next_plan_id(),
+            stats: NodeStats::default(),
+            operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Semi,
+                preserved,
+                dependent,
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ))),
+        };
+
+        let optimized = JoinOrderOptimizer::new()
+            .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
+            .expect("join-order optimization should succeed");
+        let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);
+        let LogicalOperator::Join(Join::Comparison(root)) = physical.operator else {
+            panic!("expected reduction join root")
+        };
+        assert_eq!(root.join_type, JoinType::Semi);
+        assert!(
+            crate::join::build_probe_side::contains_control_region_boundary(&root.right),
+            "the filtering control region must remain the materialized build input"
+        );
+    }
+
+    #[test]
+    fn reduction_work_orientation_survives_physical_side_selection() {
+        let session = make_test_session();
+        let bind_context = BindContext::new();
+        let plan = LogicalPlan {
+            id: bind_context.next_plan_id(),
+            stats: NodeStats::default(),
+            operator: LogicalOperator::Join(Join::Comparison(ComparisonJoin::new(
+                JoinType::Semi,
+                projection_relation(&bind_context, 100, 0, 1),
+                projection_relation(&bind_context, 101, 1, 64),
+                vec![join_condition(JoinComparisonType::Equal, 0, 1)],
+            ))),
+        };
+
+        let optimized = JoinOrderOptimizer::new()
+            .optimize_plan(&session, plan, &HashMap::new(), &bind_context)
+            .expect("join-order optimization should succeed");
+        let physical = BuildProbeSideOptimizer::new(Arc::clone(&session)).optimize_plan(optimized);
+        let LogicalOperator::Join(Join::Comparison(root)) = physical.operator else {
+            panic!("expected reduction join root")
+        };
+        assert_eq!(root.join_type, JoinType::RightSemi);
+        assert_eq!(
+            root.right.get_column_bindings()[0].table_index,
+            0,
+            "the smaller preserved input selected by DP must remain the physical build side"
+        );
     }
 }

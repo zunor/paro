@@ -75,28 +75,48 @@ impl BuildProbeSideOptimizer {
             return;
         };
 
+        let has_hash_key = join.conditions.iter().any(|condition| {
+            matches!(
+                condition.comparison,
+                paro_planner::operator::JoinComparisonType::Equal
+                    | paro_planner::operator::JoinComparisonType::NotDistinctFrom
+            )
+        });
         let left_cost = self.comparison_build_cost(
             join.left.as_ref(),
             &join.left_projection_map,
             join.conditions.iter().map(|condition| &condition.left),
+            has_hash_key,
         );
         let right_cost = self.comparison_build_cost(
             join.right.as_ref(),
             &join.right_projection_map,
             join.conditions.iter().map(|condition| &condition.right),
+            has_hash_key,
         );
-        let build_side = choose_hash_build_side(
-            join.join_type,
-            HashBuildCandidate {
+        let filtering_side = reduction_filtering_side(join.join_type);
+        // Control-region ownership constrains only a reduction's filtering
+        // input. Ordinary comparison joins never consult this witness, so do
+        // not turn the bottom-up pass into repeated full-subtree scans.
+        let filtering_contains_control_region = match filtering_side {
+            Some(JoinBuildSide::Left) => contains_control_region_boundary(join.left.as_ref()),
+            Some(JoinBuildSide::Right) => contains_control_region_boundary(join.right.as_ref()),
+            None => false,
+        };
+        let build_side = choose_join_build_side(
+            filtering_side,
+            JoinBuildCandidate {
                 serialized_work: left_cost,
-                contains_control_region: contains_control_region_boundary(join.left.as_ref()),
+                contains_control_region: filtering_side == Some(JoinBuildSide::Left)
+                    && filtering_contains_control_region,
             },
-            HashBuildCandidate {
+            JoinBuildCandidate {
                 serialized_work: right_cost,
-                contains_control_region: contains_control_region_boundary(join.right.as_ref()),
+                contains_control_region: filtering_side == Some(JoinBuildSide::Right)
+                    && filtering_contains_control_region,
             },
         );
-        if build_side == HashBuildSide::Right {
+        if build_side == JoinBuildSide::Right {
             return;
         }
 
@@ -134,9 +154,16 @@ impl BuildProbeSideOptimizer {
         plan: &LogicalPlan,
         projection: &ProjectionMap,
         condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
+        has_hash_key: bool,
     ) -> f64 {
         let cardinality = self.estimated_cardinality(plan) as f64;
         let plan_types = plan.types();
+        if !has_hash_key {
+            // Nested-loop joins materialize the complete build chunk. Unlike
+            // hash rows there is no independently serialized key/runtime
+            // suffix, so mirror the materialized row container directly.
+            return cardinality * estimate_row_width(&plan_types).max(1) as f64;
+        }
         let projected_types = projection
             .to_indices(plan_types.len())
             .into_iter()
@@ -160,18 +187,41 @@ impl BuildProbeSideOptimizer {
     }
 
     fn estimated_cardinality(&self, plan: &LogicalPlan) -> usize {
-        plan.stats
-            .estimated_cardinality
-            .map(|estimate| estimate.expected.min(usize::MAX as u64) as usize)
-            .unwrap_or_else(|| self.default_cardinality())
+        estimate_plan_cardinality(self.session.as_ref(), plan)
+    }
+}
+
+/// Estimate one atomic logical input consistently for join enumeration and
+/// final build/probe orientation.
+pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &LogicalPlan) -> usize {
+    if let Some(estimate) = plan.stats.estimated_cardinality {
+        return estimate.expected.max(1).min(usize::MAX as u64) as usize;
     }
 
-    fn default_cardinality(&self) -> usize {
-        match self.session.get_setting("default_table_cardinality") {
-            Some(paro_common::runtime_value::Value::BigInt(v)) if *v > 0 => *v as usize,
-            Some(paro_common::runtime_value::Value::Integer(v)) if *v > 0 => *v as usize,
-            _ => 1000,
+    match &plan.operator {
+        LogicalOperator::Get(get) => {
+            if let Some(rows) = get
+                .table
+                .as_ref()
+                .and_then(|table| table.get_storage())
+                .map(|storage| storage.total_rows())
+                .filter(|rows| *rows > 0)
+            {
+                return rows;
+            }
+            default_cardinality(session)
         }
+        LogicalOperator::ExpressionGet(get) => get.expressions.len().max(1),
+        LogicalOperator::TableFunctionGet(_) => 100,
+        _ => default_cardinality(session),
+    }
+}
+
+fn default_cardinality(session: &StatementContext) -> usize {
+    match session.get_setting("default_table_cardinality") {
+        Some(paro_common::runtime_value::Value::BigInt(v)) if *v > 0 => *v as usize,
+        Some(paro_common::runtime_value::Value::Integer(v)) if *v > 0 => *v as usize,
+        _ => 1000,
     }
 }
 
@@ -191,48 +241,53 @@ pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
             .any(|child| contains_control_region_boundary(child))
 }
 
-/// Physical side selected as the hash-table build input.
+/// Physical side selected as the materialized join build input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HashBuildSide {
+pub(crate) enum JoinBuildSide {
     Left,
     Right,
 }
 
-/// Inputs to the shared hash-build orientation policy.
+/// Return the logical filtering input of a reduction join in its current
+/// physical child coordinates.
+pub(crate) fn reduction_filtering_side(join_type: JoinType) -> Option<JoinBuildSide> {
+    match join_type {
+        JoinType::Semi | JoinType::Anti => Some(JoinBuildSide::Right),
+        JoinType::RightSemi | JoinType::RightAnti => Some(JoinBuildSide::Left),
+        _ => None,
+    }
+}
+
+/// Inputs to the shared join-build orientation policy.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct HashBuildCandidate {
+pub(crate) struct JoinBuildCandidate {
     /// Cost of serializing this input into the physical build-row layout.
     pub serialized_work: f64,
     /// Whether moving this subtree to the probe side crosses a control region.
     pub contains_control_region: bool,
 }
 
-/// Choose the physical hash build side for one comparison join.
+/// Choose the physical build side for one comparison join.
 ///
 /// Both DP enumeration and final build/probe lowering call this function. A
 /// reduction's filtering control region must remain a materialized build
 /// producer; otherwise the smaller serialized build input wins, with the
 /// current right-build convention breaking ties.
-pub(crate) fn choose_hash_build_side(
-    join_type: JoinType,
-    left: HashBuildCandidate,
-    right: HashBuildCandidate,
-) -> HashBuildSide {
-    let filtering_side = match join_type {
-        JoinType::Semi | JoinType::Anti => Some(HashBuildSide::Right),
-        JoinType::RightSemi | JoinType::RightAnti => Some(HashBuildSide::Left),
-        _ => None,
-    };
-    if filtering_side == Some(HashBuildSide::Left) && left.contains_control_region {
-        return HashBuildSide::Left;
+pub(crate) fn choose_join_build_side(
+    filtering_side: Option<JoinBuildSide>,
+    left: JoinBuildCandidate,
+    right: JoinBuildCandidate,
+) -> JoinBuildSide {
+    if filtering_side == Some(JoinBuildSide::Left) && left.contains_control_region {
+        return JoinBuildSide::Left;
     }
-    if filtering_side == Some(HashBuildSide::Right) && right.contains_control_region {
-        return HashBuildSide::Right;
+    if filtering_side == Some(JoinBuildSide::Right) && right.contains_control_region {
+        return JoinBuildSide::Right;
     }
     if right.serialized_work <= left.serialized_work {
-        HashBuildSide::Right
+        JoinBuildSide::Right
     } else {
-        HashBuildSide::Left
+        JoinBuildSide::Left
     }
 }
 
@@ -240,7 +295,12 @@ pub(crate) fn choose_hash_build_side(
 ///
 /// Used by the final build/probe pass for cross products and tests.
 pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
-    8 + estimate_row_payload_width(types)
+    estimate_row_width_from_payload(estimate_row_payload_width(types))
+}
+
+/// Add the fixed row-container header to an already estimated payload width.
+pub(crate) fn estimate_row_width_from_payload(payload_width: usize) -> usize {
+    std::mem::size_of::<u64>().saturating_add(payload_width)
 }
 
 /// Estimate one serialized comparison-hash-build row from its visible payload

@@ -514,7 +514,7 @@ impl CardinalityEstimator {
 
     /// Check if a filter is empty (no specific columns referenced).
     fn empty_filter(&self, filter_info: &FilterInfo) -> bool {
-        filter_info.left_set.is_none() && filter_info.right_set.is_none()
+        filter_info.left_set().is_none() && filter_info.right_set().is_none()
     }
 
     /// Add relation stats for a single-column filter.
@@ -541,8 +541,8 @@ impl CardinalityEstimator {
 
     /// Check if this is a single-column filter.
     fn single_column_filter(&self, filter_info: &FilterInfo) -> bool {
-        if filter_info.left_set.is_some()
-            && filter_info.right_set.is_some()
+        if filter_info.left_set().is_some()
+            && filter_info.right_set().is_some()
             && filter_info.set.count() > 1
         {
             // Both sets are from different relations
@@ -551,7 +551,7 @@ impl CardinalityEstimator {
         if self.empty_filter(filter_info) {
             return false;
         }
-        if matches!(filter_info.join_type, JoinType::Semi | JoinType::Anti) {
+        if matches!(filter_info.join_type(), JoinType::Semi | JoinType::Anti) {
             return false;
         }
         true
@@ -917,12 +917,12 @@ impl CardinalityEstimator {
     /// Check if an edge connects to a subgraph.
     fn edge_connects(edge: &FilterInfoWithTotalDomains, subgraph: &Subgraph2Denominator) -> bool {
         if let Some(ref relations) = subgraph.relations {
-            if let Some(ref left_set) = edge.filter_info.left_set {
+            if let Some(left_set) = edge.filter_info.left_set() {
                 if relations.contains_all(left_set) {
                     return true;
                 }
             }
-            if let Some(ref right_set) = edge.filter_info.right_set {
+            if let Some(right_set) = edge.filter_info.right_set() {
                 if relations.contains_all(right_set) {
                     return true;
                 }
@@ -964,14 +964,14 @@ impl CardinalityEstimator {
         right: &Subgraph2Denominator,
         filter: &FilterInfoWithTotalDomains,
     ) -> Arc<JoinRelationSet> {
-        match filter.filter_info.join_type {
+        match filter.filter_info.join_type() {
             JoinType::Semi | JoinType::Anti => {
                 // For SEMI/ANTI joins, only include the left side in numerator
-                if let (Some(ref left_rels), Some(ref filter_left)) =
-                    (&left.relations, &filter.filter_info.left_set)
+                if let (Some(ref left_rels), Some(filter_left)) =
+                    (&left.relations, filter.filter_info.left_set())
                 {
                     if let Some(ref right_rels) = right.relations {
-                        if let Some(ref filter_right) = filter.filter_info.right_set {
+                        if let Some(filter_right) = filter.filter_info.right_set() {
                             if left_rels.contains_all(filter_left)
                                 && right_rels.contains_all(filter_right)
                             {
@@ -1000,7 +1000,7 @@ impl CardinalityEstimator {
     ) -> f64 {
         let mut new_denom = left.denom * right.denom;
 
-        match filter.filter_info.join_type {
+        match filter.filter_info.join_type() {
             JoinType::Inner => {
                 // Get comparison type from the filter expression
                 let comparison_type = Self::get_comparison_type(&filter.filter_info.filter);
@@ -1025,11 +1025,11 @@ impl CardinalityEstimator {
             }
             JoinType::Semi | JoinType::Anti => {
                 let output_fraction = self.semi_anti_output_fraction(filter);
-                if let (Some(ref left_rels), Some(ref filter_left)) =
-                    (&left.relations, &filter.filter_info.left_set)
+                if let (Some(ref left_rels), Some(filter_left)) =
+                    (&left.relations, filter.filter_info.left_set())
                 {
                     if let Some(ref right_rels) = right.relations {
-                        if let Some(ref filter_right) = filter.filter_info.right_set {
+                        if let Some(filter_right) = filter.filter_info.right_set() {
                             if left_rels.contains_all(filter_left)
                                 && right_rels.contains_all(filter_right)
                             {
@@ -1072,7 +1072,7 @@ impl CardinalityEstimator {
                     trace!(
                         target: targets::OPTIMIZER,
                         filter_index = filter.filter_info.filter_index,
-                        join_type = ?filter.filter_info.join_type,
+                        join_type = ?filter.filter_info.join_type(),
                         preserved_binding = ?bindings.preserved,
                         filtering_binding = ?bindings.filtering,
                         preserved_ndv = preserved.distinct_count,
@@ -1089,7 +1089,7 @@ impl CardinalityEstimator {
         let (matched_fraction, minimum_output_fraction) =
             estimate.unwrap_or((DEFAULT_SEMI_ANTI_MATCH_FRACTION, 0.0));
 
-        let output_fraction = match filter.filter_info.join_type {
+        let output_fraction = match filter.filter_info.join_type() {
             JoinType::Semi => matched_fraction,
             JoinType::Anti => 1.0 - matched_fraction,
             _ => return DEFAULT_SEMI_ANTI_MATCH_FRACTION,
@@ -1174,10 +1174,10 @@ impl CardinalityEstimator {
                 let mut left_subgraph = Subgraph2Denominator::default();
                 let mut right_subgraph = Subgraph2Denominator::default();
 
-                left_subgraph.relations = edge.filter_info.left_set.clone();
-                left_subgraph.numerator_relations = edge.filter_info.left_set.clone();
-                right_subgraph.relations = edge.filter_info.right_set.clone();
-                right_subgraph.numerator_relations = edge.filter_info.right_set.clone();
+                left_subgraph.relations = edge.filter_info.left_set().cloned();
+                left_subgraph.numerator_relations = edge.filter_info.left_set().cloned();
+                right_subgraph.relations = edge.filter_info.right_set().cloned();
+                right_subgraph.numerator_relations = edge.filter_info.right_set().cloned();
 
                 left_subgraph.numerator_relations =
                     Some(self.update_numerator_relations(&left_subgraph, &right_subgraph, edge));
@@ -1190,24 +1190,25 @@ impl CardinalityEstimator {
                 // Extend existing subgraph
                 let idx = subgraph_connections[0];
                 let mut right_subgraph = Subgraph2Denominator::default();
-                right_subgraph.relations = edge.filter_info.right_set.clone();
-                right_subgraph.numerator_relations = edge.filter_info.right_set.clone();
+                right_subgraph.relations = edge.filter_info.right_set().cloned();
+                right_subgraph.numerator_relations = edge.filter_info.right_set().cloned();
 
                 // Check if right is already in left
                 if let Some(ref left_rels) = subgraphs[idx].relations {
                     if let Some(ref right_rels) = right_subgraph.relations {
                         if left_rels.contains_all(right_rels) {
-                            right_subgraph.relations = edge.filter_info.left_set.clone();
-                            right_subgraph.numerator_relations = edge.filter_info.left_set.clone();
+                            right_subgraph.relations = edge.filter_info.left_set().cloned();
+                            right_subgraph.numerator_relations =
+                                edge.filter_info.left_set().cloned();
                         }
                     }
                 }
 
                 // Check if edge connects same subgraph to itself
-                if let (Some(ref left_rels), Some(ref filter_left), Some(ref filter_right)) = (
+                if let (Some(ref left_rels), Some(filter_left), Some(filter_right)) = (
                     &subgraphs[idx].relations,
-                    &edge.filter_info.left_set,
-                    &edge.filter_info.right_set,
+                    edge.filter_info.left_set(),
+                    edge.filter_info.right_set(),
                 ) {
                     if left_rels.contains_all(filter_left) && left_rels.contains_all(filter_right) {
                         // Edge connects same subgraph, skip

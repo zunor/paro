@@ -26,13 +26,13 @@ pub struct FilterInfo {
     /// Index of this filter in the filter list.
     pub filter_index: usize,
     /// The type of join this filter is part of.
-    pub join_type: JoinType,
+    join_type: JoinType,
     /// NULL semantics for an anti-join edge.
     pub anti_join_mode: AntiJoinMode,
     /// The left side of the join (if applicable).
-    pub left_set: Option<Arc<JoinRelationSet>>,
+    left_set: Option<Arc<JoinRelationSet>>,
     /// The right side of the join (if applicable).
-    pub right_set: Option<Arc<JoinRelationSet>>,
+    right_set: Option<Arc<JoinRelationSet>>,
     /// Direct equality key from the left expression, including its optimizer
     /// relation ID. Table indexes and relation IDs are separate namespaces.
     pub left_binding: Option<JoinKeyBinding>,
@@ -298,8 +298,16 @@ impl FilterInfo {
             .flatten();
     }
 
-    pub(crate) fn has_valid_reduction_roles(&self) -> bool {
-        !matches!(self.join_type, JoinType::Semi | JoinType::Anti) || self.reduction_roles.is_some()
+    pub(crate) fn join_type(&self) -> JoinType {
+        self.join_type
+    }
+
+    pub(crate) fn left_set(&self) -> Option<&Arc<JoinRelationSet>> {
+        self.left_set.as_ref()
+    }
+
+    pub(crate) fn right_set(&self) -> Option<&Arc<JoinRelationSet>> {
+        self.right_set.as_ref()
     }
 
     /// Set the left column binding.
