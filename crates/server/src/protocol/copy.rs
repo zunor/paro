@@ -14,8 +14,8 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFormat, CopyOptions, ForceQuoteOption};
 use paro_session::{
-    CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink, SessionExecutionControl,
-    StatementCompletion,
+    ActiveStatementControl, CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink,
+    SessionExecutionControl, StatementCompletion,
 };
 use pgwire::messages::copy::{CopyData, CopyDone, CopyInResponse, CopyOutResponse};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -41,6 +41,7 @@ pub enum CopyFrontendMode {
 
 pub struct PgWireCopyOutSink<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
+    active_statement: Arc<ActiveStatementControl>,
     options: CopyOptions,
     names: Vec<String>,
     force_quote_columns: Vec<bool>,
@@ -48,7 +49,11 @@ pub struct PgWireCopyOutSink<'a> {
 }
 
 impl<'a> PgWireCopyOutSink<'a> {
-    pub fn new(socket: &'a mut Framed<TcpStream, PgCodec>, options: CopyOptions) -> Result<Self> {
+    pub fn new(
+        socket: &'a mut Framed<TcpStream, PgCodec>,
+        active_statement: Arc<ActiveStatementControl>,
+        options: CopyOptions,
+    ) -> Result<Self> {
         if matches!(options.format, CopyFormat::Binary) {
             return Err(paro_error::not_implemented(
                 "COPY TO STDOUT BINARY is not supported yet",
@@ -72,6 +77,7 @@ impl<'a> PgWireCopyOutSink<'a> {
 
         Ok(Self {
             socket,
+            active_statement,
             options,
             names: Vec::new(),
             force_quote_columns: Vec::new(),
@@ -102,10 +108,24 @@ impl<'a> PgWireCopyOutSink<'a> {
     }
 
     async fn send_copy_data_line(&mut self, line: String) -> Result<()> {
+        self.send_backend_message(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            line,
+        ))))
+        .await
+    }
+
+    /// Send one complete COPY frame after observing statement cancellation.
+    ///
+    /// Once `Framed::send` starts, it must run to completion: dropping that
+    /// future while it is flushing can leave an encoded COPY frame pending and
+    /// prevent the subsequent error response from making progress. A client
+    /// that issued a cancel request resumes reading the original connection;
+    /// the in-flight frame can then drain, and the next frame boundary reports
+    /// the cancellation without corrupting the protocol stream.
+    async fn send_backend_message(&mut self, message: PgWireBackendMessage) -> Result<()> {
+        self.active_statement.cancellation().check()?;
         self.socket
-            .send(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-                line,
-            ))))
+            .send(message)
             .await
             .map_err(|e| paro_error::internal(e.to_string()))
     }
@@ -266,14 +286,12 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
 
         let _ = types;
 
-        self.socket
-            .send(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
-                COPY_TEXT_FORMAT_CODE,
-                self.col_count as i16,
-                vec![0; self.col_count],
-            )))
-            .await
-            .map_err(|e| paro_error::internal(e.to_string()))?;
+        self.send_backend_message(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
+            COPY_TEXT_FORMAT_CODE,
+            self.col_count as i16,
+            vec![0; self.col_count],
+        )))
+        .await?;
 
         if self.options.header() {
             let header = self.serialize_header();
@@ -292,10 +310,8 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
     }
 
     async fn finish_copy_out(&mut self) -> Result<()> {
-        self.socket
-            .send(PgWireBackendMessage::CopyDone(CopyDone::new()))
+        self.send_backend_message(PgWireBackendMessage::CopyDone(CopyDone::new()))
             .await
-            .map_err(|e| paro_error::internal(e.to_string()))
     }
 }
 
@@ -581,9 +597,17 @@ fn resolve_force_quote_columns(
 
 pub fn create_copy_out_sink<'a>(
     socket: &'a mut Framed<TcpStream, PgCodec>,
+    execution_control: Arc<SessionExecutionControl>,
     options: &CopyOptions,
 ) -> Result<Box<dyn CopyProtocolSink + 'a>> {
-    Ok(Box::new(PgWireCopyOutSink::new(socket, options.clone())?))
+    let active_statement = execution_control
+        .active_statement()
+        .ok_or_else(|| paro_error::internal("COPY TO STDOUT requires an active statement scope"))?;
+    Ok(Box::new(PgWireCopyOutSink::new(
+        socket,
+        active_statement,
+        options.clone(),
+    )?))
 }
 
 pub fn create_copy_in_source<'a>(

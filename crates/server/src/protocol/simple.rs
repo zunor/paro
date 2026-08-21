@@ -105,7 +105,11 @@ impl ProtocolResultSink for ProtocolSink<'_> {
         options: &CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
         self.ensure_transport_available()?;
-        create_copy_out_sink(self.result_sink.socket_mut(), options)
+        create_copy_out_sink(
+            self.result_sink.socket_mut(),
+            Arc::clone(&self.execution_control),
+            options,
+        )
     }
 
     fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {

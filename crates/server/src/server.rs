@@ -1479,16 +1479,15 @@ mod tests {
             .and_then(|(_, payload)| backend_key_data(payload))
             .expect("startup should include backend key data");
 
-        run_simple_query_roundtrip(&mut client, "CREATE TABLE copy_out_cancel_t (v INT)").await;
-        run_simple_query_roundtrip(
-            &mut client,
-            "INSERT INTO copy_out_cancel_t SELECT * FROM range(0, 50000)",
-        )
-        .await;
-
         client
             .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
-                Query::new("COPY copy_out_cancel_t TO STDOUT WITH (FORMAT csv)".to_string()),
+                // A large streaming source cannot finish into an ordinary TCP
+                // send buffer before the cancel connection is opened. Unlike
+                // a materialized test table, it also has constant-time cleanup.
+                Query::new(
+                    "COPY (SELECT * FROM range(0, 1000000000)) TO STDOUT WITH (FORMAT csv)"
+                        .to_string(),
+                ),
             )))
             .await
             .expect("write copy out query");

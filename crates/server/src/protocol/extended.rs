@@ -195,7 +195,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
         &mut self,
         options: &CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
-        create_copy_out_sink(self.socket, options)
+        create_copy_out_sink(self.socket, Arc::clone(&self.execution_control), options)
     }
 
     fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
