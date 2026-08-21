@@ -20,15 +20,16 @@ use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
     AggregateDimensionDeferralPass, AggregateInputMaterializationPass,
-    AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, AggregatePostReductionPass,
-    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CorrelatedPartitionAggregatePass,
-    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
-    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
-    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
-    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
-    MatchedPrefixScanProjectionPass, MixedJoinPredicatePass, ReorderFilterPass,
-    ScalarAggregateWindowPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
-    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
+    AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, AggregateNonNullInputPass,
+    AggregatePostReductionPass, AggregateSingletonGroupsPass, BuildProbeSidePass,
+    ColumnLifetimePass, CommonAggregatePass, CorrelatedPartitionAggregatePass, CteFilterPusherPass,
+    CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass,
+    FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
+    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
+    JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass, MatchedPrefixScanProjectionPass,
+    MixedJoinPredicatePass, ReorderFilterPass, ScalarAggregateWindowPass, SearchOptimizationPass,
+    SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass, TopNPass,
+    UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -309,6 +310,10 @@ impl Optimizer {
             // Remove redundant detail scans while their semantic join edge is
             // still explicit, before cost-based ordering sees the graph.
             pass(AggregateJoinSubsumptionPass),
+            // Preaggregation above isolates nullable join inputs behind their
+            // own aggregate. A certified no-NULL replacement may now remove
+            // dead input columns without erasing outer-join COUNT semantics.
+            pass(AggregateNonNullInputPass),
             // Establish the exact output schema before the authoritative
             // statistics pass. Join ordering and final build/probe selection
             // then price the same projection maps and binding domain.
@@ -392,6 +397,11 @@ impl Optimizer {
                     binder: scan_projection_binder,
                 })],
             }),
+            // Terminally prove one-row grouping domains after every structural
+            // rewrite has settled join orientation, bindings, and exact NULL
+            // statistics. Physical lowering may replace only aggregates whose
+            // merge functions publish an explicit singleton projection law.
+            pass(AggregateSingletonGroupsPass),
             // Projection maps are positional annotations over the final logical
             // layout. Re-derive them after the scalar-window structural rewrite
             // so physical lowering consumes one authoritative terminal layout.

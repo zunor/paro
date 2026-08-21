@@ -25,6 +25,18 @@ pub struct GroupDependency {
     pub dependents: Box<[usize]>,
 }
 
+/// Proven upper bound on the number of input rows in each GROUP BY domain.
+///
+/// `AtMostOne` is a terminal optimizer annotation. Physical lowering may use
+/// it to replace aggregate-state construction with a scalar projection, but
+/// any group-expression rewrite must clear it and re-establish the proof.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GroupInputMultiplicity {
+    #[default]
+    Arbitrary,
+    AtMostOne,
+}
+
 impl GroupDependency {
     /// Validate the positional proof before a physical representation relies
     /// on it. Dependencies must be non-empty, in bounds, unique, and disjoint.
@@ -93,6 +105,8 @@ pub struct Aggregate {
     pub group_stats: Vec<Option<BaseStatistics>>,
     /// Functional dependencies valid for this exact group-expression layout.
     pub group_dependencies: Vec<GroupDependency>,
+    /// Maximum input multiplicity of one settled grouping domain.
+    pub group_input_multiplicity: GroupInputMultiplicity,
     /// Types of the output columns (groups + aggregates + grouping functions).
     pub returned_types: Vec<LogicalType>,
     /// GROUPING() function definitions, each entry is a list of group indexes.
@@ -117,6 +131,7 @@ impl Aggregate {
             child: Box::new(child),
             group_stats: vec![None; groups.len()],
             group_dependencies: Vec::new(),
+            group_input_multiplicity: GroupInputMultiplicity::Arbitrary,
             groups,
             grouping_sets,
             aggregates,
@@ -134,6 +149,7 @@ impl Aggregate {
         // proof is positional and therefore stale until statistics propagation
         // derives it again over the settled logical tree.
         self.group_dependencies.clear();
+        self.group_input_multiplicity = GroupInputMultiplicity::Arbitrary;
         self.returned_types = self
             .groups
             .iter()

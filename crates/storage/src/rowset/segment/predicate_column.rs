@@ -14,8 +14,8 @@ use std::ops::Range;
 
 use crate::codec::vector_decoder;
 use crate::rowset::column::ColumnBatch;
-use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::encoding::BinaryPlainPageSlice;
+use crate::rowset::encoding::{BinaryPlainPageDecoder, BinaryPlainPayloadRowRanges};
 use crate::rowset::BatchRowOrdinal;
 
 /// The least materialized representation accepted by every predicate that
@@ -230,6 +230,13 @@ impl RawVarlenPredicateBatch {
     pub(super) fn contiguous_payload(&self) -> Option<&[u8]> {
         match &self.source {
             RawVarlenSource::BinaryPlain(storage) => storage.payload_ref(),
+            RawVarlenSource::LengthPrefixed { .. } => None,
+        }
+    }
+
+    pub(super) fn contiguous_row_ranges(&self) -> Option<BinaryPlainPayloadRowRanges<'_>> {
+        match &self.source {
+            RawVarlenSource::BinaryPlain(storage) => storage.payload_row_ranges(),
             RawVarlenSource::LengthPrefixed { .. } => None,
         }
     }

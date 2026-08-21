@@ -229,6 +229,11 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn lower_aggregate(&mut self, mut aggregate: Aggregate) -> Result<Aggregate> {
+        // External lowering only relocates expression evaluation into an
+        // ExternalProject. It preserves the child's rows and the aggregate's
+        // grouping semantics, so row-domain proofs remain valid even though
+        // recomputing the output schema normally invalidates them.
+        let group_input_multiplicity = aggregate.group_input_multiplicity;
         let group_count = aggregate.groups.len();
         let mut expressions = aggregate.groups;
         expressions.extend(aggregate.aggregates);
@@ -238,6 +243,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
         aggregate.aggregates = aggregates;
         aggregate.child = Box::new(child);
         aggregate.recompute_returned_types();
+        aggregate.group_input_multiplicity = group_input_multiplicity;
         Ok(aggregate)
     }
 
@@ -863,8 +869,8 @@ mod tests {
         ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
     };
     use paro_planner::operator::{
-        ComparisonJoin, ExpressionGet, Filter, Join, JoinCondition, JoinType, LogicalOperator,
-        Order, Projection,
+        Aggregate, ComparisonJoin, ExpressionGet, Filter, GroupInputMultiplicity, Join,
+        JoinCondition, JoinType, LogicalOperator, Order, Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -1022,6 +1028,38 @@ mod tests {
             }
             other => panic!("expected temp ref, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn aggregate_lowering_preserves_singleton_group_proof() {
+        let bind_context = BindContext::new();
+        let child = expression_get(&bind_context, 1);
+        let mut aggregate = Aggregate::new(
+            2,
+            3,
+            4,
+            child,
+            vec![external_call(
+                "py_group",
+                vec![int_column(1, 0)],
+                LogicalType::Integer,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne;
+        let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
+
+        let lowered = lower(plan, &bind_context);
+        assert!(lowered.changed);
+        let LogicalOperator::Aggregate(aggregate) = lowered.plan.operator else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::AtMostOne
+        );
     }
 
     #[test]

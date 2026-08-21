@@ -9,9 +9,10 @@ use crate::operators::aggregate::perfect_aggregate_hashtable::perfect_hash_occup
 use crate::operators::aggregate::tuple_layout::TupleLayout;
 use crate::physical::specs::GroupKeyEncoding;
 use paro_function::aggregate::distributive::first_last::get_first_function;
-use paro_function::aggregate::AggregateFunction;
+use paro_function::aggregate::{AggregateFunction, AggregateSingletonMerge};
 use paro_function::scalar::function_data_equals;
-use paro_planner::operator::DistinctType;
+use paro_planner::expression::{OperatorExpression, OperatorType};
+use paro_planner::operator::{DistinctType, GroupInputMultiplicity};
 use paro_storage::statistics::{NumericStats, StringStats};
 
 fn plan_group_key_encodings(
@@ -422,6 +423,22 @@ impl PhysicalPlanGenerator {
         aggregate: &LogicalAggregate,
         having_filter: Box<[Expression]>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        if aggregate.group_input_multiplicity == GroupInputMultiplicity::AtMostOne
+            && having_filter.is_empty()
+        {
+            let child = self.generate_node(aggregate.child.as_ref())?;
+            let expressions = singleton_group_projection(aggregate)?;
+            return Ok((
+                PhysicalNodeKind::Project(ProjectSpec {
+                    expressions: expressions.into_boxed_slice(),
+                    output_names: (0..aggregate.returned_types.len())
+                        .map(|idx| format!("aggr_{idx}"))
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice(),
+                }),
+                vec![child],
+            ));
+        }
         let child = self.generate_node(aggregate.child.as_ref())?;
 
         let dependent_layout = plan_dependent_groups(aggregate);
@@ -610,6 +627,64 @@ impl PhysicalPlanGenerator {
         };
         Ok((PhysicalNodeKind::Aggregate(spec), vec![child]))
     }
+}
+
+fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expression>> {
+    if !aggregate.has_plain_grouping_domain()
+        || aggregate.post_reduction.is_some()
+        || !aggregate.grouping_functions.is_empty()
+    {
+        return Err(paro_error::internal(
+            "At-most-one aggregate annotation has an unsupported grouping domain",
+        ));
+    }
+    let mut expressions = aggregate.groups.clone();
+    expressions.reserve(aggregate.aggregates.len());
+    for (ordinal, expression) in aggregate.aggregates.iter().enumerate() {
+        let Expression::Aggregate(merge) = expression else {
+            return Err(paro_error::internal(format!(
+                "At-most-one aggregate output {ordinal} is not an aggregate expression"
+            )));
+        };
+        if merge.aggr_type != paro_planner::expression::AggregateType::NonDistinct
+            || merge.filter.is_some()
+            || !merge.order_bys.is_empty()
+            || merge.children.len() != 1
+        {
+            return Err(paro_error::internal(format!(
+                "At-most-one aggregate output {ordinal} has no scalar singleton form"
+            )));
+        }
+        let input = merge.children[0].clone();
+        let projected = match merge.function.singleton_merge() {
+            Some(AggregateSingletonMerge::Input) => input,
+            Some(AggregateSingletonMerge::InputOr(value)) => {
+                Expression::Operator(OperatorExpression::new(
+                    OperatorType::Coalesce,
+                    vec![
+                        input,
+                        Expression::Constant(ConstantExpression::new(
+                            value.clone(),
+                            merge.return_type.clone(),
+                        )),
+                    ],
+                    merge.return_type.clone(),
+                ))
+            }
+            None => {
+                return Err(paro_error::internal(format!(
+                    "At-most-one aggregate output {ordinal} lacks a singleton merge contract"
+                )))
+            }
+        };
+        expressions.push(projected);
+    }
+    if expressions.len() != aggregate.returned_types.len() {
+        return Err(paro_error::internal(
+            "At-most-one aggregate projection width does not match its logical output",
+        ));
+    }
+    Ok(expressions)
 }
 
 fn lower_post_aggregate_reduction(

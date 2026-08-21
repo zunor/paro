@@ -90,6 +90,14 @@ pub type AggregatePartialMergeFn = fn(&AggregateFunction) -> Option<AggregateFun
 /// Implementations must preserve empty-input, NULL, and overflow semantics.
 pub type AggregateInputRollupFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
 
+/// Factory for an aggregate that is equivalent when its single input is
+/// proven non-NULL on every row.
+///
+/// The replacement may change arity (for example `count(x)` to
+/// `count_star()`), but must preserve return type, empty-input behavior,
+/// FILTER semantics, and the finalized result for every non-NULL input.
+pub type AggregateNonNullInputFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
+
 /// Whether `combine` may destructively modify the source state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AggregateCombineType {
@@ -395,6 +403,20 @@ pub enum AggregateEmptyInput {
     NonNull,
 }
 
+/// Exact scalar result of merging zero or one finalized partial value.
+///
+/// Optimizers must require this explicit law before replacing a grouped
+/// partial-merge aggregate with a projection. An absent outer-join partial is
+/// represented by SQL NULL; extension aggregates opt in without relying on a
+/// display name or an assumed state identity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateSingletonMerge {
+    /// Preserve the finalized partial value, including NULL.
+    Input,
+    /// Preserve a present partial and substitute the constant for NULL.
+    InputOr(Value),
+}
+
 // ============================================================================
 // AggregateFunction
 // ============================================================================
@@ -431,9 +453,15 @@ pub struct AggregateFunction {
     /// Optional aggregate over finalized partial results.
     partial_merge: Option<AggregatePartialMergeFn>,
 
+    /// Projection equivalent to this merge over zero or one partial value.
+    singleton_merge: Option<AggregateSingletonMerge>,
+
     /// Optional aggregate over the original input rows that is equivalent to
     /// applying `partial_merge` to every finalized group.
     input_rollup: Option<AggregateInputRollupFn>,
+
+    /// Optional lower-arity implementation under an exact non-NULL proof.
+    non_null_input: Option<AggregateNonNullInputFn>,
 
     state_ownership: AggregateStateOwnership,
 
@@ -495,7 +523,9 @@ impl fmt::Debug for AggregateFunction {
             .field("empty_input", &self.empty_input)
             .field("state_size", &self.state_size)
             .field("has_partial_merge", &self.partial_merge.is_some())
+            .field("singleton_merge", &self.singleton_merge)
             .field("has_input_rollup", &self.input_rollup.is_some())
+            .field("has_non_null_input", &self.non_null_input.is_some())
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
             .finish()
@@ -522,7 +552,9 @@ impl AggregateFunction {
             empty_input: AggregateEmptyInput::Unknown,
             algebra: None,
             partial_merge: None,
+            singleton_merge: None,
             input_rollup: None,
+            non_null_input: None,
             state_ownership: AggregateStateOwnership::Opaque,
             state_size,
             initialize,
@@ -571,6 +603,15 @@ impl AggregateFunction {
         (self.partial_merge?)(self)
     }
 
+    pub fn with_singleton_merge(mut self, merge: AggregateSingletonMerge) -> Self {
+        self.singleton_merge = Some(merge);
+        self
+    }
+
+    pub fn singleton_merge(&self) -> Option<&AggregateSingletonMerge> {
+        self.singleton_merge.as_ref()
+    }
+
     /// Attach the proof and factory for an original-input rollup.
     pub fn with_input_rollup(mut self, factory: AggregateInputRollupFn) -> Self {
         self.input_rollup = Some(factory);
@@ -581,6 +622,15 @@ impl AggregateFunction {
     /// function. `None` means execution must reduce finalized group results.
     pub fn input_rollup_function(&self) -> Option<AggregateFunction> {
         (self.input_rollup?)(self)
+    }
+
+    pub fn with_non_null_input(mut self, factory: AggregateNonNullInputFn) -> Self {
+        self.non_null_input = Some(factory);
+        self
+    }
+
+    pub fn non_null_input_function(&self) -> Option<AggregateFunction> {
+        (self.non_null_input?)(self)
     }
 
     /// Compare the complete bound execution contract of two aggregate
@@ -606,7 +656,9 @@ impl AggregateFunction {
             && self.empty_input == other.empty_input
             && self.algebra == other.algebra
             && optional_fn_equal!(self.partial_merge, other.partial_merge)
+            && self.singleton_merge == other.singleton_merge
             && optional_fn_equal!(self.input_rollup, other.input_rollup)
+            && optional_fn_equal!(self.non_null_input, other.non_null_input)
             && self.state_ownership == other.state_ownership
             && self.state_size == other.state_size
             && std::ptr::fn_addr_eq(self.initialize, other.initialize)

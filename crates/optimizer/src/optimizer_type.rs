@@ -35,6 +35,10 @@ pub enum OptimizerType {
     AggregateDimensionDeferral,
     /// Materializes total, narrowing aggregate inputs below inner joins.
     AggregateInputMaterialization,
+    /// Replaces aggregate inputs proven non-NULL with a certified equivalent.
+    AggregateNonNullInput,
+    /// Proves GROUP BY domains with at most one settled input row.
+    AggregateSingletonGroups,
     /// Derives scalar reductions from finalized alpha-equivalent grouped aggregates.
     AggregatePostReduction,
     /// Reuses a key-preserving detail stream for a correlated partition aggregate.
@@ -105,7 +109,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 46] = [
+    pub const ALL: [OptimizerType; 48] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -118,6 +122,8 @@ impl OptimizerType {
         OptimizerType::AggregateJoinPreaggregation,
         OptimizerType::AggregateDimensionDeferral,
         OptimizerType::AggregateInputMaterialization,
+        OptimizerType::AggregateNonNullInput,
+        OptimizerType::AggregateSingletonGroups,
         OptimizerType::AggregatePostReduction,
         OptimizerType::CorrelatedPartitionAggregate,
         OptimizerType::ScalarAggregateWindow,
@@ -172,6 +178,8 @@ impl OptimizerType {
             OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
             OptimizerType::AggregateDimensionDeferral => "aggregate_dimension_deferral",
             OptimizerType::AggregateInputMaterialization => "aggregate_input_materialization",
+            OptimizerType::AggregateNonNullInput => "aggregate_non_null_input",
+            OptimizerType::AggregateSingletonGroups => "aggregate_singleton_groups",
             OptimizerType::AggregatePostReduction => "aggregate_post_reduction",
             OptimizerType::CorrelatedPartitionAggregate => "correlated_partition_aggregate",
             OptimizerType::ScalarAggregateWindow => "scalar_aggregate_window",
@@ -233,6 +241,8 @@ impl FromStr for OptimizerType {
             "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
             "aggregate_dimension_deferral" => Ok(OptimizerType::AggregateDimensionDeferral),
             "aggregate_input_materialization" => Ok(OptimizerType::AggregateInputMaterialization),
+            "aggregate_non_null_input" => Ok(OptimizerType::AggregateNonNullInput),
+            "aggregate_singleton_groups" => Ok(OptimizerType::AggregateSingletonGroups),
             "aggregate_post_reduction" => Ok(OptimizerType::AggregatePostReduction),
             "correlated_partition_aggregate" => Ok(OptimizerType::CorrelatedPartitionAggregate),
             "scalar_aggregate_window" => Ok(OptimizerType::ScalarAggregateWindow),

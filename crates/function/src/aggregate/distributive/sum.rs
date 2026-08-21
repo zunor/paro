@@ -7,7 +7,7 @@
 
 use crate::aggregate::{
     AggregateAlgebra, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
-    AggregateInputData, AggregateStateInput,
+    AggregateInputData, AggregateSingletonMerge, AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -301,7 +301,7 @@ fn exact_sum_signature(argument: &LogicalType, return_type: &LogicalType) -> boo
 /// detect a descriptor whose executable hooks or bind data were altered after
 /// binding while retaining the capability pointer.
 fn exact_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunction> {
-    match (source.arguments.as_slice(), &source.return_type) {
+    let function = match (source.arguments.as_slice(), &source.return_type) {
         ([LogicalType::Integer], LogicalType::BigInt) => Some(sum_i32::function(
             "sum_input_rollup",
             LogicalType::Integer,
@@ -318,14 +318,18 @@ fn exact_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunctio
             LogicalType::BigInt,
         )),
         _ => None,
-    }
+    }?;
+    Some(match source.singleton_merge().cloned() {
+        Some(law) => function.with_singleton_merge(law),
+        None => function,
+    })
 }
 
 /// Build the closed aggregate used to merge finalized integral and floating
 /// SUM partials. SQL SUM cannot provide this operation directly for integral
 /// results because it widens BIGINT to HUGEINT.
 fn sum_partial_merge(source: &AggregateFunction) -> Option<AggregateFunction> {
-    match &source.return_type {
+    let function = match &source.return_type {
         LogicalType::BigInt => Some(merge_i64::function(
             "sum_partial_merge",
             LogicalType::BigInt,
@@ -342,7 +346,8 @@ fn sum_partial_merge(source: &AggregateFunction) -> Option<AggregateFunction> {
             LogicalType::Double,
         )),
         _ => None,
-    }
+    }?;
+    Some(function.with_singleton_merge(AggregateSingletonMerge::Input))
 }
 
 pub fn get_sum_function() -> AggregateFunctionSet {

@@ -2297,6 +2297,53 @@ impl ExpressionExecutor {
                     .expect("is null result initialized"))
             }
             OperatorType::Coalesce => {
+                // The common nullable-column/default form needs neither
+                // short-circuit selections nor evaluation of a constant
+                // child. Copy the column once and patch only its NULL rows.
+                // This is particularly important after outer joins, where a
+                // defaulted aggregate state is often consumed immediately by
+                // another vectorized operator.
+                if let [child_expr, PhysicalExpression::Constant(fallback)] =
+                    expr.children.as_slice()
+                {
+                    if !fallback.value.is_null()
+                        && !matches!(
+                            fallback.value,
+                            Value::List(..) | Value::Struct(..) | Value::Array(..)
+                        )
+                    {
+                        let child = Self::execute_value(
+                            child_expr,
+                            &mut state.child_states[0],
+                            chunk,
+                            sel,
+                            count,
+                            runtime,
+                            params,
+                            shared,
+                        )?;
+                        Self::store_value(&mut state.child_results[0], &child);
+                        let result = Self::prepare_slot_result(
+                            &mut state.result,
+                            &expr.return_type,
+                            count,
+                            runtime.allocator(MemoryTag::BaseTable),
+                        )?;
+                        result.try_copy_range(0, child.as_vector(), 0, count)?;
+                        for row_idx in 0..count {
+                            if child.as_vector().is_null(row_idx) {
+                                let scalar =
+                                    result.try_set_scalar_value(row_idx, &fallback.value)?;
+                                debug_assert!(scalar, "nested COALESCE fallback was excluded");
+                            }
+                        }
+                        return Ok(state
+                            .result
+                            .evaluated(true)
+                            .expect("coalesce result initialized"));
+                    }
+                }
+
                 let result = Self::prepare_slot_result(
                     &mut state.result,
                     &expr.return_type,

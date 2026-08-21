@@ -38,6 +38,7 @@ struct DictionaryPredicateCache {
 pub(super) struct VarlenMatcher {
     strategy: VarlenMatchStrategy,
     dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
+    like_candidates: RefCell<Vec<BatchRowOrdinal>>,
 }
 
 #[derive(Debug)]
@@ -128,6 +129,7 @@ impl VarlenMatcher {
                 packed,
             }),
             dictionary_cache: RefCell::new(None),
+            like_candidates: RefCell::new(Vec::new()),
         }
     }
 
@@ -138,6 +140,7 @@ impl VarlenMatcher {
                 negated,
             },
             dictionary_cache: RefCell::new(None),
+            like_candidates: RefCell::new(Vec::new()),
         })
     }
 
@@ -194,7 +197,17 @@ impl VarlenMatcher {
         }
         if let VarlenMatchStrategy::Like { pattern, negated } = &self.strategy {
             if let Some(batch) = batch.raw_varlen() {
-                if filter_raw_like_with_anchor(batch, rows, selection, seed, pattern, *negated) {
+                let mut candidates = self.like_candidates.borrow_mut();
+                candidates.clear();
+                if filter_raw_like_with_anchor(
+                    batch,
+                    rows,
+                    selection,
+                    seed,
+                    pattern,
+                    *negated,
+                    &mut candidates,
+                ) {
                     return Ok(());
                 }
             }
@@ -673,6 +686,7 @@ fn filter_raw_like_with_anchor(
     seed: bool,
     pattern: &PreparedLikePattern,
     negated: bool,
+    candidates: &mut Vec<BatchRowOrdinal>,
 ) -> bool {
     if rows == 0 || (!seed && selection.is_empty()) {
         return true;
@@ -689,6 +703,56 @@ fn filter_raw_like_with_anchor(
     let literal_len = anchor.literal().len();
     if literal_len == 0 {
         return false;
+    }
+
+    if seed {
+        let Some(row_ranges) = batch.contiguous_row_ranges() else {
+            return false;
+        };
+        let mut next_hit = anchor_hit_from(anchor, payload, scan_range.start, scan_range.end);
+        for (row_idx, row_range) in row_ranges.take(rows).enumerate() {
+            if batch.is_null(row_idx) {
+                continue;
+            }
+            if row_range.len() < literal_len {
+                continue;
+            }
+            if next_hit.is_some_and(|hit| hit < row_range.start) {
+                next_hit = anchor_hit_from(anchor, payload, row_range.start, scan_range.end);
+            }
+            let mut candidate = false;
+            if let Some(hit) = next_hit {
+                if hit < row_range.end {
+                    if hit
+                        .checked_add(literal_len)
+                        .is_some_and(|hit_end| hit_end <= row_range.end)
+                    {
+                        candidate = true;
+                    } else {
+                        next_hit = anchor_hit_from(anchor, payload, row_range.end, scan_range.end);
+                    }
+                }
+            }
+            let like_matches = candidate && pattern.matches_bytes(&payload[row_range]);
+            if like_matches {
+                candidates.push(BatchRowOrdinal::from_validated_index(row_idx));
+            }
+        }
+        if !negated {
+            selection.extend_from_slice(candidates);
+            return true;
+        }
+
+        selection.reserve(rows - candidates.len());
+        let mut rejected = candidates.iter().map(|row| row.index()).peekable();
+        for row_idx in 0..rows {
+            if rejected.peek().is_some_and(|rejected| *rejected == row_idx) {
+                rejected.next();
+            } else if !batch.is_null(row_idx) {
+                selection.push(BatchRowOrdinal::from_validated_index(row_idx));
+            }
+        }
+        return true;
     }
 
     let mut next_hit = anchor_hit_from(anchor, payload, scan_range.start, scan_range.end);

@@ -52,7 +52,7 @@ pub mod update;
 pub mod window;
 
 pub use self::plan_operator::LogicalOperator;
-pub use aggregate::{Aggregate, PostAggregateReduction};
+pub use aggregate::{Aggregate, GroupInputMultiplicity, PostAggregateReduction};
 pub use alter::Alter;
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;

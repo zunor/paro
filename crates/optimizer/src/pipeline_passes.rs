@@ -13,7 +13,9 @@ use crate::aggregate::input_materialization;
 use crate::aggregate::join_preaggregation;
 use crate::aggregate::join_subsumption;
 use crate::aggregate::late_payload;
+use crate::aggregate::non_null_inputs;
 use crate::aggregate::post_reduction;
+use crate::aggregate::singleton_groups;
 use crate::aggregate::statistics_exec::AggregateStatisticsExecutor;
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
@@ -133,6 +135,18 @@ impl Rewriter for CommonAggregatePass {
     ) -> Result<LogicalPlan> {
         CommonAggregateOptimizer::new().optimize(&mut plan);
         Ok(plan)
+    }
+}
+
+pub struct AggregateNonNullInputPass;
+
+impl Rewriter for AggregateNonNullInputPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateNonNullInput
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(non_null_inputs::optimize_plan(plan, &ctx.column_stats))
     }
 }
 
@@ -347,6 +361,18 @@ impl Rewriter for AggregateInputMaterializationPass {
             ctx.invalidations.mark_aggregate_schema();
         }
         Ok(plan)
+    }
+}
+
+pub struct AggregateSingletonGroupsPass;
+
+impl Rewriter for AggregateSingletonGroupsPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateSingletonGroups
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(singleton_groups::optimize_plan(plan, &ctx.column_stats))
     }
 }
 

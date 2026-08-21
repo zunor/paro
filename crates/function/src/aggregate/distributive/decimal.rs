@@ -10,8 +10,8 @@ use paro_common::vector::{SelectionVector, Vector, VectorType};
 
 use crate::aggregate::{
     AggregateAlgebra, AggregateComparison, AggregateDirectUpdate, AggregateEmptyInput,
-    AggregateFinalizeProjection, AggregateFunction, AggregateInputData, AggregateStateInput,
-    DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
+    AggregateFinalizeProjection, AggregateFunction, AggregateInputData, AggregateSingletonMerge,
+    AggregateStateInput, DecimalDirectUpdate, DirectAggregateStateCursor, FunctionData,
     PreparedDirectAggregateStatePredicate,
 };
 use crate::decimal::{
@@ -462,7 +462,7 @@ fn decimal_sum_partial_merge(source: &AggregateFunction) -> Option<AggregateFunc
     };
     bind_sum(std::slice::from_ref(&source.return_type))
         .ok()
-        .map(|(function, _)| function)
+        .map(|(function, _)| function.with_singleton_merge(AggregateSingletonMerge::Input))
 }
 
 fn decimal_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunction> {
@@ -479,7 +479,10 @@ fn decimal_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunct
     }
     bind_sum(&source.arguments)
         .ok()
-        .map(|(function, _)| function)
+        .map(|(function, _)| match source.singleton_merge().cloned() {
+            Some(law) => function.with_singleton_merge(law),
+            None => function,
+        })
 }
 
 pub(in crate::aggregate) fn prepare_direct_state_predicate(

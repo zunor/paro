@@ -244,6 +244,47 @@ pub(crate) struct BinaryPlainPageSlice {
     rows: usize,
 }
 
+/// Sequential row boundaries within a validated BinaryPlain payload.
+///
+/// Random row access has to reload both adjacent offsets. Predicate kernels
+/// walk rows in order, so carrying the previous end turns the offset table
+/// into one linear load per row. Ranges are relative to
+/// [`BinaryPlainPageSlice::payload_ref`].
+pub(crate) struct BinaryPlainPayloadRowRanges<'a> {
+    page: &'a BinaryPlainPageSlice,
+    payload_start: usize,
+    row_idx: usize,
+    current: usize,
+}
+
+impl Iterator for BinaryPlainPayloadRowRanges<'_> {
+    type Item = Range<usize>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row_idx >= self.page.rows {
+            return None;
+        }
+        let next_row_idx = self.row_idx.checked_add(1)?;
+        let page_row_end = self.page.first_row.checked_add(next_row_idx)?;
+        let end = self
+            .page
+            .offset_at(page_row_end)?
+            .checked_sub(self.payload_start)?;
+        let range = self.current..end;
+        self.current = end;
+        self.row_idx = next_row_idx;
+        Some(range)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.page.rows - self.row_idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for BinaryPlainPayloadRowRanges<'_> {}
+
 impl BinaryPlainPageSlice {
     #[inline]
     fn offset_at(&self, index: usize) -> Option<usize> {
@@ -283,6 +324,15 @@ impl BinaryPlainPageSlice {
         let start = self.offset_at(self.first_row)?;
         let end = self.offset_at(self.first_row.checked_add(self.rows)?)?;
         self.data.get(start..end)
+    }
+
+    pub(crate) fn payload_row_ranges(&self) -> Option<BinaryPlainPayloadRowRanges<'_>> {
+        Some(BinaryPlainPayloadRowRanges {
+            page: self,
+            payload_start: self.offset_at(self.first_row)?,
+            row_idx: 0,
+            current: 0,
+        })
     }
 
     /// Byte range of one logical row within [`Self::payload_ref`].
