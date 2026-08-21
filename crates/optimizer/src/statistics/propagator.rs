@@ -651,8 +651,22 @@ impl StatisticsPropagator {
                 )))
             }
             Expression::Function(func) => {
+                let mut child_stats = Vec::with_capacity(func.children.len());
                 for arg in &func.children {
-                    self.propagate_expression(arg);
+                    if let Some(stats) = self.propagate_expression(arg) {
+                        child_stats.push(stats);
+                    }
+                }
+                if child_stats.len() == func.children.len() {
+                    if let Some(statistics) = func.function.statistics {
+                        let inputs = child_stats
+                            .iter()
+                            .map(|stats| stats.statistics())
+                            .collect::<Vec<_>>();
+                        if let Some(output) = statistics(&inputs) {
+                            return Some(column_statistics_arc(output));
+                        }
+                    }
                 }
 
                 Some(column_statistics_arc(BaseStatistics::new(

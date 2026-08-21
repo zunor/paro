@@ -9,6 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::statistics::BaseStatistics;
 
 use super::expression_state::ExpressionState;
 use super::function_data::FunctionData;
@@ -129,6 +130,14 @@ pub enum ScalarPredicateProjection {
     },
 }
 
+/// Derive correctness-safe output statistics from bound scalar inputs.
+///
+/// The callback belongs to the bound kernel contract: optimizer consumers do
+/// not identify built-ins by display name, and extensions can opt in only
+/// when their implementation proves the same bounds. Returning `None` means
+/// that the function cannot derive a stronger domain from these inputs.
+pub type ScalarStatisticsFn = fn(&[&BaseStatistics]) -> Option<BaseStatistics>;
+
 #[derive(Clone)]
 pub struct ScalarFunction {
     pub name: String,
@@ -139,6 +148,7 @@ pub struct ScalarFunction {
     pub init_local_state: Option<InitLocalStateFn>,
     pub stability: FunctionStability,
     pub null_handling: FunctionNullHandling,
+    pub statistics: Option<ScalarStatisticsFn>,
     pub side_effects: FunctionSideEffects,
     pub varargs: Option<LogicalType>,
 }
@@ -154,6 +164,7 @@ impl Debug for ScalarFunction {
             .field("has_init_local_state", &self.init_local_state.is_some())
             .field("stability", &self.stability)
             .field("null_handling", &self.null_handling)
+            .field("has_statistics", &self.statistics.is_some())
             .field("side_effects", &self.side_effects)
             .field("varargs", &self.varargs)
             .finish()
@@ -176,6 +187,7 @@ impl ScalarFunction {
             init_local_state: None,
             stability: FunctionStability::Consistent,
             null_handling: FunctionNullHandling::DefaultNullHandling,
+            statistics: None,
             side_effects: FunctionSideEffects::NoSideEffects,
             varargs: None,
         }
@@ -203,6 +215,11 @@ impl ScalarFunction {
 
     pub fn with_null_handling(mut self, null_handling: FunctionNullHandling) -> Self {
         self.null_handling = null_handling;
+        self
+    }
+
+    pub fn with_statistics(mut self, statistics: ScalarStatisticsFn) -> Self {
+        self.statistics = Some(statistics);
         self
     }
 
@@ -238,6 +255,7 @@ pub struct BoundScalarFunction {
     pub init_local_state: Option<InitLocalStateFn>,
     pub stability: FunctionStability,
     pub null_handling: FunctionNullHandling,
+    pub statistics: Option<ScalarStatisticsFn>,
     pub side_effects: FunctionSideEffects,
     pub varargs: Option<LogicalType>,
     pub bind_data: Option<Arc<dyn FunctionData>>,
@@ -256,6 +274,7 @@ impl Debug for BoundScalarFunction {
             .field("has_init_local_state", &self.init_local_state.is_some())
             .field("stability", &self.stability)
             .field("null_handling", &self.null_handling)
+            .field("has_statistics", &self.statistics.is_some())
             .field("side_effects", &self.side_effects)
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
@@ -276,6 +295,7 @@ impl From<ScalarFunction> for BoundScalarFunction {
             init_local_state: function.init_local_state,
             stability: function.stability,
             null_handling: function.null_handling,
+            statistics: function.statistics,
             side_effects: function.side_effects,
             varargs: function.varargs,
             bind_data: None,

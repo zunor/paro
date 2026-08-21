@@ -888,15 +888,25 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 if bytes.len() < 4 {
                     return Err(paro_error::type_mismatch("Date: insufficient bytes"));
                 }
-                let v = i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64;
-                Value::BigInt(v)
+                Value::Date(i32::from_le_bytes(bytes[..4].try_into().unwrap()))
             }
-            LogicalType::Timestamp | LogicalType::TimestampTz | LogicalType::Time => {
+            LogicalType::Timestamp => {
                 if bytes.len() < 8 {
                     return Err(paro_error::type_mismatch("Timestamp: insufficient bytes"));
                 }
-                let v = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-                Value::BigInt(v)
+                Value::Timestamp(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            LogicalType::TimestampTz => {
+                if bytes.len() < 8 {
+                    return Err(paro_error::type_mismatch("TimestampTz: insufficient bytes"));
+                }
+                Value::TimestampTz(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            LogicalType::Time => {
+                if bytes.len() < 8 {
+                    return Err(paro_error::type_mismatch("Time: insufficient bytes"));
+                }
+                Value::Time(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
             }
             LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
@@ -1621,6 +1631,31 @@ mod tests {
         let meta = writer.finish().unwrap();
         assert_eq!(meta.num_rows, 100);
         assert_eq!(meta.column_id, 0);
+    }
+
+    #[test]
+    fn temporal_column_statistics_preserve_logical_value_types() {
+        let opts = ColumnWriterOptions::new(FieldType::Date, 0)
+            .with_nullable(false)
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values = [8_035_i32, 10_591_i32];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        writer.append(&bytes, None, values.len() as u32).unwrap();
+        let meta = writer.finish().unwrap();
+
+        assert_eq!(
+            meta.column_stats.statistics().min_value(),
+            Some(Value::Date(8_035))
+        );
+        assert_eq!(
+            meta.column_stats.statistics().max_value(),
+            Some(Value::Date(10_591))
+        );
     }
 
     #[test]
