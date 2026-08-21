@@ -106,7 +106,6 @@ impl ProtocolResultSink for ProtocolSink<'_> {
         create_copy_out_sink(
             self.result_sink.socket_mut(),
             cancellation,
-            self.drain_token.clone(),
             self.force_close_token.clone(),
             options,
         )

@@ -197,7 +197,6 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
         create_copy_out_sink(
             self.socket,
             cancellation,
-            self.drain_token.clone(),
             self.force_close_token.clone(),
             options,
         )

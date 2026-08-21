@@ -54,6 +54,7 @@ pub struct StatementCancellation {
     statement_timeout: Option<Duration>,
     cancel_reason: Arc<OnceLock<StatementCancelReason>>,
     timeout_driver: Arc<dyn StatementTimeoutDriver>,
+    /// Keeps the timeout task alive until the last cancellation handle drops.
     _timeout_lifetime: Arc<TimeoutLifetime>,
 }
 

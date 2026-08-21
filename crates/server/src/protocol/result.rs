@@ -19,7 +19,6 @@ use tokio_util::codec::Framed;
 use crate::connection::PgCodec;
 
 use super::data_row::{encode_chunk_rows, encode_text_chunk_rows};
-pub(crate) use super::value_format::{format_pg_array, value_to_pg_text};
 
 const FORMAT_CODE_TEXT: i16 = 0;
 const NO_TABLE_ID: i32 = 0;
@@ -235,6 +234,7 @@ fn build_error_response_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::value_format::value_to_pg_text;
     use paro_common::runtime_value::Value;
     use paro_common::types::pg_oid::{INT2OID, INT4OID, NUMERICOID};
     use paro_session::FormatCode;

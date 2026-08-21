@@ -1585,10 +1585,104 @@ mod tests {
         )
         .await;
         let copy_frames = messages.iter().filter(|(tag, _)| *tag == b'd').count();
-        assert_eq!(copy_frames, 1, "10k compact rows fit in one COPY frame");
+        assert!(
+            (1..10).contains(&copy_frames),
+            "10k rows should be batched into a small number of COPY frames, saw {copy_frames}"
+        );
         assert!(messages.iter().any(|(tag, payload)| {
             *tag == b'C' && command_complete_tag(payload).is_some_and(|tag| tag == "COPY 10000")
         }));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_to_stdout_vector_encoding_preserves_csv_bytes() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY (SELECT CAST(42 AS BIGINT) AS id, 'a,b\"c' AS text, CAST(NULL AS VARCHAR) AS missing) TO STDOUT WITH (FORMAT csv, HEADER true)"
+                        .to_string(),
+                ),
+            )))
+            .await
+            .expect("write COPY query");
+
+        let mut csv = Vec::new();
+        loop {
+            let (tag, payload) = read_backend_message(&mut client).await;
+            if tag == b'd' {
+                csv.extend_from_slice(&payload);
+            }
+            if tag == b'Z' {
+                break;
+            }
+        }
+        assert_eq!(
+            csv, b"id,text,missing\n42,\"a,b\"\"c\",\n",
+            "direct vector encoders must preserve PostgreSQL CSV semantics"
+        );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drain_allows_copy_to_stdout_to_finish_before_closing_connection() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY (SELECT * FROM range(0, 100000)) TO STDOUT WITH (FORMAT csv)".to_string(),
+                ),
+            )))
+            .await
+            .expect("write COPY query");
+        loop {
+            let (tag, _) = read_backend_message(&mut client).await;
+            if tag == b'd' {
+                break;
+            }
+            assert_eq!(tag, b'H');
+        }
+
+        server.broadcast_drain();
+        let messages = read_messages_until_ready(&mut client).await;
+        assert!(messages.iter().any(|(tag, payload)| {
+            *tag == b'C' && command_complete_tag(payload).is_some_and(|tag| tag == "COPY 100000")
+        }));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+        let mut eof = [0_u8; 1];
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut eof))
+                .await
+                .expect("drained connection should close after COPY completion")
+                .expect("read drained connection"),
+            0
+        );
 
         server
             .shutdown(Duration::from_secs(5))

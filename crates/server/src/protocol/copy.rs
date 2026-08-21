@@ -10,7 +10,6 @@ use async_trait::async_trait;
 use futures::{SinkExt, StreamExt};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ParoError, Result};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFormat, CopyOptions, ForceQuoteOption};
 use paro_session::{
@@ -22,18 +21,31 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpStream;
-use tokio_util::bytes::Bytes;
+use tokio_util::bytes::{Bytes, BytesMut};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 
 use crate::connection::PgCodec;
-use crate::protocol::result::{
-    build_error_response, format_pg_array, value_to_pg_text, PgWireResultSink,
-};
+use crate::protocol::result::PgWireResultSink;
+use crate::protocol::value_format::TextVectorEncoder;
 
 const COPY_TEXT_FORMAT_CODE: i8 = 0;
 const COPY_DATA_TARGET_BYTES: usize = 64 * 1024;
-const COPY_CANCEL_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
+const COPY_DATA_BUFFER_BYTES: usize = COPY_DATA_TARGET_BYTES * 2;
+const COPY_CANCEL_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
+
+#[derive(Debug, Clone, Copy)]
+struct CopyFlushPolicy {
+    stalled_write_timeout: std::time::Duration,
+}
+
+impl Default for CopyFlushPolicy {
+    fn default() -> Self {
+        Self {
+            stalled_write_timeout: COPY_CANCEL_STALL_TIMEOUT,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFrontendMode {
@@ -41,73 +53,283 @@ pub enum CopyFrontendMode {
     ExtendedQuery,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CopyFieldEncoding {
+    Csv { quote: char, escape: char },
+    Text,
+}
+
+struct CopyRowEncoding {
+    field_encoding: CopyFieldEncoding,
+    delimiter: char,
+    null_bytes: Box<[u8]>,
+    force_quote_columns: Box<[bool]>,
+}
+
+impl CopyRowEncoding {
+    fn from_options(options: &CopyOptions) -> Result<Self> {
+        let delimiter_text = options
+            .delimiter()
+            .expect("CSV/TEXT options always have a delimiter");
+        let mut delimiters = delimiter_text.chars();
+        let delimiter = delimiters.next().ok_or_else(|| {
+            paro_error::invalid_parameter("COPY option delimiter must be a single character")
+        })?;
+        if delimiters.next().is_some() {
+            return Err(paro_error::invalid_parameter(
+                "COPY option delimiter must be a single character",
+            ));
+        }
+
+        let field_encoding = match options.format {
+            CopyFormat::Csv => {
+                let quote = options.quote().expect("CSV always has an effective quote");
+                CopyFieldEncoding::Csv {
+                    quote,
+                    escape: options.escape().unwrap_or(quote),
+                }
+            }
+            CopyFormat::Text => CopyFieldEncoding::Text,
+            CopyFormat::Binary => {
+                return Err(paro_error::not_implemented(
+                    "COPY TO STDOUT BINARY is not supported yet",
+                ))
+            }
+            CopyFormat::Ndjson => {
+                return Err(paro_error::not_implemented(
+                    "COPY TO STDOUT NDJSON is not supported yet",
+                ))
+            }
+        };
+
+        Ok(Self {
+            field_encoding,
+            delimiter,
+            null_bytes: options
+                .null_string()
+                .expect("COPY OUT only supports CSV/TEXT formats")
+                .as_bytes()
+                .into(),
+            force_quote_columns: Box::new([]),
+        })
+    }
+
+    fn set_force_quote_columns(&mut self, columns: Vec<bool>) {
+        self.force_quote_columns = columns.into_boxed_slice();
+    }
+
+    #[inline]
+    fn append_char(out: &mut BytesMut, value: char) {
+        let mut encoded = [0_u8; 4];
+        out.extend_from_slice(value.encode_utf8(&mut encoded).as_bytes());
+    }
+
+    #[inline]
+    fn append_delimiter(&self, out: &mut BytesMut) {
+        Self::append_char(out, self.delimiter);
+    }
+
+    fn append_field(&self, out: &mut BytesMut, field: &[u8], column: usize) -> Result<()> {
+        let field = std::str::from_utf8(field)
+            .map_err(|_| paro_error::data_corrupted("COPY text output contains invalid UTF-8"))?;
+        match self.field_encoding {
+            CopyFieldEncoding::Csv { quote, escape } => {
+                self.append_csv_field(
+                    out,
+                    field,
+                    self.force_quote_columns
+                        .get(column)
+                        .copied()
+                        .unwrap_or(false),
+                    quote,
+                    escape,
+                );
+            }
+            CopyFieldEncoding::Text => self.append_text_field(out, field),
+        }
+        Ok(())
+    }
+
+    fn append_csv_field(
+        &self,
+        out: &mut BytesMut,
+        field: &str,
+        force_quote: bool,
+        quote: char,
+        escape: char,
+    ) {
+        let needs_quote = force_quote
+            || field.contains('\n')
+            || field.contains('\r')
+            || field.contains(self.delimiter)
+            || field.contains(quote);
+        if !needs_quote {
+            out.extend_from_slice(field.as_bytes());
+            return;
+        }
+
+        Self::append_char(out, quote);
+        for ch in field.chars() {
+            if ch == quote || ch == escape {
+                Self::append_char(out, escape);
+            }
+            Self::append_char(out, ch);
+        }
+        Self::append_char(out, quote);
+    }
+
+    fn append_text_field(&self, out: &mut BytesMut, field: &str) {
+        for ch in field.chars() {
+            match ch {
+                '\\' => out.extend_from_slice(b"\\\\"),
+                '\n' => out.extend_from_slice(b"\\n"),
+                '\r' => out.extend_from_slice(b"\\r"),
+                '\t' => out.extend_from_slice(b"\\t"),
+                '\u{0008}' => out.extend_from_slice(b"\\b"),
+                '\u{000c}' => out.extend_from_slice(b"\\f"),
+                '\u{000b}' => out.extend_from_slice(b"\\v"),
+                other if other == self.delimiter => {
+                    out.extend_from_slice(b"\\");
+                    Self::append_char(out, other);
+                }
+                other => Self::append_char(out, other),
+            }
+        }
+    }
+
+    fn append_header(&self, out: &mut BytesMut, names: &[String]) -> Result<()> {
+        for (column, name) in names.iter().enumerate() {
+            if column != 0 {
+                self.append_delimiter(out);
+            }
+            match self.field_encoding {
+                CopyFieldEncoding::Csv { quote, escape } => {
+                    self.append_csv_field(out, name, false, quote, escape)
+                }
+                CopyFieldEncoding::Text => self.append_text_field(out, name),
+            }
+        }
+        out.extend_from_slice(b"\n");
+        Ok(())
+    }
+}
+
+struct CopyColumnWriter<'a> {
+    encoder: TextVectorEncoder<'a>,
+    scratch: BytesMut,
+}
+
+struct CopyRowEncoder<'a> {
+    columns: Vec<CopyColumnWriter<'a>>,
+}
+
+impl<'a> CopyRowEncoder<'a> {
+    fn try_new(chunk: &'a Chunk, output_types: &[LogicalType]) -> Result<Self> {
+        if chunk.column_count() != output_types.len() {
+            return Err(paro_error::internal(format!(
+                "COPY output column count changed from {} to {}",
+                output_types.len(),
+                chunk.column_count()
+            )));
+        }
+
+        let columns = chunk
+            .data
+            .iter()
+            .zip(output_types)
+            .map(|(vector, expected_type)| {
+                if vector.logical_type().physical_type() != expected_type.physical_type() {
+                    return Err(paro_error::internal(format!(
+                        "COPY output type changed from {expected_type} to {}",
+                        vector.logical_type()
+                    )));
+                }
+                Ok(CopyColumnWriter {
+                    encoder: TextVectorEncoder::try_new(vector, chunk.size())?,
+                    scratch: BytesMut::with_capacity(64),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { columns })
+    }
+
+    fn append_row(
+        &mut self,
+        out: &mut BytesMut,
+        row: usize,
+        encoding: &CopyRowEncoding,
+    ) -> Result<()> {
+        for (column_index, column) in self.columns.iter_mut().enumerate() {
+            if column_index != 0 {
+                encoding.append_delimiter(out);
+            }
+            if column.encoder.is_null(row) {
+                out.extend_from_slice(&encoding.null_bytes);
+                continue;
+            }
+            column
+                .encoder
+                .with_non_null_bytes(&mut column.scratch, row, |field| {
+                    encoding.append_field(out, field, column_index)
+                })?;
+        }
+        out.extend_from_slice(b"\n");
+        Ok(())
+    }
+}
+
 pub struct PgWireCopyOutSink<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
     cancellation: StatementCancellation,
-    drain_token: CancellationToken,
     force_close_token: CancellationToken,
-    options: CopyOptions,
-    delimiter: String,
-    null_string: String,
+    flush_policy: CopyFlushPolicy,
+    header: bool,
+    format: CopyFormat,
+    force_quote: ForceQuoteOption,
+    row_encoding: CopyRowEncoding,
     names: Vec<String>,
-    force_quote_columns: Vec<bool>,
-    col_count: usize,
-    copy_buffer: String,
+    output_types: Vec<LogicalType>,
+    copy_buffer: BytesMut,
 }
 
 impl<'a> PgWireCopyOutSink<'a> {
     pub fn new(
         socket: &'a mut Framed<TcpStream, PgCodec>,
         cancellation: StatementCancellation,
-        drain_token: CancellationToken,
         force_close_token: CancellationToken,
         options: CopyOptions,
     ) -> Result<Self> {
-        if matches!(options.format, CopyFormat::Binary) {
-            return Err(paro_error::not_implemented(
-                "COPY TO STDOUT BINARY is not supported yet",
-            ));
-        }
-        if matches!(options.format, CopyFormat::Ndjson) {
-            return Err(paro_error::not_implemented(
-                "COPY TO STDOUT NDJSON is not supported yet",
-            ));
-        }
+        Self::with_flush_policy(
+            socket,
+            cancellation,
+            force_close_token,
+            options,
+            CopyFlushPolicy::default(),
+        )
+    }
 
-        let delimiter = options
-            .delimiter()
-            .expect("CSV/TEXT options always have a delimiter");
-
-        if delimiter.is_empty() || delimiter.chars().count() != 1 {
-            return Err(paro_error::invalid_parameter(
-                "COPY option delimiter must be a single character",
-            ));
-        }
+    fn with_flush_policy(
+        socket: &'a mut Framed<TcpStream, PgCodec>,
+        cancellation: StatementCancellation,
+        force_close_token: CancellationToken,
+        options: CopyOptions,
+        flush_policy: CopyFlushPolicy,
+    ) -> Result<Self> {
+        let row_encoding = CopyRowEncoding::from_options(&options)?;
 
         Ok(Self {
             socket,
             cancellation,
-            drain_token,
             force_close_token,
-            delimiter: delimiter.to_string(),
-            null_string: options
-                .null_string()
-                .expect("COPY OUT only supports CSV/TEXT formats")
-                .to_string(),
-            options,
+            flush_policy,
+            header: options.header(),
+            format: options.format,
+            force_quote: options.force_quote,
+            row_encoding,
             names: Vec::new(),
-            force_quote_columns: Vec::new(),
-            col_count: 0,
-            copy_buffer: String::with_capacity(COPY_DATA_TARGET_BYTES),
+            output_types: Vec::new(),
+            copy_buffer: BytesMut::with_capacity(COPY_DATA_BUFFER_BYTES),
         })
-    }
-
-    fn quote_char(&self) -> Option<char> {
-        self.options.quote()
-    }
-
-    fn escape_char(&self) -> Option<char> {
-        self.options.escape()
     }
 
     fn abandon_connection(&self, reason: &'static str) -> ParoError {
@@ -123,19 +345,21 @@ impl<'a> PgWireCopyOutSink<'a> {
     /// Cancellation observed before encoding a frame is returned normally so
     /// the connection loop can send a terminal ErrorResponse. Cancellation
     /// while a frame is blocked first gets a short flush grace, because a
-    /// normal PostgreSQL cancel client resumes reading the original socket. If
-    /// the peer still applies backpressure, the connection is abandoned: the
-    /// queued frame remains byte-valid, but no terminal response can overtake
-    /// it and a non-reading peer cannot observe that response anyway.
+    /// normal PostgreSQL cancel client resumes reading the original socket.
+    /// Each observed write-buffer reduction renews that grace; only a full
+    /// interval with zero progress abandons the connection. The queued frame
+    /// remains byte-valid, but no terminal response can overtake it and a
+    /// non-reading peer cannot observe that response anyway.
     async fn send_cancellable_frame(&mut self, message: PgWireBackendMessage) -> Result<()> {
         if self.force_close_token.is_cancelled() {
             return Err(self.abandon_connection("connection force-closed during COPY TO STDOUT"));
         }
-        if self.drain_token.is_cancelled() {
-            return Err(self.abandon_connection("connection drained during COPY TO STDOUT"));
-        }
         self.cancellation.check()?;
 
+        // Every successful call flushes the codec completely; every failure
+        // terminates this sink. Therefore `feed` never inherits a buffer above
+        // Framed's backpressure boundary and cannot park in `poll_ready`.
+        debug_assert!(self.socket.write_buffer().is_empty());
         if let Err(error) = self.socket.feed(message).await {
             self.force_close_token.cancel();
             return Err(paro_error::connection_failure(error.to_string()));
@@ -144,14 +368,12 @@ impl<'a> PgWireCopyOutSink<'a> {
         enum FlushOutcome {
             Flushed(std::io::Result<()>),
             ForceClosed,
-            Drained,
             StatementCancelled,
         }
 
         let outcome = tokio::select! {
             biased;
             _ = self.force_close_token.cancelled() => FlushOutcome::ForceClosed,
-            _ = self.drain_token.cancelled() => FlushOutcome::Drained,
             _ = self.cancellation.cancelled() => FlushOutcome::StatementCancelled,
             result = self.socket.flush() => FlushOutcome::Flushed(result),
         };
@@ -165,18 +387,29 @@ impl<'a> PgWireCopyOutSink<'a> {
             FlushOutcome::ForceClosed => {
                 Err(self.abandon_connection("connection force-closed during COPY TO STDOUT"))
             }
-            FlushOutcome::Drained => {
-                Err(self.abandon_connection("connection drained during COPY TO STDOUT"))
-            }
-            FlushOutcome::StatementCancelled => {
-                match tokio::time::timeout(COPY_CANCEL_FLUSH_GRACE, self.socket.flush()).await {
-                    Ok(Ok(())) => self.cancellation.check(),
-                    Ok(Err(error)) => {
-                        self.force_close_token.cancel();
-                        Err(paro_error::connection_failure(error.to_string()))
+            FlushOutcome::StatementCancelled => self.flush_cancelled_frame().await,
+        }
+    }
+
+    async fn flush_cancelled_frame(&mut self) -> Result<()> {
+        let mut remaining = self.socket.write_buffer().len();
+        loop {
+            match tokio::time::timeout(self.flush_policy.stalled_write_timeout, self.socket.flush())
+                .await
+            {
+                Ok(Ok(())) => return self.cancellation.check(),
+                Ok(Err(error)) => {
+                    self.force_close_token.cancel();
+                    return Err(paro_error::connection_failure(error.to_string()));
+                }
+                Err(_) => {
+                    let current = self.socket.write_buffer().len();
+                    if current < remaining {
+                        remaining = current;
+                        continue;
                     }
-                    Err(_) => Err(self
-                        .abandon_connection("statement cancelled while flushing COPY TO STDOUT")),
+                    return Err(self
+                        .abandon_connection("statement cancelled while flushing COPY TO STDOUT"));
                 }
             }
         }
@@ -188,132 +421,12 @@ impl<'a> PgWireCopyOutSink<'a> {
         }
         let payload = std::mem::replace(
             &mut self.copy_buffer,
-            String::with_capacity(COPY_DATA_TARGET_BYTES),
+            BytesMut::with_capacity(COPY_DATA_BUFFER_BYTES),
         );
-        self.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            payload,
-        ))))
+        self.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(
+            payload.freeze(),
+        )))
         .await
-    }
-
-    fn append_csv_field(&self, out: &mut String, field: &str, force_quote: bool) {
-        let quote = self.quote_char();
-        let escape = self.escape_char().or(quote);
-        let needs_quote = self.should_quote_csv(field, force_quote);
-
-        if needs_quote {
-            let quote_char = quote.unwrap_or('"');
-            let escape_char = escape.unwrap_or(quote_char);
-            out.push(quote_char);
-            for ch in field.chars() {
-                if ch == quote_char || ch == escape_char {
-                    out.push(escape_char);
-                }
-                out.push(ch);
-            }
-            out.push(quote_char);
-        } else {
-            out.push_str(field);
-        }
-    }
-
-    fn should_quote_csv(&self, field: &str, force_quote: bool) -> bool {
-        if force_quote {
-            return true;
-        }
-
-        let quote = match self.quote_char() {
-            Some(q) => q,
-            None => return false,
-        };
-
-        if field.contains('\n') || field.contains('\r') {
-            return true;
-        }
-        if field.contains(&self.delimiter) {
-            return true;
-        }
-
-        field.contains(quote)
-    }
-
-    fn append_text_field(&self, out: &mut String, field: &str) {
-        let delimiter = self.delimiter.chars().next().unwrap_or('\t');
-        for ch in field.chars() {
-            match ch {
-                '\\' => out.push_str("\\\\"),
-                '\n' => out.push_str("\\n"),
-                '\r' => out.push_str("\\r"),
-                '\t' => out.push_str("\\t"),
-                '\u{0008}' => out.push_str("\\b"),
-                '\u{000c}' => out.push_str("\\f"),
-                '\u{000b}' => out.push_str("\\v"),
-                other if other == delimiter => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                other => out.push(other),
-            }
-        }
-    }
-
-    fn value_to_text(&self, value: &Value) -> String {
-        match value {
-            Value::List(values, _) | Value::Array(values, _, _) => format_pg_array(values),
-            _ => value_to_pg_text(value),
-        }
-    }
-
-    fn append_serialized_row(&self, chunk: &Chunk, row: usize, out: &mut String) {
-        for col in 0..self.col_count {
-            if col > 0 {
-                out.push_str(&self.delimiter);
-            }
-
-            let value = chunk.column(col).map(|v| v.get_value(row));
-            let is_null = chunk.column(col).map(|v| v.is_null(row)).unwrap_or(true);
-
-            if is_null {
-                out.push_str(&self.null_string);
-                continue;
-            }
-            let field = self.value_to_text(value.as_ref().unwrap());
-
-            match self.options.format {
-                CopyFormat::Csv => {
-                    let force_quote = self.force_quote_columns.get(col).copied().unwrap_or(false);
-                    self.append_csv_field(out, &field, force_quote);
-                }
-                CopyFormat::Text => {
-                    self.append_text_field(out, &field);
-                }
-                CopyFormat::Binary => {
-                    out.push_str(&field);
-                }
-                CopyFormat::Ndjson => {
-                    out.push_str(&field);
-                }
-            }
-        }
-
-        out.push('\n');
-    }
-
-    fn append_serialized_header(&self, out: &mut String) {
-        for (idx, name) in self.names.iter().enumerate() {
-            if idx > 0 {
-                out.push_str(&self.delimiter);
-            }
-
-            match self.options.format {
-                CopyFormat::Csv => self.append_csv_field(out, name, false),
-                CopyFormat::Text => self.append_text_field(out, name),
-                CopyFormat::Binary => out.push_str(name),
-                CopyFormat::Ndjson => out.push_str(name),
-            }
-        }
-
-        out.push('\n');
     }
 }
 
@@ -324,47 +437,58 @@ fn normalize_copy_header_name(name: &str) -> String {
 #[async_trait]
 impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
     async fn start_copy_out(&mut self, names: &[String], types: &[LogicalType]) -> Result<()> {
-        self.col_count = names.len();
+        if names.len() != types.len() {
+            return Err(paro_error::internal(format!(
+                "COPY output has {} names for {} columns",
+                names.len(),
+                types.len()
+            )));
+        }
         let normalized_names = names
             .iter()
             .map(|name| normalize_copy_header_name(name))
             .collect::<Vec<_>>();
-        self.force_quote_columns = resolve_force_quote_columns(
-            &self.options.force_quote,
-            &normalized_names,
-            self.options.format,
-        )?;
+        self.row_encoding
+            .set_force_quote_columns(resolve_force_quote_columns(
+                &self.force_quote,
+                &normalized_names,
+                self.format,
+            )?);
         self.names = normalized_names;
-
-        let _ = types;
+        self.output_types = types.to_vec();
 
         self.send_cancellable_frame(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
             COPY_TEXT_FORMAT_CODE,
-            self.col_count as i16,
-            vec![0; self.col_count],
+            self.output_types.len() as i16,
+            vec![0; self.output_types.len()],
         )))
         .await?;
 
-        if self.options.header() {
-            let mut buffer = std::mem::take(&mut self.copy_buffer);
-            self.append_serialized_header(&mut buffer);
-            self.copy_buffer = buffer;
+        if self.header {
+            self.row_encoding
+                .append_header(&mut self.copy_buffer, &self.names)?;
         }
 
         Ok(())
     }
 
     async fn push_copy_rows(&mut self, chunk: &Chunk) -> Result<()> {
-        let mut buffer = std::mem::take(&mut self.copy_buffer);
-        for row in 0..chunk.size() {
-            self.append_serialized_row(chunk, row, &mut buffer);
-            if buffer.len() >= COPY_DATA_TARGET_BYTES {
-                self.copy_buffer = buffer;
+        let mut row = 0;
+        while row < chunk.size() {
+            // Decoded vector views contain raw pointers and deliberately do
+            // not cross an await. Rebuild them only when a frame boundary
+            // splits this input chunk.
+            {
+                let mut encoder = CopyRowEncoder::try_new(chunk, &self.output_types)?;
+                while row < chunk.size() && self.copy_buffer.len() < COPY_DATA_TARGET_BYTES {
+                    encoder.append_row(&mut self.copy_buffer, row, &self.row_encoding)?;
+                    row += 1;
+                }
+            }
+            if self.copy_buffer.len() >= COPY_DATA_TARGET_BYTES {
                 self.flush_copy_buffer().await?;
-                buffer = std::mem::take(&mut self.copy_buffer);
             }
         }
-        self.copy_buffer = buffer;
         Ok(())
     }
 
@@ -372,35 +496,6 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
         self.flush_copy_buffer().await?;
         self.send_cancellable_frame(PgWireBackendMessage::CopyDone(CopyDone::new()))
             .await
-    }
-}
-
-#[async_trait]
-impl<'a> ResultSink for PgWireCopyOutSink<'a> {
-    async fn start_result(&mut self, names: &[String], types: &[LogicalType]) -> Result<()> {
-        self.start_copy_out(names, types).await
-    }
-
-    async fn push_chunk(&mut self, chunk: &Chunk) -> Result<()> {
-        self.push_copy_rows(chunk).await
-    }
-
-    async fn finish_result(&mut self, completion: &StatementCompletion) -> Result<()> {
-        let _ = completion;
-        self.finish_copy_out().await
-    }
-
-    async fn error(&mut self, err: &ParoError) -> Result<()> {
-        // Terminal errors must bypass statement cancellation. Otherwise the
-        // cancellation that caused this callback would suppress its own
-        // ErrorResponse and leave a reading client waiting forever.
-        self.socket
-            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
-                err,
-            )))
-            .await
-            .map_err(|e| paro_error::internal(e.to_string()))?;
-        Ok(())
     }
 }
 
@@ -651,14 +746,12 @@ fn resolve_force_quote_columns(
 pub fn create_copy_out_sink<'a>(
     socket: &'a mut Framed<TcpStream, PgCodec>,
     cancellation: &StatementCancellation,
-    drain_token: CancellationToken,
     force_close_token: CancellationToken,
     options: &CopyOptions,
 ) -> Result<Box<dyn CopyProtocolSink + 'a>> {
     Ok(Box::new(PgWireCopyOutSink::new(
         socket,
         cancellation.clone(),
-        drain_token,
         force_close_token,
         options.clone(),
     )?))
@@ -730,12 +823,10 @@ mod tests {
         let (mut server, mut client) = connected_pg_streams().await;
         let statement_token = CancellationToken::new();
         let cancellation = StatementCancellation::new(statement_token.clone(), None);
-        let drain_token = CancellationToken::new();
         let force_close_token = CancellationToken::new();
         let mut sink = PgWireCopyOutSink::new(
             &mut server,
             cancellation,
-            drain_token,
             force_close_token.clone(),
             CopyOptions::default(),
         )
@@ -753,6 +844,44 @@ mod tests {
                 .await
                 .is_err(),
             "the cancelled finish must not put CopyDone on the wire"
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_cancelled_flush_escalates_to_connection_close() {
+        let (mut server, _client) = connected_pg_streams().await;
+        let statement_token = CancellationToken::new();
+        let cancellation = StatementCancellation::new(statement_token.clone(), None);
+        let force_close_token = CancellationToken::new();
+        let mut sink = PgWireCopyOutSink::with_flush_policy(
+            &mut server,
+            cancellation,
+            force_close_token.clone(),
+            CopyOptions::default(),
+            CopyFlushPolicy {
+                stalled_write_timeout: Duration::from_millis(10),
+            },
+        )
+        .unwrap();
+        let cancel_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            statement_token.cancel();
+        });
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            sink.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(
+                Bytes::from(vec![b'x'; 16 * 1024 * 1024]),
+            ))),
+        )
+        .await
+        .expect("a cancelled non-reading peer must not pin the COPY task")
+        .expect_err("a stalled cancelled flush must abandon its connection");
+        cancel_task.await.unwrap();
+        assert!(error.is_connection_error());
+        assert!(
+            force_close_token.is_cancelled(),
+            "abandoning COPY must suppress the outer protocol epilogue"
         );
     }
 }

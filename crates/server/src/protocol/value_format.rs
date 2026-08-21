@@ -60,15 +60,27 @@ struct IntervalPhysical {
 pub(crate) struct TextVectorEncoder<'a> {
     vector: &'a Vector,
     decoded: DecodedVectorRef<'a>,
+    direct_utf8: bool,
     integer_buffer: itoa::Buffer,
     float_buffer: ryu::Buffer,
 }
 
 impl<'a> TextVectorEncoder<'a> {
     pub(crate) fn try_new(vector: &'a Vector, row_count: usize) -> Result<Self> {
+        let direct_utf8 = matches!(
+            vector.logical_type(),
+            LogicalType::Varchar
+                | LogicalType::VarcharCollation(_)
+                | LogicalType::TsVector
+                | LogicalType::TsQuery
+                | LogicalType::Json
+                | LogicalType::Jsonb
+                | LogicalType::StringLiteral
+        );
         Ok(Self {
             vector,
             decoded: vector.try_decode_ref(row_count)?,
+            direct_utf8,
             integer_buffer: itoa::Buffer::new(),
             float_buffer: ryu::Buffer::new(),
         })
@@ -77,6 +89,26 @@ impl<'a> TextVectorEncoder<'a> {
     #[inline]
     pub(crate) fn is_null(&self, row_idx: usize) -> bool {
         !self.decoded.is_valid(row_idx)
+    }
+
+    /// Expose one non-NULL field as borrowed UTF-8 bytes for protocol-specific
+    /// escaping. String-backed logical types are borrowed directly from their
+    /// decoded vector; other types reuse the caller's scratch buffer.
+    pub(crate) fn with_non_null_bytes<T>(
+        &mut self,
+        scratch: &mut BytesMut,
+        row_idx: usize,
+        consume: impl FnOnce(&[u8]) -> Result<T>,
+    ) -> Result<T> {
+        debug_assert!(!self.is_null(row_idx));
+        if self.direct_utf8 {
+            let value = unsafe { self.fixed::<StringView>(row_idx) };
+            return consume(value.as_bytes());
+        }
+
+        scratch.clear();
+        self.append_non_null(scratch, row_idx)?;
+        consume(scratch.as_ref())
     }
 
     /// Capacity hint for one complete vector. It deliberately uses cheap
