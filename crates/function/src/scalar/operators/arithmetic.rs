@@ -18,8 +18,8 @@ use crate::decimal::{
 use crate::scalar::executor::binary::BinaryExecutor;
 use crate::scalar::executor::{BinaryOperator, NullableBinaryOperator};
 use crate::scalar::{
-    function_data_fingerprint, BoundScalarFunction, ExpressionState, FunctionData, ScalarBindInput,
-    ScalarFunction, ScalarFunctionSet,
+    function_data_fingerprint, BoundScalarFunction, ExpressionState, FunctionData,
+    FunctionErrorMode, ScalarBindInput, ScalarFunction, ScalarFunctionSet,
 };
 use direct_decimal::{
     execute_direct_decimal_factor_product_rows, execute_direct_decimal_factor_rows,
@@ -651,7 +651,7 @@ fn decimal_result_type(
 
 fn bind_decimal_arithmetic_function(
     function: &ScalarFunction,
-    _input: &ScalarBindInput,
+    input: &ScalarBindInput,
 ) -> Result<BoundScalarFunction> {
     let op = match function.name.as_str() {
         "+" => DecimalArithmeticOp::Add,
@@ -661,10 +661,46 @@ fn bind_decimal_arithmetic_function(
         "%" => DecimalArithmeticOp::Mod,
         _ => return Err(paro_error::internal("unknown decimal arithmetic operator")),
     };
-    Ok(
-        BoundScalarFunction::from(function.clone())
-            .with_bind_data(DecimalArithmeticBindData { op }),
-    )
+    let error_mode = decimal_arithmetic_error_mode(op, &input.argument_types);
+    Ok(BoundScalarFunction::from(function.clone())
+        .with_bind_data(DecimalArithmeticBindData { op })
+        .with_error_mode(error_mode))
+}
+
+/// DECIMAL arithmetic is total when its declared result domain represents the
+/// full mathematical result domain. Add/subtract and multiply otherwise clamp
+/// precision at SQL's maximum of 38 digits, so valid inputs can overflow. Keep
+/// division and modulo conservative because their execution contracts include
+/// exceptional operands independently of result precision.
+fn decimal_arithmetic_error_mode(
+    op: DecimalArithmeticOp,
+    arguments: &[LogicalType],
+) -> FunctionErrorMode {
+    let [left, right] = arguments else {
+        return FunctionErrorMode::CanError;
+    };
+    let Ok((left_precision, left_scale)) = decimal_shape(left) else {
+        return FunctionErrorMode::CanError;
+    };
+    let Ok((right_precision, right_scale)) = decimal_shape(right) else {
+        return FunctionErrorMode::CanError;
+    };
+    let required_precision = match op {
+        DecimalArithmeticOp::Add | DecimalArithmeticOp::Sub => {
+            let scale = left_scale.max(right_scale);
+            let integral = (left_precision - left_scale).max(right_precision - right_scale);
+            integral.saturating_add(scale).saturating_add(1)
+        }
+        DecimalArithmeticOp::Mul => left_precision.saturating_add(right_precision),
+        DecimalArithmeticOp::Div | DecimalArithmeticOp::Mod => {
+            return FunctionErrorMode::CanError;
+        }
+    };
+    if required_precision <= 38 {
+        FunctionErrorMode::Infallible
+    } else {
+        FunctionErrorMode::CanError
+    }
 }
 
 fn execute_decimal_arithmetic(
@@ -1566,6 +1602,69 @@ mod tests {
                 scale: 2,
             }
         );
+    }
+
+    #[test]
+    fn decimal_totality_tracks_unclamped_mathematical_precision() {
+        let narrow = [
+            LogicalType::Decimal {
+                precision: 15,
+                scale: 2,
+            },
+            LogicalType::Decimal {
+                precision: 16,
+                scale: 2,
+            },
+        ];
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Add, &narrow),
+            FunctionErrorMode::Infallible
+        );
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Sub, &narrow),
+            FunctionErrorMode::Infallible
+        );
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Mul, &narrow),
+            FunctionErrorMode::Infallible
+        );
+
+        let clamped = [
+            LogicalType::Decimal {
+                precision: 38,
+                scale: 20,
+            },
+            LogicalType::Decimal {
+                precision: 38,
+                scale: 20,
+            },
+        ];
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Add, &clamped),
+            FunctionErrorMode::CanError
+        );
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Mul, &clamped),
+            FunctionErrorMode::CanError
+        );
+        assert_eq!(
+            decimal_arithmetic_error_mode(DecimalArithmeticOp::Div, &narrow),
+            FunctionErrorMode::CanError
+        );
+
+        let mut set = ScalarFunctionSet::new("*".to_string());
+        register_arithmetic_functions(&mut set);
+        let (function, target_types) = set.bind(&narrow).unwrap();
+        let bound = function
+            .bind(&ScalarBindInput::new(target_types, vec![None, None]))
+            .unwrap();
+        assert_eq!(bound.error_mode, FunctionErrorMode::Infallible);
+
+        let (function, target_types) = set.bind(&clamped).unwrap();
+        let bound = function
+            .bind(&ScalarBindInput::new(target_types, vec![None, None]))
+            .unwrap();
+        assert_eq!(bound.error_mode, FunctionErrorMode::CanError);
     }
 
     #[test]

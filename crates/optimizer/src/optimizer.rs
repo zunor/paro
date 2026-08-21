@@ -19,16 +19,16 @@ use crate::context::OptimizationContext;
 use crate::external::lowering::ExternalRoutineLoweringPass;
 use crate::optimizer_type::OptimizerType;
 use crate::pipeline_passes::{
-    AggregateDimensionDeferralPass, AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass,
-    AggregatePostReductionPass, BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass,
-    CorrelatedPartitionAggregatePass, CteFilterPusherPass, CteInliningPass,
-    DelimJoinEliminationPass, EmptyResultPullupPass, ExpressionRewriterPass, FilterPullupPass,
-    FilterPushdownPass, GraphMatchDecomposePass, GraphPredicatePushdownPass,
-    GraphStartSelectionPass, InClausePass, JoinEliminationPass, JoinFilterPushdownPass,
-    JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass, MatchedPrefixScanProjectionPass,
-    MixedJoinPredicatePass, ReorderFilterPass, ScalarAggregateWindowPass, SearchOptimizationPass,
-    SegmentPrunerPass, StatisticsGatheringPass, StatisticsPropagationPass, TopNPass,
-    UnusedColumnsPass,
+    AggregateDimensionDeferralPass, AggregateInputMaterializationPass,
+    AggregateJoinPreaggregationPass, AggregateJoinSubsumptionPass, AggregatePostReductionPass,
+    BuildProbeSidePass, ColumnLifetimePass, CommonAggregatePass, CorrelatedPartitionAggregatePass,
+    CteFilterPusherPass, CteInliningPass, DelimJoinEliminationPass, EmptyResultPullupPass,
+    ExpressionRewriterPass, FilterPullupPass, FilterPushdownPass, GraphMatchDecomposePass,
+    GraphPredicatePushdownPass, GraphStartSelectionPass, InClausePass, JoinEliminationPass,
+    JoinFilterPushdownPass, JoinOrderPass, LatePayloadFetchPass, LimitPushdownPass,
+    MatchedPrefixScanProjectionPass, MixedJoinPredicatePass, ReorderFilterPass,
+    ScalarAggregateWindowPass, SearchOptimizationPass, SegmentPrunerPass, StatisticsGatheringPass,
+    StatisticsPropagationPass, TopNPass, UnusedColumnsPass,
 };
 use crate::profiler::publish_optimizer_profile_snapshot;
 use crate::rewriter::Rewriter;
@@ -55,7 +55,7 @@ struct ConditionalSegment {
 
 #[derive(Clone, Copy)]
 enum PipelineCondition {
-    DimensionDeferral,
+    AggregateSchema,
     LateMaterialization,
     ScanProjection,
 }
@@ -63,7 +63,7 @@ enum PipelineCondition {
 impl PipelineCondition {
     fn is_pending(self, ctx: &OptimizationContext) -> bool {
         match self {
-            Self::DimensionDeferral => ctx.invalidations.dimension_deferral_pending(),
+            Self::AggregateSchema => ctx.invalidations.aggregate_schema_pending(),
             Self::LateMaterialization => ctx.invalidations.late_materialization_pending(),
             Self::ScanProjection => ctx.invalidations.scan_projection_pending(),
         }
@@ -71,8 +71,8 @@ impl PipelineCondition {
 
     fn consume(self, ctx: &mut OptimizationContext) {
         match self {
-            Self::DimensionDeferral => {
-                ctx.invalidations.consume_dimension_deferral();
+            Self::AggregateSchema => {
+                ctx.invalidations.consume_aggregate_schema();
             }
             Self::LateMaterialization => {
                 ctx.invalidations.consume_late_materialization();
@@ -270,7 +270,7 @@ impl Optimizer {
 
     fn build_pipeline(binder: Binder) -> Vec<PipelineStep> {
         let unused_columns_binder = binder.clone();
-        let dimension_deferral_binder = binder.clone();
+        let aggregate_schema_binder = binder.clone();
         let late_payload_binder = binder.clone();
         let final_late_payload_binder = binder.clone();
         let scan_projection_binder = binder.clone();
@@ -326,11 +326,16 @@ impl Optimizer {
             // partial aggregate authoritative for physical build/probe
             // selection.
             pass(AggregateDimensionDeferralPass),
+            // Evaluate a total, narrowing aggregate input at its lowest
+            // complete inner-join domain. This pass is independent of the
+            // dimension rewrite above; both publish the same schema/stats
+            // invalidation because either can introduce internal columns.
+            pass(AggregateInputMaterializationPass),
             PipelineStep::Conditional(ConditionalSegment {
-                condition: PipelineCondition::DimensionDeferral,
+                condition: PipelineCondition::AggregateSchema,
                 passes: vec![
                     Box::new(UnusedColumnsPass {
-                        binder: dimension_deferral_binder,
+                        binder: aggregate_schema_binder,
                     }),
                     Box::new(StatisticsGatheringPass),
                 ],

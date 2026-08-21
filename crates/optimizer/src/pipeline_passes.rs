@@ -9,6 +9,7 @@ use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
 use crate::aggregate::dimension_deferral;
+use crate::aggregate::input_materialization;
 use crate::aggregate::join_preaggregation;
 use crate::aggregate::join_subsumption;
 use crate::aggregate::late_payload;
@@ -327,7 +328,23 @@ impl Rewriter for AggregateDimensionDeferralPass {
         let (plan, changed) =
             dimension_deferral::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
         if changed {
-            ctx.invalidations.mark_dimension_deferral();
+            ctx.invalidations.mark_aggregate_schema();
+        }
+        Ok(plan)
+    }
+}
+
+pub struct AggregateInputMaterializationPass;
+
+impl Rewriter for AggregateInputMaterializationPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateInputMaterialization
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        let (plan, changed) = input_materialization::optimize_plan(plan, &ctx.bind_context)?;
+        if changed {
+            ctx.invalidations.mark_aggregate_schema();
         }
         Ok(plan)
     }

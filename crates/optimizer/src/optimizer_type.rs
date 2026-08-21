@@ -33,6 +33,8 @@ pub enum OptimizerType {
     AggregateJoinPreaggregation,
     /// Defers wide dimension payload until after fact-side partial aggregation.
     AggregateDimensionDeferral,
+    /// Materializes total, narrowing aggregate inputs below inner joins.
+    AggregateInputMaterialization,
     /// Derives scalar reductions from finalized alpha-equivalent grouped aggregates.
     AggregatePostReduction,
     /// Reuses a key-preserving detail stream for a correlated partition aggregate.
@@ -103,7 +105,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 45] = [
+    pub const ALL: [OptimizerType; 46] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -115,6 +117,7 @@ impl OptimizerType {
         OptimizerType::AggregateJoinSubsumption,
         OptimizerType::AggregateJoinPreaggregation,
         OptimizerType::AggregateDimensionDeferral,
+        OptimizerType::AggregateInputMaterialization,
         OptimizerType::AggregatePostReduction,
         OptimizerType::CorrelatedPartitionAggregate,
         OptimizerType::ScalarAggregateWindow,
@@ -168,6 +171,7 @@ impl OptimizerType {
             OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
             OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
             OptimizerType::AggregateDimensionDeferral => "aggregate_dimension_deferral",
+            OptimizerType::AggregateInputMaterialization => "aggregate_input_materialization",
             OptimizerType::AggregatePostReduction => "aggregate_post_reduction",
             OptimizerType::CorrelatedPartitionAggregate => "correlated_partition_aggregate",
             OptimizerType::ScalarAggregateWindow => "scalar_aggregate_window",
@@ -228,6 +232,7 @@ impl FromStr for OptimizerType {
             "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
             "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
             "aggregate_dimension_deferral" => Ok(OptimizerType::AggregateDimensionDeferral),
+            "aggregate_input_materialization" => Ok(OptimizerType::AggregateInputMaterialization),
             "aggregate_post_reduction" => Ok(OptimizerType::AggregatePostReduction),
             "correlated_partition_aggregate" => Ok(OptimizerType::CorrelatedPartitionAggregate),
             "scalar_aggregate_window" => Ok(OptimizerType::ScalarAggregateWindow),

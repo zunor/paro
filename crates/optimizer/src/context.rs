@@ -91,22 +91,22 @@ pub struct OptimizationContext {
 /// whose scope changes when passes move.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct OptimizerInvalidations {
-    dimension_deferral: bool,
+    aggregate_schema: bool,
     late_materialization: bool,
     scan_projection: bool,
 }
 
 impl OptimizerInvalidations {
-    pub fn mark_dimension_deferral(&mut self) {
-        self.dimension_deferral = true;
+    pub fn mark_aggregate_schema(&mut self) {
+        self.aggregate_schema = true;
     }
 
-    pub fn dimension_deferral_pending(self) -> bool {
-        self.dimension_deferral
+    pub fn aggregate_schema_pending(self) -> bool {
+        self.aggregate_schema
     }
 
-    pub fn consume_dimension_deferral(&mut self) {
-        self.dimension_deferral = false;
+    pub fn consume_aggregate_schema(&mut self) {
+        self.aggregate_schema = false;
     }
 
     pub fn mark_late_materialization(&mut self) {
