@@ -374,4 +374,100 @@ mod tests {
         assert_eq!(collect_partition_ids(sealed.partition(0)), vec![0]);
         assert_eq!(collect_partition_ids(sealed.partition(1)), vec![1]);
     }
+
+    #[test]
+    fn low_memory_partitioned_varlen_rows_survive_eviction() {
+        let pool = BufferPool::new_arc(4 * 1024 * 1024);
+        let temp_dir = std::env::temp_dir().join(format!(
+            "paro_partitioned_varlen_eviction_{}_{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        pool.set_temporary_directory(temp_dir.to_string_lossy().to_string())
+            .unwrap();
+        let decimal_type = LogicalType::Decimal {
+            precision: 38,
+            scale: 4,
+        };
+        let types = vec![
+            LogicalType::Integer,
+            LogicalType::Varchar,
+            LogicalType::Integer,
+            decimal_type.clone(),
+        ];
+        let partitioner: Arc<dyn PartitionIndexComputer> =
+            Arc::new(ModuloPartitionComputer::new(16, 0));
+        let mut builder = PartitionedRowsBuilder::from_types(
+            Arc::clone(&pool),
+            types.clone(),
+            MemoryTag::HashTable,
+            partitioner,
+        );
+        let names = [
+            "PERU",
+            "UNITED KINGDOM",
+            "a deliberately long value that cannot use the inline string representation",
+        ];
+        let row_count = 200_000usize;
+        for batch_start in (0..row_count).step_by(paro_common::vector::VECTOR_SIZE) {
+            let batch_size = (row_count - batch_start).min(paro_common::vector::VECTOR_SIZE);
+            let mut input = test_chunk_with_capacity(&types, batch_size);
+            input.set_cardinality(batch_size);
+            for row_idx in 0..batch_size {
+                let id = batch_start + row_idx;
+                input
+                    .column_mut(0)
+                    .unwrap()
+                    .set_value(row_idx, &Value::Integer(id as i32));
+                input.column_mut(1).unwrap().set_value(
+                    row_idx,
+                    &Value::Varchar(names[id % names.len()].to_string()),
+                );
+                input
+                    .column_mut(2)
+                    .unwrap()
+                    .set_value(row_idx, &Value::Integer(1992 + (id % 7) as i32));
+                input.column_mut(3).unwrap().set_value(
+                    row_idx,
+                    &Value::Decimal((id as i128) * 10_000 + 1234, 38, 4),
+                );
+            }
+            builder.append(&input).unwrap();
+        }
+
+        let rows = builder.seal();
+        let eviction = pool.evict_blocks(MemoryTag::HashTable, 0, 0, None);
+        assert!(eviction.success);
+        let mut seen = vec![false; row_count];
+        let mut output = test_chunk_with_capacity(&types, paro_common::vector::VECTOR_SIZE);
+        for partition in rows.partitions() {
+            let mut scanner = partition.scanner();
+            loop {
+                let count = scanner.next_chunk(&mut output).unwrap();
+                if count == 0 {
+                    break;
+                }
+                for row_idx in 0..count {
+                    let id = output.column(0).unwrap().get_i32(row_idx).unwrap() as usize;
+                    assert!(!seen[id], "duplicate row {id}");
+                    seen[id] = true;
+                    assert_eq!(
+                        output.column(1).unwrap().get_string(row_idx),
+                        Some(names[id % names.len()]),
+                        "varlen payload mismatch for row {id}"
+                    );
+                    assert_eq!(
+                        output.column(2).unwrap().get_i32(row_idx),
+                        Some(1992 + (id % 7) as i32)
+                    );
+                    assert_eq!(
+                        output.get_value(3, row_idx),
+                        Some(Value::Decimal((id as i128) * 10_000 + 1234, 38, 4))
+                    );
+                }
+            }
+        }
+        assert!(seen.into_iter().all(|value| value));
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }

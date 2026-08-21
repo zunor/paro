@@ -3,11 +3,27 @@
 
 use super::{AllocationSet, VectorBuffer};
 use crate::allocator::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
+use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 static SELECTION_MATERIALIZATION_COUNT: AtomicU64 = AtomicU64::new(0);
+
+struct OwnedNativeIndices(Vec<u32>);
+
+impl AsRef<[u8]> for OwnedNativeIndices {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: every byte of every u32 in the Vec is initialized, and the
+        // byte slice is tied to the immutable owner retained by `Bytes`.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.0.as_ptr().cast::<u8>(),
+                self.0.len() * std::mem::size_of::<u32>(),
+            )
+        }
+    }
+}
 
 #[inline]
 pub fn selection_materialization_count() -> u64 {
@@ -111,6 +127,41 @@ impl SelectionVector {
             }
         }
         Ok(sv)
+    }
+
+    /// Adopt owned native-endian u32 indices without copying them.
+    /// Mutation follows the normal copy-on-write path.
+    pub fn try_from_owned_indices(
+        indices: Vec<u32>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let count = indices.len();
+        if count == 0 {
+            return Self::try_with_capacity(0, allocator);
+        }
+        Self::try_from_native_bytes(
+            Bytes::from_owner(OwnedNativeIndices(indices)),
+            count,
+            allocator,
+        )
+    }
+
+    /// Adopt an immutable native-endian u32 selection buffer without copying.
+    /// Mutation follows the normal copy-on-write path.
+    pub fn try_from_native_bytes(
+        bytes: Bytes,
+        count: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            buffer: VectorBuffer::try_from_bytes(
+                std::mem::size_of::<u32>(),
+                count,
+                bytes,
+                allocator,
+            )?,
+            count,
+        })
     }
 
     /// Get index at position.
@@ -292,6 +343,52 @@ pub enum VectorSelection {
         offset: usize,
         count: usize,
     },
+    /// A zero-allocation broadcast mapping: every logical row resolves to one
+    /// physical row in the child vector.
+    Repeated {
+        index: usize,
+        count: usize,
+    },
+}
+
+/// A logical-to-physical mapping proven to fit one exact child cardinality.
+///
+/// Fields are private so the proof can only be established by the validating
+/// constructor. The value is cheaply cloneable and may be applied to several
+/// same-sized column vectors in one batch without rescanning every index.
+#[derive(Debug, Clone)]
+pub struct ValidatedVectorSelection {
+    pub(super) selection: VectorSelection,
+    pub(super) child_count: usize,
+}
+
+impl ValidatedVectorSelection {
+    pub fn try_new(selection: impl Into<VectorSelection>, child_count: usize) -> Result<Self> {
+        let selection = selection.into();
+        selection.validate_child_bounds(child_count)?;
+        Ok(Self {
+            selection,
+            child_count,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.selection.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.selection.is_empty()
+    }
+
+    /// Borrow materialized indices from the validated mapping without copying.
+    /// Callers that require a domain-specific index type can build a typed view
+    /// over this single authoritative allocation.
+    #[inline]
+    pub fn materialized_indices(&self) -> Option<&[u32]> {
+        self.selection
+            .as_materialized()
+            .map(SelectionVector::as_slice)
+    }
 }
 
 impl VectorSelection {
@@ -311,11 +408,16 @@ impl VectorSelection {
     }
 
     #[inline]
+    pub fn repeated(index: usize, count: usize) -> Self {
+        Self::Repeated { index, count }
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Materialized(sel) => sel.len(),
-            Self::Range { count, .. } => *count,
+            Self::Range { count, .. } | Self::Repeated { count, .. } => *count,
         }
     }
 
@@ -324,11 +426,40 @@ impl VectorSelection {
         self.len() == 0
     }
 
+    /// Validate that every logical row resolves inside a child vector.
+    /// Dictionary vectors establish this invariant at construction so decoded
+    /// readers can use their physical mapping without repeated bounds checks.
+    pub(crate) fn validate_child_bounds(&self, child_count: usize) -> Result<()> {
+        let invalid = match self {
+            Self::None => None,
+            Self::Materialized(selection) => selection
+                .as_slice()
+                .iter()
+                .copied()
+                .find(|index| *index as usize >= child_count)
+                .map(|index| index as usize),
+            Self::Range { offset, count } => offset
+                .checked_add(*count)
+                .filter(|end| *end <= child_count)
+                .is_none()
+                .then_some(*offset),
+            Self::Repeated { index, count } => {
+                (*count != 0 && *index >= child_count).then_some(*index)
+            }
+        };
+        if let Some(index) = invalid {
+            return Err(paro_error::out_of_range(format!(
+                "dictionary selection index {index} is outside child cardinality {child_count}"
+            )));
+        }
+        Ok(())
+    }
+
     #[inline]
     pub fn as_materialized(&self) -> Option<&SelectionVector> {
         match self {
             Self::Materialized(sel) => Some(sel),
-            Self::None | Self::Range { .. } => None,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => None,
         }
     }
 
@@ -338,6 +469,7 @@ impl VectorSelection {
             Self::None => idx,
             Self::Materialized(sel) => sel.get(idx),
             Self::Range { offset, .. } => offset + idx,
+            Self::Repeated { index, .. } => *index,
         }
     }
 
@@ -345,7 +477,7 @@ impl VectorSelection {
     pub fn allocation_identity(&self) -> Option<usize> {
         match self {
             Self::Materialized(sel) => sel.allocation_identity(),
-            Self::None | Self::Range { .. } => None,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => None,
         }
     }
 
@@ -359,7 +491,7 @@ impl VectorSelection {
     pub fn collect_allocation_size(&self, allocations: &mut super::AllocationSet) -> usize {
         match self {
             Self::Materialized(sel) => sel.collect_allocation_size(allocations),
-            Self::None | Self::Range { .. } => 0,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => 0,
         }
     }
 
@@ -385,12 +517,24 @@ impl VectorSelection {
                 }
                 Ok(selection)
             }
+            Self::Repeated { index, count } => {
+                record_selection_materialization();
+                SelectionVector::try_repeated(*index, *count, allocator)
+            }
         }
     }
 
     pub fn try_compose(&self, selection: VectorSelection) -> Result<VectorSelection> {
         match (self, selection) {
             (Self::None, selection) => Ok(selection),
+            (base, Self::Repeated { index, count }) => Ok(Self::Repeated {
+                index: base.physical_index(index),
+                count,
+            }),
+            (Self::Repeated { index, .. }, selection) => Ok(Self::Repeated {
+                index: *index,
+                count: selection.len(),
+            }),
             (Self::Materialized(child), Self::Materialized(sel)) => {
                 Ok(Self::Materialized(child.try_slice(&sel, sel.len())?))
             }
@@ -438,5 +582,32 @@ impl From<SelectionVector> for VectorSelection {
 impl From<&SelectionVector> for VectorSelection {
     fn from(selection: &SelectionVector) -> Self {
         Self::Materialized(selection.clone())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::allocator::default_allocator;
+
+    #[test]
+    fn owned_indices_are_adopted_and_mutate_with_copy_on_write() {
+        let indices = vec![3_u32, 1, 4, 1];
+        let original_address = indices.as_ptr() as usize;
+        let mut selection =
+            SelectionVector::try_from_owned_indices(indices, Arc::new(default_allocator()))
+                .unwrap();
+
+        assert_eq!(selection.buffer.data() as usize, original_address);
+        assert_eq!(
+            (0..selection.len())
+                .map(|idx| selection.get(idx))
+                .collect::<Vec<_>>(),
+            vec![3, 1, 4, 1]
+        );
+
+        selection.try_set(0, 9).unwrap();
+        assert_ne!(selection.buffer.data() as usize, original_address);
+        assert_eq!(selection.get(0), 9);
     }
 }

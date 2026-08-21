@@ -18,7 +18,7 @@ use paro_storage::row::{
 
 use crate::operators::sort::row_format::SortRowFormat;
 
-use super::sort_key_store::SortKeyStore;
+use super::sort_key_store::{KeyCursor, SortKeyStore, SortPermutation};
 use super::sort_projection_column::SortProjectionColumn;
 
 const GATHER_PLAN_CACHE_THRESHOLD: usize = VECTOR_SIZE * 2;
@@ -30,7 +30,7 @@ pub struct RunBuilder {
     payload_layout: Arc<RowLayout>,
     memory: MemoryAccountingContext,
     key_store: SortKeyStore,
-    key_rows: RowStoreBuilder,
+    key_rows: Option<RowStoreBuilder>,
     payload_rows: Option<RowStoreBuilder>,
     count: u32,
 }
@@ -56,14 +56,14 @@ struct CachedRangePlan {
 enum RunStorage {
     InMemory {
         key_store: SortKeyStore,
-        key_rows: RowStore,
+        key_rows: Option<RowStore>,
         payload_rows: Option<RowStore>,
-        permutation: Vec<u32>,
+        permutation: SortPermutation,
         gather_plan_cache: Option<GatherPlanCache>,
     },
     External {
         key_store: SortKeyStore,
-        key_rows: PrefixReleasableRowStore,
+        key_rows: Option<PrefixReleasableRowStore>,
         payload_rows: Option<PrefixReleasableRowStore>,
     },
 }
@@ -124,12 +124,14 @@ impl RunBuilder {
             Arc::clone(&encoding),
             memory.clone(),
         );
-        let key_rows = RowStoreBuilder::new_with_memory(
-            Arc::clone(&buffer_pool),
-            Arc::clone(&key_layout),
-            MemoryTag::OrderBy,
-            memory.clone(),
-        );
+        let key_rows = (!encoding.can_reconstruct_values()).then(|| {
+            RowStoreBuilder::new_with_memory(
+                Arc::clone(&buffer_pool),
+                Arc::clone(&key_layout),
+                MemoryTag::OrderBy,
+                memory.clone(),
+            )
+        });
         let payload_rows = (payload_layout.column_count() > 0).then(|| {
             RowStoreBuilder::new_with_memory(
                 Arc::clone(&buffer_pool),
@@ -159,7 +161,11 @@ impl RunBuilder {
     #[inline]
     pub fn size_in_bytes(&self) -> usize {
         self.key_store.size_in_bytes()
-            + self.key_rows.size_in_bytes()
+            + self
+                .key_rows
+                .as_ref()
+                .map(RowStoreBuilder::size_in_bytes)
+                .unwrap_or(0)
             + self
                 .payload_rows
                 .as_ref()
@@ -194,7 +200,9 @@ impl RunBuilder {
         }
 
         self.key_store.encode_batch(key)?;
-        self.key_rows.append(key)?;
+        if let Some(key_rows) = self.key_rows.as_mut() {
+            key_rows.append(key)?;
+        }
         if let Some(payload_rows) = self.payload_rows.as_mut() {
             payload_rows.append(payload)?;
         }
@@ -215,17 +223,9 @@ impl RunBuilder {
     pub fn finish(mut self, external: bool) -> Result<SortedRun> {
         self.key_store.finish_writing();
 
-        let mut permutation: Vec<u32> = (0..self.count).collect();
-        if self.count > 1 {
-            let mut cursor = self.key_store.cursor_pinned()?;
-            permutation.sort_unstable_by(|left, right| {
-                cursor
-                    .compare(*left, *right)
-                    .expect("sort key comparison must succeed during finalize")
-            });
-        }
+        let permutation = self.key_store.sorted_permutation()?;
 
-        let key_rows = self.key_rows.seal();
+        let key_rows = self.key_rows.map(RowStoreBuilder::seal);
         let payload_rows = self.payload_rows.map(RowStoreBuilder::seal);
 
         let storage = if external {
@@ -233,7 +233,7 @@ impl RunBuilder {
             let (reordered_key_rows, reordered_payload_rows) = write_sorted_external_rows(
                 Arc::clone(&self.buffer_pool),
                 self.memory.clone(),
-                &key_rows,
+                key_rows.as_ref(),
                 payload_rows.as_ref(),
                 &permutation,
             )?;
@@ -243,7 +243,9 @@ impl RunBuilder {
                 payload_rows: reordered_payload_rows,
             }
         } else {
-            let gather_plan_cache = GatherPlanCache::build(&permutation);
+            let gather_plan_cache = (key_rows.is_some() || payload_rows.is_some())
+                .then(|| GatherPlanCache::build(&permutation))
+                .flatten();
             RunStorage::InMemory {
                 key_store: self.key_store,
                 key_rows,
@@ -279,21 +281,26 @@ impl SortedRun {
                 ..
             } => key_store
                 .size_in_bytes()
-                .saturating_add(key_rows.size_in_bytes())
+                .saturating_add(key_rows.as_ref().map(RowStore::size_in_bytes).unwrap_or(0))
                 .saturating_add(
                     payload_rows
                         .as_ref()
                         .map(RowStore::size_in_bytes)
                         .unwrap_or(0),
                 )
-                .saturating_add(permutation.capacity() * std::mem::size_of::<u32>()),
+                .saturating_add(permutation.size_in_bytes()),
             RunStorage::External {
                 key_store,
                 key_rows,
                 payload_rows,
             } => key_store
                 .size_in_bytes()
-                .saturating_add(key_rows.size_in_bytes())
+                .saturating_add(
+                    key_rows
+                        .as_ref()
+                        .map(PrefixReleasableRowStore::size_in_bytes)
+                        .unwrap_or(0),
+                )
                 .saturating_add(
                     payload_rows
                         .as_ref()
@@ -344,7 +351,7 @@ impl SortedRun {
                 let (reordered_key_rows, reordered_payload_rows) = write_sorted_external_rows(
                     buffer_pool.clone(),
                     memory.clone(),
-                    &key_rows,
+                    key_rows.as_ref(),
                     payload_rows.as_ref(),
                     &permutation,
                 )?;
@@ -377,9 +384,9 @@ impl SortedRun {
     }
 
     #[inline]
-    pub fn sort_indices(&self) -> Option<&Vec<u32>> {
+    pub fn sort_indices(&self) -> Option<&[u32]> {
         match &self.storage {
-            RunStorage::InMemory { permutation, .. } => Some(permutation),
+            RunStorage::InMemory { permutation, .. } => Some(permutation.as_slice()),
             RunStorage::External { .. } => None,
         }
     }
@@ -406,8 +413,16 @@ impl SortedRun {
 
     pub(crate) fn external_key_cursor(&self) -> Option<RunRowCursor<'_>> {
         match &self.storage {
-            RunStorage::External { key_rows, .. } => Some(RunRowCursor::new(key_rows)),
+            RunStorage::External { key_rows, .. } => key_rows.as_ref().map(RunRowCursor::new),
             RunStorage::InMemory { .. } => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_materialized_key_rows(&self) -> bool {
+        match &self.storage {
+            RunStorage::InMemory { key_rows, .. } => key_rows.is_some(),
+            RunStorage::External { key_rows, .. } => key_rows.is_some(),
         }
     }
 
@@ -454,34 +469,19 @@ impl SortedRun {
 
         chunk.try_reset(chunk.allocator().clone())?;
         let output_positions: Vec<u32> = (0..count as u32).collect();
-        match &self.storage {
-            RunStorage::External { .. } => {
-                let mut key_cursor = self
-                    .external_key_cursor()
-                    .expect("external run must have key row cursor");
-                let mut payload_cursor = self.external_payload_cursor();
-                self.gather_sorted_range_projected(
-                    sorted_position as u32,
-                    count as u32,
-                    chunk,
-                    &output_positions,
-                    output_projection_columns,
-                    Some(&mut key_cursor),
-                    payload_cursor.as_mut(),
-                )?;
-            }
-            RunStorage::InMemory { .. } => {
-                self.gather_sorted_range_projected(
-                    sorted_position as u32,
-                    count as u32,
-                    chunk,
-                    &output_positions,
-                    output_projection_columns,
-                    None,
-                    None,
-                )?;
-            }
-        }
+        let mut sort_key_cursor = self.key_store().cursor_on_demand(2);
+        let mut key_row_cursor = self.external_key_cursor();
+        let mut payload_cursor = self.external_payload_cursor();
+        self.gather_sorted_range_projected(
+            sorted_position as u32,
+            count as u32,
+            chunk,
+            &output_positions,
+            output_projection_columns,
+            &mut sort_key_cursor,
+            key_row_cursor.as_mut(),
+            payload_cursor.as_mut(),
+        )?;
         chunk.set_cardinality(count);
         Ok(())
     }
@@ -493,7 +493,8 @@ impl SortedRun {
         output: &mut Chunk,
         output_positions: &[u32],
         output_projection_columns: &[SortProjectionColumn],
-        key_cursor: Option<&mut RunRowCursor<'_>>,
+        sort_key_cursor: &mut KeyCursor<'_>,
+        key_row_cursor: Option<&mut RunRowCursor<'_>>,
         payload_cursor: Option<&mut RunRowCursor<'_>>,
     ) -> Result<()> {
         let key_projection: Vec<(usize, usize)> = output_projection_columns
@@ -520,22 +521,33 @@ impl SortedRun {
                     .as_ref()
                     .and_then(|cache| cache.range_plan(sorted_start, len, output_positions));
                 if !key_projection.is_empty() {
-                    if let Some(plan) = cached_range.as_ref() {
-                        let pinned = key_rows.pin_ordinals(
-                            &plan.locality_sorted_ordinals,
-                            RowOrdering::Sequential,
-                        )?;
-                        pinned.gather_columns_projected(
-                            &key_projection,
-                            output,
-                            &plan.locality_output_positions,
-                        )?;
+                    if let Some(key_rows) = key_rows.as_ref() {
+                        if let Some(plan) = cached_range.as_ref() {
+                            let pinned = key_rows.pin_ordinals(
+                                &plan.locality_sorted_ordinals,
+                                RowOrdering::Sequential,
+                            )?;
+                            pinned.gather_columns_projected(
+                                &key_projection,
+                                output,
+                                &plan.locality_output_positions,
+                            )?;
+                        } else {
+                            let pinned = key_rows.pin_ordinals(ordinals, RowOrdering::Arbitrary)?;
+                            pinned.gather_columns_projected(
+                                &key_projection,
+                                output,
+                                output_positions,
+                            )?;
+                        }
                     } else {
-                        let pinned = key_rows.pin_ordinals(ordinals, RowOrdering::Arbitrary)?;
-                        pinned.gather_columns_projected(
+                        self.decode_normalized_keys(
+                            sorted_start,
+                            len,
                             &key_projection,
                             output,
                             output_positions,
+                            sort_key_cursor,
                         )?;
                     }
                 }
@@ -564,16 +576,31 @@ impl SortedRun {
                 }
             }
             RunStorage::External {
-                key_rows: _,
+                key_rows,
                 payload_rows,
                 ..
             } => {
                 if !key_projection.is_empty() {
-                    let key_cursor = key_cursor.ok_or_else(|| {
-                        paro_error::internal("missing external key row cursor for sort run")
-                    })?;
-                    let pinned = key_cursor.pin_range(sorted_start, len)?;
-                    pinned.gather_columns_projected(&key_projection, output, output_positions)?;
+                    if key_rows.is_some() {
+                        let key_row_cursor = key_row_cursor.ok_or_else(|| {
+                            paro_error::internal("missing external key row cursor for sort run")
+                        })?;
+                        let pinned = key_row_cursor.pin_range(sorted_start, len)?;
+                        pinned.gather_columns_projected(
+                            &key_projection,
+                            output,
+                            output_positions,
+                        )?;
+                    } else {
+                        self.decode_normalized_keys(
+                            sorted_start,
+                            len,
+                            &key_projection,
+                            output,
+                            output_positions,
+                            sort_key_cursor,
+                        )?;
+                    }
                 }
                 if !payload_projection.is_empty() {
                     payload_rows.as_ref().ok_or_else(|| {
@@ -595,6 +622,39 @@ impl SortedRun {
         Ok(())
     }
 
+    fn decode_normalized_keys(
+        &self,
+        sorted_start: u32,
+        len: u32,
+        key_projection: &[(usize, usize)],
+        output: &mut Chunk,
+        output_positions: &[u32],
+        cursor: &mut KeyCursor<'_>,
+    ) -> Result<()> {
+        if output_positions.len() != len as usize {
+            return Err(paro_error::internal(format!(
+                "sort output position count mismatch: expected {len}, got {}",
+                output_positions.len()
+            )));
+        }
+
+        let mut decoder = self
+            .key_store()
+            .encoding()
+            .decoder(output, key_projection)?;
+        let mut encoded =
+            Vec::with_capacity(self.key_store().encoding().inline_prefix_len().max(64));
+        for (offset, &output_position) in output_positions.iter().enumerate() {
+            let sorted_position = sorted_start.checked_add(offset as u32).ok_or_else(|| {
+                paro_error::internal("sort normalized-key decode position overflow")
+            })?;
+            let ordinal = self.source_ordinal_at_sorted_position(sorted_position)?;
+            cursor.read_key_into(ordinal, &mut encoded)?;
+            decoder.decode_row(&encoded, output, output_position as usize)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn advance_release_frontier(&self, frontier: u32) -> Result<()> {
         if let RunStorage::External {
             key_store,
@@ -603,7 +663,9 @@ impl SortedRun {
         } = &self.storage
         {
             key_store.advance_release_frontier(frontier as u64)?;
-            key_rows.advance_release_frontier(frontier as u64)?;
+            if let Some(key_rows) = key_rows {
+                key_rows.advance_release_frontier(frontier as u64)?;
+            }
             if let Some(payload_rows) = payload_rows {
                 payload_rows.advance_release_frontier(frontier as u64)?;
             }
@@ -719,24 +781,33 @@ impl<'a> RunRowCursor<'a> {
 fn write_sorted_external_rows(
     buffer_pool: Arc<BufferPool>,
     memory: MemoryAccountingContext,
-    key_source: &RowStore,
+    key_source: Option<&RowStore>,
     payload_source: Option<&RowStore>,
     permutation: &[u32],
-) -> Result<(PrefixReleasableRowStore, Option<PrefixReleasableRowStore>)> {
+) -> Result<(
+    Option<PrefixReleasableRowStore>,
+    Option<PrefixReleasableRowStore>,
+)> {
+    if key_source.is_none() && payload_source.is_none() {
+        return Ok((None, None));
+    }
+
     let allocator: Arc<dyn Allocator> = Arc::new(BufferAllocator::new(
         Arc::clone(&buffer_pool) as Arc<dyn BufferManager>,
         MemoryTag::OrderBy,
     ));
-    let key_format = SortRowFormat::new(
-        key_source.layout().types().iter().cloned(),
-        std::iter::empty::<LogicalType>(),
-    );
-    let mut key_writer = RowStoreSpillWriter::new(
-        Arc::clone(&buffer_pool),
-        key_format,
-        MemoryTag::OrderBy,
-        memory.clone(),
-    );
+    let mut key_writer = key_source.map(|source| {
+        let key_format = SortRowFormat::new(
+            source.layout().types().iter().cloned(),
+            std::iter::empty::<LogicalType>(),
+        );
+        RowStoreSpillWriter::new(
+            Arc::clone(&buffer_pool),
+            key_format,
+            MemoryTag::OrderBy,
+            memory.clone(),
+        )
+    });
     let mut payload_writer = payload_source.map(|source| {
         let payload_format = SortRowFormat::new(
             std::iter::empty::<LogicalType>(),
@@ -749,15 +820,17 @@ fn write_sorted_external_rows(
             memory.clone(),
         )
     });
-    let key_column_ids: Vec<usize> = (0..key_source.layout().column_count()).collect();
+    let key_column_ids = key_source
+        .map(|source| (0..source.layout().column_count()).collect::<Vec<_>>())
+        .unwrap_or_default();
     let payload_column_ids = payload_source
         .map(|source| (0..source.layout().column_count()).collect::<Vec<_>>())
         .unwrap_or_default();
-    let mut key_gathered = Chunk::try_initialize(
-        key_source.layout().types(),
-        VECTOR_SIZE,
-        Arc::clone(&allocator),
-    )?;
+    let mut key_gathered = key_source
+        .map(|source| {
+            Chunk::try_initialize(source.layout().types(), VECTOR_SIZE, Arc::clone(&allocator))
+        })
+        .transpose()?;
     let mut payload_gathered = payload_source
         .map(|source| {
             Chunk::try_initialize(source.layout().types(), VECTOR_SIZE, Arc::clone(&allocator))
@@ -765,11 +838,15 @@ fn write_sorted_external_rows(
         .transpose()?;
 
     for batch in permutation.chunks(VECTOR_SIZE) {
-        key_gathered.try_reset(key_gathered.allocator().clone())?;
-        let pinned = key_source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
-        pinned.gather_columns(&key_column_ids, &mut key_gathered, 0)?;
-        key_gathered.set_cardinality(batch.len());
-        key_writer.append_chunk(&key_gathered)?;
+        if let (Some(source), Some(writer), Some(gathered)) =
+            (key_source, key_writer.as_mut(), key_gathered.as_mut())
+        {
+            gathered.try_reset(gathered.allocator().clone())?;
+            let pinned = source.pin_ordinals(batch, RowOrdering::Arbitrary)?;
+            pinned.gather_columns(&key_column_ids, gathered, 0)?;
+            gathered.set_cardinality(batch.len());
+            writer.append_chunk(gathered)?;
+        }
 
         if let (Some(source), Some(writer), Some(gathered)) = (
             payload_source,
@@ -788,5 +865,9 @@ fn write_sorted_external_rows(
         Some(writer) => Some(writer.finish()?.into_prefix_releasable()),
         None => None,
     };
-    Ok((key_writer.finish()?.into_prefix_releasable(), payload_rows))
+    let key_rows = match key_writer {
+        Some(writer) => Some(writer.finish()?.into_prefix_releasable()),
+        None => None,
+    };
+    Ok((key_rows, payload_rows))
 }

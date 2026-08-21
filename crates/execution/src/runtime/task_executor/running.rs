@@ -17,8 +17,8 @@ impl PipelineTaskExecutor {
         let source_node_id = source_operator.index() as u64;
         ctx.profiler.start_operator(source_node_id);
         let (poll, output_rows) = {
-            let task = &mut self.task;
-            let memory = task.memory.call_scope();
+            let (task, memory) = self.task.data_and_memory_mut()?;
+            let memory = memory.call_scope();
             let scratch = OperatorScratchScope::from_expression(&mut task.scratch.expression);
             let mut call_ctx = self.call_context.context(
                 ctx.query,
@@ -87,7 +87,7 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         match std::mem::take(&mut self.task.pending) {
             PendingChunkState::SourceOutput { chunk } => {
-                chunk.restore_into(&mut self.task.scratch.source_chunk);
+                chunk.restore_into(&mut self.task.data_mut()?.scratch.source_chunk);
                 self.push_source_output(ctx)
             }
             PendingChunkState::TransformOutput {
@@ -97,6 +97,7 @@ impl PipelineTaskExecutor {
             } => {
                 let scratch = self
                     .task
+                    .data_mut()?
                     .scratch
                     .transform_chunk_mut(transform_idx)
                     .ok_or_else(|| {
@@ -130,8 +131,8 @@ impl PipelineTaskExecutor {
         let transform_node_id = transform_operator.index() as u64;
         ctx.profiler.start_operator(transform_node_id);
         let (poll, output_rows) = {
-            let task = &mut self.task;
-            let memory = task.memory.call_scope();
+            let (task, memory) = self.task.data_and_memory_mut()?;
+            let memory = memory.call_scope();
             let scratch_state = &mut task.scratch;
             let scratch = OperatorScratchScope::from_expression(&mut scratch_state.expression);
             let transform = &self.runtime.program.transforms[transform_idx];
@@ -382,8 +383,8 @@ impl PipelineTaskExecutor {
         let sink_node_id = sink_operator.index() as u64;
         ctx.profiler.start_operator(sink_node_id);
         let (poll, input_rows) = {
-            let task = &mut self.task;
-            let memory = task.memory.call_scope();
+            let (task, memory) = self.task.data_and_memory_mut()?;
+            let memory = memory.call_scope();
             let scratch_state = &mut task.scratch;
             let scratch = OperatorScratchScope::from_expression(&mut scratch_state.expression);
             let mut call_ctx = self.call_context.context(
@@ -482,13 +483,16 @@ impl PipelineTaskExecutor {
     ) -> Result<()> {
         match input_slot {
             ChunkSlot::Source => {
-                let chunk =
-                    ChunkLease::take_from_scratch(&mut self.task.scratch.source_chunk, memory)?;
+                let chunk = ChunkLease::take_from_scratch(
+                    &mut self.task.data_mut()?.scratch.source_chunk,
+                    memory,
+                )?;
                 self.task.pending = PendingChunkState::SourceOutput { chunk };
             }
             ChunkSlot::Transform(transform_idx) => {
                 let chunk = ChunkLease::take_from_scratch(
                     self.task
+                        .data_mut()?
                         .scratch
                         .transform_chunk_mut(transform_idx)
                         .ok_or_else(|| {
@@ -511,7 +515,10 @@ impl PipelineTaskExecutor {
         slot: ChunkSlot,
         memory: RetainedMemorySnapshot,
     ) -> Result<ChunkLease> {
-        ChunkLease::take_from_scratch(chunk_slot_mut(&mut self.task.scratch, slot)?, memory)
+        ChunkLease::take_from_scratch(
+            chunk_slot_mut(&mut self.task.data_mut()?.scratch, slot)?,
+            memory,
+        )
     }
 
     pub(crate) fn restore_lease_to_slot(
@@ -519,7 +526,7 @@ impl PipelineTaskExecutor {
         slot: ChunkSlot,
         chunk: ChunkLease,
     ) -> Result<()> {
-        chunk.restore_into(chunk_slot_mut(&mut self.task.scratch, slot)?);
+        chunk.restore_into(chunk_slot_mut(&mut self.task.data_mut()?.scratch, slot)?);
         Ok(())
     }
 

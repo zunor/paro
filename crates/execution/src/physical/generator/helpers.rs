@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::operators::aggregate::perfect_hash_key::PerfectHashKeyDomain;
-use crate::operators::graph::state::graph_path_element_list_type;
+use paro_planner::operator::graph_expand::graph_path_element_list_type;
 
 pub(crate) fn extract_payload_expression(
     expr: Expression,
@@ -11,6 +11,14 @@ pub(crate) fn extract_payload_expression(
     payload_types: &mut Vec<paro_common::types::LogicalType>,
 ) -> Expression {
     let return_type = expr.return_type();
+    if expr.evaluation_properties().can_share_evaluation() {
+        if let Some(reference_index) = projection_exprs
+            .iter()
+            .position(|existing| existing.equals(&expr))
+        {
+            return Expression::Reference(ReferenceExpression::new(reference_index, return_type));
+        }
+    }
     let reference_index = projection_exprs.len();
     payload_types.push(return_type.clone());
     projection_exprs.push(expr);
@@ -20,12 +28,10 @@ pub(crate) fn extract_payload_expression(
 #[derive(Debug, Clone)]
 pub(crate) struct PerfectHashPlanInfo {
     pub(crate) group_minima: Vec<i128>,
-    pub(crate) required_bits: Vec<usize>,
+    pub(crate) group_cardinalities: Vec<usize>,
 }
 
 const PERFECT_HASH_RANGE_LIMIT: u128 = 1u128 << 32;
-const PERFECT_HASH_MAX_BITS: usize = 20;
-
 pub(crate) fn can_use_perfect_hash_aggregate(
     aggregate: &LogicalAggregate,
     groups: &[Expression],
@@ -48,9 +54,8 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         }
     }
 
-    let mut total_bits = 0usize;
     let mut group_minima = Vec::with_capacity(aggregate.groups.len());
-    let mut required_bits = Vec::with_capacity(aggregate.groups.len());
+    let mut group_cardinalities = Vec::with_capacity(aggregate.groups.len());
 
     for group_idx in 0..aggregate.groups.len() {
         let group_type = aggregate.groups[group_idx].return_type();
@@ -65,28 +70,19 @@ pub(crate) fn can_use_perfect_hash_aggregate(
         if range_u128 >= PERFECT_HASH_RANGE_LIMIT {
             return None;
         }
-        let bits = required_bits_for_value(range_u128.checked_add(2)?)?;
-        total_bits = total_bits.checked_add(bits)?;
-        if total_bits > PERFECT_HASH_MAX_BITS {
-            return None;
-        }
+        // One code for NULL and one-based codes for every value in the
+        // inclusive range. Mixed-radix indexing consumes exactly this domain;
+        // rounding each key to a power of two wastes a material fraction of a
+        // large direct-addressing table.
+        let cardinality = usize::try_from(range_u128.checked_add(2)?).ok()?;
         group_minima.push(min_value);
-        required_bits.push(bits);
+        group_cardinalities.push(cardinality);
     }
 
     Some(PerfectHashPlanInfo {
         group_minima,
-        required_bits,
+        group_cardinalities,
     })
-}
-
-pub(crate) fn required_bits_for_value(mut value: u128) -> Option<usize> {
-    let mut bits = 0usize;
-    while value > 0 {
-        bits = bits.checked_add(1)?;
-        value >>= 1;
-    }
-    Some(bits)
 }
 
 pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
@@ -94,6 +90,7 @@ pub(crate) fn logical_name(op: &LogicalOperator) -> &'static str {
         LogicalOperator::Get(_) => "GET",
         LogicalOperator::Filter(_) => "FILTER",
         LogicalOperator::Projection(_) => "PROJECTION",
+        LogicalOperator::RowFetch(_) => "ROW_FETCH",
         LogicalOperator::ExternalProject(_) => "EXTERNAL_PROJECT",
         LogicalOperator::ExternalTable(_) => "EXTERNAL_TABLE",
         LogicalOperator::Limit(_) => "LIMIT",
@@ -166,6 +163,20 @@ pub(crate) fn physical_output_row_type_for_kind(
         PhysicalNodeKind::GraphShortestPath(spec) => Ok(RowType::new(
             spec.output_names.to_vec(),
             spec.output_types.to_vec(),
+        )),
+        PhysicalNodeKind::RowFetch(spec) => Ok(spec.projection.as_ref().map_or_else(
+            || {
+                RowType::new(
+                    spec.raw_output_names.to_vec(),
+                    spec.raw_output_types.to_vec(),
+                )
+            },
+            |projection| {
+                RowType::new(
+                    projection.output_names.to_vec(),
+                    projection.output_types.to_vec(),
+                )
+            },
         )),
         PhysicalNodeKind::GraphProject(spec) => Ok(RowType::new(
             spec.output_names.to_vec(),
@@ -240,10 +251,6 @@ pub(crate) fn project_by_index<T: Clone>(
     projection_map: &[usize],
     label: &str,
 ) -> Result<Vec<T>> {
-    if projection_map.is_empty() {
-        return Ok(values.to_vec());
-    }
-
     projection_map
         .iter()
         .map(|&idx| {
@@ -260,14 +267,16 @@ pub(crate) fn project_by_index<T: Clone>(
 pub(crate) fn hash_join_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
-        _ => canonical_projection(join.left.types().len(), &join.left_projection_map),
+        _ => join.left_projection_map.to_indices(join.left.types().len()),
     }
 }
 
 pub(crate) fn hash_join_right_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
-        _ => canonical_projection(join.right.types().len(), &join.right_projection_map),
+        _ => join
+            .right_projection_map
+            .to_indices(join.right.types().len()),
     }
 }
 
@@ -285,14 +294,6 @@ pub(crate) fn comparison_join_output_names(join: &ComparisonJoin) -> Result<Vec<
         "comparison join right output",
     )?;
     Ok(join_output_names(join.join_type, left_names, right_names))
-}
-
-pub(crate) fn canonical_projection(width: usize, projection_map: &[usize]) -> Vec<usize> {
-    if projection_map.is_empty() {
-        (0..width).collect()
-    } else {
-        projection_map.to_vec()
-    }
 }
 
 pub(crate) fn supports_typed_hash_join_type(join_type: JoinType) -> bool {
@@ -328,14 +329,16 @@ pub(crate) fn is_hash_join_comparison(comparison: JoinComparisonType) -> bool {
 pub(crate) fn nlj_left_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::RightSemi | JoinType::RightAnti => Vec::new(),
-        _ => canonical_projection(join.left.types().len(), &join.left_projection_map),
+        _ => join.left_projection_map.to_indices(join.left.types().len()),
     }
 }
 
 pub(crate) fn nlj_right_projection(join: &ComparisonJoin) -> Vec<usize> {
     match join.join_type {
         JoinType::Semi | JoinType::Anti | JoinType::Mark => Vec::new(),
-        _ => canonical_projection(join.right.types().len(), &join.right_projection_map),
+        _ => join
+            .right_projection_map
+            .to_indices(join.right.types().len()),
     }
 }
 
@@ -397,6 +400,7 @@ pub(crate) fn extract_schema_name_from_logical(plan: &LogicalPlan) -> Option<Str
 #[derive(Debug, Default, Clone)]
 pub(crate) struct GraphChainLayout {
     pub(crate) width: usize,
+    pub(crate) output_table_index: usize,
     pub(crate) local_id_cols: HashMap<usize, usize>,
     pub(crate) rowid_cols: HashMap<usize, usize>,
 }
@@ -406,6 +410,7 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
         LogicalOperator::GraphScan(scan) => {
             let mut layout = GraphChainLayout {
                 width: scan.output_types.len(),
+                output_table_index: scan.output_table_index,
                 ..GraphChainLayout::default()
             };
             layout.local_id_cols.insert(scan.table_index, 0);
@@ -414,6 +419,12 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
         }
         LogicalOperator::GraphExpand(expand) => {
             let mut layout = build_graph_chain_layout(expand.child.as_ref())?;
+            if layout.output_table_index != expand.output_table_index {
+                return Err(paro_error::internal(format!(
+                    "GraphExpand carrier namespace changed within a graph chain: child={}, expand={}",
+                    layout.output_table_index, expand.output_table_index
+                )));
+            }
             let base = layout.width;
             layout.rowid_cols.insert(expand.edge_table_index, base);
             layout
@@ -422,9 +433,11 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
             layout
                 .rowid_cols
                 .insert(expand.target_table_index, base + 2);
-            layout.width += 3;
-            if expand.has_path_functions {
-                layout.width += 3;
+            layout.width = expand.output_types().len();
+            if layout.width != base + 3 + usize::from(expand.has_path_functions) * 3 {
+                return Err(paro_error::internal(
+                    "GraphExpand logical carrier width is inconsistent with its child",
+                ));
             }
             Ok(layout)
         }
@@ -438,7 +451,7 @@ pub(crate) fn build_graph_chain_layout(plan: &LogicalPlan) -> Result<GraphChainL
 pub(crate) fn build_rowid_mappings_from_logical(
     plan: &LogicalPlan,
     schema_name: &str,
-) -> Result<Vec<GraphRowidMapping>> {
+) -> Result<Vec<GraphRowFetchMapping>> {
     let layout = build_graph_chain_layout(plan)?;
     let mut mappings = Vec::new();
     collect_rowid_mappings_from_logical(plan, schema_name, &layout, &mut mappings)?;
@@ -449,7 +462,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
     plan: &LogicalPlan,
     schema_name: &str,
     layout: &GraphChainLayout,
-    mappings: &mut Vec<GraphRowidMapping>,
+    mappings: &mut Vec<GraphRowFetchMapping>,
 ) -> Result<()> {
     match &plan.operator {
         LogicalOperator::GraphScan(scan) => {
@@ -463,7 +476,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                         scan.table_index
                     ))
                 })?;
-            mappings.push(GraphRowidMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: scan.table_index,
                 rowid_col_idx,
                 table_name: scan.vertex_info.table_name.clone(),
@@ -489,7 +502,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                         expand.edge_table_index
                     ))
                 })?;
-            mappings.push(GraphRowidMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: expand.edge_table_index,
                 rowid_col_idx: edge_rowid_col_idx,
                 table_name: expand.edge_info.table_name.clone(),
@@ -506,7 +519,7 @@ pub(crate) fn collect_rowid_mappings_from_logical(
                     expand.target_table_index
                 ))
             })?;
-            mappings.push(GraphRowidMapping {
+            mappings.push(GraphRowFetchMapping {
                 table_index: expand.target_table_index,
                 rowid_col_idx: target_rowid_col_idx,
                 table_name: expand.target_table_name.clone(),

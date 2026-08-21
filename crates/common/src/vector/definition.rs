@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use bytes::Bytes;
+
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
 use crate::memory::AllocationId;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{LogicalType, PhysicalType, StringView};
 
 use super::{
     AllocationSet, SelectionVector, StringHeap, ValidityMask, VectorBuffer, VectorSelection,
@@ -24,6 +26,44 @@ pub struct DictionaryInfo {
     pub unique_len: usize,
     pub provenance_id: Option<u64>,
     pub source: DictionarySource,
+}
+
+/// Opaque ownership token whose lifetime follows a shallow vector reference.
+///
+/// Vectors normally own their allocations through buffers and heaps. Blocking
+/// operators may also retain allocations owned by another subsystem (for
+/// example a page-cache pin or query accounting lease). Attaching that owner
+/// to the vector makes zero-copy handoff explicit: clones and dictionary
+/// children keep the token alive until the last data reference disappears.
+pub trait VectorLifetimeOwner: std::fmt::Debug + Send + Sync {}
+
+impl<T> VectorLifetimeOwner for T where T: std::fmt::Debug + Send + Sync {}
+
+#[derive(Debug)]
+pub(super) struct VectorLifetimeOwners {
+    owners: Box<[Arc<dyn VectorLifetimeOwner>]>,
+}
+
+impl VectorLifetimeOwners {
+    fn with_added(existing: Option<&Arc<Self>>, owner: Arc<dyn VectorLifetimeOwner>) -> Arc<Self> {
+        if let Some(existing) = existing {
+            if existing
+                .owners
+                .iter()
+                .any(|candidate| Arc::ptr_eq(candidate, &owner))
+            {
+                return Arc::clone(existing);
+            }
+        }
+        let mut owners = Vec::with_capacity(existing.map_or(1, |set| set.owners.len() + 1));
+        if let Some(existing) = existing {
+            owners.extend(existing.owners.iter().cloned());
+        }
+        owners.push(owner);
+        Arc::new(Self {
+            owners: owners.into_boxed_slice(),
+        })
+    }
 }
 
 /// A columnar vector handle.
@@ -51,6 +91,10 @@ pub struct Vector {
     /// Number of logical elements
     pub(super) count: usize,
     /// For DICTIONARY: logical-to-physical row mapping
+    ///
+    /// Dictionary construction guarantees every logical index is inside the
+    /// canonical base child's cardinality. Producers that already validated
+    /// indices may transfer that proof through the explicit unsafe constructor.
     /// For SEQUENCE: unused
     pub(super) selection: VectorSelection,
     /// Multi-purpose shared child vector:
@@ -63,6 +107,10 @@ pub struct Vector {
     pub(super) string_heap: Option<Arc<StringHeap>>,
     /// Optional provenance for dictionary overlays.
     pub(super) dictionary_info: Option<DictionaryInfo>,
+    /// Non-allocation owners required by the referenced vector storage.
+    /// Allocated only for the uncommon zero-copy handoff that needs an
+    /// ownership token beyond the vector's ordinary buffers and heaps.
+    pub(super) lifetime_owners: Option<Arc<VectorLifetimeOwners>>,
 }
 
 pub(crate) struct VectorResetState {
@@ -100,7 +148,12 @@ impl Vector {
         capacity: usize,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
-        let element_size = logical_type.physical_size();
+        if logical_type == LogicalType::Unknown {
+            return Err(paro_error::invalid_input(
+                "cannot allocate a physical vector for unresolved UNKNOWN type",
+            ));
+        }
+        let element_size = logical_type.type_size();
         let mut vec = Self {
             vector_type: VectorType::Flat,
             buffer: VectorBuffer::try_with_allocator(element_size, capacity, allocator.clone())?,
@@ -112,6 +165,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
 
         // Initialize child vectors for nested types
@@ -145,6 +199,40 @@ impl Vector {
             _ => {}
         }
         Ok(vec)
+    }
+
+    /// Create an all-valid flat vector over immutable fixed-width bytes.
+    ///
+    /// The byte owner is retained by the vector. Any later mutable access
+    /// transparently materializes allocator-owned storage through COW.
+    pub fn try_from_fixed_width_bytes(
+        logical_type: LogicalType,
+        rows: usize,
+        bytes: Bytes,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        if matches!(
+            logical_type.physical_type(),
+            PhysicalType::Varchar | PhysicalType::List | PhysicalType::Struct | PhysicalType::Array
+        ) {
+            return Err(paro_error::invalid_input(format!(
+                "external fixed-width vector does not support {logical_type:?}"
+            )));
+        }
+        let element_size = logical_type.type_size();
+        Ok(Self {
+            vector_type: VectorType::Flat,
+            buffer: VectorBuffer::try_from_bytes(element_size, rows, bytes, allocator.clone())?,
+            validity: ValidityMask::with_allocator(rows, allocator),
+            count: rows,
+            logical_type,
+            selection: VectorSelection::None,
+            child: None,
+            children: Vec::new(),
+            string_heap: None,
+            dictionary_info: None,
+            lifetime_owners: None,
+        })
     }
 
     pub fn child(&self) -> Option<&Arc<Vector>> {
@@ -233,23 +321,14 @@ impl Vector {
     }
 
     /// Prepare a varlen result vector for direct row-wise writes.
-    pub fn begin_varlen_write(
+    pub fn try_begin_varlen_write(
         &mut self,
         count: usize,
-    ) -> (*mut InlineString, &mut ValidityMask, &mut StringHeap) {
-        debug_assert!(matches!(
-            self.logical_type,
-            LogicalType::Varchar
-                | LogicalType::VarcharCollation(_)
-                | LogicalType::TsVector
-                | LogicalType::TsQuery
-                | LogicalType::Json
-                | LogicalType::Jsonb
-                | LogicalType::Blob
-        ));
+    ) -> Result<(*mut StringView, &mut ValidityMask, &mut StringHeap)> {
+        debug_assert!(self.logical_type.is_utf8_varlen() || self.logical_type == LogicalType::Blob);
 
         self.make_exclusive();
-        self.set_len(count);
+        self.try_set_len(count)?;
 
         let allocator = self.allocator().clone();
         let heap_arc = self.string_heap.get_or_insert_with(|| {
@@ -261,9 +340,9 @@ impl Vector {
         let heap = Arc::get_mut(heap_arc).expect("varlen heap must be uniquely owned");
         heap.clear();
 
-        let entries = self.buffer.data() as *mut InlineString;
+        let entries = self.buffer.data() as *mut StringView;
         let validity = &mut self.validity;
-        (entries, validity, heap)
+        Ok((entries, validity, heap))
     }
 
     /// Create a shallow reference to this vector (Zero-copy).
@@ -271,13 +350,49 @@ impl Vector {
         self.clone()
     }
 
-    /// Create a shallow reference while presenting a different logical type.
+    /// Create a zero-copy reference that retains an additional opaque owner.
     ///
-    /// This is valid for casts that keep the physical representation unchanged.
-    pub fn reference_as(&self, logical_type: LogicalType) -> Self {
+    /// The owner is attached recursively to nested children so extracting a
+    /// list/struct/dictionary child cannot outlive the lease that protects its
+    /// shared allocation.
+    pub fn reference_with_lifetime_owner(&self, owner: Arc<dyn VectorLifetimeOwner>) -> Self {
+        let mut vector = self.reference();
+        vector.attach_lifetime_owner(owner);
+        vector
+    }
+
+    fn attach_lifetime_owner(&mut self, owner: Arc<dyn VectorLifetimeOwner>) {
+        self.lifetime_owners = Some(VectorLifetimeOwners::with_added(
+            self.lifetime_owners.as_ref(),
+            Arc::clone(&owner),
+        ));
+        if let Some(child) = &mut self.child {
+            let mut referenced = child.reference();
+            referenced.attach_lifetime_owner(Arc::clone(&owner));
+            *child = Arc::new(referenced);
+        }
+        for child in &mut self.children {
+            let mut referenced = child.reference();
+            referenced.attach_lifetime_owner(Arc::clone(&owner));
+            *child = Arc::new(referenced);
+        }
+    }
+
+    /// Create a shallow reference while presenting a storage-compatible logical type.
+    ///
+    /// This validates the representation and the direction of the UTF-8
+    /// invariant. In particular, arbitrary BLOB bytes cannot be relabeled as a
+    /// textual value and later consumed through an unchecked UTF-8 view.
+    pub fn try_reference_as(&self, logical_type: LogicalType) -> Result<Self> {
+        if !logical_types_are_reference_compatible(&self.logical_type, &logical_type) {
+            return Err(paro_error::type_mismatch(format!(
+                "zero-copy vector reference is not storage-compatible: {:?} -> {:?}",
+                self.logical_type, logical_type
+            )));
+        }
         let mut vector = self.reference();
         vector.logical_type = logical_type;
-        vector
+        Ok(vector)
     }
 
     /// Ensure the vector's primary buffer and validity mask are exclusively owned.
@@ -302,11 +417,8 @@ impl Vector {
         if self.buffer.capacity() >= capacity {
             return Ok(());
         }
-        self.buffer = VectorBuffer::try_with_allocator(
-            self.logical_type.physical_size(),
-            capacity,
-            allocator,
-        )?;
+        self.buffer =
+            VectorBuffer::try_with_allocator(self.logical_type.type_size(), capacity, allocator)?;
         Ok(())
     }
 
@@ -396,13 +508,7 @@ impl Vector {
                 self.child = None;
                 self.string_heap = None;
             }
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::Blob => {
+            logical_type if logical_type.physical_type() == PhysicalType::Varchar => {
                 self.try_ensure_buffer_capacity(capacity, allocator.clone())?;
                 self.child = None;
                 self.children.clear();
@@ -588,8 +694,14 @@ impl Vector {
     /// Used when manually populating the vector.
     #[inline]
     pub fn try_set_len(&mut self, len: usize) -> Result<()> {
-        if self.vector_type == VectorType::Flat && self.buffer.element_size() > 0 {
-            debug_assert!(len <= self.buffer.capacity(), "Length exceeds capacity");
+        if self.vector_type == VectorType::Flat
+            && self.buffer.element_size() > 0
+            && len > self.buffer.capacity()
+        {
+            return Err(paro_error::out_of_range(format!(
+                "vector length exceeds capacity: length={len}, capacity={}",
+                self.buffer.capacity()
+            )));
         }
         // Also need to resize validity mask if needed
         if len > self.validity.len() {
@@ -966,48 +1078,19 @@ impl Vector {
     }
 }
 
-// ============================================================================
-// LogicalType extension
-// ============================================================================
+fn logical_types_are_reference_compatible(source: &LogicalType, target: &LogicalType) -> bool {
+    if source == target {
+        return true;
+    }
 
-impl LogicalType {
-    /// Get the physical size in bytes for this type.
-    ///
-    /// For compound types (Array, List, Struct), returns 0 as data is stored in child vector.
-    pub fn physical_size(&self) -> usize {
-        match self {
-            LogicalType::Boolean => 1,
-            LogicalType::TinyInt | LogicalType::UTinyInt => 1,
-            LogicalType::SmallInt | LogicalType::USmallInt => 2,
-            LogicalType::Integer | LogicalType::UInteger => 4,
-            LogicalType::BigInt | LogicalType::UBigInt => 8,
-            LogicalType::HugeInt | LogicalType::UHugeInt | LogicalType::Uuid => 16,
-            LogicalType::Float => 4,
-            LogicalType::Double => 8,
-            LogicalType::Date => 4,
-            LogicalType::Timestamp => 8,
-            LogicalType::TimestampTz => 8,
-            LogicalType::Time => 8,
-            LogicalType::Interval => 16,
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb => 16, // InlineString: 16 bytes
-            LogicalType::Blob => 16, // InlineString: 16 bytes (same as Varchar)
-            LogicalType::Decimal { precision, .. } => {
-                if *precision <= 18 {
-                    8
-                } else {
-                    16
-                }
-            }
-            LogicalType::Null => 1, // Still needs validity bit, and at least 1 byte if we allocate
-            LogicalType::Array(_, _) => 0, // Data in child vector
-            LogicalType::List(_) => 8, // Offset (u32) + length (u32)
-            LogicalType::Struct(_) => 0, // Data in child vectors
-            _ => 8,
+    match (source, target) {
+        // A shallow reference does not recursively retype child vectors.
+        (LogicalType::Array(..), LogicalType::Array(..))
+        | (LogicalType::List(_), LogicalType::List(_))
+        | (LogicalType::Struct(_), LogicalType::Struct(_)) => false,
+        _ => {
+            source.physical_type() == target.physical_type()
+                && !(source == &LogicalType::Blob && target.is_utf8_varlen())
         }
     }
 }

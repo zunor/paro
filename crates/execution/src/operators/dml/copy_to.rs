@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::CopyToFileSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -20,7 +19,6 @@ use super::helpers::{
 #[derive(Debug, Clone)]
 pub struct CopyToFileSinkExec {
     pub spec: CopyToFileSpec,
-    pub required: RequiredProperties,
 }
 
 impl CopyToFileSinkExec {

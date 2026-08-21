@@ -84,13 +84,11 @@ WHERE r < 0.5;
 QUERY PLAN
 PROJECTION  (rows=30)
   Output: r
-  ->  PROJECTION  (rows=30)
-    Output: r
-    ->  FILTER  (rows=30)
-      Filter: #0 < CAST(0.5 AS DOUBLE)
-      ->  PROJECTION  (rows=100)
-        Output: r
-        ->  TABLE_FUNCTION_SCAN  (rows=100)
+  ->  FILTER  (rows=30)
+    Filter: #0 < 0.5
+    ->  PROJECTION  (rows=100)
+      Output: r
+      ->  TABLE_FUNCTION_SCAN  (rows=100)
 
 EXPLAIN
 SELECT count(*)

@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
 use crate::binder::context::BindContext;
@@ -42,10 +42,24 @@ impl CardinalityEstimate {
     }
 }
 
+/// Provenance controls which optimizer phase owns a cardinality annotation.
+///
+/// Tree-local statistics can always be recomputed after a rewrite. A join
+/// graph estimate, however, accounts for equality classes and joint domains
+/// across the whole associative region; reconstructing it from one physical
+/// tree cut loses that information.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CardinalityProvenance {
+    #[default]
+    Statistics,
+    JoinGraph,
+}
+
 /// Statistics attached to a logical plan node.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct NodeStats {
     pub estimated_cardinality: Option<CardinalityEstimate>,
+    pub cardinality_provenance: CardinalityProvenance,
 }
 
 /// Logical plan wrapper that owns plan-node identity and node-local metadata.
@@ -160,6 +174,97 @@ impl LogicalPlan {
         })
     }
 
+    /// Iteratively transform a plan after all of its children have been
+    /// transformed, while folding one caller-defined state per subtree.
+    ///
+    /// Logical plans can become substantially deeper than the SQL surface
+    /// shape after decorrelation and CTE rewrites. Keeping the traversal here
+    /// gives every pass a bounded native stack and a single child
+    /// detach/rebuild contract instead of duplicating recursive walkers.
+    pub fn try_fold_post_order<State>(
+        self,
+        mut transform: impl FnMut(LogicalPlan, Vec<State>) -> Result<(LogicalPlan, State)>,
+    ) -> Result<(LogicalPlan, State)> {
+        struct Frame<State> {
+            skeleton: LogicalPlan,
+            remaining: std::vec::IntoIter<LogicalPlan>,
+            children: Vec<LogicalPlan>,
+            child_states: Vec<State>,
+        }
+
+        impl<State> Frame<State> {
+            fn detach(plan: LogicalPlan) -> Result<Self> {
+                let mut detached = Vec::new();
+                let skeleton = plan.try_map_children(|child| {
+                    detached.push(child);
+                    Ok(LogicalPlan::synthetic(LogicalOperator::DummyScan))
+                })?;
+                let child_count = detached.len();
+                Ok(Self {
+                    skeleton,
+                    remaining: detached.into_iter(),
+                    children: Vec::with_capacity(child_count),
+                    child_states: Vec::with_capacity(child_count),
+                })
+            }
+
+            fn rebuild(self) -> Result<(LogicalPlan, Vec<State>)> {
+                let mut children = self.children.into_iter();
+                let plan = self.skeleton.try_map_children(|_| {
+                    children.next().ok_or_else(|| {
+                        paro_error::internal("post-order traversal lost a transformed child")
+                    })
+                })?;
+                if children.next().is_some() {
+                    return Err(paro_error::internal(
+                        "post-order traversal produced excess transformed children",
+                    ));
+                }
+                Ok((plan, self.child_states))
+            }
+        }
+
+        let mut frames = vec![Frame::detach(self)?];
+        loop {
+            if let Some(child) = frames.last_mut().and_then(|frame| frame.remaining.next()) {
+                frames.push(Frame::detach(child)?);
+                continue;
+            }
+            let frame = frames
+                .pop()
+                .ok_or_else(|| paro_error::internal("post-order traversal stack is empty"))?;
+            let (plan, child_states) = frame.rebuild()?;
+            let (plan, state) = transform(plan, child_states)?;
+            let Some(parent) = frames.last_mut() else {
+                return Ok((plan, state));
+            };
+            parent.children.push(plan);
+            parent.child_states.push(state);
+        }
+    }
+
+    /// Iterative post-order map without a caller-visible fold state.
+    pub fn try_map_post_order(
+        self,
+        mut transform: impl FnMut(LogicalPlan) -> Result<LogicalPlan>,
+    ) -> Result<LogicalPlan> {
+        self.try_fold_post_order(|plan, _children: Vec<()>| Ok((transform(plan)?, ())))
+            .map(|(plan, ())| plan)
+    }
+
+    /// Visit every node with a bounded native stack.
+    pub fn try_visit_pre_order(
+        &self,
+        mut visitor: impl FnMut(&LogicalPlan) -> Result<()>,
+    ) -> Result<()> {
+        let mut pending = vec![self];
+        while let Some(plan) = pending.pop() {
+            visitor(plan)?;
+            pending.extend(plan.children().into_iter().rev());
+        }
+        Ok(())
+    }
+
     pub fn visit_children_mut<F>(&mut self, f: F) -> ControlFlow<()>
     where
         F: for<'a> FnMut(&'a mut LogicalPlan) -> ControlFlow<()>,
@@ -176,6 +281,7 @@ impl LogicalPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operator::EmptyResult;
 
     #[test]
     fn logical_plan_ids_share_bind_context_counter() {
@@ -198,5 +304,36 @@ mod tests {
         assert_eq!(synthetic.id, PlanNodeId::SYNTHETIC);
         assert_eq!(synthetic.stats, NodeStats::default());
         assert!(!synthetic.is_empty_result());
+    }
+
+    #[test]
+    fn post_order_fold_handles_deep_plans_without_native_recursion() {
+        const DEPTH: usize = 10_000;
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::DummyScan);
+        for _ in 0..DEPTH {
+            plan = LogicalPlan::synthetic(LogicalOperator::EmptyResult(EmptyResult::new(plan)));
+        }
+
+        let (mut plan, node_count) = plan
+            .try_fold_post_order(|plan, children: Vec<usize>| {
+                Ok((plan, 1 + children.into_iter().sum::<usize>()))
+            })
+            .expect("bounded post-order traversal");
+        assert_eq!(node_count, DEPTH + 1);
+
+        // Dismantle iteratively as well so the test itself never relies on a
+        // recursive Box drop for its deep synthetic tree.
+        let mut wrappers = 0;
+        loop {
+            match plan.operator {
+                LogicalOperator::EmptyResult(empty) => {
+                    wrappers += 1;
+                    plan = *empty.child;
+                }
+                LogicalOperator::DummyScan => break,
+                _ => panic!("unexpected operator in deep synthetic plan"),
+            }
+        }
+        assert_eq!(wrappers, DEPTH);
     }
 }

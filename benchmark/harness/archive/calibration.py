@@ -427,6 +427,7 @@ def _health(
     cache_hit: bool = False,
     clean_observations: int = 0,
     required_observations: int = 0,
+    calibration_payload: dict[str, Any] | None = None,
 ) -> ArchiveHealth:
     effective = GateEnforcement.SOFT if policy.enforcement == GateEnforcement.HARD else policy.enforcement
     return ArchiveHealth(
@@ -439,6 +440,7 @@ def _health(
         cache_hit=cache_hit,
         clean_observations=clean_observations,
         required_observations=required_observations,
+        calibration_payload=calibration_payload,
     )
 
 

@@ -20,21 +20,19 @@ use paro_context::StatementContext;
 use paro_planner::operator::ExplainSpec;
 
 use crate::explain::analyze_render::render_explain_analyze;
-use crate::explain::profiler::{ExplainProfiler, OperatorProfiler, ProfileWorkerContext};
+use crate::explain::profiler::ExplainProfiler;
 use crate::memory_runtime::QueryMemoryPool;
 use crate::pipeline::graph::{
     ControlRegion, ControlRegionId, PipelineGraph, PipelineId, PipelineRoot, PipelineSubgraphRoot,
     SinkSharing,
 };
 use crate::pipeline::{PipelineProgramSet, StatementProgram, UtilityProgram};
+use crate::runtime::scheduler::run_bound_pipeline_runtime;
 use crate::runtime::{
-    BlockReason, Blocker, BreakerHandleRegistry, ControlRegionRuntime, ControlRegionRuntimeSet,
-    OperatorWakeScope, ParameterBindings, PipelineDependencyGates, PipelineRuntime,
-    PipelineScheduler, PipelineTaskExecutor, PipelineTaskId, PipelineTaskStepContext,
-    QueryOutputPort, QueryRuntimeContext, RecursiveCteGateAction, SharedSinkRuntimeSet,
-    TaskStepResult, UtilityContext, WakeGeneration,
+    BreakerHandleRegistry, ControlRegionRuntime, ControlRegionRuntimeSet, ParameterBindings,
+    PipelineDependencyGates, PipelineRuntime, PipelineScheduler, QueryOutputPort,
+    QueryRuntimeContext, RecursiveCteGateAction, SharedSinkRuntimeSet, UtilityContext,
 };
-use crate::thread_context::ThreadContext;
 
 use super::cleanup::{
     cleanup_handles, cleanup_reason_for_error, merge_execution_and_cleanup_result,
@@ -120,6 +118,14 @@ fn start_program_with_output(
 ) -> Result<ProgramExecution> {
     let output = match program {
         StatementProgram::Pipeline { graph, .. }
+            if fetch_driven
+                && session.limits.parallel_scheduler
+                && graph.control_regions.is_empty()
+                && session.number_of_threads() > 1 =>
+        {
+            QueryOutputPort::with_blocking_writes(&streaming_output)
+        }
+        StatementProgram::Pipeline { graph, .. }
             if fetch_driven && supports_fetch_driven_pipeline(graph.as_ref()) =>
         {
             streaming_output
@@ -136,6 +142,21 @@ fn start_program_with_output(
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
+        }
+        StatementProgram::Pipeline {
+            graph, programs, ..
+        } if fetch_driven && PipelineScheduler::should_use_parallel_scheduler(graph, &query) => {
+            let background = BackgroundExecutionDriver::spawn(
+                graph.clone(),
+                programs.clone(),
+                query.clone(),
+                allocator,
+            )?;
+            return Ok(ProgramExecution {
+                query,
+                driver: None,
+                background: Some(background),
+            });
         }
         StatementProgram::Pipeline {
             graph, programs, ..
@@ -209,17 +230,13 @@ impl BackgroundExecutionDriver {
                     run_pipeline_graph(graph.as_ref(), &programs, &worker_query, allocator)
                 })) {
                     Ok(result) => result,
-                    Err(_) => Err(paro_error::internal(
-                        "control-region background driver panicked",
-                    )),
+                    Err(_) => Err(paro_error::internal("background query driver panicked")),
                 };
                 worker_query.output.close();
                 worker_state.finish(result);
             })
             .map_err(|error| {
-                paro_error::internal(format!(
-                    "failed to spawn control-region background driver: {error}"
-                ))
+                paro_error::internal(format!("failed to spawn background query driver: {error}"))
             })?;
         Ok(Self {
             state,
@@ -241,7 +258,7 @@ impl BackgroundExecutionDriver {
         if let Some(handle) = self.handle.take() {
             handle
                 .join()
-                .map_err(|_| paro_error::internal("control-region background driver panicked"))?;
+                .map_err(|_| paro_error::internal("background query driver panicked"))?;
         }
         self.state.take_result().unwrap_or(Ok(()))
     }
@@ -551,6 +568,7 @@ fn run_pipeline_dag(
                 for pipeline in newly_finished {
                     mark_pipeline_finished(
                         pipeline,
+                        ctx.handles.as_ref(),
                         &mut finished,
                         &mut finished_count,
                         &mut gates,
@@ -564,6 +582,7 @@ fn run_pipeline_dag(
         run_pipeline(pipeline_id, ctx)?;
         mark_pipeline_finished(
             pipeline_id,
+            ctx.handles.as_ref(),
             &mut finished,
             &mut finished_count,
             &mut gates,
@@ -576,6 +595,7 @@ fn run_pipeline_dag(
 
 fn mark_pipeline_finished(
     pipeline_id: PipelineId,
+    handles: &BreakerHandleRegistry,
     finished: &mut [bool],
     finished_count: &mut usize,
     gates: &mut PipelineDependencyGates,
@@ -586,6 +606,7 @@ fn mark_pipeline_finished(
     }
     finished[pipeline_id.index()] = true;
     *finished_count += 1;
+    handles.pipeline_finished(pipeline_id);
     for event in gates.mark_finished(pipeline_id) {
         if !finished[event.pipeline.index()] && gates.is_ready(event.pipeline) {
             ready.push_back(event.pipeline);
@@ -730,80 +751,21 @@ fn run_pipeline(pipeline: PipelineId, ctx: &GraphExecutionContext<'_>) -> Result
         ctx.query,
         shared_sink,
     )?);
-    run_runtime(runtime, ctx.query, ctx.allocator.clone())
+    run_runtime(runtime, ctx)
 }
 
-fn run_runtime(
-    runtime: Arc<PipelineRuntime>,
-    query: &QueryRuntimeContext,
-    allocator: Arc<dyn Allocator>,
-) -> Result<()> {
-    let task = runtime.create_task_state(query, allocator)?;
-    let task_id = PipelineTaskId(runtime.program.id.index() as u64);
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let thread = ThreadContext::new(0, query.session.number_of_threads().max(1));
-    let wake = OperatorWakeScope {
-        task_id,
-        generation: WakeGeneration(0),
-    };
-    let mut profiler =
-        query
-            .explain_profiler
-            .as_ref()
-            .map_or_else(OperatorProfiler::disabled, |profiler| {
-                OperatorProfiler::new_with_context(
-                    profiler.clone(),
-                    ProfileWorkerContext::new(
-                        Some(task_id.0),
-                        Some(task_id.0),
-                        Some(0),
-                        Some(query.session.number_of_threads().max(1) as u64),
-                        None,
-                    ),
-                )
-            });
-    let mut step_ctx = PipelineTaskStepContext {
-        query,
-        thread: &thread,
-        wake: &wake,
-        profiler: &mut profiler,
-    };
-
-    loop {
-        match executor.step(&mut step_ctx)? {
-            TaskStepResult::Continue => {}
-            TaskStepResult::Done => {
-                profiler.flush();
-                return Ok(());
-            }
-            TaskStepResult::Blocked(blocker) => {
-                return Err(completed_output_blocked_error(&blocker));
-            }
-        }
-    }
-}
-
-fn completed_output_blocked_error(blocker: &Blocker) -> paro_common::error::ParoError {
-    match &blocker.reason {
-        BlockReason::OutputBackpressure => paro_error::internal(
-            "completed-output/control-region pipeline blocked on root output backpressure; this path must use unbounded or discarding output",
-        ),
-        BlockReason::ExternalRuntime => paro_error::internal(
-            "external runtime blockers must be rejected before completed-output/control-region execution",
-        ),
-        BlockReason::Memory | BlockReason::Spill => paro_error::internal(
-            "memory/spill blockers need a scheduler waiter registry and are not valid inside completed-output/control-region execution",
-        ),
-        BlockReason::DerivedIndex => paro_error::internal(
-            "derived-index blockers need a scheduler waiter registry and are not valid inside completed-output/control-region execution",
-        ),
-        BlockReason::CancelCheck => paro_error::internal(
-            "cancellation blockers should be reported as query cancellation, not parked inside completed-output/control-region execution",
-        ),
-        BlockReason::Other(reason) => paro_error::internal(format!(
-            "completed-output/control-region pipeline blocked on unsupported reason {reason}; this path cannot park tasks"
-        )),
-    }
+fn run_runtime(runtime: Arc<PipelineRuntime>, ctx: &GraphExecutionContext<'_>) -> Result<()> {
+    let pipeline = runtime.program.id;
+    let spec = ctx
+        .graph
+        .pipeline(pipeline)
+        .ok_or_else(|| paro_error::internal("control-region pipeline spec missing"))?;
+    run_bound_pipeline_runtime(
+        runtime,
+        spec.properties.capabilities.parallelism,
+        Arc::new(ctx.query.clone()),
+        ctx.allocator.clone(),
+    )
 }
 
 fn run_control_region_root(
@@ -840,60 +802,85 @@ fn run_control_region(
     completed: &mut HashSet<PipelineId>,
 ) -> Result<()> {
     match regions.regions.get(id.index()) {
-        Some(ControlRegionRuntime::RecursiveCte(_)) => {}
-        Some(ControlRegionRuntime::CorrelatedSubquery(_)) => {
-            return run_correlated_subquery_region(id, regions, ctx, completed);
+        Some(ControlRegionRuntime::RecursiveCte(_)) => {
+            run_recursive_cte_region(id, regions, ctx, completed)
         }
-        None => return Err(paro_error::internal("control-region id is invalid")),
+        Some(ControlRegionRuntime::CorrelatedSubquery(_)) => {
+            run_correlated_subquery_region(id, regions, ctx, completed)
+        }
+        None => Err(paro_error::internal("control-region id is invalid")),
     }
+}
 
+fn recursive_cte_controller_mut(
+    regions: &mut ControlRegionRuntimeSet,
+    id: ControlRegionId,
+) -> Result<&mut crate::runtime::RecursiveCteControllerState> {
     let region = regions
         .regions
         .get_mut(id.index())
         .ok_or_else(|| paro_error::internal("control-region id is invalid"))?;
     match region {
-        ControlRegionRuntime::RecursiveCte(controller) => {
-            let anchor = controller.start_anchor()?;
-            let anchor_id = anchor.program.id;
-            run_runtime(anchor, ctx.query, ctx.allocator.clone())?;
-            completed.insert(anchor_id);
-            let mut action = controller.finish_anchor()?;
-            loop {
-                match action {
-                    RecursiveCteGateAction::RunPipelines(_) => {
-                        controller.start_recursive_iteration(ctx.query)?;
-                        {
-                            let iteration =
-                                controller.iteration_runtime.as_ref().ok_or_else(|| {
-                                    paro_error::internal("recursive CTE iteration runtime missing")
-                                })?;
-                            for runtime in iteration.recursive_pipelines.iter().cloned() {
-                                let pipeline_id = runtime.program.id;
-                                run_runtime(runtime, ctx.query, ctx.allocator.clone())?;
-                                completed.insert(pipeline_id);
-                            }
-                        }
-                        action = controller.finish_recursive_iteration()?;
-                    }
-                    RecursiveCteGateAction::RunPipeline(pipeline) => {
-                        if pipeline != controller.programs.emit.id {
-                            return Err(paro_error::internal(
-                                "recursive CTE controller requested unknown pipeline",
-                            ));
-                        }
-                        let emit = controller.start_emit(ctx.query)?;
-                        let emit_id = emit.program.id;
-                        run_runtime(emit, ctx.query, ctx.allocator.clone())?;
-                        completed.insert(emit_id);
-                        controller.finish_emit()?;
-                        return Ok(());
-                    }
-                    RecursiveCteGateAction::Done => return Ok(()),
+        ControlRegionRuntime::RecursiveCte(controller) => Ok(controller),
+        ControlRegionRuntime::CorrelatedSubquery(_) => Err(paro_error::internal(
+            "control-region id does not reference a recursive CTE",
+        )),
+    }
+}
+
+fn run_recursive_cte_region(
+    id: ControlRegionId,
+    regions: &mut ControlRegionRuntimeSet,
+    ctx: &GraphExecutionContext<'_>,
+    completed: &mut HashSet<PipelineId>,
+) -> Result<()> {
+    let anchor = recursive_cte_controller_mut(regions, id)?.start_anchor()?;
+    let anchor_id = anchor.program.id;
+    run_pipeline_dependencies(anchor_id, id, regions, ctx, completed)?;
+    run_runtime(anchor, ctx)?;
+    completed.insert(anchor_id);
+
+    let mut action = recursive_cte_controller_mut(regions, id)?.finish_anchor()?;
+    loop {
+        match action {
+            RecursiveCteGateAction::RunPipelines(_) => {
+                recursive_cte_controller_mut(regions, id)?.start_recursive_iteration(ctx.query)?;
+                let runtimes = recursive_cte_controller_mut(regions, id)?
+                    .iteration_runtime
+                    .as_ref()
+                    .ok_or_else(|| paro_error::internal("recursive CTE iteration runtime missing"))?
+                    .recursive_pipelines
+                    .to_vec();
+                for runtime in &runtimes {
+                    completed.remove(&runtime.program.id);
                 }
+                for runtime in runtimes {
+                    let pipeline_id = runtime.program.id;
+                    if completed.contains(&pipeline_id) {
+                        continue;
+                    }
+                    run_pipeline_dependencies(pipeline_id, id, regions, ctx, completed)?;
+                    run_runtime(runtime, ctx)?;
+                    completed.insert(pipeline_id);
+                }
+                action = recursive_cte_controller_mut(regions, id)?.finish_recursive_iteration()?;
             }
-        }
-        ControlRegionRuntime::CorrelatedSubquery(_) => {
-            unreachable!("correlated region handled above")
+            RecursiveCteGateAction::RunPipeline(pipeline) => {
+                let emit_pipeline = recursive_cte_controller_mut(regions, id)?.programs.emit.id;
+                if pipeline != emit_pipeline {
+                    return Err(paro_error::internal(
+                        "recursive CTE controller requested unknown pipeline",
+                    ));
+                }
+                let emit = recursive_cte_controller_mut(regions, id)?.start_emit(ctx.query)?;
+                let emit_id = emit.program.id;
+                run_pipeline_dependencies(emit_id, id, regions, ctx, completed)?;
+                run_runtime(emit, ctx)?;
+                completed.insert(emit_id);
+                recursive_cte_controller_mut(regions, id)?.finish_emit()?;
+                return Ok(());
+            }
+            RecursiveCteGateAction::Done => return Ok(()),
         }
     }
 }
@@ -934,7 +921,7 @@ fn run_correlated_subquery_region(
     };
     run_pipeline_dependencies(join_id, id, regions, ctx, completed)?;
     let join = correlated_subquery_controller_mut(regions, id)?.start_join(ctx.query)?;
-    run_runtime(join, ctx.query, ctx.allocator.clone())?;
+    run_runtime(join, ctx)?;
     completed.insert(join_id);
 
     let controller = correlated_subquery_controller_mut(regions, id)?;
@@ -1003,7 +990,7 @@ fn run_pipeline_runtime_or_nested_region(
     {
         return run_control_region(nested, regions, ctx, completed);
     }
-    run_runtime(runtime, ctx.query, ctx.allocator.clone())
+    run_runtime(runtime, ctx)
 }
 
 fn control_region_entry_pipeline(

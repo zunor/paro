@@ -195,7 +195,7 @@ fn array_to_string_impl_internal(
     let list_child_view = list_child
         .map(|child| child.try_to_view(child.len()))
         .transpose()?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for i in 0..count {
         let collection_is_null = if let Some(array) = &array_view {

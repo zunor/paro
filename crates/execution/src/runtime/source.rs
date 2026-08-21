@@ -31,7 +31,7 @@ pub use crate::operators::set::{
     SetOperationEmitSourceExec,
 };
 pub use crate::operators::sort::{SortEmitSourceExec, TopNEmitSourceExec};
-pub use crate::operators::window::WindowEmitSourceExec;
+pub use crate::operators::window::{PartitionAggregateWindowEmitSourceExec, WindowEmitSourceExec};
 
 #[derive(Debug)]
 pub enum SourceExec {
@@ -59,6 +59,7 @@ pub enum SourceExec {
     SortEmit(SortEmitSourceExec),
     TopNEmit(TopNEmitSourceExec),
     WindowEmit(WindowEmitSourceExec),
+    PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceExec),
     SetOperationEmit(SetOperationEmitSourceExec),
     CteScan(CteScanSourceExec),
     DelimScan(DelimScanSourceExec),
@@ -93,6 +94,7 @@ impl SourceExec {
             Self::SortEmit(_) => "SORT_EMIT",
             Self::TopNEmit(_) => "TOP_N_EMIT",
             Self::WindowEmit(_) => "WINDOW_EMIT",
+            Self::PartitionAggregateWindowEmit(_) => "PARTITION_AGGREGATE_WINDOW_EMIT",
             Self::SetOperationEmit(_) => "SET_OPERATION_EMIT",
             Self::CteScan(_) => "CTE_SCAN",
             Self::DelimScan(_) => "DELIM_SCAN",
@@ -128,6 +130,7 @@ impl SourceExec {
             Self::SortEmit(exec) => exec.create_global(ctx),
             Self::TopNEmit(exec) => exec.create_global(ctx),
             Self::WindowEmit(exec) => exec.create_global(ctx),
+            Self::PartitionAggregateWindowEmit(exec) => exec.create_global(ctx),
             Self::SetOperationEmit(exec) => exec.create_global(ctx),
             Self::CteScan(exec) => exec.create_global(ctx),
             Self::DelimScan(exec) => exec.create_global(ctx),
@@ -167,6 +170,7 @@ impl SourceExec {
             Self::SortEmit(exec) => exec.create_local(ctx, global),
             Self::TopNEmit(exec) => exec.create_local(ctx, global),
             Self::WindowEmit(exec) => exec.create_local(ctx, global),
+            Self::PartitionAggregateWindowEmit(exec) => exec.create_local(ctx, global),
             Self::SetOperationEmit(exec) => exec.create_local(ctx, global),
             Self::CteScan(exec) => exec.create_local(ctx, global),
             Self::DelimScan(exec) => exec.create_local(ctx, global),
@@ -208,6 +212,7 @@ impl SourceExec {
             Self::SortEmit(exec) => exec.poll_next(ctx, global, local, output),
             Self::TopNEmit(exec) => exec.poll_next(ctx, global, local, output),
             Self::WindowEmit(exec) => exec.poll_next(ctx, global, local, output),
+            Self::PartitionAggregateWindowEmit(exec) => exec.poll_next(ctx, global, local, output),
             Self::SetOperationEmit(exec) => exec.poll_next(ctx, global, local, output),
             Self::CteScan(exec) => exec.poll_next(ctx, global, local, output),
             Self::DelimScan(exec) => exec.poll_next(ctx, global, local, output),

@@ -370,8 +370,12 @@ impl JoinElimination {
 
     fn join_shape_supported(&self, join: &ComparisonJoin) -> bool {
         join.mark_index.is_none()
-            && join.left_projection_map.is_empty()
-            && join.right_projection_map.is_empty()
+            && join
+                .left_projection_map
+                .is_identity(join.left.types().len())
+            && join
+                .right_projection_map
+                .is_identity(join.right.types().len())
             && join.duplicate_eliminated_columns.is_empty()
             && !join.delim_flipped
             && !join.conditions.is_empty()
@@ -414,17 +418,17 @@ impl JoinElimination {
             if column_ref.binding.table_index != get.table_index {
                 return false;
             }
-            let Some(column_id) = get.column_ids.get(column_ref.binding.column_index) else {
+            let Some(column_id) = get.stored_column(column_ref.binding.column_index) else {
                 return false;
             };
-            key_columns.insert(*column_id);
+            key_columns.insert(column_id);
         }
 
         if key_columns.is_empty() {
             return false;
         }
 
-        table.constraints.iter().any(|constraint| {
+        table.constraints().iter().any(|constraint| {
             matches!(
                 constraint.constraint_type,
                 ConstraintType::Unique | ConstraintType::PrimaryKey
@@ -580,17 +584,22 @@ mod tests {
             .map(|idx| ColumnDefinition::new(format!("c{idx}"), LogicalType::Integer))
             .collect();
 
-        let mut table = TableCatalogEntry::new(
+        let info = paro_catalog::entry::CreateTableInfo::new(
             "paro".to_string(),
             "public".to_string(),
             name.to_string(),
             columns,
-            storage,
-            paro_catalog::entry::CatalogObjectId::from_raw(10_001),
-            0,
-        );
-        table.constraints = constraints;
-        Arc::new(table)
+        )
+        .with_constraints(constraints);
+        Arc::new(
+            TableCatalogEntry::from_info(
+                info,
+                storage,
+                paro_catalog::entry::CatalogObjectId::from_raw(10_001),
+                0,
+            )
+            .unwrap(),
+        )
     }
 
     fn create_get(
@@ -607,7 +616,10 @@ mod tests {
             .map(|idx| table.columns[*idx].logical_type.clone())
             .collect::<Vec<_>>();
         let mut get = Get::new(table_index, names, types.clone(), table);
-        get.column_ids = column_ids;
+        get.column_sources = column_ids
+            .into_iter()
+            .map(|column_id| paro_planner::operator::GetColumnSource::Stored { column_id })
+            .collect();
         get.column_types = types.clone();
         get.returned_types = types;
         LogicalOperator::Get(get)

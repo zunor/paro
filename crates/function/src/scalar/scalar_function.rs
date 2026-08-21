@@ -9,6 +9,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::statistics::BaseStatistics;
 
 use super::expression_state::ExpressionState;
 use super::function_data::FunctionData;
@@ -113,6 +114,30 @@ impl ScalarBindInput {
 pub type ScalarBindFn =
     fn(function: &ScalarFunction, input: &ScalarBindInput) -> Result<BoundScalarFunction>;
 
+/// A bound scalar result that can be projected back onto one input argument.
+///
+/// This metadata describes semantics, not an implementation detail. Consumers
+/// such as scan predicate builders may use it only when they can prove that a
+/// predicate over the result has an equivalent predicate over the source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScalarPredicateProjection {
+    /// A substring over Unicode scalar positions. `start` follows SQL's
+    /// one-based convention and `length` is the requested character count.
+    Utf8Substring {
+        source_argument: usize,
+        start: i64,
+        length: Option<i64>,
+    },
+}
+
+/// Derive correctness-safe output statistics from bound scalar inputs.
+///
+/// The callback belongs to the bound kernel contract: optimizer consumers do
+/// not identify built-ins by display name, and extensions can opt in only
+/// when their implementation proves the same bounds. Returning `None` means
+/// that the function cannot derive a stronger domain from these inputs.
+pub type ScalarStatisticsFn = fn(&[&BaseStatistics]) -> Option<BaseStatistics>;
+
 #[derive(Clone)]
 pub struct ScalarFunction {
     pub name: String,
@@ -123,6 +148,7 @@ pub struct ScalarFunction {
     pub init_local_state: Option<InitLocalStateFn>,
     pub stability: FunctionStability,
     pub null_handling: FunctionNullHandling,
+    pub statistics: Option<ScalarStatisticsFn>,
     pub side_effects: FunctionSideEffects,
     pub varargs: Option<LogicalType>,
 }
@@ -138,6 +164,7 @@ impl Debug for ScalarFunction {
             .field("has_init_local_state", &self.init_local_state.is_some())
             .field("stability", &self.stability)
             .field("null_handling", &self.null_handling)
+            .field("has_statistics", &self.statistics.is_some())
             .field("side_effects", &self.side_effects)
             .field("varargs", &self.varargs)
             .finish()
@@ -160,6 +187,7 @@ impl ScalarFunction {
             init_local_state: None,
             stability: FunctionStability::Consistent,
             null_handling: FunctionNullHandling::DefaultNullHandling,
+            statistics: None,
             side_effects: FunctionSideEffects::NoSideEffects,
             varargs: None,
         }
@@ -187,6 +215,11 @@ impl ScalarFunction {
 
     pub fn with_null_handling(mut self, null_handling: FunctionNullHandling) -> Self {
         self.null_handling = null_handling;
+        self
+    }
+
+    pub fn with_statistics(mut self, statistics: ScalarStatisticsFn) -> Self {
+        self.statistics = Some(statistics);
         self
     }
 
@@ -218,9 +251,11 @@ pub struct BoundScalarFunction {
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
     pub dispatch: ScalarDispatch,
+    pub predicate_projection: Option<ScalarPredicateProjection>,
     pub init_local_state: Option<InitLocalStateFn>,
     pub stability: FunctionStability,
     pub null_handling: FunctionNullHandling,
+    pub statistics: Option<ScalarStatisticsFn>,
     pub side_effects: FunctionSideEffects,
     pub varargs: Option<LogicalType>,
     pub bind_data: Option<Arc<dyn FunctionData>>,
@@ -235,9 +270,11 @@ impl Debug for BoundScalarFunction {
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
             .field("dispatch", &self.dispatch)
+            .field("predicate_projection", &self.predicate_projection)
             .field("has_init_local_state", &self.init_local_state.is_some())
             .field("stability", &self.stability)
             .field("null_handling", &self.null_handling)
+            .field("has_statistics", &self.statistics.is_some())
             .field("side_effects", &self.side_effects)
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
@@ -254,9 +291,11 @@ impl From<ScalarFunction> for BoundScalarFunction {
             arguments: function.arguments,
             return_type: function.return_type,
             dispatch: function.dispatch,
+            predicate_projection: None,
             init_local_state: function.init_local_state,
             stability: function.stability,
             null_handling: function.null_handling,
+            statistics: function.statistics,
             side_effects: function.side_effects,
             varargs: function.varargs,
             bind_data: None,
@@ -283,6 +322,11 @@ impl BoundScalarFunction {
 
     pub fn with_bind_data<T: FunctionData + 'static>(mut self, data: T) -> Self {
         self.bind_data = Some(Arc::new(data));
+        self
+    }
+
+    pub fn with_predicate_projection(mut self, projection: ScalarPredicateProjection) -> Self {
+        self.predicate_projection = Some(projection);
         self
     }
 
@@ -513,7 +557,7 @@ mod tests {
         Ok(())
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Hash)]
     struct TestBindData {
         value: i32,
     }
@@ -528,6 +572,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .is_some_and(|other| other == self)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            crate::scalar::function_data_fingerprint(self)
         }
 
         fn as_any(&self) -> &dyn Any {

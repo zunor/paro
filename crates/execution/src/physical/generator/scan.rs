@@ -5,7 +5,8 @@ use super::*;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
-use paro_storage::index::{collect_predicate_columns, PredicateTree};
+use paro_planner::expression::ExpressionIterator;
+use paro_storage::index::PredicateTree;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_get(
@@ -23,7 +24,7 @@ impl PhysicalPlanGenerator {
         } else {
             (None, Vec::new())
         };
-        let spec = self.rowset_scan_spec(get, runtime_predicate, runtime_residual)?;
+        let spec = self.rowset_scan_spec(get, runtime_predicate, runtime_residual, None)?;
         Ok((PhysicalNodeKind::RowsetScan(spec), Vec::new()))
     }
 
@@ -32,34 +33,39 @@ impl PhysicalPlanGenerator {
         get: &Get,
         predicate: Option<PredicateTree>,
         residual_predicates: Vec<Expression>,
+        estimated_selectivity: Option<f64>,
     ) -> Result<RowsetScanSpec> {
         let Some(table) = get.table.clone() else {
             return Err(paro_error::internal(
                 "base table metadata is not available for rowset scan",
             ));
         };
-        let table_column_count = table.columns.len();
-        let mut column_ids = Vec::with_capacity(get.column_ids.len());
+        let mut column_ids = Vec::with_capacity(get.column_sources.len());
+        let mut value_projections = Vec::with_capacity(get.column_sources.len());
         let mut emit_row_id = false;
-        for (idx, column_id) in get.column_ids.iter().copied().enumerate() {
-            if column_id < table_column_count {
-                column_ids.push(column_id);
-            } else if column_id == table_column_count
-                && get
-                    .names
-                    .get(idx)
-                    .is_some_and(|name| name.eq_ignore_ascii_case("rowid"))
-            {
-                emit_row_id = true;
-            } else {
-                return Err(paro_error::internal(format!(
-                    "column id {column_id} is out of range for table with {table_column_count} columns"
-                )));
+        for source in &get.column_sources {
+            match source {
+                paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                    column_ids.push(*column_id);
+                    value_projections.push(RowsetColumnValueProjection::Stored);
+                }
+                paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                    source_column,
+                    byte_width,
+                } => {
+                    column_ids.push(*source_column);
+                    value_projections.push(rowset_value_projection(
+                        *source_column,
+                        *byte_width,
+                        predicate.as_ref(),
+                    )?);
+                }
+                paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
             }
         }
 
-        let late_materialize = self.ctx.rowset_scan_pushdown
-            && should_late_materialize(&predicate, &column_ids, emit_row_id, table_column_count);
+        let column_projection =
+            RowsetColumnProjection::try_with_value_projections(column_ids, value_projections)?;
 
         Ok(RowsetScanSpec {
             table_index: get.table_index,
@@ -67,11 +73,15 @@ impl PhysicalPlanGenerator {
             returned_types: get.returned_types.clone().into_boxed_slice(),
             relation_name: get.relation_name.clone(),
             relation_alias: get.relation_alias.clone(),
-            column_ids: column_ids.into_boxed_slice(),
+            column_projection,
             emit_row_id,
             column_types: get.column_types.clone().into_boxed_slice(),
             table,
-            late_materialize,
+            access_policy: RowsetScanAccessPolicy::new(
+                self.ctx.rowset_scan_pushdown,
+                estimated_selectivity,
+                self.ctx.scan_access_cost,
+            ),
             predicate,
             residual_predicates: residual_predicates.into_boxed_slice(),
             scan_order: self
@@ -125,11 +135,21 @@ impl PhysicalPlanGenerator {
     pub(crate) fn lower_filter(
         &mut self,
         filter: &LogicalFilter,
+        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        if let LogicalOperator::Aggregate(aggregate) = &filter.child.operator {
+            if let Some(having_filter) = rebase_aggregate_only_filter(
+                filter.expressions.clone(),
+                aggregate.groups.len(),
+                aggregate.aggregates.len(),
+            ) {
+                return self.lower_aggregate_filter(filter, aggregate, having_filter);
+            }
+        }
         if self.ctx.rowset_scan_pushdown {
             if let LogicalOperator::Get(get) = &filter.child.operator {
                 if get.table.is_some() {
-                    return self.lower_filter_over_get(filter, get);
+                    return self.lower_filter_over_get(filter, get, filter_cardinality);
                 }
             }
         }
@@ -145,15 +165,81 @@ impl PhysicalPlanGenerator {
         };
         let spec = FilterSpec {
             expressions: expressions.into_boxed_slice(),
-            projection_map: filter.projection_map.clone().into_boxed_slice(),
+            projection_map: filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Filter(spec), vec![child]))
+    }
+
+    /// Attach aggregate-only HAVING predicates to the aggregate emit path
+    /// while preserving the filter's independently derived output projection.
+    ///
+    /// HAVING dependencies and output dependencies are deliberately separate:
+    /// column lifetime analysis may remove an aggregate value from the parent
+    /// layout even though the value is still required to decide whether a
+    /// group survives. The aggregate owns that predicate; a projection above
+    /// it owns the final carrier shape.
+    fn lower_aggregate_filter(
+        &mut self,
+        filter: &LogicalFilter,
+        aggregate: &LogicalAggregate,
+        having_filter: Box<[Expression]>,
+    ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
+        let aggregate_width = aggregate.returned_types.len();
+        let projection = filter.projection_map.to_indices(aggregate_width);
+        let (aggregate_kind, aggregate_children) =
+            self.lower_aggregate_with_having(aggregate, having_filter)?;
+        if filter.projection_map.is_identity(aggregate_width) {
+            return Ok((aggregate_kind, aggregate_children));
+        }
+
+        let aggregate_output =
+            physical_output_row_type_for_kind(filter.child.as_ref(), &aggregate_kind)?;
+        let aggregate_label = OperatorLabel::new(filter.child.id, aggregate_kind.name());
+        let aggregate_id = self.push_node(
+            aggregate_kind,
+            aggregate_output,
+            aggregate_children,
+            aggregate_label,
+            filter.child.stats.estimated_cardinality,
+        );
+
+        let expressions = projection
+            .iter()
+            .map(|&index| {
+                aggregate
+                    .returned_types
+                    .get(index)
+                    .cloned()
+                    .map(|ty| Expression::Reference(ReferenceExpression::new(index, ty)))
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "aggregate HAVING projection index {index} is out of bounds for {aggregate_width} columns"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output_names = project_by_index(
+            &filter.child.output_names(),
+            &projection,
+            "aggregate HAVING output",
+        )?;
+        Ok((
+            PhysicalNodeKind::Project(ProjectSpec {
+                expressions: expressions.into_boxed_slice(),
+                output_names: output_names.into_boxed_slice(),
+            }),
+            vec![aggregate_id],
+        ))
     }
 
     fn lower_filter_over_get(
         &mut self,
         filter: &LogicalFilter,
         get: &Get,
+        filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let (filter_predicate, mut residual) =
             predicate_builder::build_predicate_tree(&filter.expressions, get)?;
@@ -163,10 +249,19 @@ impl PhysicalPlanGenerator {
 
         let predicate =
             predicate_builder::combine_predicate_trees(filter_predicate, runtime_predicate);
-        let mut scan_spec = self.rowset_scan_spec(get, predicate, residual.clone())?;
+        // A residual predicate is evaluated above the scan, so the filter's
+        // output cardinality is not a valid estimate of storage-predicate
+        // selectivity in that case.
+        let estimated_selectivity = residual
+            .is_empty()
+            .then(|| estimated_filter_selectivity(filter, filter_cardinality))
+            .flatten();
+        let mut scan_spec =
+            self.rowset_scan_spec(get, predicate, residual.clone(), estimated_selectivity)?;
 
         if residual.is_empty() {
-            project_rowset_scan_spec(&mut scan_spec, get, &filter.projection_map)?;
+            let projection = filter.projection_map.to_indices(filter.child.types().len());
+            project_rowset_scan_spec(&mut scan_spec, get, &projection)?;
             return Ok((PhysicalNodeKind::RowsetScan(scan_spec), Vec::new()));
         }
 
@@ -183,7 +278,10 @@ impl PhysicalPlanGenerator {
         let expressions = normalize_filter_expressions(residual).into_boxed_slice();
         let spec = FilterSpec {
             expressions,
-            projection_map: filter.projection_map.clone().into_boxed_slice(),
+            projection_map: filter
+                .projection_map
+                .to_indices(filter.child.types().len())
+                .into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Filter(spec), vec![child_id]))
     }
@@ -194,10 +292,9 @@ impl PhysicalPlanGenerator {
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let child = self.generate_node(project.child.as_ref())?;
         let spec = ProjectSpec {
-            table_index: project.table_index,
             expressions: project.expressions.clone().into_boxed_slice(),
             output_names: align_output_names(
-                project.output_names.clone(),
+                project.visible_names.clone(),
                 project.expressions.len(),
                 "project output",
             )?
@@ -304,15 +401,62 @@ impl PhysicalPlanGenerator {
             child_types.len(),
             "order child output",
         )?;
-        let output_names = project_by_index(&child_names, &order.projection_map, "order output")?;
-        let output_types = project_by_index(&child_types, &order.projection_map, "order output")?;
+        let projection = order.projection_map.to_indices(child_types.len());
+        let output_names = project_by_index(&child_names, &projection, "order output")?;
+        let output_types = project_by_index(&child_types, &projection, "order output")?;
         let spec = SortSpec {
             orders: order.orders.clone().into_boxed_slice(),
-            projection_map: order.projection_map.clone().into_boxed_slice(),
+            projection_map: projection.into_boxed_slice(),
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
         };
         Ok((PhysicalNodeKind::Sort(spec), vec![child]))
+    }
+}
+
+fn rebase_aggregate_only_filter(
+    expressions: Vec<Expression>,
+    group_count: usize,
+    aggregate_count: usize,
+) -> Option<Box<[Expression]>> {
+    let mut expressions = normalize_filter_expressions(expressions);
+    if expressions.is_empty()
+        || !expressions
+            .iter_mut()
+            .all(|expression| rebase_aggregate_references(expression, group_count, aggregate_count))
+    {
+        return None;
+    }
+    Some(expressions.into_boxed_slice())
+}
+
+fn rebase_aggregate_references(
+    expression: &mut Expression,
+    group_count: usize,
+    aggregate_count: usize,
+) -> bool {
+    match expression {
+        Expression::Reference(reference) => {
+            let Some(rebased) = reference.index.checked_sub(group_count) else {
+                return false;
+            };
+            if rebased >= aggregate_count {
+                return false;
+            }
+            reference.index = rebased;
+            true
+        }
+        Expression::ColumnRef(_)
+        | Expression::Aggregate(_)
+        | Expression::Subquery(_)
+        | Expression::Window(_) => false,
+        _ => {
+            let mut valid = true;
+            ExpressionIterator::enumerate_children_mut(expression, |child| {
+                valid &= rebase_aggregate_references(child, group_count, aggregate_count);
+            });
+            valid
+        }
     }
 }
 
@@ -362,7 +506,7 @@ fn direct_projection_column(expr: &Expression, get: &Get) -> Option<usize> {
         Expression::ColumnRef(column) => column.binding.column_index,
         _ => return None,
     };
-    get.column_ids.get(source_index).copied()
+    get.stored_column(source_index)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -445,14 +589,10 @@ fn project_rowset_scan_spec(
     get: &Get,
     projection_map: &[usize],
 ) -> Result<()> {
-    if projection_map.is_empty() {
-        return Ok(());
-    }
-
-    let table_column_count = spec.table.columns.len();
     let mut output_names = Vec::with_capacity(projection_map.len());
     let mut returned_types = Vec::with_capacity(projection_map.len());
     let mut column_ids = Vec::with_capacity(projection_map.len());
+    let mut value_projections = Vec::with_capacity(projection_map.len());
     let mut column_types = Vec::with_capacity(projection_map.len());
     let mut emit_row_id = false;
 
@@ -469,67 +609,70 @@ fn project_rowset_scan_spec(
                 get.returned_types.len()
             ))
         })?;
-        let column_id = *get.column_ids.get(idx).ok_or_else(|| {
+        let source = get.column_source(idx).ok_or_else(|| {
             paro_error::internal(format!(
-                "filter projection column index {idx} is out of range for rowset output with {} columns",
-                get.column_ids.len()
+                "filter projection source index {idx} is out of range for rowset output with {} columns",
+                get.column_sources.len()
             ))
         })?;
 
         output_names.push(name);
         returned_types.push(returned_type);
-        if column_id < table_column_count {
-            column_ids.push(column_id);
-            let column_type = get.column_types.get(idx).cloned().ok_or_else(|| {
-                paro_error::internal(format!(
-                    "filter projection column type index {idx} is out of range for rowset output with {} columns",
-                    get.column_types.len()
-                ))
-            })?;
-            column_types.push(column_type);
-        } else if column_id == table_column_count {
-            emit_row_id = true;
-        } else {
-            return Err(paro_error::internal(format!(
-                "filter projection column id {column_id} is out of range for table with {table_column_count} columns"
-            )));
+        match source {
+            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                column_ids.push(column_id);
+                value_projections.push(RowsetColumnValueProjection::Stored);
+                column_types.push(get.column_types[idx].clone());
+            }
+            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                source_column,
+                byte_width,
+            } => {
+                column_ids.push(source_column);
+                value_projections.push(rowset_value_projection(
+                    source_column,
+                    byte_width,
+                    spec.predicate.as_ref(),
+                )?);
+                column_types.push(get.column_types[idx].clone());
+            }
+            paro_planner::operator::GetColumnSource::VirtualRowId => emit_row_id = true,
         }
     }
 
     spec.output_names = output_names.into_boxed_slice();
     spec.returned_types = returned_types.into_boxed_slice();
-    spec.column_ids = column_ids.into_boxed_slice();
+    spec.column_projection =
+        RowsetColumnProjection::try_with_value_projections(column_ids, value_projections)?;
     spec.column_types = column_types.into_boxed_slice();
     spec.emit_row_id = emit_row_id;
-    spec.late_materialize = should_late_materialize(
-        &spec.predicate,
-        spec.column_ids.as_ref(),
-        spec.emit_row_id,
-        table_column_count,
-    );
     Ok(())
 }
 
-fn should_late_materialize(
-    predicate: &Option<PredicateTree>,
-    column_ids: &[usize],
-    emit_row_id: bool,
-    table_column_count: usize,
-) -> bool {
-    let Some(predicate) = predicate else {
-        return false;
-    };
-    let predicate_columns = collect_predicate_columns(predicate);
-    if predicate_columns.is_empty() {
-        return false;
+fn rowset_value_projection(
+    source_column: usize,
+    byte_width: usize,
+    predicate: Option<&PredicateTree>,
+) -> Result<RowsetColumnValueProjection> {
+    let column_id = source_column as u32;
+    if byte_width == 0
+        || !predicate.is_some_and(|tree| tree.proves_ascii_prefix_width(column_id, byte_width))
+    {
+        return Err(paro_error::internal(
+            "matched-prefix scan output lacks its exact pushed predicate witness",
+        ));
     }
+    Ok(RowsetColumnValueProjection::MatchedUtf8Prefix { byte_width })
+}
 
-    let output_columns = if column_ids.is_empty() && !emit_row_id {
-        (0..table_column_count).collect::<Vec<_>>()
-    } else {
-        column_ids.to_vec()
-    };
-    output_columns
-        .iter()
-        .any(|column_id| !predicate_columns.contains(&(*column_id as u32)))
+fn estimated_filter_selectivity(
+    filter: &LogicalFilter,
+    filter_cardinality: Option<paro_planner::plan::CardinalityEstimate>,
+) -> Option<f64> {
+    let input = filter.child.stats.estimated_cardinality?.expected;
+    let output = filter_cardinality?.expected;
+    if input == 0 {
+        return Some(0.0);
+    }
+    Some((output as f64 / input as f64).clamp(0.0, 1.0))
 }

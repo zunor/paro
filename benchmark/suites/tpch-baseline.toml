@@ -1,0 +1,5 @@
+name = "tpch-baseline"
+description = "TPC-H SF1 correctness and performance baseline"
+
+[[include]]
+workload = "tpch"

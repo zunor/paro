@@ -116,7 +116,8 @@ fn run_compaction(tablet: &TabletRef) {
 fn primary_index_basic() {
     let idx = PrimaryIndex::new();
     let k = b"k1".to_vec();
-    let loc = paro_storage::primary_key::RowID::new(1, 5);
+    let loc =
+        paro_storage::primary_key::RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(5));
     assert!(idx.get(&k).is_none());
     assert_eq!(idx.upsert(k.clone(), loc), None);
     assert_eq!(idx.get(&k), Some(loc));
@@ -127,12 +128,12 @@ fn primary_index_basic() {
 #[test]
 fn delete_vector_roundtrip() {
     let mut dv = DeleteVector::new();
-    dv.mark_deleted(1);
-    dv.mark_deleted(100);
+    dv.mark_deleted(paro_storage::rowset::SegmentRowId::from_raw(1));
+    dv.mark_deleted(paro_storage::rowset::SegmentRowId::from_raw(100));
     let bytes = dv.to_bytes().unwrap();
     let restored = DeleteVector::from_bytes(&bytes).unwrap();
-    assert!(restored.is_deleted(1));
-    assert!(restored.is_deleted(100));
+    assert!(restored.is_deleted(paro_storage::rowset::SegmentRowId::from_raw(1)));
+    assert!(restored.is_deleted(paro_storage::rowset::SegmentRowId::from_raw(100)));
     assert_eq!(restored.cardinality(), 2);
 }
 
@@ -169,7 +170,7 @@ fn delta_writer_delete_keys_persists_delete_vector() {
         .unwrap()
         .unwrap();
     assert_eq!(dv.cardinality(), 5);
-    assert!(dv.is_deleted(0));
+    assert!(dv.is_deleted(paro_storage::rowset::SegmentRowId::from_raw(0)));
 
     drop(tmp);
 }

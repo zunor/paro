@@ -7,7 +7,6 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
 
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::UpdateSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -21,7 +20,6 @@ use super::helpers::{
 #[derive(Debug, Clone)]
 pub struct UpdateSinkExec {
     pub spec: UpdateSpec,
-    pub required: RequiredProperties,
 }
 
 impl UpdateSinkExec {

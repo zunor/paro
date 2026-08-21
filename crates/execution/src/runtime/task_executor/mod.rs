@@ -95,6 +95,8 @@ pub struct PipelineTaskExecutor {
     output_more_continuations: VecDeque<usize>,
     finish_group: Option<FinishTaskGroup>,
     active_finish_task: Option<super::context::FinishTaskId>,
+    finish_tasks_completed: usize,
+    defer_shared_producer_merge: bool,
     call_context: OperatorCallContextCell,
 }
 
@@ -111,8 +113,20 @@ impl PipelineTaskExecutor {
             output_more_continuations: VecDeque::new(),
             finish_group: None,
             active_finish_task: None,
+            finish_tasks_completed: 0,
+            defer_shared_producer_merge: false,
             call_context,
         }
+    }
+
+    /// Create a scheduler data worker whose local merge does not close a shared-sink producer.
+    ///
+    /// A shared-sink producer is a pipeline, not an individual morsel worker. The scheduler
+    /// signals that producer once all of the pipeline's local sink states have merged.
+    pub fn new_parallel_data_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+        let mut executor = Self::new(runtime, task);
+        executor.defer_shared_producer_merge = true;
+        executor
     }
 
     /// Create an executor that starts at the global finish phase.
@@ -120,7 +134,8 @@ impl PipelineTaskExecutor {
     /// Parallel pipeline scheduling runs N data tasks through source,
     /// transform flush, and local sink merge. Once all local merges have
     /// rendezvoused, a single finish task owns the global seal/finalize path.
-    pub fn new_finish_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+    pub(crate) fn new_finish_task(runtime: Arc<PipelineRuntime>, task: PipelineTaskState) -> Self {
+        debug_assert!(task.is_finish_only());
         let mut executor = Self::new(runtime, task);
         executor.phase = PipelineTaskPhase::Merging;
         executor.completion_stage = PipelineCompletionStage::PrepareFinish;

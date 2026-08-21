@@ -4,7 +4,7 @@
 use super::{StringHeap, ValidityMask, Vector, VectorType};
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, ParoError};
-use crate::types::{InlineString, LogicalType};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -126,10 +126,11 @@ impl Vector {
             | LogicalType::TsQuery
             | LogicalType::Json
             | LogicalType::Jsonb
+            | LogicalType::StringLiteral
             | LogicalType::Blob => {
                 let mut heap: Option<StringHeap> = None;
                 unsafe {
-                    let entries = result.buffer.data() as *mut InlineString;
+                    let entries = result.buffer.data() as *mut StringView;
                     for (i, &take_true) in mask.iter().take(count).enumerate() {
                         let (vec, source_idx) = Self::merge_source_row(
                             take_true,
@@ -148,7 +149,7 @@ impl Vector {
                             }
                             None => {
                                 result.validity.try_set_null(i)?;
-                                *entries.add(i) = InlineString::empty();
+                                *entries.add(i) = StringView::empty();
                             }
                         }
                     }

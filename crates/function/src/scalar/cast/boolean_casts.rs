@@ -90,7 +90,7 @@ pub fn bool_to_varchar(
     let data = view
         .get_data::<bool>()
         .expect("bool cast requires pointer data");
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
@@ -111,13 +111,12 @@ pub fn varchar_to_bool(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
-            let source = source_value.as_str();
+            let source = view.str(row);
             if let Some(value) = parse_bool_literal(source) {
                 result.set_bool(row, value);
             } else if ctx.try_cast {

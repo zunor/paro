@@ -8,10 +8,12 @@ use crate::tablet::{ColumnId, TabletRef};
 use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
 use paro_common::allocator::Allocator;
 use paro_common::error::Result;
+use paro_common::vector::VECTOR_SIZE;
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::tablet_reader::TabletReader;
+pub use crate::codec::vector_decoder::ColumnValueProjection;
 
 #[derive(Debug, Clone)]
 pub struct TabletReaderParams {
@@ -24,6 +26,7 @@ pub struct TabletReaderParams {
     pub late_materialize: bool,
     pub predicate_columns: Option<Vec<ColumnId>>,
     pub segment: Option<SegmentSharedPtr>,
+    pub segment_ordinal_range: Option<(u64, u64)>,
     pub segment_options: Option<SegmentOptions>,
     pub prefetcher: Option<Arc<Prefetcher>>,
     pub emit_row_id: bool,
@@ -35,10 +38,30 @@ pub struct ColumnProjection {
     output_columns: Vec<usize>,
     read_columns: Vec<usize>,
     output_to_read: Vec<usize>,
+    value_projections: Vec<ColumnValueProjection>,
 }
 
 impl ColumnProjection {
     pub fn new(output_columns: Vec<usize>) -> Self {
+        let value_projections = vec![ColumnValueProjection::Stored; output_columns.len()];
+        Self::build(output_columns, value_projections)
+    }
+
+    pub fn try_with_value_projections(
+        output_columns: Vec<usize>,
+        value_projections: Vec<ColumnValueProjection>,
+    ) -> Result<Self> {
+        if output_columns.len() != value_projections.len() {
+            return Err(paro_common::error::invalid_input(format!(
+                "column projection width mismatch: outputs={}, value projections={}",
+                output_columns.len(),
+                value_projections.len()
+            )));
+        }
+        Ok(Self::build(output_columns, value_projections))
+    }
+
+    fn build(output_columns: Vec<usize>, value_projections: Vec<ColumnValueProjection>) -> Self {
         let mut read_columns = Vec::new();
         let mut output_to_read = Vec::with_capacity(output_columns.len());
         let mut seen = HashMap::new();
@@ -56,6 +79,7 @@ impl ColumnProjection {
             output_columns,
             read_columns,
             output_to_read,
+            value_projections,
         }
     }
 
@@ -70,6 +94,34 @@ impl ColumnProjection {
     pub fn output_to_read(&self) -> &[usize] {
         &self.output_to_read
     }
+
+    pub fn value_projections(&self) -> &[ColumnValueProjection] {
+        &self.value_projections
+    }
+
+    /// Return a compact prefix transform for read columns that have no stored
+    /// output consumer.  Conflicting derived widths conservatively retain the
+    /// stored batch; a single raw read may legally feed several outputs.
+    pub fn exclusive_matched_prefix_widths(&self) -> Vec<Option<usize>> {
+        let mut widths = vec![None; self.read_columns.len()];
+        let mut disabled = vec![false; self.read_columns.len()];
+        for (&read_idx, projection) in self.output_to_read.iter().zip(&self.value_projections) {
+            match projection {
+                ColumnValueProjection::Stored => disabled[read_idx] = true,
+                ColumnValueProjection::MatchedUtf8Prefix { byte_width } => match widths[read_idx] {
+                    None => widths[read_idx] = Some(*byte_width),
+                    Some(existing) if existing == *byte_width => {}
+                    Some(_) => disabled[read_idx] = true,
+                },
+            }
+        }
+        for (width, disabled) in widths.iter_mut().zip(disabled) {
+            if disabled {
+                *width = None;
+            }
+        }
+        widths
+    }
 }
 
 impl Default for TabletReaderParams {
@@ -78,12 +130,13 @@ impl Default for TabletReaderParams {
             version: i64::MAX,
             columns: None,
             projection: None,
-            batch_size: 4096,
+            batch_size: VECTOR_SIZE,
             use_direct_io: false,
             predicate_tree: None,
             late_materialize: false,
             predicate_columns: None,
             segment: None,
+            segment_ordinal_range: None,
             segment_options: None,
             prefetcher: None,
             emit_row_id: false,
@@ -130,6 +183,11 @@ impl TabletReaderParams {
 
     pub fn with_segment_handle(mut self, segment: SegmentSharedPtr) -> Self {
         self.segment = Some(segment);
+        self
+    }
+
+    pub fn with_segment_ordinal_range(mut self, start: u64, end: u64) -> Self {
+        self.segment_ordinal_range = Some((start, end));
         self
     }
 

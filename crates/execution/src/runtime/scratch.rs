@@ -7,12 +7,15 @@ use std::sync::Arc;
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
-use paro_common::error::Result;
-use paro_common::memory::MemoryAccountingClass;
+use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
 
-use crate::memory_runtime::{LocalMemoryGrant, OperatorMemoryScope};
+use crate::memory_runtime::{
+    LocalMemoryGrant, OperatorMemoryAccount, OperatorMemoryScope, QueryMemoryPool,
+    DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+};
 
 use super::context::RetainedMemorySnapshot;
 use super::state::{SinkLocal, SourceLocal, TransformLocal};
@@ -327,20 +330,149 @@ impl TaskMemoryGrants {
         Self { operator }
     }
 
+    /// Create a task-local grant owned by the query memory hierarchy.
+    pub(crate) fn query_accounted(
+        query_memory: Arc<QueryMemoryPool>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let account = Arc::new(OperatorMemoryAccount::new(query_memory));
+        let owner: Arc<dyn MemoryOwner> = account;
+        Ok(Self::new(LocalMemoryGrant::new(
+            owner,
+            DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
+            MemoryTag::Allocator,
+            MemoryAccountingClass::NonRevocable,
+            allocator,
+        )?))
+    }
+
     #[inline]
     pub fn call_scope(&self) -> OperatorMemoryScope<'_> {
         OperatorMemoryScope::new(&self.operator)
     }
 }
 
+/// State owned by a scheduler-dispatched finish sub-task.
+///
+/// Finish tasks operate only on pipeline-global state. Keeping their state
+/// separate from [`PipelineTaskState`] makes it impossible to accidentally
+/// construct source/transform/sink locals or vector scratch for completion
+/// work, while retaining the same query-owned memory grant contract.
+#[derive(Debug)]
+pub(crate) struct FinishTaskState {
+    memory: TaskMemoryGrants,
+}
+
+impl FinishTaskState {
+    pub(crate) fn try_new(
+        query_memory: Arc<QueryMemoryPool>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            memory: TaskMemoryGrants::query_accounted(query_memory, allocator)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn call_scope(&self) -> OperatorMemoryScope<'_> {
+        self.memory.call_scope()
+    }
+}
+
 #[derive(Debug)]
 pub struct PipelineTaskState {
+    // Transitional scheduler boundary: data workers and the coordinator-owned
+    // global finish work still share PipelineTaskExecutor's completion state
+    // machine, but never share operator-local state. The long-term endpoint is
+    // a distinct PipelineFinishExecutor that owns only TaskMemoryGrants and
+    // global completion stages; keep every access explicit until that split so
+    // phase mistakes remain recoverable internal errors rather than hidden
+    // Deref panics.
+    role: PipelineTaskRole,
+    pub memory: TaskMemoryGrants,
+    pub pending: PendingChunkState,
+}
+
+#[derive(Debug)]
+enum PipelineTaskRole {
+    Data(PipelineDataTaskState),
+    Finish,
+}
+
+#[derive(Debug)]
+pub struct PipelineDataTaskState {
     pub source: SourceLocal,
     pub transforms: Box<[TransformLocal]>,
     pub sink: SinkLocal,
-    pub memory: TaskMemoryGrants,
     pub scratch: PipelineScratch,
-    pub pending: PendingChunkState,
+}
+
+impl PipelineTaskState {
+    pub(crate) fn new_data(
+        source: SourceLocal,
+        transforms: Box<[TransformLocal]>,
+        sink: SinkLocal,
+        memory: TaskMemoryGrants,
+        scratch: PipelineScratch,
+    ) -> Self {
+        Self {
+            role: PipelineTaskRole::Data(PipelineDataTaskState {
+                source,
+                transforms,
+                sink,
+                scratch,
+            }),
+            memory,
+            pending: PendingChunkState::Empty,
+        }
+    }
+
+    pub(crate) fn new_finish(
+        query_memory: Arc<QueryMemoryPool>,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        Ok(Self {
+            role: PipelineTaskRole::Finish,
+            memory: TaskMemoryGrants::query_accounted(query_memory, allocator)?,
+            pending: PendingChunkState::Empty,
+        })
+    }
+
+    #[inline]
+    pub fn data(&self) -> Result<&PipelineDataTaskState> {
+        match &self.role {
+            PipelineTaskRole::Data(data) => Ok(data),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
+    }
+
+    #[inline]
+    pub fn data_mut(&mut self) -> Result<&mut PipelineDataTaskState> {
+        match &mut self.role {
+            PipelineTaskRole::Data(data) => Ok(data),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
+    }
+
+    pub fn data_and_memory_mut(
+        &mut self,
+    ) -> Result<(&mut PipelineDataTaskState, &TaskMemoryGrants)> {
+        let Self { role, memory, .. } = self;
+        match role {
+            PipelineTaskRole::Data(data) => Ok((data, memory)),
+            PipelineTaskRole::Finish => Err(paro_error::internal(
+                "finish task cannot enter a data-path operator phase",
+            )),
+        }
+    }
+
+    pub(crate) fn is_finish_only(&self) -> bool {
+        matches!(self.role, PipelineTaskRole::Finish)
+    }
 }
 
 #[cfg(test)]

@@ -175,6 +175,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
+            invalidations: crate::context::OptimizerInvalidations::default(),
         };
 
         let rewritten = ReorderFilter::new()
@@ -218,6 +219,7 @@ mod tests {
             cost_model: CostModel::default(),
             verify_enabled: true,
             profiler: PipelineProfiler::default(),
+            invalidations: crate::context::OptimizerInvalidations::default(),
         };
 
         let rewritten = ReorderFilter::new()

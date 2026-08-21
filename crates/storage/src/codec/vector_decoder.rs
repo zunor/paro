@@ -3,20 +3,420 @@
 
 use crate::codec::{nested_payload_codec, physical_layout};
 use crate::rowset::column::{ColumnBatch, StorageDictionaryBatch};
-use crate::rowset::encoding::BinaryPlainPageDecoder;
+use crate::rowset::encoding::{
+    BinaryPlainPageBuilder, BinaryPlainPageDecoder, BinaryPlainPageSlice,
+};
+use crate::rowset::BatchRowOrdinal;
 use bytes::Bytes;
+use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{DictionaryInfo, DictionarySource, SelectionVector, Vector};
+use paro_common::vector::{
+    DictionaryInfo, DictionarySource, SelectionVector, ValidatedVectorSelection, Vector,
+};
+use std::collections::HashMap;
 use std::sync::Arc;
+
+/// Value semantics requested from the column decoder. Derived scan values get
+/// an explicit identity at the tablet projection layer; the decoder owns the
+/// encoding-specific transformation needed to produce them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnValueProjection {
+    Stored,
+    MatchedUtf8Prefix { byte_width: usize },
+}
+
+/// One validated selection with both the common vector proof and a typed
+/// storage-domain view over the same allocation.
+///
+/// The wrapper prevents the stored and derived decoder paths from receiving
+/// two independently supplied mappings while keeping matched-prefix row
+/// lookup as a direct newtype slice access in the hot loop.
+pub(crate) struct ColumnBatchSelection {
+    vector: ValidatedVectorSelection,
+}
+
+struct OwnedBatchOrdinals(Vec<BatchRowOrdinal>);
+
+impl AsRef<[u8]> for OwnedBatchOrdinals {
+    fn as_ref(&self) -> &[u8] {
+        // SAFETY: BatchRowOrdinal is repr(transparent) over u32, every element
+        // is initialized, and Bytes retains this typed owner unchanged.
+        unsafe {
+            std::slice::from_raw_parts(
+                self.0.as_ptr().cast::<u8>(),
+                self.0.len() * std::mem::size_of::<u32>(),
+            )
+        }
+    }
+}
+
+impl ColumnBatchSelection {
+    pub(crate) fn try_new(
+        ordinals: Vec<BatchRowOrdinal>,
+        child_count: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        let count = ordinals.len();
+        let selection = SelectionVector::try_from_native_bytes(
+            Bytes::from_owner(OwnedBatchOrdinals(ordinals)),
+            count,
+            allocator,
+        )?;
+        let vector = ValidatedVectorSelection::try_new(selection, child_count)
+            .map_err(|error| paro_error::data_corrupted(error.to_string()))?;
+        Ok(Self { vector })
+    }
+
+    #[inline]
+    fn ordinals(&self) -> &[BatchRowOrdinal] {
+        BatchRowOrdinal::from_validated_raw_slice(
+            self.vector
+                .materialized_indices()
+                .expect("column batch selection is always materialized"),
+        )
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.vector.len()
+    }
+
+    #[inline]
+    pub(crate) fn validated_vector(&self) -> &ValidatedVectorSelection {
+        &self.vector
+    }
+}
+
+/// A bounded, reader-local cache for the decoded domain of storage dictionary
+/// batches. Storage scans can emit several logical batches backed by the same
+/// physical dictionary page. The code stream changes between those batches,
+/// but rebuilding the immutable dictionary child does not add information.
+///
+/// Each `(column slot, null representation)` retains only the most recently
+/// observed page, so memory is bounded by the reader projection rather than by
+/// the number of pages scanned.
+#[derive(Default)]
+pub(crate) struct StorageDictionaryDecoderCache {
+    entries: Mutex<HashMap<(u64, bool), CachedStorageDictionary>>,
+}
+
+struct CachedStorageDictionary {
+    encoded_dictionary: Bytes,
+    logical_type: LogicalType,
+    utf8_verified: bool,
+    dictionary_len: usize,
+    child: Arc<Vector>,
+}
+
+/// A cardinality-checked view over the storage dictionary code stream.
+///
+/// Stored-vector decode, sparse localization, and derived projections all use
+/// this one parser so code-width and row-domain validation cannot drift.
+#[derive(Clone, Copy)]
+struct ValidatedDictionaryCodes<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> ValidatedDictionaryCodes<'a> {
+    fn try_new(bytes: &'a [u8], rows: usize) -> Result<Self> {
+        let expected = rows
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("storage dictionary cardinality overflow"))?;
+        if bytes.len() != expected {
+            return Err(paro_error::data_corrupted(
+                "storage dictionary code count does not match row count",
+            ));
+        }
+        Ok(Self { bytes })
+    }
+
+    #[inline]
+    fn code_at(self, row: usize) -> u32 {
+        debug_assert!(row < self.bytes.len() / std::mem::size_of::<u32>());
+        let offset = row * std::mem::size_of::<u32>();
+        u32::from_le_bytes(
+            self.bytes[offset..offset + std::mem::size_of::<u32>()]
+                .try_into()
+                .expect("validated dictionary code width"),
+        )
+    }
+}
+
+impl StorageDictionaryDecoderCache {
+    fn decoded_child(
+        &self,
+        cache_slot: u64,
+        logical_type: &LogicalType,
+        batch: &StorageDictionaryBatch,
+        has_null_slot: bool,
+        allocator: Arc<dyn Allocator>,
+        utf8_verified: bool,
+    ) -> Result<(Arc<Vector>, usize)> {
+        let key = (cache_slot, has_null_slot);
+        let mut entries = self.entries.lock();
+        if let Some(cached) = entries.get(&key) {
+            let same_allocation = cached.encoded_dictionary.as_ptr() == batch.dictionary.as_ptr()
+                && cached.encoded_dictionary.len() == batch.dictionary.len();
+            if same_allocation
+                && cached.logical_type == *logical_type
+                && cached.utf8_verified == utf8_verified
+            {
+                return Ok((Arc::clone(&cached.child), cached.dictionary_len));
+            }
+        }
+
+        let (child, dictionary_len) = decode_storage_dictionary_child(
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator,
+            utf8_verified,
+        )?;
+        let child = Arc::new(child);
+        entries.insert(
+            key,
+            CachedStorageDictionary {
+                encoded_dictionary: batch.dictionary.clone(),
+                logical_type: logical_type.clone(),
+                utf8_verified,
+                dictionary_len,
+                child: Arc::clone(&child),
+            },
+        );
+        Ok((child, dictionary_len))
+    }
+}
+
+pub(crate) fn decode_column_batch_with_projection(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    physical_rows: usize,
+    selection: Option<&ColumnBatchSelection>,
+    rows: usize,
+    projection: ColumnValueProjection,
+    allocator: Arc<dyn Allocator>,
+    storage_provenance_id: Option<u64>,
+    cache: &StorageDictionaryDecoderCache,
+    cache_slot: u64,
+) -> Result<Vector> {
+    match projection {
+        ColumnValueProjection::Stored => {
+            let vector = decode_column_batch_cached(
+                logical_type,
+                batch,
+                physical_rows,
+                Arc::clone(&allocator),
+                storage_provenance_id,
+                cache,
+                cache_slot,
+            )?;
+            let Some(selection) = selection else {
+                if rows != physical_rows {
+                    return Err(paro_error::internal(
+                        "stored column projection row domain is inconsistent",
+                    ));
+                }
+                return Ok(vector);
+            };
+            if selection.len() != rows {
+                return Err(paro_error::internal(
+                    "stored column projection selection width is inconsistent",
+                ));
+            }
+            Vector::try_dictionary_from_validated(Arc::new(vector), selection.vector.clone())
+        }
+        ColumnValueProjection::MatchedUtf8Prefix { byte_width } => {
+            if !logical_type.is_utf8_varlen() {
+                return Err(paro_error::internal(
+                    "matched UTF-8 prefix projection requires a textual source column",
+                ));
+            }
+            decode_matched_utf8_prefix_batch(
+                batch,
+                physical_rows,
+                selection.map(ColumnBatchSelection::ordinals),
+                rows,
+                byte_width,
+                allocator,
+            )
+        }
+    }
+}
+
+/// Project an already materialized textual vector when the source column was
+/// synthesized (schema fill/base-row resolution) rather than decoded from the
+/// current batch. Raw page encodings remain the decoder's responsibility;
+/// this fallback only operates on canonical vector values.
+pub(crate) fn project_matched_utf8_prefix_vector(
+    input: &Vector,
+    rows: usize,
+    byte_width: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    let view = input.try_to_varlen_view(rows)?;
+    let mut output = Vector::try_new(LogicalType::Varchar, rows, allocator)?;
+    let (entries, _validity, heap) = output.try_begin_varlen_write(rows)?;
+    for row in 0..rows {
+        if !view.is_valid(row) {
+            return Err(paro_error::data_corrupted(
+                "NULL row escaped a matched-prefix predicate",
+            ));
+        }
+        let prefix = view.bytes(row).get(..byte_width).ok_or_else(|| {
+            paro_error::data_corrupted("matched string is shorter than its prefix witness")
+        })?;
+        if !prefix.is_ascii() {
+            return Err(paro_error::data_corrupted(
+                "matched string contradicts its ASCII prefix witness",
+            ));
+        }
+        // SAFETY: the output vector owns the heap and exposes `rows` entries.
+        let entry = unsafe { heap.try_add_blob(prefix) }?;
+        unsafe { entries.add(row).write(entry) };
+    }
+    output.try_set_count(rows)?;
+    Ok(output)
+}
+
+fn decode_matched_utf8_prefix_batch(
+    batch: &ColumnBatch,
+    physical_rows: usize,
+    selection: Option<&[BatchRowOrdinal]>,
+    rows: usize,
+    byte_width: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    if byte_width == 0 || selection.is_some_and(|selection| selection.len() != rows) {
+        return Err(paro_error::internal(
+            "invalid matched UTF-8 prefix projection contract",
+        ));
+    }
+    if batch
+        .nulls
+        .as_ref()
+        .is_some_and(|nulls| nulls.len() < physical_rows)
+    {
+        return Err(paro_error::data_corrupted(
+            "matched-prefix null bitmap is shorter than its row domain",
+        ));
+    }
+    let physical_index = |output_index: usize| {
+        selection.map_or(output_index, |selection| selection[output_index].index())
+    };
+    if (0..rows).any(|index| physical_index(index) >= physical_rows)
+        || (1..rows).any(|index| physical_index(index - 1) >= physical_index(index))
+    {
+        return Err(paro_error::data_corrupted(
+            "matched-prefix selection is not strictly increasing within the batch",
+        ));
+    }
+    let mut output = Vector::try_new(LogicalType::Varchar, rows, allocator)?;
+    let (entries, _validity, heap) = output.try_begin_varlen_write(rows)?;
+    let validate_utf8 = !batch.has_verified_utf8();
+    let mut write_value = |output_index: usize, value: &[u8]| -> Result<()> {
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        let prefix = value.get(..byte_width).ok_or_else(|| {
+            paro_error::data_corrupted("matched string is shorter than its prefix witness")
+        })?;
+        if !prefix.is_ascii() {
+            return Err(paro_error::data_corrupted(
+                "matched string contradicts its ASCII prefix witness",
+            ));
+        }
+        // SAFETY: the output vector owns `heap`, and the fallible setup exposed
+        // exactly `rows` writable entries.
+        let entry = unsafe { heap.try_add_blob(prefix) }?;
+        unsafe { entries.add(output_index).write(entry) };
+        Ok(())
+    };
+    let is_null = |row: usize| {
+        batch
+            .nulls
+            .as_ref()
+            .is_some_and(|nulls| nulls.get(row).is_some_and(|flag| *flag != 0))
+    };
+
+    if let Some(dictionary_batch) = &batch.storage_dictionary {
+        let codes =
+            ValidatedDictionaryCodes::try_new(dictionary_batch.codes.as_ref(), physical_rows)?;
+        let mut dictionary = BinaryPlainPageDecoder::new(dictionary_batch.dictionary.clone());
+        dictionary.init()?;
+        for output_index in 0..rows {
+            let row = physical_index(output_index);
+            if is_null(row) {
+                return Err(paro_error::data_corrupted(
+                    "NULL row escaped a matched-prefix predicate",
+                ));
+            }
+            let code = codes.code_at(row);
+            let value = dictionary.value_ref_at(code).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix dictionary code is out of range")
+            })?;
+            write_value(output_index, value)?;
+        }
+    } else if let Some(storage) = &batch.storage_binary_plain {
+        if storage.rows() != physical_rows {
+            return Err(paro_error::data_corrupted(
+                "matched-prefix BinaryPlain cardinality is inconsistent",
+            ));
+        }
+        for output_index in 0..rows {
+            let row = physical_index(output_index);
+            if is_null(row) {
+                return Err(paro_error::data_corrupted(
+                    "NULL row escaped a matched-prefix predicate",
+                ));
+            }
+            let value = storage.row_value_ref(row).ok_or_else(|| {
+                paro_error::data_corrupted("matched-prefix BinaryPlain row is missing")
+            })?;
+            write_value(output_index, value)?;
+        }
+    } else {
+        let mut output_index = 0usize;
+        for_each_length_prefixed_value(&batch.data, physical_rows, |row, value| {
+            if output_index < rows && physical_index(output_index) == row {
+                if is_null(row) {
+                    return Err(paro_error::data_corrupted(
+                        "NULL row escaped a matched-prefix predicate",
+                    ));
+                }
+                write_value(output_index, value)?;
+                output_index += 1;
+            }
+            Ok(())
+        })?;
+        if output_index != rows {
+            return Err(paro_error::data_corrupted(
+                "matched-prefix column batch cardinality is inconsistent",
+            ));
+        }
+    }
+    output.try_set_count(rows)?;
+    Ok(output)
+}
 
 pub(crate) fn build_vector_from_bytes(
     logical_type: &LogicalType,
     data: &Bytes,
     rows: usize,
     allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    build_vector_from_bytes_with_utf8_validation(logical_type, data, rows, allocator, true)
+}
+
+fn build_vector_from_bytes_with_utf8_validation(
+    logical_type: &LogicalType,
+    data: &Bytes,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
 ) -> Result<Vector> {
     let mut vector = match logical_type {
         LogicalType::Boolean => build_bool_vector(data, rows, allocator),
@@ -75,23 +475,9 @@ pub(crate) fn build_vector_from_bytes(
         | LogicalType::TsQuery
         | LogicalType::Json
         | LogicalType::Jsonb => {
-            let values = parse_strings(data, rows)?;
-            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-            for (idx, value) in values.iter().enumerate() {
-                vector.try_set_string(idx, value)?;
-            }
-            vector.try_set_count(rows)?;
-            Ok(vector)
+            build_varlen_vector(logical_type, data, rows, allocator, validate_utf8)
         }
-        LogicalType::Blob => {
-            let values = parse_blobs(data, rows)?;
-            let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
-            for (idx, value) in values.iter().enumerate() {
-                vector.try_set_blob(idx, value)?;
-            }
-            vector.try_set_count(rows)?;
-            Ok(vector)
-        }
+        LogicalType::Blob => build_varlen_vector(logical_type, data, rows, allocator, false),
         LogicalType::List(child_type) => {
             build_list_vector(data, rows, child_type.as_ref(), allocator)
         }
@@ -128,18 +514,16 @@ pub(crate) fn storage_dictionary_provenance_id(
     mix(rowset_id) ^ mix(((segment_id as u64) << 32) | column_id as u64)
 }
 
-fn decode_storage_dictionary_batch(
+fn decode_storage_dictionary_child(
     logical_type: &LogicalType,
     batch: &StorageDictionaryBatch,
-    nulls: Option<&[u8]>,
-    rows: usize,
+    has_null_slot: bool,
     allocator: Arc<dyn Allocator>,
-    provenance_id: Option<u64>,
-) -> Result<Vector> {
+    utf8_verified: bool,
+) -> Result<(Vector, usize)> {
     let mut dictionary_decoder = BinaryPlainPageDecoder::new(batch.dictionary.clone());
     dictionary_decoder.init()?;
     let dictionary_len = dictionary_decoder.count() as usize;
-    let has_null_slot = nulls.is_some();
     let unique_len = dictionary_len + usize::from(has_null_slot);
 
     let mut child = Vector::try_new(logical_type.clone(), unique_len.max(1), allocator.clone())?;
@@ -154,9 +538,15 @@ fn decode_storage_dictionary_batch(
                 let value = dictionary_decoder
                     .string_at(idx as u32)
                     .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
-                let value = std::str::from_utf8(&value).map_err(|_| {
-                    paro_error::data_corrupted("dictionary entry is not valid UTF-8")
-                })?;
+                let value = if utf8_verified {
+                    // SAFETY: the encoded page's verified-UTF-8 contract covers
+                    // every dictionary value in this batch.
+                    unsafe { std::str::from_utf8_unchecked(&value) }
+                } else {
+                    std::str::from_utf8(&value).map_err(|_| {
+                        paro_error::data_corrupted("dictionary entry is not valid UTF-8")
+                    })?
+                };
                 child.try_set_string(idx, value)?;
             }
         }
@@ -202,17 +592,42 @@ fn decode_storage_dictionary_batch(
         child.try_set_null(dictionary_len, true)?;
     }
     child.try_set_count(unique_len)?;
+    Ok((child, dictionary_len))
+}
 
-    if batch.codes.len() % std::mem::size_of::<u32>() != 0 {
-        return Err(paro_error::data_corrupted(
-            "Storage dictionary codes are not aligned to u32",
-        ));
-    }
-    if batch.codes.len() / std::mem::size_of::<u32>() != rows {
-        return Err(paro_error::data_corrupted(
-            "Storage dictionary code count does not match row count",
-        ));
-    }
+fn decode_storage_dictionary_batch(
+    logical_type: &LogicalType,
+    batch: &StorageDictionaryBatch,
+    nulls: Option<&[u8]>,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    provenance_id: Option<u64>,
+    utf8_verified: bool,
+    cache: Option<(&StorageDictionaryDecoderCache, u64)>,
+) -> Result<Vector> {
+    let has_null_slot = nulls.is_some();
+    let (child, dictionary_len) = if let Some((cache, cache_slot)) = cache {
+        cache.decoded_child(
+            cache_slot,
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator.clone(),
+            utf8_verified,
+        )?
+    } else {
+        let (child, dictionary_len) = decode_storage_dictionary_child(
+            logical_type,
+            batch,
+            has_null_slot,
+            allocator.clone(),
+            utf8_verified,
+        )?;
+        (Arc::new(child), dictionary_len)
+    };
+    let unique_len = child.len();
+
+    let codes = ValidatedDictionaryCodes::try_new(batch.codes.as_ref(), rows)?;
     if let Some(nulls) = nulls {
         if nulls.len() < rows {
             return Err(paro_error::data_corrupted(
@@ -222,14 +637,25 @@ fn decode_storage_dictionary_batch(
     }
 
     let null_index = dictionary_len as u32;
+    #[cfg(target_endian = "little")]
+    if nulls.is_none() {
+        let selection =
+            SelectionVector::try_from_native_bytes(batch.codes.clone(), rows, allocator)?;
+        let selection = validate_storage_dictionary_selection(selection, child.len())?;
+        return Vector::try_with_validated_dictionary(
+            child,
+            selection,
+            DictionaryInfo {
+                unique_len,
+                provenance_id,
+                source: DictionarySource::Storage,
+            },
+        );
+    }
+
     let mut selection = Vec::with_capacity(rows);
     for row_idx in 0..rows {
-        let code_offset = row_idx * std::mem::size_of::<u32>();
-        let mut code = u32::from_le_bytes(
-            batch.codes[code_offset..code_offset + std::mem::size_of::<u32>()]
-                .try_into()
-                .expect("u32-aligned storage dictionary codes"),
-        );
+        let mut code = codes.code_at(row_idx);
         if nulls.is_some_and(|flags| flags[row_idx] != 0) {
             code = null_index;
         } else if code as usize >= dictionary_len {
@@ -241,15 +667,171 @@ fn decode_storage_dictionary_batch(
         selection.push(code);
     }
 
-    Vector::try_with_dictionary(
-        Arc::new(child),
-        SelectionVector::try_from_indices(selection, allocator)?,
+    let selection = SelectionVector::try_from_indices(selection, allocator)?;
+    let selection = validate_storage_dictionary_selection(selection, child.len())?;
+    Vector::try_with_validated_dictionary(
+        child,
+        selection,
         DictionaryInfo {
             unique_len,
             provenance_id,
             source: DictionarySource::Storage,
         },
     )
+}
+
+/// Decode a sparse row-id lookup without inflating the complete storage
+/// dictionary into query-owned vector memory.
+///
+/// A dimension-table dictionary can contain thousands of unique strings while
+/// a post-TopN lookup references only tens of them. In that shape, build a
+/// batch-local dictionary from the referenced codes and preserve the outer
+/// dictionary vector representation. The localized child deliberately has no
+/// storage provenance: two row-id batches may select different dictionary
+/// entries at the same local ordinals and therefore cannot share dictionary
+/// function results by the original column identity.
+pub(crate) fn decode_sparse_column_batch(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    let Some(storage_dictionary) = &batch.storage_dictionary else {
+        return decode_column_batch(logical_type, batch, rows, allocator, None);
+    };
+    let Some(localized) =
+        localize_storage_dictionary(storage_dictionary, batch.nulls.as_deref(), rows)?
+    else {
+        return decode_storage_dictionary_batch(
+            logical_type,
+            storage_dictionary,
+            batch.nulls.as_deref(),
+            rows,
+            allocator,
+            None,
+            batch.has_verified_utf8(),
+            None,
+        );
+    };
+    decode_storage_dictionary_batch(
+        logical_type,
+        &localized,
+        batch.nulls.as_deref(),
+        rows,
+        allocator,
+        None,
+        batch.has_verified_utf8(),
+        None,
+    )
+}
+
+fn localize_storage_dictionary(
+    batch: &StorageDictionaryBatch,
+    nulls: Option<&[u8]>,
+    rows: usize,
+) -> Result<Option<StorageDictionaryBatch>> {
+    let codes = ValidatedDictionaryCodes::try_new(batch.codes.as_ref(), rows)?;
+    if nulls.is_some_and(|flags| flags.len() < rows) {
+        return Err(paro_error::data_corrupted(
+            "Null map shorter than sparse dictionary row count",
+        ));
+    }
+
+    let mut dictionary = BinaryPlainPageDecoder::new(batch.dictionary.clone());
+    dictionary.init()?;
+    let dictionary_len = dictionary.count() as usize;
+    // Localization performs its own dictionary build and code remap. Require
+    // a substantial domain reduction so ordinary scans and tiny dictionaries
+    // retain the reader-local full-dictionary cache path.
+    if rows.saturating_mul(4) >= dictionary_len {
+        return Ok(None);
+    }
+
+    let mut referenced_codes = Vec::with_capacity(rows);
+    for row_idx in 0..rows {
+        if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            continue;
+        }
+        let code = codes.code_at(row_idx);
+        if code as usize >= dictionary_len {
+            return Err(paro_error::data_corrupted(format!(
+                "storage dictionary code {code} out of range {dictionary_len}"
+            )));
+        }
+        referenced_codes.push(code);
+    }
+    referenced_codes.sort_unstable();
+    referenced_codes.dedup();
+
+    let mut builder = BinaryPlainPageBuilder::new(batch.dictionary.len().max(1));
+    for &code in &referenced_codes {
+        let value = dictionary
+            .string_at(code)
+            .ok_or_else(|| paro_error::data_corrupted("dictionary entry missing"))?;
+        if !builder.add_slice(&value) {
+            return Err(paro_error::internal(
+                "localized dictionary unexpectedly exceeded source dictionary storage",
+            ));
+        }
+    }
+    let localized_dictionary = builder.finish()?;
+
+    let mut localized_codes = Vec::with_capacity(batch.codes.len());
+    for row_idx in 0..rows {
+        let local_code = if nulls.is_some_and(|flags| flags[row_idx] != 0) {
+            0
+        } else {
+            let code = codes.code_at(row_idx);
+            u32::try_from(referenced_codes.binary_search(&code).map_err(|_| {
+                paro_error::internal("referenced dictionary code missing from localized domain")
+            })?)
+            .map_err(|_| paro_error::out_of_range("localized dictionary exceeds u32 domain"))?
+        };
+        localized_codes.extend_from_slice(&local_code.to_le_bytes());
+    }
+    Ok(Some(StorageDictionaryBatch {
+        dictionary: localized_dictionary,
+        codes: Bytes::from(localized_codes),
+    }))
+}
+
+fn decode_storage_binary_plain_batch(
+    logical_type: &LogicalType,
+    batch: &BinaryPlainPageSlice,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
+) -> Result<Vector> {
+    if batch.rows() != rows {
+        return Err(paro_error::data_corrupted(
+            "BinaryPlain batch row count does not match requested rows",
+        ));
+    }
+    let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
+    let (entries, _validity, heap) = vector.try_begin_varlen_write(rows)?;
+    for row_idx in 0..rows {
+        let value = batch
+            .row_value_ref(row_idx)
+            .ok_or_else(|| paro_error::data_corrupted("BinaryPlain batch row is missing"))?;
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        // SAFETY: the target vector retains this heap with the decoded entry.
+        let entry = unsafe { heap.try_add_blob(value) }?;
+        // SAFETY: try_begin_varlen_write returned exactly `rows` writable entries.
+        unsafe { entries.add(row_idx).write(entry) };
+    }
+    Ok(vector)
+}
+
+fn validate_storage_dictionary_selection(
+    selection: SelectionVector,
+    child_count: usize,
+) -> Result<ValidatedVectorSelection> {
+    ValidatedVectorSelection::try_new(selection, child_count).map_err(|error| {
+        paro_error::data_corrupted(format!("invalid storage dictionary code: {error}"))
+    })
 }
 
 pub(crate) fn decode_column_batch(
@@ -267,16 +849,62 @@ pub(crate) fn decode_column_batch(
             rows,
             allocator,
             storage_provenance_id,
+            batch.has_verified_utf8(),
+            None,
         );
     }
 
-    let mut vector = build_vector_from_bytes(logical_type, &batch.data, rows, allocator)?;
+    if let Some(storage_binary_plain) = &batch.storage_binary_plain {
+        let mut vector = decode_storage_binary_plain_batch(
+            logical_type,
+            storage_binary_plain,
+            rows,
+            allocator,
+            !batch.has_verified_utf8() && !matches!(logical_type, LogicalType::Blob),
+        )?;
+        if let Some(nulls) = batch.nulls.as_deref() {
+            apply_nulls(&mut vector, nulls, rows)?;
+        }
+        return Ok(vector);
+    }
+
+    let mut vector = build_vector_from_bytes_with_utf8_validation(
+        logical_type,
+        &batch.data,
+        rows,
+        allocator,
+        !batch.has_verified_utf8(),
+    )?;
     if !matches!(logical_type, LogicalType::Null) {
         if let Some(nulls) = batch.nulls.as_deref() {
             apply_nulls(&mut vector, nulls, rows)?;
         }
     }
     Ok(vector)
+}
+
+pub(crate) fn decode_column_batch_cached(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    storage_provenance_id: Option<u64>,
+    cache: &StorageDictionaryDecoderCache,
+    cache_slot: u64,
+) -> Result<Vector> {
+    if let Some(storage_dictionary) = &batch.storage_dictionary {
+        return decode_storage_dictionary_batch(
+            logical_type,
+            storage_dictionary,
+            batch.nulls.as_deref(),
+            rows,
+            allocator,
+            storage_provenance_id,
+            batch.has_verified_utf8(),
+            Some((cache, cache_slot)),
+        );
+    }
+    decode_column_batch(logical_type, batch, rows, allocator, storage_provenance_id)
 }
 
 pub(crate) fn infer_batch_row_count(
@@ -374,26 +1002,82 @@ where
             "Column data length does not match expected rows",
         ));
     }
-    let mut vector = Vector::try_new(logical_type, rows, allocator)?;
-    if rows > 0 {
-        #[cfg(target_endian = "little")]
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                vector.flat_data_mut::<T>().cast::<u8>(),
-                expected_bytes,
-            );
-        }
-        #[cfg(target_endian = "big")]
-        {
-            let values = parse_primitive::<T>(data, rows)?;
-            unsafe {
-                std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
-            }
-        }
+    #[cfg(target_endian = "little")]
+    {
+        Vector::try_from_fixed_width_bytes(logical_type, rows, data.clone(), allocator)
     }
-    vector.try_set_count(rows)?;
+    #[cfg(target_endian = "big")]
+    {
+        let values = parse_primitive::<T>(data, rows)?;
+        let mut vector = Vector::try_new(logical_type, rows, allocator)?;
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr(), vector.flat_data_mut::<T>(), rows);
+        }
+        vector.try_set_count(rows)?;
+        Ok(vector)
+    }
+}
+
+fn build_varlen_vector(
+    logical_type: &LogicalType,
+    data: &Bytes,
+    rows: usize,
+    allocator: Arc<dyn Allocator>,
+    validate_utf8: bool,
+) -> Result<Vector> {
+    let mut vector = Vector::try_new(logical_type.clone(), rows, allocator)?;
+    let (entries, _validity, heap) = vector.try_begin_varlen_write(rows)?;
+    for_each_length_prefixed_value(data, rows, |row_idx, value| {
+        if validate_utf8 {
+            std::str::from_utf8(value)
+                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))?;
+        }
+        // SAFETY: the target vector retains this heap with the decoded entry.
+        let entry = unsafe { heap.try_add_blob(value) }?;
+        // SAFETY: `try_begin_varlen_write(rows)` returns a `StringView` array
+        // with exactly `rows` writable entries and `row_idx < rows`.
+        unsafe { entries.add(row_idx).write(entry) };
+        Ok(())
+    })?;
     Ok(vector)
+}
+
+/// Walk the canonical length-prefixed varlen encoding once. Stored decoding
+/// and derived projections share this parser so encoding validation cannot
+/// drift between the two paths.
+fn for_each_length_prefixed_value(
+    data: &Bytes,
+    rows: usize,
+    mut visit: impl FnMut(usize, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let mut offset = 0usize;
+    for row in 0..rows {
+        let length_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("variable-length column offset overflow"))?;
+        let length = u32::from_le_bytes(
+            data.get(offset..length_end)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("variable-length column length prefix is truncated")
+                })?
+                .try_into()
+                .expect("validated u32 length width"),
+        ) as usize;
+        let value_end = length_end.checked_add(length).ok_or_else(|| {
+            paro_error::data_corrupted("variable-length column value offset overflow")
+        })?;
+        let value = data.get(length_end..value_end).ok_or_else(|| {
+            paro_error::data_corrupted("variable-length value exceeds encoded buffer")
+        })?;
+        visit(row, value)?;
+        offset = value_end;
+    }
+    if offset != data.len() {
+        return Err(paro_error::data_corrupted(
+            "variable-length column contains trailing bytes",
+        ));
+    }
+    Ok(())
 }
 
 fn build_bool_vector(data: &Bytes, rows: usize, allocator: Arc<dyn Allocator>) -> Result<Vector> {
@@ -693,20 +1377,6 @@ pub(crate) fn decode_struct_payload(
     Ok(values)
 }
 
-fn parse_strings(data: &Bytes, rows: usize) -> Result<Vec<String>> {
-    parse_varlen_values(data, rows)?
-        .into_iter()
-        .map(|raw| {
-            String::from_utf8(raw)
-                .map_err(|_| paro_error::data_corrupted("Invalid UTF-8 in string column"))
-        })
-        .collect()
-}
-
-fn parse_blobs(data: &Bytes, rows: usize) -> Result<Vec<Vec<u8>>> {
-    parse_varlen_values(data, rows)
-}
-
 pub(crate) fn parse_varlen_values(data: &Bytes, rows: usize) -> Result<Vec<Vec<u8>>> {
     let mut offset = 0usize;
     let bytes = data.as_ref();
@@ -876,5 +1546,212 @@ impl FromPrimitiveLe for f32 {
     fn from_le_bytes(bytes: &[u8]) -> Self {
         let arr: [u8; 4] = bytes.try_into().expect("slice with incorrect length");
         f32::from_le_bytes(arr)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rowset::encoding::BinaryPlainPageBuilder;
+    use paro_common::allocator::default_allocator;
+
+    fn encode_varlen(values: &[&[u8]]) -> Bytes {
+        let mut encoded = Vec::new();
+        for value in values {
+            encoded.extend_from_slice(&(value.len() as u32).to_le_bytes());
+            encoded.extend_from_slice(value);
+        }
+        Bytes::from(encoded)
+    }
+
+    #[test]
+    fn varlen_vector_decodes_directly_from_canonical_rows() {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let encoded = encode_varlen(&[b"short", b"a value longer than twelve bytes"]);
+
+        let vector = build_vector_from_bytes(&LogicalType::Varchar, &encoded, 2, allocator)
+            .expect("valid varlen column");
+
+        assert_eq!(vector.get_string(0), Some("short"));
+        assert_eq!(
+            vector.get_string(1),
+            Some("a value longer than twelve bytes")
+        );
+    }
+
+    #[test]
+    fn varchar_decoder_rejects_invalid_utf8_while_blob_preserves_it() {
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let encoded = encode_varlen(&[&[0xff, 0xfe]]);
+
+        assert!(
+            build_vector_from_bytes(&LogicalType::Varchar, &encoded, 1, allocator.clone()).is_err()
+        );
+        let blob = build_vector_from_bytes(&LogicalType::Blob, &encoded, 1, allocator)
+            .expect("blob bytes need not be UTF-8");
+        assert_eq!(blob.get_blob(0), Some([0xff, 0xfe].as_slice()));
+    }
+
+    #[test]
+    fn reader_cache_reuses_dictionary_child_across_code_batches() {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        assert!(builder.add_slice(b"alpha"));
+        assert!(builder.add_slice(b"beta"));
+        let dictionary = builder.finish().unwrap();
+        let make_batch = |codes: &[u32]| {
+            ColumnBatch::with_storage_dictionary(
+                dictionary.clone(),
+                Bytes::from(
+                    codes
+                        .iter()
+                        .flat_map(|code| code.to_le_bytes())
+                        .collect::<Vec<_>>(),
+                ),
+                None,
+            )
+            .with_verified_utf8()
+        };
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let cache = StorageDictionaryDecoderCache::default();
+
+        let first = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(&[0, 1, 0]),
+            3,
+            allocator.clone(),
+            Some(7),
+            &cache,
+            11,
+        )
+        .unwrap();
+        let second = decode_column_batch_cached(
+            &LogicalType::Varchar,
+            &make_batch(&[1, 0]),
+            2,
+            allocator,
+            Some(7),
+            &cache,
+            11,
+        )
+        .unwrap();
+
+        assert!(Arc::ptr_eq(
+            first.child().expect("dictionary child"),
+            second.child().expect("dictionary child")
+        ));
+        assert_eq!(first.get_string(0), Some("alpha"));
+        assert_eq!(first.get_string(1), Some("beta"));
+        assert_eq!(second.get_string(0), Some("beta"));
+        assert_eq!(second.get_string(1), Some("alpha"));
+    }
+
+    #[test]
+    fn sparse_decode_localizes_large_dictionary_domain() {
+        let mut builder = BinaryPlainPageBuilder::new(64 * 1024);
+        for index in 0..128 {
+            assert!(builder.add_slice(format!("dictionary_value_{index:03}").as_bytes()));
+        }
+        let dictionary = builder.finish().unwrap();
+        let batch = ColumnBatch::with_storage_dictionary(
+            dictionary,
+            Bytes::from(
+                [91_u32, 3, 91, 127]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("dictionary_value_091"));
+        assert_eq!(vector.get_string(1), Some("dictionary_value_003"));
+        assert_eq!(vector.get_string(2), Some("dictionary_value_091"));
+        assert_eq!(vector.get_string(3), Some("dictionary_value_127"));
+        let info = vector.dictionary_info().expect("localized dictionary");
+        assert_eq!(info.unique_len, 3);
+        assert_eq!(info.provenance_id, None);
+    }
+
+    #[test]
+    fn sparse_dictionary_localization_preserves_nulls_and_duplicate_codes() {
+        let mut builder = BinaryPlainPageBuilder::new(64 * 1024);
+        for index in 0..64 {
+            assert!(builder.add_slice(format!("entry_{index:03}_payload").as_bytes()));
+        }
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(
+                [41_u32, 7, 41, 3]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            Some(Bytes::from_static(&[0, 1, 0, 0])),
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            4,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("entry_041_payload"));
+        assert!(vector.is_null(1));
+        assert_eq!(vector.get_string(2), Some("entry_041_payload"));
+        assert_eq!(vector.get_string(3), Some("entry_003_payload"));
+        assert_eq!(
+            vector
+                .dictionary_info()
+                .expect("localized dictionary")
+                .unique_len,
+            3,
+            "two referenced values plus the canonical null slot"
+        );
+    }
+
+    #[test]
+    fn sparse_decode_keeps_small_dictionary_domain() {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        assert!(builder.add_slice(b"alpha"));
+        assert!(builder.add_slice(b"beta"));
+        let batch = ColumnBatch::with_storage_dictionary(
+            builder.finish().unwrap(),
+            Bytes::from(
+                [1_u32, 1]
+                    .into_iter()
+                    .flat_map(u32::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        )
+        .with_verified_utf8();
+        let vector = decode_sparse_column_batch(
+            &LogicalType::Varchar,
+            &batch,
+            2,
+            Arc::new(default_allocator()),
+        )
+        .unwrap();
+
+        assert_eq!(vector.get_string(0), Some("beta"));
+        assert_eq!(vector.get_string(1), Some("beta"));
+        assert_eq!(
+            vector
+                .dictionary_info()
+                .expect("storage dictionary")
+                .unique_len,
+            2,
+            "small domains should not pay for local dictionary reconstruction"
+        );
     }
 }

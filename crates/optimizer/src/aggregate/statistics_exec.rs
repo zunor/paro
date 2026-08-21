@@ -156,7 +156,7 @@ impl AggregateStatisticsExecutor {
                 }
                 Some(AggregateResult {
                     aggregate_type: StatisticsAggregate::CountStar,
-                    value: Self::visible_rows_value(scan),
+                    value: Self::visible_rows_value(scan)?,
                 })
             }
             "count" => {
@@ -165,7 +165,7 @@ impl AggregateStatisticsExecutor {
                 }
                 Some(AggregateResult {
                     aggregate_type: StatisticsAggregate::CountStar,
-                    value: Self::visible_rows_value(scan),
+                    value: Self::visible_rows_value(scan)?,
                 })
             }
             "min" | "max" => {
@@ -190,23 +190,14 @@ impl AggregateStatisticsExecutor {
         }
     }
 
-    fn visible_rows_value(scan: &SimpleScanInfo) -> Value {
-        let visible_rows = scan
-            .storage
-            .tablet()
-            .statistics()
-            .map(|stats| {
-                stats
-                    .num_rows
-                    .saturating_sub(stats.delete_stats.num_deleted_rows) as usize
-            })
-            .unwrap_or_else(|_| {
-                scan.storage
-                    .total_rows()
-                    .saturating_sub(scan.storage.deleted_row_count())
-            });
+    fn visible_rows_value(scan: &SimpleScanInfo) -> Option<Value> {
+        let visible_rows = scan.storage.tablet().statistics().ok().map(|stats| {
+            stats
+                .num_rows
+                .saturating_sub(stats.delete_stats.num_deleted_rows) as usize
+        })?;
         let count = i64::try_from(visible_rows).unwrap_or(i64::MAX);
-        Value::BigInt(count)
+        Some(Value::BigInt(count))
     }
 
     fn resolve_simple_scan(plan: &LogicalPlan) -> Option<SimpleScanInfo> {
@@ -252,11 +243,10 @@ impl AggregateStatisticsExecutor {
                     if current_binding.table_index != get.table_index {
                         return None;
                     }
-                    let column_id = *get.column_ids.get(current_binding.column_index)?;
+                    let column_id = get.stored_column(current_binding.column_index)?;
                     let table = get.table.as_ref()?;
                     let storage = table.get_storage()?;
-                    let base = storage.column_statistics(column_id)?;
-                    return Some(Arc::new(ColumnStatistics::new(base)));
+                    return Some(Arc::new(storage.column_statistics(column_id)?));
                 }
                 _ => return None,
             }
@@ -352,22 +342,18 @@ mod tests {
         children: Vec<Expression>,
         return_type: LogicalType,
     ) -> Expression {
-        let function = AggregateFunction {
-            name: name.to_string(),
-            arguments: children.iter().map(|child| child.return_type()).collect(),
-            return_type: return_type.clone(),
-            state_size: 8,
-            initialize: noop_initialize,
-            update: noop_update,
-            combine: noop_combine,
-            finalize: noop_finalize,
-            simple_update: None,
-            destructor: None,
-            state_serialize: None,
-            state_deserialize: None,
-            varargs: None,
-            bind_data: None,
-        };
+        let function = AggregateFunction::new(
+            name.to_string(),
+            children.iter().map(|child| child.return_type()).collect(),
+            return_type.clone(),
+            8,
+            noop_initialize,
+            noop_update,
+            noop_combine,
+            noop_finalize,
+            None,
+            None,
+        );
         Expression::Aggregate(AggregateExpression::new(function, children, return_type))
     }
 
@@ -417,8 +403,8 @@ mod tests {
     fn extract_numeric_min_max() {
         let mut base = BaseStatistics::new(LogicalType::Integer);
         base.set_has_no_null_fast();
-        NumericStats::set_min(&mut base, &Value::Integer(10));
-        NumericStats::set_max(&mut base, &Value::Integer(42));
+        NumericStats::set_guaranteed_min(&mut base, &Value::Integer(10));
+        NumericStats::set_guaranteed_max(&mut base, &Value::Integer(42));
         let stats = ColumnStatistics::new(base);
 
         assert_eq!(

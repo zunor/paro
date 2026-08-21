@@ -4,6 +4,8 @@
 use paro_common::allocator::MemoryTag;
 use paro_function::scalar::FunctionExecContext;
 
+use crate::explain::profiler::{OperatorProfilePhase, ProfileMorselRange};
+
 use super::helpers::finish_context;
 use super::parallel_finish::run_parallel_finish_tasks;
 use super::*;
@@ -29,8 +31,8 @@ impl PipelineTaskExecutor {
         let transform_node_id = transform_operator.index() as u64;
         ctx.profiler.start_operator(transform_node_id);
         let (poll, output_rows) = {
-            let task = &mut self.task;
-            let memory = task.memory.call_scope();
+            let (task, memory) = self.task.data_and_memory_mut()?;
+            let memory = memory.call_scope();
             let expression = &mut task.scratch.expression;
             let transform_chunks = &mut task.scratch.transform_chunks;
             let scratch = OperatorScratchScope::from_expression(expression);
@@ -156,8 +158,8 @@ impl PipelineTaskExecutor {
         let sink_node_id = sink_operator.index() as u64;
         ctx.profiler.start_operator(sink_node_id);
         let poll = {
-            let task = &mut self.task;
-            let memory = task.memory.call_scope();
+            let (task, memory) = self.task.data_and_memory_mut()?;
+            let memory = memory.call_scope();
             let scratch = OperatorScratchScope::from_expression(&mut task.scratch.expression);
             let mut call_ctx = self.call_context.context(
                 ctx.query,
@@ -188,6 +190,10 @@ impl PipelineTaskExecutor {
             self.completion_stage = PipelineCompletionStage::PrepareFinish;
             return Ok(TaskStepResult::Continue);
         };
+        if self.defer_shared_producer_merge {
+            self.completion_stage = PipelineCompletionStage::PrepareFinish;
+            return Ok(TaskStepResult::Continue);
+        }
 
         match shared.mark_producer_merged()? {
             SharedSinkMergeEvent::WaitingForProducers { .. } => {
@@ -212,7 +218,7 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
-        ctx.profiler.start_operator(sink_node_id);
+        let phase_timer = ctx.profiler.start_phase();
         let poll = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -227,7 +233,15 @@ impl PipelineTaskExecutor {
                 .exec
                 .prepare_finish(&mut finish_ctx, &self.runtime.sink_global)
         };
-        ctx.profiler.cancel_operator(sink_node_id);
+        if poll.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerPrepareFinish,
+                phase_timer,
+                0,
+                None,
+            );
+        }
         let poll = poll?;
 
         match poll {
@@ -296,7 +310,7 @@ impl PipelineTaskExecutor {
 
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
-        ctx.profiler.start_operator(sink_node_id);
+        let phase_timer = ctx.profiler.start_phase();
         let work = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -311,7 +325,15 @@ impl PipelineTaskExecutor {
                 .exec
                 .finish_work(&mut finish_ctx, &self.runtime.sink_global)
         };
-        ctx.profiler.cancel_operator(sink_node_id);
+        if work.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishWork,
+                phase_timer,
+                0,
+                None,
+            );
+        }
         let work = work?;
 
         match work {
@@ -320,6 +342,12 @@ impl PipelineTaskExecutor {
                 Ok(TaskStepResult::Continue)
             }
             FinishWork::Parallel(group) => {
+                if group.task_count == 0 {
+                    return Err(paro_common::error::internal(
+                        "finish group must declare at least one task",
+                    ));
+                }
+                self.finish_tasks_completed = 0;
                 self.finish_group = Some(group);
                 self.drive_parallel_finish(ctx)
             }
@@ -335,7 +363,7 @@ impl PipelineTaskExecutor {
             .take()
             .expect("finish group must exist while driving parallel finish");
 
-        if group.task_count_hint > 1 && self.active_finish_task.is_none() {
+        if group.task_count > 1 && self.active_finish_task.is_none() {
             let result = self.drive_parallel_finish_group(ctx, &group);
             if matches!(result, Ok(TaskStepResult::Blocked(_))) {
                 self.finish_group = Some(group);
@@ -382,6 +410,13 @@ impl PipelineTaskExecutor {
                 result
             }
             NextFinishTask::Drained => {
+                if self.finish_tasks_completed != group.task_count {
+                    return Err(paro_common::error::internal(format!(
+                        "finish group task count mismatch: declared={}, completed={}",
+                        group.task_count, self.finish_tasks_completed
+                    )));
+                }
+                self.finish_parallel_group(ctx, &group)?;
                 self.completion_stage = PipelineCompletionStage::Finish;
                 Ok(TaskStepResult::Continue)
             }
@@ -398,6 +433,8 @@ impl PipelineTaskExecutor {
         group: &FinishTaskGroup,
         task_id: FinishTaskId,
     ) -> Result<TaskStepResult> {
+        let sink_node_id = self.runtime.program.sink.operator_id.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
         let task_result = {
             let mut finish_ctx = finish_context(
                 ctx,
@@ -408,6 +445,19 @@ impl PipelineTaskExecutor {
             );
             group.driver.run_task(task_id, &mut finish_ctx)
         };
+        if task_result.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishTask,
+                phase_timer,
+                0,
+                Some(ProfileMorselRange::new(
+                    "finish_task",
+                    u64::from(task_id.0),
+                    u64::from(task_id.0) + 1,
+                )),
+            );
+        }
         let poll = match task_result {
             Ok(poll) => poll,
             Err(error) => {
@@ -423,6 +473,10 @@ impl PipelineTaskExecutor {
         match poll {
             FinishTaskPoll::Done => {
                 self.active_finish_task = None;
+                self.finish_tasks_completed = self
+                    .finish_tasks_completed
+                    .checked_add(1)
+                    .ok_or_else(|| paro_common::error::internal("finish task count overflow"))?;
                 Ok(TaskStepResult::Continue)
             }
             FinishTaskPoll::Pending(blocker) => Ok(self.block(PipelineTaskPhase::Merging, blocker)),
@@ -434,7 +488,7 @@ impl PipelineTaskExecutor {
         ctx: &mut PipelineTaskStepContext<'_>,
         group: &FinishTaskGroup,
     ) -> Result<TaskStepResult> {
-        let mut task_ids = Vec::with_capacity(group.task_count_hint);
+        let mut task_ids = Vec::with_capacity(group.task_count);
         loop {
             let next = {
                 let mut finish_ctx = finish_context(
@@ -466,8 +520,16 @@ impl PipelineTaskExecutor {
         }
 
         if task_ids.is_empty() {
-            self.completion_stage = PipelineCompletionStage::Finish;
-            return Ok(TaskStepResult::Continue);
+            return Err(paro_common::error::internal(
+                "parallel finish group issued no tasks",
+            ));
+        }
+        if task_ids.len() != group.task_count {
+            return Err(paro_common::error::internal(format!(
+                "parallel finish group task count mismatch: declared={}, issued={}",
+                group.task_count,
+                task_ids.len()
+            )));
         }
 
         let result = run_parallel_finish_tasks(
@@ -476,13 +538,47 @@ impl PipelineTaskExecutor {
             group.clone(),
             task_ids,
             ctx.query.allocator(MemoryTag::Allocator),
+            ctx.profiler,
+            self.runtime.program.sink.operator_id.index() as u64,
         );
         if let Err(error) = result {
             self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
             return Err(error);
         }
+        self.finish_parallel_group(ctx, group)?;
         self.completion_stage = PipelineCompletionStage::Finish;
         Ok(TaskStepResult::Continue)
+    }
+
+    fn finish_parallel_group(
+        &mut self,
+        ctx: &mut PipelineTaskStepContext<'_>,
+        group: &FinishTaskGroup,
+    ) -> Result<()> {
+        let sink_node_id = self.runtime.program.sink.operator_id.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
+        let mut finish_ctx = finish_context(
+            ctx,
+            self.runtime.program.id,
+            self.runtime.program.sink.operator_id,
+            None,
+            &self.task,
+        );
+        let result = group.driver.finish_group(&mut finish_ctx);
+        if result.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinishGroup,
+                phase_timer,
+                0,
+                None,
+            );
+        }
+        if let Err(error) = result {
+            self.cancel_finish_group(ctx, group, Self::cancel_reason_for_error(ctx.query, &error));
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub(crate) fn cancel_finish_group(
@@ -512,6 +608,7 @@ impl PipelineTaskExecutor {
     ) -> Result<TaskStepResult> {
         let sink_operator = self.runtime.program.sink.operator_id;
         let sink_node_id = sink_operator.index() as u64;
+        let phase_timer = ctx.profiler.start_phase();
         ctx.profiler.start_operator(sink_node_id);
         let poll = {
             let mut finish_ctx = finish_context(
@@ -531,6 +628,15 @@ impl PipelineTaskExecutor {
             Ok(FinishPoll::DoneWithResult(chunk)) => chunk.size() as u64,
             _ => 0,
         };
+        if poll.is_ok() {
+            ctx.profiler.end_phase(
+                sink_node_id,
+                OperatorProfilePhase::BreakerFinish,
+                phase_timer,
+                output_rows,
+                None,
+            );
+        }
         if output_rows == 0 {
             ctx.profiler.cancel_operator(sink_node_id);
         } else {

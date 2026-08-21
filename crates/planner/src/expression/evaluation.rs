@@ -3,7 +3,7 @@
 
 //! Evaluation properties used to guard semantics-changing rewrites.
 
-use paro_function::scalar::{FunctionSideEffects, FunctionStability};
+use paro_function::scalar::{FunctionErrorMode, FunctionSideEffects, FunctionStability};
 
 use super::{Expression, ExpressionIterator, WindowExpression};
 
@@ -18,6 +18,7 @@ pub struct EvaluationProperties {
     side_effects: FunctionSideEffects,
     crosses_execution_boundary: bool,
     contains_subquery: bool,
+    can_error: bool,
 }
 
 impl Default for EvaluationProperties {
@@ -27,6 +28,7 @@ impl Default for EvaluationProperties {
             side_effects: FunctionSideEffects::NoSideEffects,
             crosses_execution_boundary: false,
             contains_subquery: false,
+            can_error: false,
         }
     }
 }
@@ -48,6 +50,13 @@ impl EvaluationProperties {
         !self.can_share_evaluation() || self.crosses_execution_boundary
     }
 
+    /// Whether the expression is total over every row admitted by its input
+    /// types. Moving a total expression across a row-removing operator cannot
+    /// expose a new SQL error on a row that the original plan never evaluated.
+    pub fn is_infallible(self) -> bool {
+        !self.can_error
+    }
+
     fn merge(&mut self, other: Self) {
         self.stability = merge_stability(self.stability, other.stability);
         if other.side_effects == FunctionSideEffects::HasSideEffects {
@@ -55,6 +64,7 @@ impl EvaluationProperties {
         }
         self.crosses_execution_boundary |= other.crosses_execution_boundary;
         self.contains_subquery |= other.contains_subquery;
+        self.can_error |= other.can_error;
     }
 }
 
@@ -81,12 +91,27 @@ impl Expression {
                 side_effects: function.function.side_effects,
                 crosses_execution_boundary: function.crosses_execution_boundary(),
                 contains_subquery: false,
+                can_error: function.function.error_mode == FunctionErrorMode::CanError,
             },
             // A subquery owns a plan rather than an ordinary expression child. Until plan-level
             // properties are available, treating it as non-shareable prevents accidental cloning
             // or elimination of work hidden behind that boundary.
             Expression::Subquery(_) => EvaluationProperties {
                 contains_subquery: true,
+                can_error: true,
+                ..EvaluationProperties::default()
+            },
+            // Casts and the remaining composite expression kinds do not yet
+            // carry a bound totality contract. Keep them conservative rather
+            // than inferring safety from their children.
+            Expression::Cast(_)
+            | Expression::Conjunction(_)
+            | Expression::Case(_)
+            | Expression::Comparison(_)
+            | Expression::Operator(_)
+            | Expression::Aggregate(_)
+            | Expression::Window(_) => EvaluationProperties {
+                can_error: true,
                 ..EvaluationProperties::default()
             },
             _ => EvaluationProperties::default(),
@@ -156,6 +181,20 @@ mod tests {
         Expression::Function(expression)
     }
 
+    fn infallible_call(children: Vec<Expression>) -> Expression {
+        let mut expression = call(
+            FunctionStability::Consistent,
+            FunctionSideEffects::NoSideEffects,
+            false,
+            children,
+        );
+        let Expression::Function(function) = &mut expression else {
+            unreachable!("call constructs a function expression");
+        };
+        function.function.error_mode = FunctionErrorMode::Infallible;
+        expression
+    }
+
     #[test]
     fn volatile_descendant_prevents_shared_evaluation() {
         let volatile = call(
@@ -200,5 +239,23 @@ mod tests {
         let properties = expression.evaluation_properties();
         assert!(properties.can_share_evaluation());
         assert!(properties.is_reorder_fence());
+    }
+
+    #[test]
+    fn totality_requires_every_function_in_the_tree_to_be_infallible() {
+        let leaf = infallible_call(vec![]);
+        assert!(leaf.evaluation_properties().is_infallible());
+
+        let total = infallible_call(vec![leaf]);
+        assert!(total.evaluation_properties().is_infallible());
+
+        let fallible_leaf = call(
+            FunctionStability::Consistent,
+            FunctionSideEffects::NoSideEffects,
+            false,
+            vec![],
+        );
+        let mixed = infallible_call(vec![fallible_leaf]);
+        assert!(!mixed.evaluation_properties().is_infallible());
     }
 }

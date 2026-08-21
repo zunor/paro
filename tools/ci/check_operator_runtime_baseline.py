@@ -329,7 +329,7 @@ def _check_hash_join_reclaimer_guard() -> list[str]:
     state = _read("crates/execution/src/operators/join/state.rs")
     required_breaker = [
         "HashJoinBuildSpillReclaimer",
-        "spill_build_for_reclaim",
+        "reclaim_build",
         "enable_build_reclaim",
         "disable_build_reclaim",
         "SpillCost::Repartition",
@@ -452,8 +452,12 @@ def _check_aggregate_reclaimer_guard() -> list[str]:
 def _check_sort_merge_guard() -> list[str]:
     source = _strip_test_sections(_read("crates/execution/src/sorting/sorted_run_merger.rs"))
     linear_scan_count = source.count("fn select_next_run(")
+    # `materialize_range` creates its cursors once and reuses them across the
+    # complete range. Only constructors in the streaming source path are
+    # per-batch debt.
+    streaming_source = source.split("pub fn get_data(", 1)[1]
     per_batch_cursor_count = (
-        source.count("cursor_on_demand(1)")
+        streaming_source.count("cursor_on_demand(1)")
         + source.count(".map(SortedRun::external_key_cursor)")
         + source.count(".map(SortedRun::external_payload_cursor)")
     )
@@ -834,11 +838,15 @@ def _check_explain_profile_schema_guard() -> list[str]:
     for rel, source in {
         "runtime/scheduler.rs": scheduler,
         "query_executor/pipeline_driver.rs": pipeline_driver,
-        "query_executor/program_executor.rs": program_executor,
         "runtime/task_executor/parallel_finish.rs": parallel_finish,
     }.items():
         if "new_with_context" not in source or "ProfileWorkerContext::new" not in source:
             errors.append(f"PROFILE {rel} must attach pipeline/work/thread profile context")
+    if "run_bound_pipeline_runtime" not in program_executor:
+        errors.append(
+            "PROFILE query_executor/program_executor.rs must delegate control-region "
+            "pipelines to the context-aware scheduler runtime"
+        )
 
     if "record_query_memory_stats" not in program_executor or "runtime_stats()" not in program_executor:
         errors.append("PROFILE EXPLAIN ANALYZE must snapshot query memory stats before rendering")

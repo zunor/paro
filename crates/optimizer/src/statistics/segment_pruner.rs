@@ -135,12 +135,9 @@ impl SegmentPruner {
                 // Check if this column reference matches the Get's table index
                 if col_ref.binding.table_index == get.table_index {
                     // Extract the column index in the base table
-                    if col_ref.binding.column_index < get.column_ids.len() {
-                        return Some((
-                            get.column_ids[col_ref.binding.column_index],
-                            col_ref.binding.column_index,
-                        ));
-                    }
+                    return get
+                        .stored_column(col_ref.binding.column_index)
+                        .map(|column_id| (column_id, col_ref.binding.column_index));
                 }
                 None
             }

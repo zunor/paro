@@ -313,6 +313,45 @@ impl ArenaAllocator {
         self.destroy();
     }
 
+    /// Transfer every allocation owned by `other` into this arena.
+    ///
+    /// Existing pointers remain stable: ownership is transferred by splicing
+    /// the backing chunk lists, not by copying their contents. This is useful
+    /// when independently built aggregate states are combined into one owner.
+    pub fn absorb(&mut self, other: &mut ArenaAllocator) -> Result<()> {
+        let combined_size = self
+            .allocated_size
+            .checked_add(other.allocated_size)
+            .ok_or_else(|| paro_error::out_of_range("arena allocation accounting overflow"))?;
+        let Some(mut other_head) = other.head.take() else {
+            return Ok(());
+        };
+        let other_tail = other.tail;
+        debug_assert!(!other_tail.is_null());
+
+        if self.head.is_some() {
+            // Preserve the target head as the allocation head. Absorbed
+            // chunks only carry ownership for already-built states; making
+            // them the head would strand unused capacity in the target's
+            // current chunk and make future allocations depend on merge order.
+            other_head.prev = self.tail;
+            // SAFETY: `self.tail` is the oldest live chunk in `self`, has no
+            // successor, and remains stable while `other_head` is moved into
+            // its `next` link.
+            unsafe {
+                (*self.tail).next = Some(other_head);
+            }
+            self.tail = other_tail;
+        } else {
+            self.tail = other_tail;
+            self.head = Some(other_head);
+        }
+        self.allocated_size = combined_size;
+        other.tail = std::ptr::null_mut();
+        other.allocated_size = 0;
+        Ok(())
+    }
+
     /// Get the head chunk.
     #[allow(dead_code)]
     pub(crate) fn get_head(&self) -> Option<&ArenaChunk> {
@@ -687,6 +726,44 @@ mod tests {
         assert!(arena1.is_empty());
         assert!(!arena2.is_empty());
         assert_eq!(arena2.allocation_size(), size);
+    }
+
+    #[test]
+    fn test_arena_allocator_absorb_preserves_both_chunk_lists() {
+        let allocator = Arc::new(DefaultAllocator::new());
+        let mut target = ArenaAllocator::with_capacity(allocator.clone(), 16);
+        let mut source = ArenaAllocator::with_capacity(allocator, 16);
+
+        let target_ptr = target.allocate(8).unwrap();
+        let source_ptr = source.allocate(8).unwrap();
+        // Force a second source chunk so the splice covers a real chain.
+        let source_large_ptr = source.allocate(64).unwrap();
+        unsafe {
+            target_ptr.write(11);
+            source_ptr.write(22);
+            source_large_ptr.write(33);
+        }
+        let expected_capacity = target.allocation_size() + source.allocation_size();
+
+        target.absorb(&mut source).unwrap();
+
+        assert!(source.is_empty());
+        assert_eq!(source.allocation_size(), 0);
+        assert_eq!(target.allocation_size(), expected_capacity);
+        unsafe {
+            assert_eq!(target_ptr.read(), 11);
+            assert_eq!(source_ptr.read(), 22);
+            assert_eq!(source_large_ptr.read(), 33);
+        }
+        let capacity_after_absorb = target.allocation_size();
+        target.allocate(4).unwrap();
+        assert_eq!(
+            target.allocation_size(),
+            capacity_after_absorb,
+            "post-absorb allocation should keep using the target's partial head"
+        );
+        target.reset();
+        assert!(!target.is_empty());
     }
 
     #[test]

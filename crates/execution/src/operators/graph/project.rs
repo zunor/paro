@@ -2,24 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use paro_catalog::entry::CatalogEntryEnum;
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
+use paro_common::vector::SelectionVector;
+use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::{ColumnRefExpression, Expression};
 use paro_planner::operator::ColumnBinding;
-use paro_storage::tablet::TabletReaderParams;
+use paro_storage::tablet::TabletRowIdReader;
+use paro_storage::transaction::overlay_reader::TxnOverlayReader;
 use paro_transaction::TableId;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::physical::specs::GraphProjectSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::state::{
-    GraphProjectMaterializedRuntime, GraphProjectTableFetchPlan, GraphProjectTransformLocal,
-    TransformGlobal, TransformLocal,
+    GraphProjectTransformLocal, RowFetchMaterializedRuntime, RowFetchTablePlan, TransformGlobal,
+    TransformLocal,
 };
 use crate::runtime::transform::{TransformFinishPoll, TransformFlushPoll, TransformPoll};
 use crate::runtime::{read_u64_from_vector, visit_column_refs, ExpressionEvalInput};
@@ -42,7 +43,7 @@ impl GraphProjectTransformExec {
         let materialized = if self.spec.rowid_mappings.is_empty() {
             None
         } else {
-            Some(build_graph_project_materialized_runtime(ctx, &self.spec)?)
+            Some(build_row_fetch_materialized_runtime(ctx, &self.spec)?)
         };
         let raw_filter_executors = if materialized.is_none() {
             graph_project_filter_executors(&self.spec.filters, ctx.query.session.as_ref())
@@ -165,7 +166,7 @@ fn build_graph_project_output(
         .materialized
         .as_mut()
         .ok_or_else(|| paro_error::internal("graph project materialized runtime missing"))?;
-    let materialized = materialize_graph_project_input(ctx, materialized_runtime, input)?;
+    let materialized = materialize_row_fetch_input(ctx, materialized_runtime, input)?;
     let Some(filtered) = apply_graph_project_filters(
         ctx,
         &mut local.filter_selection,
@@ -175,19 +176,40 @@ fn build_graph_project_output(
     else {
         return Chunk::try_init_empty(&spec.output_types, output.allocator().clone());
     };
+    if let Some(projection) = materialized_runtime.direct_project_columns.as_ref() {
+        let columns = projection
+            .iter()
+            .map(|&column_idx| {
+                filtered.column(column_idx).cloned().ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "late row-fetch projection column {column_idx} is missing"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        return Chunk::try_from_arc_vectors_with_cardinality(
+            columns,
+            filtered.size(),
+            output.allocator().clone(),
+        );
+    }
     let mut projected = Chunk::try_initialize(
         &spec.output_types,
         filtered.size(),
         output.allocator().clone(),
     )?;
-    materialized_runtime.project_executor.execute_all_kernel(
-        VectorKernelInput::from_eval_input(ExpressionEvalInput {
-            params: ctx.query.params.as_ref(),
-            columns: &filtered,
-        }),
-        ctx.query,
-        &mut projected,
-    )?;
+    materialized_runtime
+        .project_executor
+        .as_mut()
+        .expect("computed late row-fetch projection executor initialized")
+        .execute_all_kernel(
+            VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                params: ctx.query.params.as_ref(),
+                columns: &filtered,
+            }),
+            ctx.query,
+            &mut projected,
+        )?;
     Ok(projected)
 }
 
@@ -203,13 +225,13 @@ fn graph_project_filter_executors(
         .collect()
 }
 
-fn build_graph_project_materialized_runtime(
+fn build_row_fetch_materialized_runtime(
     ctx: &mut PipelineInitContext,
     spec: &GraphProjectSpec,
-) -> Result<GraphProjectMaterializedRuntime> {
+) -> Result<RowFetchMaterializedRuntime> {
     let mut required_cols: HashMap<usize, Vec<usize>> = HashMap::new();
     for expr in spec.expressions.iter().chain(spec.filters.iter()) {
-        collect_graph_project_table_refs(expr, &mut required_cols);
+        collect_graph_project_table_refs(expr, spec.carrier_table_index, &mut required_cols);
     }
     for cols in required_cols.values_mut() {
         cols.sort_unstable();
@@ -229,7 +251,7 @@ fn build_graph_project_materialized_runtime(
     mappings.dedup_by_key(|mapping| mapping.table_index);
 
     let mut table_fetches = Vec::with_capacity(mappings.len());
-    let mut table_col_offsets = HashMap::new();
+    let mut table_column_map = HashMap::new();
     let mut next_column_offset = 0usize;
     for mapping in mappings {
         let required = required_cols
@@ -251,8 +273,13 @@ fn build_graph_project_materialized_runtime(
             .transaction
             .read_tracker()
             .record_table_read(TableId::new(storage.table_id()));
-        table_col_offsets.insert(mapping.table_index, next_column_offset);
-        next_column_offset += table.columns.len();
+        for (local_index, &catalog_column) in required.iter().enumerate() {
+            table_column_map.insert(
+                (mapping.table_index, catalog_column),
+                next_column_offset + local_index,
+            );
+        }
+        next_column_offset += required.len();
         let column_ids = required
             .iter()
             .map(|&column| {
@@ -261,28 +288,22 @@ fn build_graph_project_materialized_runtime(
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        let column_types = table
-            .columns
-            .iter()
-            .map(|column| column.logical_type.clone())
-            .collect::<Vec<_>>();
-        table_fetches.push(GraphProjectTableFetchPlan {
+        table_fetches.push(RowFetchTablePlan {
             table_index: mapping.table_index,
             table_name: mapping.table_name.clone(),
             rowid_col_idx: mapping.rowid_col_idx,
             storage: storage.clone(),
+            storage_snapshot: ctx.query.storage_snapshot(storage)?,
             reader: None,
             rowids: Vec::new(),
-            column_types: column_types.into_boxed_slice(),
             required_columns: required.clone().into_boxed_slice(),
             column_ids: column_ids.into_boxed_slice(),
-            full_cols: vec![None; table.columns.len()],
         });
     }
 
     let mut path_columns = Vec::new();
     for expr in spec.expressions.iter().chain(spec.filters.iter()) {
-        collect_graph_project_path_refs(expr, &mut path_columns);
+        collect_graph_project_path_refs(expr, spec.carrier_table_index, &mut path_columns);
     }
     let mut seen = HashSet::new();
     path_columns.retain(|column| seen.insert(*column));
@@ -296,30 +317,57 @@ fn build_graph_project_materialized_runtime(
     let remapped_filters = spec
         .filters
         .iter()
-        .map(|expr| remap_graph_project_expression(expr, &table_col_offsets, &path_column_map))
+        .map(|expr| {
+            remap_graph_project_expression(
+                expr,
+                spec.carrier_table_index,
+                &table_column_map,
+                &path_column_map,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
     let remapped_expressions = spec
         .expressions
         .iter()
-        .map(|expr| remap_graph_project_expression(expr, &table_col_offsets, &path_column_map))
+        .map(|expr| {
+            remap_graph_project_expression(
+                expr,
+                spec.carrier_table_index,
+                &table_column_map,
+                &path_column_map,
+            )
+        })
         .collect::<Result<Vec<_>>>()?;
-    Ok(GraphProjectMaterializedRuntime {
+    let direct_project_columns = remapped_expressions
+        .iter()
+        .map(|expression| match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => Some(column.binding.column_index),
+            Expression::Reference(reference) => Some(reference.index),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()
+        .map(Vec::into_boxed_slice);
+    let project_executor = direct_project_columns.is_none().then(|| {
+        ExpressionExecutor::with_expressions_for_session(
+            &remapped_expressions,
+            ctx.query.session.as_ref(),
+        )
+    });
+    Ok(RowFetchMaterializedRuntime {
         table_fetches: table_fetches.into_boxed_slice(),
         path_columns: path_columns.into_boxed_slice(),
         filter_executors: graph_project_filter_executors(
             &remapped_filters,
             ctx.query.session.as_ref(),
         ),
-        project_executor: ExpressionExecutor::with_expressions_for_session(
-            &remapped_expressions,
-            ctx.query.session.as_ref(),
-        ),
+        direct_project_columns,
+        project_executor,
     })
 }
 
-fn materialize_graph_project_input(
+fn materialize_row_fetch_input(
     ctx: &mut OperatorCallContext,
-    runtime: &mut GraphProjectMaterializedRuntime,
+    runtime: &mut RowFetchMaterializedRuntime,
     input: &Chunk,
 ) -> Result<Chunk> {
     let row_count = input.size();
@@ -341,11 +389,27 @@ fn materialize_graph_project_input(
             )?);
         }
         if fetch.reader.is_none() {
-            let params =
-                TabletReaderParams::with_version(ctx.query.transaction.visible_version_i64());
-            let mut reader = fetch.storage.create_reader(params)?;
-            reader.prepare()?;
-            fetch.reader = Some(reader);
+            let overlay =
+                TxnOverlayReader::for_tablet(&fetch.storage.tablet(), &ctx.query.transaction)?;
+            let mut rowsets = fetch.storage_snapshot.rowsets()?;
+            if let Some(overlay) = overlay {
+                let visible = rowsets
+                    .iter()
+                    .map(|rowset| rowset.rowset_id())
+                    .collect::<HashSet<_>>();
+                rowsets.extend(
+                    overlay
+                        .all_rowsets()
+                        .into_iter()
+                        .filter(|rowset| !visible.contains(&rowset.rowset_id())),
+                );
+            }
+            fetch.reader = Some(TabletRowIdReader::new(
+                fetch.storage.tablet(),
+                rowsets,
+                &fetch.column_ids,
+                ctx.query.allocator(MemoryTag::ColumnData),
+            )?);
         }
         let reader = fetch
             .reader
@@ -353,22 +417,13 @@ fn materialize_graph_project_input(
             .expect("graph project table reader was initialized above");
         let fetched = reader.get_by_rowids(&fetch.rowids, &fetch.column_ids)?;
 
-        fetch.full_cols.clear();
-        fetch.full_cols.resize(fetch.column_types.len(), None);
-        for (pos, &column_idx) in fetch.required_columns.iter().enumerate() {
-            if let Some(column) = fetched.column(pos) {
-                fetch.full_cols[column_idx] = Some(column.clone());
-            }
-        }
-        for (column_idx, column) in fetch.full_cols.iter_mut().enumerate() {
-            combined_columns.push(match column {
-                Some(column) => column.clone(),
-                None => graph_null_vector(
-                    &fetch.column_types[column_idx],
-                    row_count,
-                    input.allocator().clone(),
-                )?,
-            });
+        for pos in 0..fetch.required_columns.len() {
+            combined_columns.push(fetched.column(pos).cloned().ok_or_else(|| {
+                paro_error::internal(format!(
+                    "row fetch for table {} omitted projected column {pos}",
+                    fetch.table_name
+                ))
+            })?);
         }
     }
 
@@ -470,18 +525,22 @@ fn clone_chunk_refs(input: &Chunk) -> Chunk {
 
 fn remap_graph_project_expression(
     expr: &Expression,
-    table_col_offsets: &HashMap<usize, usize>,
+    carrier_table_index: usize,
+    table_column_map: &HashMap<(usize, usize), usize>,
     path_column_map: &HashMap<usize, usize>,
 ) -> Result<Expression> {
     let mut missing = None;
     visit_column_refs(expr, &mut |col_ref| {
         let binding = col_ref.binding;
-        if binding.table_index == usize::MAX {
+        if binding.table_index == carrier_table_index {
             if !path_column_map.contains_key(&binding.column_index) {
                 missing = Some(format!("path column {}", binding.column_index));
             }
-        } else if !table_col_offsets.contains_key(&binding.table_index) {
-            missing = Some(format!("table index {}", binding.table_index));
+        } else if !table_column_map.contains_key(&(binding.table_index, binding.column_index)) {
+            missing = Some(format!(
+                "table column ({}, {})",
+                binding.table_index, binding.column_index
+            ));
         }
     });
     if let Some(label) = missing {
@@ -491,15 +550,15 @@ fn remap_graph_project_expression(
     }
     Ok(expr.clone().replace_column_ref(&|col_ref| {
         let binding = col_ref.binding;
-        let new_index = if binding.table_index == usize::MAX {
+        let new_index = if binding.table_index == carrier_table_index {
             path_column_map
                 .get(&binding.column_index)
                 .copied()
                 .expect("graph project path mapping validated")
         } else {
-            table_col_offsets
-                .get(&binding.table_index)
-                .map(|offset| offset + binding.column_index)
+            table_column_map
+                .get(&(binding.table_index, binding.column_index))
+                .copied()
                 .expect("graph project table mapping validated")
         };
         Some(Expression::ColumnRef(ColumnRefExpression::new(
@@ -509,9 +568,13 @@ fn remap_graph_project_expression(
     }))
 }
 
-fn collect_graph_project_table_refs(expr: &Expression, out: &mut HashMap<usize, Vec<usize>>) {
+fn collect_graph_project_table_refs(
+    expr: &Expression,
+    carrier_table_index: usize,
+    out: &mut HashMap<usize, Vec<usize>>,
+) {
     visit_column_refs(expr, &mut |col_ref| {
-        if col_ref.binding.table_index != usize::MAX {
+        if col_ref.binding.table_index != carrier_table_index {
             out.entry(col_ref.binding.table_index)
                 .or_default()
                 .push(col_ref.binding.column_index);
@@ -519,21 +582,14 @@ fn collect_graph_project_table_refs(expr: &Expression, out: &mut HashMap<usize, 
     });
 }
 
-fn collect_graph_project_path_refs(expr: &Expression, out: &mut Vec<usize>) {
+fn collect_graph_project_path_refs(
+    expr: &Expression,
+    carrier_table_index: usize,
+    out: &mut Vec<usize>,
+) {
     visit_column_refs(expr, &mut |col_ref| {
-        if col_ref.binding.table_index == usize::MAX {
+        if col_ref.binding.table_index == carrier_table_index {
             out.push(col_ref.binding.column_index);
         }
     });
-}
-
-fn graph_null_vector(
-    logical_type: &LogicalType,
-    count: usize,
-    allocator: Arc<dyn paro_common::allocator::Allocator>,
-) -> Result<Arc<Vector>> {
-    let mut vector = Vector::try_new(logical_type.clone(), count, allocator)?;
-    vector.set_count(count);
-    vector.validity_mut().set_all_invalid(count);
-    Ok(Arc::new(vector))
 }

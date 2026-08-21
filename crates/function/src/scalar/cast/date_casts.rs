@@ -221,22 +221,22 @@ pub fn varchar_to_date(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
+    let input = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for i in 0..count {
-        if !input.is_null(i) {
-            if let Some(s) = input.get_string(i) {
-                match parse_date(s) {
-                    Some(days) => {
-                        unsafe { result.set_flat::<i32>(i, days) };
-                    }
-                    None => {
-                        if ctx.try_cast {
-                            result.set_null(i, true);
-                            all_success = false;
-                        } else {
-                            return Err(paro_error::invalid_value("DATE", s));
-                        }
+        if input.is_valid(i) {
+            let s = input.str(i);
+            match parse_date(s) {
+                Some(days) => {
+                    unsafe { result.set_flat::<i32>(i, days) };
+                }
+                None => {
+                    if ctx.try_cast {
+                        result.set_null(i, true);
+                        all_success = false;
+                    } else {
+                        return Err(paro_error::invalid_value("DATE", s));
                     }
                 }
             }
@@ -761,22 +761,22 @@ pub fn varchar_to_timestamp(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
+    let input = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for i in 0..count {
-        if !input.is_null(i) {
-            if let Some(s) = input.get_string(i) {
-                match parse_timestamp(s) {
-                    Some(micros) => {
-                        unsafe { result.set_flat::<i64>(i, micros) };
-                    }
-                    None => {
-                        if ctx.try_cast {
-                            result.set_null(i, true);
-                            all_success = false;
-                        } else {
-                            return Err(paro_error::invalid_value("TIMESTAMP", s));
-                        }
+        if input.is_valid(i) {
+            let s = input.str(i);
+            match parse_timestamp(s) {
+                Some(micros) => {
+                    unsafe { result.set_flat::<i64>(i, micros) };
+                }
+                None => {
+                    if ctx.try_cast {
+                        result.set_null(i, true);
+                        all_success = false;
+                    } else {
+                        return Err(paro_error::invalid_value("TIMESTAMP", s));
                     }
                 }
             }
@@ -824,20 +824,20 @@ pub fn varchar_to_timestamp_tz(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
+    let input = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for i in 0..count {
-        if !input.is_null(i) {
-            if let Some(s) = input.get_string(i) {
-                match parse_timestamptz(s) {
-                    Some(micros) => unsafe { result.set_flat::<i64>(i, micros) },
-                    None => {
-                        if ctx.try_cast {
-                            result.set_null(i, true);
-                            all_success = false;
-                        } else {
-                            return Err(paro_error::invalid_value("TIMESTAMPTZ", s));
-                        }
+        if input.is_valid(i) {
+            let s = input.str(i);
+            match parse_timestamptz(s) {
+                Some(micros) => unsafe { result.set_flat::<i64>(i, micros) },
+                None => {
+                    if ctx.try_cast {
+                        result.set_null(i, true);
+                        all_success = false;
+                    } else {
+                        return Err(paro_error::invalid_value("TIMESTAMPTZ", s));
                     }
                 }
             }
@@ -885,20 +885,20 @@ pub fn varchar_to_time(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
+    let input = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for i in 0..count {
-        if !input.is_null(i) {
-            if let Some(s) = input.get_string(i) {
-                match parse_time_of_day(s) {
-                    Some(micros) => unsafe { result.set_flat::<i64>(i, micros) },
-                    None => {
-                        if ctx.try_cast {
-                            result.set_null(i, true);
-                            all_success = false;
-                        } else {
-                            return Err(paro_error::invalid_value("TIME", s));
-                        }
+        if input.is_valid(i) {
+            let s = input.str(i);
+            match parse_time_of_day(s) {
+                Some(micros) => unsafe { result.set_flat::<i64>(i, micros) },
+                None => {
+                    if ctx.try_cast {
+                        result.set_null(i, true);
+                        all_success = false;
+                    } else {
+                        return Err(paro_error::invalid_value("TIME", s));
                     }
                 }
             }
@@ -1284,22 +1284,22 @@ pub fn varchar_to_interval(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
+    let input = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for i in 0..count {
-        if !input.is_null(i) {
-            if let Some(s) = input.get_string(i) {
-                match parse_interval(s) {
-                    Some(interval) => {
-                        unsafe { result.set_flat::<Interval>(i, interval) };
-                    }
-                    None => {
-                        if ctx.try_cast {
-                            result.set_null(i, true);
-                            all_success = false;
-                        } else {
-                            return Err(paro_error::invalid_value("INTERVAL", s));
-                        }
+        if input.is_valid(i) {
+            let s = input.str(i);
+            match parse_interval(s) {
+                Some(interval) => {
+                    unsafe { result.set_flat::<Interval>(i, interval) };
+                }
+                None => {
+                    if ctx.try_cast {
+                        result.set_null(i, true);
+                        all_success = false;
+                    } else {
+                        return Err(paro_error::invalid_value("INTERVAL", s));
                     }
                 }
             }

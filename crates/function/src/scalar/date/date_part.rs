@@ -15,8 +15,10 @@
 use crate::{ExpressionState, ScalarFunction, ScalarFunctionSet};
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::statistics::{BaseStatistics, NumericStats};
 
 /// Microseconds per second
 const MICROS_PER_SECOND: i64 = 1_000_000;
@@ -369,6 +371,48 @@ macro_rules! define_extract_fn {
 // Year extraction
 // ============================================================================
 
+fn year_from_date_statistics(inputs: &[&BaseStatistics]) -> Option<BaseStatistics> {
+    let input = *inputs.first()?;
+    let (Value::Date(minimum), Value::Date(maximum)) = (input.min_value()?, input.max_value()?)
+    else {
+        return None;
+    };
+    year_statistics(
+        input,
+        extract_from_date(i64::from(minimum), DatePartSpecifier::Year),
+        extract_from_date(i64::from(maximum), DatePartSpecifier::Year),
+    )
+}
+
+fn year_from_timestamp_statistics(inputs: &[&BaseStatistics]) -> Option<BaseStatistics> {
+    let input = *inputs.first()?;
+    let (Value::Timestamp(minimum), Value::Timestamp(maximum)) =
+        (input.min_value()?, input.max_value()?)
+    else {
+        return None;
+    };
+    year_statistics(
+        input,
+        extract_from_timestamp(minimum, DatePartSpecifier::Year),
+        extract_from_timestamp(maximum, DatePartSpecifier::Year),
+    )
+}
+
+fn year_statistics(input: &BaseStatistics, minimum: i64, maximum: i64) -> Option<BaseStatistics> {
+    if minimum > maximum {
+        return None;
+    }
+    let mut output = NumericStats::create_empty(LogicalType::BigInt);
+    NumericStats::update(&mut output, &Value::BigInt(minimum));
+    NumericStats::update(&mut output, &Value::BigInt(maximum));
+    if input.can_have_null() {
+        output.set_has_null_fast();
+    }
+    let range = usize::try_from(maximum.checked_sub(minimum)?.checked_add(1)?).ok()?;
+    output.set_distinct_count(input.get_distinct_count().min(range));
+    Some(output)
+}
+
 define_extract_fn!(
     year_from_date,
     DatePartSpecifier::Year,
@@ -384,18 +428,24 @@ define_extract_fn!(
 
 pub fn get_year_functions() -> ScalarFunctionSet {
     let mut set = ScalarFunctionSet::new("year".to_string());
-    set.add_function(ScalarFunction::new(
-        "year".to_string(),
-        vec![LogicalType::Date],
-        LogicalType::BigInt,
-        year_from_date,
-    ));
-    set.add_function(ScalarFunction::new(
-        "year".to_string(),
-        vec![LogicalType::Timestamp],
-        LogicalType::BigInt,
-        year_from_timestamp,
-    ));
+    set.add_function(
+        ScalarFunction::new(
+            "year".to_string(),
+            vec![LogicalType::Date],
+            LogicalType::BigInt,
+            year_from_date,
+        )
+        .with_statistics(year_from_date_statistics),
+    );
+    set.add_function(
+        ScalarFunction::new(
+            "year".to_string(),
+            vec![LogicalType::Timestamp],
+            LogicalType::BigInt,
+            year_from_timestamp,
+        )
+        .with_statistics(year_from_timestamp_statistics),
+    );
     set
 }
 
@@ -753,6 +803,21 @@ mod tests {
         let days = 19889_i64;
         let year = extract_from_date(days, DatePartSpecifier::Year);
         assert!(year >= 2024 && year <= 2025);
+    }
+
+    #[test]
+    fn year_kernel_derives_a_bounded_output_domain() {
+        let mut input = NumericStats::create_empty(LogicalType::Date);
+        NumericStats::update(&mut input, &Value::Date(0));
+        NumericStats::update(&mut input, &Value::Date(730));
+        input.set_has_null_fast();
+
+        let output = year_from_date_statistics(&[&input]).expect("year statistics");
+
+        assert_eq!(output.min_value(), Some(Value::BigInt(1970)));
+        assert_eq!(output.max_value(), Some(Value::BigInt(1972)));
+        assert!(output.can_have_null());
+        assert!(output.can_have_no_null());
     }
 
     #[test]

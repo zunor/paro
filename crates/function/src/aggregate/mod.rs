@@ -12,19 +12,91 @@
 
 use paro_common::allocator::ArenaAllocator;
 use paro_common::error::Result;
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionRef, SelectionVector, Vector};
 use std::fmt;
 use std::sync::Arc;
 
+use crate::scalar::function_data_equals;
+
+mod direct_state_filter;
+mod direct_update;
 pub mod distributive;
+
+pub use direct_state_filter::{
+    prepare_direct_state_predicate, PreparedDirectAggregateStatePredicate,
+};
+pub use direct_update::{
+    DirectGroupSlotSource, DirectGroupedAggregateProgram, DirectGroupedAggregateScratch,
+    PreparedDirectGroupedAggregateInput, ValidatedDirectGroupSlots,
+};
 
 // Re-export FunctionData from scalar module
 pub use crate::scalar::FunctionData;
 
+/// Algebraic identity exposed by an aggregate implementation.
+///
+/// Optimizers may use this marker to compose aggregate states across a
+/// partitioning boundary. It is deliberately attached to the bound function
+/// rather than inferred from its display name: extension aggregates may reuse
+/// built-in names without inheriting their algebraic laws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateAlgebra {
+    /// Additive decomposition over non-NULL inputs using the aggregate's
+    /// declared update/combine semantics (including floating-point rounding).
+    Sum,
+}
+
+/// Ownership model of one initialized aggregate state.
+///
+/// `InlineCopy` is a correctness-bearing capability: every readable byte is
+/// contained in the fixed-width state row, and duplicating that row cannot
+/// create aliased ownership. Execution paths that copy raw state bytes must
+/// require this capability instead of inferring it from an update/combine
+/// optimization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AggregateStateOwnership {
+    Opaque,
+    InlineCopy,
+}
+
 /// Function to initialize the state.
-/// The state is a raw byte slice of size `state_size`.
+///
+/// # Safety
+///
+/// `state` points to writable storage of at least `state_size` bytes, but that
+/// storage is not guaranteed to be zeroed. Implementations must establish a
+/// valid empty-state representation without reading the previous bytes and
+/// must initialize every field that update/combine/finalize/destructor may
+/// read. Struct padding does not need to be initialized.
 pub type AggregateInitializeFn = unsafe fn(state: *mut u8);
+
+/// Factory for an aggregate that merges finalized partial results while
+/// preserving the original aggregate's return type and empty-input semantics.
+///
+/// This capability is explicit because SQL `SUM(result)` is not generally the
+/// same physical function: for example, `COUNT` returns BIGINT while
+/// `SUM(BIGINT)` returns HUGEINT.
+pub type AggregatePartialMergeFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
+
+/// Factory for an aggregate over the original input rows whose finalized
+/// result is equivalent to reducing the finalized per-group results.
+///
+/// This is stronger than [`AggregateAlgebra`]. It is a correctness-bearing
+/// capability used to maintain a rollup state alongside grouped states. The
+/// grouped states must still be finalized (or otherwise validated) so an
+/// error in an individual group is not hidden by cancellation in the rollup.
+/// Implementations must preserve empty-input, NULL, and overflow semantics.
+pub type AggregateInputRollupFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
+
+/// Factory for an aggregate that is equivalent when its single input is
+/// proven non-NULL on every row.
+///
+/// The replacement may change arity (for example `count(x)` to
+/// `count_star()`), but must preserve return type, empty-input behavior,
+/// FILTER semantics, and the finalized result for every non-NULL input.
+pub type AggregateNonNullInputFn = fn(&AggregateFunction) -> Option<AggregateFunction>;
 
 /// Whether `combine` may destructively modify the source state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +139,28 @@ pub struct AggregateStateInput<'a> {
     address_selection: SelectionRef<'a>,
     update_selection: Option<&'a SelectionVector>,
     state_offset: usize,
+}
+
+/// Fast cursor for the common case where group lookup produced a flat or
+/// contiguous-range address vector and the aggregate update has no secondary
+/// row selection. Constructing this once per aggregate batch keeps selection
+/// dispatch out of the row loop.
+#[derive(Clone, Copy)]
+pub struct DirectAggregateStateCursor {
+    address_data: *const *mut u8,
+    state_offset: usize,
+}
+
+impl DirectAggregateStateCursor {
+    /// # Safety
+    ///
+    /// `row` must be within the count used to construct the parent
+    /// [`AggregateStateInput`], and the pointed-to aggregate state must be
+    /// initialized and live.
+    #[inline(always)]
+    pub unsafe fn state_ptr(self, row: usize) -> *mut u8 {
+        unsafe { (*self.address_data.add(row)).add(self.state_offset) }
+    }
 }
 
 impl<'a> AggregateStateInput<'a> {
@@ -116,6 +210,25 @@ impl<'a> AggregateStateInput<'a> {
         let physical_row = self.address_selection.get(address_row);
         (*self.address_data.add(physical_row)).add(self.state_offset)
     }
+
+    /// Return a selection-free cursor when logical rows map to a contiguous
+    /// range of the address vector.
+    pub fn direct_cursor(&self) -> Option<DirectAggregateStateCursor> {
+        if self.update_selection.is_some() {
+            return None;
+        }
+        let address_data = match self.address_selection {
+            SelectionRef::Incremental { .. } => self.address_data,
+            SelectionRef::Range { offset, .. } => unsafe { self.address_data.add(offset) },
+            SelectionRef::Borrowed(_) | SelectionRef::Owned(_) | SelectionRef::Constant { .. } => {
+                return None
+            }
+        };
+        Some(DirectAggregateStateCursor {
+            address_data,
+            state_offset: self.state_offset,
+        })
+    }
 }
 
 /// Function to update the state with new values.
@@ -144,6 +257,12 @@ pub type AggregateCombineFn =
 
 /// Function to finalize the state into a result.
 ///
+/// Finalization is observational: it may validate the state and write the
+/// result, but it must not mutate, move from, or destroy aggregate-owned
+/// state. The engine may finalize the same state more than once (for example,
+/// once for a post-aggregate reduction and again for output). Destruction is
+/// exclusively the responsibility of [`AggregateDestructorFn`].
+///
 /// # Arguments
 /// * `states`: Vector containing pointers to states.
 /// * `result`: Result vector to write to.
@@ -154,6 +273,65 @@ pub type AggregateFinalizeFn = unsafe fn(
     result: &mut Vector,
     count: usize,
 ) -> Result<()>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateComparison {
+    Equal,
+    NotEqual,
+    LessThan,
+    GreaterThan,
+    LessThanOrEqual,
+    GreaterThanOrEqual,
+}
+
+/// A correctness-proven scalar projection applied to one finalized aggregate
+/// value before comparing it with a runtime constant.
+///
+/// The projection is part of the state-filter identity: merge-time
+/// preselection and emit-time filtering must use exactly the same SQL value
+/// transformation. New variants require a function-specific implementation
+/// that preserves finalize errors, cast errors, TRY_CAST nullification, and
+/// declared logical types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggregateFinalizeProjection {
+    Identity,
+    DecimalCast {
+        target_precision: u8,
+        target_scale: u8,
+        try_cast: bool,
+    },
+}
+
+/// Prepare a scalar predicate that finalizes, projects, and compares one
+/// aggregate state without materializing an intermediate vector.
+///
+/// This capability is deliberately separate from [`AggregateStateFilterFn`]:
+/// the vector filter is sufficient for emit-time evaluation, while a direct
+/// predicate is also a proof that perfect-table sealing can validate every
+/// visited state before discarding a non-matching slot.
+pub type AggregateDirectStateFilterFn = fn(
+    function: &AggregateFunction,
+    projection: &AggregateFinalizeProjection,
+    comparison: AggregateComparison,
+    constant: &Value,
+)
+    -> Result<Option<PreparedDirectAggregateStatePredicate>>;
+
+/// Evaluate a bound comparison directly against aggregate states.
+///
+/// Implementations must preserve finalize-time validation (including overflow)
+/// and append matching logical row indices to `selection`. `constant` has the
+/// projection's exact output type; the implementation must finalize and
+/// validate the source value before applying that projection.
+pub type AggregateStateFilterFn = unsafe fn(
+    states: &AggregateStateInput,
+    input_data: &AggregateInputData,
+    projection: &AggregateFinalizeProjection,
+    comparison: AggregateComparison,
+    constant: &Value,
+    selection: &mut SelectionVector,
+    count: usize,
+) -> Result<usize>;
 
 /// Function to destruct complex states (if state contains allocated resources like StringHeap).
 pub type AggregateDestructorFn =
@@ -180,6 +358,85 @@ pub type AggregateStateDeserializeFn =
 /// The state is a single pointer, inputs are vectors.
 pub type AggregateSimpleUpdateFn =
     unsafe fn(inputs: &[&Vector], input_data: &AggregateInputData, state: *mut u8, count: usize);
+
+/// Update DISTINCT inputs that have already been partitioned into contiguous
+/// group-state runs.
+///
+/// `states` contains one state per entry in `run_starts`; input vectors contain
+/// `count` globally distinct argument rows. The callback can reduce each run
+/// without materializing a repeated state pointer for every input row.
+pub type AggregateDistinctRunUpdateFn = unsafe fn(
+    inputs: &[&Vector],
+    input_data: &AggregateInputData,
+    states: &AggregateStateInput,
+    run_starts: &[u32],
+    count: usize,
+);
+
+/// Engine-recognized grouped update semantics.
+///
+/// This explicit capability lets a physical aggregate compile compatible
+/// functions into one update loop without relying on function names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateDirectUpdate {
+    CountStar,
+    Decimal(DecimalDirectUpdate),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecimalDirectUpdate {
+    NarrowSumI64,
+    WideSumI128,
+    AverageI64,
+    AverageI128,
+}
+
+/// Result nullability of an aggregate evaluated over zero input rows.
+///
+/// This is a semantic contract used by rewrites that change outer-preserving
+/// aggregation into null-rejecting joins. It is intentionally independent of
+/// the SQL function name and of the aggregate's internal state identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggregateEmptyInput {
+    Unknown,
+    Null,
+    NonNull,
+}
+
+/// Exact scalar result of merging zero or one finalized partial value.
+///
+/// Optimizers must require this explicit law before replacing a grouped
+/// partial-merge aggregate with a projection. An absent outer-join partial is
+/// represented by SQL NULL; extension aggregates opt in without relying on a
+/// display name or an assumed state identity.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateSingletonMerge {
+    /// Preserve the finalized partial value, including NULL.
+    Input,
+    /// Preserve a present partial and substitute an exactly result-typed
+    /// constant for NULL.
+    InputOr(Value),
+}
+
+impl AggregateSingletonMerge {
+    /// Return the fallback only when the declaration already inhabits the
+    /// aggregate's exact result domain.
+    ///
+    /// This is optimizer proof metadata, not a SQL cast site. Accepting a
+    /// coercible value could silently change the declared singleton law (for
+    /// example numeric zero into VARCHAR `"0"`), so extension functions must
+    /// publish the correctly typed value explicitly.
+    pub fn validated_fallback(&self, return_type: &LogicalType) -> Option<&Value> {
+        let Self::InputOr(value) = self else {
+            return None;
+        };
+        (!value.is_null() && value.logical_type() == *return_type).then_some(value)
+    }
+
+    pub fn is_valid_for(&self, return_type: &LogicalType) -> bool {
+        matches!(self, Self::Input) || self.validated_fallback(return_type).is_some()
+    }
+}
 
 // ============================================================================
 // AggregateFunction
@@ -208,6 +465,27 @@ pub struct AggregateFunction {
     pub arguments: Vec<LogicalType>,
     pub return_type: LogicalType,
 
+    /// Finalized result contract for an empty input relation.
+    pub empty_input: AggregateEmptyInput,
+
+    /// Algebraic identity available to logical aggregate rewrites.
+    pub algebra: Option<AggregateAlgebra>,
+
+    /// Optional aggregate over finalized partial results.
+    partial_merge: Option<AggregatePartialMergeFn>,
+
+    /// Projection equivalent to this merge over zero or one partial value.
+    singleton_merge: Option<AggregateSingletonMerge>,
+
+    /// Optional aggregate over the original input rows that is equivalent to
+    /// applying `partial_merge` to every finalized group.
+    input_rollup: Option<AggregateInputRollupFn>,
+
+    /// Optional lower-arity implementation under an exact non-NULL proof.
+    non_null_input: Option<AggregateNonNullInputFn>,
+
+    state_ownership: AggregateStateOwnership,
+
     /// Size of the state in bytes.
     pub state_size: usize,
 
@@ -223,9 +501,21 @@ pub struct AggregateFunction {
     /// Finalize state to result (vectorized).
     pub finalize: AggregateFinalizeFn,
 
+    /// Optional finalized-value comparison implemented on raw state.
+    pub state_filter: Option<AggregateStateFilterFn>,
+
+    /// Optional prepared single-state form of [`Self::state_filter`].
+    pub direct_state_filter: Option<AggregateDirectStateFilterFn>,
+
     /// Simple update (for ungrouped aggregation optimization).
     /// If None, the execution engine must use `update` with a vector of identical pointers.
     pub simple_update: Option<AggregateSimpleUpdateFn>,
+
+    /// Optional reducer for pre-deduplicated, group-clustered input runs.
+    pub distinct_run_update: Option<AggregateDistinctRunUpdateFn>,
+
+    /// Optional semantics for a fused grouped-update program.
+    pub direct_update: Option<AggregateDirectUpdate>,
 
     /// Destructor for the state (optional).
     pub destructor: Option<AggregateDestructorFn>,
@@ -251,7 +541,12 @@ impl fmt::Debug for AggregateFunction {
             .field("name", &self.name)
             .field("arguments", &self.arguments)
             .field("return_type", &self.return_type)
+            .field("empty_input", &self.empty_input)
             .field("state_size", &self.state_size)
+            .field("has_partial_merge", &self.partial_merge.is_some())
+            .field("singleton_merge", &self.singleton_merge)
+            .field("has_input_rollup", &self.input_rollup.is_some())
+            .field("has_non_null_input", &self.non_null_input.is_some())
             .field("varargs", &self.varargs)
             .field("has_bind_data", &self.bind_data.is_some())
             .finish()
@@ -275,18 +570,162 @@ impl AggregateFunction {
             name,
             arguments,
             return_type,
+            empty_input: AggregateEmptyInput::Unknown,
+            algebra: None,
+            partial_merge: None,
+            singleton_merge: None,
+            input_rollup: None,
+            non_null_input: None,
+            state_ownership: AggregateStateOwnership::Opaque,
             state_size,
             initialize,
             update,
             combine,
             finalize,
+            state_filter: None,
+            direct_state_filter: None,
             simple_update,
+            distinct_run_update: None,
+            direct_update: None,
             destructor,
             state_serialize: None,
             state_deserialize: None,
             varargs: None,
             bind_data: None,
         }
+    }
+
+    pub fn with_state_filter(mut self, filter: AggregateStateFilterFn) -> Self {
+        self.state_filter = Some(filter);
+        self
+    }
+
+    pub fn with_direct_state_filter(mut self, filter: AggregateDirectStateFilterFn) -> Self {
+        self.direct_state_filter = Some(filter);
+        self
+    }
+
+    pub fn with_algebra(mut self, algebra: AggregateAlgebra) -> Self {
+        self.algebra = Some(algebra);
+        self
+    }
+
+    pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
+        self.empty_input = empty_input;
+        self
+    }
+
+    pub fn with_partial_merge(mut self, merge: AggregatePartialMergeFn) -> Self {
+        self.partial_merge = Some(merge);
+        self
+    }
+
+    pub fn partial_merge_function(&self) -> Option<AggregateFunction> {
+        (self.partial_merge?)(self)
+    }
+
+    pub fn with_singleton_merge(mut self, merge: AggregateSingletonMerge) -> Self {
+        self.singleton_merge = Some(merge);
+        self
+    }
+
+    pub fn singleton_merge(&self) -> Option<&AggregateSingletonMerge> {
+        self.singleton_merge.as_ref()
+    }
+
+    /// Attach the proof and factory for an original-input rollup.
+    pub fn with_input_rollup(mut self, factory: AggregateInputRollupFn) -> Self {
+        self.input_rollup = Some(factory);
+        self
+    }
+
+    /// Build the canonical original-input aggregate certified by this bound
+    /// function. `None` means execution must reduce finalized group results.
+    pub fn input_rollup_function(&self) -> Option<AggregateFunction> {
+        (self.input_rollup?)(self)
+    }
+
+    pub fn with_non_null_input(mut self, factory: AggregateNonNullInputFn) -> Self {
+        self.non_null_input = Some(factory);
+        self
+    }
+
+    pub fn non_null_input_function(&self) -> Option<AggregateFunction> {
+        (self.non_null_input?)(self)
+    }
+
+    /// Compare the complete bound execution contract of two aggregate
+    /// functions.
+    ///
+    /// Display names are deliberately excluded: aliases may share execution
+    /// semantics. Types, state layout, executable hooks, bind data, and every
+    /// correctness-bearing capability are included. Physical-plan validators
+    /// should use this method instead of reconstructing this identity ad hoc.
+    pub fn execution_semantics_equal(&self, other: &Self) -> bool {
+        macro_rules! optional_fn_equal {
+            ($left:expr, $right:expr) => {
+                match ($left, $right) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => std::ptr::fn_addr_eq(left, right),
+                    _ => false,
+                }
+            };
+        }
+
+        self.arguments == other.arguments
+            && self.return_type == other.return_type
+            && self.empty_input == other.empty_input
+            && self.algebra == other.algebra
+            && optional_fn_equal!(self.partial_merge, other.partial_merge)
+            && optional_fn_equal!(self.input_rollup, other.input_rollup)
+            && optional_fn_equal!(self.non_null_input, other.non_null_input)
+            && self.state_ownership == other.state_ownership
+            && self.state_size == other.state_size
+            && std::ptr::fn_addr_eq(self.initialize, other.initialize)
+            && std::ptr::fn_addr_eq(self.update, other.update)
+            && std::ptr::fn_addr_eq(self.combine, other.combine)
+            && std::ptr::fn_addr_eq(self.finalize, other.finalize)
+            && optional_fn_equal!(self.state_filter, other.state_filter)
+            && optional_fn_equal!(self.direct_state_filter, other.direct_state_filter)
+            && optional_fn_equal!(self.simple_update, other.simple_update)
+            && optional_fn_equal!(self.distinct_run_update, other.distinct_run_update)
+            && self.direct_update == other.direct_update
+            && optional_fn_equal!(self.destructor, other.destructor)
+            && optional_fn_equal!(self.state_serialize, other.state_serialize)
+            && optional_fn_equal!(self.state_deserialize, other.state_deserialize)
+            && self.varargs == other.varargs
+            && function_data_equals(self.bind_data.as_ref(), other.bind_data.as_ref())
+    }
+
+    /// Declare that an initialized state is a self-contained, trivially
+    /// copyable value with no external ownership.
+    ///
+    /// # Safety
+    ///
+    /// Copying the complete state object representation into suitably aligned
+    /// uninitialized storage must produce an independent valid state. In
+    /// particular, readable fields cannot borrow or own external storage.
+    pub unsafe fn with_trivially_copyable_state(mut self) -> Self {
+        self.state_ownership = AggregateStateOwnership::InlineCopy;
+        self
+    }
+
+    /// Whether byte-copying one initialized state creates another independent
+    /// valid state. A destructor is an unconditional veto even if a function
+    /// was configured inconsistently.
+    pub fn state_is_trivially_copyable(&self) -> bool {
+        self.state_ownership == AggregateStateOwnership::InlineCopy && self.destructor.is_none()
+    }
+
+    /// Set the reducer used when DISTINCT finalization has contiguous group runs.
+    pub fn with_distinct_run_update(mut self, update: AggregateDistinctRunUpdateFn) -> Self {
+        self.distinct_run_update = Some(update);
+        self
+    }
+
+    pub fn with_direct_update(mut self, update: AggregateDirectUpdate) -> Self {
+        self.direct_update = Some(update);
+        self
     }
 
     /// Set explicit state serialization hooks for build-phase spill.
@@ -366,6 +805,13 @@ impl AggregateFunctionSet {
 
     pub fn set_dynamic_bind(&mut self, bind: AggregateFunctionSetBindFn) {
         self.dynamic_bind = Some(bind);
+    }
+
+    pub fn with_empty_input(mut self, empty_input: AggregateEmptyInput) -> Self {
+        for function in &mut self.functions {
+            function.empty_input = empty_input;
+        }
+        self
     }
 
     /// Find the best matching function for the given arguments using cost-based implicit casting.
@@ -753,7 +1199,7 @@ mod tests {
     use std::any::Any;
 
     /// Example bind data for AVG function (stores precision info)
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Hash)]
     struct AvgBindData {
         precision: u8,
         scale: u8,
@@ -769,6 +1215,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .map_or(false, |o| self == o)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            crate::scalar::function_data_fingerprint(self)
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -824,5 +1274,32 @@ mod tests {
 
         assert!(!func.has_bind_data());
         assert!(func.get_bind_data::<AvgBindData>().is_none());
+    }
+
+    #[test]
+    fn singleton_law_is_not_part_of_executable_function_identity() {
+        let plain = create_dummy_aggregate("merge", vec![LogicalType::BigInt], LogicalType::BigInt);
+        let annotated = plain
+            .clone()
+            .with_singleton_merge(AggregateSingletonMerge::Input);
+
+        assert!(plain.execution_semantics_equal(&annotated));
+    }
+
+    #[test]
+    fn singleton_fallback_must_already_match_the_return_domain() {
+        let integer = AggregateSingletonMerge::InputOr(Value::Integer(0));
+        assert!(integer.validated_fallback(&LogicalType::BigInt).is_none());
+        let varchar = AggregateSingletonMerge::InputOr(Value::BigInt(0));
+        assert!(varchar.validated_fallback(&LogicalType::Varchar).is_none());
+        let bigint = AggregateSingletonMerge::InputOr(Value::BigInt(0));
+        assert_eq!(
+            bigint.validated_fallback(&LogicalType::BigInt),
+            Some(&Value::BigInt(0))
+        );
+        assert!(
+            !AggregateSingletonMerge::InputOr(Value::Null(LogicalType::BigInt))
+                .is_valid_for(&LogicalType::BigInt)
+        );
     }
 }

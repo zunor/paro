@@ -198,6 +198,9 @@ fn generate_typed_physical_plan(
         paro_execution::physical::PlanBuildContext {
             force_external: ctx.limits.force_external,
             rowset_scan_pushdown: ctx.limits.rowset_scan_pushdown,
+            max_memory: ctx.limits.max_memory,
+            max_threads: ctx.limits.max_threads.max(1),
+            scan_access_cost: Default::default(),
         },
     );
     generator.generate(logical_plan)

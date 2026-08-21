@@ -22,6 +22,12 @@ const SLOW_PAGE_IO_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_DECOMPRESS_THRESHOLD: Duration = Duration::from_millis(8);
 const SLOW_PAGE_FALLBACK_THRESHOLD: Duration = Duration::from_millis(12);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodedPageAccess {
+    Sequential,
+    SparseGather,
+}
+
 /// Page reader context used for PageKey construction and version isolation.
 #[derive(Debug, Clone)]
 pub struct PageReaderContext {
@@ -46,6 +52,7 @@ impl PageReaderContext {
 #[derive(Debug, Clone)]
 pub struct PageReaderOptions {
     pub cache_decompressed: bool,
+    pub cache_decoded: bool,
     pub parallel_decompressor: Option<ParallelDecompressor>,
 }
 
@@ -53,6 +60,7 @@ impl Default for PageReaderOptions {
     fn default() -> Self {
         Self {
             cache_decompressed: false,
+            cache_decoded: false,
             parallel_decompressor: None,
         }
     }
@@ -186,11 +194,67 @@ impl PageReader {
         self.make_key(pointer)
     }
 
+    /// Whether this reader is configured to retain codec-decoded pages.
+    pub fn decoded_cache_enabled(&self) -> bool {
+        self.options.cache_decoded && self.cache.is_some()
+    }
+
+    /// Look up a codec-decoded logical page. Page keys include rowset
+    /// generation, so compaction and replacement cannot return stale values.
+    pub fn lookup_decoded(&self, pointer: PagePointer) -> Option<Bytes> {
+        self.decoded_cache_enabled()
+            .then(|| self.lookup_cached(&self.make_key(pointer), PageContentKind::Decoded))
+            .flatten()
+    }
+
+    /// Initialize and publish a logical page directly in its cache allocation.
+    /// `None` means the decoded-cache policy rejected admission; callers should
+    /// retain an uncached materialization.
+    pub fn cache_decoded_with<F>(
+        &self,
+        pointer: PagePointer,
+        size: usize,
+        initializer: F,
+    ) -> Result<Option<Bytes>>
+    where
+        F: FnOnce(&mut [u8]) -> Result<()>,
+    {
+        if !self.options.cache_decoded {
+            return Ok(None);
+        }
+        let Some(cache) = &self.cache else {
+            return Ok(None);
+        };
+        cache
+            .get_or_load_decoded_into(self.make_key(pointer), size, initializer)?
+            .map(|handle| handle.try_into_bytes())
+            .transpose()
+    }
+
+    /// Sequential consumers necessarily materialize a logical page. Sparse
+    /// gathers do so only after the page has survived one probationary access,
+    /// avoiding cache pollution from one-off point lookups while recognizing
+    /// repeated analytical reuse.
+    pub(crate) fn should_materialize_decoded(
+        &self,
+        pointer: PagePointer,
+        access: DecodedPageAccess,
+    ) -> bool {
+        match access {
+            DecodedPageAccess::Sequential => true,
+            DecodedPageAccess::SparseGather => {
+                self.options.cache_decoded
+                    && self.cache.as_ref().is_some_and(|cache| {
+                        cache.should_promote_sparse_decoded(&self.make_key(pointer))
+                    })
+            }
+        }
+    }
+
     fn lookup_cached(&self, key: &PageKey, kind: PageContentKind) -> Option<Bytes> {
         let cache = self.cache.as_ref()?;
         let handle = cache.lookup(key, kind)?;
-        let data = handle.data()?;
-        Some(Bytes::copy_from_slice(data))
+        handle.try_into_bytes().ok()
     }
 
     fn read_raw_page<R: Read + Seek>(
@@ -354,6 +418,7 @@ struct PendingPage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferPool, PageCache};
     use crate::compression::{Lz4BlockCompression, ParallelDecompressor};
     use crate::rowset::page::{
         CompressionType, DataPageFooter, NullEncoding, PageFooter, PageIO, PageReadOptions,
@@ -388,6 +453,36 @@ mod tests {
         buffer.set_position(0);
         let (read_body, _, _) = reader.read_page(&mut buffer, &opts).unwrap();
         assert_eq!(read_body.as_ref(), body.as_slice());
+    }
+
+    #[test]
+    fn decoded_cache_is_version_isolated() {
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let pointer = PagePointer::new(128, 64);
+        let options = PageReaderOptions {
+            cache_decoded: true,
+            ..PageReaderOptions::default()
+        };
+        let reader = PageReader::new(
+            PageReaderContext::new(1, 2, 3, 4),
+            Some(cache.clone()),
+            options.clone(),
+        );
+        reader
+            .cache_decoded_with(pointer, b"logical page".len(), |destination| {
+                destination.copy_from_slice(b"logical page");
+                Ok(())
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            reader.lookup_decoded(pointer).unwrap().as_ref(),
+            b"logical page"
+        );
+
+        let next_generation =
+            PageReader::new(PageReaderContext::new(1, 2, 4, 4), Some(cache), options);
+        assert!(next_generation.lookup_decoded(pointer).is_none());
     }
 
     #[test]
@@ -429,6 +524,7 @@ mod tests {
             None,
             PageReaderOptions {
                 cache_decompressed: false,
+                cache_decoded: false,
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),
@@ -496,6 +592,7 @@ mod tests {
             None,
             PageReaderOptions {
                 cache_decompressed: false,
+                cache_decoded: false,
                 parallel_decompressor: Some(
                     ParallelDecompressor::new(Arc::new(default_allocator())).with_max_threads(4),
                 ),

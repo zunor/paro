@@ -11,7 +11,7 @@ use crate::compaction::publish::record::{
 };
 use crate::primary_key::{DeleteVector, PrimaryKeySerializer};
 use crate::rowid_resolver;
-use crate::rowset::{Rowset, RowsetSharedPtr, RowsetWriterBuilder, SegmentIterator};
+use crate::rowset::{Rowset, RowsetSharedPtr, RowsetWriterBuilder, SegmentIterator, SegmentRowId};
 use crate::search::SearchInlineBuilderSet;
 use crate::tablet::{tablet_schema::KeysType, ColumnId, PhysicalRowRef, Tablet};
 use paro_common::allocator::Allocator;
@@ -247,7 +247,7 @@ fn row_locations_for_rowset(rowset: &Rowset) -> Result<Vec<PhysicalRowRef>> {
             out.push(PhysicalRowRef::new(
                 rowset.rowset_id(),
                 seg.segment_id(),
-                row_id,
+                SegmentRowId::from_raw(row_id),
             ));
         }
     }

@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::sync::{Arc, Mutex};
 
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::sort_key::compare_keys;
+use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 
 use crate::result_type::SourceResultType;
@@ -16,7 +16,7 @@ use super::sort_descriptor::Sort;
 use super::sort_key_store::KeyCursor;
 use super::sorted_run::{RunRowCursor, SortedRun};
 
-const MERGE_KEY_SCRATCH_RETAIN_BYTES: usize = 64 * 1024;
+const NO_MERGE_RUN: usize = usize::MAX;
 
 #[derive(Debug, Clone)]
 pub struct KWayMergeState {
@@ -24,74 +24,144 @@ pub struct KWayMergeState {
     end_positions: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RunConsumption {
-    run_idx: usize,
+#[derive(Debug, Default)]
+struct RunOutputBatch {
     sorted_start: u32,
-    len: u32,
-    output_range_start: usize,
-    output_range_len: usize,
+    output_positions: Vec<u32>,
 }
 
 #[derive(Debug, Default)]
 struct MergeOutputBatch {
-    output_positions: Vec<u32>,
-    consumptions: Vec<RunConsumption>,
+    runs: Vec<RunOutputBatch>,
+    len: usize,
 }
 
-#[derive(Debug, Eq, PartialEq)]
-struct MergeHeapEntry {
-    key: Vec<u8>,
-    run_idx: usize,
-    sorted_position: u32,
+/// Reusable winner tree for k-way merge.
+///
+/// Leaves contain run indices and internal nodes contain the run whose current
+/// row sorts first. Unlike `BinaryHeap<Vec<u8>>`, the tree never copies a sort
+/// key: comparisons read directly from each run's key store.
+#[derive(Debug, Default)]
+struct MergeTournament {
+    leaf_count: usize,
+    winners: Vec<usize>,
 }
 
-impl Ord for MergeHeapEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        compare_keys(&other.key, &self.key)
-            .then_with(|| other.run_idx.cmp(&self.run_idx))
-            .then_with(|| other.sorted_position.cmp(&self.sorted_position))
+impl MergeTournament {
+    fn reset(&mut self) {
+        self.leaf_count = 0;
+        self.winners.clear();
+    }
+
+    fn is_initialized(&self) -> bool {
+        self.leaf_count != 0
+    }
+
+    fn initialize(
+        &mut self,
+        run_count: usize,
+        mut is_active: impl FnMut(usize) -> bool,
+        mut compare: impl FnMut(usize, usize) -> Result<Ordering>,
+    ) -> Result<()> {
+        self.leaf_count = run_count.max(1).next_power_of_two();
+        self.winners
+            .resize(self.leaf_count.saturating_mul(2), NO_MERGE_RUN);
+        self.winners.fill(NO_MERGE_RUN);
+        for run_idx in 0..run_count {
+            if is_active(run_idx) {
+                self.winners[self.leaf_count + run_idx] = run_idx;
+            }
+        }
+        for node_idx in (1..self.leaf_count).rev() {
+            self.winners[node_idx] = choose_merge_winner(
+                self.winners[node_idx * 2],
+                self.winners[node_idx * 2 + 1],
+                &mut compare,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn winner(&self) -> Option<usize> {
+        self.winners
+            .get(1)
+            .copied()
+            .filter(|run_idx| *run_idx != NO_MERGE_RUN)
+    }
+
+    fn update(
+        &mut self,
+        run_idx: usize,
+        active: bool,
+        mut compare: impl FnMut(usize, usize) -> Result<Ordering>,
+    ) -> Result<()> {
+        if self.leaf_count == 0 || run_idx >= self.leaf_count {
+            return Err(paro_error::internal(format!(
+                "merge tournament update is out of bounds: run={run_idx}, leaves={}",
+                self.leaf_count
+            )));
+        }
+        let leaf_idx = self.leaf_count + run_idx;
+        self.winners[leaf_idx] = if active { run_idx } else { NO_MERGE_RUN };
+        let mut node_idx = leaf_idx / 2;
+        while node_idx > 0 {
+            self.winners[node_idx] = choose_merge_winner(
+                self.winners[node_idx * 2],
+                self.winners[node_idx * 2 + 1],
+                &mut compare,
+            )?;
+            node_idx /= 2;
+        }
+        Ok(())
     }
 }
 
-impl PartialOrd for MergeHeapEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
+fn choose_merge_winner(
+    left: usize,
+    right: usize,
+    compare: &mut impl FnMut(usize, usize) -> Result<Ordering>,
+) -> Result<usize> {
+    match (left, right) {
+        (NO_MERGE_RUN, NO_MERGE_RUN) => Ok(NO_MERGE_RUN),
+        (NO_MERGE_RUN, right) => Ok(right),
+        (left, NO_MERGE_RUN) => Ok(left),
+        (left, right) => Ok(if compare(left, right)? == Ordering::Greater {
+            right
+        } else {
+            left
+        }),
     }
 }
 
 impl MergeOutputBatch {
-    fn clear(&mut self) {
-        self.output_positions.clear();
-        self.consumptions.clear();
+    fn clear(&mut self, run_count: usize) {
+        self.runs.resize_with(run_count, RunOutputBatch::default);
+        for run in &mut self.runs {
+            run.output_positions.clear();
+        }
+        self.len = 0;
     }
 
     fn len(&self) -> usize {
-        self.output_positions.len()
+        self.len
     }
 
     fn push(&mut self, run_idx: usize, sorted_position: u32, output_position: u32) {
-        let range_start = self.output_positions.len();
-        self.output_positions.push(output_position);
-
-        if let Some(last) = self.consumptions.last_mut() {
-            if last.run_idx == run_idx
-                && last.sorted_start + last.len == sorted_position
-                && last.output_range_start + last.output_range_len == range_start
-            {
-                last.len += 1;
-                last.output_range_len += 1;
-                return;
-            }
+        let run = self
+            .runs
+            .get_mut(run_idx)
+            .expect("merge output run index must be valid");
+        if run.output_positions.is_empty() {
+            run.sorted_start = sorted_position;
+        } else {
+            debug_assert_eq!(
+                run.sorted_start + run.output_positions.len() as u32,
+                sorted_position,
+                "a merge consumes each input run in sorted order"
+            );
         }
-
-        self.consumptions.push(RunConsumption {
-            run_idx,
-            sorted_start: sorted_position,
-            len: 1,
-            output_range_start: range_start,
-            output_range_len: 1,
-        });
+        run.output_positions.push(output_position);
+        self.len += 1;
     }
 }
 
@@ -120,6 +190,63 @@ impl SortedRunMerger {
     #[inline]
     pub fn run_count(&self) -> usize {
         self.sorted_runs.len()
+    }
+
+    pub(crate) fn materialize_range(
+        &self,
+        start: usize,
+        end: usize,
+        output_types: &[LogicalType],
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Vec<Chunk>> {
+        if start >= end || end > self.total_count {
+            return Err(paro_error::internal(format!(
+                "invalid sorted merge materialization range: start={start}, end={end}, total={}",
+                self.total_count
+            )));
+        }
+        let mut key_cursors = self
+            .sorted_runs
+            .iter()
+            .map(|run| run.key_store().cursor_on_demand(1))
+            .collect::<Vec<_>>();
+        let start_positions = self.compute_partition_boundaries(start, None, &mut key_cursors)?;
+        let end_positions =
+            self.compute_partition_boundaries(end, Some(&start_positions), &mut key_cursors)?;
+        let mut local = SortedRunMergerLocalState::new();
+        local.batch_range = Some((start, end));
+        local.current_position = start;
+        local.merge_state = Some(KWayMergeState {
+            current_positions: start_positions,
+            end_positions,
+        });
+
+        let mut chunks = Vec::with_capacity((end - start).div_ceil(VECTOR_SIZE));
+        let mut materialized_rows = 0usize;
+        while !local.batch_exhausted() {
+            self.collect_output_batch(&mut local, &mut key_cursors)?;
+            let batch_len = local.output_batch.len();
+            if batch_len == 0 {
+                return Err(paro_error::internal(format!(
+                    "sorted merge materialization stopped before its range ended: current={}, end={end}",
+                    local.current_position
+                )));
+            }
+            let mut chunk =
+                Chunk::try_initialize(output_types, VECTOR_SIZE, Arc::clone(&allocator))?;
+            self.gather_output_batch(&mut chunk, &local, &mut key_cursors)?;
+            materialized_rows = materialized_rows.checked_add(chunk.size()).ok_or_else(|| {
+                paro_error::internal("sorted merge materialized row count overflow")
+            })?;
+            chunks.push(chunk);
+        }
+        if materialized_rows != end - start {
+            return Err(paro_error::internal(format!(
+                "sorted merge materialization length mismatch: expected={}, actual={materialized_rows}",
+                end - start,
+            )));
+        }
+        Ok(chunks)
     }
 
     pub fn get_data(
@@ -156,6 +283,24 @@ impl SortedRunMerger {
             return self.get_data(chunk, gstate, lstate);
         }
 
+        self.gather_output_batch(chunk, lstate, &mut key_cursors)?;
+
+        let mut result = SourceResultType::HaveMoreOutput;
+        if lstate.batch_exhausted() {
+            self.finish_partition(gstate, lstate)?;
+            if gstate.all_partitions_scanned() {
+                result = SourceResultType::Finished;
+            }
+        }
+        Ok(result)
+    }
+
+    fn gather_output_batch(
+        &self,
+        chunk: &mut Chunk,
+        lstate: &SortedRunMergerLocalState,
+        sort_key_cursors: &mut [KeyCursor<'_>],
+    ) -> Result<()> {
         chunk.try_reset(chunk.allocator().clone())?;
         let mut key_row_cursors = self
             .sorted_runs
@@ -168,30 +313,24 @@ impl SortedRunMerger {
             .map(SortedRun::external_payload_cursor)
             .collect::<Vec<Option<RunRowCursor<'_>>>>();
 
-        for consumption in &lstate.output_batch.consumptions {
-            let positions = &lstate.output_batch.output_positions[consumption.output_range_start
-                ..consumption.output_range_start + consumption.output_range_len];
-            let run = &self.sorted_runs[consumption.run_idx];
+        for (run_idx, output_batch) in lstate.output_batch.runs.iter().enumerate() {
+            if output_batch.output_positions.is_empty() {
+                continue;
+            }
+            let run = &self.sorted_runs[run_idx];
             run.gather_sorted_range_projected(
-                consumption.sorted_start,
-                consumption.len,
+                output_batch.sorted_start,
+                output_batch.output_positions.len() as u32,
                 chunk,
-                positions,
+                &output_batch.output_positions,
                 self.sort.output_projection_columns(),
-                key_row_cursors[consumption.run_idx].as_mut(),
-                payload_row_cursors[consumption.run_idx].as_mut(),
+                &mut sort_key_cursors[run_idx],
+                key_row_cursors[run_idx].as_mut(),
+                payload_row_cursors[run_idx].as_mut(),
             )?;
         }
         chunk.set_cardinality(lstate.output_batch.len());
-
-        let mut result = SourceResultType::HaveMoreOutput;
-        if lstate.batch_exhausted() {
-            self.finish_partition(gstate, lstate)?;
-            if gstate.all_partitions_scanned() {
-                result = SourceResultType::Finished;
-            }
-        }
-        Ok(result)
+        Ok(())
     }
 
     fn assign_partition(
@@ -209,15 +348,12 @@ impl SortedRunMerger {
             .map(|run| run.key_store().cursor_on_demand(1))
             .collect::<Vec<_>>();
         let start_positions = self.compute_partition_boundaries(
-            batch_start as u32,
+            batch_start,
             lstate.prev_run_positions.as_deref(),
             &mut cursors,
         )?;
-        let end_positions = self.compute_partition_boundaries(
-            batch_end as u32,
-            Some(&start_positions),
-            &mut cursors,
-        )?;
+        let end_positions =
+            self.compute_partition_boundaries(batch_end, Some(&start_positions), &mut cursors)?;
 
         lstate.batch_range = Some((batch_start, batch_end));
         lstate.current_position = batch_start;
@@ -227,7 +363,7 @@ impl SortedRunMerger {
             current_positions: start_positions,
             end_positions,
         });
-        lstate.clear_merge_heap();
+        lstate.merge_tournament.reset();
         Ok(true)
     }
 
@@ -251,7 +387,7 @@ impl SortedRunMerger {
         lstate: &mut SortedRunMergerLocalState,
         key_cursors: &mut [KeyCursor<'_>],
     ) -> Result<()> {
-        lstate.output_batch.clear();
+        lstate.output_batch.clear(self.sorted_runs.len());
         if lstate.merge_state.is_none() {
             return Ok(());
         }
@@ -269,68 +405,76 @@ impl SortedRunMerger {
                 .sum::<usize>()
         };
         let batch_count = remaining.min(VECTOR_SIZE);
-        if lstate.merge_heap.is_empty() && remaining > 0 {
-            for run_idx in 0..self.sorted_runs.len() {
-                let sorted_position = {
-                    let merge_state = lstate
-                        .merge_state
-                        .as_ref()
-                        .expect("merge state checked above");
-                    (merge_state.current_positions[run_idx] < merge_state.end_positions[run_idx])
-                        .then_some(merge_state.current_positions[run_idx])
-                };
-                let Some(sorted_position) = sorted_position else {
-                    continue;
-                };
-                let mut entry = lstate.take_merge_heap_entry(run_idx, sorted_position);
-                self.read_merge_heap_entry_key(&mut entry, key_cursors)?;
-                lstate.merge_heap.push(entry);
-            }
+        if !lstate.merge_tournament.is_initialized() && remaining > 0 {
+            let merge_state = lstate
+                .merge_state
+                .as_ref()
+                .expect("merge state checked above");
+            let positions = &merge_state.current_positions;
+            let ends = &merge_state.end_positions;
+            lstate.merge_tournament.initialize(
+                self.sorted_runs.len(),
+                |run_idx| positions[run_idx] < ends[run_idx],
+                |left, right| self.compare_run_heads(left, right, positions, key_cursors),
+            )?;
         }
 
         for output_idx in 0..batch_count {
-            let Some(mut entry) = lstate.merge_heap.pop() else {
+            let Some(run_idx) = lstate.merge_tournament.winner() else {
                 break;
             };
+            let sorted_position = lstate
+                .merge_state
+                .as_ref()
+                .expect("merge state checked above")
+                .current_positions[run_idx];
             lstate
                 .output_batch
-                .push(entry.run_idx, entry.sorted_position, output_idx as u32);
+                .push(run_idx, sorted_position, output_idx as u32);
             lstate.current_position += 1;
-            let next_position = entry.sorted_position + 1;
-            let end_position = {
+            let active = {
                 let merge_state = lstate
                     .merge_state
                     .as_mut()
                     .expect("merge state checked above");
-                merge_state.current_positions[entry.run_idx] = next_position;
-                merge_state.end_positions[entry.run_idx]
+                merge_state.current_positions[run_idx] = sorted_position + 1;
+                merge_state.current_positions[run_idx] < merge_state.end_positions[run_idx]
             };
-            if next_position < end_position {
-                entry.sorted_position = next_position;
-                self.read_merge_heap_entry_key(&mut entry, key_cursors)?;
-                lstate.merge_heap.push(entry);
-            } else {
-                lstate.recycle_merge_heap_entry(entry);
-            }
+            let positions = &lstate
+                .merge_state
+                .as_ref()
+                .expect("merge state checked above")
+                .current_positions;
+            lstate
+                .merge_tournament
+                .update(run_idx, active, |left, right| {
+                    self.compare_run_heads(left, right, positions, key_cursors)
+                })?;
         }
 
         Ok(())
     }
 
-    fn read_merge_heap_entry_key(
+    fn compare_run_heads(
         &self,
-        entry: &mut MergeHeapEntry,
+        left_run_idx: usize,
+        right_run_idx: usize,
+        positions: &[u32],
         key_cursors: &mut [KeyCursor<'_>],
-    ) -> Result<()> {
-        let ordinal = self.sorted_runs[entry.run_idx]
-            .source_ordinal_at_sorted_position(entry.sorted_position)?;
-        key_cursors[entry.run_idx].read_key_into(ordinal, &mut entry.key)?;
-        Ok(())
+    ) -> Result<Ordering> {
+        self.compare_positions(
+            left_run_idx,
+            positions[left_run_idx],
+            right_run_idx,
+            positions[right_run_idx],
+            key_cursors,
+        )
+        .map(|ordering| ordering.then_with(|| left_run_idx.cmp(&right_run_idx)))
     }
 
     fn compute_partition_boundaries(
         &self,
-        batch_start: u32,
+        batch_start: usize,
         prev_boundaries: Option<&[u32]>,
         key_cursors: &mut [KeyCursor<'_>],
     ) -> Result<Vec<u32>> {
@@ -340,7 +484,7 @@ impl SortedRunMerger {
             .unwrap_or_else(|| vec![0; num_runs]);
         let mut total_remaining = batch_start;
         for position in &run_positions {
-            total_remaining = total_remaining.saturating_sub(*position);
+            total_remaining = total_remaining.saturating_sub(*position as usize);
         }
 
         let mut active_runs: Vec<usize> = (0..num_runs)
@@ -348,16 +492,17 @@ impl SortedRunMerger {
             .collect();
 
         while total_remaining > 0 && !active_runs.is_empty() {
-            let base_delta = total_remaining.div_ceil(active_runs.len() as u32);
+            let base_delta = total_remaining.div_ceil(active_runs.len());
             let mut best_run_idx = active_runs[0];
             let mut best_delta = base_delta
-                .min(self.sorted_runs[best_run_idx].count() as u32 - run_positions[best_run_idx]);
-            let mut best_position = run_positions[best_run_idx] + best_delta - 1;
+                .min(self.sorted_runs[best_run_idx].count() - run_positions[best_run_idx] as usize);
+            let mut best_position =
+                checked_sorted_position(run_positions[best_run_idx], best_delta)?;
 
             for &run_idx in &active_runs[1..] {
-                let remaining = self.sorted_runs[run_idx].count() as u32 - run_positions[run_idx];
+                let remaining = self.sorted_runs[run_idx].count() - run_positions[run_idx] as usize;
                 let delta = base_delta.min(remaining);
-                let position = run_positions[run_idx] + delta - 1;
+                let position = checked_sorted_position(run_positions[run_idx], delta)?;
                 if self.compare_positions(
                     run_idx,
                     position,
@@ -372,7 +517,13 @@ impl SortedRunMerger {
                 }
             }
 
-            run_positions[best_run_idx] += best_delta;
+            run_positions[best_run_idx] = run_positions[best_run_idx]
+                .checked_add(u32::try_from(best_delta).map_err(|_| {
+                    paro_error::internal(format!(
+                        "sorted merge boundary delta exceeds u32: {best_delta}"
+                    ))
+                })?)
+                .ok_or_else(|| paro_error::internal("sorted merge boundary overflow"))?;
             total_remaining -= best_delta;
             active_runs.retain(|&run_idx| {
                 run_positions[run_idx] < self.sorted_runs[run_idx].count() as u32
@@ -414,6 +565,16 @@ fn split_two_mut<T>(values: &mut [T], left: usize, right: usize) -> (&mut T, &mu
     }
 }
 
+fn checked_sorted_position(start: u32, delta: usize) -> Result<u32> {
+    let delta = u32::try_from(delta).map_err(|_| {
+        paro_error::internal(format!("sorted merge boundary delta exceeds u32: {delta}"))
+    })?;
+    start
+        .checked_add(delta)
+        .and_then(|end| end.checked_sub(1))
+        .ok_or_else(|| paro_error::internal("sorted merge boundary position overflow"))
+}
+
 #[derive(Debug)]
 pub struct SortedRunMergerLocalState {
     pub batch_range: Option<(usize, usize)>,
@@ -422,8 +583,7 @@ pub struct SortedRunMergerLocalState {
     pub prev_run_positions: Option<Vec<u32>>,
     pub partition_idx: Option<usize>,
     output_batch: MergeOutputBatch,
-    merge_heap: BinaryHeap<MergeHeapEntry>,
-    merge_entry_pool: Vec<MergeHeapEntry>,
+    merge_tournament: MergeTournament,
 }
 
 impl SortedRunMergerLocalState {
@@ -435,8 +595,7 @@ impl SortedRunMergerLocalState {
             prev_run_positions: None,
             partition_idx: None,
             output_batch: MergeOutputBatch::default(),
-            merge_heap: BinaryHeap::new(),
-            merge_entry_pool: Vec::new(),
+            merge_tournament: MergeTournament::default(),
         }
     }
 
@@ -448,49 +607,18 @@ impl SortedRunMergerLocalState {
         }
     }
 
-    fn clear_merge_heap(&mut self) {
-        while let Some(entry) = self.merge_heap.pop() {
-            self.recycle_merge_heap_entry(entry);
-        }
-    }
-
-    fn take_merge_heap_entry(&mut self, run_idx: usize, sorted_position: u32) -> MergeHeapEntry {
-        if let Some(mut entry) = self.merge_entry_pool.pop() {
-            entry.run_idx = run_idx;
-            entry.sorted_position = sorted_position;
-            entry.key.clear();
-            entry
-        } else {
-            MergeHeapEntry {
-                key: Vec::new(),
-                run_idx,
-                sorted_position,
-            }
-        }
-    }
-
-    fn recycle_merge_heap_entry(&mut self, mut entry: MergeHeapEntry) {
-        if entry.key.capacity() > MERGE_KEY_SCRATCH_RETAIN_BYTES {
-            entry.key = Vec::new();
-        } else {
-            entry.key.clear();
-        }
-        self.merge_entry_pool.push(entry);
-    }
-
     #[cfg(test)]
-    pub(crate) fn scratch_capacities(&self) -> (usize, usize, usize, usize) {
-        let key_scratch_bytes = self
-            .merge_heap
+    pub(crate) fn scratch_capacities(&self) -> (usize, usize, usize) {
+        let output_position_capacity = self
+            .output_batch
+            .runs
             .iter()
-            .chain(self.merge_entry_pool.iter())
-            .map(|entry| entry.key.capacity())
+            .map(|run| run.output_positions.capacity())
             .sum();
         (
-            self.output_batch.output_positions.capacity(),
-            self.output_batch.consumptions.capacity(),
-            self.merge_heap.capacity(),
-            key_scratch_bytes,
+            output_position_capacity,
+            self.output_batch.runs.capacity(),
+            self.merge_tournament.winners.capacity(),
         )
     }
 }
@@ -612,5 +740,27 @@ impl SortedRunMergerGlobalState {
         }
         *next_release_partition = release_upto;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod merge_output_tests {
+    use super::MergeOutputBatch;
+
+    #[test]
+    fn interleaved_merge_rows_are_coalesced_per_input_run() {
+        let mut batch = MergeOutputBatch::default();
+        batch.clear(2);
+        batch.push(0, 10, 0);
+        batch.push(1, 20, 1);
+        batch.push(0, 11, 2);
+        batch.push(1, 21, 3);
+        batch.push(0, 12, 4);
+
+        assert_eq!(batch.len(), 5);
+        assert_eq!(batch.runs[0].sorted_start, 10);
+        assert_eq!(batch.runs[0].output_positions, vec![0, 2, 4]);
+        assert_eq!(batch.runs[1].sorted_start, 20);
+        assert_eq!(batch.runs[1].output_positions, vec![1, 3]);
     }
 }

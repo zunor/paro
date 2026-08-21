@@ -12,7 +12,7 @@ use paro_common::identity::DatabaseType;
 use paro_external::runtime::host::PythonRuntimeProvider;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
-use paro_storage::buffer::{BufferPool, StandardBufferManager};
+use paro_storage::buffer::{BufferPool, PageCache, StandardBufferManager};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -183,6 +183,7 @@ impl TestStatementContextBuilder {
         let _ = scheduler.set_threads(1);
         let execution_resources = Arc::new(ExecutionResources {
             scheduler,
+            page_cache: Arc::new(PageCache::new(buffer_pool.clone())),
             buffer_pool,
             buffer_manager,
             query_memory_coordinator: None,
@@ -242,7 +243,6 @@ impl TestStatementContextBuilder {
                 graph_index: graph_manager.clone(),
                 python_runtime: self.python_runtime,
                 governance: crate::QueryResourceGovernance::default(),
-                plan_cache: None,
                 connection_info: None,
             }),
             graph_registry: graph_manager,

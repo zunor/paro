@@ -119,6 +119,11 @@ pub struct BoundCastInfo {
     /// Optional metadata for the cast (e.g. decimal precision/scale)
     pub cast_data: Option<Arc<dyn BoundCastData>>,
     context_dependency: CastContextDependency,
+    /// Source/target contract assigned by the cast registry when this
+    /// implementation is bound. Runtime consumers may use it to reject a
+    /// stale expression before dispatching an unsafe typed cast kernel.
+    source_type: Option<LogicalType>,
+    target_type: Option<LogicalType>,
 }
 
 impl BoundCastInfo {
@@ -127,6 +132,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Fixed(function),
             cast_data: None,
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -135,6 +142,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Varlen(function),
             cast_data: None,
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -143,6 +152,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Array(function),
             cast_data: None,
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -151,6 +162,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Struct(function),
             cast_data: None,
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -159,6 +172,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Fixed(function),
             cast_data: Some(data),
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -167,6 +182,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Varlen(function),
             cast_data: Some(data),
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -175,6 +192,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Array(function),
             cast_data: Some(data),
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -183,6 +202,8 @@ impl BoundCastInfo {
             dispatch: CastDispatch::Struct(function),
             cast_data: Some(data),
             context_dependency: CastContextDependency::Independent,
+            source_type: None,
+            target_type: None,
         }
     }
 
@@ -200,6 +221,38 @@ impl BoundCastInfo {
 
     pub fn context_dependency(&self) -> CastContextDependency {
         self.context_dependency
+    }
+
+    fn with_type_contract(mut self, source: &LogicalType, target: &LogicalType) -> Self {
+        self.source_type = Some(source.clone());
+        self.target_type = Some(target.clone());
+        self
+    }
+
+    /// Logical source/target contract for the selected cast dispatch.
+    pub fn type_contract(&self) -> Option<(&LogicalType, &LogicalType)> {
+        Some((self.source_type.as_ref()?, self.target_type.as_ref()?))
+    }
+
+    /// Whether this descriptor is the canonical, context-independent
+    /// DECIMAL-to-DECIMAL cast selected by the registry.
+    ///
+    /// Execution fast paths use this proof before replacing the bound vector
+    /// cast with the shared scalar DECIMAL conversion. Merely observing two
+    /// DECIMAL logical types is insufficient because extensions or future
+    /// bind data may carry different semantics.
+    pub fn is_canonical_decimal_cast(&self) -> bool {
+        let Some((LogicalType::Decimal { .. }, LogicalType::Decimal { .. })) = self.type_contract()
+        else {
+            return false;
+        };
+        self.context_dependency == CastContextDependency::Independent
+            && self.cast_data.is_none()
+            && matches!(
+                self.dispatch,
+                CastDispatch::Fixed(function)
+                    if std::ptr::fn_addr_eq(function, decimal_casts::decimal_to_decimal_cast as FixedCastFn)
+            )
     }
 
     pub fn identity(source: &LogicalType, target: &LogicalType) -> Self {
@@ -288,6 +341,7 @@ impl CastFunctionSet {
 
     /// Register a direct cast from source to target.
     pub fn register_cast(&mut self, source: LogicalType, target: LogicalType, info: BoundCastInfo) {
+        let info = info.with_type_contract(&source, &target);
         self.direct_casts.insert((source, target), info);
     }
 
@@ -304,7 +358,7 @@ impl CastFunctionSet {
     ) -> Result<BoundCastInfo> {
         // 1. Check for NopCast (same type)
         if source == target {
-            return Ok(BoundCastInfo::identity(source, target));
+            return Ok(BoundCastInfo::identity(source, target).with_type_contract(source, target));
         }
 
         // 2. Check direct casts
@@ -316,7 +370,7 @@ impl CastFunctionSet {
         let bind_input = BindCastInput::new(self);
         for (_i, bind_func) in self.bind_functions.iter().enumerate().rev() {
             if let Some(info) = (bind_func.function)(&bind_input, source, target)? {
-                return Ok(info);
+                return Ok(info.with_type_contract(source, target));
             }
         }
 
@@ -342,6 +396,8 @@ impl fmt::Debug for BoundCastInfo {
             .field("dispatch", &self.dispatch)
             .field("cast_data", &self.cast_data)
             .field("context_dependency", &self.context_dependency)
+            .field("source_type", &self.source_type)
+            .field("target_type", &self.target_type)
             .finish()
     }
 }
@@ -376,7 +432,7 @@ fn reference_identity_cast(
     _ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let target_type = result.logical_type().clone();
-    *result = source.reference_as(target_type);
+    *result = source.try_reference_as(target_type)?;
     result.set_count(count);
     Ok(true)
 }

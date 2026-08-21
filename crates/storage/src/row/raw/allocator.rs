@@ -13,7 +13,7 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext, Memory
 
 use super::segment::RawRowChunkPart;
 use super::{RawRowChunkState, RawRowLayout, RawRowPinProperties, RawRowPinState};
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 
 /// A block of memory for storing raw row data.
 ///
@@ -150,6 +150,11 @@ impl RawRowAllocator {
     #[inline]
     pub fn layout_ptr(&self) -> Arc<RawRowLayout> {
         Arc::clone(&self.layout)
+    }
+
+    #[inline]
+    pub fn accounting_class(&self) -> MemoryAccountingClass {
+        self.memory.accounting_class()
     }
 
     /// Get the number of row blocks.
@@ -556,17 +561,17 @@ impl RawRowAllocator {
     /// # Safety
     /// row_locations must contain valid pointers to row data.
     pub unsafe fn recompute_heap_pointers(
-        old_heap_ptr: *mut u8,
+        old_heap_address: usize,
         new_heap_ptr: *mut u8,
-        row_locations: &[*mut u8],
-        offset: usize,
+        base_row_ptr: *mut u8,
+        row_width: usize,
         count: usize,
         layout: &RawRowLayout,
         base_col_offset: usize,
-    ) {
-        let diff = new_heap_ptr.offset_from(old_heap_ptr);
-        if diff == 0 {
-            return;
+        heap_size: usize,
+    ) -> Result<()> {
+        if old_heap_address == new_heap_ptr as usize {
+            return Ok(());
         }
 
         for &col_idx in layout.get_variable_columns() {
@@ -576,49 +581,65 @@ impl RawRowAllocator {
             match typ {
                 LogicalType::Varchar | LogicalType::Blob => {
                     Self::recompute_string_heap_pointers(
-                        diff,
-                        row_locations,
-                        offset,
+                        old_heap_address,
+                        new_heap_ptr,
+                        base_row_ptr,
+                        row_width,
                         count,
                         base_col_offset + col_offset,
-                    );
+                        heap_size,
+                    )?;
                 }
                 // TODO: Handle nested types (List, Struct, Array)
                 _ => {}
             }
         }
+        Ok(())
     }
 
     unsafe fn recompute_string_heap_pointers(
-        diff: isize,
-        row_locations: &[*mut u8],
-        offset: usize,
+        old_heap_address: usize,
+        new_heap_ptr: *mut u8,
+        base_row_ptr: *mut u8,
+        row_width: usize,
         count: usize,
         string_location_offset: usize,
-    ) {
+        heap_size: usize,
+    ) -> Result<()> {
         for i in 0..count {
-            let row_ptr = row_locations[offset + i];
-            if row_ptr.is_null() {
-                continue;
-            }
+            let row_ptr = base_row_ptr.add(i * row_width);
 
             let string_location = row_ptr.add(string_location_offset);
 
-            // Read length (first 4 bytes)
-            let len_ptr = string_location as *const u32;
-            let len = std::ptr::read_unaligned(len_ptr);
+            // SAFETY: `string_location` addresses a live canonical row cell.
+            let value_len = StringView::cell_len(string_location);
 
-            if len > 12 {
-                // Heap string: last 8 bytes is the pointer
-                // string_t size is 16 bytes.
-                // [len:4][prefix:4][ptr:8]
-                let ptr_location = string_location.add(8) as *mut *mut u8;
-                let current_ptr = std::ptr::read_unaligned(ptr_location);
-
-                let new_target = current_ptr.offset(diff);
-                std::ptr::write_unaligned(ptr_location, new_target);
+            if value_len > StringView::INLINE_CAPACITY {
+                // SAFETY: the branch established the out-of-line row-cell
+                // representation and the cell's pointer remains live.
+                let current_ptr = StringView::cell_heap_ptr(string_location);
+                let current_address = current_ptr as usize;
+                let heap_offset = current_address.checked_sub(old_heap_address).ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "raw row varlen pointer precedes its heap range: pointer={current_address:#x} heap_base={old_heap_address:#x}"
+                    ))
+                })?;
+                let string_end = heap_offset.checked_add(value_len).ok_or_else(|| {
+                    paro_error::data_corrupted("raw row varlen heap range overflow")
+                })?;
+                if string_end > heap_size {
+                    return Err(paro_error::data_corrupted(format!(
+                        "raw row varlen pointer exceeds its heap range: offset={heap_offset} length={} heap_size={heap_size}",
+                        value_len
+                    )));
+                }
+                let new_target = new_heap_ptr.add(heap_offset);
+                // SAFETY: relocation preserves the same immutable bytes,
+                // prefix, and length while updating only the pointer field.
+                StringView::set_cell_heap_ptr(string_location, new_target);
             }
         }
+        Ok(())
     }
 
     fn release_blocks(buffer_pool: &Arc<BufferPool>, blocks: &mut Vec<RawRowBlock>) {
@@ -666,6 +687,49 @@ impl RawRowAllocator {
             }
         }
     }
+
+    /// Pin one row chunk part and make all row-local varlen pointers valid for
+    /// the currently pinned heap address.
+    ///
+    /// Every consumer that dereferences raw rows must enter through this method:
+    /// pinning only the row block leaves heap pointers stale after buffer-pool
+    /// eviction. The per-part lock serializes pointer rewriting while the row
+    /// and heap blocks remain pinned in `pin_state`.
+    pub fn pin_chunk_part(
+        &self,
+        pin_state: &mut RawRowPinState,
+        part: &RawRowChunkPart,
+    ) -> Result<*mut u8> {
+        let base_row_ptr = self.get_row_pointer(pin_state, part)?;
+        if part.total_heap_size == 0 {
+            return Ok(base_row_ptr);
+        }
+
+        let new_heap_ptr = self.get_heap_pointer(pin_state, part)?;
+        let new_heap_address = new_heap_ptr as usize;
+        let mut heap_base_address = part.heap_base_address.lock().unwrap();
+        if let Some(old_heap_address) = *heap_base_address {
+            if old_heap_address != new_heap_address {
+                // SAFETY: both blocks are pinned by `pin_state`; the part
+                // metadata bounds the contiguous row and heap ranges.
+                unsafe {
+                    Self::recompute_heap_pointers(
+                        old_heap_address,
+                        new_heap_ptr,
+                        base_row_ptr,
+                        self.layout.get_row_width(),
+                        part.count as usize,
+                        &self.layout,
+                        0,
+                        part.total_heap_size,
+                    )?;
+                }
+            }
+        }
+        *heap_base_address = Some(new_heap_address);
+        Ok(base_row_ptr)
+    }
+
     /// Initialize chunk state for reading/writing.
     ///
     /// Sets up pointers and handles pinning.
@@ -694,7 +758,11 @@ impl RawRowAllocator {
 
             // Setup row locations
             let row_width = self.layout.get_row_width();
-            let base_row_ptr = self.get_row_pointer(pin_state, part)?;
+            let base_row_ptr = if recompute {
+                self.pin_chunk_part(pin_state, part)?
+            } else {
+                self.get_row_pointer(pin_state, part)?
+            };
 
             for i in 0..next_count {
                 // Store pointer as u64
@@ -715,70 +783,10 @@ impl RawRowAllocator {
                 // Not implemented yet as it's not required for current use cases
             }
 
-            // Recompute row-local heap pointers when the block address changes.
-            if part.total_heap_size > 0 {
-                // Only recompute if:
-                // 1. recompute flag is true (not first initialization)
-                // 2. blocks are not already pinned (would have same address)
-                if recompute && pin_state.properties != RawRowPinProperties::AlreadyPinned {
-                    // Get the new base heap pointer after pinning
-                    let new_base_heap_ptr = self.get_heap_pointer(pin_state, part)?;
-
-                    // Acquire lock for thread-safe access to base_heap_ptr
-                    let mut _lock = part.lock.lock().unwrap();
-
-                    // Check if pointer changed (block was evicted and reloaded at different address)
-                    if part.base_heap_ptr != Some(new_base_heap_ptr) {
-                        // Only recompute if we have an old pointer (not first load)
-                        if let Some(old_base_heap_ptr) = part.base_heap_ptr {
-                            // Convert u64 pointers back to *mut u8 for recompute_heap_pointers
-                            let mut row_ptrs: Vec<*mut u8> = Vec::with_capacity(next_count);
-                            for i in 0..next_count {
-                                unsafe {
-                                    let ptr_val = *row_locations_slice.add(current_offset + i);
-                                    row_ptrs.push(ptr_val as *mut u8);
-                                }
-                            }
-
-                            // Recompute all heap pointers in the rows
-                            // This updates VARCHAR pointers, LIST pointers, etc.
-                            unsafe {
-                                Self::recompute_heap_pointers(
-                                    old_base_heap_ptr.add(part.heap_block_offset as usize),
-                                    new_base_heap_ptr.add(part.heap_block_offset as usize),
-                                    &row_ptrs,
-                                    current_offset,
-                                    next_count,
-                                    &self.layout,
-                                    0,
-                                );
-                            }
-                        }
-                        // Update the base pointer in the part
-                        // SAFETY: We have the lock, and we're updating through a raw pointer
-                        // because part is passed as & reference but needs mutation
-                        let part_ptr = *part as *const RawRowChunkPart;
-                        let part_mut = part_ptr as *mut RawRowChunkPart;
-                        unsafe {
-                            (*part_mut).base_heap_ptr = Some(new_base_heap_ptr);
-                        }
-                    }
-                } else if part.base_heap_ptr.is_none() {
-                    // First time loading this part - initialize base_heap_ptr
-                    let new_base_heap_ptr = self.get_heap_pointer(pin_state, part)?;
-                    let _lock = part.lock.lock().unwrap();
-                    let part_ptr = *part as *const RawRowChunkPart;
-                    let part_mut = part_ptr as *mut RawRowChunkPart;
-                    unsafe {
-                        (*part_mut).base_heap_ptr = Some(new_base_heap_ptr);
-                    }
-                }
-
-                // Initialize heap pointers if requested
-                if init_heap_pointers {
-                    // Would set up heap_locations vector here
-                    // Not implemented yet as it's not required for current use cases
-                }
+            // Initialize heap pointers if requested. Row-local string pointers
+            // are already valid after `pin_chunk_part` above.
+            if init_heap_pointers {
+                // Would set up heap_locations vector here.
             }
 
             current_offset += next_count;

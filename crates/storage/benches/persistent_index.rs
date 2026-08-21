@@ -22,7 +22,10 @@ fn make_entries(start: u32, count: usize) -> Vec<(Vec<u8>, RowID)> {
     (0..count)
         .map(|offset| {
             let row = start + offset as u32;
-            (make_key(row), RowID::new(1, row))
+            (
+                make_key(row),
+                RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(row)),
+            )
         })
         .collect()
 }
@@ -42,7 +45,12 @@ impl BenchState {
         let persistent_dir = dir.path().join("persistent");
 
         let entries: Vec<_> = (0..ENTRY_COUNT)
-            .map(|i| (make_key(i), RowID::new(1, i)))
+            .map(|i| {
+                (
+                    make_key(i),
+                    RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(i)),
+                )
+            })
             .collect();
         let immutable_entries: Vec<_> = entries
             .iter()

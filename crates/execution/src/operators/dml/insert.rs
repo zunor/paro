@@ -11,7 +11,6 @@ use paro_function::scalar::FunctionExecContext;
 use paro_planner::operator::InsertOnConflictAction;
 use paro_storage::table::table_handle::InsertOnConflictAction as StorageInsertOnConflictAction;
 
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::InsertSpec;
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -26,7 +25,6 @@ use super::helpers::{
 #[derive(Debug, Clone)]
 pub struct InsertSinkExec {
     pub spec: InsertSpec,
-    pub required: RequiredProperties,
 }
 
 impl InsertSinkExec {

@@ -250,7 +250,7 @@ pub(crate) fn snapshot_epoch(version: i64) -> u64 {
 }
 
 fn row_cache_key(row: PhysicalRowRef) -> (RowsetId, u32, u64) {
-    (row.rowset_id, row.segment_id, row.row_id as u64)
+    (row.rowset_id, row.segment_id, row.row_offset.get() as u64)
 }
 
 pub(crate) fn materialize_column(
@@ -329,7 +329,7 @@ fn fetch_projected_batch(
         let entry = fetch_map
             .entry(row.segment_key())
             .or_insert_with(|| (segment, Vec::new()));
-        entry.1.push(row.row_id as u64);
+        entry.1.push(row.row_offset.get() as u64);
     }
     stats.segment_groups = fetch_map.len();
 
@@ -910,10 +910,26 @@ mod tests {
             .first()
             .expect("visible segment");
         let rows = [
-            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 2),
-            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 0),
-            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 2),
-            PhysicalRowRef::new(segment.rowset_id, segment.segment_id, 1),
+            PhysicalRowRef::new(
+                segment.rowset_id,
+                segment.segment_id,
+                crate::rowset::SegmentRowId::from_raw(2),
+            ),
+            PhysicalRowRef::new(
+                segment.rowset_id,
+                segment.segment_id,
+                crate::rowset::SegmentRowId::from_raw(0),
+            ),
+            PhysicalRowRef::new(
+                segment.rowset_id,
+                segment.segment_id,
+                crate::rowset::SegmentRowId::from_raw(2),
+            ),
+            PhysicalRowRef::new(
+                segment.rowset_id,
+                segment.segment_id,
+                crate::rowset::SegmentRowId::from_raw(1),
+            ),
         ];
 
         let projected = SearchRowFetcher::new(&snapshot, table.types())

@@ -8,6 +8,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use regex::Regex;
 
+use crate::scalar::function_data_fingerprint;
 use crate::{
     BoundScalarFunction, ExpressionState, FunctionData, FunctionErrorMode, FunctionLocalState,
     ScalarBindInput, ScalarFunction, ScalarFunctionSet,
@@ -19,7 +20,7 @@ enum BoundRegexp {
     Invalid,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Hash)]
 struct RegexpBindData {
     pattern: String,
     case_insensitive: bool,
@@ -36,6 +37,10 @@ impl FunctionData for RegexpBindData {
         };
 
         self.pattern == other.pattern && self.case_insensitive == other.case_insensitive
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -177,8 +182,8 @@ fn execute_regexp(
     let pattern_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing pattern column".to_string()))?;
-    let text_view = text_vec.try_to_varlen_view(count)?;
-    let pattern_view = pattern_vec.try_to_varlen_view(count)?;
+    let text_view = text_vec.try_to_utf8_view(count)?;
+    let pattern_view = pattern_vec.try_to_utf8_view(count)?;
 
     result.set_count(count);
     let local_pattern = regexp_local_state(state).map(|data| &data.pattern);
@@ -188,16 +193,14 @@ fn execute_regexp(
         if !text_view.is_valid(row) || !pattern_view.is_valid(row) {
             result.set_null(row, true);
         } else {
-            let text_value = text_view.get_inline_string(row);
-            let text = text_value.as_str();
+            let text = text_view.str(row);
             let matched = match local_pattern {
                 Some(BoundRegexp::Compiled(regex)) => regex.is_match(text),
                 Some(BoundRegexp::Invalid) => false,
                 None => {
-                    let pattern_value = pattern_view.get_inline_string(row);
                     let pattern = match bound_pattern {
                         Some(bind) => bind.pattern.as_str(),
-                        None => pattern_value.as_str(),
+                        None => pattern_view.str(row),
                     };
                     match compile_regex(pattern, case_insensitive) {
                         Ok(regex) => regex.is_match(text),

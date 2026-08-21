@@ -18,7 +18,7 @@ use super::Allocator;
 use crate::error::Result;
 
 /// Number of memory tags (must match MemoryTag enum variants).
-pub const MEMORY_TAG_COUNT: usize = 21;
+pub const MEMORY_TAG_COUNT: usize = 22;
 
 thread_local! {
     static ALLOCATOR_TRACKING_EVENT_COUNT: Cell<u64> = const { Cell::new(0) };
@@ -75,6 +75,8 @@ pub enum MemoryTag {
     MemTable = 19,
     /// Host-side buffers owned by external runtimes and IPC bridges
     ExternalRuntimeHost = 20,
+    /// Codec-decoded storage pages governed by the decoded-cache capacity
+    DecodedPageCache = 21,
 }
 
 impl MemoryTag {
@@ -102,6 +104,7 @@ impl MemoryTag {
             MemoryTag::Wal => "WAL",
             MemoryTag::MemTable => "MEM_TABLE",
             MemoryTag::ExternalRuntimeHost => "EXTERNAL_RUNTIME_HOST",
+            MemoryTag::DecodedPageCache => "DECODED_PAGE_CACHE",
         }
     }
 
@@ -129,6 +132,7 @@ impl MemoryTag {
             MemoryTag::Wal,
             MemoryTag::MemTable,
             MemoryTag::ExternalRuntimeHost,
+            MemoryTag::DecodedPageCache,
         ]
     }
 
@@ -162,6 +166,7 @@ impl MemoryTag {
             18 => Some(MemoryTag::Wal),
             19 => Some(MemoryTag::MemTable),
             20 => Some(MemoryTag::ExternalRuntimeHost),
+            21 => Some(MemoryTag::DecodedPageCache),
             _ => None,
         }
     }
@@ -717,7 +722,7 @@ mod tests {
 
     #[test]
     fn test_memory_tag_count() {
-        assert_eq!(MEMORY_TAG_COUNT, 21);
+        assert_eq!(MEMORY_TAG_COUNT, 22);
         assert_eq!(MemoryTag::all().len(), MEMORY_TAG_COUNT);
     }
 
@@ -740,7 +745,8 @@ mod tests {
             MemoryTag::from_index(20),
             Some(MemoryTag::ExternalRuntimeHost)
         );
-        assert_eq!(MemoryTag::from_index(21), None);
+        assert_eq!(MemoryTag::from_index(21), Some(MemoryTag::DecodedPageCache));
+        assert_eq!(MemoryTag::from_index(22), None);
         assert_eq!(MemoryTag::from_index(100), None);
     }
 

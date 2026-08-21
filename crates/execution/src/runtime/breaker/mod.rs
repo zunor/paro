@@ -11,6 +11,7 @@ pub mod delim;
 pub mod external_table;
 pub mod join;
 pub mod materialized;
+pub mod partition_aggregate_window;
 pub mod recursive;
 pub mod registry;
 pub mod set_operation;
@@ -36,9 +37,12 @@ pub use join::{
     choose_hash_join_radix_bits, CompletionLatch, HashJoinBuildSpillReclaimer,
     HashJoinLocalBuildSpillReclaimer, JoinBuildHandle, JoinBuildId, JoinBuildMode,
     JoinBuildSpillBuffer, JoinBuildStats, JoinExternalModeConfig, JoinPartitionSet,
-    JoinProbeSpillBuffer, JoinRuntimeFilterSketch, JoinSpillState, JoinSpillStats, ProbeSpillSet,
+    JoinProbeSpillBuffer, JoinRuntimeFilterBuilder, JoinSpillState, JoinSpillStats, ProbeSpillSet,
 };
 pub use materialized::{FoundBits, MaterializedHandle, MaterializedReader};
+pub use partition_aggregate_window::{
+    PartitionAggregatePendingSpillReclaimer, PartitionAggregateWindowHandle,
+};
 pub use recursive::{RecursiveDedupSet, RecursiveTableHandle};
 pub use registry::{
     BreakerHandleMetadata, BreakerHandleRegistry, HandleRef, RuntimeBreakerHandle,
@@ -49,6 +53,7 @@ pub use shared_sink::{
     SharedSinkCoordinator, SharedSinkMergeEvent, SharedSinkProducerIndex, SharedSinkState,
 };
 pub use sort::{
-    SortHandle, SortPendingRunsReclaimer, SortSealedState, TopNHandle, TopNRuntimeState,
+    SortHandle, SortMaterializationBuild, SortOutputState, SortPendingRunsReclaimer,
+    SortSealedState, TopNHandle, TopNRuntimeState,
 };
 pub use window::WindowHandle;

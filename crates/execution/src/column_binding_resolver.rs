@@ -29,6 +29,8 @@ pub struct ColumnBindingResolver {
     types: Vec<LogicalType>,
     /// If true, only verify bindings without replacing expressions.
     verify_only: bool,
+    error: Option<paro_common::error::ParoError>,
+    scope: String,
 }
 
 impl ColumnBindingResolver {
@@ -38,6 +40,8 @@ impl ColumnBindingResolver {
             bindings: Vec::new(),
             types: Vec::new(),
             verify_only: false,
+            error: None,
+            scope: "operator input".to_string(),
         }
     }
 
@@ -50,6 +54,8 @@ impl ColumnBindingResolver {
             bindings: Vec::new(),
             types: Vec::new(),
             verify_only: true,
+            error: None,
+            scope: "operator input".to_string(),
         }
     }
 
@@ -61,7 +67,7 @@ impl ColumnBindingResolver {
     pub fn resolve(plan: &mut LogicalOperator) -> Result<()> {
         let mut resolver = Self::new();
         resolver.visit_operator(plan);
-        Ok(())
+        resolver.error.map_or(Ok(()), Err)
     }
 
     /// Verify that all column bindings can be resolved without modifying the plan.
@@ -72,6 +78,9 @@ impl ColumnBindingResolver {
         // First, verify all column references can be resolved
         let mut resolver = Self::new_verify_only();
         resolver.visit_operator(plan);
+        if let Some(error) = resolver.error {
+            return Err(error);
+        }
 
         // Then, verify no duplicate table indices exist
         Self::verify_table_indices(plan)?;
@@ -142,13 +151,22 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             // We need to resolve LHS expressions with LHS bindings, then RHS with RHS
             // =========================================================================
             LogicalOperator::Join(Join::Comparison(comp_join)) => {
+                let join_type = comp_join.join_type;
+                let left_bindings = comp_join.left.get_column_bindings();
+                let right_bindings = comp_join.right.get_column_bindings();
                 // First get the bindings of the LHS and resolve the LHS expressions
                 self.visit_logical_plan(comp_join.left.as_mut());
                 if !comp_join.delim_flipped {
+                    self.scope = format!(
+                        "{join_type} comparison join left duplicate key; left={left_bindings:?}, right={right_bindings:?}"
+                    );
                     for expr in &mut comp_join.duplicate_eliminated_columns {
                         self.visit_expression(expr);
                     }
                 }
+                self.scope = format!(
+                    "{join_type} comparison join probe key; left={left_bindings:?}, right={right_bindings:?}"
+                );
                 for cond in &mut comp_join.conditions {
                     self.visit_expression(&mut cond.left);
                 }
@@ -156,10 +174,16 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
                 // Then get the bindings of the RHS and resolve the RHS expressions
                 self.visit_logical_plan(comp_join.right.as_mut());
                 if comp_join.delim_flipped {
+                    self.scope = format!(
+                        "{join_type} comparison join right duplicate key; left={left_bindings:?}, right={right_bindings:?}"
+                    );
                     for expr in &mut comp_join.duplicate_eliminated_columns {
                         self.visit_expression(expr);
                     }
                 }
+                self.scope = format!(
+                    "{join_type} comparison join build key; left={left_bindings:?}, right={right_bindings:?}"
+                );
                 for cond in &mut comp_join.conditions {
                     self.visit_expression(&mut cond.right);
                 }
@@ -187,6 +211,34 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
                 self.types = left_types;
                 self.types.extend(right_types);
                 self.visit_expression(&mut any_join.condition);
+
+                self.bindings = op.get_column_bindings();
+                self.types = op.types();
+            }
+
+            // =========================================================================
+            // Special case: Aggregate with an optional post-reduction domain
+            //
+            // Ordinary GROUP BY and aggregate inputs are evaluated against the
+            // child and therefore resolve normally. Post-reduction reducers and
+            // their predicate intentionally retain logical bindings to finalized
+            // aggregate outputs; the physical aggregate generator validates and
+            // rebases those independent local domains after this resolver runs.
+            // =========================================================================
+            LogicalOperator::Aggregate(aggregate) => {
+                self.visit_logical_plan(aggregate.child.as_mut());
+                self.scope = "Aggregate input expression".to_string();
+                for expression in &mut aggregate.groups {
+                    self.visit_expression(expression);
+                }
+                for expression in &mut aggregate.aggregates {
+                    self.visit_expression(expression);
+                }
+                if self.error.is_none() {
+                    if let Err(error) = aggregate.verify_post_reduction() {
+                        self.error = Some(error);
+                    }
+                }
 
                 self.bindings = op.get_column_bindings();
                 self.types = op.types();
@@ -283,7 +335,7 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             // =========================================================================
             // Special case: Graph Projection
             // A Projection over a graph chain (GraphScan/GraphExpand)
-            // uses PhysicalGraphProject which does its own late-materialization
+            // uses GraphProject which does its own late-materialization
             // column remapping. We must NOT resolve the COLUMNS expressions
             // here because the graph chain's output bindings (local_id, rowid,
             // edge_rowid, ...) don't correspond to the actual table columns
@@ -303,7 +355,9 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             // 3. Finally update bindings to this operator's output
             // =========================================================================
             _ => {
+                let operator_type = op.op_type();
                 self.visit_operator_children(op);
+                self.scope = format!("{operator_type:?} expression");
                 self.visit_operator_expressions(op);
                 self.bindings = op.get_column_bindings();
                 self.types = op.types();
@@ -322,7 +376,13 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
                 && self.bindings.len() == self.types.len()
                 && expr.return_type != self.types[index]
             {
-                // Type mismatches are unexpected; keep the resolver side-effect free here.
+                if self.error.is_none() {
+                    self.error = Some(paro_error::internal(format!(
+                        "Column binding type mismatch for {:?} in {} at input index {}: expression={:?}, input={:?}",
+                        effective_binding, self.scope, index, expr.return_type, self.types[index]
+                    )));
+                }
+                return None;
             }
 
             if self.verify_only {
@@ -337,8 +397,12 @@ impl LogicalOperatorVisitor for ColumnBindingResolver {
             }));
         }
 
-        // Could not find the binding. Keep the original column reference and let
-        // downstream operators evaluate it positionally if possible.
+        if self.error.is_none() {
+            self.error = Some(paro_error::internal(format!(
+                "Column binding {:?} ({:?}) is not produced by {} {:?}",
+                effective_binding, expr.return_type, self.scope, self.bindings
+            )));
+        }
         None
     }
 }

@@ -801,7 +801,7 @@ impl SerializedDataChunk {
                     Self::serialize_vector(data, child, child_count)?;
                 } else {
                     // No child vector, write zeros
-                    let child_size = child_type.physical_size();
+                    let child_size = child_type.type_size();
                     let total_bytes = count * array_size * child_size;
                     data.resize(data.len() + total_bytes, 0);
                 }
@@ -834,7 +834,7 @@ impl SerializedDataChunk {
             }
             _ => {
                 // For unsupported types, write raw bytes based on physical size
-                let type_size = logical_type.physical_size();
+                let type_size = logical_type.type_size();
                 if type_size > 0 && vector.vector_type() == VectorType::Flat {
                     let slice: &[u8] = unsafe {
                         std::slice::from_raw_parts(vector.flat_data::<u8>(), count * type_size)
@@ -1129,7 +1129,7 @@ impl SerializedDataChunk {
             }
             _ => {
                 // For unsupported types, read raw bytes based on physical size
-                let type_size = logical_type.physical_size();
+                let type_size = logical_type.type_size();
                 if type_size > 0 {
                     let total_bytes = count * type_size;
                     if *offset + total_bytes > data.len() {

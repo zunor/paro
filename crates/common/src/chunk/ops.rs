@@ -132,6 +132,57 @@ impl Chunk {
         Ok(())
     }
 
+    /// Reset only the writable suffix of a reusable output chunk.
+    ///
+    /// Operators that replace a prefix with dictionary/reference vectors do
+    /// not need to allocate fresh flat vectors for that prefix. The suffix is
+    /// restored from the same reset metadata as [`Self::try_reset`], while the
+    /// caller must replace every column before `first_writable_column` before
+    /// publishing the chunk.
+    pub fn try_reset_writable_suffix(
+        &mut self,
+        first_writable_column: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<()> {
+        if first_writable_column > self.data.len() {
+            return Err(crate::error::internal(format!(
+                "chunk writable suffix starts at column {first_writable_column}, but chunk has {} columns",
+                self.data.len()
+            )));
+        }
+
+        self.count = 0;
+        if let Some(reset_state) = &mut self.reset_state {
+            debug_assert_eq!(reset_state.columns.len(), self.data.len());
+            self.capacity = self.initial_capacity;
+            self.allocator = reset_state.allocator.clone();
+            for (col, state) in self
+                .data
+                .iter_mut()
+                .zip(reset_state.columns.iter_mut())
+                .skip(first_writable_column)
+            {
+                if let Some(vector) = Arc::get_mut(col) {
+                    state.try_reset_unique(vector)?;
+                } else {
+                    *col = Arc::new(state.try_reset_shared()?);
+                }
+            }
+            return Ok(());
+        }
+
+        self.allocator = allocator.clone();
+        for col in self.data.iter_mut().skip(first_writable_column) {
+            let logical_type = col.logical_type().clone();
+            *col = Arc::new(Vector::try_new(
+                logical_type,
+                self.capacity,
+                allocator.clone(),
+            )?);
+        }
+        Ok(())
+    }
+
     pub fn destroy(&mut self) {
         self.data.clear();
         self.count = 0;

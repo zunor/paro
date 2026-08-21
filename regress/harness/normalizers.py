@@ -21,7 +21,11 @@ _SEARCH_EXPLAIN_ID_RE = re.compile(
 _EXTERNAL_LATENCY_RE = re.compile(
     r"Latency\(us\):\s*acquire=\d+\s+queue=\d+\s+kernel=\d+\s+encode_decode=\d+"
 )
-_ROWS_LOOPS_RE = re.compile(r"rows=\d+\s+loops=\d+")
+_OPERATOR_LOOPS_RE = re.compile(r"\bloops=\d+")
+_ROWS_LOOPS_RE = re.compile(r"rows=\d+\s+loops=(?:\d+|<loops>)")
+_OPTIONAL_SCHEDULER_RUNTIME_RE = re.compile(
+    r"(?:\s+scheduler_(?:worker_count|morsel_count|blocked_count|ready_time_us)=\d+)+"
+)
 _JSON_OPERATOR_TIMING_RE = re.compile(r'"(startup_time_ms|total_time_ms)"\s*:\s*[\d.]+')
 _JSON_OPERATOR_COUNTERS_RE = re.compile(r'"(rows|loops)"\s*:\s*\d+')
 _PROFILE_LINE_RE = re.compile(
@@ -70,6 +74,12 @@ def normalize_explain_operator_timing(lines: list[str]) -> list[str]:
     result: list[str] = []
     for line in lines:
         line = _ACTUAL_TIME_RE.sub("actual time=<time-range>", line)
+        # Parallel pipelines may use a different number of scheduler turns while
+        # producing the same deterministic row count.
+        line = _OPERATOR_LOOPS_RE.sub("loops=<loops>", line)
+        # Scheduler engagement depends on runtime queueing and morsel availability. The
+        # optional suffix can legitimately appear or disappear between identical runs.
+        line = _OPTIONAL_SCHEDULER_RUNTIME_RE.sub("", line)
         line = _JSON_OPERATOR_TIMING_RE.sub(lambda m: f'"{m.group(1)}": 0.0', line)
         line = _PROFILE_LINE_RE.sub(
             (

@@ -4,178 +4,6 @@
 use super::*;
 
 impl<'a> PipelineLowerer<'a> {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_aggregate_to_sink(
-        &mut self,
-        root: PhysicalPlanNodeId,
-        spec: &AggregateSpec,
-        consumer_transforms: Vec<TransformSpec>,
-        sink: SinkSpec,
-        sink_sharing: SinkSharing,
-        output: RowType,
-        pipelines: &mut Vec<PipelineSpec>,
-        dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<PipelineId> {
-        let child = self.only_child(root)?;
-        let aggregate_output = self.plan.node(root).output.clone();
-        let handle = self.handles.register(
-            BreakerHandleKind::Aggregate,
-            aggregate_output.clone(),
-            Default::default(),
-        );
-
-        let producer_sink = aggregate_build_sink_spec(handle, spec.clone());
-        let producer = self.lower_subtree_to_sink(
-            child,
-            producer_sink,
-            SinkSharing::Exclusive,
-            self.plan.node(child).output.clone(),
-            pipelines,
-            dependencies,
-        )?;
-        self.handles.set_producer(handle, producer)?;
-
-        let consumer_source = aggregate_emit_source_spec(handle, spec.clone());
-        let pushed = self.push_pipeline(
-            consumer_source,
-            consumer_transforms,
-            sink,
-            sink_sharing,
-            output,
-            pipelines,
-            dependencies,
-        )?;
-        let consumer = pushed.entry;
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::FinalizeBeforeEmit,
-        });
-        Ok(pushed.tail)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_topn_to_sink(
-        &mut self,
-        root: PhysicalPlanNodeId,
-        spec: &TopNSpec,
-        consumer_transforms: Vec<TransformSpec>,
-        sink: SinkSpec,
-        sink_sharing: SinkSharing,
-        output: RowType,
-        pipelines: &mut Vec<PipelineSpec>,
-        dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<PipelineId> {
-        ensure_streaming_topn_supported(spec)?;
-        let child = self.only_child(root)?;
-        let topn_output = self.plan.node(root).output.clone();
-        let handle =
-            self.handles
-                .register(BreakerHandleKind::TopN, topn_output, Default::default());
-
-        let producer = self.lower_subtree_to_sink(
-            child,
-            SinkSpec::TopNBuild(TopNBuildSinkSpec {
-                handle,
-                spec: spec.clone(),
-                required: Default::default(),
-            }),
-            SinkSharing::Exclusive,
-            self.plan.node(child).output.clone(),
-            pipelines,
-            dependencies,
-        )?;
-        self.handles.set_producer(handle, producer)?;
-
-        let consumer_source = SourceSpec::TopNEmit(TopNEmitSourceSpec {
-            handle,
-            spec: spec.clone(),
-        });
-        let pushed = self.push_pipeline(
-            consumer_source,
-            consumer_transforms,
-            sink,
-            sink_sharing,
-            output,
-            pipelines,
-            dependencies,
-        )?;
-        let consumer = pushed.entry;
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::FinalizeBeforeEmit,
-        });
-        Ok(pushed.tail)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn lower_sort_to_sink(
-        &mut self,
-        root: PhysicalPlanNodeId,
-        spec: &SortSpec,
-        consumer_transforms: Vec<TransformSpec>,
-        sink: SinkSpec,
-        sink_sharing: SinkSharing,
-        output: RowType,
-        pipelines: &mut Vec<PipelineSpec>,
-        dependencies: &mut Vec<PipelineDependency>,
-    ) -> Result<PipelineId> {
-        let child = self.only_child(root)?;
-        let sort_output = self.plan.node(root).output.clone();
-        let input = self.plan.node(child).output.clone();
-        let handle = self.handles.register(
-            BreakerHandleKind::Sort,
-            sort_output.clone(),
-            Default::default(),
-        );
-
-        let producer = self.lower_subtree_to_sink(
-            child,
-            SinkSpec::SortBuild(SortBuildSinkSpec {
-                handle,
-                orders: spec.orders.clone(),
-                projection_map: spec.projection_map.clone(),
-                input_types: input.types.clone(),
-                output_names: sort_output.names.clone(),
-                output_types: sort_output.types.clone(),
-                force_external: false,
-                required: Default::default(),
-            }),
-            SinkSharing::Exclusive,
-            input,
-            pipelines,
-            dependencies,
-        )?;
-        self.handles.set_producer(handle, producer)?;
-
-        let consumer_source = SourceSpec::SortEmit(SortEmitSourceSpec {
-            handle,
-            ordering: ordering_spec_from_orders(&spec.orders),
-            output_names: sort_output.names.clone(),
-            output_types: sort_output.types.clone(),
-        });
-        let pushed = self.push_pipeline(
-            consumer_source,
-            consumer_transforms,
-            sink,
-            sink_sharing,
-            output,
-            pipelines,
-            dependencies,
-        )?;
-        let consumer = pushed.entry;
-        self.handles.add_consumer(handle, consumer)?;
-        dependencies.push(PipelineDependency {
-            producer,
-            consumer,
-            kind: DependencyKind::FinalizeBeforeEmit,
-        });
-        Ok(pushed.tail)
-    }
-
     pub(crate) fn collect_tail_to_breaker(
         &mut self,
         root: PhysicalPlanNodeId,
@@ -198,19 +26,6 @@ impl<'a> PipelineLowerer<'a> {
                     transforms.push(TransformSpec::Limit(spec.clone()));
                     current = self.only_child(current)?;
                 }
-                PhysicalNodeKind::Aggregate(spec) if is_streaming_aggregate_supported(spec) => {
-                    let child = self.only_child(current)?;
-                    if self.subtree_root_needs_post_join_fanout(child)? {
-                        transforms.reverse();
-                        return Ok(Some(BreakerTail {
-                            breaker: current,
-                            transforms,
-                            output: self.plan.node(root).output.clone(),
-                        }));
-                    }
-                    transforms.push(TransformSpec::StreamingAggregate(spec.clone()));
-                    current = child;
-                }
                 PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {
                     let child = self.only_child(current)?;
                     if self.subtree_root_needs_post_join_fanout(child)? {
@@ -226,6 +41,10 @@ impl<'a> PipelineLowerer<'a> {
                 }
                 PhysicalNodeKind::GraphExpand(spec) => {
                     transforms.push(TransformSpec::GraphExpand(spec.clone()));
+                    current = self.only_child(current)?;
+                }
+                PhysicalNodeKind::RowFetch(spec) => {
+                    transforms.push(TransformSpec::RowFetch(spec.clone()));
                     current = self.only_child(current)?;
                 }
                 PhysicalNodeKind::GraphProject(spec) => {
@@ -281,12 +100,10 @@ impl<'a> PipelineLowerer<'a> {
             | PhysicalNodeKind::Project(_)
             | PhysicalNodeKind::Limit(_)
             | PhysicalNodeKind::GraphExpand(_)
+            | PhysicalNodeKind::RowFetch(_)
             | PhysicalNodeKind::GraphProject(_)
             | PhysicalNodeKind::GraphShortestPath(_)
             | PhysicalNodeKind::ExternalProject(_) => Some(self.only_child(root)?),
-            PhysicalNodeKind::Aggregate(spec) if is_streaming_aggregate_supported(spec) => {
-                Some(self.only_child(root)?)
-            }
             PhysicalNodeKind::Window(spec) if is_streaming_window_supported(spec) => {
                 Some(self.only_child(root)?)
             }

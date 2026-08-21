@@ -31,33 +31,31 @@ MATERIALIZED_CTE
     Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
     ->  PROJECTION
       Output: p.id, p.peer_id, a.total
-      ->  FILTER
-        Filter: #2 = #3
-        ->  CROSS_PRODUCT
-          ->  PROJECTION
-            Output: expr_1, expr_2, expr_3
-            ->  PROJECTION
-              Output: l.id, peer_id, l.grp
-              ->  FILTER
-                Filter: #1 = #4 AND #0 < #3
-                ->  CROSS_PRODUCT
-                  ->  CTE_SCAN
-                    CTE Index: 0
-                    Table Index: 16
-                  ->  CTE_SCAN
-                    CTE Index: 0
-                    Table Index: 17
-          ->  PROJECTION
-            Output: expr_1, expr_2
-            ->  PROJECTION
-              Output: grp, total
-              ->  AGGREGATE
-                Group Key: #1
-                Aggregates: sum(#2)
-                Output: aggr_0, aggr_1
-                ->  CTE_SCAN
-                  CTE Index: 0
-                  Table Index: 25
+      ->  HASH_JOIN
+        Join Type: INNER
+        Join Condition: #2 = #0
+        ->  PROJECTION
+          Output: expr_1, expr_2, expr_3
+          ->  FILTER
+            Filter: #0 < #2
+            ->  HASH_JOIN
+              Join Type: INNER
+              Join Condition: #1 = #1
+              ->  CTE_SCAN
+                CTE Index: 0
+                Table Index: 16
+              ->  CTE_SCAN
+                CTE Index: 0
+                Table Index: 17
+        ->  PROJECTION
+          Output: expr_1, expr_2
+          ->  AGGREGATE
+            Group Key: #1
+            Aggregates: sum(#2)
+            Output: aggr_0, aggr_1
+            ->  CTE_SCAN
+              CTE Index: 0
+              Table Index: 25
 
 -- @normalize explain_operator_timing,explain_summary_timing
 EXPLAIN ANALYZE
@@ -85,33 +83,34 @@ JOIN agg AS a ON a.grp = p.grp
 ORDER BY p.id, p.peer_id;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=2)
-  SINK #1 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=1)
+  SOURCE #0 VALUES (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #1 CTE_MATERIALIZE (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=2)
-  SINK #3 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=1)
+  SOURCE #2 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #3 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=5 loops=<loops>)
 PIPELINE 2
-  SOURCE #4 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #5 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #6 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #7 MATERIALIZE (actual time=<time-range> rows=3 loops=1)
+  SOURCE #4 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #5 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #6 HASH_JOIN_BUILD (actual time=<time-range> rows=3 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 3
-  SOURCE #8 CTE_SCAN (actual time=<time-range> rows=5 loops=2)
-  SINK #9 MATERIALIZE (actual time=<time-range> rows=5 loops=1)
+  SOURCE #7 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #8 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 4
-  SOURCE #10 CTE_SCAN (actual time=<time-range> rows=5 loops=2)
-  TRANSFORM #11 CROSS_PRODUCT_PROBE (actual time=<time-range> rows=25 loops=5)
-  TRANSFORM #12 FILTER (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #13 PROJECTION (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #14 PROJECTION (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #15 CROSS_PRODUCT_PROBE (actual time=<time-range> rows=6 loops=2)
-  TRANSFORM #16 FILTER (actual time=<time-range> rows=2 loops=2)
-  TRANSFORM #17 PROJECTION (actual time=<time-range> rows=2 loops=2)
-  SINK #18 SORT_BUILD (actual time=<time-range> rows=2 loops=2 peak_memory_bytes=262166)
+  SOURCE #9 CTE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #10 HASH_JOIN_PROBE (actual time=<time-range> rows=9 loops=<loops>)
+  TRANSFORM #11 FILTER (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #12 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #13 HASH_JOIN_PROBE (actual time=<time-range> rows=2 loops=<loops>)
+  TRANSFORM #14 PROJECTION (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #15 SORT_BUILD (actual time=<time-range> rows=2 loops=<loops> peak_memory_bytes=262148)
 PIPELINE 5
-  SOURCE #19 SORT_EMIT (actual time=<time-range> rows=2 loops=2)
-  SINK #20 CLIENT_RESULT (actual time=<time-range> rows=2 loops=1)
-PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+  SOURCE #16 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #17 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #18 SORT_BUILD (actual time=<time-range> rows=0 loops=<loops>)
+PIPELINE 6
+  SOURCE #19 SORT_EMIT (actual time=<time-range> rows=2 loops=<loops>)
+  SINK #20 CLIENT_RESULT (actual time=<time-range> rows=2 loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=2 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 2
@@ -159,32 +158,34 @@ walk(node, depth) AS (
 SELECT node, depth FROM walk ORDER BY depth, node;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=2)
-  SINK #1 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=1 loops=1)
+  SOURCE #0 VALUES (actual time=<time-range> rows=1 loops=<loops>)
+  SINK #1 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=1 loops=<loops>)
 PIPELINE 1
-  SOURCE #2 VALUES (actual time=<time-range> rows=15 loops=6)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=15 loops=3)
-  SINK #4 MATERIALIZE (actual time=<time-range> rows=15 loops=3)
+  SOURCE #2 VALUES (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #4 HASH_JOIN_BUILD (actual time=<time-range> rows=5 loops=<loops> runtime_filter_installed_count=1)
 PIPELINE 2
-  SOURCE #5 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=7)
-  TRANSFORM #6 FILTER (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #7 CROSS_PRODUCT_PROBE (actual time=<time-range> rows=15 loops=3)
-  TRANSFORM #8 FILTER (actual time=<time-range> rows=4 loops=3)
-  TRANSFORM #9 PROJECTION (actual time=<time-range> rows=4 loops=3)
-  SINK #10 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=4 loops=3)
+  SOURCE #5 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #6 FILTER (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #7 HASH_JOIN_PROBE (actual time=<time-range> rows=4 loops=<loops>)
+  TRANSFORM #8 PROJECTION (actual time=<time-range> rows=4 loops=<loops>)
+  SINK #9 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=4 loops=<loops>)
 PIPELINE 3
-  SOURCE #11 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=5)
-  TRANSFORM #12 PROJECTION (actual time=<time-range> rows=5 loops=4)
-  TRANSFORM #13 PROJECTION (actual time=<time-range> rows=5 loops=4)
-  SINK #14 SORT_BUILD (actual time=<time-range> rows=5 loops=4 peak_memory_bytes=262175)
+  SOURCE #10 HASH_JOIN_SPILL_REPLAY (actual time=<time-range> rows=0 loops=<loops>)
+  TRANSFORM #11 PROJECTION (actual time=<time-range> rows=0 loops=<loops>)
+  SINK #12 RECURSIVE_TABLE_APPEND (actual time=<time-range> rows=0 loops=<loops>)
 PIPELINE 4
-  SOURCE #15 SORT_EMIT (actual time=<time-range> rows=5 loops=2)
-  SINK #16 CLIENT_RESULT (actual time=<time-range> rows=5 loops=1)
+  SOURCE #13 RECURSIVE_TABLE_SCAN (actual time=<time-range> rows=5 loops=<loops>)
+  TRANSFORM #14 PROJECTION (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #15 SORT_BUILD (actual time=<time-range> rows=5 loops=<loops> peak_memory_bytes=262130)
+PIPELINE 5
+  SOURCE #16 SORT_EMIT (actual time=<time-range> rows=5 loops=<loops>)
+  SINK #17 CLIENT_RESULT (actual time=<time-range> rows=5 loops=<loops>)
 CONTROL_REGION 0 RECURSIVE_CTE (iterations=3 termination=empty_delta)
   ITERATION 1 (delta_rows=1 working_rows=1)
   ITERATION 2 (delta_rows=2 working_rows=2)
   ITERATION 3 (delta_rows=2 working_rows=2)
-PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=1 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
 Rows Returned: 5

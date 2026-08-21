@@ -32,11 +32,7 @@ pub(crate) fn build_payload_chunk_ref<'a>(
         return Ok(payload);
     }
 
-    let projected_len = if projection.is_empty() {
-        input.column_count()
-    } else {
-        projection.len()
-    };
+    let projected_len = projection.len();
     if projected_len != output_types.len() {
         return Err(paro_error::internal(format!(
             "hash join build payload projection has {projected_len} columns but {} types",
@@ -44,13 +40,12 @@ pub(crate) fn build_payload_chunk_ref<'a>(
         )));
     }
 
-    let identity_projection = projection.is_empty()
-        || (projection.len() == input.column_count()
-            && projection
-                .iter()
-                .copied()
-                .enumerate()
-                .all(|(output_idx, input_idx)| output_idx == input_idx));
+    let identity_projection = projection.len() == input.column_count()
+        && projection
+            .iter()
+            .copied()
+            .enumerate()
+            .all(|(output_idx, input_idx)| output_idx == input_idx);
     if identity_projection {
         return Ok(input);
     }
@@ -70,6 +65,51 @@ pub(crate) fn build_payload_chunk_ref<'a>(
                 paro_error::internal("hash join build projection out of bounds")
             })?));
     }
+    payload.set_capacity(input.size().max(1));
+    payload.try_set_cardinality(input.size())?;
+    Ok(payload)
+}
+
+pub(crate) fn build_payload_with_extras_ref<'a>(
+    input: &'a Chunk,
+    projection: &[usize],
+    output_types: &[LogicalType],
+    extras: &'a Chunk,
+    slot: &'a mut Option<Chunk>,
+) -> Result<&'a Chunk> {
+    if extras.is_empty() && input.size() != 0 {
+        return Err(paro_error::internal(
+            "hash join residual payload cardinality is empty",
+        ));
+    }
+    if extras.size() != input.size() {
+        return Err(paro_error::internal(
+            "hash join residual payload cardinality does not match build input",
+        ));
+    }
+    if output_types.len() != projection.len() + extras.column_count() {
+        return Err(paro_error::internal(
+            "hash join visible and residual payload widths do not match stored types",
+        ));
+    }
+    if slot.is_none() {
+        *slot = Some(Chunk::try_new(input.allocator().clone())?);
+    }
+    let payload = slot
+        .as_mut()
+        .expect("hash join residual payload metadata initialized");
+    payload.data.clear();
+    payload
+        .data
+        .reserve(projection.len() + extras.column_count());
+    for &column_idx in projection {
+        payload
+            .data
+            .push(Arc::clone(input.data.get(column_idx).ok_or_else(|| {
+                paro_error::internal("hash join build projection out of bounds")
+            })?));
+    }
+    payload.data.extend(extras.data.iter().cloned());
     payload.set_capacity(input.size().max(1));
     payload.try_set_cardinality(input.size())?;
     Ok(payload)
@@ -99,12 +139,12 @@ mod tests {
     }
 
     #[test]
-    fn build_payload_empty_projection_reuses_input_columns_without_projection_vec() {
+    fn build_payload_identity_projection_reuses_input_columns() {
         let input = input_chunk();
         let mut slot = None;
         let payload = build_payload_chunk_ref(
             &input,
-            &[],
+            &[0, 1],
             &[LogicalType::Integer, LogicalType::Integer],
             &mut slot,
         )

@@ -25,22 +25,38 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
+use arc_swap::ArcSwapOption;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::SelectionVector;
+use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 use paro_storage::buffer::BufferPool;
 use paro_storage::buffer::MemoryTag;
 use paro_storage::row::RowLayout;
 
 use super::build_store::{BuildRowLayout, BuildStoreScanState, HashBuildStore};
-use super::hash_kernel::JoinKeyLayout;
+use super::hash_kernel::{JoinKeyLayout, PreparedProbeKeys};
 use super::ht_entry::HtEntry;
+pub(crate) use super::integer_index::ConcurrentBuildTimeIntegerIndexBuilder as BuildTimeIntegerIndexBuilder;
+use super::integer_index::{
+    ConcurrentBuildTimeIntegerIndexBuilder, ExactIntegerJoinIndex, IntegerKeyKind,
+};
+use super::pair_integer_index::ExactI64PairJoinIndex;
 use super::scan_structure::ScanStructure;
+
+#[path = "integer_finalize.rs"]
+mod integer_finalize;
+use integer_finalize::BuiltIntegerIndex;
+pub(crate) use integer_finalize::ParallelDirectIntegerIndexBuild;
+#[path = "pair_integer_finalize.rs"]
+mod pair_integer_finalize;
+#[path = "table_grouped_reduction.rs"]
+mod table_grouped_reduction;
+use table_grouped_reduction::GroupedReductionExtremaState;
 
 #[derive(Debug, Default)]
 struct HtEntryTable {
@@ -94,6 +110,11 @@ pub struct JoinHashTableConfig {
     pub initial_radix_bits: usize,
     /// Whether to use salt for large hash tables.
     pub use_salt_threshold: usize,
+    /// The complete equality-key tuple is proven unique by the logical plan.
+    pub build_keys_unique: bool,
+    /// Build-time direct artifact shared by local tables. It is absent from the
+    /// merged table so finish can take sole ownership and publish it.
+    pub(crate) build_time_integer_builder: Option<Arc<ConcurrentBuildTimeIntegerIndexBuilder>>,
 }
 
 impl Default for JoinHashTableConfig {
@@ -101,6 +122,8 @@ impl Default for JoinHashTableConfig {
         Self {
             initial_radix_bits: 4,
             use_salt_threshold: 8192,
+            build_keys_unique: false,
+            build_time_integer_builder: None,
         }
     }
 }
@@ -144,6 +167,8 @@ pub struct JoinHashTable {
 
     /// Types of build-side payload columns.
     pub build_types: Vec<LogicalType>,
+    /// Visible prefix of `build_types`; remaining columns are execution-only.
+    build_output_count: usize,
 
     /// Column index of the found flag inside the build-side row layout.
     pub found_flag_column_index: Option<usize>,
@@ -165,6 +190,27 @@ pub struct JoinHashTable {
 
     /// Hash table entries (pointer table).
     entries: Mutex<HtEntryTable>,
+
+    /// Optional exact index owner for bounded unique integer equality keys.
+    integer_index: ArcSwapOption<ExactIntegerJoinIndex>,
+
+    /// Optional exact index for two-column BIGINT equality keys.
+    pair_integer_index: ArcSwapOption<ExactI64PairJoinIndex>,
+
+    /// Lazily allocated compact per-key summaries for fused reductions.
+    grouped_reduction_extrema: Mutex<GroupedReductionExtremaState>,
+
+    /// Build-time bounds accumulated from hot key vectors. Keeping this local
+    /// to each parallel table removes a full serialized-row pass at finalize.
+    integer_index_build_stats: Mutex<IntegerIndexBuildStats>,
+
+    /// Physical key kind retained even if later input makes the exact index
+    /// ineligible. It is used to materialize hashes for generic fallback.
+    integer_key_kind: Option<IntegerKeyKind>,
+
+    /// Whether any build rows were appended without computing their hash.
+    /// Hashing is deferred while a bounded exact integer index is viable.
+    deferred_hashes: AtomicBool,
 
     /// Lock-free read pointer published after finalize.
     probe_entries: AtomicPtr<HtEntry>,
@@ -198,6 +244,121 @@ pub struct JoinHashTable {
 
     /// Row count.
     count: AtomicUsize,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum IntegerIndexBuildStats {
+    Ineligible,
+    Empty {
+        kind: IntegerKeyKind,
+    },
+    Bounded {
+        kind: IntegerKeyKind,
+        minimum: u128,
+        maximum: u128,
+        count: usize,
+    },
+}
+
+impl IntegerIndexBuildStats {
+    fn new(
+        join_type: JoinType,
+        equality_types: &[LogicalType],
+        comparisons: &[JoinComparisonType],
+    ) -> Self {
+        if join_type == JoinType::Invalid
+            || equality_types.len() != 1
+            || comparisons
+                .iter()
+                .any(|comparison| *comparison != JoinComparisonType::Equal)
+        {
+            return Self::Ineligible;
+        }
+        IntegerKeyKind::from_logical_type(&equality_types[0])
+            .map_or(Self::Ineligible, |kind| Self::Empty { kind })
+    }
+
+    fn add_batch(&mut self, vector: &Vector, logical_count: usize, selected: &[u32]) -> Result<()> {
+        let kind = match *self {
+            Self::Empty { kind } | Self::Bounded { kind, .. } => kind,
+            Self::Ineligible => return Ok(()),
+        };
+        let Some((minimum, maximum)) = kind.selected_bounds(vector, logical_count, selected)?
+        else {
+            *self = Self::Ineligible;
+            return Ok(());
+        };
+        *self = match *self {
+            Self::Empty { .. } => Self::Bounded {
+                kind,
+                minimum,
+                maximum,
+                count: selected.len(),
+            },
+            Self::Bounded {
+                minimum: current_minimum,
+                maximum: current_maximum,
+                count,
+                ..
+            } => Self::Bounded {
+                kind,
+                minimum: current_minimum.min(minimum),
+                maximum: current_maximum.max(maximum),
+                count: count.saturating_add(selected.len()),
+            },
+            Self::Ineligible => unreachable!("ineligible stats returned above"),
+        };
+        Ok(())
+    }
+
+    fn exact_index_candidate(self) -> bool {
+        !matches!(self, Self::Ineligible)
+    }
+
+    fn merge(&mut self, incoming: Self) {
+        *self = match (*self, incoming) {
+            (Self::Ineligible, _) | (_, Self::Ineligible) => Self::Ineligible,
+            (
+                current @ Self::Empty { kind },
+                Self::Empty {
+                    kind: incoming_kind,
+                },
+            ) if kind == incoming_kind => current,
+            (
+                Self::Empty { kind },
+                bounded @ Self::Bounded {
+                    kind: incoming_kind,
+                    ..
+                },
+            ) if kind == incoming_kind => bounded,
+            (
+                bounded @ Self::Bounded { kind, .. },
+                Self::Empty {
+                    kind: incoming_kind,
+                },
+            ) if kind == incoming_kind => bounded,
+            (
+                Self::Bounded {
+                    kind,
+                    minimum,
+                    maximum,
+                    count,
+                },
+                Self::Bounded {
+                    kind: incoming_kind,
+                    minimum: incoming_minimum,
+                    maximum: incoming_maximum,
+                    count: incoming_count,
+                },
+            ) if kind == incoming_kind => Self::Bounded {
+                kind,
+                minimum: minimum.min(incoming_minimum),
+                maximum: maximum.max(incoming_maximum),
+                count: count.saturating_add(incoming_count),
+            },
+            _ => Self::Ineligible,
+        };
+    }
 }
 
 impl std::fmt::Debug for JoinHashTable {
@@ -250,6 +411,33 @@ impl JoinHashTable {
         config: JoinHashTableConfig,
         memory: MemoryAccountingContext,
     ) -> Self {
+        let build_output_count = build_types.len();
+        Self::new_with_memory_and_output_count(
+            buffer_pool,
+            allocator,
+            conditions,
+            build_types,
+            build_output_count,
+            join_type,
+            config,
+            memory,
+        )
+    }
+
+    pub fn new_with_memory_and_output_count(
+        buffer_pool: Arc<BufferPool>,
+        allocator: Arc<dyn Allocator>,
+        conditions: Vec<JoinCondition>,
+        build_types: Vec<LogicalType>,
+        build_output_count: usize,
+        join_type: JoinType,
+        config: JoinHashTableConfig,
+        memory: MemoryAccountingContext,
+    ) -> Self {
+        assert!(
+            build_output_count <= build_types.len(),
+            "visible hash-join payload cannot exceed stored payload"
+        );
         // Extract equality types from conditions
         let mut equality_types = Vec::new();
         let mut null_values_are_equal = Vec::new();
@@ -268,7 +456,8 @@ impl JoinHashTable {
             }
         }
 
-        let found_flag_column_index = if Self::propagates_build_side(join_type) {
+        let build_keys_may_be_null = Self::propagates_build_side(join_type);
+        let found_flag_column_index = if build_keys_may_be_null {
             Some(equality_types.len() + build_types.len())
         } else {
             None
@@ -278,7 +467,11 @@ impl JoinHashTable {
             build_types.clone(),
             found_flag_column_index.is_some(),
         );
-        let key_layout = JoinKeyLayout::new(&equality_types);
+        let key_layout = JoinKeyLayout::new(
+            &equality_types,
+            &equality_comparisons,
+            build_keys_may_be_null,
+        );
         let spill_layout = Arc::new(RowLayout::from_types(
             build_row_layout.spill_types().to_vec(),
             paro_storage::row::RowValidityType::CanHaveNullValues,
@@ -295,6 +488,13 @@ impl JoinHashTable {
         let pointer_offset = build_row_layout.next_offset();
         let hash_offset = build_row_layout.hash_offset();
         let found_flag_offset = found_flag_column_index.map(|_| build_row_layout.found_offset());
+        let integer_index_build_stats =
+            IntegerIndexBuildStats::new(join_type, &equality_types, &equality_comparisons);
+        let integer_key_kind = match integer_index_build_stats {
+            IntegerIndexBuildStats::Empty { kind }
+            | IntegerIndexBuildStats::Bounded { kind, .. } => Some(kind),
+            IntegerIndexBuildStats::Ineligible => None,
+        };
 
         Self {
             buffer_pool,
@@ -306,6 +506,7 @@ impl JoinHashTable {
             equality_comparisons,
             key_layout,
             build_types,
+            build_output_count,
             found_flag_column_index,
             build_row_layout,
             build_memory,
@@ -313,6 +514,12 @@ impl JoinHashTable {
             spill_layout,
             build_store: Mutex::new(build_store),
             entries: Mutex::new(HtEntryTable::default()),
+            integer_index: ArcSwapOption::empty(),
+            pair_integer_index: ArcSwapOption::empty(),
+            grouped_reduction_extrema: Mutex::new(GroupedReductionExtremaState::Unconfigured),
+            integer_index_build_stats: Mutex::new(integer_index_build_stats),
+            integer_key_kind,
+            deferred_hashes: AtomicBool::new(false),
             probe_entries: AtomicPtr::new(ptr::null_mut()),
             capacity: AtomicUsize::new(0),
             bitmask: AtomicUsize::new(0),
@@ -342,6 +549,14 @@ impl JoinHashTable {
 
     pub fn key_count(&self) -> usize {
         self.build_row_layout.key_count()
+    }
+
+    pub fn build_output_count(&self) -> usize {
+        self.build_output_count
+    }
+
+    pub fn build_output_types(&self) -> &[LogicalType] {
+        &self.build_types[..self.build_output_count]
     }
 
     pub fn spill_types(&self) -> &[LogicalType] {
@@ -377,7 +592,13 @@ impl JoinHashTable {
     pub fn size_in_bytes(&self) -> usize {
         let data_size = self.build_store.lock().unwrap().size_in_bytes();
         let entries_size = self.entries.lock().unwrap().size_in_bytes();
-        data_size + entries_size
+        let integer_index_size = self
+            .integer_index
+            .load()
+            .as_ref()
+            .map(|index| index.size_in_bytes())
+            .unwrap_or(0);
+        data_size + entries_size + integer_index_size + self.pair_integer_index_size()
     }
 
     /// Estimate pointer-table size for a given row count.
@@ -404,11 +625,39 @@ impl JoinHashTable {
             .read_value(row_ptr as *const u8, key_idx)
     }
 
-    pub fn read_build_value(&self, row_ptr: usize, build_idx: usize) -> Value {
-        self.build_row_layout.read_value(
-            row_ptr as *const u8,
-            self.build_row_layout.payload_base_col_idx(build_idx),
-        )
+    /// Gather one build-side payload column for matched row pointers.
+    ///
+    /// # Safety
+    /// Every non-zero entry in `row_ptrs` must come from this hash table's build
+    /// store and remain live for this call.
+    pub unsafe fn gather_build_column(
+        &self,
+        row_ptrs: &[usize],
+        build_idx: usize,
+        output: &mut Vector,
+    ) -> Result<()> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe {
+            self.build_row_layout
+                .gather_payload_column(row_ptrs, build_idx, output)
+        }
+    }
+
+    /// Read one fixed-width build payload cell directly from its row.
+    ///
+    /// # Safety
+    /// `row_ptr` must come from this table and remain live, and `T` must match
+    /// the payload column's physical representation.
+    pub unsafe fn read_build_payload_fixed<T: Copy>(
+        &self,
+        row_ptr: usize,
+        build_idx: usize,
+    ) -> Option<T> {
+        // SAFETY: forwarded from this method's caller.
+        unsafe {
+            self.build_row_layout
+                .read_payload_fixed(row_ptr as *const u8, build_idx)
+        }
     }
 
     pub fn scan_spill_chunk(
@@ -416,6 +665,7 @@ impl JoinHashTable {
         state: &mut BuildStoreScanState,
         output: &mut Chunk,
     ) -> Result<usize> {
+        self.materialize_deferred_hashes();
         self.build_store
             .lock()
             .unwrap()
@@ -441,6 +691,7 @@ impl JoinHashTable {
     where
         F: FnMut(&Chunk) -> Result<()>,
     {
+        self.materialize_deferred_hashes();
         let empty_store = HashBuildStore::new_with_memory(
             self.buffer_pool.clone(),
             self.allocator.clone(),
@@ -453,6 +704,12 @@ impl JoinHashTable {
             std::mem::replace(&mut *store, empty_store)
         };
         self.count.store(0, Ordering::Relaxed);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
+        self.deferred_hashes.store(false, Ordering::Release);
         drained_store.drain_spill_chunks(visitor)
     }
 
@@ -469,6 +726,13 @@ impl JoinHashTable {
                 ))
             }
         };
+        if self.deferred_hashes.swap(false, Ordering::AcqRel) {
+            let kind = self
+                .integer_key_kind
+                .expect("deferred integer hashes require a physical key kind");
+            let layout = Arc::clone(self.build_row_layout.base());
+            store.materialize_deferred_hashes(|row_ptr| kind.row_hash(layout.as_ref(), row_ptr, 0));
+        }
         let drained_bytes = store.size_in_bytes();
         if drained_bytes == 0 {
             return Ok(Some(0));
@@ -483,8 +747,25 @@ impl JoinHashTable {
         let drained_store = std::mem::replace(&mut *store, empty_store);
         drop(store);
         self.count.store(0, Ordering::Relaxed);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
+        self.deferred_hashes.store(false, Ordering::Release);
         drained_store.drain_spill_chunks(visitor)?;
         Ok(Some(drained_bytes))
+    }
+
+    fn materialize_deferred_hashes(&self) {
+        let mut store = self.build_store.lock().unwrap();
+        if self.deferred_hashes.swap(false, Ordering::AcqRel) {
+            let kind = self
+                .integer_key_kind
+                .expect("deferred integer hashes require a physical key kind");
+            let layout = Arc::clone(self.build_row_layout.base());
+            store.materialize_deferred_hashes(|row_ptr| kind.row_hash(layout.as_ref(), row_ptr, 0));
+        }
     }
 
     fn prepare_keys(
@@ -506,7 +787,23 @@ impl JoinHashTable {
         let input_rows = input_sel.map(SelectionVector::as_slice);
         let output_rows = output_sel.as_mut_slice();
 
-        if build_side && Self::propagates_build_side(self.join_type) {
+        let preserve_all_rows = build_side && Self::propagates_build_side(self.join_type);
+        let mut all_null_sensitive_keys_valid = true;
+        if !preserve_all_rows {
+            for (column_idx, nulls_equal) in self.null_values_are_equal.iter().enumerate() {
+                if !*nulls_equal
+                    && !keys.data[column_idx]
+                        .try_to_view(keys.size())?
+                        .validity()
+                        .all_valid()
+                {
+                    all_null_sensitive_keys_valid = false;
+                    break;
+                }
+            }
+        }
+
+        if preserve_all_rows || all_null_sensitive_keys_valid {
             for idx in 0..input_count {
                 let row_idx = input_rows.map_or(idx, |rows| rows[idx] as usize);
                 output_rows[idx] = row_idx as u32;
@@ -533,9 +830,16 @@ impl JoinHashTable {
         Ok(output_count)
     }
 
+    pub(crate) fn prepare_probe_keys<'a>(
+        &self,
+        keys: &'a paro_common::chunk::Chunk,
+    ) -> Result<PreparedProbeKeys<'a>> {
+        self.key_layout.prepare_probe_keys(keys)
+    }
+
     pub(crate) fn key_values_match_build_row(
         &self,
-        keys: &paro_common::chunk::Chunk,
+        keys: &PreparedProbeKeys<'_>,
         probe_row_idx: usize,
         row_ptr: usize,
     ) -> bool {
@@ -552,13 +856,28 @@ impl JoinHashTable {
         if self.found_flag_offset.is_none() {
             return false;
         }
-        self.build_row_layout.set_found(row_ptr as *mut u8, found);
+        self.build_row_layout
+            .set_match_mask(row_ptr as *mut u8, u8::from(found));
+        true
+    }
+
+    pub fn mark_build_side_match_mask(&self, row_ptr: usize, mask: u8) -> bool {
+        if self.found_flag_offset.is_none() {
+            return false;
+        }
+        self.build_row_layout
+            .mark_match_mask(row_ptr as *mut u8, mask);
         true
     }
 
     pub fn build_side_found(&self, row_ptr: usize) -> Option<bool> {
         self.found_flag_offset
             .map(|_| self.build_row_layout.found(row_ptr as *const u8))
+    }
+
+    pub fn build_side_match_mask(&self, row_ptr: usize) -> Option<u8> {
+        self.found_flag_offset
+            .map(|_| self.build_row_layout.match_mask(row_ptr as *const u8))
     }
 
     pub fn hash_column_index(&self) -> usize {
@@ -576,20 +895,53 @@ impl JoinHashTable {
     pub fn reset_runtime_state(&self) {
         self.finalized.store(false, Ordering::Release);
         self.probe_entries.store(ptr::null_mut(), Ordering::Release);
+        self.integer_index.store(None);
+        self.pair_integer_index.store(None);
         *self.entries.lock().unwrap() = HtEntryTable::default();
+        self.reset_grouped_reduction_extrema();
         self.capacity.store(0, Ordering::Relaxed);
         self.bitmask.store(0, Ordering::Relaxed);
         self.chains_longer_than_one.store(false, Ordering::Relaxed);
     }
 
+    pub(crate) fn lookup_i64_group_slots(
+        &self,
+        vector: &Vector,
+        vector_count: usize,
+        output_slots: &mut [usize],
+    ) -> Result<bool> {
+        let index = self.integer_index.load();
+        let Some(index) = index.as_ref() else {
+            return Ok(false);
+        };
+        index.lookup_i64_group_slots(vector, vector_count, output_slots)
+    }
+
+    fn group_slot_for_build_row(&self, build_row: usize, row_ptr: *const u8) -> Option<usize> {
+        self.integer_index.load().as_ref().and_then(|index| {
+            index.group_slot_for_build_row(build_row, row_ptr, self.build_row_layout.base())
+        })
+    }
+
     pub fn reset_data_collection(&self) {
+        self.reset_runtime_state();
         self.build_store.lock().unwrap().reset();
         self.count.store(0, Ordering::Relaxed);
+        self.deferred_hashes.store(false, Ordering::Release);
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::new(
+            self.join_type,
+            &self.equality_types,
+            &self.equality_comparisons,
+        );
     }
 
     pub fn refresh_count_from_data_collection(&self) {
         let count = self.build_store.lock().unwrap().count() as usize;
         self.count.store(count, Ordering::Relaxed);
+        // Callers that populate the row store directly bypass vector-domain
+        // collection. The optional exact index must decline rather than trust
+        // incomplete bounds.
+        *self.integer_index_build_stats.lock().unwrap() = IntegerIndexBuildStats::Ineligible;
     }
 
     /// Build by appending keys and payload to the build store.
@@ -634,17 +986,85 @@ impl JoinHashTable {
             return Ok(0);
         }
 
-        hashes.resize(appended_count, 0);
-        self.key_layout
-            .hash_selected_into(keys, build_sel, appended_count, hashes);
-        let appended_count = self.build_store.lock().unwrap().append_key_payload_chunk(
+        let defer_hashes = if self.config.build_time_integer_builder.is_some() {
+            // Storage bounds and the producer lifecycle already prove this
+            // artifact's complete domain. Avoid repeating a min/max pass over
+            // every hot key vector merely to rediscover runtime bounds.
+            true
+        } else {
+            let mut integer_stats = self.integer_index_build_stats.lock().unwrap();
+            if integer_stats.exact_index_candidate() {
+                let key = keys.column(0).ok_or_else(|| {
+                    paro_error::internal("hash join build has no first equality-key column")
+                })?;
+                integer_stats.add_batch(
+                    key,
+                    keys.size(),
+                    &build_sel.as_slice()[..appended_count],
+                )?;
+            }
+            integer_stats.exact_index_candidate()
+        };
+
+        if !defer_hashes {
+            hashes.resize(appended_count, 0);
+            self.key_layout
+                .hash_selected_into(keys, build_sel, appended_count, hashes)?;
+        }
+
+        let mut store = self.build_store.lock().unwrap();
+        let build_time_integer_builder = self.config.build_time_integer_builder.as_ref();
+        let build_time_integer_reservation =
+            build_time_integer_builder.and_then(|builder| builder.reserve_batch(appended_count));
+        let direct_key = build_time_integer_builder
+            .map(|_| {
+                keys.column(0)
+                    .ok_or_else(|| paro_error::internal("hash join build has no direct-index key"))
+            })
+            .transpose()?;
+        let direct_key_view = direct_key
+            .as_ref()
+            .map(|key| key.try_to_view(keys.size()))
+            .transpose()?;
+        let appended_count = store.append_key_payload_chunk_with(
             keys,
             payload,
             build_sel,
             appended_count,
-            hashes,
+            (!defer_hashes).then_some(hashes.as_slice()),
             false,
+            |output_idx, source_row_idx, row_ptr| {
+                if let (Some(builder), Some(reservation), Some(key)) = (
+                    build_time_integer_builder,
+                    build_time_integer_reservation.as_ref(),
+                    direct_key_view.as_ref(),
+                ) {
+                    builder.insert_reserved_vector_row_with_link(
+                        reservation,
+                        output_idx,
+                        key,
+                        source_row_idx,
+                        row_ptr,
+                        |row_ptr, previous| {
+                            self.build_row_layout
+                                .set_next(row_ptr as *mut u8, previous as *const u8);
+                        },
+                    )?;
+                }
+                Ok(())
+            },
         )?;
+        if let (Some(builder), Some(reservation)) =
+            (build_time_integer_builder, build_time_integer_reservation)
+        {
+            builder.publish_batch(reservation);
+        }
+        if defer_hashes {
+            // Publish the deferred state while holding the same store lock that
+            // made the zero hash fields visible to spill/finalize readers.
+            self.deferred_hashes.store(true, Ordering::Release);
+        }
+        drop(store);
 
         // Update count
         self.count.fetch_add(appended_count, Ordering::Relaxed);
@@ -700,10 +1120,29 @@ impl JoinHashTable {
         }
 
         if self.count() == 0 {
+            self.finalize_grouped_reduction_extrema()?;
             self.probe_entries.store(ptr::null_mut(), Ordering::Release);
             self.finalized.store(true, Ordering::Release);
             return Ok(());
         }
+
+        let direct_index = self.try_build_direct_integer_index()?;
+        let integer_index = match direct_index {
+            Some(index) => Some(index),
+            None => self.try_build_ranked_integer_index()?,
+        };
+        if let Some(index) = integer_index {
+            self.publish_integer_index(index)?;
+            return Ok(());
+        }
+        if self.try_build_pair_integer_index()? {
+            return Ok(());
+        }
+
+        // Exact-index admission is speculative. If bounds or uniqueness make
+        // it unsuitable, initialize the canonical hash field once here before
+        // constructing generic pointer chains.
+        self.materialize_deferred_hashes();
 
         // Step 1: Allocate and initialize pointer table
         self.allocate_pointer_table()?;
@@ -721,8 +1160,46 @@ impl JoinHashTable {
             .store(has_long_chains, Ordering::Relaxed);
 
         self.probe_entries.store(entries_ptr, Ordering::Release);
+        self.finalize_grouped_reduction_extrema()?;
         self.finalized.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn publish_integer_index(&self, built: BuiltIntegerIndex) -> Result<()> {
+        self.chains_longer_than_one
+            .store(built.has_long_chains, Ordering::Relaxed);
+        self.integer_index.store(Some(Arc::new(built.index)));
+        self.finalize_grouped_reduction_extrema()?;
+        self.finalized.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    pub(crate) fn publish_build_time_integer_builder(
+        &self,
+        builder: ConcurrentBuildTimeIntegerIndexBuilder,
+    ) -> Result<bool> {
+        let Some((index, has_long_chains)) = builder.finish(|row_ptr, previous| {
+            self.build_row_layout
+                .set_next(row_ptr as *mut u8, previous as *const u8);
+        })?
+        else {
+            return Ok(false);
+        };
+        self.publish_integer_index(BuiltIntegerIndex {
+            index,
+            has_long_chains,
+        })?;
+        Ok(true)
+    }
+
+    #[cfg(test)]
+    fn has_integer_index(&self) -> bool {
+        self.integer_index.load().is_some()
+    }
+
+    #[cfg(test)]
+    fn has_pair_integer_index(&self) -> bool {
+        self.pair_integer_index.load().is_some()
     }
 
     /// Check if salt should be used for probing.
@@ -763,7 +1240,14 @@ impl JoinHashTable {
         // Count is updated by combine
         let self_count = self_store.count() as usize;
         self.count.store(self_count, Ordering::Relaxed);
-
+        let incoming_stats = *other.integer_index_build_stats.lock().unwrap();
+        self.integer_index_build_stats
+            .lock()
+            .unwrap()
+            .merge(incoming_stats);
+        if other.deferred_hashes.load(Ordering::Acquire) {
+            self.deferred_hashes.store(true, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -813,6 +1297,15 @@ impl JoinHashTable {
             return Ok(());
         }
 
+        let integer_index = self.integer_index.load();
+        if let Some(index) = integer_index.as_ref() {
+            Self::probe_exact_integer_index(index, keys, scan_structure, filtered_count)?;
+            return Ok(());
+        }
+        if self.probe_pair_integer_index(keys, scan_structure, filtered_count)? {
+            return Ok(());
+        }
+
         if scan_structure.hashes.len() < filtered_count {
             scan_structure.hashes.resize(filtered_count, 0);
         }
@@ -821,7 +1314,7 @@ impl JoinHashTable {
             &scan_structure.probe_sel,
             filtered_count,
             &mut scan_structure.hashes,
-        );
+        )?;
 
         let capacity = self.capacity.load(Ordering::Relaxed);
         let bitmask = self.bitmask.load(Ordering::Relaxed);
@@ -864,6 +1357,31 @@ impl JoinHashTable {
         Ok(())
     }
 
+    fn probe_exact_integer_index(
+        index: &ExactIntegerJoinIndex,
+        keys: &Chunk,
+        scan_structure: &mut ScanStructure,
+        filtered_count: usize,
+    ) -> Result<()> {
+        let key = keys.column(0).ok_or_else(|| {
+            paro_error::internal("integer join index probe is missing its key column")
+        })?;
+        let prepared_rows = scan_structure.probe_sel.as_slice();
+        scan_structure.sel_vector.set_len(keys.size());
+        let matched_rows = scan_structure.sel_vector.as_mut_slice();
+        let matched_count = index.lookup_vector_rows(
+            key.as_ref(),
+            keys.size(),
+            &prepared_rows[..filtered_count],
+            &mut scan_structure.pointers,
+            matched_rows,
+        )?;
+        scan_structure.count = matched_count;
+        scan_structure.sel_vector.set_len(matched_count);
+        scan_structure.exact_key_matches = true;
+        Ok(())
+    }
+
     /// Compute hash values with the same key hashing path used by probe().
     pub(crate) fn compute_key_hashes(
         &self,
@@ -891,6 +1409,15 @@ impl JoinHashTable {
         FullOuterScanState::new()
     }
 
+    pub fn create_full_outer_scan_state_for_block(&self, block_idx: usize) -> FullOuterScanState {
+        let row_offset = self.build_store.lock().unwrap().block_row_offset(block_idx);
+        FullOuterScanState::for_block(block_idx, row_offset)
+    }
+
+    pub fn build_block_count(&self) -> usize {
+        self.build_store.lock().unwrap().block_count()
+    }
+
     pub fn scan_full_outer(
         &self,
         state: &mut FullOuterScanState,
@@ -904,8 +1431,63 @@ impl JoinHashTable {
         self.build_store.lock().unwrap().scan_payload_rows(
             &mut state.scan_state,
             emit_found,
-            &self.build_types,
+            self.build_output_types(),
             result,
+        )
+    }
+
+    pub fn scan_reduction_cascade(
+        &self,
+        state: &mut FullOuterScanState,
+        required_mask: u8,
+        forbidden_mask: u8,
+        result: &mut Chunk,
+    ) -> Result<usize> {
+        if self.found_flag_column_index.is_none() {
+            result.set_cardinality(0);
+            return Ok(0);
+        }
+        self.build_store.lock().unwrap().scan_payload_rows_by_mask(
+            &mut state.scan_state,
+            required_mask,
+            forbidden_mask,
+            self.build_output_types(),
+            result,
+        )
+    }
+
+    pub(crate) fn scan_grouped_reduction_extrema(
+        &self,
+        state: &mut FullOuterScanState,
+        build_residual_offset: usize,
+        channel_match_masks: &[u8],
+        required_mask: u8,
+        forbidden_mask: u8,
+        result: &mut Chunk,
+    ) -> Result<usize> {
+        let Some(extrema) = self.grouped_reduction_extrema() else {
+            return self.scan_reduction_cascade(state, required_mask, forbidden_mask, result);
+        };
+        let build_idx = self.build_output_count + build_residual_offset;
+        let store = self.build_store.lock().unwrap();
+        store.scan_payload_rows_where_indexed(
+            &mut state.scan_state,
+            self.build_output_types(),
+            result,
+            |build_row, row_ptr| {
+                let group_slot = self.group_slot_for_build_row(build_row, row_ptr);
+                let build_value =
+                    unsafe { self.read_build_payload_fixed::<i64>(row_ptr as usize, build_idx) };
+                let mut match_mask = 0u8;
+                if let (Some(group_slot), Some(build_value)) = (group_slot, build_value) {
+                    for (channel, &channel_mask) in channel_match_masks.iter().enumerate() {
+                        if extrema.contains_unequal_i64(group_slot, channel, build_value)? {
+                            match_mask |= channel_mask;
+                        }
+                    }
+                }
+                Ok(match_mask & required_mask == required_mask && match_mask & forbidden_mask == 0)
+            },
         )
     }
 }
@@ -922,451 +1504,14 @@ impl FullOuterScanState {
             scan_state: BuildStoreScanState::default(),
         }
     }
+
+    pub fn for_block(block_idx: usize, global_row_idx: usize) -> Self {
+        Self {
+            scan_state: BuildStoreScanState::for_block(block_idx, global_row_idx),
+        }
+    }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use paro_common::allocator::MemoryTag;
-    use paro_common::memory::{MemoryDomain, MemoryOwner};
-    use paro_common::vector::VECTOR_SIZE;
-    use paro_planner::expression::{ConstantExpression, Expression};
-    use paro_storage::buffer::BufferPool;
-
-    use crate::join_hashtable::hash_kernel::JoinKeyLayout;
-    use crate::join_hashtable::ht_entry::HtEntry;
-    use crate::memory_runtime::QueryMemoryPool;
-
-    fn create_test_buffer_pool() -> Arc<BufferPool> {
-        BufferPool::new_arc(64 * 1024 * 1024) // 64MB
-    }
-
-    fn equality_condition() -> JoinCondition {
-        JoinCondition::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            JoinComparisonType::Equal,
-        )
-    }
-
-    fn not_distinct_condition() -> JoinCondition {
-        JoinCondition::new(
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            Expression::Constant(ConstantExpression::new(
-                Value::Integer(1),
-                LogicalType::Integer,
-            )),
-            JoinComparisonType::NotDistinctFrom,
-        )
-    }
-
-    fn chunk_from_optional_i32(values: &[Option<i32>]) -> Chunk {
-        let mut chunk = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer],
-            values.len(),
-        );
-        for (row_idx, value) in values.iter().enumerate() {
-            let column = chunk.column_mut(0).expect("column must exist");
-            match value {
-                Some(value) => column.set_value(row_idx, &Value::Integer(*value)),
-                None => column.set_value(row_idx, &Value::Null(LogicalType::Integer)),
-            }
-        }
-        chunk.set_cardinality(values.len());
-        chunk
-    }
-
-    #[test]
-    fn join_hash_table_build_store_respects_query_quota() {
-        let pool = Arc::new(QueryMemoryPool::new(1));
-        let owner: Arc<dyn MemoryOwner> = pool;
-        let memory = MemoryAccountingContext::from_owner(
-            owner,
-            MemoryDomain::Host,
-            MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        );
-        let table = JoinHashTable::new_with_memory(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-            memory,
-        );
-        let keys = chunk_from_optional_i32(&[Some(1), Some(2)]);
-        let payload = chunk_from_optional_i32(&[Some(10), Some(20)]);
-
-        let err = table
-            .build(&keys, &payload)
-            .expect_err("tiny query quota must reject hash join build storage");
-        assert!(err.to_string().contains("quota"));
-    }
-
-    fn find_linear_probe_collision_pair() -> (i32, i32) {
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
-        let values = (0..10_000).collect::<Vec<i32>>();
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &values,
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let hashes = (0..values.len())
-            .map(|row_idx| layout.hash_key_at(&keys, row_idx))
-            .collect::<Vec<_>>();
-        for left in 0..values.len() {
-            let left_hash = hashes[left];
-            for right in (left + 1)..values.len() {
-                let right_hash = hashes[right];
-                if (left_hash as usize & 15) == (right_hash as usize & 15)
-                    && (left_hash & HtEntry::SALT_MASK) != (right_hash & HtEntry::SALT_MASK)
-                {
-                    return (values[left], values[right]);
-                }
-            }
-        }
-        panic!("failed to find collision pair with different salts");
-    }
-
-    #[test]
-    fn test_join_hash_table_new() {
-        let buffer_pool = create_test_buffer_pool();
-        let conditions = vec![];
-        let build_types = vec![LogicalType::Integer, LogicalType::Varchar];
-
-        let ht = JoinHashTable::new(
-            buffer_pool,
-            paro_common::test_utils::test_allocator(),
-            conditions,
-            build_types,
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        assert_eq!(ht.count(), 0);
-        assert!(ht.is_empty());
-        assert!(!ht.finalized.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_calculate_capacity() {
-        assert_eq!(JoinHashTable::calculate_capacity(0), 16);
-        assert_eq!(JoinHashTable::calculate_capacity(10), 32);
-        assert_eq!(JoinHashTable::calculate_capacity(100), 256);
-        assert_eq!(JoinHashTable::calculate_capacity(1000), 2048);
-    }
-
-    #[test]
-    fn test_propagates_build_side() {
-        assert!(!JoinHashTable::propagates_build_side(JoinType::Inner));
-        assert!(!JoinHashTable::propagates_build_side(JoinType::Left));
-        assert!(JoinHashTable::propagates_build_side(JoinType::Right));
-        assert!(JoinHashTable::propagates_build_side(JoinType::Outer));
-        assert!(!JoinHashTable::propagates_build_side(JoinType::Semi));
-        assert!(!JoinHashTable::propagates_build_side(JoinType::Anti));
-    }
-
-    #[test]
-    fn test_finalize() {
-        let buffer_pool = create_test_buffer_pool();
-        let ht = JoinHashTable::new(
-            buffer_pool,
-            paro_common::test_utils::test_allocator(),
-            vec![],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        assert!(!ht.finalized.load(Ordering::Relaxed));
-        ht.finalize().unwrap();
-        assert!(ht.finalized.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_right_join_layout_tracks_found_flag_offset() {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Right,
-            JoinHashTableConfig::default(),
-        );
-
-        assert!(ht.has_found_flag());
-        assert_eq!(ht.found_flag_column_index, Some(2));
-        assert!(ht.found_flag_offset.is_some());
-    }
-
-    #[test]
-    fn test_scan_full_outer_uses_found_flag_filter() {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Right,
-            JoinHashTableConfig::default(),
-        );
-
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[1, 2, 3],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[10, 20, 30],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-
-        ht.build(&keys, &payload).unwrap();
-        ht.finalize().unwrap();
-
-        let row_ptrs = ht.all_build_row_ptrs();
-        assert_eq!(row_ptrs.len(), 3);
-
-        for (row_ptr, found) in row_ptrs.iter().copied().zip([false, true, false]) {
-            ht.set_build_side_found(row_ptr, found);
-            let stored = ht.build_side_found(row_ptr).unwrap();
-            assert_eq!(stored, found);
-        }
-
-        let mut unmatched_state = ht.create_full_outer_scan_state();
-        let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let unmatched_count = ht
-            .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
-            .unwrap();
-        assert_eq!(unmatched_count, 2);
-        assert_eq!(unmatched.data[0].get_value(0).to_string(), "10");
-        assert_eq!(unmatched.data[0].get_value(1).to_string(), "30");
-
-        let mut matched_state = ht.create_full_outer_scan_state();
-        let mut matched = Chunk::try_new(paro_common::test_utils::test_allocator())
-            .expect("test chunk allocation failed");
-        let matched_count = ht
-            .scan_full_outer(&mut matched_state, true, &mut matched)
-            .unwrap();
-        assert_eq!(matched_count, 1);
-        assert_eq!(matched.data[0].get_value(0).to_string(), "20");
-    }
-
-    #[test]
-    fn test_build_filters_null_keys_for_equal_conditions() {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        let keys = chunk_from_optional_i32(&[Some(1), None, Some(2)]);
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[10, 20, 30],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-
-        ht.build(&keys, &payload).unwrap();
-
-        assert_eq!(ht.count(), 2);
-        assert!(ht.has_null.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn test_not_distinct_from_keeps_null_keys_and_probe_matches_them() {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![not_distinct_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        let build_keys = chunk_from_optional_i32(&[None]);
-        let build_payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[99],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-
-        ht.build(&build_keys, &build_payload).unwrap();
-        ht.finalize().unwrap();
-
-        assert_eq!(ht.count(), 1);
-        assert!(!ht.has_null.load(Ordering::Relaxed));
-
-        let probe_keys = chunk_from_optional_i32(&[None]);
-        let left = probe_keys.clone();
-        let mut scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-        ht.probe(&probe_keys, &mut scan, None, probe_keys.size())
-            .unwrap();
-
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            VECTOR_SIZE,
-        );
-        let count = scan
-            .next_inner_join(&probe_keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-
-        assert_eq!(count, 1);
-        assert!(result.data[0].is_null(0));
-        assert_eq!(result.data[1].get_value(0).to_string(), "99");
-    }
-
-    #[test]
-    fn test_probe_respects_selected_count() {
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[3],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[30],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        ht.build(&keys, &payload).unwrap();
-        ht.finalize().unwrap();
-
-        let probe_keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[3, 3],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let probe_sel = paro_common::test_utils::test_selection(vec![1, 0]);
-        let mut scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-
-        ht.probe(&probe_keys, &mut scan, Some(&probe_sel), 1)
-            .unwrap();
-
-        assert_eq!(scan.count, 1);
-        assert_eq!(scan.sel_vector.get(0), 1);
-    }
-
-    #[test]
-    fn test_probe_linear_probing_finds_rows_behind_salt_mismatch() {
-        let (first_key, second_key) = find_linear_probe_collision_pair();
-        let ht = JoinHashTable::new(
-            create_test_buffer_pool(),
-            paro_common::test_utils::test_allocator(),
-            vec![equality_condition()],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-        );
-
-        let build_keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[first_key, second_key],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let build_payload = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[11, 22],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        ht.build(&build_keys, &build_payload).unwrap();
-        ht.finalize().unwrap();
-
-        let probe_keys = Chunk::from_arc_vectors(
-            vec![Arc::new(
-                paro_common::test_utils::test_i32_vector_with_allocator(
-                    &[second_key],
-                    paro_common::test_utils::test_allocator(),
-                ),
-            )],
-            paro_common::test_utils::test_allocator(),
-        );
-        let left = probe_keys.clone();
-        let mut scan = ht
-            .create_scan_structure()
-            .expect("test scan structure allocation failed");
-        ht.probe(&probe_keys, &mut scan, None, probe_keys.size())
-            .unwrap();
-
-        let mut result = paro_common::test_utils::test_chunk_with_capacity(
-            &[LogicalType::Integer, LogicalType::Integer],
-            VECTOR_SIZE,
-        );
-        let count = scan
-            .next_inner_join(&probe_keys, &left, &mut result, &ht, &[], &[])
-            .unwrap();
-
-        assert_eq!(count, 1);
-        assert_eq!(
-            result.data[0].get_value(0).to_string(),
-            second_key.to_string()
-        );
-        assert_eq!(result.data[1].get_value(0).to_string(), "22");
-    }
-}
+#[path = "table_tests.rs"]
+mod tests;

@@ -8,6 +8,85 @@
 
 use paro_common::types::LogicalType;
 
+/// A statistic that is safe to use as a correctness boundary.
+///
+/// `Guaranteed` means the bound covers the complete population represented by
+/// the statistics object. `Empty` is the identity used while building an exact
+/// summary; observing its first value produces a guarantee. `Unknown` is
+/// deliberately contagious when non-empty summaries are merged: a bound
+/// observed for only one input cannot constrain the union. Cost-model estimates
+/// belong in separate metadata and must never be wrapped in this type.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) enum StatisticsBound<T> {
+    #[default]
+    Unknown,
+    Empty,
+    Guaranteed(T),
+}
+
+impl<T> StatisticsBound<T> {
+    #[inline]
+    pub(super) fn guaranteed(&self) -> Option<&T> {
+        match self {
+            Self::Unknown | Self::Empty => None,
+            Self::Guaranteed(value) => Some(value),
+        }
+    }
+
+    #[inline]
+    pub(super) fn guaranteed_mut(&mut self) -> Option<&mut T> {
+        match self {
+            Self::Unknown | Self::Empty => None,
+            Self::Guaranteed(value) => Some(value),
+        }
+    }
+
+    #[inline]
+    pub(super) fn is_guaranteed(&self) -> bool {
+        matches!(self, Self::Guaranteed(_))
+    }
+
+    #[inline]
+    pub(super) fn set_guaranteed(&mut self, value: T) {
+        *self = Self::Guaranteed(value);
+    }
+
+    #[inline]
+    pub(super) fn clear(&mut self) {
+        *self = Self::Unknown;
+    }
+
+    /// Fold an observed value into an exact summary.
+    ///
+    /// An unknown summary remains unknown because observing a suffix cannot
+    /// establish a bound for the population that preceded it.
+    pub(super) fn observe_with(&mut self, value: T, combine: impl FnOnce(&T, &T) -> T) {
+        *self = match &*self {
+            Self::Unknown => Self::Unknown,
+            Self::Empty => Self::Guaranteed(value),
+            Self::Guaranteed(current) => Self::Guaranteed(combine(current, &value)),
+        };
+    }
+
+    /// Merge two complete-population bounds.
+    ///
+    /// The combiner is evaluated only when both inputs are guaranteed. If
+    /// either input is unknown, the merged population has no guaranteed bound.
+    pub(super) fn merge_with(&mut self, other: &Self, combine: impl FnOnce(&T, &T) -> T)
+    where
+        T: Copy,
+    {
+        *self = match (&*self, other) {
+            (Self::Guaranteed(left), Self::Guaranteed(right)) => {
+                Self::Guaranteed(combine(left, right))
+            }
+            (Self::Empty, other) => *other,
+            (current, Self::Empty) => *current,
+            _ => Self::Unknown,
+        };
+    }
+}
+
 /// Type of statistics for a column.
 ///
 /// Determines which type-specific statistics structure is used

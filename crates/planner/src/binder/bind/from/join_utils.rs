@@ -48,6 +48,15 @@ fn collect_table_bindings_recursive(op: &LogicalOperator, bindings: &mut HashSet
         LogicalOperator::Projection(proj) => {
             collect_table_bindings_recursive(&proj.child.operator, bindings);
         }
+        LogicalOperator::RowFetch(fetch) => {
+            bindings.extend(
+                fetch
+                    .sources
+                    .iter()
+                    .map(|source| source.materialized_table_index),
+            );
+            collect_table_bindings_recursive(&fetch.child.operator, bindings);
+        }
         LogicalOperator::ExternalProject(project) => {
             bindings.insert(project.project_index);
             collect_table_bindings_recursive(&project.child.operator, bindings);
@@ -386,21 +395,20 @@ mod tests {
 
     #[test]
     fn get_expression_side_visits_window_frame_offsets() {
-        let expression = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let expression = Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(col(7, 0))),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
 
         assert_eq!(
             get_expression_side(&expression, &HashSet::from([6]), &HashSet::from([7])),

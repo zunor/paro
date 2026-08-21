@@ -1,10 +1,10 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{StringHeap, ValidityMask, Vector, VectorBuffer, VectorType};
+use super::{StringHeap, Vector, VectorBuffer, VectorType};
 use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -42,7 +42,10 @@ impl Vector {
             | LogicalType::TsVector
             | LogicalType::TsQuery
             | LogicalType::Json
-            | LogicalType::Jsonb => Value::Varchar(self.get_string(idx).unwrap().to_string()),
+            | LogicalType::Jsonb
+            | LogicalType::StringLiteral => {
+                Value::Varchar(self.get_string(idx).unwrap().to_string())
+            }
             LogicalType::Blob => Value::Blob(self.get_blob(idx).unwrap().to_vec()),
             LogicalType::Array(child_type, array_size) => {
                 fn resolve_array_row(vector: &Vector, idx: usize) -> (&Vector, usize) {
@@ -350,6 +353,9 @@ impl Vector {
 
     /// Get string value at index. Returns None if null.
     pub fn get_string(&self, idx: usize) -> Option<&str> {
+        if !self.logical_type.is_utf8_varlen() {
+            return None;
+        }
         if self.is_null(idx) {
             return None;
         }
@@ -360,12 +366,14 @@ impl Vector {
                 } else {
                     idx
                 };
-                // SAFETY: We know buffer contains InlineString array
+                // SAFETY: We know buffer contains StringView array
                 let inline_str = unsafe {
-                    let entries = self.buffer.data() as *const InlineString;
+                    let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
-                Some(inline_str.as_str())
+                // SAFETY: textual vector write paths validate or accept only
+                // UTF-8, and unsafe decoders must uphold the same invariant.
+                Some(unsafe { inline_str.as_str_unchecked() })
             }
             VectorType::Dictionary => {
                 let physical_idx = self.selection().physical_index(idx);
@@ -387,9 +395,9 @@ impl Vector {
                 } else {
                     idx
                 };
-                // SAFETY: We know buffer contains InlineString array
+                // SAFETY: We know buffer contains StringView array
                 let inline_str = unsafe {
-                    let entries = self.buffer.data() as *const InlineString;
+                    let entries = self.buffer.data() as *const StringView;
                     &*entries.add(entry_idx)
                 };
                 Some(inline_str.as_bytes())
@@ -695,8 +703,8 @@ impl Vector {
 
     /// Set string value at index.
     ///
-    /// For short strings (≤12 bytes), data is stored inline in InlineString.
-    /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short strings (≤12 bytes), data is stored inline in StringView.
+    /// For longer strings, data is stored in StringHeap and StringView.ptr points to it.
     pub fn set_string(&mut self, idx: usize, val: &str) {
         self.try_set_string(idx, val)
             .expect("vector string allocation failed");
@@ -704,16 +712,39 @@ impl Vector {
 
     /// Set string value at index.
     ///
-    /// For short strings (≤12 bytes), data is stored inline in InlineString.
-    /// For longer strings, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short strings (≤12 bytes), data is stored inline in StringView.
+    /// For longer strings, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_string(&mut self, idx: usize, val: &str) -> Result<()> {
+        if !self.logical_type.is_utf8_varlen() {
+            return Err(paro_error::type_mismatch(format!(
+                "string write requires a textual varlen vector, got {:?}",
+                self.logical_type
+            )));
+        }
         self.try_set_varlen(idx, val.as_bytes())
+    }
+
+    /// Copy canonical textual bytes without rescanning UTF-8.
+    ///
+    /// # Safety
+    ///
+    /// `val` must be valid UTF-8. This is reserved for typed storage formats
+    /// whose write boundary accepted `&str` and whose persistence layer proves
+    /// byte-for-byte integrity before returning the payload.
+    pub unsafe fn try_set_canonical_utf8_bytes(&mut self, idx: usize, val: &[u8]) -> Result<()> {
+        if !self.logical_type.is_utf8_varlen() {
+            return Err(paro_error::type_mismatch(format!(
+                "canonical UTF-8 write requires a textual varlen vector, got {:?}",
+                self.logical_type
+            )));
+        }
+        self.try_set_varlen(idx, val)
     }
 
     /// Set blob value at index.
     ///
-    /// For short blobs (≤12 bytes), data is stored inline in InlineString.
-    /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short blobs (≤12 bytes), data is stored inline in StringView.
+    /// For longer blobs, data is stored in StringHeap and StringView.ptr points to it.
     pub fn set_blob(&mut self, idx: usize, val: &[u8]) {
         self.try_set_blob(idx, val)
             .expect("vector blob allocation failed");
@@ -721,9 +752,15 @@ impl Vector {
 
     /// Set blob value at index.
     ///
-    /// For short blobs (≤12 bytes), data is stored inline in InlineString.
-    /// For longer blobs, data is stored in StringHeap and InlineString.ptr points to it.
+    /// For short blobs (≤12 bytes), data is stored inline in StringView.
+    /// For longer blobs, data is stored in StringHeap and StringView.ptr points to it.
     pub fn try_set_blob(&mut self, idx: usize, val: &[u8]) -> Result<()> {
+        if self.logical_type != LogicalType::Blob {
+            return Err(paro_error::type_mismatch(format!(
+                "blob write requires a BLOB vector, got {:?}",
+                self.logical_type
+            )));
+        }
         self.try_set_varlen(idx, val)
     }
 
@@ -738,8 +775,8 @@ impl Vector {
         self.try_make_exclusive()?;
         self.validity.try_make_exclusive()?;
 
-        let inline_value = if val.len() <= INLINE_LENGTH {
-            InlineString::from_bytes(val)
+        let inline_value = if let Some(value) = StringView::try_inline(val) {
+            value
         } else {
             self.try_add_out_of_line_varlen(idx, val)?
         };
@@ -751,9 +788,10 @@ impl Vector {
         Ok(())
     }
 
-    fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<InlineString> {
+    fn try_add_out_of_line_varlen(&mut self, idx: usize, val: &[u8]) -> Result<StringView> {
         if let Some(heap) = self.string_heap.as_mut().and_then(Arc::get_mut) {
-            return heap.try_add_blob(val);
+            // SAFETY: `heap` is retained by `self`, which also stores the view.
+            return unsafe { heap.try_add_blob(val) };
         }
 
         let preserve_entries = self
@@ -771,22 +809,21 @@ impl Vector {
             .max(1);
 
         let mut rebuilt_heap = StringHeap::with_allocator(initial_capacity, allocator.clone());
-        let rebuilt_buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
-            self.buffer.capacity(),
-            allocator,
-        )?;
+        let rebuilt_buffer =
+            VectorBuffer::try_with_allocator(StringView::SIZE, self.buffer.capacity(), allocator)?;
 
         unsafe {
-            let entries = self.buffer.data() as *const InlineString;
-            let rewritten_entries = rebuilt_buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *const StringView;
+            let rewritten_entries = rebuilt_buffer.data() as *mut StringView;
             for entry_idx in 0..preserve_entries {
                 let entry = *entries.add(entry_idx);
+                // SAFETY: `rebuilt_heap` becomes the owner of the rewritten buffer.
                 *rewritten_entries.add(entry_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
             }
         }
 
-        let inline_value = rebuilt_heap.try_add_blob(val)?;
+        // SAFETY: `rebuilt_heap` becomes the owner of the rewritten buffer.
+        let inline_value = unsafe { rebuilt_heap.try_add_blob(val) }?;
 
         self.buffer = rebuilt_buffer;
         self.string_heap = Some(Arc::new(rebuilt_heap));
@@ -809,309 +846,5 @@ impl Vector {
 
         self.try_copy_range(0, source, start, count)?;
         self.try_set_count(count)
-    }
-
-    /// Reference a single value, converting this vector to a constant vector.
-    ///
-    /// The vector will be converted to a CONSTANT vector that references
-    /// the given value for all logical indices.
-    ///
-    /// # Arguments
-    /// * `value` - The value to reference
-    pub fn reference_value(&mut self, value: &Value) {
-        use crate::allocator::default_allocator;
-
-        let allocator = Arc::new(default_allocator());
-        let logical_type = value.logical_type();
-
-        if value.is_null() {
-            // Create a constant null vector
-            self.vector_type = VectorType::Constant;
-            self.logical_type = logical_type;
-            self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
-                .expect("vector buffer allocation failed");
-            // For constant vectors, validity mask only needs 1 entry
-            self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
-            self.validity.set_null(0);
-            self.selection = super::VectorSelection::None;
-            self.child = None;
-            self.string_heap = None;
-            self.dictionary_info = None;
-            return;
-        }
-
-        // Create a constant vector from the value
-        match value {
-            Value::Boolean(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut bool;
-                    *ptr = *v;
-                }
-            }
-            Value::TinyInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i8;
-                    *ptr = *v;
-                }
-            }
-            Value::SmallInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(2, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i16;
-                    *ptr = *v;
-                }
-            }
-            Value::Integer(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i32;
-                    *ptr = *v;
-                }
-            }
-            Value::BigInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i64;
-                    *ptr = *v;
-                }
-            }
-            Value::HugeInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i128;
-                    *ptr = *v;
-                }
-            }
-            Value::UTinyInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(1, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data();
-                    *ptr = *v;
-                }
-            }
-            Value::USmallInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(2, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut u16;
-                    *ptr = *v;
-                }
-            }
-            Value::UInteger(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut u32;
-                    *ptr = *v;
-                }
-            }
-            Value::UBigInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut u64;
-                    *ptr = *v;
-                }
-            }
-            Value::UHugeInt(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut u128;
-                    *ptr = *v;
-                }
-            }
-            Value::Uuid(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut u128;
-                    *ptr = *v;
-                }
-            }
-            Value::Float(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut f32;
-                    *ptr = *v;
-                }
-            }
-            Value::Double(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut f64;
-                    *ptr = *v;
-                }
-            }
-            Value::Decimal(v, precision, _scale) => {
-                if *precision <= 18 {
-                    self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
-                        .expect("vector buffer allocation failed");
-                    let narrow =
-                        i64::try_from(*v).expect("Decimal value exceeds i64 range for precision");
-                    unsafe {
-                        let ptr = self.buffer.data() as *mut i64;
-                        *ptr = narrow;
-                    }
-                } else {
-                    self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
-                        .expect("vector buffer allocation failed");
-                    unsafe {
-                        let ptr = self.buffer.data() as *mut i128;
-                        *ptr = *v;
-                    }
-                }
-            }
-            Value::Varchar(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(
-                    std::mem::size_of::<InlineString>(),
-                    1,
-                    allocator.clone(),
-                )
-                .expect("vector buffer allocation failed");
-
-                // Use StringHeap which handles both short and long strings
-                let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
-                let inline_str = heap
-                    .try_add_string(v)
-                    .expect("vector value string allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut InlineString;
-                    *ptr = inline_str;
-                }
-                // Only store heap if string is not inlined
-                if !inline_str.is_inlined() {
-                    self.string_heap = Some(Arc::new(heap));
-                }
-            }
-            Value::Blob(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(
-                    std::mem::size_of::<InlineString>(),
-                    1,
-                    allocator.clone(),
-                )
-                .expect("vector buffer allocation failed");
-
-                // Use StringHeap which handles both short and long blobs
-                let mut heap = StringHeap::with_allocator(v.len().max(64), allocator.clone());
-                let inline_str = heap
-                    .try_add_blob(v)
-                    .expect("vector value blob allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut InlineString;
-                    *ptr = inline_str;
-                }
-                // Only store heap if blob is not inlined
-                if !inline_str.is_inlined() {
-                    self.string_heap = Some(Arc::new(heap));
-                }
-            }
-            Value::Date(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(4, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i32;
-                    *ptr = *v;
-                }
-            }
-            Value::Timestamp(v) | Value::TimestampTz(v) | Value::Time(v) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(8, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let ptr = self.buffer.data() as *mut i64;
-                    *ptr = *v;
-                }
-            }
-            Value::Interval(months, days, micros) => {
-                self.buffer = super::VectorBuffer::try_with_allocator(16, 1, allocator)
-                    .expect("vector buffer allocation failed");
-                unsafe {
-                    let base = self.buffer.data();
-                    *(base as *mut i32) = *months;
-                    *(base.add(4) as *mut i32) = *days;
-                    *(base.add(8) as *mut i64) = *micros;
-                }
-            }
-            Value::Null(_) => {
-                // Already handled above
-                unreachable!()
-            }
-            Value::List(_, _) => {
-                // List values are not directly supported as constants.
-                // Mark as null for now.
-                self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
-                self.validity.set_null(0);
-            }
-            Value::Array(children, child_type, array_size) => {
-                // Create a child vector with the array elements
-                let child_capacity = *array_size;
-                let mut child =
-                    Vector::try_new(child_type.clone(), child_capacity, allocator.clone())
-                        .expect("vector allocation failed");
-                child.set_count(child_capacity);
-
-                // Set each element in the child vector
-                for (i, child_val) in children.iter().enumerate() {
-                    child.set_value(i, child_val);
-                }
-
-                self.child = Some(Arc::new(child));
-                self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
-                    .expect("vector buffer allocation failed");
-                self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
-            }
-            Value::Struct(values, fields) => {
-                let mut children = Vec::with_capacity(values.len());
-                for (value, (_name, field_type)) in values.iter().zip(fields.iter()) {
-                    let child = Vector::try_constant_from_value(
-                        field_type.clone(),
-                        value.clone(),
-                        1,
-                        allocator.clone(),
-                    )
-                    .expect("struct constant child allocation failed");
-                    children.push(Arc::new(child));
-                }
-                self.children = children;
-                self.child = None;
-                self.buffer = super::VectorBuffer::try_with_allocator(0, 0, allocator)
-                    .expect("vector buffer allocation failed");
-                self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
-            }
-        }
-
-        self.vector_type = VectorType::Constant;
-        self.logical_type = logical_type;
-        if !matches!(
-            value,
-            Value::Varchar(_)
-                | Value::Blob(_)
-                | Value::List(_, _)
-                | Value::Array(_, _, _)
-                | Value::Struct(_, _)
-        ) {
-            // For constant vectors, validity mask only needs 1 entry
-            self.validity = ValidityMask::with_allocator(1, self.buffer.allocator().clone());
-        }
-        self.selection = super::VectorSelection::None;
-        self.dictionary_info = None;
-        // Only reset child if we're NOT an Array or List (which just set it)
-        if !matches!(value, Value::Array(_, _, _) | Value::List(_, _)) {
-            self.child = None;
-        }
-        if !matches!(value, Value::Struct(_, _)) {
-            self.children.clear();
-        }
     }
 }

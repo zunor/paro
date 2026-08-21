@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::tablet_runtime::{PhysicalRowRef, PrimaryIndexUpdate, Tablet};
+use super::tablet_runtime::{PrimaryIndexUpdate, Tablet};
 use crate::codec::vector_decoder;
 use crate::compaction::publish::record::PkPublishDelta;
 use crate::primary_key::{
@@ -9,6 +9,7 @@ use crate::primary_key::{
     RowID,
 };
 use crate::rowset::column::ColumnBatch;
+use crate::rowset::PhysicalRowRef;
 use crate::rowset::{Rowset, RowsetSharedPtr};
 use crate::tablet::tablet_schema::KeysType;
 use crate::tablet::ColumnId;

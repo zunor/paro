@@ -439,6 +439,51 @@ mod tests {
     }
 
     #[test]
+    fn correlated_having_uses_aggregate_group_output_as_delim_key() {
+        let mut binder = test_binder();
+        let outer = wrapped(
+            &binder,
+            expression_get(60, vec![LogicalType::Integer, LogicalType::Integer]),
+        );
+        let mut root = LogicalOperator::Aggregate(Aggregate::new(
+            61,
+            62,
+            63,
+            outer,
+            vec![int_col(60, 1)],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        let subquery = subquery_expression(
+            SubqueryType::Exists,
+            expression_get(70, vec![LogicalType::Integer]),
+            vec![],
+            vec![],
+            vec![],
+            vec![correlated_column(60, 1, LogicalType::Integer)],
+            LogicalType::Boolean,
+            ComparisonType::Equal,
+        );
+
+        binder
+            .plan_correlated_subquery(&subquery, &mut root)
+            .expect("plan correlated HAVING");
+
+        let LogicalOperator::Join(Join::Comparison(join)) = root else {
+            panic!("expected mark join");
+        };
+        assert_eq!(
+            extract_binding(&join.conditions[0].left),
+            Some(ColumnBinding::new(61, 0))
+        );
+        assert_eq!(
+            extract_binding(&join.duplicate_eliminated_columns[0]),
+            Some(ColumnBinding::new(61, 0))
+        );
+    }
+
+    #[test]
     fn plan_correlated_not_exists_subquery_returns_negated_mark_expression() {
         let mut binder = test_binder();
         let correlated = vec![correlated_column(61, 0, LogicalType::Integer)];
@@ -950,7 +995,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(output_types.len(), 2);
                 assert_eq!(output_names.len(), 2);
             }
@@ -965,19 +1010,18 @@ mod tests {
         let row_number_function = WindowFunction::row_number();
         let window = LogicalOperator::Window(Window::new(
             341,
-            vec![WindowExpression {
-                function: row_number_function.clone(),
-                children: vec![],
-                partitions: vec![],
-                orders: vec![OrderByExpression {
+            vec![WindowExpression::native(
+                row_number_function.clone(),
+                vec![],
+                vec![],
+                vec![OrderByExpression {
                     expression: int_col(342, 0),
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::get_default_frame(&row_number_function),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::get_default_frame(&row_number_function),
+                false,
+            )],
             wrapped(&binder, expression_get(342, vec![LogicalType::Integer])),
         ));
         let dependent_join = DependentJoin::lateral(
@@ -998,7 +1042,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0, 2]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0, 2][..]));
                 assert_eq!(output_types.len(), 3);
                 assert_eq!(output_names.len(), 3);
             }
@@ -1036,7 +1080,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(output_types.len(), 2);
             }
             other => panic!("expected comparison join, got {other:?}"),
@@ -1070,7 +1114,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                 assert_eq!(
                     extract_binding(&join.conditions[0].right),
                     Some(ColumnBinding::new(361, 1))
@@ -1131,7 +1175,7 @@ mod tests {
 
             match plan {
                 LogicalOperator::Join(Join::Comparison(join)) => {
-                    assert_eq!(join.right_projection_map, vec![0]);
+                    assert_eq!(join.right_projection_map.as_columns(), Some(&[0][..]));
                     assert_eq!(
                         extract_binding(&join.conditions[0].right),
                         Some(ColumnBinding::new(setop_table, 1)),
@@ -1162,11 +1206,11 @@ mod tests {
         let row_number_function = WindowFunction::row_number();
         let window = LogicalOperator::Window(Window::new(
             375,
-            vec![WindowExpression {
-                function: row_number_function.clone(),
-                children: vec![],
-                partitions: vec![],
-                orders: vec![OrderByExpression {
+            vec![WindowExpression::native(
+                row_number_function.clone(),
+                vec![],
+                vec![],
+                vec![OrderByExpression {
                     expression: Expression::ColumnRef(ColumnRefExpression::new(
                         ColumnBinding::new(371, 0),
                         LogicalType::Integer,
@@ -1174,10 +1218,9 @@ mod tests {
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::get_default_frame(&row_number_function),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::get_default_frame(&row_number_function),
+                false,
+            )],
             wrapped(&binder, LogicalOperator::Aggregate(aggregate)),
         ));
         let dependent_join = DependentJoin::lateral(
@@ -1197,7 +1240,7 @@ mod tests {
 
         match plan {
             LogicalOperator::Join(Join::Comparison(join)) => {
-                assert_eq!(join.right_projection_map, vec![0, 2]);
+                assert_eq!(join.right_projection_map.as_columns(), Some(&[0, 2][..]));
                 assert_eq!(output_types.len(), 3);
             }
             other => panic!("expected comparison join, got {other:?}"),

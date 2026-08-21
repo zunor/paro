@@ -134,7 +134,7 @@ product-contract problems. Current registered profiles are:
 
 | Profile | Purpose | Rewrites | Lifecycle |
 |---------|---------|----------|-----------|
-| `explain_operator_timing` | Normalize EXPLAIN ANALYZE per-operator timing text | `actual time=...` | Stable |
+| `explain_operator_timing` | Normalize EXPLAIN ANALYZE per-operator timing and scheduler-dependent telemetry | `actual time=...`, `loops=...`, optional `scheduler_*` suffixes | Stable |
 | `explain_summary_timing` | Normalize EXPLAIN summary timing text | `Planning Time: ...`, `Execution Time: ...` | Stable |
 | `explain_runtime_bytes` | Normalize volatile spill/memory byte fields | `Memory: ...`, `Disk: ...`, `Peak Memory: ...`, `Temp Storage: ...` | Stable |
 | `explain_routine_ids` | Normalize catalog ids embedded in routine labels | `Routine: name[id@generation]`, `Routines: ...` | Stable |

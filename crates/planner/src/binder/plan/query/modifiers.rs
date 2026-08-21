@@ -57,7 +57,7 @@ impl Binder {
                 .collect();
             root = LogicalOperator::Projection(
                 Projection::new(projection_index, self.wrap_plan(root), expressions)
-                    .with_output_names(visible_names),
+                    .with_visible_names(visible_names),
             );
         }
 

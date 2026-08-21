@@ -647,6 +647,8 @@ pub enum TokenKind {
     END,
     #[token("ENDPOINT", ignore(ascii_case))]
     ENDPOINT,
+    #[token("ENFORCED", ignore(ascii_case))]
+    ENFORCED,
     #[token("EDGE", ignore(ascii_case))]
     EDGE,
     #[token("ENGINE", ignore(ascii_case))]

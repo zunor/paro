@@ -6,18 +6,25 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use paro_planner::expression::{Expression, ExpressionIterator};
-use paro_planner::operator::{Join, JoinType, LogicalOperator, LogicalOperatorType};
+use paro_common::logging::targets;
+use paro_planner::expression::{ComparisonType, Expression, ExpressionIterator};
+use paro_planner::operator::{
+    AntiJoinMode, ColumnBinding, Join, JoinType, LogicalOperator, LogicalOperatorType,
+};
 
-use crate::expression::join_tree_has_evaluation_fence;
+use crate::expression::{
+    comparison_join_tree_has_evaluation_fence, join_tree_has_evaluation_fence,
+};
 use crate::join_order::query_graph::FilterInfo;
 use crate::join_order::relation::JoinRelationSetManager;
+use tracing::debug;
 
 /// A filter extracted from the logical plan together with the join semantics it came from.
 #[derive(Debug, Clone)]
 pub struct ExtractedFilter {
     pub expression: Expression,
     pub join_type: JoinType,
+    pub anti_join_mode: AntiJoinMode,
 }
 
 /// Predicates extracted from a reorderable join region.
@@ -31,15 +38,16 @@ pub struct ExtractedJoinPredicates {
 }
 
 impl ExtractedFilter {
-    pub fn new(expression: Expression, join_type: JoinType) -> Self {
+    pub fn new(expression: Expression, join_type: JoinType, anti_join_mode: AntiJoinMode) -> Self {
         Self {
             expression,
             join_type,
+            anti_join_mode,
         }
     }
 
     pub fn inner(expression: Expression) -> Self {
-        Self::new(expression, JoinType::Inner)
+        Self::new(expression, JoinType::Inner, AntiJoinMode::Regular)
     }
 }
 
@@ -48,9 +56,16 @@ impl ExtractedFilter {
 #[derive(Debug, Clone, Default)]
 pub struct RelationStats {
     /// Estimated distinct count for each column.
-    pub column_distinct_count: Vec<DistinctCount>,
+    pub column_distinct_count: HashMap<ColumnBinding, DistinctCount>,
     /// Estimated cardinality (row count).
     pub cardinality: usize,
+    /// Estimated schema-dependent bytes carried by one row after projection pruning.
+    pub estimated_payload_width: usize,
+    /// Whether this atomic relation owns a control-region boundary that cannot
+    /// be moved onto a reduction join's probe side without materialization.
+    pub contains_control_region: bool,
+    /// Declared unique keys that remain visible in this relation.
+    pub unique_keys: Vec<Vec<ColumnBinding>>,
     /// Filter strength (selectivity factor).
     pub filter_strength: f64,
     /// Whether statistics have been initialized.
@@ -61,8 +76,11 @@ impl RelationStats {
     /// Create new empty statistics.
     pub fn new() -> Self {
         Self {
-            column_distinct_count: Vec::new(),
+            column_distinct_count: HashMap::new(),
             cardinality: 1,
+            estimated_payload_width: 1,
+            contains_control_region: false,
+            unique_keys: Vec::new(),
             filter_strength: 1.0,
             stats_initialized: false,
         }
@@ -291,6 +309,11 @@ impl RelationManager {
             // Extract bindings from the expression
             let mut bindings = HashSet::new();
             if !self.extract_bindings(&extracted_filter.expression, &mut bindings) {
+                debug!(
+                    target: targets::OPTIMIZER,
+                    expression = ?extracted_filter.expression,
+                    "Skipped join-region reordering because a predicate binding is external or unresolved"
+                );
                 return None;
             }
 
@@ -314,9 +337,18 @@ impl RelationManager {
                 set,
                 filters.len(),
                 extracted_filter.join_type,
+                extracted_filter.anti_join_mode,
             );
 
-            self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info);
+            if !self.populate_filter_info_bindings(extracted_filter, set_manager, &mut filter_info)
+            {
+                debug!(
+                    target: targets::OPTIMIZER,
+                    expression = ?extracted_filter.expression,
+                    "Skipped join-region reordering because a predicate binding is external or unresolved"
+                );
+                return None;
+            }
             filters.push(Arc::new(filter_info));
         }
 
@@ -328,46 +360,42 @@ impl RelationManager {
 
     /// Check if a join is reorderable.
     pub fn join_is_reorderable(join: &Join) -> bool {
-        if Self::join_contains_delim_get(join) || join_tree_has_evaluation_fence(join) {
-            return false;
-        }
-
         match join {
-            Join::Cross(_) => true,
-            Join::Comparison(cj) => {
-                if !cj.duplicate_eliminated_columns.is_empty() {
-                    return false;
-                }
-                match cj.join_type {
-                    JoinType::Inner | JoinType::Semi | JoinType::Anti => {
-                        // Check if conditions reference columns from both sides
-                        for cond in &cj.conditions {
-                            if Self::expression_contains_column_ref(&cond.left)
-                                && Self::expression_contains_column_ref(&cond.right)
-                            {
-                                return true;
-                            }
-                        }
-                        false
-                    }
-                    _ => false,
-                }
-            }
+            Join::Cross(_) => !join_tree_has_evaluation_fence(join),
+            Join::Comparison(join) => Self::comparison_join_is_reorderable(join),
             Join::Any(_) => false,
         }
     }
 
-    fn join_contains_delim_get(join: &Join) -> bool {
-        Self::operator_contains_delim_get(&join.left().operator)
-            || Self::operator_contains_delim_get(&join.right().operator)
+    fn comparison_join_is_reorderable(join: &paro_planner::operator::ComparisonJoin) -> bool {
+        !comparison_join_tree_has_evaluation_fence(join)
+            && join.duplicate_eliminated_columns.is_empty()
+            && matches!(
+                join.join_type,
+                JoinType::Inner | JoinType::Semi | JoinType::Anti
+            )
+            && Self::comparison_has_binary_edge(join)
     }
 
-    fn operator_contains_delim_get(op: &LogicalOperator) -> bool {
-        matches!(op, LogicalOperator::DelimGet(_))
-            || op
-                .children()
-                .into_iter()
-                .any(|child| Self::operator_contains_delim_get(&child.operator))
+    /// Whether this reduction can be detached from its current preserved
+    /// input and represented as a query-graph edge.
+    ///
+    /// A comparison with a constant on one side still has valid SEMI/ANTI
+    /// execution semantics, but it does not identify both graph roles. Such a
+    /// join must remain an atomic relation; converting it to a root predicate
+    /// would lose its existential multiplicity contract.
+    pub(crate) fn reduction_join_is_reorderable(
+        join: &paro_planner::operator::ComparisonJoin,
+    ) -> bool {
+        matches!(join.join_type, JoinType::Semi | JoinType::Anti)
+            && Self::comparison_join_is_reorderable(join)
+    }
+
+    fn comparison_has_binary_edge(join: &paro_planner::operator::ComparisonJoin) -> bool {
+        join.conditions.iter().any(|condition| {
+            Self::expression_contains_column_ref(&condition.left)
+                && Self::expression_contains_column_ref(&condition.right)
+        })
     }
 
     /// Check if an expression contains a column reference.
@@ -408,6 +436,7 @@ impl RelationManager {
                 | LogicalOperatorType::Aggregate
                 | LogicalOperatorType::Window
                 | LogicalOperatorType::CTERef
+                | LogicalOperatorType::DelimGet
         )
     }
 
@@ -428,7 +457,7 @@ impl RelationManager {
         extracted_filter: &ExtractedFilter,
         set_manager: &mut JoinRelationSetManager,
         filter_info: &mut FilterInfo,
-    ) {
+    ) -> bool {
         match &extracted_filter.expression {
             Expression::Comparison(comp) => {
                 let mut left_bindings = HashSet::new();
@@ -436,7 +465,7 @@ impl RelationManager {
                 if !self.extract_bindings(&comp.left, &mut left_bindings)
                     || !self.extract_bindings(&comp.right, &mut right_bindings)
                 {
-                    return;
+                    return false;
                 }
 
                 if !left_bindings.is_empty() && !right_bindings.is_empty() {
@@ -445,10 +474,16 @@ impl RelationManager {
                 }
 
                 if let Some(binding) = Self::extract_column_binding(&comp.left) {
-                    filter_info.set_left_binding(binding);
+                    let Some(relation) = self.get_relation_id(binding.table_index) else {
+                        return false;
+                    };
+                    filter_info.set_left_binding(binding, relation);
                 }
                 if let Some(binding) = Self::extract_column_binding(&comp.right) {
-                    filter_info.set_right_binding(binding);
+                    let Some(relation) = self.get_relation_id(binding.table_index) else {
+                        return false;
+                    };
+                    filter_info.set_right_binding(binding, relation);
                 }
             }
             Expression::Conjunction(conj)
@@ -468,26 +503,51 @@ impl RelationManager {
                         left_bindings.extend(child_left);
                         right_bindings.extend(child_right);
                     }
-
-                    if filter_info.left_binding.is_none() {
-                        if let Some(binding) = Self::extract_column_binding(&comp.left) {
-                            filter_info.set_left_binding(binding);
-                        }
-                    }
-                    if filter_info.right_binding.is_none() {
-                        if let Some(binding) = Self::extract_column_binding(&comp.right) {
-                            filter_info.set_right_binding(binding);
-                        }
-                    }
                 }
 
                 if !left_bindings.is_empty() && !right_bindings.is_empty() {
                     filter_info.set_left_set(set_manager.get_relation_from_set(&left_bindings));
                     filter_info.set_right_set(set_manager.get_relation_from_set(&right_bindings));
                 }
+
+                // A conjunction is one existential predicate, but its direct
+                // key statistics must come from an equality child. Predicate
+                // order is not semantic: choosing the first comparison makes
+                // `a <> b AND k = k` lose the hash-domain estimate merely
+                // because the residual happened to be written first.
+                let key = conj
+                    .children
+                    .iter()
+                    .filter_map(|child| match child {
+                        Expression::Comparison(comparison)
+                            if matches!(
+                                comparison.comparison_type,
+                                ComparisonType::Equal | ComparisonType::NotDistinctFrom
+                            ) =>
+                        {
+                            Some(comparison)
+                        }
+                        _ => None,
+                    })
+                    .next();
+                if let Some(key) = key {
+                    if let Some(binding) = Self::extract_column_binding(&key.left) {
+                        let Some(relation) = self.get_relation_id(binding.table_index) else {
+                            return false;
+                        };
+                        filter_info.set_left_binding(binding, relation);
+                    }
+                    if let Some(binding) = Self::extract_column_binding(&key.right) {
+                        let Some(relation) = self.get_relation_id(binding.table_index) else {
+                            return false;
+                        };
+                        filter_info.set_right_binding(binding, relation);
+                    }
+                }
             }
             _ => {}
         }
+        true
     }
 
     fn extract_column_binding(expr: &Expression) -> Option<paro_planner::operator::ColumnBinding> {
@@ -544,7 +604,7 @@ mod tests {
             names: vec!["col".to_string()],
             relation_name: None,
             relation_alias: None,
-            column_ids: vec![0],
+            column_sources: vec![paro_planner::operator::GetColumnSource::Stored { column_id: 0 }],
             column_types: vec![LogicalType::Integer],
             table: None,
             scan_order: None,
@@ -587,21 +647,20 @@ mod tests {
     fn test_extract_bindings_visits_window_frame_offsets() {
         let mut manager = RelationManager::new();
         manager.add_relation(create_test_get(7), None, RelationStats::new());
-        let expression = Expression::Window(WindowExpression {
-            function: paro_function::window::WindowFunction::row_number(),
-            children: vec![],
-            partitions: vec![],
-            orders: vec![],
-            frame: WindowFrame {
+        let expression = Expression::Window(WindowExpression::native(
+            paro_function::window::WindowFunction::row_number(),
+            vec![],
+            vec![],
+            vec![],
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(create_column_ref(7, 0))),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::CurrentRow,
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
         let mut bindings = HashSet::new();
 
         assert!(manager.extract_bindings(&expression, &mut bindings));
@@ -750,9 +809,9 @@ mod tests {
         assert!(extracted.root_filters.is_empty());
         // First filter references both relations
         assert_eq!(filters[0].set.count(), 2);
-        assert_eq!(filters[0].join_type, JoinType::Inner);
-        assert!(filters[0].left_set.is_some());
-        assert!(filters[0].right_set.is_some());
+        assert_eq!(filters[0].join_type(), JoinType::Inner);
+        assert!(filters[0].left_set().is_some());
+        assert!(filters[0].right_set().is_some());
         // Second filter references only one relation
         assert_eq!(filters[1].set.count(), 1);
     }
@@ -773,18 +832,31 @@ mod tests {
 
         let filters = manager
             .extract_edges(
-                &[ExtractedFilter::new(filter, JoinType::Semi)],
+                &[ExtractedFilter::new(
+                    filter,
+                    JoinType::Anti,
+                    AntiJoinMode::NullAware,
+                )],
                 &mut set_manager,
             )
             .expect("reorderable predicate")
             .graph_filters;
 
         assert_eq!(filters.len(), 1);
-        assert_eq!(filters[0].join_type, JoinType::Semi);
-        assert_eq!(filters[0].left_binding, Some(ColumnBinding::new(0, 0)));
-        assert_eq!(filters[0].right_binding, Some(ColumnBinding::new(1, 0)));
-        assert!(filters[0].left_set.is_some());
-        assert!(filters[0].right_set.is_some());
+        assert_eq!(filters[0].join_type(), JoinType::Anti);
+        assert_eq!(filters[0].anti_join_mode, AntiJoinMode::NullAware);
+        assert_eq!(
+            filters[0].left_binding.map(|key| key.column),
+            Some(ColumnBinding::new(0, 0))
+        );
+        assert_eq!(filters[0].left_binding.map(|key| key.relation), Some(0));
+        assert_eq!(
+            filters[0].right_binding.map(|key| key.column),
+            Some(ColumnBinding::new(1, 0))
+        );
+        assert_eq!(filters[0].right_binding.map(|key| key.relation), Some(1));
+        assert!(filters[0].left_set().is_some());
+        assert!(filters[0].right_set().is_some());
     }
 
     #[test]
@@ -887,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn test_join_with_delim_get_subtree_is_not_reorderable() {
+    fn test_join_with_delim_get_subtree_is_reorderable_inside_owner_region() {
         let left = create_test_get(0);
         let right = LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer]));
         let join = ComparisonJoin::new(
@@ -904,7 +976,7 @@ mod tests {
             )],
         );
 
-        assert!(!RelationManager::join_is_reorderable(&Join::Comparison(
+        assert!(RelationManager::join_is_reorderable(&Join::Comparison(
             join
         )));
     }

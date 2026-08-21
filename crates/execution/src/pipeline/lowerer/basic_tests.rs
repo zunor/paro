@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::physical::properties::MemoryClass;
 
 #[test]
 fn lowerer_builds_source_transform_sink_pipeline() {
@@ -118,6 +119,143 @@ fn grouped_aggregate_lowers_to_build_emit_breaker_pipelines() {
 }
 
 #[test]
+fn aggregate_probe_fuses_emit_into_hash_join_without_row_copy() {
+    let plan = aggregate_probe_hash_join_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert!(!graph.pipelines.iter().any(|pipeline| matches!(
+        pipeline.source,
+        SourceSpec::Materialized(_)
+    ) || matches!(
+        pipeline.sink,
+        SinkSpec::Materialize(_)
+    )));
+    let probe = graph
+        .pipelines
+        .iter()
+        .find(|pipeline| {
+            matches!(
+                pipeline.source,
+                SourceSpec::HashAggregateEmit(_) | SourceSpec::PerfectHashAggregateEmit(_)
+            )
+        })
+        .expect("aggregate emit probe pipeline");
+    assert!(probe
+        .transforms
+        .iter()
+        .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
+    assert_eq!(
+        probe.properties.capabilities.parallelism,
+        crate::physical::properties::Parallelism::unbounded()
+    );
+    assert!(graph
+        .dependencies
+        .iter()
+        .any(|dependency| dependency.kind == DependencyKind::FinalizeBeforeEmit));
+}
+
+#[test]
+fn single_task_breaker_emit_materializes_before_parallel_probe() {
+    for breaker in SingleTaskEmitBreaker::variants() {
+        let plan = single_task_breaker_probe_hash_join_plan(breaker);
+        let mut lowerer = PipelineLowerer::new(&plan);
+        let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+        let emit = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| breaker.matches_source(&pipeline.source))
+            .expect("single-task breaker emit pipeline");
+        assert_eq!(
+            emit.properties.capabilities.parallelism,
+            crate::physical::properties::Parallelism::single()
+        );
+        assert!(matches!(emit.sink, SinkSpec::Materialize(_)));
+        assert!(!emit
+            .transforms
+            .iter()
+            .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_))));
+
+        let probe = graph
+            .pipelines
+            .iter()
+            .find(|pipeline| {
+                matches!(pipeline.source, SourceSpec::Materialized(_))
+                    && pipeline
+                        .transforms
+                        .iter()
+                        .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+            })
+            .expect("parallel materialized probe pipeline");
+        assert_eq!(
+            probe.properties.capabilities.parallelism,
+            crate::physical::properties::Parallelism::unbounded()
+        );
+    }
+}
+
+#[test]
+fn partition_aggregate_window_lowers_to_build_emit_breaker_pipelines() {
+    let plan = partition_aggregate_window_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(matches!(
+        graph.pipelines[0].sink,
+        SinkSpec::PartitionAggregateWindowBuild(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[1].source,
+        SourceSpec::PartitionAggregateWindowEmit(_)
+    ));
+    assert_eq!(graph.dependencies.len(), 1);
+    assert_eq!(
+        graph.dependencies[0].kind,
+        DependencyKind::FinalizeBeforeEmit
+    );
+    assert_eq!(graph.handles.len(), 1);
+    assert_eq!(
+        graph.handles.iter().next().unwrap().kind,
+        BreakerHandleKind::PartitionAggregateWindow
+    );
+    let build = &graph.pipelines[0].properties;
+    assert_eq!(build.memory.class, MemoryClass::Blocking);
+    assert!(build.memory.revocable);
+    assert!(build.memory.spillable);
+    assert!(build.capabilities.supports_spill);
+    let emit = &graph.pipelines[1].properties;
+    assert_eq!(emit.memory.class, MemoryClass::Blocking);
+}
+
+#[test]
+fn ungrouped_aggregate_lowers_to_parallel_build_and_single_emit() {
+    let plan = ungrouped_aggregate_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.pipelines.len(), 2);
+    assert!(matches!(
+        graph.pipelines[0].sink,
+        SinkSpec::UngroupedAggregate(_)
+    ));
+    assert!(matches!(
+        graph.pipelines[1].source,
+        SourceSpec::UngroupedAggregateEmit(_)
+    ));
+    assert_eq!(
+        graph.pipelines[0].properties.capabilities.parallelism.max,
+        usize::MAX
+    );
+    assert_eq!(graph.dependencies.len(), 1);
+    assert_eq!(
+        graph.dependencies[0].kind,
+        DependencyKind::FinalizeBeforeEmit
+    );
+}
+
+#[test]
 fn topn_lowers_to_build_emit_breaker_pipelines() {
     let plan = topn_plan();
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -132,6 +270,11 @@ fn topn_lowers_to_build_emit_breaker_pipelines() {
         DependencyKind::FinalizeBeforeEmit
     );
     assert_eq!(graph.handles.len(), 1);
+    let build = &graph.pipelines[0].properties;
+    assert_eq!(build.memory.class, MemoryClass::Blocking);
+    assert!(!build.memory.revocable);
+    assert!(!build.memory.spillable);
+    assert!(!build.capabilities.supports_spill);
 }
 
 #[test]
@@ -223,6 +366,7 @@ fn forced_external_hash_join_keeps_spill_replay_pipeline() {
         PlanBuildContext {
             force_external: true,
             rowset_scan_pushdown: true,
+            ..PlanBuildContext::default()
         },
     );
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -352,6 +496,61 @@ fn right_hash_join_lowers_unmatched_emit_pipeline() {
         graph.dependencies[2].kind,
         DependencyKind::FinalizeBeforeEmit
     );
+}
+
+#[test]
+fn hash_join_merges_optional_branches_directly_into_topn_heap() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        other => panic!("expected hash join root, got {other:?}"),
+    };
+    let output = plan.node(plan.root).output.clone();
+    let topn = TopNSpec {
+        orders: vec![OrderByNode {
+            expression: Expression::Reference(ReferenceExpression::new(0, output.types[0].clone())),
+            ascending: true,
+            nulls_first: true,
+        }]
+        .into_boxed_slice(),
+        limit: 1,
+        offset: 0,
+        hnsw_ef_hint: None,
+        output_names: output.names.clone(),
+        output_types: output.types.clone(),
+    };
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let mut pipelines = Vec::new();
+    let mut dependencies = Vec::new();
+
+    let tail = lowerer
+        .lower_hash_join_to_sink(
+            plan.root,
+            &spec,
+            vec![TransformSpec::StreamingTopN(topn)],
+            SinkSpec::ClientResult(ClientResultSpec::default()),
+            SinkSharing::Exclusive,
+            output,
+            &mut pipelines,
+            &mut dependencies,
+        )
+        .unwrap();
+
+    assert_eq!(pipelines.len(), 4);
+    assert!(matches!(pipelines[1].sink, SinkSpec::TopNBuild(_)));
+    assert!(matches!(
+        pipelines[2].source,
+        SourceSpec::HashJoinSpillReplay(_)
+    ));
+    assert!(matches!(pipelines[2].sink, SinkSpec::TopNBuild(_)));
+    assert_eq!(pipelines[1].sink_sharing, pipelines[2].sink_sharing);
+    assert!(matches!(pipelines[3].source, SourceSpec::TopNEmit(_)));
+    assert!(pipelines[3].transforms.is_empty());
+    assert!(matches!(pipelines[3].sink, SinkSpec::ClientResult(_)));
+    assert!(!pipelines
+        .iter()
+        .any(|pipeline| matches!(pipeline.sink, SinkSpec::Materialize(_))));
+    assert_eq!(tail, PipelineId::new(3));
 }
 
 #[test]

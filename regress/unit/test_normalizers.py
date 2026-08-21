@@ -11,15 +11,28 @@ from harness.normalizers import apply_normalizers, normalizer_profiles
 def test_apply_explain_operator_timing_normalizer_rewrites_actual_time() -> None:
     lines = [
         "FILTER  (actual time=0.018..0.024 rows=2)",
-        "->  SEQ_SCAN on t  (actual time=1.2..3.45 rows=3)",
+        (
+            "->  SEQ_SCAN on t  (actual time=1.2..3.45 rows=3 loops=2 "
+            "scheduler_worker_count=4 scheduler_morsel_count=8 "
+            "scheduler_blocked_count=1 scheduler_ready_time_us=42)"
+        ),
         '{"actual":{"startup_time_ms":0.018,"total_time_ms":0.024,"rows":2}}',
     ]
 
     assert apply_normalizers(lines, ("explain_operator_timing",)) == [
         "FILTER  (actual time=<time-range> rows=2)",
-        "->  SEQ_SCAN on t  (actual time=<time-range> rows=3)",
+        "->  SEQ_SCAN on t  (actual time=<time-range> rows=3 loops=<loops>)",
         '{"actual":{"startup_time_ms": 0.0,"total_time_ms": 0.0,"rows":2}}',
     ]
+
+
+def test_operator_timing_and_counter_normalizers_compose() -> None:
+    lines = ["ROWSET_SCAN (actual time=0.1..0.2 rows=7 loops=3)"]
+
+    assert apply_normalizers(
+        lines,
+        ("explain_operator_timing", "explain_operator_counters"),
+    ) == ["ROWSET_SCAN (actual time=<time-range> rows=<rows> loops=<loops>)"]
 
 
 def test_apply_explain_operator_timing_normalizer_rewrites_runtime_profile() -> None:

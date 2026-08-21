@@ -34,7 +34,9 @@ use crate::primary_key::{
     PERSISTENT_INDEX_FORMAT_VERSION,
 };
 use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
-use crate::rowset::{Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentsOverlap};
+use crate::rowset::{
+    PhysicalRowRef, Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
+};
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
@@ -67,34 +69,7 @@ pub struct TabletIdentity {
     pub schema_version: u32,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PhysicalRowRef {
-    pub rowset_id: u64,
-    pub segment_id: u32,
-    pub row_offset: u32,
-}
-
-impl PhysicalRowRef {
-    pub const fn new(rowset_id: u64, segment_id: u32, row_offset: u32) -> Self {
-        Self {
-            rowset_id,
-            segment_id,
-            row_offset,
-        }
-    }
-
-    pub const fn segment_key(self) -> (u64, u32) {
-        (self.rowset_id, self.segment_id)
-    }
-}
-
-impl From<(u64, u32, u32)> for PhysicalRowRef {
-    fn from(value: (u64, u32, u32)) -> Self {
-        Self::new(value.0, value.1, value.2)
-    }
-}
-
-impl From<PhysicalRowRef> for (u64, u32, u32) {
+impl From<PhysicalRowRef> for (u64, u32, SegmentRowId) {
     fn from(value: PhysicalRowRef) -> Self {
         (value.rowset_id, value.segment_id, value.row_offset)
     }
@@ -1078,7 +1053,7 @@ impl Tablet {
                     self.tablet_id(),
                     location.rowset_id,
                     location.segment_id,
-                    location.row_offset,
+                    location.row_offset.get(),
                 ),
                 LockMode::X,
             )
@@ -1896,11 +1871,12 @@ impl Tablet {
         locations: &[(u64, u32, u32)],
         delete_version: i64,
     ) -> Result<()> {
-        let physical_locations: Vec<_> = locations
+        let physical_locations = locations
             .iter()
-            .copied()
-            .map(PhysicalRowRef::from)
-            .collect();
+            .map(|&(rowset_id, segment_id, row_offset)| {
+                PhysicalRowRef::new(rowset_id, segment_id, SegmentRowId::from_raw(row_offset))
+            })
+            .collect::<Vec<_>>();
         self.apply_row_id_delete_refs_internal(&physical_locations, delete_version, true, true)
     }
 
@@ -2062,7 +2038,7 @@ impl Tablet {
 
         let mut had_rowset_updates = false;
         for ((_, segment_id), delete_vector) in rowset_vectors {
-            let deletes: Vec<u32> = delete_vector.iter().collect();
+            let deletes: Vec<SegmentRowId> = delete_vector.iter().collect();
             if deletes.is_empty() {
                 continue;
             }
@@ -2094,7 +2070,7 @@ impl Tablet {
             if let Some(rowset) = self.find_rowset_by_id(rs_id) {
                 let mut chain =
                     DeleteVector::load_versioned_from_dir(rowset.rowset_path(), seg_id)?;
-                let deletes: Vec<u32> = dv.iter().collect();
+                let deletes: Vec<SegmentRowId> = dv.iter().collect();
                 if deletes.is_empty() {
                     continue;
                 }
@@ -2170,7 +2146,7 @@ impl Tablet {
                 out.push(PhysicalRowRef::new(
                     rowset.rowset_id(),
                     seg.segment_id(),
-                    row_id,
+                    SegmentRowId::from_raw(row_id),
                 ));
             }
         }
@@ -4108,7 +4084,7 @@ mod tests {
         // Build persistent index with one key
         let pi_dir = tmp.path().join("primary_index");
         let pi = PersistentIndex::new(&pi_dir).unwrap();
-        pi.apply_upserts(&[(b"k1".to_vec(), RowID::new(1, 0))])
+        pi.apply_upserts(&[(b"k1".to_vec(), RowID::new(1, SegmentRowId::from_raw(0)))])
             .unwrap();
 
         let tablet = Tablet::create_from_meta(meta, None).unwrap();

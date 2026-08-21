@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use paro_common::error::{self as paro_error, Result};
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{ColumnRefExpression, Expression, ExpressionIterator};
-use paro_planner::operator::{Join, LogicalOperator};
+use paro_planner::operator::{ColumnBinding, Join, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 
 pub fn verify_logical_plan(_bind_context: &BindContext, plan: &LogicalPlan) -> Result<()> {
@@ -22,6 +22,45 @@ fn verify_plan(_bind_context: &BindContext, plan: &LogicalOperator) -> Result<()
 
 struct Verifier {
     seen_table_indices: HashSet<usize>,
+}
+
+#[derive(Debug)]
+struct GraphProjectionScope {
+    materialized_table_indices: HashSet<usize>,
+    carrier_bindings: Vec<ColumnBinding>,
+}
+
+impl GraphProjectionScope {
+    fn from_plan(plan: &LogicalPlan) -> Option<Self> {
+        match &plan.operator {
+            LogicalOperator::GraphScan(scan) => Some(Self {
+                materialized_table_indices: HashSet::from([scan.table_index]),
+                carrier_bindings: plan.get_column_bindings(),
+            }),
+            LogicalOperator::GraphExpand(expand) => {
+                let mut scope = Self::from_plan(expand.child.as_ref())?;
+                scope
+                    .materialized_table_indices
+                    .insert(expand.edge_table_index);
+                scope
+                    .materialized_table_indices
+                    .insert(expand.target_table_index);
+                scope.carrier_bindings = plan.get_column_bindings();
+                Some(scope)
+            }
+            LogicalOperator::Filter(filter) => {
+                let mut scope = Self::from_plan(filter.child.as_ref())?;
+                scope.carrier_bindings = plan.get_column_bindings();
+                Some(scope)
+            }
+            LogicalOperator::EmptyResult(empty) => {
+                let mut scope = Self::from_plan(empty.child.as_ref())?;
+                scope.carrier_bindings = plan.get_column_bindings();
+                Some(scope)
+            }
+            _ => None,
+        }
+    }
 }
 
 impl Verifier {
@@ -65,38 +104,91 @@ impl Verifier {
             LogicalOperator::Get(get) => {
                 let len = get.returned_types.len();
                 if get.names.len() != len
-                    || get.column_ids.len() != len
+                    || get.column_sources.len() != len
                     || get.column_types.len() != len
                 {
                     return Err(paro_error::internal(format!(
-                        "Get output mismatch: returned_types={}, names={}, column_ids={}, column_types={}",
+                        "Get output mismatch: returned_types={}, names={}, column_sources={}, column_types={}",
                         get.returned_types.len(),
                         get.names.len(),
-                        get.column_ids.len(),
+                        get.column_sources.len(),
                         get.column_types.len()
                     )));
+                }
+                if get
+                    .returned_types
+                    .iter()
+                    .zip(&get.column_types)
+                    .any(|(returned, source)| returned.physical_type() != source.physical_type())
+                {
+                    return Err(paro_error::internal(
+                        "Get returned and source types require the same physical representation",
+                    ));
                 }
 
                 if let Some(table) = &get.table {
                     let table_col_count = table.columns.len();
-                    for (idx, &col_id) in get.column_ids.iter().enumerate() {
-                        let is_virtual_rowid = col_id == table_col_count
-                            && matches!(
-                                get.column_types.get(idx),
-                                Some(paro_common::types::LogicalType::BigInt)
-                            );
-                        if col_id > table_col_count
-                            || (col_id == table_col_count && !is_virtual_rowid)
-                        {
-                            return Err(paro_error::internal(format!(
-                                "Get column id {} out of range (table columns={})",
-                                col_id, table_col_count
-                            )));
+                    let mut virtual_rowids = 0usize;
+                    for (idx, source) in get.column_sources.iter().enumerate() {
+                        match source {
+                            paro_planner::operator::GetColumnSource::Stored { column_id } => {
+                                if *column_id >= table_col_count {
+                                    return Err(paro_error::internal(format!(
+                                        "Get stored column id {column_id} out of range (table columns={table_col_count})"
+                                    )));
+                                }
+                                if get.column_types[idx] != table.columns[*column_id].logical_type {
+                                    return Err(paro_error::internal(
+                                        "Get stored output physical type differs from its catalog source",
+                                    ));
+                                }
+                            }
+                            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                                source_column,
+                                byte_width,
+                            } => {
+                                if *source_column >= table_col_count
+                                    || *byte_width == 0
+                                    || !table.columns[*source_column].logical_type.is_utf8_varlen()
+                                    || get.column_types[idx]
+                                        != table.columns[*source_column].logical_type
+                                    || !get.column_types[idx].is_utf8_varlen()
+                                    || get.returned_types[idx]
+                                        != paro_common::types::LogicalType::Varchar
+                                {
+                                    return Err(paro_error::internal(
+                                        "Get matched-prefix source requires a stored VARCHAR column, positive width, and VARCHAR output",
+                                    ));
+                                }
+                            }
+                            paro_planner::operator::GetColumnSource::VirtualRowId => {
+                                virtual_rowids += 1;
+                                if get.column_types[idx] != paro_common::types::LogicalType::BigInt
+                                    || get.returned_types[idx]
+                                        != paro_common::types::LogicalType::BigInt
+                                {
+                                    return Err(paro_error::internal(
+                                        "Get virtual row id requires BIGINT physical and returned types",
+                                    ));
+                                }
+                            }
                         }
+                    }
+                    if virtual_rowids > 1 {
+                        return Err(paro_error::internal(
+                            "Get may expose at most one virtual row id",
+                        ));
                     }
                 }
             }
             LogicalOperator::Projection(proj) => {
+                if proj.visible_names.len() > proj.expressions.len() {
+                    return Err(paro_error::internal(format!(
+                        "Projection visible-name prefix exceeds outputs: visible_names={}, expressions={}",
+                        proj.visible_names.len(),
+                        proj.expressions.len()
+                    )));
+                }
                 if proj.returned_types.len() != proj.expressions.len() {
                     return Err(paro_error::internal(format!(
                         "Projection returned_types mismatch: returned_types={}, expressions={}",
@@ -113,8 +205,118 @@ impl Verifier {
                         )));
                     }
                 }
+                if let Some(scope) = GraphProjectionScope::from_plan(proj.child.as_ref()) {
+                    for expression in &proj.expressions {
+                        self.verify_graph_projection_bindings(expression, &scope)?;
+                    }
+                } else {
+                    let child_bindings = proj.child.get_column_bindings();
+                    let child_types = proj.child.types();
+                    for expression in &proj.expressions {
+                        self.verify_expression_bindings(
+                            expression,
+                            &child_bindings,
+                            &child_types,
+                            "Projection",
+                        )?;
+                    }
+                }
+            }
+            LogicalOperator::RowFetch(fetch) => {
+                let child_bindings = fetch.child.get_column_bindings();
+                if fetch.sources.is_empty() {
+                    return Err(paro_error::internal("RowFetch has no materialized source"));
+                }
+                if !child_bindings
+                    .iter()
+                    .any(|binding| binding.table_index == fetch.carrier_table_index)
+                {
+                    return Err(paro_error::internal(format!(
+                        "RowFetch carrier table {} is not produced by its child",
+                        fetch.carrier_table_index
+                    )));
+                }
+                let mut source_indices = HashSet::with_capacity(fetch.sources.len());
+                for source in &fetch.sources {
+                    if !source_indices.insert(source.materialized_table_index) {
+                        return Err(paro_error::internal(format!(
+                            "RowFetch source table index {} is duplicated",
+                            source.materialized_table_index
+                        )));
+                    }
+                    let Expression::ColumnRef(rowid) = &source.rowid else {
+                        return Err(paro_error::internal(
+                            "RowFetch rowid carrier must be a direct column reference",
+                        ));
+                    };
+                    if rowid.depth != 0
+                        || rowid.binding.table_index != fetch.carrier_table_index
+                        || rowid.return_type != paro_common::types::LogicalType::BigInt
+                    {
+                        return Err(paro_error::internal(
+                            "RowFetch rowid must be a direct BIGINT carrier column",
+                        ));
+                    }
+                    if source.needed_columns.is_empty() {
+                        return Err(paro_error::internal(format!(
+                            "RowFetch source table {} exposes no catalog columns",
+                            source.materialized_table_index
+                        )));
+                    }
+                    let mut previous = None;
+                    for &column in source.needed_columns.iter() {
+                        if column >= source.table.columns.len() {
+                            return Err(paro_error::internal(format!(
+                                "RowFetch source table {} column {} exceeds catalog width {}",
+                                source.materialized_table_index,
+                                column,
+                                source.table.columns.len()
+                            )));
+                        }
+                        if previous.is_some_and(|previous| previous >= column) {
+                            return Err(paro_error::internal(format!(
+                                "RowFetch source table {} columns must be strictly ordered and unique",
+                                source.materialized_table_index
+                            )));
+                        }
+                        previous = Some(column);
+                    }
+                    let child_types = fetch.child.types();
+                    self.verify_expression_bindings(
+                        &source.rowid,
+                        &child_bindings,
+                        &child_types,
+                        "RowFetch rowid",
+                    )?;
+                }
+            }
+            LogicalOperator::Filter(filter) => {
+                let child_bindings = filter.child.get_column_bindings();
+                let child_types = filter.child.types();
+                Self::verify_projection_map(
+                    "Filter",
+                    &filter.projection_map,
+                    child_bindings.len(),
+                )?;
+                for expression in &filter.expressions {
+                    self.verify_expression_bindings(
+                        expression,
+                        &child_bindings,
+                        &child_types,
+                        "Filter",
+                    )?;
+                }
+            }
+            LogicalOperator::Order(order) => {
+                Self::verify_projection_map(
+                    "Order",
+                    &order.projection_map,
+                    order.child.types().len(),
+                )?;
             }
             LogicalOperator::Aggregate(agg) => {
+                agg.verify_post_reduction()?;
+                agg.verify_group_input_multiplicity()?;
                 let expected =
                     agg.groups.len() + agg.aggregates.len() + agg.grouping_functions.len();
                 if agg.returned_types.len() != expected {
@@ -141,6 +343,27 @@ impl Verifier {
                             idx, agg.returned_types[idx]
                         )));
                     }
+                }
+                if let Some((dependency_idx, _)) = agg
+                    .group_dependencies
+                    .iter()
+                    .enumerate()
+                    .find(|(_, dependency)| !dependency.is_valid_for(agg.groups.len()))
+                {
+                    return Err(paro_error::internal(format!(
+                        "Aggregate group dependency {dependency_idx} is invalid for {} groups",
+                        agg.groups.len()
+                    )));
+                }
+                let child_bindings = agg.child.get_column_bindings();
+                let child_types = agg.child.types();
+                for expression in agg.groups.iter().chain(agg.aggregates.iter()) {
+                    self.verify_expression_bindings(
+                        expression,
+                        &child_bindings,
+                        &child_types,
+                        "Aggregate",
+                    )?;
                 }
             }
             LogicalOperator::Join(join) => {
@@ -172,67 +395,220 @@ impl Verifier {
         Ok(())
     }
 
+    fn verify_expression_bindings(
+        &self,
+        expression: &Expression,
+        available: &[ColumnBinding],
+        available_types: &[paro_common::types::LogicalType],
+        scope: &str,
+    ) -> Result<()> {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth == 0 {
+                let Some(position) = available
+                    .iter()
+                    .position(|binding| *binding == column.binding)
+                else {
+                    return Err(paro_error::internal(format!(
+                        "{scope} expression references unavailable binding {:?}; input bindings: {available:?}",
+                        column.binding
+                    )));
+                };
+                let input_type = available_types.get(position).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "{scope} input domain has {} bindings but {} types",
+                        available.len(),
+                        available_types.len()
+                    ))
+                })?;
+                if &column.return_type != input_type {
+                    return Err(paro_error::internal(format!(
+                        "{scope} binding {:?} type mismatch: expression={:?}, input={input_type:?}",
+                        column.binding, column.return_type
+                    )));
+                }
+            }
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expression, |child| {
+            if result.is_ok() {
+                result = self.verify_expression_bindings(child, available, available_types, scope);
+            }
+        });
+        result
+    }
+
+    fn verify_graph_projection_bindings(
+        &self,
+        expression: &Expression,
+        scope: &GraphProjectionScope,
+    ) -> Result<()> {
+        if let Expression::ColumnRef(column) = expression {
+            if column.depth != 0 {
+                return Ok(());
+            }
+            let binding = column.binding;
+            let available = scope.carrier_bindings.contains(&binding)
+                || scope
+                    .materialized_table_indices
+                    .contains(&binding.table_index);
+            if !available {
+                return Err(paro_error::internal(format!(
+                    "Graph projection expression references unavailable binding {:?}; materialized tables: {:?}, carrier bindings: {:?}",
+                    binding, scope.materialized_table_indices, scope.carrier_bindings
+                )));
+            }
+            return Ok(());
+        }
+
+        let mut result = Ok(());
+        ExpressionIterator::enumerate_children(expression, |child| {
+            if result.is_ok() {
+                result = self.verify_graph_projection_bindings(child, scope);
+            }
+        });
+        result
+    }
+
     fn verify_join_projection_maps(&self, join: &Join) -> Result<()> {
         match join {
             Join::Comparison(cj) => {
                 let left_len = cj.left.types().len();
                 let right_len = cj.right.types().len();
-                for &idx in &cj.left_projection_map {
-                    if idx >= left_len {
-                        return Err(paro_error::internal(format!(
-                            "Join left_projection_map index {} out of range (left types={})",
-                            idx, left_len
-                        )));
-                    }
+                let left_bindings = cj.left.get_column_bindings();
+                let right_bindings = cj.right.get_column_bindings();
+                let left_types = cj.left.types();
+                let right_types = cj.right.types();
+                let (duplicate_input, duplicate_types) = if cj.delim_flipped {
+                    (right_bindings.as_slice(), right_types.as_slice())
+                } else {
+                    (left_bindings.as_slice(), left_types.as_slice())
+                };
+                for expression in &cj.duplicate_eliminated_columns {
+                    self.verify_expression_bindings(
+                        expression,
+                        duplicate_input,
+                        duplicate_types,
+                        "comparison join duplicate-eliminated key",
+                    )?;
                 }
-                for &idx in &cj.right_projection_map {
-                    if idx >= right_len {
-                        return Err(paro_error::internal(format!(
-                            "Join right_projection_map index {} out of range (right types={})",
-                            idx, right_len
-                        )));
-                    }
+                for condition in &cj.conditions {
+                    self.verify_expression_bindings(
+                        &condition.left,
+                        &left_bindings,
+                        &left_types,
+                        "comparison join probe key",
+                    )?;
+                    self.verify_expression_bindings(
+                        &condition.right,
+                        &right_bindings,
+                        &right_types,
+                        "comparison join build key",
+                    )?;
+                }
+                Self::verify_projection_map(
+                    "Join left_projection_map",
+                    &cj.left_projection_map,
+                    left_len,
+                )?;
+                Self::verify_projection_map(
+                    "Join right_projection_map",
+                    &cj.right_projection_map,
+                    right_len,
+                )?;
+                if matches!(
+                    cj.join_type,
+                    paro_planner::operator::JoinType::Semi
+                        | paro_planner::operator::JoinType::Anti
+                        | paro_planner::operator::JoinType::Mark
+                ) && !cj.right_projection_map.is_none()
+                {
+                    return Err(paro_error::internal(
+                        "SEMI/ANTI/MARK join must not project right columns".to_string(),
+                    ));
                 }
                 if matches!(
                     cj.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                ) && !cj.right_projection_map.is_empty()
+                    paro_planner::operator::JoinType::RightSemi
+                        | paro_planner::operator::JoinType::RightAnti
+                ) && !cj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
-                        "SEMI/ANTI join must not project right columns".to_string(),
+                        "RIGHT SEMI/ANTI join must not project left columns".to_string(),
                     ));
                 }
             }
             Join::Any(aj) => {
                 let left_len = aj.left.types().len();
                 let right_len = aj.right.types().len();
-                for &idx in &aj.left_projection_map {
-                    if idx >= left_len {
-                        return Err(paro_error::internal(format!(
-                            "Join left_projection_map index {} out of range (left types={})",
-                            idx, left_len
-                        )));
-                    }
-                }
-                for &idx in &aj.right_projection_map {
-                    if idx >= right_len {
-                        return Err(paro_error::internal(format!(
-                            "Join right_projection_map index {} out of range (right types={})",
-                            idx, right_len
-                        )));
-                    }
+                let mut input_bindings = aj.left.get_column_bindings();
+                input_bindings.extend(aj.right.get_column_bindings());
+                let mut input_types = aj.left.types();
+                input_types.extend(aj.right.types());
+                self.verify_expression_bindings(
+                    &aj.condition,
+                    &input_bindings,
+                    &input_types,
+                    "ANY join condition",
+                )?;
+                Self::verify_projection_map(
+                    "Join left_projection_map",
+                    &aj.left_projection_map,
+                    left_len,
+                )?;
+                Self::verify_projection_map(
+                    "Join right_projection_map",
+                    &aj.right_projection_map,
+                    right_len,
+                )?;
+                if matches!(
+                    aj.join_type,
+                    paro_planner::operator::JoinType::Semi
+                        | paro_planner::operator::JoinType::Anti
+                        | paro_planner::operator::JoinType::Mark
+                ) && !aj.right_projection_map.is_none()
+                {
+                    return Err(paro_error::internal(
+                        "SEMI/ANTI/MARK join must not project right columns".to_string(),
+                    ));
                 }
                 if matches!(
                     aj.join_type,
-                    paro_planner::operator::JoinType::Semi | paro_planner::operator::JoinType::Anti
-                ) && !aj.right_projection_map.is_empty()
+                    paro_planner::operator::JoinType::RightSemi
+                        | paro_planner::operator::JoinType::RightAnti
+                ) && !aj.left_projection_map.is_none()
                 {
                     return Err(paro_error::internal(
-                        "SEMI/ANTI join must not project right columns".to_string(),
+                        "RIGHT SEMI/ANTI join must not project left columns".to_string(),
                     ));
                 }
             }
             Join::Cross(_) => {}
+        }
+        Ok(())
+    }
+
+    fn verify_projection_map(
+        label: &str,
+        projection_map: &paro_planner::operator::ProjectionMap,
+        child_width: usize,
+    ) -> Result<()> {
+        let Some(indices) = projection_map.as_columns() else {
+            return Ok(());
+        };
+        let mut seen = HashSet::with_capacity(indices.len());
+        for &index in indices {
+            if index >= child_width {
+                return Err(paro_error::internal(format!(
+                    "{label} index {index} out of range (child columns={child_width})"
+                )));
+            }
+            if !seen.insert(index) {
+                return Err(paro_error::internal(format!(
+                    "{label} contains duplicate child index {index}"
+                )));
+            }
         }
         Ok(())
     }
@@ -274,6 +650,15 @@ impl Verifier {
                 for expr in &agg.aggregates {
                     self.verify_expression(expr)?;
                 }
+                if let Some(reduction) = &agg.post_reduction {
+                    for reducer in &reduction.reducers {
+                        self.verify_expression(reducer)?;
+                    }
+                    for scalar in &reduction.scalar_expressions {
+                        self.verify_expression(scalar)?;
+                    }
+                    self.verify_expression(&reduction.predicate)?;
+                }
             }
             LogicalOperator::Join(join) => match join {
                 Join::Comparison(cj) => {
@@ -310,6 +695,7 @@ impl Verifier {
             LogicalOperator::Window(window) => {
                 let mut result = Ok(());
                 for expression in &window.expressions {
+                    expression.verify_bound_contract()?;
                     ExpressionIterator::enumerate_window_children(expression, |child| {
                         if result.is_ok() {
                             result = self.verify_expression(child);
@@ -344,6 +730,9 @@ impl Verifier {
     }
 
     fn verify_expression(&self, expr: &Expression) -> Result<()> {
+        if let Expression::Window(window) = expr {
+            window.verify_bound_contract()?;
+        }
         if let Expression::ColumnRef(column) = expr {
             return self.verify_column_ref(column);
         }

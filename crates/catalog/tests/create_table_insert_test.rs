@@ -195,10 +195,10 @@ fn test_create_table_with_constraints_persists_runtime_descriptor_sync() {
         .expect("table should be visible to current transaction");
     let table = table.as_table().unwrap();
 
-    assert_eq!(table.constraints.len(), constraints.len());
+    assert_eq!(table.constraints().len(), constraints.len());
     assert_eq!(
         table
-            .constraints
+            .constraints()
             .iter()
             .find(|c| c.constraint_type == paro_catalog::entry::ConstraintType::PrimaryKey)
             .map(|c| c.columns.clone()),

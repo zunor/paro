@@ -6,17 +6,20 @@ use std::sync::Arc;
 use paro_catalog::entry::{ColumnDefinition, EdgeTableInfo, TableCatalogEntry, VertexTableInfo};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_function::aggregate::distributive::sum::get_sum_function;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
-    ComparisonExpression, ComparisonType, ConjunctionExpression, ConjunctionType,
-    ConstantExpression, Expression, OperatorExpression, OperatorType, ReferenceExpression,
-    WindowExpression, WindowFrame,
+    AggregateExpression, ComparisonExpression, ComparisonType, ConjunctionExpression,
+    ConjunctionType, ConstantExpression, Expression, OperatorExpression, OperatorType,
+    OrderByExpression, ReferenceExpression, WindowExpression, WindowFrame,
 };
+use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order, Projection,
-    SetOperation, Window as LogicalWindow,
+    Aggregate, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order,
+    Projection, SetOperation, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::PredicateTree;
@@ -25,8 +28,123 @@ use paro_storage::search::{
     NormalizedSearchRequest, ProjectionSpec, SearchCapabilityState, SearchIntent,
     SearchRequestMode,
 };
+use paro_storage::statistics::{NumericStats, StringStats};
 
 use super::*;
+use crate::physical::specs::GroupKeyEncoding;
+
+#[path = "tests/aggregate_singleton.rs"]
+mod aggregate_singleton;
+#[path = "tests/window_arguments.rs"]
+mod window_arguments;
+
+#[test]
+fn physical_rewrite_composes_consecutive_projects() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".into(), "b".into(), "c".into()],
+            vec![LogicalType::Integer; 3],
+        )),
+    );
+    let inner = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            1,
+            values,
+            vec![
+                Expression::Reference(ReferenceExpression::new(2, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            ],
+        )),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            2,
+            inner,
+            vec![
+                Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            ],
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&outer)
+        .unwrap();
+    let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
+        panic!("expected project root");
+    };
+    let [child] = plan.node(plan.root).children.as_slice(&plan.children) else {
+        panic!("expected unary project");
+    };
+
+    assert!(matches!(
+        plan.node(*child).kind,
+        PhysicalNodeKind::Values(_)
+    ));
+    assert!(matches!(
+        &project.expressions[0],
+        Expression::Reference(reference) if reference.index == 0
+    ));
+    assert!(matches!(
+        &project.expressions[1],
+        Expression::Reference(reference) if reference.index == 2
+    ));
+}
+
+#[test]
+fn physical_rewrite_preserves_computed_expression_multiplicity() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".into()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let computed = Expression::Comparison(ComparisonExpression::new(
+        ComparisonType::Equal,
+        Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(7),
+            LogicalType::Integer,
+        )),
+    ));
+    let inner = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(1, values, vec![computed])),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(Projection::new(
+            2,
+            inner,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Boolean)),
+            ],
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&outer)
+        .unwrap();
+    let [child] = plan.node(plan.root).children.as_slice(&plan.children) else {
+        panic!("expected unary project");
+    };
+
+    assert!(matches!(
+        plan.node(*child).kind,
+        PhysicalNodeKind::Project(_)
+    ));
+}
 
 #[test]
 fn arena_generator_builds_streaming_subset_without_runtime_objects() {
@@ -45,7 +163,7 @@ fn arena_generator_builds_streaming_subset_without_runtime_objects() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, filter, vec![project_expr]).with_output_names(vec!["a".into()]),
+            Projection::new(1, filter, vec![project_expr]).with_visible_names(vec!["a".into()]),
         ),
     );
     let limit = LogicalPlan::new(
@@ -98,6 +216,419 @@ fn arena_generator_lowers_distinct_to_hash_aggregate() {
 }
 
 #[test]
+fn aggregate_uses_lossless_fixed_width_keys_for_bounded_strings() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["brand".to_string()],
+            vec![LogicalType::Varchar],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Varchar)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = StringStats::create_empty(LogicalType::Varchar);
+    StringStats::update(&mut stats, "Brand45");
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::PackedString {
+            physical_type: LogicalType::UBigInt,
+            max_length: 7,
+        }]
+    );
+}
+
+#[test]
+fn aggregate_packs_inline_strings_when_fixed_keys_preserve_row_width() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["nation".to_string()],
+            vec![LogicalType::Varchar],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Varchar)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = StringStats::create_empty(LogicalType::Varchar);
+    StringStats::update(&mut stats, "UNITED KINGDOM");
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::PackedString {
+            physical_type: LogicalType::UHugeInt,
+            max_length: 14,
+        }]
+    );
+}
+
+#[test]
+fn aggregate_skips_offset_keys_that_only_replace_row_padding() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["size".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![ref_expr(0, LogicalType::Integer)],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    let mut stats = paro_storage::statistics::NumericStats::create_empty(LogicalType::Integer);
+    paro_storage::statistics::NumericStats::set_guaranteed_min(
+        &mut stats,
+        &paro_common::runtime_value::Value::Integer(-5),
+    );
+    paro_storage::statistics::NumericStats::set_guaranteed_max(
+        &mut stats,
+        &paro_common::runtime_value::Value::Integer(250),
+    );
+    aggregate.group_stats[0] = Some(stats);
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+    assert_eq!(
+        spec.group_key_encodings.as_ref(),
+        [GroupKeyEncoding::Identity]
+    );
+}
+
+#[test]
+fn aggregate_requires_complete_bounds_for_offset_keys() {
+    fn lower_with_stats(
+        first_stats: paro_storage::statistics::BaseStatistics,
+        second_stats: paro_storage::statistics::BaseStatistics,
+    ) -> Box<[GroupKeyEncoding]> {
+        let ctx = BindContext::new();
+        let values = LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                0,
+                vec![],
+                vec!["first".to_string(), "second".to_string()],
+                vec![LogicalType::BigInt, LogicalType::BigInt],
+            )),
+        );
+        let count = Expression::Aggregate(AggregateExpression::new(
+            get_count_star_function(),
+            vec![],
+            LogicalType::BigInt,
+        ));
+        let mut aggregate = Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![
+                ref_expr(0, LogicalType::BigInt),
+                ref_expr(1, LogicalType::BigInt),
+            ],
+            vec![],
+            vec![count],
+            vec![],
+        );
+        aggregate.group_stats = vec![Some(first_stats), Some(second_stats)];
+        let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+        let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+        let plan = generator
+            .generate(&aggregate)
+            .expect("aggregate should lower");
+        let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+            panic!("expected aggregate root");
+        };
+        spec.group_key_encodings.clone()
+    }
+
+    let mut known = NumericStats::create_empty(LogicalType::BigInt);
+    NumericStats::update_i64(&mut known, 10);
+    NumericStats::update_i64(&mut known, 20);
+    assert_eq!(
+        lower_with_stats(known.copy(), known.copy()).as_ref(),
+        [
+            GroupKeyEncoding::OffsetInteger {
+                physical_type: LogicalType::UTinyInt,
+                minimum: 10,
+            },
+            GroupKeyEncoding::OffsetInteger {
+                physical_type: LogicalType::UTinyInt,
+                minimum: 10,
+            },
+        ]
+    );
+
+    let mut incomplete = known.copy();
+    incomplete.merge(&NumericStats::create_unknown(LogicalType::BigInt));
+    assert_eq!(
+        lower_with_stats(incomplete, known).as_ref(),
+        [GroupKeyEncoding::Identity, GroupKeyEncoding::Identity]
+    );
+}
+
+#[test]
+fn aggregate_materializes_proven_dependent_groups_as_states() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string(), "name".to_string(), "comment".to_string()],
+            vec![
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+                LogicalType::Varchar,
+            ],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let mut aggregate = Aggregate::new(
+        1,
+        2,
+        3,
+        values,
+        vec![
+            ref_expr(0, LogicalType::BigInt),
+            ref_expr(1, LogicalType::Varchar),
+            ref_expr(2, LogicalType::Varchar),
+        ],
+        vec![],
+        vec![count],
+        vec![],
+    );
+    aggregate.group_dependencies.push(GroupDependency {
+        determinants: Box::new([0]),
+        dependents: Box::new([1, 2]),
+    });
+    let aggregate = LogicalPlan::new(&ctx, LogicalOperator::Aggregate(aggregate));
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&aggregate)
+        .expect("aggregate should lower");
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("expected aggregate root");
+    };
+
+    assert_eq!(spec.grouping_key_count, 1);
+    assert_eq!(spec.groups.len(), 1);
+    assert_eq!(spec.aggregates.len(), 3);
+    assert_eq!(spec.state_output_projection.as_ref(), [0, 2, 3, 1]);
+    assert_eq!(
+        spec.output_types.as_ref(),
+        [
+            LogicalType::BigInt,
+            LogicalType::Varchar,
+            LogicalType::Varchar,
+            LogicalType::BigInt,
+        ]
+    );
+    assert!(spec.perfect_hash.is_none());
+}
+
+#[test]
+fn arena_generator_fuses_aggregate_only_having_into_aggregate_emit() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![ref_expr(0, LogicalType::Integer)],
+            vec![],
+            vec![count],
+            vec![],
+        )),
+    );
+    let having = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(
+            aggregate,
+            vec![comparison(
+                ComparisonType::GreaterThan,
+                ref_expr(1, LogicalType::BigInt),
+                Expression::Constant(ConstantExpression::new(
+                    Value::BigInt(1),
+                    LogicalType::BigInt,
+                )),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator.generate(&having).expect("HAVING should lower");
+
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(plan.root).kind else {
+        panic!("aggregate-only HAVING should be fused into aggregate emit");
+    };
+    assert_eq!(spec.having_filter.len(), 1);
+    let Expression::Comparison(predicate) = &spec.having_filter[0] else {
+        panic!("expected rebased HAVING comparison");
+    };
+    let Expression::Reference(reference) = predicate.left.as_ref() else {
+        panic!("expected aggregate reference in HAVING");
+    };
+    assert_eq!(reference.index, 0);
+}
+
+#[test]
+fn aggregate_having_fusion_preserves_an_independent_output_projection() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["key".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let count = Expression::Aggregate(AggregateExpression::new(
+        get_count_star_function(),
+        vec![],
+        LogicalType::BigInt,
+    ));
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(Aggregate::new(
+            1,
+            2,
+            3,
+            values,
+            vec![ref_expr(0, LogicalType::Integer)],
+            vec![],
+            vec![count],
+            vec![],
+        )),
+    );
+    let mut filter = Filter::new(
+        aggregate,
+        vec![comparison(
+            ComparisonType::GreaterThan,
+            ref_expr(1, LogicalType::BigInt),
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(10),
+                LogicalType::BigInt,
+            )),
+        )],
+    );
+    // COUNT is required by HAVING but not by the parent plan.
+    filter.projection_map = vec![0].into();
+    let having = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let plan = generator.generate(&having).expect("HAVING should lower");
+
+    let PhysicalNodeKind::Project(project) = &plan.node(plan.root).kind else {
+        panic!("projected HAVING should retain an explicit output projection");
+    };
+    assert_eq!(project.expressions.len(), 1);
+    assert!(matches!(
+        &project.expressions[0],
+        Expression::Reference(reference) if reference.index == 0
+    ));
+    let [aggregate_id] = plan.child_ids(&plan.node(plan.root).children) else {
+        panic!("HAVING projection should have one aggregate child");
+    };
+    let PhysicalNodeKind::Aggregate(spec) = &plan.node(*aggregate_id).kind else {
+        panic!("HAVING predicate should remain attached to the aggregate");
+    };
+    assert_eq!(spec.having_filter.len(), 1);
+    assert!(plan
+        .nodes
+        .iter()
+        .all(|node| !matches!(node.kind, PhysicalNodeKind::Filter(_))));
+}
+
+#[test]
 fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     let ctx = BindContext::new();
     let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
@@ -125,7 +656,7 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
             )),
         ],
     );
-    filter.projection_map = vec![0];
+    filter.projection_map = vec![0].into();
     let plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
@@ -134,9 +665,9 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
         panic!("fully pushed filter should lower to rowset scan root");
     };
-    assert_eq!(spec.column_ids.as_ref(), [0]);
+    assert_eq!(spec.column_projection.columns(), [0].as_slice());
     assert!(spec.residual_predicates.is_empty());
-    assert!(!spec.late_materialize);
+    assert!(!spec.planned_materialization().is_late());
     let Some(PredicateTree::And(children)) = spec.predicate.as_ref() else {
         panic!("expected conjunctive storage predicate");
     };
@@ -144,6 +675,65 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
     assert!(physical
         .format_explain_text_with_spec(&paro_planner::operator::ExplainSpec::default())
         .contains("Pushed Predicate"));
+}
+
+#[test]
+fn zero_column_rowset_projection_never_enables_late_materialization() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let mut filter = Filter::new(
+        get,
+        vec![comparison(
+            ComparisonType::Equal,
+            ref_expr(0, LogicalType::Integer),
+            int_const(42),
+        )],
+    );
+    filter.projection_map = paro_planner::operator::ProjectionMap::none();
+    let mut plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+    plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(1));
+
+    let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&plan)
+        .expect("zero-column filter should lower");
+    let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+        panic!("fully pushed zero-column filter should lower to rowset scan");
+    };
+
+    assert!(spec.column_projection.columns().is_empty());
+    assert!(!spec.planned_materialization().is_late());
+}
+
+#[test]
+fn rowset_scan_materialization_policy_uses_estimated_filter_density() {
+    let build_scan = |filtered_rows: u64| {
+        let ctx = BindContext::new();
+        let mut get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+        get.stats.estimated_cardinality =
+            Some(paro_planner::plan::CardinalityEstimate::exact(1_000_000));
+        let filter = Filter::new(
+            get,
+            vec![comparison(
+                ComparisonType::LessThanOrEqual,
+                ref_expr(0, LogicalType::Integer),
+                int_const(42),
+            )],
+        );
+        let mut plan = LogicalPlan::new(&ctx, LogicalOperator::Filter(filter));
+        plan.stats.estimated_cardinality = Some(paro_planner::plan::CardinalityEstimate::exact(
+            filtered_rows,
+        ));
+        let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+            .generate(&plan)
+            .expect("filter should lower");
+        let PhysicalNodeKind::RowsetScan(spec) = &physical.node(physical.root).kind else {
+            panic!("fully pushed filter should lower to rowset scan");
+        };
+        spec.planned_materialization().is_late()
+    };
+
+    assert!(!build_scan(990_000));
+    assert!(build_scan(10_000));
 }
 
 #[test]
@@ -176,7 +766,7 @@ fn arena_generator_can_disable_rowset_scan_pushdown() {
         panic!("filter child should be rowset scan");
     };
     assert!(scan.predicate.is_none());
-    assert!(!scan.late_materialize);
+    assert!(!scan.planned_materialization().is_late());
 }
 
 #[test]
@@ -255,6 +845,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
             },
             None,
             0,
+            3,
             "v".to_string(),
             "g".to_string(),
             "public".to_string(),
@@ -279,6 +870,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
         0,
         1,
         2,
+        3,
         "v".to_string(),
         1,
         1,
@@ -305,7 +897,7 @@ fn arena_generator_hands_graph_expand_filters_to_graph_project() {
                     LogicalType::UBigInt,
                 ))],
             )
-            .with_output_names(vec!["src".to_string()]),
+            .with_visible_names(vec!["src".to_string()]),
         ),
     );
 
@@ -346,6 +938,7 @@ fn arena_generator_lowers_graph_path_functions_with_path_history() {
             },
             None,
             0,
+            3,
             "v".to_string(),
             "g".to_string(),
             "public".to_string(),
@@ -370,6 +963,7 @@ fn arena_generator_lowers_graph_path_functions_with_path_history() {
         0,
         1,
         2,
+        3,
         "v".to_string(),
         1,
         1,
@@ -460,7 +1054,7 @@ fn arena_generator_names_hidden_order_columns() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, exprs).with_output_names(vec!["a".into()]),
+            Projection::new(1, values, exprs).with_visible_names(vec!["a".into()]),
         ),
     );
     let order = LogicalPlan::new(&ctx, LogicalOperator::Order(Order::new(project, vec![])));
@@ -509,7 +1103,7 @@ fn arena_generator_names_hidden_window_child_columns() {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, exprs).with_output_names(vec!["visible".into()]),
+            Projection::new(1, values, exprs).with_visible_names(vec!["visible".into()]),
         ),
     );
     let row_number = WindowFunction::row_number();
@@ -517,15 +1111,14 @@ fn arena_generator_names_hidden_window_child_columns() {
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             2,
-            vec![WindowExpression {
-                function: row_number.clone(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::get_default_frame(&row_number),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+            vec![WindowExpression::native(
+                row_number.clone(),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                WindowFrame::get_default_frame(&row_number),
+                false,
+            )],
             project,
         )),
     );
@@ -548,6 +1141,164 @@ fn arena_generator_names_hidden_window_child_columns() {
 }
 
 #[test]
+fn whole_partition_aggregate_window_lowers_to_sort_free_breaker() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["grp".to_string(), "value".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let (sum, target_types) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind integer sum");
+    assert_eq!(target_types, vec![LogicalType::Integer]);
+    let return_type = sum.return_type.clone();
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![Expression::Reference(ReferenceExpression::new(
+            1,
+            LogicalType::Integer,
+        ))],
+        return_type,
+    );
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower whole-partition aggregate window");
+    let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
+        panic!("expected sort-free partition aggregate window");
+    };
+    assert_eq!(spec.detail_columns.as_ref(), [0, 1]);
+    assert_eq!(spec.aggregate.grouping_key_count, 1);
+    assert_eq!(spec.aggregate.aggregates.len(), 1);
+    assert_eq!(spec.output_types.len(), 3);
+    spec.verify().expect("partition aggregate spec");
+}
+
+#[test]
+fn bigint_partition_key_lowers_to_typed_sort_free_breaker() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["partkey".to_string(), "value".to_string()],
+            vec![LogicalType::BigInt, LogicalType::Integer],
+        )),
+    );
+    let aggregate =
+        AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::BigInt,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower BIGINT partition aggregate window");
+    let PhysicalNodeKind::PartitionAggregateWindow(spec) = &plan.node(plan.root).kind else {
+        panic!("expected typed BIGINT partition aggregate window");
+    };
+    assert_eq!(spec.aggregate.groups[0].return_type(), LogicalType::BigInt);
+    spec.verify().expect("BIGINT partition aggregate spec");
+}
+
+#[test]
+fn ordered_full_partition_aggregate_keeps_the_semantic_window_fallback() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["grp".to_string(), "value".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("bind integer sum");
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![Expression::Reference(ReferenceExpression::new(
+            1,
+            LogicalType::Integer,
+        ))],
+        LogicalType::BigInt,
+    );
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            2,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                vec![OrderByExpression {
+                    expression: Expression::Reference(ReferenceExpression::new(
+                        1,
+                        LogicalType::Integer,
+                    )),
+                    ascending: true,
+                    nulls_first: false,
+                }],
+                WindowFrame {
+                    frame_type: paro_planner::expression::WindowFrameType::Rows,
+                    start_bound: paro_planner::expression::WindowFrameBound::Unbounded,
+                    start_is_preceding: true,
+                    end_bound: paro_planner::expression::WindowFrameBound::Unbounded,
+                    end_is_preceding: false,
+                },
+            )],
+            values,
+        )),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .expect("lower ordered aggregate window");
+    assert!(matches!(
+        plan.node(plan.root).kind,
+        PhysicalNodeKind::Window(_)
+    ));
+}
+
+#[test]
 fn arena_generator_lowers_row_literal_union_all_to_values() {
     let ctx = BindContext::new();
     let row = |value| {
@@ -562,7 +1313,7 @@ fn arena_generator_lowers_row_literal_union_all_to_values() {
                         LogicalType::Integer,
                     ))],
                 )
-                .with_output_names(vec!["v".to_string()]),
+                .with_visible_names(vec!["v".to_string()]),
             ),
         )
     };
@@ -658,7 +1409,7 @@ fn arena_generator_lowers_search_scan_with_planned_token() {
     assert_eq!(spec.output_names.as_ref(), ["c", "score"]);
 }
 
-fn test_get() -> Get {
+pub(super) fn test_get() -> Get {
     let storage = Arc::new(
         paro_storage::table::table_factory::TableFactory::default()
             .create_table(&[
@@ -691,7 +1442,11 @@ fn test_get() -> Get {
         names: vec!["a".to_string(), "b".to_string(), "c".to_string()],
         relation_name: Some("scan_t".to_string()),
         relation_alias: None,
-        column_ids: vec![0, 1, 2],
+        column_sources: vec![
+            paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+            paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+            paro_planner::operator::GetColumnSource::Stored { column_id: 2 },
+        ],
         column_types: vec![
             LogicalType::Integer,
             LogicalType::Integer,

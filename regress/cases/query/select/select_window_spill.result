@@ -49,12 +49,12 @@ SELECT
 FROM window_spill_test
 WHERE part IN (1, 2);
 QUERY PLAN
-PROJECTION  (rows=6)
+PROJECTION  (rows=8)
   Output: part, id, score, rn, rk, lead_score, lag_score
-  ->  WINDOW  (rows=6)
-    ->  ROWSET_SCAN on public.window_spill_test  (rows=6)
+  ->  WINDOW  (rows=8)
+    ->  ROWSET_SCAN on public.window_spill_test  (rows=8)
       Columns: part, id, score
-      Pushed Predicate: col#0 = 1 OR col#0 = 2
+      Pushed Predicate: col#0 IN (1, 2)
       Late Materialize: auto
 
 CREATE TABLE window_large_partition_test (part INT, id INT, payload VARCHAR);
@@ -106,3 +106,30 @@ PROJECTION  (rows=69)
   ->  WINDOW  (rows=69)
     ->  ROWSET_SCAN on public.window_large_partition_test  (rows=69)
       Columns: part, id
+
+SET force_external = true;
+SET
+
+SELECT
+    id,
+    SUM(score) FILTER (WHERE score >= 80) OVER () AS high_score_sum,
+    COUNT(score) OVER () AS non_null_scores,
+    AVG(score) OVER () AS average_score
+FROM (
+    VALUES (1, 10), (2, NULL), (3, 30), (4, 90)
+) AS global_window_input(id, score)
+ORDER BY id;
+id	high_score_sum	non_null_scores	average_score
+1	90	3	43.333333
+2	90	3	43.333333
+3	90	3	43.333333
+4	90	3	43.333333
+
+SELECT id, SUM(score) OVER () AS total
+FROM (VALUES (1, 10)) AS empty_global_window_input(id, score)
+WHERE false
+ORDER BY id;
+id	total
+
+SET force_external = DEFAULT;
+SET

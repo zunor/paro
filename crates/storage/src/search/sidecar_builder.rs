@@ -406,21 +406,22 @@ fn hnsw_distance_metric_from_name(name: &str) -> DistanceMetric {
     }
 }
 
-fn contiguous_base_row_id(rowids: &[u32]) -> Result<u32> {
+fn contiguous_base_row_id(rowids: &[crate::rowset::SegmentRowId]) -> Result<u32> {
     let Some(first) = rowids.first().copied() else {
         return Ok(0);
     };
     for (offset, rowid) in rowids.iter().copied().enumerate() {
         let expected = first
+            .get()
             .checked_add(offset as u32)
             .ok_or_else(|| paro_error::out_of_range("search sidecar rowid overflow"))?;
-        if rowid != expected {
+        if rowid.get() != expected {
             return Err(paro_error::invalid_input(
                 "search sidecar builder requires contiguous segment batches",
             ));
         }
     }
-    Ok(first)
+    Ok(first.get())
 }
 
 fn column_batch_to_column_data(batch: ColumnBatch, rows: usize) -> Result<ColumnData> {

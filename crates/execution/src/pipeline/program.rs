@@ -1,8 +1,6 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-//! Immutable runtime program image compiled from a lowered pipeline graph.
-
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
@@ -12,7 +10,6 @@ use crate::physical::plan::PhysicalPlan;
 use crate::physical::row_type::RowType;
 use crate::physical::specs::UtilitySpec;
 use crate::runtime::context::UtilityContext;
-use crate::runtime::HandleRef;
 use crate::runtime::{
     AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, ClientResultSinkExec,
     CopyToFileSinkExec, CrossProductProbeTransformExec, CteMaterializeSinkExec, CteScanSourceExec,
@@ -24,17 +21,18 @@ use crate::runtime::{
     HashJoinBuildSinkExec, HashJoinProbeTransformExec, HashJoinSpillReplaySourceExec,
     HashJoinUnmatchedSourceExec, InsertSinkExec, MaterializeSinkExec, MaterializedSourceExec,
     NestedLoopJoinProbeTransformExec, NljUnmatchedSourceExec, OperatorRole,
+    PartitionAggregateWindowBuildSinkExec, PartitionAggregateWindowEmitSourceExec,
     PerfectHashAggregateEmitSourceExec, PerfectHashAggregateSinkExec, ProjectTransformExec,
-    PropertyRepairTransformExec, RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec,
+    RecursiveTableAppendSinkExec, RecursiveTableScanSourceExec, RowFetchTransformExec,
     RowsetSourceDesc, RowsetSourceExec, RuntimeOperatorOrigin, RuntimeRoleOrdinal,
     SetOperationEmitSourceExec, SetOperationInputSinkExec, SinkExec, SortBuildSinkExec,
     SortEmitSourceExec, SortRangeJoinProbeTransformExec, SourceExec, SparseVectorSearchSourceExec,
-    StreamingAggregateTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
-    StreamingWindowTransformExec, TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec,
-    TransformExec, UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec,
-    ValuesSourceExec, VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
+    StreamingLimitTransformExec, StreamingTopNTransformExec, StreamingWindowTransformExec,
+    TableFunctionSourceExec, TopNBuildSinkExec, TopNEmitSourceExec, TransformExec,
+    UngroupedAggregateEmitSourceExec, UngroupedAggregateSinkExec, UpdateSinkExec, ValuesSourceExec,
+    VectorSearchSourceExec, WindowBuildSinkExec, WindowEmitSourceExec,
 };
-use crate::runtime::{ChunkLayout, PipelineScratchLayout, RuntimeOperatorId};
+use crate::runtime::{ChunkLayout, HandleRef, PipelineScratchLayout, RuntimeOperatorId};
 
 use super::graph::{
     ControlRegion, ControlRegionId, PipelineGraph, PipelineId, PipelineRoot, PipelineSpec,
@@ -369,7 +367,7 @@ impl OperatorRuntimeRegistry {
                 right_handle: HandleRef::new(spec.right_handle),
                 join_type: spec.spec.join_type,
                 conditions: spec.spec.conditions.clone(),
-                mark_null_condition_start: spec.spec.mark_null_condition_start,
+                mark_semantics: spec.spec.mark_semantics,
                 left_projection: spec.spec.left_projection.clone(),
                 right_projection: spec.spec.right_projection.clone(),
                 right_output_types: spec.spec.right_output_types.clone(),
@@ -386,12 +384,16 @@ impl OperatorRuntimeRegistry {
                 SourceExec::HashJoinSpillReplay(HashJoinSpillReplaySourceExec {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
-                    conditions: spec.conditions.clone(),
+                    anti_join_mode: spec.anti_join_mode,
+                    key_conditions: spec.key_conditions.clone(),
+                    build_residual_conditions: spec.build_residual_conditions.clone(),
+                    probe_residual_count: spec.probe_residual_count,
                     probe_types: spec.probe_types.clone(),
+                    build_output_count: spec.build_output_count,
                     build_payload_types: spec.build_payload_types.clone(),
                     left_projection: spec.left_projection.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             SourceSpec::HashJoinUnmatched(spec) => {
@@ -399,8 +401,8 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     left_output_types: spec.left_output_types.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             SourceSpec::HashAggregateEmit(spec) => {
@@ -431,6 +433,12 @@ impl OperatorRuntimeRegistry {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
             }),
+            SourceSpec::PartitionAggregateWindowEmit(spec) => {
+                SourceExec::PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceExec {
+                    handle: HandleRef::new(spec.handle),
+                    spec: spec.spec.clone(),
+                })
+            }
             SourceSpec::SetOperationEmit(spec) => {
                 SourceExec::SetOperationEmit(SetOperationEmitSourceExec {
                     handle: HandleRef::new(spec.handle),
@@ -472,10 +480,13 @@ impl OperatorRuntimeRegistry {
                 TransformExec::HashJoinProbe(HashJoinProbeTransformExec {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
-                    conditions: spec.conditions.clone(),
+                    anti_join_mode: spec.anti_join_mode,
+                    key_conditions: spec.key_conditions.clone(),
+                    build_residual_conditions: spec.build_residual_conditions.clone(),
+                    probe_residual_count: spec.probe_residual_count,
                     left_projection: spec.left_projection.clone(),
-                    right_projection: spec.right_projection.clone(),
                     output_types: spec.output_types.clone(),
+                    reduction_cascade: spec.reduction_cascade.clone(),
                 })
             }
             TransformSpec::NestedLoopJoinProbe(spec) => {
@@ -483,7 +494,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     conditions: spec.conditions.clone(),
-                    mark_null_condition_start: spec.mark_null_condition_start,
+                    mark_semantics: spec.mark_semantics,
                     arbitrary_condition: spec.arbitrary_condition.clone(),
                     left_projection: spec.left_projection.clone(),
                     right_projection: spec.right_projection.clone(),
@@ -496,7 +507,7 @@ impl OperatorRuntimeRegistry {
                     handle: HandleRef::new(spec.handle),
                     join_type: spec.join_type,
                     conditions: spec.conditions.clone(),
-                    mark_null_condition_start: spec.mark_null_condition_start,
+                    mark_semantics: spec.mark_semantics,
                     left_projection: spec.left_projection.clone(),
                     right_projection: spec.right_projection.clone(),
                     right_output_types: spec.right_output_types.clone(),
@@ -516,11 +527,6 @@ impl OperatorRuntimeRegistry {
             TransformSpec::StreamingTopN(spec) => {
                 TransformExec::StreamingTopN(StreamingTopNTransformExec { spec: spec.clone() })
             }
-            TransformSpec::StreamingAggregate(spec) => {
-                TransformExec::StreamingAggregate(StreamingAggregateTransformExec {
-                    spec: spec.clone(),
-                })
-            }
             TransformSpec::StreamingWindow(spec) => {
                 TransformExec::StreamingWindow(StreamingWindowTransformExec { spec: spec.clone() })
             }
@@ -530,6 +536,9 @@ impl OperatorRuntimeRegistry {
             TransformSpec::GraphExpand(spec) => {
                 TransformExec::GraphExpand(GraphExpandTransformExec { spec: spec.clone() })
             }
+            TransformSpec::RowFetch(spec) => {
+                TransformExec::RowFetch(RowFetchTransformExec { spec: spec.clone() })
+            }
             TransformSpec::GraphProject(spec) => {
                 TransformExec::GraphProject(GraphProjectTransformExec { spec: spec.clone() })
             }
@@ -538,9 +547,6 @@ impl OperatorRuntimeRegistry {
                     spec: spec.clone(),
                 })
             }
-            TransformSpec::PropertyRepair(spec) => TransformExec::PropertyRepair(
-                PropertyRepairTransformExec::try_new(spec.kind.clone())?,
-            ),
         };
         Ok(TransformSlot {
             operator_id,
@@ -561,40 +567,39 @@ impl OperatorRuntimeRegistry {
             }
             SinkSpec::Materialize(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::CrossProductBuild(spec) => SinkExec::Materialize(MaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::HashJoinBuild(spec) => SinkExec::HashJoinBuild(HashJoinBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 join_type: spec.join_type,
-                conditions: spec.conditions.clone(),
+                build_keys_unique: spec.build_keys_unique,
+                build_time_integer_index: spec.build_time_integer_index.clone(),
+                key_conditions: spec.key_conditions.clone(),
+                residual_conditions: spec.residual_conditions.clone(),
                 build_projection: spec.build_projection.clone(),
+                build_output_count: spec.build_output_count,
+                grouped_reduction_channels: spec.grouped_reduction_channels,
                 build_payload_types: spec.build_payload_types.clone(),
-                required: spec.required.clone(),
                 force_external: spec.force_external,
             }),
             SinkSpec::HashAggregateBuild(spec) => {
                 SinkExec::HashAggregateBuild(HashAggregateBuildSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::UngroupedAggregate(spec) => {
                 SinkExec::UngroupedAggregate(UngroupedAggregateSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::PerfectHashAggregate(spec) => {
                 SinkExec::PerfectHashAggregate(PerfectHashAggregateSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::SortBuild(spec) => SinkExec::SortBuild(SortBuildSinkExec {
@@ -605,62 +610,56 @@ impl OperatorRuntimeRegistry {
                 output_names: spec.output_names.clone(),
                 output_types: spec.output_types.clone(),
                 force_external: spec.force_external,
-                required: spec.required.clone(),
             }),
             SinkSpec::TopNBuild(spec) => SinkExec::TopNBuild(TopNBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::WindowBuild(spec) => SinkExec::WindowBuild(WindowBuildSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
+            SinkSpec::PartitionAggregateWindowBuild(spec) => {
+                SinkExec::PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkExec {
+                    handle: HandleRef::new(spec.handle),
+                    spec: spec.spec.clone(),
+                })
+            }
             SinkSpec::SetOperationInput(spec) => {
                 SinkExec::SetOperationInput(SetOperationInputSinkExec {
                     handle: HandleRef::new(spec.handle),
                     spec: spec.spec.clone(),
                     side: spec.side,
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::CteMaterialize(spec) => SinkExec::CteMaterialize(CteMaterializeSinkExec {
                 handle: HandleRef::new(spec.handle),
-                required: spec.required.clone(),
             }),
             SinkSpec::DelimCapture(spec) => SinkExec::DelimCapture(DelimCaptureSinkExec {
                 handle: HandleRef::new(spec.handle),
                 duplicate_keys: spec.duplicate_keys.clone(),
                 cached_outer: spec.cached_outer.map(HandleRef::new),
-                required: spec.required.clone(),
             }),
             SinkSpec::RecursiveTableAppend(spec) => {
                 SinkExec::RecursiveTableAppend(RecursiveTableAppendSinkExec {
                     handle: HandleRef::new(spec.handle),
-                    required: spec.required.clone(),
                 })
             }
             SinkSpec::ExternalTable(spec) => SinkExec::ExternalTable(ExternalTableSinkExec {
                 handle: HandleRef::new(spec.handle),
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Insert(spec) => SinkExec::Insert(InsertSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Update(spec) => SinkExec::Update(UpdateSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::Delete(spec) => SinkExec::Delete(DeleteSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
             SinkSpec::CopyToFile(spec) => SinkExec::CopyToFile(CopyToFileSinkExec {
                 spec: spec.spec.clone(),
-                required: spec.required.clone(),
             }),
         };
         Ok(SinkSlot {
@@ -744,7 +743,7 @@ fn scratch_layout_for(
         transform_layouts.push(transform_chunk_layout(transform, &current));
     }
     Ok(PipelineScratchLayout::new(
-        chunk_layout(&source),
+        source_chunk_layout(&spec.source, &source),
         transform_layouts,
         spec.output.column_count().max(1),
     ))
@@ -756,7 +755,27 @@ fn chunk_layout(row_type: &RowType) -> ChunkLayout {
 
 fn transform_chunk_layout(transform: &TransformSpec, row_type: &RowType) -> ChunkLayout {
     match transform {
-        TransformSpec::Filter(_) | TransformSpec::Limit(_) => {
+        TransformSpec::Filter(_)
+        | TransformSpec::Limit(_)
+        | TransformSpec::Project(_)
+        | TransformSpec::RowFetch(_)
+        | TransformSpec::GraphProject(_) => ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE),
+        _ => chunk_layout(row_type),
+    }
+}
+
+/// Sources that publish immutable breaker chunks replace every output vector
+/// by reference. Preallocating a full materialized chunk for them only creates
+/// buffers which are immediately discarded on the first poll.
+fn source_chunk_layout(source: &SourceSpec, row_type: &RowType) -> ChunkLayout {
+    match source {
+        SourceSpec::Chunk(_)
+        | SourceSpec::CteScan(_)
+        | SourceSpec::DelimScan(_)
+        | SourceSpec::RecursiveTableScan(_)
+        | SourceSpec::TopNEmit(_)
+        | SourceSpec::WindowEmit(_)
+        | SourceSpec::SetOperationEmit(_) => {
             ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
         }
         _ => chunk_layout(row_type),
@@ -831,31 +850,28 @@ mod tests {
     };
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
-    use paro_function::window::WindowFunction;
-    use paro_planner::expression::{
-        ConstantExpression, Expression, ReferenceExpression, WindowExpression, WindowFrame,
-    };
-    use paro_planner::operator::join::{JoinCondition, JoinType};
+    use paro_planner::expression::{ConstantExpression, Expression, ReferenceExpression};
+    use paro_planner::operator::join::{AntiJoinMode, JoinCondition, JoinType};
 
-    use crate::physical::properties::{
-        NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PipelineProperties,
-        PropertyRepairKind,
-    };
+    use crate::physical::properties::PipelineProperties;
     use crate::physical::row_type::RowType;
     use crate::physical::specs::{
         AggregateSpec, DeleteSpec, DummyScanSpec, FilterSpec, GraphExpandSpec, GraphScanSpec,
-        LimitSpec, ProjectSpec, ValuesSpec, WindowSpec,
+        LimitSpec, ProjectSpec, ValuesSpec,
     };
     use crate::runtime::{OperatorRole, RuntimeRoleOrdinal};
 
     use super::*;
     use crate::pipeline::graph::{
-        ClientResultSpec, ControlRegion, PipelineGraph, PipelineRoot, PipelineSpec,
+        ClientResultSpec, ControlRegion, HashJoinBuildSinkSpec, HashJoinProbeSpec,
+        HashJoinSpillReplaySourceSpec, PipelineGraph, PipelineRoot, PipelineSpec,
         RecursiveCteDedup, RecursiveCteRegion, RecursiveTermination, SinkSharing,
     };
     use crate::pipeline::handles::{
         BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind,
     };
+
+    use crate::pipeline::program_test_window::window_spec;
 
     fn row_type(names: &[&str], types: &[LogicalType]) -> RowType {
         RowType::new(
@@ -907,15 +923,20 @@ mod tests {
     fn empty_aggregate_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 0,
+            state_output_projection: Box::new([]),
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([]),
             groups: Box::new([]),
+            group_key_encodings: Box::new([]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([]),
             grouping_functions: Box::new([]),
             aggregate_inputs: Box::new([]),
             aggregate_filters: Box::new([]),
             aggregate_orders: Box::new([]),
+            post_reduction: None,
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
@@ -938,25 +959,6 @@ mod tests {
             hnsw_ef_hint: None,
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
-        }
-    }
-
-    fn window_spec() -> WindowSpec {
-        WindowSpec {
-            window_index: 1,
-            expressions: vec![WindowExpression {
-                function: WindowFunction::row_number(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::default(),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }]
-            .into_boxed_slice(),
-            input_width: 1,
-            output_names: Box::new(["a".to_string(), "rn".to_string()]),
-            output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
         }
     }
 
@@ -1046,7 +1048,6 @@ mod tests {
                     row_id_index: 1,
                     is_full_table_delete: false,
                 },
-                required: Default::default(),
             }),
             sink_sharing: SinkSharing::Exclusive,
             properties: PipelineProperties::default(),
@@ -1073,10 +1074,9 @@ mod tests {
             transforms: vec![
                 TransformSpec::Filter(FilterSpec {
                     expressions: Box::new([]),
-                    projection_map: Box::new([]),
+                    projection_map: Box::new([0]),
                 }),
                 TransformSpec::Project(ProjectSpec {
-                    table_index: 8,
                     expressions: Box::new([Expression::Reference(ReferenceExpression::new(
                         0,
                         LogicalType::Integer,
@@ -1137,7 +1137,7 @@ mod tests {
         );
         assert_eq!(
             program.scratch.transform_outputs[1].kind,
-            crate::runtime::ChunkLayoutKind::Materialized
+            crate::runtime::ChunkLayoutKind::View
         );
         assert_eq!(
             program.scratch.transform_outputs[2].kind,
@@ -1214,40 +1214,6 @@ mod tests {
     }
 
     #[test]
-    fn blocking_property_repair_transform_fails_program_build() {
-        let output = row_type(&["a"], &[LogicalType::Integer]);
-        let blocking_repairs = [
-            PropertyRepairKind::Sort(OrderingSpec::new(vec![OrderingColumn {
-                column: 0,
-                direction: OrderingDirection::Asc,
-                nulls: NullOrdering::Last,
-            }])),
-            PropertyRepairKind::MaterializationAdapter,
-        ];
-
-        for repair in blocking_repairs {
-            let spec = PipelineSpec {
-                id: PipelineId::new(0),
-                source: values_source(),
-                transforms: vec![TransformSpec::PropertyRepair(
-                    super::super::graph::PropertyRepairSpec { kind: repair },
-                )],
-                sink: client_sink(),
-                sink_sharing: SinkSharing::Exclusive,
-                properties: PipelineProperties::default(),
-                output: output.clone(),
-            };
-
-            let err = PipelineProgramBuilder::default()
-                .build_program(&spec)
-                .expect_err("blocking repair should fail before runtime execution");
-            assert!(err
-                .to_string()
-                .contains("blocking property repair must be lowered into breaker pipelines"));
-        }
-    }
-
-    #[test]
     fn materialized_slots_store_typed_handle_refs_for_runtime_binding() {
         let mut handles = BreakerHandleCatalogBuilder::default();
         let handle = handles.register(
@@ -1261,10 +1227,7 @@ mod tests {
                 handle,
             }),
             transforms: Vec::new(),
-            sink: SinkSpec::Materialize(super::super::graph::MaterializeSinkSpec {
-                handle,
-                required: Default::default(),
-            }),
+            sink: SinkSpec::Materialize(super::super::graph::MaterializeSinkSpec { handle }),
             sink_sharing: SinkSharing::Exclusive,
             properties: PipelineProperties::default(),
             output: row_type(&["a"], &[LogicalType::Integer]),
@@ -1332,37 +1295,44 @@ mod tests {
             pipelines: vec![
                 PipelineSpec {
                     id: PipelineId::new(0),
-                    source: SourceSpec::HashJoinSpillReplay(
-                        super::super::graph::HashJoinSpillReplaySourceSpec {
-                            handle: join,
-                            join_type: JoinType::Inner,
-                            conditions: Box::new([join_condition()]),
-                            probe_types: Box::new([LogicalType::Integer]),
-                            build_payload_types: Box::new([LogicalType::Integer]),
-                            left_projection: Box::new([0]),
-                            right_projection: Box::new([0]),
-                            output_names: Box::new(["l".to_string(), "r".to_string()]),
-                            output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
-                        },
-                    ),
-                    transforms: vec![TransformSpec::HashJoinProbe(
-                        super::super::graph::HashJoinProbeSpec {
-                            handle: join,
-                            join_type: JoinType::Inner,
-                            conditions: Box::new([join_condition()]),
-                            left_projection: Box::new([0]),
-                            right_projection: Box::new([0]),
-                            output_names: Box::new(["l".to_string(), "r".to_string()]),
-                            output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
-                        },
-                    )],
-                    sink: SinkSpec::HashJoinBuild(super::super::graph::HashJoinBuildSinkSpec {
+                    source: SourceSpec::HashJoinSpillReplay(HashJoinSpillReplaySourceSpec {
                         handle: join,
                         join_type: JoinType::Inner,
-                        conditions: Box::new([join_condition()]),
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: Box::new([join_condition()]),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
+                        probe_types: Box::new([LogicalType::Integer]),
+                        build_payload_types: Box::new([LogicalType::Integer]),
+                        build_output_count: 1,
+                        left_projection: Box::new([0]),
+                        output_names: Box::new(["l".to_string(), "r".to_string()]),
+                        output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                        reduction_cascade: None,
+                    }),
+                    transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                        handle: join,
+                        join_type: JoinType::Inner,
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: Box::new([join_condition()]),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
+                        left_projection: Box::new([0]),
+                        output_names: Box::new(["l".to_string(), "r".to_string()]),
+                        output_types: Box::new([LogicalType::Integer, LogicalType::Integer]),
+                        reduction_cascade: None,
+                    })],
+                    sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
+                        handle: join,
+                        join_type: JoinType::Inner,
+                        build_keys_unique: false,
+                        build_time_integer_index: None,
+                        key_conditions: Box::new([join_condition()]),
+                        residual_conditions: Box::default(),
+                        grouped_reduction_channels: None,
                         build_projection: Box::new([0]),
                         build_payload_types: Box::new([LogicalType::Integer]),
-                        required: Default::default(),
+                        build_output_count: 1,
                         force_external: false,
                     }),
                     sink_sharing: SinkSharing::Exclusive,
@@ -1382,7 +1352,6 @@ mod tests {
                         super::super::graph::HashAggregateBuildSinkSpec {
                             handle: aggregate,
                             spec: aggregate_spec,
-                            required: Default::default(),
                         },
                     ),
                     sink_sharing: SinkSharing::Exclusive,
@@ -1401,12 +1370,11 @@ mod tests {
                     sink: SinkSpec::SortBuild(super::super::graph::SortBuildSinkSpec {
                         handle: sort,
                         orders: vec![order_by_first_column()].into_boxed_slice(),
-                        projection_map: Box::new([]),
+                        projection_map: Box::new([0]),
                         input_types: Box::new([LogicalType::Integer]),
                         output_names: Box::new(["a".to_string()]),
                         output_types: Box::new([LogicalType::Integer]),
                         force_external: false,
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1422,7 +1390,6 @@ mod tests {
                     sink: SinkSpec::TopNBuild(super::super::graph::TopNBuildSinkSpec {
                         handle: topn,
                         spec: topn_spec(),
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1438,7 +1405,6 @@ mod tests {
                     sink: SinkSpec::WindowBuild(super::super::graph::WindowBuildSinkSpec {
                         handle: window,
                         spec: window_spec(),
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),
@@ -1452,7 +1418,6 @@ mod tests {
                     transforms: Vec::new(),
                     sink: SinkSpec::CteMaterialize(super::super::graph::CteMaterializeSinkSpec {
                         handle: cte,
-                        required: Default::default(),
                     }),
                     sink_sharing: SinkSharing::Exclusive,
                     properties: PipelineProperties::default(),

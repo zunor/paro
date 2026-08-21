@@ -11,7 +11,8 @@
 //! - Returns NULL for empty input.
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateEmptyInput, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -344,7 +345,7 @@ pub fn get_array_agg_function() -> AggregateFunctionSet {
     add_array_agg_overload(&mut set, LogicalType::Double);
     add_array_agg_overload(&mut set, LogicalType::Boolean);
     add_array_agg_overload(&mut set, LogicalType::Varchar);
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

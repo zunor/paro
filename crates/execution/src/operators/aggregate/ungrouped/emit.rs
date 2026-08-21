@@ -5,8 +5,11 @@ use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::vector::{SelectionVector, VECTOR_SIZE};
 use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
+use paro_function::scalar::FunctionExecContext;
 
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
 use crate::operators::aggregate::aggregate_kernel::finalize_states;
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
@@ -19,6 +22,7 @@ use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
     BreakerHandleGlobal, SourceGlobal, SourceLocal, UngroupedAggregateEmitSourceLocal,
 };
+use crate::runtime::ExpressionEvalInput;
 
 #[derive(Debug, Clone)]
 pub struct UngroupedAggregateEmitSourceExec {
@@ -37,12 +41,27 @@ impl UngroupedAggregateEmitSourceExec {
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
+        ctx: &mut PipelineInitContext,
         _global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::UngroupedAggregateEmit(
-            UngroupedAggregateEmitSourceLocal::default(),
-        ))
+        let mut local = UngroupedAggregateEmitSourceLocal::default();
+        if !self.spec.having_filter.is_empty() {
+            if self.spec.having_filter.len() != 1 {
+                return Err(paro_error::internal(
+                    "aggregate HAVING lowering requires one normalized predicate",
+                ));
+            }
+            local.having_executor = Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.having_filter,
+                ctx.query.session.as_ref(),
+            ));
+            local.having_selection = Some(SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+        }
+        Ok(SourceLocal::UngroupedAggregateEmit(local))
     }
 
     pub(crate) fn poll_next(
@@ -109,8 +128,30 @@ impl UngroupedAggregateEmitSourceExec {
             output,
             1,
         )?;
+        let selected_count = if let (Some(executor), Some(selection)) = (
+            local.having_executor.as_mut(),
+            local.having_selection.as_mut(),
+        ) {
+            executor.select_kernel(
+                0,
+                VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                    params: ctx.query.params.as_ref(),
+                    columns: output,
+                })
+                .with_count(1),
+                ctx.query,
+                selection,
+            )?
+        } else {
+            1
+        };
         state.destroy()?;
         local.emitted = true;
-        Ok(SourcePoll::Output)
+        if selected_count == 0 {
+            output.try_set_cardinality(0)?;
+            Ok(SourcePoll::Finished)
+        } else {
+            Ok(SourcePoll::Output)
+        }
     }
 }

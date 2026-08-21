@@ -5,7 +5,7 @@
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::{
     DataRef, SelectionRef, SelectionVector, ValidityRef, Vector, VECTOR_SIZE,
 };
@@ -14,9 +14,6 @@ use super::{
     ListEntry, RawRowChunkState, RawRowChunkView, RawRowCollection, RawRowLayout, RawRowPinState,
     RawRowSegment, RawRowVectorView,
 };
-
-/// Size threshold for inlined strings.
-const STRING_INLINE_LENGTH: usize = 12;
 
 // =============================================================================
 // Core Functions
@@ -57,6 +54,7 @@ pub fn build_rows(
         // Allocate space.
         let allocation = {
             let allocator = segment.allocator_mut();
+            let accounting_class = allocator.accounting_class();
             let heap_sizes_opt = if layout.all_constant() {
                 None
             } else {
@@ -65,7 +63,7 @@ pub fn build_rows(
 
             allocator.allocate_rows(remaining, heap_sizes_opt).map_err(|err| {
                 paro_error::internal(format!(
-                    "failed to allocate row slots while building spill chunk: offset={offset}, remaining={remaining}, count={count}, error={err}"
+                    "failed to allocate row slots: class={accounting_class:?}, offset={offset}, remaining={remaining}, count={count}, error={err}"
                 ))
             })?
         };
@@ -143,7 +141,7 @@ pub fn build_rows(
             };
             let row_block_offset =
                 allocation.row_block_offset + allocation_row_offset * layout.get_row_width();
-            let mut part = if let Some(heap_info) = &allocation.heap_info {
+            let part = if let Some(heap_info) = &allocation.heap_info {
                 super::RawRowChunkPart::new(
                     allocation.row_block_index as u32,
                     row_block_offset as u32,
@@ -176,7 +174,7 @@ pub fn build_rows(
                         heap_info.heap_block_index,
                         allocation_heap_offset,
                     ) {
-                        part.base_heap_ptr = Some(ptr);
+                        *part.heap_base_address.lock().unwrap() = Some(ptr as usize);
                     }
                 }
             }
@@ -357,13 +355,13 @@ fn compute_string_heap_sizes_internal<const HAS_APPEND_SEL: bool, const ALL_VALI
         }
 
         // Get string using physical index
-        let data_ptr = format.get_data::<paro_common::types::InlineString>();
+        let data_ptr = format.get_data::<paro_common::types::StringView>();
         if !data_ptr.is_null() {
             unsafe {
                 let string_t = &*data_ptr.add(source_idx);
                 let len = string_t.len();
                 // Only non-inlined strings need heap space
-                if len > STRING_INLINE_LENGTH {
+                if !string_t.is_inlined() {
                     *heap_size += len;
                 }
             }
@@ -484,7 +482,7 @@ fn compute_string_within_collection_heap_sizes(
 ) {
     let source_sel = format.sel();
     let source_validity = format.validity();
-    let source_data = format.get_data::<paro_common::types::InlineString>();
+    let source_data = format.get_data::<paro_common::types::StringView>();
 
     for (i, heap_size) in heap_sizes.iter_mut().enumerate().take(count) {
         let append_idx = append_index(append_sel, i);
@@ -504,7 +502,7 @@ fn compute_string_within_collection_heap_sizes(
         }
 
         *heap_size += RawRowLayout::validity_mask_size(list_entry.length);
-        *heap_size += list_entry.length * std::mem::size_of::<paro_common::types::InlineString>();
+        *heap_size += list_entry.length * paro_common::types::StringView::SIZE;
 
         if source_data.is_null() {
             continue;
@@ -523,7 +521,7 @@ fn compute_string_within_collection_heap_sizes(
             unsafe {
                 let string_t = &*source_data.add(source_idx);
                 let str_len = string_t.len();
-                if str_len > STRING_INLINE_LENGTH {
+                if !string_t.is_inlined() {
                     *heap_size += str_len;
                 }
             }
@@ -662,9 +660,8 @@ fn compute_single_collection_heap_size(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            heap_size +=
-                list_entry.length * std::mem::size_of::<paro_common::types::InlineString>();
-            let source_data = format.get_data::<paro_common::types::InlineString>();
+            heap_size += list_entry.length * paro_common::types::StringView::SIZE;
+            let source_data = format.get_data::<paro_common::types::StringView>();
             if source_data.is_null() {
                 return heap_size;
             }
@@ -681,7 +678,7 @@ fn compute_single_collection_heap_size(
                 unsafe {
                     let string_t = &*source_data.add(source_idx);
                     let str_len = string_t.len();
-                    if str_len > STRING_INLINE_LENGTH {
+                    if !string_t.is_inlined() {
                         heap_size += str_len;
                     }
                 }
@@ -1506,7 +1503,7 @@ fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
 ) {
     let source_sel = format.sel();
     let source_validity = format.validity();
-    let data_ptr = format.get_data::<paro_common::types::InlineString>();
+    let data_ptr = format.get_data::<paro_common::types::StringView>();
 
     let entry_idx = col_idx / 8;
     let bit_idx = col_idx % 8;
@@ -1535,36 +1532,24 @@ fn scatter_string_internal<const HAS_APPEND_SEL: bool, const ALL_VALID: bool>(
                 let len = bytes.len();
 
                 let dst = row_ptr.add(offset);
-
-                // Write length (4 bytes)
-                std::ptr::write(dst as *mut u32, len as u32);
-
-                if len <= STRING_INLINE_LENGTH {
-                    // Inline: copy entire string starting at offset 4
-                    if len > 0 {
-                        std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(4), len);
-                    }
-                    // Zero remaining inline space
-                    if len < STRING_INLINE_LENGTH {
-                        std::ptr::write_bytes(dst.add(4 + len), 0, STRING_INLINE_LENGTH - len);
-                    }
+                let row_value = if string_t.is_inlined() {
+                    *string_t
                 } else {
-                    // Non-inline: write prefix (4 bytes) then heap pointer
-                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), dst.add(4), 4);
-
-                    // Copy to heap and store pointer
                     let heap_ptr = heap_locations[i];
                     std::ptr::copy_nonoverlapping(bytes.as_ptr(), heap_ptr, len);
-
-                    std::ptr::write(dst.add(8) as *mut *mut u8, heap_ptr);
                     heap_locations[i] = heap_ptr.add(len);
-                }
+                    // SAFETY: the copied bytes are initialized in row-owned
+                    // storage that outlives the target cell.
+                    StringView::from_out_of_line(bytes, heap_ptr, len as u32)
+                };
+                // SAFETY: `dst` is a writable varlen cell in this row.
+                row_value.write_cell(dst);
             }
         } else {
             // Write null string
             unsafe {
                 let dst = row_ptr.add(offset);
-                std::ptr::write_bytes(dst, 0, 16);
+                StringView::empty().write_cell(dst);
 
                 if !layout.all_valid() {
                     let validity_ptr = row_ptr.add(entry_idx);
@@ -1634,26 +1619,26 @@ unsafe fn scatter_collection_payload(
         | LogicalType::Json
         | LogicalType::Jsonb
         | LogicalType::Blob => {
-            let inline_size = std::mem::size_of::<paro_common::types::InlineString>();
-            let source_data = format.get_data::<paro_common::types::InlineString>();
+            let inline_size = paro_common::types::StringView::SIZE;
+            let source_data = format.get_data::<paro_common::types::StringView>();
             let mut heap_cursor = payload_ptr.add(list_entry.length * inline_size);
 
             for elem_i in 0..list_entry.length {
                 let source_pos = list_entry.offset + elem_i;
                 let dst_ptr =
-                    payload_ptr.add(elem_i * inline_size) as *mut paro_common::types::InlineString;
+                    payload_ptr.add(elem_i * inline_size) as *mut paro_common::types::StringView;
 
                 let Some(source_idx) =
                     (source_pos < source_sel.len()).then(|| source_sel.get(source_pos))
                 else {
                     clear_collection_validity_bit(validity_mask_ptr, elem_i);
-                    std::ptr::write(dst_ptr, paro_common::types::InlineString::empty());
+                    std::ptr::write(dst_ptr, paro_common::types::StringView::empty());
                     continue;
                 };
 
                 if !is_valid_at(source_validity, source_idx) || source_data.is_null() {
                     clear_collection_validity_bit(validity_mask_ptr, elem_i);
-                    std::ptr::write(dst_ptr, paro_common::types::InlineString::empty());
+                    std::ptr::write(dst_ptr, paro_common::types::StringView::empty());
                     continue;
                 }
 
@@ -2354,7 +2339,7 @@ mod tests {
 
         let base = std::mem::size_of::<u64>()
             + RawRowLayout::validity_mask_size(2)
-            + 2 * std::mem::size_of::<paro_common::types::InlineString>();
+            + 2 * paro_common::types::StringView::SIZE;
         let expected_0 = base + values[1].len();
         let expected_1 = base + values[3].len();
 

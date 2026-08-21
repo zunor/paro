@@ -17,12 +17,38 @@ pub struct ZoneMapEntry {
     pub max: Bytes,
     /// Whether the page contains null values
     pub has_null: bool,
+    /// Whether min/max are exact observed values rather than truncated or
+    /// otherwise conservative bounds.
+    pub bounds_exact: bool,
+}
+
+/// Provenance of serialized zone-map bounds.
+///
+/// Candidate pruning accepts conservative bounds, while predicate proofs may
+/// only consume exact observed bounds. Requiring this value at every writer
+/// call prevents a future truncating encoder from accidentally opting into
+/// proof semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BoundsPrecision {
+    Exact,
+    Conservative,
+}
+
+impl BoundsPrecision {
+    fn is_exact(self) -> bool {
+        matches!(self, Self::Exact)
+    }
 }
 
 impl ZoneMapEntry {
     /// Create a new zone map entry.
-    pub fn new(min: Bytes, max: Bytes, has_null: bool) -> Self {
-        ZoneMapEntry { min, max, has_null }
+    pub fn new(min: Bytes, max: Bytes, has_null: bool, precision: BoundsPrecision) -> Self {
+        ZoneMapEntry {
+            min,
+            max,
+            has_null,
+            bounds_exact: precision.is_exact(),
+        }
     }
 }
 
@@ -51,27 +77,22 @@ impl ZoneMapIndexWriter {
     }
 
     /// Add a zone map entry for a page.
-    pub fn add(&mut self, min: Bytes, max: Bytes, has_null: bool) {
-        // Update global stats using byte comparison
-        if self.global_min.is_none() || min < *self.global_min.as_ref().unwrap() {
-            self.global_min = Some(min.clone());
-        }
-        if self.global_max.is_none() || max > *self.global_max.as_ref().unwrap() {
-            self.global_max = Some(max.clone());
-        }
-        if has_null {
-            self.global_has_null = true;
-        }
-
-        self.entries.push(ZoneMapEntry { min, max, has_null });
+    pub fn add(&mut self, min: Bytes, max: Bytes, has_null: bool, precision: BoundsPrecision) {
+        self.add_with_cmp(min, max, has_null, precision, |left, right| left.cmp(right));
     }
 
-    /// Add a zone map entry with custom comparator.
-    pub fn add_with_cmp<F>(&mut self, min: Bytes, max: Bytes, has_null: bool, cmp: F)
-    where
+    /// Add a zone-map entry with an explicit bounds provenance and comparator.
+    pub fn add_with_cmp<F>(
+        &mut self,
+        min: Bytes,
+        max: Bytes,
+        has_null: bool,
+        precision: BoundsPrecision,
+        cmp: F,
+    ) where
         F: Fn(&[u8], &[u8]) -> std::cmp::Ordering,
     {
-        // Update global stats using custom comparator
+        // Update global stats using byte comparison
         if self.global_min.is_none()
             || cmp(&min, self.global_min.as_ref().unwrap()) == std::cmp::Ordering::Less
         {
@@ -86,7 +107,12 @@ impl ZoneMapIndexWriter {
             self.global_has_null = true;
         }
 
-        self.entries.push(ZoneMapEntry { min, max, has_null });
+        self.entries.push(ZoneMapEntry {
+            min,
+            max,
+            has_null,
+            bounds_exact: precision.is_exact(),
+        });
     }
 
     /// Finish and serialize the index.
@@ -95,7 +121,7 @@ impl ZoneMapIndexWriter {
     /// ```text
     /// global_min_len(4) | global_min | global_max_len(4) | global_max | global_has_null(1)
     /// num_entries(4)
-    /// [min_len(4) | min | max_len(4) | max | has_null(1)] * num_entries
+    /// [min_len(4) | min | max_len(4) | max | has_null(1) | bounds_exact(1)] * num_entries
     /// ```
     pub fn finish(&self) -> Bytes {
         let mut buf = BytesMut::new();
@@ -111,6 +137,7 @@ impl ZoneMapIndexWriter {
             Self::write_value(&mut buf, Some(&entry.min));
             Self::write_value(&mut buf, Some(&entry.max));
             buf.put_u8(if entry.has_null { 1 } else { 0 });
+            buf.put_u8(if entry.bounds_exact { 1 } else { 0 });
         }
 
         buf.freeze()
@@ -177,12 +204,7 @@ impl ZoneMapIndexReader {
         let global_min = Self::read_value(&mut buf)?;
         let global_max = Self::read_value(&mut buf)?;
 
-        if buf.remaining() < 1 {
-            return Err(paro_error::data_corrupted(
-                "ZoneMapIndexReader: missing global has_null",
-            ));
-        }
-        let global_has_null = buf.get_u8() != 0;
+        let global_has_null = read_bool(&mut buf, "global has_null")?;
 
         // Read per-page zone maps
         if buf.remaining() < 4 {
@@ -192,21 +214,39 @@ impl ZoneMapIndexReader {
         }
         let num_entries = buf.get_u32_le() as usize;
 
-        let mut entries = Vec::with_capacity(num_entries);
+        const MIN_ENTRY_BYTES: usize = 4 + 4 + 1 + 1;
+        if num_entries > buf.remaining() / MIN_ENTRY_BYTES {
+            return Err(paro_error::data_corrupted(format!(
+                "ZoneMapIndexReader: entry count {num_entries} exceeds remaining payload"
+            )));
+        }
+        let mut entries = Vec::new();
+        entries.try_reserve_exact(num_entries).map_err(|_| {
+            paro_error::data_corrupted(format!(
+                "ZoneMapIndexReader: cannot allocate {num_entries} entries"
+            ))
+        })?;
         for _ in 0..num_entries {
             let min = Self::read_value(&mut buf)?
                 .ok_or_else(|| paro_error::data_corrupted("ZoneMapIndexReader: missing min"))?;
             let max = Self::read_value(&mut buf)?
                 .ok_or_else(|| paro_error::data_corrupted("ZoneMapIndexReader: missing max"))?;
 
-            if buf.remaining() < 1 {
-                return Err(paro_error::data_corrupted(
-                    "ZoneMapIndexReader: missing has_null",
-                ));
-            }
-            let has_null = buf.get_u8() != 0;
+            let has_null = read_bool(&mut buf, "entry has_null")?;
+            let bounds_exact = read_bool(&mut buf, "bounds precision")?;
 
-            entries.push(ZoneMapEntry { min, max, has_null });
+            entries.push(ZoneMapEntry {
+                min,
+                max,
+                has_null,
+                bounds_exact,
+            });
+        }
+        if buf.has_remaining() {
+            return Err(paro_error::data_corrupted(format!(
+                "ZoneMapIndexReader: {} trailing bytes",
+                buf.remaining()
+            )));
         }
 
         Ok(ZoneMapIndexReader {
@@ -311,6 +351,21 @@ impl ZoneMapIndexReader {
     }
 }
 
+fn read_bool(buf: &mut &[u8], field: &str) -> Result<bool> {
+    if buf.remaining() < 1 {
+        return Err(paro_error::data_corrupted(format!(
+            "ZoneMapIndexReader: missing {field}"
+        )));
+    }
+    match buf.get_u8() {
+        0 => Ok(false),
+        1 => Ok(true),
+        value => Err(paro_error::data_corrupted(format!(
+            "ZoneMapIndexReader: invalid {field} flag {value}"
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -329,11 +384,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();
@@ -363,11 +420,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();
@@ -400,6 +459,7 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
 
         let data = writer.finish();

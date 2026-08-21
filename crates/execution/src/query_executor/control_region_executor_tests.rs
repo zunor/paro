@@ -263,7 +263,6 @@ fn recursive_control_region_statement_with_termination(
                 transforms: Vec::new(),
                 sink: SinkSpec::RecursiveTableAppend(RecursiveTableAppendSinkSpec {
                     handle: intermediate,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -275,7 +274,6 @@ fn recursive_control_region_statement_with_termination(
                 transforms: Vec::new(),
                 sink: SinkSpec::RecursiveTableAppend(RecursiveTableAppendSinkSpec {
                     handle: intermediate,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -344,7 +342,6 @@ fn correlated_control_region_statement() -> StatementProgram {
                     ))]
                     .into_boxed_slice(),
                     cached_outer: None,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -401,7 +398,6 @@ fn correlated_control_region_with_capture_dependency_statement() -> StatementPro
                 transforms: Vec::new(),
                 sink: SinkSpec::Materialize(MaterializeSinkSpec {
                     handle: materialized,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -421,7 +417,6 @@ fn correlated_control_region_with_capture_dependency_statement() -> StatementPro
                     ))]
                     .into_boxed_slice(),
                     cached_outer: None,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -492,7 +487,6 @@ fn correlated_control_region_with_external_dependent_producer_statement() -> Sta
                     ))]
                     .into_boxed_slice(),
                     cached_outer: None,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),

@@ -27,6 +27,24 @@ pub enum OptimizerType {
     InClause,
     /// Reorders joins for optimal execution.
     JoinOrder,
+    /// Reuses grouped aggregates across redundant detail joins.
+    AggregateJoinSubsumption,
+    /// Pre-aggregates multiplicative nullable join sides by their join key.
+    AggregateJoinPreaggregation,
+    /// Defers wide dimension payload until after fact-side partial aggregation.
+    AggregateDimensionDeferral,
+    /// Materializes total, narrowing aggregate inputs below inner joins.
+    AggregateInputMaterialization,
+    /// Replaces aggregate inputs proven non-NULL with a certified equivalent.
+    AggregateNonNullInput,
+    /// Proves GROUP BY domains with at most one settled input row.
+    AggregateSingletonGroups,
+    /// Derives scalar reductions from finalized alpha-equivalent grouped aggregates.
+    AggregatePostReduction,
+    /// Reuses a key-preserving detail stream for a correlated partition aggregate.
+    CorrelatedPartitionAggregate,
+    /// Reuses a filtered detail stream for an uncorrelated scalar aggregate.
+    ScalarAggregateWindow,
     /// Eliminates redundant joins introduced by `DelimGet`.
     DelimJoinElimination,
     /// Rewrites UNNEST operations.
@@ -62,6 +80,8 @@ pub enum OptimizerType {
     SamplingPushdown,
     /// Pushes join filters to table scans.
     JoinFilterPushdown,
+    /// Separates hash keys from residual predicates on inner joins.
+    MixedJoinPredicate,
     /// Extension-provided optimizers.
     Extension,
     /// Materializes CTEs for reuse.
@@ -70,6 +90,8 @@ pub enum OptimizerType {
     SumRewriter,
     /// Delays materialization for efficiency.
     LateMaterialization,
+    /// Emits an exact predicate-proven ASCII prefix as a derived scan column.
+    MatchedPrefixScanProjection,
     /// Inlines CTEs when beneficial.
     CteInlining,
     /// Eliminates common subplans.
@@ -87,7 +109,7 @@ pub enum OptimizerType {
 }
 
 impl OptimizerType {
-    pub const ALL: [OptimizerType; 37] = [
+    pub const ALL: [OptimizerType; 48] = [
         OptimizerType::ExpressionRewriter,
         OptimizerType::FilterPullup,
         OptimizerType::FilterPushdown,
@@ -96,6 +118,15 @@ impl OptimizerType {
         OptimizerType::RegexRange,
         OptimizerType::InClause,
         OptimizerType::JoinOrder,
+        OptimizerType::AggregateJoinSubsumption,
+        OptimizerType::AggregateJoinPreaggregation,
+        OptimizerType::AggregateDimensionDeferral,
+        OptimizerType::AggregateInputMaterialization,
+        OptimizerType::AggregateNonNullInput,
+        OptimizerType::AggregateSingletonGroups,
+        OptimizerType::AggregatePostReduction,
+        OptimizerType::CorrelatedPartitionAggregate,
+        OptimizerType::ScalarAggregateWindow,
         OptimizerType::DelimJoinElimination,
         OptimizerType::UnnestRewriter,
         OptimizerType::UnusedColumns,
@@ -114,10 +145,12 @@ impl OptimizerType {
         OptimizerType::ReorderFilter,
         OptimizerType::SamplingPushdown,
         OptimizerType::JoinFilterPushdown,
+        OptimizerType::MixedJoinPredicate,
         OptimizerType::Extension,
         OptimizerType::MaterializedCte,
         OptimizerType::SumRewriter,
         OptimizerType::LateMaterialization,
+        OptimizerType::MatchedPrefixScanProjection,
         OptimizerType::CteInlining,
         OptimizerType::CommonSubplan,
         OptimizerType::JoinElimination,
@@ -141,6 +174,15 @@ impl OptimizerType {
             OptimizerType::RegexRange => "regex_range",
             OptimizerType::InClause => "in_clause",
             OptimizerType::JoinOrder => "join_order",
+            OptimizerType::AggregateJoinSubsumption => "aggregate_join_subsumption",
+            OptimizerType::AggregateJoinPreaggregation => "aggregate_join_preaggregation",
+            OptimizerType::AggregateDimensionDeferral => "aggregate_dimension_deferral",
+            OptimizerType::AggregateInputMaterialization => "aggregate_input_materialization",
+            OptimizerType::AggregateNonNullInput => "aggregate_non_null_input",
+            OptimizerType::AggregateSingletonGroups => "aggregate_singleton_groups",
+            OptimizerType::AggregatePostReduction => "aggregate_post_reduction",
+            OptimizerType::CorrelatedPartitionAggregate => "correlated_partition_aggregate",
+            OptimizerType::ScalarAggregateWindow => "scalar_aggregate_window",
             OptimizerType::DelimJoinElimination => "delim_join_elimination",
             OptimizerType::UnnestRewriter => "unnest_rewriter",
             OptimizerType::UnusedColumns => "unused_columns",
@@ -159,10 +201,12 @@ impl OptimizerType {
             OptimizerType::ReorderFilter => "reorder_filter",
             OptimizerType::SamplingPushdown => "sampling_pushdown",
             OptimizerType::JoinFilterPushdown => "join_filter_pushdown",
+            OptimizerType::MixedJoinPredicate => "mixed_join_predicate",
             OptimizerType::Extension => "extension",
             OptimizerType::MaterializedCte => "materialized_cte",
             OptimizerType::SumRewriter => "sum_rewriter",
             OptimizerType::LateMaterialization => "late_materialization",
+            OptimizerType::MatchedPrefixScanProjection => "matched_prefix_scan_projection",
             OptimizerType::CteInlining => "cte_inlining",
             OptimizerType::CommonSubplan => "common_subplan",
             OptimizerType::JoinElimination => "join_elimination",
@@ -193,6 +237,15 @@ impl FromStr for OptimizerType {
             "regex_range" => Ok(OptimizerType::RegexRange),
             "in_clause" => Ok(OptimizerType::InClause),
             "join_order" => Ok(OptimizerType::JoinOrder),
+            "aggregate_join_subsumption" => Ok(OptimizerType::AggregateJoinSubsumption),
+            "aggregate_join_preaggregation" => Ok(OptimizerType::AggregateJoinPreaggregation),
+            "aggregate_dimension_deferral" => Ok(OptimizerType::AggregateDimensionDeferral),
+            "aggregate_input_materialization" => Ok(OptimizerType::AggregateInputMaterialization),
+            "aggregate_non_null_input" => Ok(OptimizerType::AggregateNonNullInput),
+            "aggregate_singleton_groups" => Ok(OptimizerType::AggregateSingletonGroups),
+            "aggregate_post_reduction" => Ok(OptimizerType::AggregatePostReduction),
+            "correlated_partition_aggregate" => Ok(OptimizerType::CorrelatedPartitionAggregate),
+            "scalar_aggregate_window" => Ok(OptimizerType::ScalarAggregateWindow),
             "delim_join_elimination" => Ok(OptimizerType::DelimJoinElimination),
             "unnest_rewriter" => Ok(OptimizerType::UnnestRewriter),
             "unused_columns" => Ok(OptimizerType::UnusedColumns),
@@ -211,10 +264,12 @@ impl FromStr for OptimizerType {
             "reorder_filter" => Ok(OptimizerType::ReorderFilter),
             "sampling_pushdown" => Ok(OptimizerType::SamplingPushdown),
             "join_filter_pushdown" => Ok(OptimizerType::JoinFilterPushdown),
+            "mixed_join_predicate" => Ok(OptimizerType::MixedJoinPredicate),
             "extension" => Ok(OptimizerType::Extension),
             "materialized_cte" => Ok(OptimizerType::MaterializedCte),
             "sum_rewriter" => Ok(OptimizerType::SumRewriter),
             "late_materialization" => Ok(OptimizerType::LateMaterialization),
+            "matched_prefix_scan_projection" => Ok(OptimizerType::MatchedPrefixScanProjection),
             "cte_inlining" => Ok(OptimizerType::CteInlining),
             "common_subplan" => Ok(OptimizerType::CommonSubplan),
             "join_elimination" => Ok(OptimizerType::JoinElimination),

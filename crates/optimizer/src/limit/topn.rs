@@ -120,12 +120,12 @@ impl TopNOptimizer {
             let Projection {
                 table_index,
                 expressions,
-                output_names,
+                visible_names,
                 child,
                 ..
             } = proj;
             let inner = *child;
-            projections.push((table_index, expressions, output_names));
+            projections.push((table_index, expressions, visible_names));
             child_lp = inner;
         }
 
@@ -139,7 +139,7 @@ impl TopNOptimizer {
                 while let Some((table_index, expressions, output_names)) = projections.pop() {
                     let proj =
                         Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
-                            .with_output_names(output_names);
+                            .with_visible_names(output_names);
                     result = LogicalOperator::Projection(proj);
                 }
                 return LogicalPlan {
@@ -157,7 +157,7 @@ impl TopNOptimizer {
 
         while let Some((table_index, expressions, output_names)) = projections.pop() {
             let proj = Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
-                .with_output_names(output_names);
+                .with_visible_names(output_names);
             result = LogicalOperator::Projection(proj);
         }
 
@@ -191,7 +191,10 @@ mod tests {
             names: vec!["a".to_string(), "b".to_string()],
             relation_name: None,
             relation_alias: None,
-            column_ids: vec![0, 1],
+            column_sources: vec![
+                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+            ],
             column_types: vec![LogicalType::Integer, LogicalType::Integer],
             table: None,
             scan_order: None,
@@ -236,7 +239,7 @@ mod tests {
                     }),
                 ],
             )
-            .with_output_names(vec!["id_alias".to_string(), "score_alias".to_string()]),
+            .with_visible_names(vec!["id_alias".to_string(), "score_alias".to_string()]),
         )
     }
 

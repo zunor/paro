@@ -7,58 +7,130 @@ use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::SelectionVector;
-use paro_planner::operator::join::JoinType;
+use paro_planner::operator::join::{AntiJoinMode, JoinType};
 
 use crate::join_hashtable::scan_structure::ScanStructure;
 use crate::join_hashtable::JoinHashTable;
+use crate::operators::join::hash::residual::HashJoinResidualProbeState;
 use crate::operators::join::join_result_helpers::{
     construct_anti_join_result, construct_left_outer_result, construct_mark_join_result,
 };
+use crate::runtime::context::QueryRuntimeContext;
 
 pub(crate) fn scan_hash_join_results(
     join_type: JoinType,
+    anti_join_mode: AntiJoinMode,
     probe_keys: &Chunk,
     input: &Chunk,
     output: &mut Chunk,
     hash_table: &JoinHashTable,
     scan_structure: &mut ScanStructure,
     left_projection: &[usize],
-    right_projection: &[usize],
+    residual: Option<&mut HashJoinResidualProbeState>,
+    runtime: &QueryRuntimeContext,
 ) -> Result<usize> {
+    if let Some(residual) = residual {
+        let mut select = |lhs_sel: &SelectionVector,
+                          rhs_pointers: &[usize],
+                          match_count: usize,
+                          output: &mut SelectionVector| {
+            residual.select_matches(
+                runtime,
+                hash_table,
+                lhs_sel,
+                rhs_pointers,
+                match_count,
+                output,
+            )
+        };
+        return match join_type {
+            JoinType::Inner | JoinType::Right => scan_structure.next_inner_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Left | JoinType::Outer => scan_structure.next_left_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Semi => scan_structure.next_semi_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::Anti if anti_join_mode == AntiJoinMode::Regular => scan_structure
+                .next_anti_join_with_filter(
+                    probe_keys,
+                    input,
+                    output,
+                    hash_table,
+                    left_projection,
+                    &mut select,
+                ),
+            JoinType::Single => scan_structure.next_single_join_with_filter(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+                &mut select,
+            ),
+            JoinType::RightSemi | JoinType::RightAnti => scan_structure
+                .next_right_semi_or_anti_join_with_filter(probe_keys, hash_table, &mut select),
+            JoinType::Mark | JoinType::Anti | JoinType::Invalid => Err(paro_error::internal(
+                "hash join residual predicate is not valid for this join mode",
+            )),
+        };
+    }
     match join_type {
-        JoinType::Inner | JoinType::Right => scan_structure.next_inner_join(
-            probe_keys,
-            input,
-            output,
-            hash_table,
-            left_projection,
-            right_projection,
-        ),
-        JoinType::Left | JoinType::Outer => scan_structure.next_left_join(
-            probe_keys,
-            input,
-            output,
-            hash_table,
-            left_projection,
-            right_projection,
-        ),
+        JoinType::Inner
+            if scan_structure.exact_key_matches
+                && !scan_structure.has_long_chains
+                && hash_table.build_output_count() == 0 =>
+        {
+            scan_structure.next_exact_unique_left_only_inner_join(input, output, left_projection)
+        }
+        JoinType::Inner | JoinType::Right => {
+            scan_structure.next_inner_join(probe_keys, input, output, hash_table, left_projection)
+        }
+        JoinType::Left | JoinType::Outer => {
+            scan_structure.next_left_join(probe_keys, input, output, hash_table, left_projection)
+        }
         JoinType::Semi => {
             scan_structure.next_semi_join(probe_keys, input, output, hash_table, left_projection)
         }
-        JoinType::Anti => {
-            scan_structure.next_anti_join(probe_keys, input, output, hash_table, left_projection)
-        }
+        JoinType::Anti => match anti_join_mode {
+            AntiJoinMode::Regular => scan_structure.next_anti_join(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+            ),
+            AntiJoinMode::NullAware => scan_structure.next_null_aware_anti_join(
+                probe_keys,
+                input,
+                output,
+                hash_table,
+                left_projection,
+            ),
+        },
         JoinType::Mark => {
             scan_structure.next_mark_join(probe_keys, input, output, hash_table, left_projection)
         }
-        JoinType::Single => scan_structure.next_single_join(
-            probe_keys,
-            input,
-            output,
-            hash_table,
-            left_projection,
-            right_projection,
-        ),
+        JoinType::Single => {
+            scan_structure.next_single_join(probe_keys, input, output, hash_table, left_projection)
+        }
         JoinType::RightSemi | JoinType::RightAnti => {
             scan_structure.next_right_semi_or_anti_join(probe_keys, hash_table)
         }
@@ -70,7 +142,6 @@ pub(crate) fn emit_empty_build_probe_result(
     join_type: JoinType,
     input: &Chunk,
     left_projection: &[usize],
-    right_projection: &[usize],
     output_types: &[LogicalType],
     output: &mut Chunk,
 ) -> Result<usize> {
@@ -80,11 +151,7 @@ pub(crate) fn emit_empty_build_probe_result(
     }
     match join_type {
         JoinType::Left | JoinType::Outer | JoinType::Single => {
-            let left_len = if left_projection.is_empty() {
-                input.column_count()
-            } else {
-                left_projection.len()
-            };
+            let left_len = left_projection.len();
             let right_types = output_types.get(left_len..).ok_or_else(|| {
                 paro_error::internal("hash join output type layout is shorter than left projection")
             })?;
@@ -114,9 +181,6 @@ pub(crate) fn emit_empty_build_probe_result(
         | JoinType::Semi
         | JoinType::RightSemi
         | JoinType::RightAnti
-        | JoinType::Invalid => {
-            let _ = right_projection;
-            Ok(0)
-        }
+        | JoinType::Invalid => Ok(0),
     }
 }

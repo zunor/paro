@@ -27,27 +27,27 @@ WHERE fulltext_match(content, 'graph database')
 ORDER BY bm25(content, 'graph database') DESC, id
 LIMIT 2;
 QUERY PLAN
-PROJECTION  (rows=0)
+PROJECTION  (rows=1)
   Output: id
-  Cardinality: [0, 0, 1]
+  Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
-  ->  TOP_N  (rows=0)
+  ->  TOP_N  (rows=1)
     Sort Key: #1 DESC NULLS FIRST, #0 ASC NULLS LAST
     Limit: 2
-    Cardinality: [0, 0, 1]
+    Cardinality: [0, 1, 1]
     Output Schema: id INTEGER, __paro_hidden_1 FLOAT
-    ->  PROJECTION  (rows=0)
+    ->  PROJECTION  (rows=1)
       Output: id, __paro_hidden_1
-      Cardinality: [0, 0, 1]
+      Cardinality: [0, 1, 1]
       Output Schema: id INTEGER, __paro_hidden_1 FLOAT
-      ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+      ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>
         Search Capability: Queryable
         Column: 2
         Mode: Filter
-        Cardinality: [4, 4, 4]
+        Cardinality: [0, 1, 1]
         Output Schema: id INTEGER, content VARCHAR
 
 SELECT id
@@ -66,18 +66,18 @@ FROM search_opt_docs
 WHERE fulltext_match(content, 'graph database')
   AND category = 'tech';
 QUERY PLAN
-PROJECTION  (rows=0)
+PROJECTION  (rows=1)
   Output: id
-  Cardinality: [0, 0, 1]
+  Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
-  ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=4)
+  ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
     Search Definition: <search-definition-id>
     Search Generation: <search-generation-id>
     Search Root: <search-root-id>
     Search Capability: Queryable
     Column: 2
     Mode: Filter
-    Cardinality: [4, 4, 4]
+    Cardinality: [0, 1, 1]
     Output Schema: id INTEGER, category VARCHAR, content VARCHAR
 
 DROP TABLE search_opt_docs;

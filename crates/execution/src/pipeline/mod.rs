@@ -9,6 +9,8 @@ pub mod graph;
 pub mod handles;
 pub mod lowerer;
 pub mod program;
+#[cfg(test)]
+mod program_test_window;
 pub mod properties;
 
 pub use program::{

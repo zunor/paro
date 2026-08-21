@@ -27,6 +27,7 @@ use super::delim::DelimHandle;
 use super::external_table::ExternalTableHandle;
 use super::join::JoinBuildHandle;
 use super::materialized::MaterializedHandle;
+use super::partition_aggregate_window::PartitionAggregateWindowHandle;
 use super::recursive::RecursiveTableHandle;
 use super::set_operation::SetOperationHandle;
 use super::sort::{SortHandle, TopNHandle};
@@ -91,6 +92,7 @@ pub enum RuntimeBreakerHandle {
     HashJoinBuild(Arc<JoinBuildHandle>),
     Aggregate(Arc<AggregateHandle>),
     Window(Arc<WindowHandle>),
+    PartitionAggregateWindow(Arc<PartitionAggregateWindowHandle>),
     SetOperation(Arc<SetOperationHandle>),
     Cte(Arc<CteHandle>),
     Delim(Arc<DelimHandle>),
@@ -114,6 +116,9 @@ impl RuntimeBreakerHandle {
                 Self::Aggregate(Arc::new(AggregateHandle::new(metadata)))
             }
             BreakerHandleKind::Window => Self::Window(Arc::new(WindowHandle::new(metadata))),
+            BreakerHandleKind::PartitionAggregateWindow => Self::PartitionAggregateWindow(
+                Arc::new(PartitionAggregateWindowHandle::new(metadata)),
+            ),
             BreakerHandleKind::SetOperation => {
                 Self::SetOperation(Arc::new(SetOperationHandle::new(metadata)))
             }
@@ -147,6 +152,7 @@ impl RuntimeBreakerHandle {
             Self::HashJoinBuild(handle) => handle.metadata(),
             Self::Aggregate(handle) => handle.metadata(),
             Self::Window(handle) => handle.metadata(),
+            Self::PartitionAggregateWindow(handle) => handle.metadata(),
             Self::SetOperation(handle) => handle.metadata(),
             Self::Delim(handle) => handle.metadata(),
             Self::RecursiveTable(handle) => handle.metadata(),
@@ -163,6 +169,7 @@ impl RuntimeBreakerHandle {
             Self::HashJoinBuild(handle) => handle.cleanup_status(),
             Self::Aggregate(handle) => handle.cleanup_status(),
             Self::Window(handle) => handle.cleanup_status(),
+            Self::PartitionAggregateWindow(handle) => handle.cleanup_status(),
             Self::SetOperation(handle) => handle.cleanup_status(),
             Self::Delim(handle) => handle.cleanup_status(),
             Self::RecursiveTable(handle) => handle.cleanup_status(),
@@ -181,6 +188,7 @@ impl RuntimeCleanup for RuntimeBreakerHandle {
             Self::HashJoinBuild(handle) => handle.cleanup(ctx, reason),
             Self::Aggregate(handle) => handle.cleanup(ctx, reason),
             Self::Window(handle) => handle.cleanup(ctx, reason),
+            Self::PartitionAggregateWindow(handle) => handle.cleanup(ctx, reason),
             Self::SetOperation(handle) => handle.cleanup(ctx, reason),
             Self::Delim(handle) => handle.cleanup(ctx, reason),
             Self::RecursiveTable(handle) => handle.cleanup(ctx, reason),
@@ -226,6 +234,11 @@ typed_handle!(
 );
 typed_handle!(AggregateHandle, BreakerHandleKind::Aggregate, Aggregate);
 typed_handle!(WindowHandle, BreakerHandleKind::Window, Window);
+typed_handle!(
+    PartitionAggregateWindowHandle,
+    BreakerHandleKind::PartitionAggregateWindow,
+    PartitionAggregateWindow
+);
 typed_handle!(
     SetOperationHandle,
     BreakerHandleKind::SetOperation,
@@ -330,6 +343,18 @@ impl BreakerHandleRegistry {
         }
     }
 
+    /// Notify breaker handles that one static consumer pipeline has completed.
+    /// Handles use their catalog ownership metadata to release large resources
+    /// as soon as the final consumer is done instead of retaining them until
+    /// query teardown.
+    pub fn pipeline_finished(&self, pipeline: PipelineId) {
+        for handle in self.handles.iter() {
+            if let RuntimeBreakerHandle::HashJoinBuild(join) = handle {
+                join.consumer_finished(pipeline);
+            }
+        }
+    }
+
     pub fn live_handle_count(&self) -> usize {
         self.handles
             .iter()
@@ -405,6 +430,7 @@ mod tests {
             BreakerHandleKind::HashJoinBuild,
             BreakerHandleKind::Aggregate,
             BreakerHandleKind::Window,
+            BreakerHandleKind::PartitionAggregateWindow,
             BreakerHandleKind::SetOperation,
             BreakerHandleKind::Cte,
             BreakerHandleKind::Delim,
@@ -436,6 +462,9 @@ mod tests {
                     assert_eq!(handle.cleanup_status(), expected)
                 }
                 RuntimeBreakerHandle::Window(handle) => {
+                    assert_eq!(handle.cleanup_status(), expected)
+                }
+                RuntimeBreakerHandle::PartitionAggregateWindow(handle) => {
                     assert_eq!(handle.cleanup_status(), expected)
                 }
                 RuntimeBreakerHandle::SetOperation(handle) => {
@@ -475,6 +504,8 @@ mod tests {
             .expect("aggregate")
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: Vec::new(),
+                pending_radix_merges: Vec::new(),
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,
@@ -491,7 +522,7 @@ mod tests {
 
         let mut cte_chunks = vec![Chunk::try_new(test_allocator()).expect("chunk")];
         registry
-            .get::<CteHandle>(HandleRef::new(ids[7]))
+            .get::<CteHandle>(HandleRef::new(ids[8]))
             .expect("cte")
             .append_chunks(&mut cte_chunks)
             .expect("append cte");
@@ -544,6 +575,7 @@ mod tests {
             BreakerHandleKind::HashJoinBuild,
             BreakerHandleKind::Aggregate,
             BreakerHandleKind::Window,
+            BreakerHandleKind::PartitionAggregateWindow,
             BreakerHandleKind::SetOperation,
             BreakerHandleKind::Cte,
             BreakerHandleKind::Delim,
@@ -576,7 +608,7 @@ mod tests {
             .get::<WindowHandle>(HandleRef::new(ids[5]))
             .expect("window");
         let cte = registry
-            .get::<CteHandle>(HandleRef::new(ids[7]))
+            .get::<CteHandle>(HandleRef::new(ids[8]))
             .expect("cte");
         assert_eq!(materialized.pending_chunk_count(), 1);
         assert_eq!(window.pending_chunk_count(), 1);

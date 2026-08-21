@@ -37,6 +37,8 @@
 //!
 //! Implementation notes live alongside the module sources.
 
+mod fixed_predicate;
+mod predicate_column;
 mod segment;
 mod segment_delete_vector;
 mod segment_format;
@@ -44,10 +46,12 @@ mod segment_indexes;
 mod segment_iterator;
 mod segment_loader;
 mod segment_predicate;
+mod segment_predicate_program;
 mod segment_search;
 #[cfg(test)]
 mod segment_tests;
 mod segment_writer;
+mod varlen_predicate;
 
 pub use segment::{Segment, SegmentMeta, SegmentOptions, SegmentSharedPtr};
 pub use segment_format::{ColumnMeta, SegmentFooter};

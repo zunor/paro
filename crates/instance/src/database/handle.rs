@@ -6,7 +6,7 @@
 use crate::checkpoint::coordinator::{
     CheckpointCoordinator, CheckpointExecutionContext, CheckpointTriggerReason,
 };
-use crate::config::CheckpointConfigOptions;
+use crate::config::{CheckpointConfigOptions, CompactionConfigOptions};
 use crate::database::closer::DatabaseCloser;
 use crate::database::commit_health::CommitHealth;
 use crate::database::compaction_driver::CompactionDriver;
@@ -115,6 +115,16 @@ pub struct AttachOptions {
     pub visibility: AttachVisibility,
     /// Additional key-value options.
     pub options: HashMap<String, String>,
+}
+
+/// Runtime services and maintenance policy bound to one database handle.
+///
+/// Keeping these process-local resources separate from [`AttachOptions`]
+/// prevents catalog-visible attach semantics from becoming coupled to the
+/// instance runtime that happens to open the database.
+pub(crate) struct DatabaseRuntimeOptions {
+    pub commit_drain_wake_pool: Arc<CommitDrainWakePool>,
+    pub compaction: CompactionConfigOptions,
 }
 
 impl Default for AttachOptions {
@@ -308,6 +318,7 @@ impl DatabaseHandle {
         object_id_allocator: Arc<CatalogObjectIdAllocator>,
         initial_state: DbState,
         commit_drain_wake_pool: Arc<CommitDrainWakePool>,
+        compaction: CompactionConfigOptions,
     ) -> Self {
         let catalog = Self::catalog_for_path(&identity.name, &identity.path, object_id_allocator);
         let database_id = identity.id;
@@ -326,7 +337,11 @@ impl DatabaseHandle {
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
             task_scheduler: RwLock::new(None),
-            compaction: CompactionDriver::new(buffer_pool),
+            compaction: CompactionDriver::new(
+                buffer_pool,
+                compaction.max_concurrency,
+                compaction.admission,
+            ),
             checkpoint_coordinator: CheckpointCoordinator::new(),
             checkpoint_trigger: CheckpointTriggerState::default(),
             wal_observability: WalObservability::new(),
@@ -360,6 +375,7 @@ impl DatabaseHandle {
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
             )),
+            CompactionConfigOptions::default(),
         )
     }
 
@@ -394,6 +410,7 @@ impl DatabaseHandle {
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
             )),
+            CompactionConfigOptions::default(),
         )
     }
 
@@ -426,6 +443,39 @@ impl DatabaseHandle {
             object_id_allocator,
             DbState::Opening,
             commit_drain_wake_pool,
+            CompactionConfigOptions::default(),
+        )
+    }
+
+    pub(crate) fn with_runtime_options(
+        id: u64,
+        name: String,
+        path: String,
+        buffer_pool: Arc<BufferPool>,
+        object_id_allocator: Arc<CatalogObjectIdAllocator>,
+        options: AttachOptions,
+        runtime: DatabaseRuntimeOptions,
+    ) -> Self {
+        let db_type = match options.access_mode {
+            AccessMode::ReadOnly => DatabaseType::ReadOnly,
+            _ => DatabaseType::ReadWrite,
+        };
+        Self::base(
+            DatabaseIdentity::new(
+                id,
+                name,
+                path,
+                db_type,
+                options.recovery_mode,
+                options.visibility,
+                options.is_main_database,
+                options.options,
+            ),
+            buffer_pool,
+            object_id_allocator,
+            DbState::Opening,
+            runtime.commit_drain_wake_pool,
+            runtime.compaction,
         )
     }
 
@@ -452,6 +502,7 @@ impl DatabaseHandle {
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
             )),
+            CompactionConfigOptions::default(),
         )
     }
 
@@ -478,6 +529,7 @@ impl DatabaseHandle {
             Arc::new(CommitDrainWakePool::new(
                 CommitDrainWakePoolOptions::default(),
             )),
+            CompactionConfigOptions::default(),
         )
     }
 
@@ -571,6 +623,12 @@ impl DatabaseHandle {
     /// Get compaction observability snapshot for control-plane diagnostics.
     pub fn compaction_observability(&self) -> Option<CompactionObservability> {
         self.compaction.observability()
+    }
+
+    pub fn enter_foreground_maintenance_guard(
+        &self,
+    ) -> Option<crate::database::compaction_driver::ForegroundMaintenanceGuard> {
+        self.compaction.enter_foreground()
     }
 
     /// Bind the instance task scheduler for background maintenance tasks.

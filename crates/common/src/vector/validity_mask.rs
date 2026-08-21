@@ -461,9 +461,7 @@ impl ValidityMask {
             return Ok(());
         }
 
-        if dst_end > self.capacity {
-            self.try_resize(dst_end)?;
-        }
+        self.try_ensure_capacity(dst_end)?;
 
         if source.all_valid() {
             return self.try_set_range_valid(dst_offset, count);
@@ -495,6 +493,28 @@ impl ValidityMask {
             VectorSelection::Range { offset, .. } => {
                 self.try_copy_range_from(dst_offset, source, *offset, count)
             }
+            VectorSelection::Repeated {
+                index,
+                count: selection_count,
+            } => {
+                if count > *selection_count || (count != 0 && *index >= source.capacity) {
+                    return Err(paro_error::internal(format!(
+                        "ValidityMask repeated selection is out of bounds: index={index}, count={count}, selection_count={selection_count}, source_capacity={}",
+                        source.capacity
+                    )));
+                }
+                let dst_end = dst_offset.checked_add(count).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "ValidityMask repeated selection destination overflow: offset={dst_offset}, count={count}"
+                    ))
+                })?;
+                self.try_ensure_capacity(dst_end)?;
+                if source.all_valid() || source.is_valid(*index) {
+                    self.try_set_range_valid(dst_offset, count)
+                } else {
+                    self.try_set_range_invalid(dst_offset, count)
+                }
+            }
             VectorSelection::Materialized(sel) => {
                 if count > sel.len() {
                     return Err(paro_error::internal(format!(
@@ -507,9 +527,7 @@ impl ValidityMask {
                         "ValidityMask copy selection destination overflow: offset={dst_offset}, count={count}"
                     ))
                 })?;
-                if dst_end > self.capacity {
-                    self.try_resize(dst_end)?;
-                }
+                self.try_ensure_capacity(dst_end)?;
                 if source.all_valid() {
                     return self.try_set_range_valid(dst_offset, count);
                 }
@@ -560,9 +578,7 @@ impl ValidityMask {
             .max()
             .and_then(|idx| idx.checked_add(1))
             .ok_or_else(|| paro_error::internal("ValidityMask scatter destination overflow"))?;
-        if required_capacity > self.capacity {
-            self.try_resize(required_capacity)?;
-        }
+        self.try_ensure_capacity(required_capacity)?;
 
         if source.all_valid() {
             for &dst_idx in dst_positions {
@@ -889,6 +905,19 @@ impl ValidityMask {
 
         self.bits = Some(new_buf);
         self.capacity = new_size;
+        Ok(())
+    }
+
+    /// Ensure that at least `required_capacity` rows remain addressable.
+    ///
+    /// Unlike [`Self::try_resize`], this operation never shrinks the logical
+    /// range. Writers that update a subrange must preserve validity state for
+    /// rows written by earlier, potentially out-of-order operations.
+    #[inline]
+    pub fn try_ensure_capacity(&mut self, required_capacity: usize) -> Result<()> {
+        if required_capacity > self.capacity {
+            self.try_resize(required_capacity)?;
+        }
         Ok(())
     }
 

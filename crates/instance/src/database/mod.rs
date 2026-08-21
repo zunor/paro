@@ -677,7 +677,7 @@ impl Instance {
             metadata: &self.metadata,
             open_ctx: self
                 .runtime
-                .database_open_context(self.boot_config.checkpoint),
+                .database_open_context(self.boot_config.checkpoint, self.boot_config.compaction),
         }
     }
 

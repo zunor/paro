@@ -102,6 +102,21 @@ impl LogicalOperatorVisitor for CommonAggregateOptimizer {
         self.standard_visit_operator(op);
         if let LogicalOperator::Aggregate(aggr) = op {
             self.extract_common_aggregates(aggr);
+            // `standard_visit_operator` necessarily visits this operator
+            // before its own aggregate-output remap exists. Post-reduction
+            // expressions are unusual in that they consume outputs owned by
+            // the same Aggregate, so apply the newly established ordinal map
+            // once more to that local annotation. Parent expressions will be
+            // remapped naturally as traversal unwinds.
+            if let Some(reduction) = aggr.post_reduction.as_mut() {
+                for reducer in &mut reduction.reducers {
+                    self.visit_expression(reducer);
+                }
+                for scalar in &mut reduction.scalar_expressions {
+                    self.visit_expression(scalar);
+                }
+                self.visit_expression(&mut reduction.predicate);
+            }
         }
     }
 
@@ -117,9 +132,15 @@ impl LogicalOperatorVisitor for CommonAggregateOptimizer {
 mod tests {
     use paro_common::types::LogicalType;
     use paro_function::aggregate::distributive::count::get_count_function;
+    use paro_function::aggregate::distributive::minmax::get_max_function;
     use paro_function::scalar::math::get_random_function;
-    use paro_planner::expression::{AggregateExpression, Expression, FunctionExpression};
-    use paro_planner::operator::{Aggregate, LogicalOperator};
+    use paro_planner::expression::{
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
+        FunctionExpression, ReferenceExpression,
+    };
+    use paro_planner::operator::{
+        Aggregate, ColumnBinding, LogicalOperator, PostAggregateReduction,
+    };
     use paro_planner::plan::LogicalPlan;
 
     use super::CommonAggregateOptimizer;
@@ -167,5 +188,99 @@ mod tests {
         CommonAggregateOptimizer::new().extract_common_aggregates(&mut operator);
 
         assert_eq!(operator.aggregates.len(), 2);
+    }
+
+    #[test]
+    fn deduplication_remaps_aggregate_local_post_reduction_ordinals() {
+        let aggregate_index = 2;
+        let reduction_index = 4;
+        let duplicate = count_of(Expression::Constant(
+            paro_planner::expression::ConstantExpression::new(
+                paro_common::runtime_value::Value::Double(1.0),
+                LogicalType::Double,
+            ),
+        ));
+        let (max, _) = get_max_function()
+            .bind(&[LogicalType::BigInt])
+            .expect("bind max(bigint)");
+        let reducer = Expression::Aggregate(AggregateExpression::new(
+            max,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(aggregate_index, 1),
+                LogicalType::BigInt,
+            ))],
+            LogicalType::BigInt,
+        ));
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(aggregate_index, 1),
+                LogicalType::BigInt,
+            )),
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(reduction_index, 0),
+                LogicalType::BigInt,
+            )),
+        ));
+        let aggregate = Aggregate::new(
+            1,
+            aggregate_index,
+            3,
+            LogicalPlan::synthetic(LogicalOperator::DummyScan),
+            vec![Expression::Constant(
+                paro_planner::expression::ConstantExpression::new(
+                    paro_common::runtime_value::Value::Integer(1),
+                    LogicalType::Integer,
+                ),
+            )],
+            vec![],
+            vec![duplicate.clone(), duplicate],
+            vec![],
+        )
+        .with_post_reduction(PostAggregateReduction {
+            reduction_index,
+            reducers: vec![reducer],
+            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::BigInt,
+            ))],
+            predicate,
+        });
+        let mut plan = LogicalPlan::synthetic(LogicalOperator::Aggregate(aggregate));
+
+        CommonAggregateOptimizer::new().optimize(&mut plan);
+
+        let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
+            panic!("expected aggregate root");
+        };
+        assert_eq!(aggregate.aggregates.len(), 1);
+        let reduction = aggregate
+            .post_reduction
+            .as_ref()
+            .expect("post reduction survives deduplication");
+        let Expression::Aggregate(reducer) = &reduction.reducers[0] else {
+            panic!("expected reducer aggregate");
+        };
+        assert!(matches!(
+            reducer.children.as_slice(),
+            [Expression::ColumnRef(column)]
+                if column.binding == ColumnBinding::new(aggregate_index, 0)
+        ));
+        let Expression::Comparison(predicate) = &reduction.predicate else {
+            panic!("expected post predicate comparison");
+        };
+        assert!(matches!(
+            predicate.left.as_ref(),
+            Expression::ColumnRef(column)
+                if column.binding == ColumnBinding::new(aggregate_index, 0)
+        ));
+        assert!(matches!(
+            predicate.right.as_ref(),
+            Expression::ColumnRef(column)
+                if column.binding == ColumnBinding::new(reduction_index, 0)
+        ));
+        aggregate
+            .verify_post_reduction()
+            .expect("remapped post-reduction domains remain valid");
     }
 }

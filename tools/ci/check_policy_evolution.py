@@ -23,6 +23,8 @@ from harness.performance_gate import (  # noqa: E402
     load_policy,
     validate_baseline_for_check,
 )
+from harness.archive.calibration import load_calibration_health  # noqa: E402
+from harness.archive.store import ArchiveStore  # noqa: E402
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -34,6 +36,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Comma-separated platform keys with configured policy-evolution runners.",
     )
     parser.add_argument(
+        "--archive",
+        type=Path,
+        default=Path(os.getenv("PARO_PERF_ARCHIVE_DIR", ".ci/paro-perf-archive")),
+        help="Performance archive containing promotion calibration.",
+    )
+    parser.add_argument(
         "--required-platforms",
         default=os.getenv("PARO_POLICY_EVOLUTION_REQUIRED_PLATFORMS", DEFAULT_REQUIRED_PLATFORMS),
         help="Comma-separated platform keys required before a non-shadow policy can be promoted.",
@@ -43,7 +51,12 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = args.repo_root.resolve()
     available = _csv_set(args.available_platforms)
     required = _csv_set(args.required_platforms)
-    errors = _validate(repo_root=repo_root, available_platforms=available, required_platforms=required)
+    errors = _validate(
+        repo_root=repo_root,
+        available_platforms=available,
+        required_platforms=required,
+        archive_root=args.archive.resolve(),
+    )
     if errors:
         print("policy evolution guard failed:", file=sys.stderr)
         for error in errors:
@@ -53,8 +66,19 @@ def main(argv: list[str] | None = None) -> int:
     return 0
 
 
-def _validate(*, repo_root: Path, available_platforms: set[str], required_platforms: set[str]) -> list[str]:
+def _validate(
+    *,
+    repo_root: Path,
+    available_platforms: set[str],
+    required_platforms: set[str],
+    archive_root: Path | None = None,
+) -> list[str]:
     errors: list[str] = []
+    archive_root = archive_root or repo_root / ".ci" / "paro-perf-archive"
+    archive = ArchiveStore(
+        root=archive_root,
+        cache_root=repo_root / ".ci" / "policy-evolution-archive-cache",
+    )
     policy_dir = repo_root / "benchmark" / "policies"
     for policy_path in sorted(policy_dir.glob("*.toml")):
         try:
@@ -92,6 +116,17 @@ def _validate(*, repo_root: Path, available_platforms: set[str], required_platfo
                 )
             except BaselineError as exc:
                 errors.append(f"{baseline_path}: {exc}")
+            if policy.calibration.source == "archive":
+                health = load_calibration_health(
+                    store=archive,
+                    gate=policy.name,
+                    platform=platform,
+                    policy=policy,
+                )
+                if not health.ok:
+                    errors.append(
+                        f"{policy.name} cannot leave shadow on {platform}: {health.message}"
+                    )
     return errors
 
 

@@ -6,8 +6,8 @@
 
 use std::collections::HashSet;
 
-use super::ColumnBinding;
-use crate::expression::Expression;
+use super::{ColumnBinding, ProjectionMap};
+use crate::expression::{ComparisonType, Expression};
 use crate::plan::LogicalPlan;
 use paro_common::types::LogicalType;
 
@@ -36,6 +36,19 @@ pub enum JoinType {
     RightSemi,
     /// RIGHT ANTI JOIN - rows from right that have NO match in left
     RightAnti,
+}
+
+/// NULL semantics used by a left anti join.
+///
+/// A regular anti join implements `NOT EXISTS`: NULL probe keys simply do not
+/// match. A null-aware anti join implements a scalar `NOT IN`: a NULL anywhere
+/// on the build side rejects every probe row, while NULL probe keys are
+/// rejected whenever the build side is non-empty.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AntiJoinMode {
+    #[default]
+    Regular,
+    NullAware,
 }
 
 impl JoinType {
@@ -91,28 +104,36 @@ impl std::fmt::Display for JoinType {
     }
 }
 
-fn project_types(child_types: &[LogicalType], projection_map: &[usize]) -> Vec<LogicalType> {
-    if projection_map.is_empty() {
-        child_types.to_vec()
-    } else {
-        projection_map
+fn project_types(child_types: &[LogicalType], projection_map: &ProjectionMap) -> Vec<LogicalType> {
+    match projection_map.as_columns() {
+        None => child_types.to_vec(),
+        Some(indices) => indices
             .iter()
             .filter_map(|&idx| child_types.get(idx).cloned())
-            .collect()
+            .collect(),
     }
 }
 
 fn project_bindings(
     child_bindings: &[ColumnBinding],
-    projection_map: &[usize],
+    projection_map: &ProjectionMap,
 ) -> Vec<ColumnBinding> {
-    if projection_map.is_empty() {
-        child_bindings.to_vec()
-    } else {
-        projection_map
+    match projection_map.as_columns() {
+        None => child_bindings.to_vec(),
+        Some(indices) => indices
             .iter()
             .filter_map(|&idx| child_bindings.get(idx).copied())
-            .collect()
+            .collect(),
+    }
+}
+
+fn default_join_projections(join_type: JoinType) -> (ProjectionMap, ProjectionMap) {
+    match join_type {
+        JoinType::Semi | JoinType::Anti | JoinType::Mark => {
+            (ProjectionMap::all(), ProjectionMap::none())
+        }
+        JoinType::RightSemi | JoinType::RightAnti => (ProjectionMap::none(), ProjectionMap::all()),
+        _ => (ProjectionMap::all(), ProjectionMap::all()),
     }
 }
 
@@ -196,6 +217,21 @@ impl JoinComparisonType {
     }
 }
 
+impl From<JoinComparisonType> for ComparisonType {
+    fn from(comparison: JoinComparisonType) -> Self {
+        match comparison {
+            JoinComparisonType::Equal => Self::Equal,
+            JoinComparisonType::NotEqual => Self::NotEqual,
+            JoinComparisonType::LessThan => Self::LessThan,
+            JoinComparisonType::LessThanOrEqual => Self::LessThanOrEqual,
+            JoinComparisonType::GreaterThan => Self::GreaterThan,
+            JoinComparisonType::GreaterThanOrEqual => Self::GreaterThanOrEqual,
+            JoinComparisonType::DistinctFrom => Self::DistinctFrom,
+            JoinComparisonType::NotDistinctFrom => Self::NotDistinctFrom,
+        }
+    }
+}
+
 /// A single join condition comparing expressions from left and right sides.
 #[derive(Debug, Clone)]
 pub struct JoinCondition {
@@ -272,12 +308,36 @@ impl JoinSide {
     }
 }
 
+/// Truth-value contract for a comparison MARK join.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarkJoinSemantics {
+    /// The operator does not expose a marker.
+    NotMark,
+    /// EXISTS-style marker: only TRUE/FALSE are observable.
+    TwoValued,
+    /// IN/ANY-style marker: NULL results from this condition onward contribute
+    /// SQL UNKNOWN; preceding correlation conditions only select RHS rows.
+    ThreeValuedFrom(usize),
+}
+
+impl MarkJoinSemantics {
+    pub fn for_join_type(join_type: JoinType) -> Self {
+        if join_type == JoinType::Mark {
+            Self::ThreeValuedFrom(0)
+        } else {
+            Self::NotMark
+        }
+    }
+}
+
 /// ComparisonJoin represents a join with comparison conditions.
 /// This is the most common type of join (e.g., a.id = b.id).
 #[derive(Debug)]
 pub struct ComparisonJoin {
     /// The type of join (INNER, LEFT, RIGHT, etc.)
     pub join_type: JoinType,
+    /// Three-valued-logic mode for `JoinType::Anti`.
+    pub anti_join_mode: AntiJoinMode,
     /// Left child operator.
     pub left: Box<LogicalPlan>,
     /// Right child operator.
@@ -286,21 +346,16 @@ pub struct ComparisonJoin {
     pub conditions: Vec<JoinCondition>,
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
-    /// First condition whose NULL result contributes UNKNOWN to a MARK join.
-    ///
-    /// Correlated MARK joins evaluate correlation predicates before the actual
-    /// ANY/IN payload comparison. NULL in those correlation predicates means
-    /// the RHS row is not part of this outer row's subquery result, while NULL
-    /// in the payload comparison preserves SQL UNKNOWN semantics.
-    pub mark_null_condition_start: Option<usize>,
+    /// Explicit truth-value semantics for MARK output.
+    pub mark_semantics: MarkJoinSemantics,
     /// Columns that are duplicate-eliminated and pushed into the RHS.
     pub duplicate_eliminated_columns: Vec<Expression>,
     /// Whether the delim join has been flipped to de-duplicating the RHS instead.
     pub delim_flipped: bool,
     /// Columns from left side to output.
-    pub left_projection_map: Vec<usize>,
+    pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
-    pub right_projection_map: Vec<usize>,
+    pub right_projection_map: ProjectionMap,
 }
 
 impl ComparisonJoin {
@@ -318,18 +373,28 @@ impl ComparisonJoin {
         right: LogicalPlan,
         conditions: Vec<JoinCondition>,
     ) -> Self {
+        let (left_projection_map, right_projection_map) = default_join_projections(join_type);
         Self {
             join_type,
+            anti_join_mode: AntiJoinMode::Regular,
             left: Box::new(left),
             right: Box::new(right),
             conditions,
             mark_index: None,
-            mark_null_condition_start: matches!(join_type, JoinType::Mark).then_some(0),
+            mark_semantics: MarkJoinSemantics::for_join_type(join_type),
             duplicate_eliminated_columns: vec![],
             delim_flipped: false,
-            left_projection_map: vec![],
-            right_projection_map: vec![],
+            left_projection_map,
+            right_projection_map,
         }
+    }
+
+    /// Lower a MARK join consumed by `NOT(marker)` to a null-aware anti join.
+    pub fn make_null_aware_anti(&mut self) {
+        self.join_type = JoinType::Anti;
+        self.anti_join_mode = AntiJoinMode::NullAware;
+        self.mark_index = None;
+        self.mark_semantics = MarkJoinSemantics::NotMark;
     }
 
     /// Check if this join has at least one equality condition.
@@ -385,9 +450,9 @@ pub struct AnyJoin {
     /// Table index for MARK join results.
     pub mark_index: Option<usize>,
     /// Columns from left side to output.
-    pub left_projection_map: Vec<usize>,
+    pub left_projection_map: ProjectionMap,
     /// Columns from right side to output.
-    pub right_projection_map: Vec<usize>,
+    pub right_projection_map: ProjectionMap,
 }
 
 impl AnyJoin {
@@ -398,14 +463,15 @@ impl AnyJoin {
         right: LogicalPlan,
         condition: Expression,
     ) -> Self {
+        let (left_projection_map, right_projection_map) = default_join_projections(join_type);
         Self {
             join_type,
             left: Box::new(left),
             right: Box::new(right),
             condition,
             mark_index: None,
-            left_projection_map: vec![],
-            right_projection_map: vec![],
+            left_projection_map,
+            right_projection_map,
         }
     }
 
@@ -737,7 +803,7 @@ mod tests {
             expression_get_plan(20, vec![LogicalType::Varchar]),
             vec![],
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
 
         assert_eq!(
             join.get_types(),
@@ -757,7 +823,7 @@ mod tests {
             expression_get_plan(20, right_types.clone()),
             vec![],
         );
-        right_semi.right_projection_map = vec![1];
+        right_semi.right_projection_map = vec![1].into();
         assert_eq!(right_semi.get_types(), vec![LogicalType::Boolean]);
 
         let right_anti = ComparisonJoin::new(
@@ -780,7 +846,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        join.left_projection_map = vec![1];
+        join.left_projection_map = vec![1].into();
 
         assert_eq!(
             join.get_types(),
@@ -801,7 +867,7 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        right_semi.right_projection_map = vec![1];
+        right_semi.right_projection_map = vec![1].into();
         assert_eq!(right_semi.get_types(), vec![LogicalType::Boolean]);
 
         let right_anti = AnyJoin::new(
@@ -828,8 +894,8 @@ mod tests {
             duplicate_plan_preserving_indices(&right, dup_ctx.shared().as_ref()),
             vec![],
         );
-        comparison.left_projection_map = vec![1];
-        comparison.right_projection_map = vec![0];
+        comparison.left_projection_map = vec![1].into();
+        comparison.right_projection_map = vec![0].into();
 
         let mut any = AnyJoin::new(
             JoinType::Inner,
@@ -840,8 +906,8 @@ mod tests {
                 LogicalType::Boolean,
             )),
         );
-        any.left_projection_map = vec![1];
-        any.right_projection_map = vec![0];
+        any.left_projection_map = vec![1].into();
+        any.right_projection_map = vec![0].into();
 
         assert_eq!(
             comparison.get_types(),

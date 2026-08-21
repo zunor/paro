@@ -864,7 +864,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 storage,
                 self.db.catalog().object_id_allocator().allocate(),
                 0,
-            ),
+            )?,
         )));
         let handle = schema
             .collection(CatalogType::Table)

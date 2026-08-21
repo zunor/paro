@@ -4,26 +4,34 @@
 //! Shared window frame kernel for the breaker runtime.
 
 use std::ops::Range;
+use std::sync::Arc;
 
+use paro_common::allocator::{Allocator, ArenaAllocator};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_common::vector::{Vector, VECTOR_SIZE};
+use paro_function::aggregate::{AggregateCombineType, AggregateInputData};
 use paro_function::window::WindowFunctionType;
 use paro_planner::expression::{
-    Expression, OrderByExpression, WindowExpression, WindowFrameBound, WindowFrameType,
+    AggregateType, Expression, OrderByExpression, WindowExpression, WindowFrameBound,
+    WindowFrameType,
 };
 
 use super::{
     are_peers, value_from_expr, value_is_null_from_expr, value_to_i64, WindowPartition,
     WindowRowKey,
 };
+use crate::operators::aggregate::aggregate_kernel::{
+    destroy_states, finalize_states, initialize_states, update_states, AggregatePayload,
+};
+use crate::operators::aggregate::aggregate_object::AggregateObject;
+use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
 
 /// Materialized frame ranges for every row in one partition.
 ///
-/// Ranges are stored relative to the partition. This keeps the aggregate fast
-/// paths indexable without translation while `absolute_range` provides the
-/// global row-key range used by generic aggregate and value functions.
+/// Ranges are stored relative to the partition.
 pub(super) struct WindowFrameIndex {
     partition: WindowPartition,
     ranges: Vec<Range<usize>>,
@@ -56,17 +64,8 @@ impl WindowFrameIndex {
         Ok(Self { partition, ranges })
     }
 
-    pub(super) fn absolute_range(&self, absolute_idx: usize) -> Range<usize> {
-        let relative = self.relative_range(absolute_idx);
-        (self.partition.start + relative.start)..(self.partition.start + relative.end)
-    }
-
     pub(super) fn relative_range(&self, absolute_idx: usize) -> Range<usize> {
         self.ranges[absolute_idx - self.partition.start].clone()
-    }
-
-    fn relative_ranges(&self) -> &[Range<usize>] {
-        &self.ranges
     }
 }
 
@@ -87,7 +86,7 @@ impl WindowValueIndex {
         partition: WindowPartition,
         expr: &WindowExpression,
     ) -> Result<Self> {
-        let child = expr.children.first().ok_or_else(|| {
+        let child = expr.arguments().first().ok_or_else(|| {
             paro_error::internal("frame value window function requires an argument")
         })?;
         let non_null_rows = if expr.ignore_nulls {
@@ -115,12 +114,16 @@ impl WindowValueIndex {
         current_row: usize,
         expr: &WindowExpression,
     ) -> Result<Value> {
-        let null = || Value::Null(expr.return_type.clone());
-        let row = match expr.function.function_type {
+        let null = || Value::Null(expr.return_type());
+        let function_type = expr
+            .native_invocation()
+            .map(|(function, _)| function.function_type)
+            .ok_or_else(|| paro_error::internal("frame value kernel requires a native window"))?;
+        let row = match function_type {
             WindowFunctionType::FirstValue => self.row_from_head(&frame, 0, expr.ignore_nulls),
             WindowFunctionType::LastValue => self.row_from_tail(&frame, expr.ignore_nulls),
             WindowFunctionType::NthValue => {
-                let Some(offset) = expr.children.get(1) else {
+                let Some(offset) = expr.arguments().get(1) else {
                     return Err(paro_error::internal("NTH_VALUE requires an offset"));
                 };
                 let value = value_from_expr(chunks, &sorted_keys[current_row], offset);
@@ -153,7 +156,7 @@ impl WindowValueIndex {
                 value_from_expr(
                     chunks,
                     &sorted_keys[self.partition.start + row],
-                    &expr.children[0],
+                    &expr.arguments()[0],
                 )
             })
             .unwrap_or_else(null))
@@ -233,18 +236,7 @@ impl WindowValueIndex {
 }
 
 pub(super) fn aggregate_frame_is_partition_constant(expr: &WindowExpression) -> bool {
-    if expr.frame.frame_type != WindowFrameType::Range || !expr.orders.is_empty() {
-        return false;
-    }
-    let starts_at_partition = matches!(
-        (&expr.frame.start_bound, expr.frame.start_is_preceding),
-        (WindowFrameBound::Unbounded, true) | (WindowFrameBound::CurrentRow, _)
-    );
-    let ends_at_partition = matches!(
-        (&expr.frame.end_bound, expr.frame.end_is_preceding),
-        (WindowFrameBound::Unbounded, false) | (WindowFrameBound::CurrentRow, _)
-    );
-    starts_at_partition && ends_at_partition
+    expr.frame.covers_whole_partition(!expr.orders.is_empty())
 }
 
 pub(super) fn aggregate_window_value(
@@ -252,100 +244,169 @@ pub(super) fn aggregate_window_value(
     sorted_keys: &[WindowRowKey],
     frame: Range<usize>,
     expr: &WindowExpression,
+    allocator: Arc<dyn Allocator>,
 ) -> Result<Value> {
-    match aggregate_frame_function(&expr.function.name) {
-        Some(AggregateFrameFunction::Count) => {
-            aggregate_count(chunks, sorted_keys, frame.start, frame.end, expr)
+    let aggregate = expr.aggregate_invocation().ok_or_else(|| {
+        paro_error::internal("aggregate window kernel received a native invocation")
+    })?;
+    if aggregate.aggr_type != AggregateType::NonDistinct || !aggregate.order_bys.is_empty() {
+        return Err(paro_error::not_implemented(
+            "sort-window aggregate kernel supports plain unordered aggregates only",
+        ));
+    }
+
+    // FILTER is evaluated against the sorted window row domain below. The
+    // grouped aggregate object normally stores a payload-column Reference for
+    // that filter, but the sort-window fallback has no aggregate payload
+    // descriptor: a bound Window may still carry a ColumnRef here. Build the
+    // state object from the exact bound kernel while deliberately removing the
+    // already-consumed row-selection modifier.
+    let mut state_aggregate = aggregate.clone();
+    state_aggregate.filter = None;
+    let objects = [AggregateObject::from_bound(&state_aggregate)?];
+    let layout = AggregateStateLayout::new(&objects)?;
+    let word_count = layout.total_size().div_ceil(size_of::<u64>()).max(1);
+    let mut state = vec![0u64; word_count];
+    let state_ptr = state.as_mut_ptr().cast::<u8>();
+    let single_address = pointer_vector(1, state_ptr, allocator.clone())?;
+    initialize_states(&layout, &objects, &single_address, 1)?;
+    let mut arena = ArenaAllocator::new(allocator.clone());
+    let mut input_data =
+        AggregateInputData::new(None, &mut arena, AggregateCombineType::PreserveInput);
+    let aggregate_inputs = [(0..aggregate.children.len()).collect::<Vec<_>>()];
+
+    let result = (|| {
+        let mut address_batch = pointer_vector(VECTOR_SIZE, state_ptr, allocator.clone())?;
+        for batch in frame.clone().step_by(VECTOR_SIZE) {
+            let count = (frame.end - batch).min(VECTOR_SIZE);
+            let batch_keys = &sorted_keys[batch..batch + count];
+            let selected_keys = if let Some(filter) = aggregate.filter.as_deref() {
+                batch_keys
+                    .iter()
+                    .copied()
+                    .filter(|key| {
+                        matches!(value_from_expr(chunks, key, filter), Value::Boolean(true))
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            let input_keys = if aggregate.filter.is_some() {
+                selected_keys.as_slice()
+            } else {
+                batch_keys
+            };
+            if input_keys.is_empty() {
+                continue;
+            }
+            address_batch.try_set_count(input_keys.len())?;
+            let inputs =
+                materialize_aggregate_inputs(chunks, input_keys, aggregate, allocator.clone())?;
+            let payload_chunk = Chunk::try_from_arc_vectors_with_cardinality(
+                inputs.into_iter().map(Arc::new).collect(),
+                input_keys.len(),
+                allocator.clone(),
+            )?;
+            let payload = AggregatePayload {
+                chunk: &payload_chunk,
+                aggregate_inputs: &aggregate_inputs,
+            };
+            update_states(
+                &objects,
+                &mut input_data,
+                &payload,
+                &address_batch,
+                input_keys.len(),
+            )?;
         }
-        Some(AggregateFrameFunction::Sum) => {
-            aggregate_sum(chunks, sorted_keys, frame.start, frame.end, expr)
-        }
-        Some(AggregateFrameFunction::Avg) => {
-            aggregate_avg(chunks, sorted_keys, frame.start, frame.end, expr)
-        }
-        Some(AggregateFrameFunction::Min) => {
-            aggregate_min_max(chunks, sorted_keys, frame.start, frame.end, expr, false)
-        }
-        Some(AggregateFrameFunction::Max) => {
-            aggregate_min_max(chunks, sorted_keys, frame.start, frame.end, expr, true)
-        }
-        None => Err(paro_error::not_implemented(format!(
-            "Aggregate window function '{}' is not supported by the window breaker frame kernel",
-            expr.function.name
-        ))),
+
+        let mut output = Chunk::try_initialize(
+            std::slice::from_ref(&aggregate.return_type),
+            1,
+            allocator.clone(),
+        )?;
+        finalize_states(&objects, &mut input_data, &single_address, &mut output, 1)?;
+        Ok(output
+            .column(0)
+            .expect("aggregate result column")
+            .get_value(0))
+    })();
+
+    let destroy_result = destroy_states(&objects, &mut input_data, &single_address, 1);
+    match (result, destroy_result) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(())) => Ok(value),
     }
 }
 
-pub(super) fn try_aggregate_partition_fast(
+fn pointer_vector(
+    count: usize,
+    state_ptr: *mut u8,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vector> {
+    let mut addresses = Vector::try_new(LogicalType::BigInt, count.max(1), allocator)?;
+    addresses.try_set_count(count)?;
+    // SAFETY: BIGINT is pointer-width on supported targets and the vector owns
+    // capacity for `count` entries. AggregateStateInput reads these bits back
+    // as state addresses without dereferencing the logical BIGINT value.
+    unsafe {
+        let data = addresses.flat_data_mut::<*mut u8>();
+        for row in 0..count {
+            *data.add(row) = state_ptr;
+        }
+    }
+    Ok(addresses)
+}
+
+fn materialize_aggregate_inputs(
     chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    partition: WindowPartition,
-    expr: &WindowExpression,
-    frames: &WindowFrameIndex,
-) -> Result<Option<Vec<Value>>> {
-    if expr.frame.frame_type != WindowFrameType::Rows {
-        return Ok(None);
+    keys: &[WindowRowKey],
+    aggregate: &paro_planner::expression::AggregateExpression,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Vec<Vector>> {
+    let mut inputs = Vec::with_capacity(aggregate.children.len());
+    for child in &aggregate.children {
+        let mut vector =
+            Vector::try_new(child.return_type(), keys.len().max(1), allocator.clone())?;
+        vector.try_set_count(keys.len())?;
+        for (row, key) in keys.iter().enumerate() {
+            match child {
+                Expression::Constant(constant) => vector.set_value(row, &constant.value),
+                Expression::Reference(reference) => {
+                    let source = chunks
+                        .get(key.chunk_idx)
+                        .and_then(|chunk| chunk.column(reference.index))
+                        .ok_or_else(|| {
+                            paro_error::internal(format!(
+                                "aggregate window argument references missing column {}",
+                                reference.index
+                            ))
+                        })?;
+                    vector.try_copy_at(row, source, key.row_idx)?;
+                }
+                Expression::ColumnRef(column) => {
+                    let source = chunks
+                        .get(key.chunk_idx)
+                        .and_then(|chunk| chunk.column(column.binding.column_index))
+                        .ok_or_else(|| {
+                            paro_error::internal(format!(
+                                "aggregate window argument references missing column {}",
+                                column.binding.column_index
+                            ))
+                        })?;
+                    vector.try_copy_at(row, source, key.row_idx)?;
+                }
+                _ => {
+                    return Err(paro_error::internal(
+                        "aggregate window argument was not lowered to a direct value",
+                    ))
+                }
+            }
+        }
+        inputs.push(vector);
     }
-    let Some(function) = aggregate_frame_function(&expr.function.name) else {
-        return Ok(None);
-    };
-    if function != AggregateFrameFunction::Count && expr.children.len() != 1 {
-        return Ok(None);
-    }
-
-    let ranges = frames.relative_ranges();
-
-    match function {
-        AggregateFrameFunction::Count if expr.children.is_empty() => {
-            Ok(Some(fast_count_star(ranges)))
-        }
-        AggregateFrameFunction::Count => {
-            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(Some(fast_count_values(ranges, &values)))
-        }
-        AggregateFrameFunction::Sum => {
-            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(fast_sum_values(ranges, &values, &expr.return_type))
-        }
-        AggregateFrameFunction::Avg => {
-            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(Some(fast_avg_values(ranges, &values, &expr.return_type)))
-        }
-        AggregateFrameFunction::Min | AggregateFrameFunction::Max => {
-            let values = partition_argument_values(chunks, sorted_keys, partition, expr)?;
-            Ok(Some(fast_min_max_values(
-                ranges,
-                &values,
-                &expr.return_type,
-                function == AggregateFrameFunction::Max,
-            )?))
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AggregateFrameFunction {
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
-
-fn aggregate_frame_function(name: &str) -> Option<AggregateFrameFunction> {
-    if name.eq_ignore_ascii_case("count") {
-        Some(AggregateFrameFunction::Count)
-    } else if name.eq_ignore_ascii_case("sum") {
-        Some(AggregateFrameFunction::Sum)
-    } else if name.eq_ignore_ascii_case("avg") {
-        Some(AggregateFrameFunction::Avg)
-    } else if name.eq_ignore_ascii_case("min") {
-        Some(AggregateFrameFunction::Min)
-    } else if name.eq_ignore_ascii_case("max") {
-        Some(AggregateFrameFunction::Max)
-    } else {
-        None
-    }
+    Ok(inputs)
 }
 
 fn frame_range(
@@ -413,229 +474,6 @@ fn frame_range(
     })
 }
 
-fn partition_argument_values(
-    chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    partition: WindowPartition,
-    expr: &WindowExpression,
-) -> Result<Vec<Value>> {
-    let child = expr
-        .children
-        .first()
-        .ok_or_else(|| paro_error::internal("window aggregate requires one argument"))?;
-    Ok(sorted_keys[partition.start..partition.end]
-        .iter()
-        .map(|key| value_from_expr(chunks, key, child))
-        .collect())
-}
-
-fn fast_count_star(ranges: &[Range<usize>]) -> Vec<Value> {
-    ranges
-        .iter()
-        .map(|range| Value::BigInt(range.len() as i64))
-        .collect()
-}
-
-fn fast_count_values(ranges: &[Range<usize>], values: &[Value]) -> Vec<Value> {
-    let mut prefix = Vec::with_capacity(values.len() + 1);
-    prefix.push(0i64);
-    for value in values {
-        let next = prefix.last().copied().unwrap_or(0) + i64::from(!value.is_null());
-        prefix.push(next);
-    }
-    ranges
-        .iter()
-        .map(|range| Value::BigInt(prefix[range.end] - prefix[range.start]))
-        .collect()
-}
-
-fn fast_sum_values(
-    ranges: &[Range<usize>],
-    values: &[Value],
-    return_type: &LogicalType,
-) -> Option<Vec<Value>> {
-    let use_float = matches!(return_type, LogicalType::Float | LogicalType::Double)
-        || values
-            .iter()
-            .any(|value| value_to_f64(value).is_some() && value_to_i64(value).is_none());
-    let mut counts = Vec::with_capacity(values.len() + 1);
-    let mut int_prefix = Vec::with_capacity(values.len() + 1);
-    let mut float_prefix = Vec::with_capacity(values.len() + 1);
-    counts.push(0usize);
-    int_prefix.push(0i128);
-    float_prefix.push(0.0f64);
-    for value in values {
-        let mut count = *counts.last().unwrap_or(&0);
-        let mut int_sum = *int_prefix.last().unwrap_or(&0);
-        let mut float_sum = *float_prefix.last().unwrap_or(&0.0);
-        if let Some(number) = value_to_f64(value) {
-            count += 1;
-            if use_float {
-                float_sum += number;
-            } else if let Some(integer) = value_to_i64(value) {
-                int_sum += integer as i128;
-            } else {
-                return None;
-            }
-        }
-        counts.push(count);
-        int_prefix.push(int_sum);
-        float_prefix.push(float_sum);
-    }
-
-    Some(
-        ranges
-            .iter()
-            .map(|range| {
-                if counts[range.end] == counts[range.start] {
-                    return Value::Null(return_type.clone());
-                }
-                number_value_for_type(
-                    return_type,
-                    int_prefix[range.end] - int_prefix[range.start],
-                    float_prefix[range.end] - float_prefix[range.start],
-                    use_float,
-                )
-            })
-            .collect(),
-    )
-}
-
-fn fast_avg_values(
-    ranges: &[Range<usize>],
-    values: &[Value],
-    return_type: &LogicalType,
-) -> Vec<Value> {
-    let mut counts = Vec::with_capacity(values.len() + 1);
-    let mut sums = Vec::with_capacity(values.len() + 1);
-    counts.push(0usize);
-    sums.push(0.0f64);
-    for value in values {
-        let mut count = *counts.last().unwrap_or(&0);
-        let mut sum = *sums.last().unwrap_or(&0.0);
-        if let Some(number) = value_to_f64(value) {
-            count += 1;
-            sum += number;
-        }
-        counts.push(count);
-        sums.push(sum);
-    }
-    ranges
-        .iter()
-        .map(|range| {
-            let count = counts[range.end] - counts[range.start];
-            if count == 0 {
-                Value::Null(return_type.clone())
-            } else {
-                Value::Double((sums[range.end] - sums[range.start]) / count as f64)
-            }
-        })
-        .collect()
-}
-
-fn fast_min_max_values(
-    ranges: &[Range<usize>],
-    values: &[Value],
-    return_type: &LogicalType,
-    is_max: bool,
-) -> Result<Vec<Value>> {
-    let sparse = MinMaxSparseTable::new(values, is_max)?;
-    ranges
-        .iter()
-        .map(|range| {
-            Ok(sparse
-                .query(values, range.start, range.end)?
-                .map(|idx| values[idx].clone())
-                .unwrap_or_else(|| Value::Null(return_type.clone())))
-        })
-        .collect()
-}
-
-struct MinMaxSparseTable {
-    levels: Vec<Vec<Option<usize>>>,
-    logs: Vec<usize>,
-    is_max: bool,
-}
-
-impl MinMaxSparseTable {
-    fn new(values: &[Value], is_max: bool) -> Result<Self> {
-        let n = values.len();
-        let mut logs = vec![0usize; n + 1];
-        for idx in 2..=n {
-            logs[idx] = logs[idx / 2] + 1;
-        }
-        let mut levels = Vec::new();
-        levels.push(
-            values
-                .iter()
-                .enumerate()
-                .map(|(idx, value)| (!value.is_null()).then_some(idx))
-                .collect::<Vec<_>>(),
-        );
-        let mut width = 1usize;
-        while width.saturating_mul(2) <= n {
-            let prev = levels.last().expect("sparse table has base level");
-            let next_len = n - width * 2 + 1;
-            let mut next = Vec::with_capacity(next_len);
-            for idx in 0..next_len {
-                next.push(better_index(values, prev[idx], prev[idx + width], is_max)?);
-            }
-            levels.push(next);
-            width *= 2;
-        }
-        Ok(Self {
-            levels,
-            logs,
-            is_max,
-        })
-    }
-
-    fn query(&self, values: &[Value], start: usize, end: usize) -> Result<Option<usize>> {
-        if start >= end {
-            return Ok(None);
-        }
-        let len = end - start;
-        let level = self.logs[len];
-        let width = 1usize << level;
-        better_index(
-            values,
-            self.levels[level][start],
-            self.levels[level][end - width],
-            self.is_max,
-        )
-    }
-}
-
-fn better_index(
-    values: &[Value],
-    left: Option<usize>,
-    right: Option<usize>,
-    is_max: bool,
-) -> Result<Option<usize>> {
-    match (left, right) {
-        (None, None) => Ok(None),
-        (Some(idx), None) | (None, Some(idx)) => Ok(Some(idx)),
-        (Some(left), Some(right)) => {
-            let replace = values[right]
-                .partial_cmp(&values[left])
-                .map(|ordering| {
-                    if is_max {
-                        ordering.is_gt()
-                    } else {
-                        ordering.is_lt()
-                    }
-                })
-                .ok_or_else(|| {
-                    paro_error::invalid_input(format!(
-                        "window MIN/MAX values are not comparable: left={:?}, right={:?}",
-                        values[left], values[right]
-                    ))
-                })?;
-            Ok(Some(if replace { right } else { left }))
-        }
-    }
-}
-
 fn frame_offset(chunks: &[Chunk], key: &WindowRowKey, expr: &Expression) -> Result<usize> {
     let value = value_from_expr(chunks, key, expr);
     if value.is_null() {
@@ -680,173 +518,4 @@ fn build_peer_ranges(
         peer_start = peer_end;
     }
     peer_ranges
-}
-
-fn aggregate_count(
-    chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    frame_start: usize,
-    frame_end: usize,
-    expr: &WindowExpression,
-) -> Result<Value> {
-    if expr.children.is_empty() {
-        return Ok(Value::BigInt((frame_end - frame_start) as i64));
-    }
-    let child = &expr.children[0];
-    let mut count = 0i64;
-    for key in &sorted_keys[frame_start..frame_end] {
-        if !value_from_expr(chunks, key, child).is_null() {
-            count += 1;
-        }
-    }
-    Ok(Value::BigInt(count))
-}
-
-fn aggregate_sum(
-    chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    frame_start: usize,
-    frame_end: usize,
-    expr: &WindowExpression,
-) -> Result<Value> {
-    let child = expr
-        .children
-        .first()
-        .ok_or_else(|| paro_error::internal("SUM window aggregate requires one argument"))?;
-    let mut seen = false;
-    let mut int_sum = 0i128;
-    let mut float_sum = 0.0f64;
-    let mut use_float = matches!(expr.return_type, LogicalType::Float | LogicalType::Double);
-    for key in &sorted_keys[frame_start..frame_end] {
-        let value = value_from_expr(chunks, key, child);
-        if value.is_null() {
-            continue;
-        }
-        seen = true;
-        if let Some(number) = value_to_f64(&value) {
-            if use_float {
-                float_sum += number;
-            } else if let Some(integer) = value_to_i64(&value) {
-                int_sum += integer as i128;
-            } else {
-                use_float = true;
-                float_sum += int_sum as f64 + number;
-            }
-        }
-    }
-    if !seen {
-        return Ok(Value::Null(expr.return_type.clone()));
-    }
-    Ok(number_value_for_type(
-        &expr.return_type,
-        int_sum,
-        float_sum,
-        use_float,
-    ))
-}
-
-fn aggregate_avg(
-    chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    frame_start: usize,
-    frame_end: usize,
-    expr: &WindowExpression,
-) -> Result<Value> {
-    let child = expr
-        .children
-        .first()
-        .ok_or_else(|| paro_error::internal("AVG window aggregate requires one argument"))?;
-    let mut sum = 0.0f64;
-    let mut count = 0usize;
-    for key in &sorted_keys[frame_start..frame_end] {
-        let value = value_from_expr(chunks, key, child);
-        if let Some(number) = value_to_f64(&value) {
-            sum += number;
-            count += 1;
-        }
-    }
-    if count == 0 {
-        return Ok(Value::Null(expr.return_type.clone()));
-    }
-    Ok(Value::Double(sum / count as f64))
-}
-
-fn aggregate_min_max(
-    chunks: &[Chunk],
-    sorted_keys: &[WindowRowKey],
-    frame_start: usize,
-    frame_end: usize,
-    expr: &WindowExpression,
-    is_max: bool,
-) -> Result<Value> {
-    let child = expr
-        .children
-        .first()
-        .ok_or_else(|| paro_error::internal("MIN/MAX window aggregate requires one argument"))?;
-    let mut best: Option<Value> = None;
-    for key in &sorted_keys[frame_start..frame_end] {
-        let value = value_from_expr(chunks, key, child);
-        if value.is_null() {
-            continue;
-        }
-        let replace = best
-            .as_ref()
-            .and_then(|best| value.partial_cmp(best))
-            .map(|ordering| {
-                if is_max {
-                    ordering.is_gt()
-                } else {
-                    ordering.is_lt()
-                }
-            })
-            .unwrap_or(true);
-        if replace {
-            best = Some(value);
-        }
-    }
-    Ok(best.unwrap_or_else(|| Value::Null(expr.return_type.clone())))
-}
-
-fn value_to_f64(value: &Value) -> Option<f64> {
-    match value {
-        Value::TinyInt(value) => Some(*value as f64),
-        Value::SmallInt(value) => Some(*value as f64),
-        Value::Integer(value) => Some(*value as f64),
-        Value::BigInt(value) => Some(*value as f64),
-        Value::UTinyInt(value) => Some(*value as f64),
-        Value::USmallInt(value) => Some(*value as f64),
-        Value::UInteger(value) => Some(*value as f64),
-        Value::UBigInt(value) => Some(*value as f64),
-        Value::Float(value) => Some(*value as f64),
-        Value::Double(value) => Some(*value),
-        _ => None,
-    }
-}
-
-fn number_value_for_type(
-    ty: &LogicalType,
-    int_sum: i128,
-    float_sum: f64,
-    use_float: bool,
-) -> Value {
-    if use_float {
-        return match ty {
-            LogicalType::Float => Value::Float(float_sum as f32),
-            LogicalType::Double => Value::Double(float_sum),
-            _ => Value::Double(float_sum),
-        };
-    }
-    match ty {
-        LogicalType::TinyInt => Value::TinyInt(int_sum as i8),
-        LogicalType::SmallInt => Value::SmallInt(int_sum as i16),
-        LogicalType::Integer => Value::Integer(int_sum as i32),
-        LogicalType::BigInt => Value::BigInt(int_sum as i64),
-        LogicalType::UTinyInt => Value::UTinyInt(int_sum as u8),
-        LogicalType::USmallInt => Value::USmallInt(int_sum as u16),
-        LogicalType::UInteger => Value::UInteger(int_sum as u32),
-        LogicalType::UBigInt => Value::UBigInt(int_sum as u64),
-        LogicalType::Float => Value::Float(int_sum as f32),
-        LogicalType::Double => Value::Double(int_sum as f64),
-        _ => Value::BigInt(int_sum as i64),
-    }
 }

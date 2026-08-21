@@ -124,6 +124,49 @@ impl ProfileMorselRange {
     }
 }
 
+/// Stable execution phases that refine an operator call without changing its
+/// row/loop accounting.
+///
+/// Phase timers are intentionally separate from `start_operator` and
+/// `end_operator`: breaker completion often succeeds with zero output rows,
+/// and must remain observable without pretending that it ran another data
+/// loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorProfilePhase {
+    BreakerPrepareFinish,
+    BreakerFinishWork,
+    BreakerFinishTask,
+    BreakerFinishGroup,
+    BreakerFinishWait,
+    BreakerFinish,
+}
+
+impl OperatorProfilePhase {
+    fn name(self) -> &'static str {
+        match self {
+            Self::BreakerPrepareFinish => "breaker_prepare_finish",
+            Self::BreakerFinishWork => "breaker_finish_work",
+            Self::BreakerFinishTask => "breaker_finish_task",
+            Self::BreakerFinishGroup => "breaker_finish_group",
+            Self::BreakerFinishWait => "breaker_finish_wait",
+            Self::BreakerFinish => "breaker_finish",
+        }
+    }
+
+    fn wait_reason(self) -> Option<&'static str> {
+        match self {
+            Self::BreakerFinishWait => Some("parallel_finish"),
+            _ => None,
+        }
+    }
+}
+
+/// Allocation-free phase timer. Disabled profiling does not read the clock.
+#[derive(Debug)]
+pub struct ProfilePhaseTimer {
+    started_at: Option<Instant>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExplainProfileEvent {
     pub query_id: u64,
@@ -278,6 +321,8 @@ impl OperatorProfiler {
             &shared,
             ProfileEventInput {
                 operator_id: node_id,
+                morsel_range: None,
+                inherit_worker_morsel_range: true,
                 phase: "operator",
                 rows: output_rows,
                 bytes: 0,
@@ -302,6 +347,49 @@ impl OperatorProfiler {
         {
             self.active = None;
         }
+    }
+
+    pub fn start_phase(&self) -> ProfilePhaseTimer {
+        ProfilePhaseTimer {
+            started_at: self.shared.as_ref().map(|_| Instant::now()),
+        }
+    }
+
+    /// Complete a successful phase call, including successful zero-row calls.
+    ///
+    /// Phase events never inherit the worker's source morsel. Global breaker
+    /// completion phases therefore remain unattributed, while phase-local work
+    /// such as an individual parallel finish task supplies an explicit range.
+    pub fn end_phase(
+        &mut self,
+        node_id: ExplainNodeId,
+        phase: OperatorProfilePhase,
+        timer: ProfilePhaseTimer,
+        rows: u64,
+        morsel_range: Option<ProfileMorselRange>,
+    ) {
+        let Some(shared) = self.shared.as_ref().cloned() else {
+            return;
+        };
+        let Some(started_at) = timer.started_at else {
+            return;
+        };
+        let ended_at = Instant::now();
+        self.push_event(
+            &shared,
+            ProfileEventInput {
+                operator_id: node_id,
+                morsel_range,
+                inherit_worker_morsel_range: false,
+                phase: phase.name(),
+                rows,
+                bytes: 0,
+                started_at,
+                ended_at,
+                wait_reason: phase.wait_reason(),
+                memory_class: None,
+            },
+        );
     }
 
     pub fn record_runtime(&mut self, node_id: ExplainNodeId, runtime: ExplainRuntimeStats) {
@@ -338,6 +426,8 @@ impl OperatorProfiler {
             &shared,
             ProfileEventInput {
                 operator_id: node_id,
+                morsel_range: None,
+                inherit_worker_morsel_range: true,
                 phase: "wait",
                 rows: 0,
                 bytes: blocker.retained_memory.bytes as u64,
@@ -376,6 +466,8 @@ impl OperatorProfiler {
             &shared,
             ProfileEventInput {
                 operator_id: node_id,
+                morsel_range: None,
+                inherit_worker_morsel_range: true,
                 phase: "wake",
                 rows: 0,
                 bytes: 0,
@@ -409,7 +501,11 @@ impl OperatorProfiler {
             operator_id: input.operator_id,
             thread_id: self.worker.thread_id,
             total_threads: self.worker.total_threads,
-            morsel_range: self.worker.morsel_range,
+            morsel_range: if input.inherit_worker_morsel_range {
+                input.morsel_range.or(self.worker.morsel_range)
+            } else {
+                input.morsel_range
+            },
             phase: input.phase,
             rows: input.rows,
             bytes: input.bytes,
@@ -423,6 +519,8 @@ impl OperatorProfiler {
 
 struct ProfileEventInput {
     operator_id: ExplainNodeId,
+    morsel_range: Option<ProfileMorselRange>,
+    inherit_worker_morsel_range: bool,
     phase: &'static str,
     rows: u64,
     bytes: u64,
@@ -633,5 +731,66 @@ mod tests {
         assert_eq!(snapshot.events[0].wait_reason, Some("output_backpressure"));
         assert_eq!(snapshot.events[0].memory_class, Some("runtime"));
         assert_eq!(snapshot.events[0].bytes, 512);
+    }
+
+    #[test]
+    fn explicit_phase_records_successful_zero_row_work_and_range() {
+        let shared = ExplainProfiler::new();
+        let mut profiler = OperatorProfiler::new_with_context(
+            shared.clone(),
+            ProfileWorkerContext::new(
+                Some(5),
+                Some(50),
+                Some(1),
+                Some(4),
+                Some(ProfileMorselRange::new("rowset", 100, 200)),
+            ),
+        );
+
+        let timer = profiler.start_phase();
+        profiler.end_phase(
+            7,
+            OperatorProfilePhase::BreakerFinishTask,
+            timer,
+            0,
+            Some(ProfileMorselRange::new("finish_task", 3, 4)),
+        );
+        let wait_timer = profiler.start_phase();
+        profiler.end_phase(
+            7,
+            OperatorProfilePhase::BreakerFinishWait,
+            wait_timer,
+            0,
+            None,
+        );
+        profiler.flush();
+
+        let snapshot = shared.snapshot();
+        assert_eq!(snapshot.events.len(), 2);
+        let task = snapshot
+            .events
+            .iter()
+            .find(|event| event.phase == "breaker_finish_task")
+            .expect("finish task phase");
+        assert_eq!(task.rows, 0);
+        assert_eq!(
+            task.morsel_range,
+            Some(ProfileMorselRange::new("finish_task", 3, 4))
+        );
+        let wait = snapshot
+            .events
+            .iter()
+            .find(|event| event.phase == "breaker_finish_wait")
+            .expect("finish wait phase");
+        assert_eq!(wait.wait_reason, Some("parallel_finish"));
+        assert_eq!(wait.morsel_range, None);
+    }
+
+    #[test]
+    fn disabled_phase_timer_does_not_emit_events() {
+        let mut profiler = OperatorProfiler::disabled();
+        let timer = profiler.start_phase();
+        profiler.end_phase(1, OperatorProfilePhase::BreakerFinish, timer, 0, None);
+        profiler.flush();
     }
 }

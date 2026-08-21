@@ -4,6 +4,7 @@
 use super::tablet_reader::TabletReader;
 use crate::codec::vector_decoder;
 use crate::rowset::load_base_rowids_for_offsets;
+use crate::rowset::{BatchRowOrdinal, SegmentRowId};
 use crate::tablet::{ColumnId, PhysicalRowRef, TabletRef};
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
@@ -61,6 +62,7 @@ impl TabletReader {
         Err(paro_error::internal("Column ID not found in schema"))
     }
 
+    #[cfg(test)]
     pub(super) fn build_chunk(
         &self,
         batch: &[(ColumnId, crate::rowset::column::ColumnBatch)],
@@ -69,32 +71,92 @@ impl TabletReader {
         rowset_id: u64,
         segment_id: u32,
     ) -> Result<Chunk> {
+        self.build_chunk_with_owned_selection(
+            batch,
+            rows,
+            rows,
+            None,
+            SegmentRowId::from_raw_slice(rowids),
+            rowset_id,
+            segment_id,
+        )
+    }
+
+    pub(super) fn build_chunk_with_owned_selection(
+        &self,
+        batch: &[(ColumnId, crate::rowset::column::ColumnBatch)],
+        rows: usize,
+        physical_rows: usize,
+        selection: Option<Vec<BatchRowOrdinal>>,
+        rowids: &[SegmentRowId],
+        rowset_id: u64,
+        segment_id: u32,
+    ) -> Result<Chunk> {
         if rows == 0 {
             return Chunk::try_new(self.allocator.clone());
         }
-
-        let mut read_vectors: Vec<Arc<Vector>> = Vec::with_capacity(self.projection.len());
+        if selection
+            .as_ref()
+            .is_some_and(|selection| selection.len() != rows)
+        {
+            return Err(paro_error::data_corrupted(
+                "Column batch selection length does not match logical rows",
+            ));
+        }
+        let mut stored_reads = vec![false; self.projection.len()];
+        for (&read_idx, projection) in self.output_to_read.iter().zip(&self.value_projections) {
+            if matches!(
+                projection,
+                super::tablet_reader::ColumnValueProjection::Stored
+            ) {
+                stored_reads[read_idx] = true;
+            }
+        }
+        let mut read_vectors: Vec<Option<Arc<Vector>>> = Vec::with_capacity(self.projection.len());
+        let mut raw_batches = Vec::with_capacity(self.projection.len());
         let allocator = self.allocator.clone();
+        let decoder_selection = selection
+            .map(|selection| {
+                vector_decoder::ColumnBatchSelection::try_new(
+                    selection,
+                    physical_rows,
+                    allocator.clone(),
+                )
+            })
+            .transpose()?;
         let mut batch_hint = 0usize;
 
         for (idx, col_id) in self.projection.iter().enumerate() {
             let ty = &self.read_types[idx];
             if let Some(col_batch) = find_column_batch(batch, *col_id, &mut batch_hint) {
+                raw_batches.push(Some(col_batch));
+                if !stored_reads[idx] {
+                    read_vectors.push(None);
+                    continue;
+                }
                 let storage_provenance = col_batch.storage_dictionary.as_ref().map(|_| {
                     vector_decoder::storage_dictionary_provenance_id(rowset_id, segment_id, *col_id)
                 });
-                read_vectors.push(Arc::new(vector_decoder::decode_column_batch(
-                    ty,
-                    col_batch,
-                    rows,
-                    allocator.clone(),
-                    storage_provenance,
-                )?));
+                read_vectors.push(Some(Arc::new(
+                    vector_decoder::decode_column_batch_with_projection(
+                        ty,
+                        col_batch,
+                        physical_rows,
+                        decoder_selection.as_ref(),
+                        rows,
+                        vector_decoder::ColumnValueProjection::Stored,
+                        allocator.clone(),
+                        storage_provenance,
+                        &self.storage_dictionary_cache,
+                        u64::from(*col_id),
+                    )?,
+                )));
                 continue;
             }
+            raw_batches.push(None);
 
-            if let Some(vector) = self.schema_fill_vector(rowset_id, idx, rows)? {
-                read_vectors.push(vector);
+            if let Some(vector) = self.schema_fill_vector(rowset_id, idx, physical_rows)? {
+                read_vectors.push(Some(vector));
                 continue;
             }
 
@@ -103,22 +165,88 @@ impl TabletReader {
                 let resolved_vector = resolved.column(0).ok_or_else(|| {
                     paro_error::internal("resolved partial row scan chunk missing requested column")
                 })?;
-                read_vectors.push(resolved_vector.clone());
+                read_vectors.push(Some(resolved_vector.clone()));
             } else {
-                read_vectors.push(Arc::new(Vector::try_constant_null(
+                read_vectors.push(Some(Arc::new(Vector::try_constant_null(
                     ty.clone(),
-                    rows,
+                    physical_rows,
                     allocator.clone(),
-                )?));
+                )?)));
+            }
+        }
+
+        if let Some(selection) = &decoder_selection {
+            for (read_idx, vector) in read_vectors.iter_mut().enumerate() {
+                let Some(vector) = vector else {
+                    continue;
+                };
+                // Raw stored batches were decoded directly into the logical
+                // row domain above. Only synthesized schema/base-row vectors
+                // still need the shared selection applied here.
+                if raw_batches[read_idx].is_some() {
+                    continue;
+                }
+                if vector.len() == physical_rows {
+                    *vector = Arc::new(Vector::try_dictionary_from_validated(
+                        vector.clone(),
+                        selection.validated_vector().clone(),
+                    )?);
+                } else if vector.len() != rows {
+                    return Err(paro_error::data_corrupted(format!(
+                        "Selected column vector has {} rows, expected {rows} logical or {physical_rows} physical rows",
+                        vector.len(),
+                    )));
+                }
             }
         }
 
         let mut output_vectors = Vec::with_capacity(self.output_to_read.len());
-        for &read_idx in &self.output_to_read {
-            let vector = read_vectors
-                .get(read_idx)
-                .ok_or_else(|| paro_error::internal("Output mapping out of range"))?
-                .clone();
+        for (&read_idx, projection) in self.output_to_read.iter().zip(&self.value_projections) {
+            let vector = match projection {
+                super::tablet_reader::ColumnValueProjection::Stored => read_vectors
+                    .get(read_idx)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| paro_error::internal("Stored output mapping is unavailable"))?
+                    .clone(),
+                super::tablet_reader::ColumnValueProjection::MatchedUtf8Prefix { byte_width } => {
+                    if let Some(batch) = raw_batches.get(read_idx).copied().flatten() {
+                        let storage_provenance = batch.storage_dictionary.as_ref().map(|_| {
+                            vector_decoder::storage_dictionary_provenance_id(
+                                rowset_id,
+                                segment_id,
+                                self.projection[read_idx],
+                            )
+                        });
+                        Arc::new(vector_decoder::decode_column_batch_with_projection(
+                            &self.read_types[read_idx],
+                            batch,
+                            physical_rows,
+                            decoder_selection.as_ref(),
+                            rows,
+                            vector_decoder::ColumnValueProjection::MatchedUtf8Prefix {
+                                byte_width: *byte_width,
+                            },
+                            allocator.clone(),
+                            storage_provenance,
+                            &self.storage_dictionary_cache,
+                            u64::from(self.projection[read_idx]),
+                        )?)
+                    } else {
+                        let vector = read_vectors
+                            .get(read_idx)
+                            .and_then(Option::as_ref)
+                            .ok_or_else(|| {
+                                paro_error::internal("Matched-prefix source mapping is unavailable")
+                            })?;
+                        Arc::new(vector_decoder::project_matched_utf8_prefix_vector(
+                            vector,
+                            rows,
+                            *byte_width,
+                            allocator.clone(),
+                        )?)
+                    }
+                }
+            };
             output_vectors.push(vector);
         }
 
@@ -140,17 +268,14 @@ impl TabletReader {
             )?));
         }
 
-        Ok(Chunk::from_arc_vectors(
-            output_vectors,
-            self.allocator.clone(),
-        ))
+        Chunk::try_from_arc_vectors_with_cardinality(output_vectors, rows, self.allocator.clone())
     }
 
     fn load_base_rowids(
         &self,
         rowset_id: u64,
         segment_id: u32,
-        rowids: &[u32],
+        rowids: &[SegmentRowId],
     ) -> Result<Option<Vec<u64>>> {
         let rowset = self
             .rowsets
@@ -164,22 +289,23 @@ impl TabletReader {
                     rowset_id
                 ))
             })?;
-        Ok(
-            load_base_rowids_for_offsets(rowset.rowset_path(), segment_id, rowids)?.map(
-                |base_rowids| {
-                    base_rowids
-                        .into_iter()
-                        .map(|rowid| rowid.to_raw())
-                        .collect()
-                },
-            ),
-        )
+        Ok(load_base_rowids_for_offsets(
+            rowset.rowset_path(),
+            segment_id,
+            SegmentRowId::as_raw_slice(rowids),
+        )?
+        .map(|base_rowids| {
+            base_rowids
+                .into_iter()
+                .map(|rowid| rowid.to_raw())
+                .collect()
+        }))
     }
 
     fn build_row_id_vector(
         tablet: &TabletRef,
         rows: usize,
-        rowids: &[u32],
+        rowids: &[SegmentRowId],
         rowset_id: u64,
         segment_id: u32,
         allocator: Arc<dyn Allocator>,

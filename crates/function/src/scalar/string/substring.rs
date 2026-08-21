@@ -7,12 +7,14 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
+use crate::scalar::function_data_fingerprint;
 use crate::{
     scalar::executor::varlen::VarcharResultWriter, BoundScalarFunction, ExpressionState,
     FunctionData, FunctionErrorMode, ScalarBindInput, ScalarFunction, ScalarFunctionSet,
+    ScalarPredicateProjection,
 };
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct SubstringBindData {
     start: Option<i64>,
     length: Option<i64>,
@@ -30,12 +32,16 @@ impl FunctionData for SubstringBindData {
             .is_some_and(|other| other == self)
     }
 
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct CountBindData {
     count: i64,
 }
@@ -50,6 +56,10 @@ impl FunctionData for CountBindData {
             .as_any()
             .downcast_ref::<Self>()
             .is_some_and(|other| other == self)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -68,6 +78,11 @@ fn bind_substring_2(
             start: Some(start),
             length: None,
         });
+        bound = bound.with_predicate_projection(ScalarPredicateProjection::Utf8Substring {
+            source_argument: 0,
+            start,
+            length: None,
+        });
     }
     Ok(bound)
 }
@@ -82,6 +97,13 @@ fn bind_substring_3(
     let length = input.constant_value(2).and_then(Value::as_i64);
     if start.is_some() || length.is_some() {
         bound = bound.with_bind_data(SubstringBindData { start, length });
+    }
+    if let (Some(start), Some(length)) = (start, length) {
+        bound = bound.with_predicate_projection(ScalarPredicateProjection::Utf8Substring {
+            source_argument: 0,
+            start,
+            length: Some(length),
+        });
     }
     Ok(bound)
 }
@@ -110,43 +132,68 @@ fn count_bind_data(state: &dyn ExpressionState) -> Option<&CountBindData> {
         .and_then(|data| data.as_any().downcast_ref::<CountBindData>())
 }
 
-/// Extract substring using Unicode codepoints.
-/// start is 1-indexed (SQL standard).
-/// Negative start counts from end.
-fn substring_unicode(s: &str, start: i64, length: Option<i64>) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let char_count = chars.len() as i64;
-
-    if char_count == 0 {
-        return String::new();
+/// Extract a borrowed UTF-8 substring using SQL's codepoint positions.
+///
+/// A substring is always contiguous in the source, so materializing `Vec<char>`
+/// and a second `String` only adds per-row allocations. ASCII values use direct
+/// byte offsets; non-ASCII values scan only to the requested boundaries.
+fn substring_unicode(s: &str, start: i64, length: Option<i64>) -> &str {
+    if s.is_empty() {
+        return s;
     }
 
-    // Handle start position (1-indexed)
-    let start_idx = if start > 0 {
-        (start - 1).min(char_count) as usize
-    } else if start < 0 {
-        // Negative: count from end
-        (char_count + start).max(0) as usize
+    let character_count = if start < 0 {
+        Some(if s.is_ascii() {
+            s.len()
+        } else {
+            s.chars().count()
+        })
     } else {
-        // start = 0: special case, treat as 1 but reduce length by 1
+        None
+    };
+    let start_index = if start > 0 {
+        usize::try_from(start - 1).unwrap_or(usize::MAX)
+    } else if start < 0 {
+        character_count
+            .expect("negative substring start computes the character count")
+            .saturating_sub(start.unsigned_abs().min(usize::MAX as u64) as usize)
+    } else {
         0
     };
-
-    // Handle length
-    let end_idx = match length {
-        Some(len) if len <= 0 => start_idx, // Zero or negative length = empty
-        Some(len) => {
-            let adjusted_len = if start == 0 { len - 1 } else { len };
-            (start_idx as i64 + adjusted_len).min(char_count) as usize
+    let requested_length = match length {
+        Some(value) if value <= 0 => 0,
+        Some(value) => {
+            let value = usize::try_from(value).unwrap_or(usize::MAX);
+            if start == 0 {
+                value.saturating_sub(1)
+            } else {
+                value
+            }
         }
-        None => char_count as usize, // No length = to end
+        None => usize::MAX,
     };
-
-    if start_idx >= end_idx {
-        return String::new();
+    if requested_length == 0 {
+        return &s[0..0];
     }
 
-    chars[start_idx..end_idx].iter().collect()
+    let start_byte = codepoint_offset(s, start_index);
+    let end_byte = if requested_length == usize::MAX {
+        s.len()
+    } else {
+        codepoint_offset(s, start_index.saturating_add(requested_length))
+    };
+    &s[start_byte..end_byte]
+}
+
+#[inline]
+fn codepoint_offset(value: &str, index: usize) -> usize {
+    if value.is_ascii() {
+        return index.min(value.len());
+    }
+    value
+        .char_indices()
+        .nth(index)
+        .map_or(value.len(), |(offset, _)| offset)
 }
 
 /// Implementation of `substring(VARCHAR, BIGINT) -> VARCHAR`.
@@ -162,10 +209,10 @@ fn substring_2_varchar(
     let start_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing start column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let start_view = start_vec.try_to_view(count)?;
     let bound_start = substring_bind_data(state).and_then(|data| data.start);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !start_view.is_valid(row) {
@@ -173,8 +220,9 @@ fn substring_2_varchar(
             continue;
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
-        let sub = substring_unicode(str_view.get_inline_string(row).as_str(), start, None);
-        writer.write_str(row, &sub)?;
+        let value = str_view.str(row);
+        let sub = substring_unicode(value, start, None);
+        writer.write_str(row, sub)?;
     }
 
     Ok(())
@@ -196,13 +244,13 @@ fn substring_3_varchar(
     let len_vec = input
         .column(2)
         .ok_or_else(|| paro_common::error::internal("Missing length column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let start_view = start_vec.try_to_view(count)?;
     let len_view = len_vec.try_to_view(count)?;
     let bind_data = substring_bind_data(state);
     let bound_start = bind_data.and_then(|data| data.start);
     let bound_length = bind_data.and_then(|data| data.length);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !start_view.is_valid(row) || !len_view.is_valid(row) {
@@ -211,12 +259,9 @@ fn substring_3_varchar(
         }
         let start = bound_start.unwrap_or_else(|| start_view.get_i64(row));
         let length = bound_length.unwrap_or_else(|| len_view.get_i64(row));
-        let sub = substring_unicode(
-            str_view.get_inline_string(row).as_str(),
-            start,
-            Some(length),
-        );
-        writer.write_str(row, &sub)?;
+        let value = str_view.str(row);
+        let sub = substring_unicode(value, start, Some(length));
+        writer.write_str(row, sub)?;
     }
 
     Ok(())
@@ -231,18 +276,17 @@ fn left_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector)
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !n_view.is_valid(row) {
             writer.set_null(row);
             continue;
         }
-        let value_inline = str_view.get_inline_string(row);
-        let value = value_inline.as_str();
+        let value = str_view.str(row);
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
         let sub = if n >= 0 {
             value.chars().take(n as usize).collect::<String>()
@@ -266,18 +310,17 @@ fn right_varchar(input: &Chunk, state: &dyn ExpressionState, result: &mut Vector
     let n_vec = input
         .column(1)
         .ok_or_else(|| paro_common::error::internal("Missing n column".to_string()))?;
-    let str_view = str_vec.try_to_varlen_view(count)?;
+    let str_view = str_vec.try_to_utf8_view(count)?;
     let n_view = n_vec.try_to_view(count)?;
     let bound_count = count_bind_data(state).map(|data| data.count);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !str_view.is_valid(row) || !n_view.is_valid(row) {
             writer.set_null(row);
             continue;
         }
-        let value_inline = str_view.get_inline_string(row);
-        let value = value_inline.as_str();
+        let value = str_view.str(row);
         let n = bound_count.unwrap_or_else(|| n_view.get_i64(row));
 
         let chars: Vec<char> = value.chars().collect();

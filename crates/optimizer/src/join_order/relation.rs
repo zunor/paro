@@ -61,22 +61,22 @@ impl JoinRelationSet {
         self.relations.binary_search(&relation).is_ok()
     }
 
-    /// Check if `sub` is a subset of `super_set`.
+    /// Check whether this set contains every relation in `subset`.
     ///
     /// Both sets must be sorted for this to work correctly.
-    pub fn is_subset(super_set: &JoinRelationSet, sub: &JoinRelationSet) -> bool {
-        if sub.count() == 0 {
+    pub fn contains_all(&self, subset: &JoinRelationSet) -> bool {
+        if subset.count() == 0 {
             return true;
         }
-        if sub.count() > super_set.count() {
+        if subset.count() > self.count() {
             return false;
         }
 
         let mut j = 0;
-        for i in 0..super_set.count() {
-            if sub.relations[j] == super_set.relations[i] {
+        for i in 0..self.count() {
+            if subset.relations[j] == self.relations[i] {
                 j += 1;
-                if j == sub.count() {
+                if j == subset.count() {
                     return true;
                 }
             }
@@ -354,18 +354,18 @@ mod tests {
     }
 
     #[test]
-    fn test_is_subset() {
+    fn test_contains_all() {
         let super_set = JoinRelationSet::new(vec![1, 2, 3, 4, 5]);
         let sub1 = JoinRelationSet::new(vec![2, 4]);
         let sub2 = JoinRelationSet::new(vec![1, 3, 5]);
         let not_sub = JoinRelationSet::new(vec![2, 6]);
         let empty = JoinRelationSet::empty();
 
-        assert!(JoinRelationSet::is_subset(&super_set, &sub1));
-        assert!(JoinRelationSet::is_subset(&super_set, &sub2));
-        assert!(!JoinRelationSet::is_subset(&super_set, &not_sub));
-        assert!(JoinRelationSet::is_subset(&super_set, &empty));
-        assert!(JoinRelationSet::is_subset(&super_set, &super_set));
+        assert!(super_set.contains_all(&sub1));
+        assert!(super_set.contains_all(&sub2));
+        assert!(!super_set.contains_all(&not_sub));
+        assert!(super_set.contains_all(&empty));
+        assert!(super_set.contains_all(&super_set));
     }
 
     #[test]

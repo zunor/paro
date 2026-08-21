@@ -149,7 +149,10 @@ mod tests {
             names: vec!["id".to_string(), "name".to_string()],
             relation_name: None,
             relation_alias: None,
-            column_ids: vec![0, 1],
+            column_sources: vec![
+                paro_planner::operator::GetColumnSource::Stored { column_id: 0 },
+                paro_planner::operator::GetColumnSource::Stored { column_id: 1 },
+            ],
             column_types: vec![LogicalType::Integer, LogicalType::Varchar],
             table: None,
             scan_order: None,
@@ -177,7 +180,7 @@ mod tests {
                     return_type: LogicalType::Integer,
                 }),
             ],
-            output_names: vec!["id".to_string(), "name".to_string()],
+            visible_names: vec!["id".to_string(), "name".to_string()],
             returned_types: vec![LogicalType::Integer, LogicalType::Varchar],
             child: Box::new(LogicalPlan::synthetic(child)),
         })

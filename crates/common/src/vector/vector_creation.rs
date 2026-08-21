@@ -2,13 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    DictionaryInfo, DictionarySource, SelectionVector, StringHeap, ValidityMask, Vector,
-    VectorBuffer, VectorSelection, VectorType,
+    DictionaryInfo, DictionarySource, SelectionVector, StringHeap, ValidatedVectorSelection,
+    ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
 };
 use crate::allocator::Allocator;
-use crate::error::Result;
+use crate::error::{self as paro_error, Result};
 use crate::runtime_value::Value;
-use crate::types::{InlineString, LogicalType};
+use crate::types::{LogicalType, StringView};
 use std::sync::Arc;
 
 impl Vector {
@@ -136,24 +136,21 @@ impl Vector {
         // Create heap for string storage
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
-        let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
-            values.len(),
-            allocator,
-        )?;
+        let buffer = VectorBuffer::try_with_allocator(StringView::SIZE, values.len(), allocator)?;
 
-        // SAFETY: We allocated space for InlineString array
+        // SAFETY: We allocated space for StringView array
         unsafe {
-            let entries = buffer.data() as *mut InlineString;
+            let entries = buffer.data() as *mut StringView;
             for (i, s) in values.iter().enumerate() {
                 match s {
                     Some(str_val) => {
                         // try_add_string handles both short (inlined) and long (heap) strings.
+                        // SAFETY: `heap` is stored in the vector with this entry.
                         *entries.add(i) = heap.try_add_string(str_val)?;
                     }
                     None => {
                         vec.validity.set_null(i);
-                        *entries.add(i) = InlineString::empty();
+                        *entries.add(i) = StringView::empty();
                     }
                 }
             }
@@ -176,17 +173,14 @@ impl Vector {
         // Create heap for string storage
         let mut heap = StringHeap::with_allocator(4096, allocator.clone());
 
-        let buffer = VectorBuffer::try_with_allocator(
-            std::mem::size_of::<InlineString>(),
-            values.len(),
-            allocator,
-        )?;
+        let buffer = VectorBuffer::try_with_allocator(StringView::SIZE, values.len(), allocator)?;
 
-        // SAFETY: We allocated space for InlineString array
+        // SAFETY: We allocated space for StringView array
         unsafe {
-            let entries = buffer.data() as *mut InlineString;
+            let entries = buffer.data() as *mut StringView;
             for (i, s) in values.iter().enumerate() {
                 // try_add_string handles both short (inlined) and long (heap) strings.
+                // SAFETY: `heap` is stored in the vector with this entry.
                 *entries.add(i) = heap.try_add_string(s)?;
             }
         }
@@ -222,6 +216,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -253,6 +248,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -275,6 +271,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
         vec.validity.set_null(0);
         Ok(vec)
@@ -308,6 +305,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -315,7 +313,11 @@ impl Vector {
         child: Arc<Vector>,
         selection: VectorSelection,
         dictionary_info: DictionaryInfo,
+        selection_is_validated: bool,
     ) -> Result<Self> {
+        if !selection_is_validated {
+            selection.validate_child_bounds(child.len())?;
+        }
         let (base_child, combined_selection) = if child.vector_type == VectorType::Dictionary {
             let base_child = child
                 .child
@@ -342,6 +344,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: Some(dictionary_info),
+            lifetime_owners: None,
         })
     }
 
@@ -367,6 +370,40 @@ impl Vector {
                 provenance_id: None,
                 source: DictionarySource::GenericSelection,
             },
+            false,
+        )
+    }
+
+    /// Create a generic dictionary overlay from a reusable bounds proof.
+    pub fn try_dictionary_from_validated(
+        child: Arc<Vector>,
+        selection: ValidatedVectorSelection,
+    ) -> Result<Self> {
+        if selection.child_count != child.len() {
+            return Err(paro_error::invalid_input(format!(
+                "validated dictionary selection targets {} rows, child has {}",
+                selection.child_count,
+                child.len()
+            )));
+        }
+        let unique_len = if child.vector_type == VectorType::Dictionary {
+            child
+                .child
+                .as_ref()
+                .expect("Dictionary vector missing child")
+                .len()
+        } else {
+            child.len()
+        };
+        Self::try_dictionary_with_info(
+            child,
+            selection.selection,
+            DictionaryInfo {
+                unique_len,
+                provenance_id: None,
+                source: DictionarySource::GenericSelection,
+            },
+            true,
         )
     }
 
@@ -383,7 +420,24 @@ impl Vector {
             child,
             VectorSelection::Materialized(selection.into()),
             dictionary_info,
+            false,
         )
+    }
+
+    /// Create a dictionary vector with provenance from a reusable bounds proof.
+    pub fn try_with_validated_dictionary(
+        child: Arc<Vector>,
+        selection: ValidatedVectorSelection,
+        dictionary_info: DictionaryInfo,
+    ) -> Result<Self> {
+        if selection.child_count != child.len() {
+            return Err(paro_error::invalid_input(format!(
+                "validated dictionary selection targets {} rows, child has {}",
+                selection.child_count,
+                child.len()
+            )));
+        }
+        Self::try_dictionary_with_info(child, selection.selection, dictionary_info, true)
     }
 
     /// Create a dictionary vector from a first-class selection representation.
@@ -408,12 +462,27 @@ impl Vector {
                 provenance_id: None,
                 source: DictionarySource::GenericSelection,
             },
+            false,
         )
+    }
+
+    /// Create a zero-copy broadcast view of one child row.
+    ///
+    /// The repeated mapping is represented symbolically, so broadcasting a
+    /// scalar out of a vector does not allocate a selection buffer or box the
+    /// value through [`crate::runtime_value::Value`].
+    pub fn try_broadcast_ref(child: Arc<Vector>, index: usize, count: usize) -> Result<Self> {
+        Self::try_gather_ref(child, VectorSelection::repeated(index, count))
     }
 
     /// Create a zero-copy range view over this vector.
     pub fn slice_ref(&self, offset: usize, len: usize) -> Result<Self> {
-        debug_assert!(offset + len <= self.len(), "vector range out of bounds");
+        if offset.checked_add(len).is_none_or(|end| end > self.len()) {
+            return Err(paro_error::out_of_range(format!(
+                "vector range offset={offset} length={len} exceeds cardinality {}",
+                self.len()
+            )));
+        }
         match self.vector_type {
             VectorType::Constant => {
                 let mut result = self.reference();
@@ -430,6 +499,7 @@ impl Vector {
                     Arc::new(self.reference()),
                     VectorSelection::Range { offset, count: len },
                     dictionary_info,
+                    true,
                 )
             }
         }
@@ -455,6 +525,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         };
         // Set child count to match array_size * count
         if let Some(child_arc) = &mut vec.child {
@@ -497,6 +568,7 @@ impl Vector {
             children: Vec::new(),
             string_heap: None,
             dictionary_info: None,
+            lifetime_owners: None,
         })
     }
 
@@ -566,9 +638,18 @@ impl Vector {
                 Ok(vec)
             }
             Value::Array(_, _, _) | Value::List(_, _) | Value::Struct(_, _) => {
-                // For Array, List, and Struct, we use reference_value to set up child vectors
+                // Nested constants use the same canonical flat representation as
+                // ordinary vectors. Only the outer row is constant; its child
+                // payload remains a one-row materialization that copy/gather can
+                // consume through the regular nested-vector paths.
                 let mut vec = Self::try_new(logical_type, 1, allocator)?;
-                vec.reference_value(&value);
+                vec.set_value(0, &value);
+                // Establish the single physical row before exposing an arbitrary
+                // logical constant cardinality. Array and struct children follow
+                // physical cardinality, while list children keep their payload
+                // length; try_set_count encodes those invariants centrally.
+                vec.try_set_count(1)?;
+                vec.vector_type = VectorType::Constant;
                 vec.count = count;
                 Ok(vec)
             }

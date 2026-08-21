@@ -12,7 +12,6 @@ use paro_function::scalar::FunctionExecContext;
 use paro_planner::expression::Expression;
 
 use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
-use crate::physical::properties::RequiredProperties;
 use crate::runtime::breaker::{DelimHandle, HandleRef};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -24,7 +23,6 @@ pub struct DelimCaptureSinkExec {
     pub handle: HandleRef<DelimHandle>,
     pub duplicate_keys: Box<[Expression]>,
     pub cached_outer: Option<HandleRef<DelimHandle>>,
-    pub required: RequiredProperties,
 }
 
 pub fn delim_key_types(expressions: &[Expression]) -> Vec<LogicalType> {

@@ -46,7 +46,7 @@ pub use paro_transaction::{
 };
 pub use query_resources::{
     ConnectionInfoProvider, ConnectionInfoSnapshot, GraphIndexProvider, GraphRegistry,
-    QueryResourceGovernance, QueryResources, SharedPlanCacheHandle,
+    QueryResourceGovernance, QueryResources,
 };
 pub use runtime_limits::RuntimeLimits;
 pub use session_metadata::{

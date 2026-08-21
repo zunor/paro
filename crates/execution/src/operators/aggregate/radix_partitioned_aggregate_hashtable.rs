@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -16,7 +17,9 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 
 use super::aggregate_object::AggregateObject;
-use super::grouped_aggregate_hashtable::{GroupedAggregateHashTable, HTScanPosition};
+use super::grouped_aggregate_hashtable::{
+    GroupedAggregateHashTable, HTScanPosition, HashTableCapacityHint, SerializedSourceRows,
+};
 
 const MAX_RADIX_PARTITION_BITS: usize = 8;
 
@@ -38,7 +41,182 @@ pub enum AggregateHashTable {
     Radix(RadixPartitionedAggregateHashTable),
 }
 
+/// Concurrent ownership target for independently processed radix partitions.
+///
+/// DISTINCT finalization routes source keys by their output-group hash. Each
+/// task therefore owns one complete output partition and can install its flat
+/// table directly instead of re-routing and copying every row through another
+/// radix table. Ordinary aggregate merge also uses this container to hand a
+/// populated target partition to exactly one task. The coordinator calls
+/// [`Self::finish`] after all installations.
+#[derive(Debug)]
+pub(crate) struct ConcurrentRadixAggregateBuild {
+    group_types: Vec<LogicalType>,
+    scan_output_types: Vec<LogicalType>,
+    partition_bits: usize,
+    partitions: Box<[Mutex<Option<GroupedAggregateHashTable>>]>,
+}
+
+impl ConcurrentRadixAggregateBuild {
+    pub(crate) fn try_new(table: AggregateHashTable) -> Result<Self> {
+        let AggregateHashTable::Radix(table) = table else {
+            return Err(paro_error::internal(
+                "concurrent aggregate merge requires a radix table",
+            ));
+        };
+        let RadixPartitionedAggregateHashTable {
+            group_types,
+            partition_bits,
+            partitions,
+            ..
+        } = table;
+        validate_radix_partition_count(partition_bits, partitions.len())?;
+        let scan_output_types = partitions
+            .first()
+            .map(GroupedAggregateHashTable::scan_output_types)
+            .ok_or_else(|| paro_error::internal("radix aggregate target has no partitions"))?;
+        if partitions
+            .iter()
+            .any(|partition| partition.scan_output_types() != scan_output_types)
+        {
+            return Err(paro_error::internal(
+                "radix aggregate target partitions have inconsistent output schemas",
+            ));
+        }
+        Ok(Self {
+            group_types,
+            scan_output_types,
+            partition_bits,
+            partitions: partitions
+                .into_iter()
+                .map(|partition| Mutex::new(Some(partition)))
+                .collect(),
+        })
+    }
+
+    /// Transfer exclusive ownership of one target partition to its task.
+    pub(crate) fn take_partition(&self, partition_idx: usize) -> Result<AggregateHashTable> {
+        let partition = self.partitions.get(partition_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "radix aggregate claim partition out of bounds: index={partition_idx}, count={}",
+                self.partitions.len()
+            ))
+        })?;
+        let table = partition.lock().take().ok_or_else(|| {
+            paro_error::internal(format!(
+                "radix aggregate partition was already claimed: index={partition_idx}"
+            ))
+        })?;
+        Ok(AggregateHashTable::Flat(table))
+    }
+
+    pub(crate) fn install(&self, partition_idx: usize, table: AggregateHashTable) -> Result<()> {
+        let AggregateHashTable::Flat(table) = table else {
+            return Err(paro_error::internal(
+                "direct radix aggregate assembly requires a flat partition",
+            ));
+        };
+        if table.group_types() != self.group_types {
+            return Err(paro_error::internal(format!(
+                "radix aggregate partition schema mismatch: expected={:?}, actual={:?}",
+                self.group_types,
+                table.group_types()
+            )));
+        }
+        let partition = self.partitions.get(partition_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "radix aggregate install partition out of bounds: index={partition_idx}, count={}",
+                self.partitions.len()
+            ))
+        })?;
+        let mut target = partition.lock();
+        if target.is_some() {
+            return Err(paro_error::internal(format!(
+                "radix aggregate partition was installed without being claimed: index={partition_idx}"
+            )));
+        }
+        if self.scan_output_types != table.scan_output_types() {
+            return Err(paro_error::internal(format!(
+                "radix aggregate partition output schema mismatch at index {partition_idx}: expected={:?}, actual={:?}",
+                self.scan_output_types,
+                table.scan_output_types()
+            )));
+        }
+        *target = Some(table);
+        Ok(())
+    }
+
+    pub(crate) fn finish(&self) -> Result<AggregateHashTable> {
+        let mut partitions = Vec::with_capacity(self.partitions.len());
+        for partition in &self.partitions {
+            partitions.push(partition.lock().take().ok_or_else(|| {
+                paro_error::internal("concurrent radix aggregate build was finalized twice")
+            })?);
+        }
+        validate_radix_partition_count(self.partition_bits, partitions.len())?;
+        Ok(AggregateHashTable::Radix(
+            RadixPartitionedAggregateHashTable {
+                group_types: self.group_types.clone(),
+                partition_bits: self.partition_bits,
+                partition_mask: partitions.len() - 1,
+                partitions,
+                scratch: RadixRoutingScratch::default(),
+            },
+        ))
+    }
+}
+
 impl AggregateHashTable {
+    /// Split a finalized table into independently scannable ownership units.
+    pub fn into_scan_partitions(self) -> Vec<Self> {
+        match self {
+            Self::Flat(table) => vec![Self::Flat(table)],
+            Self::Radix(table) => table
+                .into_partitions()
+                .into_iter()
+                .map(Self::Flat)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn visit_flat_partitions(
+        &self,
+        mut visit: impl FnMut(&GroupedAggregateHashTable) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Flat(table) => visit(table),
+            Self::Radix(table) => {
+                for partition in &table.partitions {
+                    visit(partition)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Visit finalized aggregate columns across every physical partition
+    /// while retaining the table for the later output scan.
+    pub(crate) fn visit_finalized_aggregates(
+        &mut self,
+        capacity: usize,
+        allocator: Arc<dyn Allocator>,
+        mut visit: impl FnMut(&Chunk) -> Result<()>,
+    ) -> Result<()> {
+        match self {
+            Self::Flat(table) => table.visit_finalized_aggregates(capacity, allocator, &mut visit),
+            Self::Radix(table) => {
+                for partition in &mut table.partitions {
+                    partition.visit_finalized_aggregates(
+                        capacity,
+                        allocator.clone(),
+                        &mut visit,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn new_flat(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -71,6 +249,26 @@ impl AggregateHashTable {
             allocator,
             memory,
         )?))
+    }
+
+    pub(crate) fn new_flat_with_memory_capacity_hint(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Result<Self> {
+        Ok(Self::Flat(
+            GroupedAggregateHashTable::new_with_memory_capacity_hint(
+                group_types,
+                aggregate_objects,
+                aggregate_inputs,
+                allocator,
+                memory,
+                capacity_hint,
+            )?,
+        ))
     }
 
     pub fn new_radix(
@@ -111,6 +309,28 @@ impl AggregateHashTable {
         )?))
     }
 
+    pub(crate) fn new_radix_with_memory_capacity_hint(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        partition_bits: usize,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Result<Self> {
+        Ok(Self::Radix(
+            RadixPartitionedAggregateHashTable::new_with_capacity_hint(
+                group_types,
+                aggregate_objects,
+                aggregate_inputs,
+                partition_bits,
+                allocator,
+                memory,
+                capacity_hint,
+            )?,
+        ))
+    }
+
     pub fn hash_groups(&self, groups: &Chunk) -> Result<Vector> {
         match self {
             Self::Flat(table) => table.hash_groups(groups),
@@ -125,10 +345,58 @@ impl AggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
+        self.find_or_create_groups_partitioned(groups, hashes, hashes, addresses, new_groups)
+    }
+
+    /// Probe using `lookup_hashes` while routing radix ownership using
+    /// `partition_hashes`.
+    ///
+    /// Ordinary aggregation passes the same vector for both. DISTINCT
+    /// aggregation routes by the output-group prefix so one final group never
+    /// spans multiple partitions, while exact deduplication still probes by
+    /// the complete `(groups..., inputs...)` key.
+    pub(crate) fn find_or_create_groups_partitioned(
+        &mut self,
+        groups: &Chunk,
+        lookup_hashes: &Vector,
+        partition_hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
         match self {
-            Self::Flat(table) => table.find_or_create_groups(groups, hashes, addresses, new_groups),
+            Self::Flat(table) => {
+                table.find_or_create_groups(groups, lookup_hashes, addresses, new_groups)
+            }
+            Self::Radix(table) => table.find_or_create_groups_partitioned(
+                groups,
+                lookup_hashes,
+                partition_hashes,
+                addresses,
+                new_groups,
+            ),
+        }
+    }
+
+    pub(crate) fn find_or_create_serialized_group_prefix(
+        &mut self,
+        source: &GroupedAggregateHashTable,
+        source_rows: SerializedSourceRows<'_>,
+        hashes: &Vector,
+        addresses: &mut Vector,
+    ) -> Result<()> {
+        let count = source_rows.len();
+        validate_hashes(hashes, count)?;
+        validate_address_capacity(addresses, count)?;
+        let hash_values = &hashes.as_slice::<u64>()[..count];
+        match self {
+            Self::Flat(table) => table.find_or_create_serialized_group_prefix(
+                source,
+                source_rows,
+                hash_values,
+                addresses,
+            ),
             Self::Radix(table) => {
-                table.find_or_create_groups(groups, hashes, addresses, new_groups)
+                table.find_or_create_serialized_group_prefix(source, source_rows, hashes, addresses)
             }
         }
     }
@@ -186,6 +454,26 @@ impl AggregateHashTable {
                 Ok(produced)
             }
             Self::Radix(table) => table.scan(&mut position.radix, result),
+        }
+    }
+
+    pub fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut AggregateHTScanPosition,
+        result: &mut Chunk,
+        selection: &mut SelectionVector,
+        mut select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        match self {
+            Self::Flat(table) => {
+                table.scan_with_aggregate_filter(&mut position.flat, result, selection, select)
+            }
+            Self::Radix(table) => table.scan_with_aggregate_filter(
+                &mut position.radix,
+                result,
+                selection,
+                &mut select,
+            ),
         }
     }
 
@@ -326,16 +614,20 @@ struct RadixRoutingScratch {
     offsets: Vec<usize>,
     cursors: Vec<usize>,
     rows_by_partition: Vec<u32>,
+    serialized_rows_by_partition: Vec<u32>,
     decoded_hashes: Vec<u64>,
     hashes_by_partition: Vec<u64>,
     selection: Option<SelectionVector>,
     address_vector: Option<Vector>,
-    hash_vector: Option<Vector>,
     partition_addresses: Option<Vector>,
     partition_new_groups: Option<SelectionVector>,
 }
 
 impl RadixPartitionedAggregateHashTable {
+    fn into_partitions(self) -> Vec<GroupedAggregateHashTable> {
+        self.partitions
+    }
+
     pub fn new(
         group_types: Vec<LogicalType>,
         aggregate_objects: Vec<AggregateObject>,
@@ -344,24 +636,37 @@ impl RadixPartitionedAggregateHashTable {
         allocator: Arc<dyn Allocator>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
-        if partition_bits == 0 || partition_bits > MAX_RADIX_PARTITION_BITS {
-            return Err(paro_error::internal(format!(
-                "Invalid radix partition bits for aggregate hash table: bits={partition_bits}, allowed=1..={MAX_RADIX_PARTITION_BITS}"
-            )));
-        }
-        let partition_count = 1usize.checked_shl(partition_bits as u32).ok_or_else(|| {
-            paro_error::internal(format!(
-                "Radix partition count overflow for bits={partition_bits}"
-            ))
-        })?;
+        Self::new_with_capacity_hint(
+            group_types,
+            aggregate_objects,
+            aggregate_inputs,
+            partition_bits,
+            allocator,
+            memory,
+            HashTableCapacityHint::default(),
+        )
+    }
+
+    fn new_with_capacity_hint(
+        group_types: Vec<LogicalType>,
+        aggregate_objects: Vec<AggregateObject>,
+        aggregate_inputs: Vec<Vec<usize>>,
+        partition_bits: usize,
+        allocator: Arc<dyn Allocator>,
+        memory: MemoryAccountingContext,
+        capacity_hint: HashTableCapacityHint,
+    ) -> Result<Self> {
+        let partition_count = radix_partition_count(partition_bits)?;
+        let partition_hint = capacity_hint.divided_across(partition_count);
         let mut partitions = Vec::with_capacity(partition_count);
         for _ in 0..partition_count {
-            partitions.push(GroupedAggregateHashTable::new_with_memory(
+            partitions.push(GroupedAggregateHashTable::new_with_memory_capacity_hint(
                 group_types.clone(),
                 aggregate_objects.clone(),
                 aggregate_inputs.clone(),
                 allocator.clone(),
                 memory.clone(),
+                partition_hint,
             )?);
         }
         Ok(Self {
@@ -413,7 +718,19 @@ impl RadixPartitionedAggregateHashTable {
         addresses: &mut Vector,
         new_groups: &mut SelectionVector,
     ) -> Result<usize> {
-        validate_hashes(hashes, groups.size())?;
+        self.find_or_create_groups_partitioned(groups, hashes, hashes, addresses, new_groups)
+    }
+
+    fn find_or_create_groups_partitioned(
+        &mut self,
+        groups: &Chunk,
+        lookup_hashes: &Vector,
+        partition_hashes: &Vector,
+        addresses: &mut Vector,
+        new_groups: &mut SelectionVector,
+    ) -> Result<usize> {
+        validate_hashes(lookup_hashes, groups.size())?;
+        validate_hashes(partition_hashes, groups.size())?;
         validate_address_capacity(addresses, groups.size())?;
 
         if groups.size() == 0 {
@@ -426,17 +743,18 @@ impl RadixPartitionedAggregateHashTable {
             self.partition_bits,
             self.partition_mask,
             self.partitions.len(),
-            hashes,
+            partition_hashes,
+            lookup_hashes,
             groups.size(),
         )?;
 
         addresses.try_set_count(groups.size())?;
-        let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
         if new_groups.capacity() < groups.size() {
             *new_groups =
                 SelectionVector::try_with_capacity(groups.size(), groups.allocator().clone())?;
         }
         new_groups.set_len(groups.size());
+        let new_group_data = new_groups.as_mut_slice().as_mut_ptr();
         let mut new_group_count = 0usize;
 
         let RadixPartitionedAggregateHashTable {
@@ -444,11 +762,6 @@ impl RadixPartitionedAggregateHashTable {
             scratch,
             ..
         } = self;
-        let mut partition_addresses = take_vector_scratch(
-            &mut scratch.partition_addresses,
-            LogicalType::BigInt,
-            groups.allocator().clone(),
-        )?;
         let mut partition_new_groups = take_selection_scratch(
             &mut scratch.partition_new_groups,
             groups.allocator().clone(),
@@ -459,18 +772,7 @@ impl RadixPartitionedAggregateHashTable {
             if start == end {
                 continue;
             }
-            let selection = scratch.partition_selection(start, end, groups.allocator().clone())?;
-            let mut partition_groups = groups.clone_referencing_vectors();
-            partition_groups.try_slice(selection, end - start)?;
-            let partition_hashes_vec =
-                scratch.selected_hash_vector(start, end, groups.allocator().clone())?;
             let partition_row_count = end - start;
-            ensure_vector_scratch(
-                &mut partition_addresses,
-                LogicalType::BigInt,
-                partition_row_count,
-                groups.allocator().clone(),
-            )?;
             ensure_selection_scratch(
                 &mut partition_new_groups,
                 partition_row_count,
@@ -482,50 +784,106 @@ impl RadixPartitionedAggregateHashTable {
                     "Radix partition index out of bounds: partition_idx={partition_idx}"
                 ))
             })?;
-            partition.find_or_create_groups(
-                &partition_groups,
-                &partition_hashes_vec,
-                &mut partition_addresses,
+            partition.find_or_create_groups_selected(
+                groups,
+                &scratch.rows_by_partition[start..end],
+                &scratch.hashes_by_partition[start..end],
+                addresses,
                 &mut partition_new_groups,
             )?;
 
-            let partition_address_format =
-                partition_addresses.try_decode_ref(partition_row_count)?;
-            let partition_address_data = partition_address_format.get_data::<*mut u8>();
-            for local_row in 0..partition_row_count {
-                let global_row = scratch.rows_by_partition[start + local_row];
-                let physical_idx = partition_address_format.physical_index(local_row);
-                if !partition_address_format.validity().is_valid(physical_idx) {
-                    return Err(paro_error::internal(format!(
-                        "Partition address vector contains NULL: partition_idx={partition_idx}, local_row={local_row}"
-                    )));
-                }
-                let state_ptr = unsafe { *partition_address_data.add(physical_idx) };
-                unsafe {
-                    *address_data.add(global_row as usize) = state_ptr;
-                }
-            }
-
             for idx in 0..partition_new_groups.len() {
-                let local_row = partition_new_groups.get(idx);
-                if local_row >= partition_row_count {
+                let global_row = partition_new_groups.get(idx);
+                if global_row >= groups.size() {
                     return Err(paro_error::internal(format!(
-                        "Partition new-group index out of bounds: partition_idx={partition_idx}, local_row={local_row}, partition_rows={}",
-                        partition_row_count
+                        "Partition new-group index out of bounds: partition_idx={partition_idx}, row={global_row}, groups={}",
+                        groups.size()
                     )));
                 }
-                new_groups.try_set(
-                    new_group_count,
-                    scratch.rows_by_partition[start + local_row] as usize,
-                )?;
+                // SAFETY: `new_groups` was sized to the full input cardinality and
+                // every partition contributes at most one entry per routed row.
+                unsafe {
+                    *new_group_data.add(new_group_count) = global_row as u32;
+                }
                 new_group_count += 1;
             }
         }
 
-        scratch.partition_addresses = Some(partition_addresses);
         scratch.partition_new_groups = Some(partition_new_groups);
         new_groups.set_len(new_group_count);
         Ok(new_groups.len())
+    }
+
+    fn find_or_create_serialized_group_prefix(
+        &mut self,
+        source: &GroupedAggregateHashTable,
+        source_rows: SerializedSourceRows<'_>,
+        hashes: &Vector,
+        addresses: &mut Vector,
+    ) -> Result<()> {
+        let count = source_rows.len();
+        validate_hashes(hashes, count)?;
+        validate_address_capacity(addresses, count)?;
+        if count == 0 {
+            addresses.try_set_count(0)?;
+            return Ok(());
+        }
+        self.scratch.route_hashes(
+            self.partition_bits,
+            self.partition_mask,
+            self.partitions.len(),
+            hashes,
+            hashes,
+            count,
+        )?;
+        self.scratch
+            .route_serialized_source_rows(source_rows, count)?;
+
+        addresses.try_set_count(count)?;
+        let address_data = unsafe { addresses.flat_data_mut::<*mut u8>() };
+        let RadixPartitionedAggregateHashTable {
+            partitions,
+            scratch,
+            ..
+        } = self;
+        let mut partition_addresses = take_vector_scratch(
+            &mut scratch.partition_addresses,
+            LogicalType::BigInt,
+            source.allocator(),
+        )?;
+
+        for (partition_idx, partition) in partitions.iter_mut().enumerate() {
+            let (start, end) = scratch.partition_range(partition_idx)?;
+            if start == end {
+                continue;
+            }
+            let partition_count = end - start;
+            ensure_vector_scratch(
+                &mut partition_addresses,
+                LogicalType::BigInt,
+                partition_count,
+                source.allocator(),
+            )?;
+            partition.find_or_create_serialized_group_prefix(
+                source,
+                SerializedSourceRows::new(
+                    source_rows.start(),
+                    &scratch.serialized_rows_by_partition[start..end],
+                ),
+                &scratch.hashes_by_partition[start..end],
+                &mut partition_addresses,
+            )?;
+
+            let partition_address_data = unsafe { partition_addresses.flat_data::<*mut u8>() };
+            for local_row in 0..partition_count {
+                let global_row = scratch.rows_by_partition[start + local_row] as usize;
+                unsafe {
+                    *address_data.add(global_row) = *partition_address_data.add(local_row);
+                }
+            }
+        }
+        scratch.partition_addresses = Some(partition_addresses);
+        Ok(())
     }
 
     pub fn update_aggregates(
@@ -563,6 +921,7 @@ impl RadixPartitionedAggregateHashTable {
             self.partition_bits,
             self.partition_mask,
             self.partitions.len(),
+            hashes,
             hashes,
             payload.size(),
         )?;
@@ -651,6 +1010,41 @@ bits {}/{} partitions {}/{} group_types {:?}/{:?}",
                     ))
                 })?;
             if partition.scan(part_position, result)? {
+                return Ok(true);
+            }
+            partition.destroy()?;
+            position.partition_idx += 1;
+        }
+        result.try_set_cardinality(0)?;
+        Ok(false)
+    }
+
+    pub fn scan_with_aggregate_filter(
+        &mut self,
+        position: &mut RadixHTScanPosition,
+        result: &mut Chunk,
+        selection: &mut SelectionVector,
+        mut select: impl FnMut(&Chunk, usize, &mut SelectionVector) -> Result<usize>,
+    ) -> Result<bool> {
+        while position.partition_idx < self.partitions.len() {
+            let partition_idx = position.partition_idx;
+            let partition = self.partitions.get_mut(partition_idx).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "Radix partition index out of bounds during filtered scan: partition_idx={partition_idx}"
+                ))
+            })?;
+            if position.partition_positions.len() <= partition_idx {
+                position
+                    .partition_positions
+                    .resize_with(partition_idx + 1, HTScanPosition::default);
+            }
+            let partition_position = &mut position.partition_positions[partition_idx];
+            if partition.scan_with_aggregate_filter(
+                partition_position,
+                result,
+                selection,
+                &mut select,
+            )? {
                 return Ok(true);
             }
             partition.destroy()?;
@@ -832,13 +1226,63 @@ fn validate_address_capacity(addresses: &Vector, row_count: usize) -> Result<()>
     Ok(())
 }
 
+fn radix_partition_count(partition_bits: usize) -> Result<usize> {
+    if partition_bits == 0 || partition_bits > MAX_RADIX_PARTITION_BITS {
+        return Err(paro_error::internal(format!(
+            "Invalid radix partition bits for aggregate hash table: bits={partition_bits}, allowed=1..={MAX_RADIX_PARTITION_BITS}"
+        )));
+    }
+    1usize.checked_shl(partition_bits as u32).ok_or_else(|| {
+        paro_error::internal(format!(
+            "Radix partition count overflow for bits={partition_bits}"
+        ))
+    })
+}
+
+fn validate_radix_partition_count(partition_bits: usize, actual: usize) -> Result<()> {
+    let expected = radix_partition_count(partition_bits)?;
+    if actual != expected {
+        return Err(paro_error::internal(format!(
+            "Radix aggregate partition count mismatch: bits={partition_bits}, expected={expected}, actual={actual}"
+        )));
+    }
+    Ok(())
+}
+
 impl RadixRoutingScratch {
+    fn route_serialized_source_rows(
+        &mut self,
+        source_rows: SerializedSourceRows<'_>,
+        row_count: usize,
+    ) -> Result<()> {
+        if source_rows.len() != row_count || self.rows_by_partition.len() != row_count {
+            return Err(paro_error::internal(format!(
+                "Serialized radix route size mismatch: source={}, routed={}, expected={row_count}",
+                source_rows.len(),
+                self.rows_by_partition.len()
+            )));
+        }
+        self.serialized_rows_by_partition.resize(row_count, 0);
+        for routed_idx in 0..row_count {
+            let input_idx = self.rows_by_partition[routed_idx] as usize;
+            let relative = source_rows.relative_row(input_idx)?;
+            self.serialized_rows_by_partition[routed_idx] =
+                u32::try_from(relative).map_err(|_| {
+                    paro_error::internal(format!(
+                        "Serialized source row offset exceeds u32: offset={relative}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
+
     fn route_hashes(
         &mut self,
         partition_bits: usize,
         partition_mask: usize,
         partition_count: usize,
-        hashes: &Vector,
+        partition_hashes: &Vector,
+        lookup_hashes: &Vector,
         row_count: usize,
     ) -> Result<()> {
         self.partition_ids.resize(row_count, 0);
@@ -850,21 +1294,37 @@ impl RadixRoutingScratch {
         self.cursors.resize(partition_count, 0);
         self.counts.fill(0);
 
-        let hash_format = hashes.try_decode_ref(row_count)?;
-        let hash_data = hash_format.get_data::<u64>();
+        validate_hashes(partition_hashes, row_count)?;
+        validate_hashes(lookup_hashes, row_count)?;
+        let partition_format = partition_hashes.try_decode_ref(row_count)?;
+        let partition_data = partition_format.get_data::<u64>();
         let shift = (u64::BITS as usize).saturating_sub(partition_bits);
         for row_idx in 0..row_count {
-            let physical_idx = hash_format.physical_index(row_idx);
-            if !hash_format.validity().is_valid(physical_idx) {
+            let physical_idx = partition_format.physical_index(row_idx);
+            if !partition_format.validity().is_valid(physical_idx) {
                 return Err(paro_error::internal(format!(
-                    "Group hash contains NULL at row {row_idx}"
+                    "Group partition hash contains NULL at row {row_idx}"
                 )));
             }
-            let hash = unsafe { *hash_data.add(physical_idx) };
+            let hash = unsafe { *partition_data.add(physical_idx) };
             let partition_idx = ((hash >> shift) as usize) & partition_mask;
             self.partition_ids[row_idx] = partition_idx;
             self.decoded_hashes[row_idx] = hash;
             self.counts[partition_idx] += 1;
+        }
+
+        if !std::ptr::eq(partition_hashes, lookup_hashes) {
+            let lookup_format = lookup_hashes.try_decode_ref(row_count)?;
+            let lookup_data = lookup_format.get_data::<u64>();
+            for row_idx in 0..row_count {
+                let physical_idx = lookup_format.physical_index(row_idx);
+                if !lookup_format.validity().is_valid(physical_idx) {
+                    return Err(paro_error::internal(format!(
+                        "Group lookup hash contains NULL at row {row_idx}"
+                    )));
+                }
+                self.decoded_hashes[row_idx] = unsafe { *lookup_data.add(physical_idx) };
+            }
         }
 
         self.offsets[0] = 0;
@@ -956,28 +1416,6 @@ impl RadixRoutingScratch {
         }
         Ok(vector)
     }
-
-    fn selected_hash_vector(
-        &mut self,
-        start: usize,
-        end: usize,
-        allocator: Arc<dyn Allocator>,
-    ) -> Result<&Vector> {
-        let count = end - start;
-        let vector = ensure_vector(
-            &mut self.hash_vector,
-            LogicalType::UBigInt,
-            count,
-            allocator,
-        )?;
-        let target = unsafe { vector.flat_data_mut::<u64>() };
-        for (target_idx, &hash) in self.hashes_by_partition[start..end].iter().enumerate() {
-            unsafe {
-                *target.add(target_idx) = hash;
-            }
-        }
-        Ok(vector)
-    }
 }
 
 fn ensure_vector(
@@ -1055,7 +1493,7 @@ mod tests {
 
     use paro_common::test_utils::{
         test_allocator, test_chunk_with_capacity, test_i32_vector_with_allocator,
-        test_selection_with_capacity, test_vector_with_capacity,
+        test_i64_vector_with_allocator, test_selection_with_capacity, test_vector_with_capacity,
     };
 
     fn insert_integer_groups(table: &mut AggregateHashTable, values: &[i32]) {
@@ -1122,5 +1560,118 @@ mod tests {
 
         assert_eq!(table.count(), 0);
         assert_eq!(table.memory_usage(), 0);
+    }
+
+    #[test]
+    fn concurrent_radix_build_merges_into_owned_populated_partitions() {
+        let mut target = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            test_allocator(),
+        )
+        .expect("target table");
+        insert_integer_groups(&mut target, &[10, 11]);
+
+        let build = Arc::new(
+            ConcurrentRadixAggregateBuild::try_new(target).expect("concurrent build target"),
+        );
+        std::thread::scope(|scope| {
+            let first_build = Arc::clone(&build);
+            let first_task = scope.spawn(move || {
+                let mut first = first_build.take_partition(0)?;
+                insert_integer_groups(&mut first, &[1, 2]);
+                first_build.install(0, first)
+            });
+            let second_build = Arc::clone(&build);
+            let second_task = scope.spawn(move || {
+                let mut second = second_build.take_partition(1)?;
+                insert_integer_groups(&mut second, &[3, 4]);
+                second_build.install(1, second)
+            });
+            first_task
+                .join()
+                .expect("first merge task")
+                .expect("install first partition");
+            second_task
+                .join()
+                .expect("second merge task")
+                .expect("install second partition");
+        });
+
+        let mut table = build.finish().expect("finish concurrent build");
+        assert_eq!(drain_integer_group_table(&mut table), 6);
+    }
+
+    #[test]
+    fn serialized_prefix_projection_routes_radix_addresses_to_original_rows() {
+        let allocator = test_allocator();
+        let groups = (0..64).map(|value| value % 17).collect::<Vec<i32>>();
+        let inputs = (0..64).map(i64::from).collect::<Vec<i64>>();
+        let source_chunk = Chunk::from_vectors(
+            vec![
+                test_i32_vector_with_allocator(&groups, allocator.clone()),
+                test_i64_vector_with_allocator(&inputs, allocator.clone()),
+            ],
+            allocator.clone(),
+        );
+        let mut source = GroupedAggregateHashTable::new(
+            vec![LogicalType::Integer, LogicalType::BigInt],
+            Vec::new(),
+            Vec::new(),
+            allocator.clone(),
+        )
+        .expect("source table");
+        let source_hashes = source.hash_groups(&source_chunk).expect("source hashes");
+        let mut source_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.len());
+        let mut source_new_groups = test_selection_with_capacity(groups.len());
+        source
+            .find_or_create_groups(
+                &source_chunk,
+                &source_hashes,
+                &mut source_addresses,
+                &mut source_new_groups,
+            )
+            .expect("insert source rows");
+
+        let mut run_starts = test_selection_with_capacity(groups.len());
+        let mut projected_hashes = test_vector_with_capacity(LogicalType::UBigInt, groups.len());
+        source
+            .project_serialized_group_prefix_runs(
+                0,
+                groups.len(),
+                1,
+                &mut run_starts,
+                &mut projected_hashes,
+            )
+            .expect("project serialized prefix runs");
+        let mut target = AggregateHashTable::new_radix(
+            vec![LogicalType::Integer],
+            Vec::new(),
+            Vec::new(),
+            2,
+            allocator,
+        )
+        .expect("target radix table");
+        let mut target_addresses = test_vector_with_capacity(LogicalType::BigInt, groups.len());
+        target
+            .find_or_create_serialized_group_prefix(
+                &source,
+                SerializedSourceRows::new(0, run_starts.as_slice()),
+                &projected_hashes,
+                &mut target_addresses,
+            )
+            .expect("project serialized prefixes");
+
+        assert_eq!(target.count(), 17);
+        let mut addresses_by_group = std::collections::HashMap::new();
+        for (row_idx, group) in groups.into_iter().enumerate() {
+            let address = target_addresses.get_i64(row_idx).expect("target address");
+            match addresses_by_group.insert(group, address) {
+                Some(previous) => assert_eq!(address, previous),
+                None => {}
+            }
+        }
     }
 }

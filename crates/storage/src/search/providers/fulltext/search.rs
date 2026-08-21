@@ -390,7 +390,7 @@ fn fulltext_ranked_rows_from_points(
                 let row = PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    point.idx as u32,
+                    crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                 );
                 (!snapshot.is_overlay_deleted(row)).then(|| RankedRow::new(row, point.score))
             })
@@ -403,7 +403,7 @@ fn fulltext_ranked_rows_from_points(
                     PhysicalRowRef::new(
                         visible_segment.rowset_id,
                         visible_segment.segment_id,
-                        point.idx as u32,
+                        crate::rowset::SegmentRowId::from_raw(point.idx as u32),
                     ),
                     point.score,
                 )
@@ -423,7 +423,7 @@ fn fulltext_rows_from_bitmap(
             let row = PhysicalRowRef::new(
                 visible_segment.rowset_id,
                 visible_segment.segment_id,
-                row_id,
+                crate::rowset::SegmentRowId::from_raw(row_id),
             );
             if !snapshot.is_overlay_deleted(row) {
                 rows.push(row);
@@ -434,7 +434,7 @@ fn fulltext_rows_from_bitmap(
             rows.push(PhysicalRowRef::new(
                 visible_segment.rowset_id,
                 visible_segment.segment_id,
-                row_id,
+                crate::rowset::SegmentRowId::from_raw(row_id),
             ));
         }
     }
@@ -628,7 +628,7 @@ impl FullTextTopKCursor {
                 PhysicalRowRef::new(
                     visible_segment.rowset_id,
                     visible_segment.segment_id,
-                    row_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
                 ),
                 score_document_from_tokens_with_stats(
                     self.score_mode,
@@ -808,7 +808,7 @@ impl FullTextFilterCursor {
                 rows.push(PhysicalRowRef::new(
                     segment.rowset_id,
                     segment.segment_id,
-                    row_id,
+                    crate::rowset::SegmentRowId::from_raw(row_id),
                 ));
             }
         }
@@ -1012,7 +1012,7 @@ mod tests {
         };
 
         assert_eq!(batch.rows.len(), 1);
-        assert_eq!(batch.rows[0].row_id, 0);
+        assert_eq!(batch.rows[0].row_offset, 0);
         let metrics = storage_metrics().snapshot();
         let sidecar = metrics
             .search_sidecar_reader_by_key

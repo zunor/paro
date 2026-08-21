@@ -3,8 +3,8 @@
 
 use std::marker::PhantomData;
 
-use crate::error::Result;
-use crate::types::{InlineString, LogicalType};
+use crate::error::{self as paro_error, Result};
+use crate::types::{LogicalType, PhysicalType, StringView};
 
 use super::{
     ArrayVector, SelectionVector, ValidityMask, Vector, VectorBuffer, VectorSelection, VectorType,
@@ -15,7 +15,7 @@ pub enum SelectionRef<'a> {
     Borrowed(&'a SelectionVector),
     Owned(SelectionVector),
     Range { offset: usize, count: usize },
-    Constant { count: usize },
+    Constant { index: usize, count: usize },
     Incremental { count: usize },
 }
 
@@ -26,7 +26,7 @@ impl<'a> SelectionRef<'a> {
             Self::Borrowed(sel) => sel.len(),
             Self::Owned(sel) => sel.len(),
             Self::Range { count, .. } => *count,
-            Self::Constant { count } | Self::Incremental { count } => *count,
+            Self::Constant { count, .. } | Self::Incremental { count } => *count,
         }
     }
 
@@ -41,7 +41,7 @@ impl<'a> SelectionRef<'a> {
             Self::Borrowed(sel) => sel.get(idx),
             Self::Owned(sel) => sel.get(idx),
             Self::Range { offset, .. } => offset + idx,
-            Self::Constant { .. } => 0,
+            Self::Constant { index, .. } => *index,
             Self::Incremental { .. } => idx,
         }
     }
@@ -55,8 +55,28 @@ impl<'a> SelectionRef<'a> {
         }
     }
 
+    #[inline]
+    pub fn materialized_indices(&self) -> Option<&[u32]> {
+        match self {
+            Self::Borrowed(selection) => Some(selection.as_slice()),
+            Self::Owned(selection) => Some(selection.as_slice()),
+            Self::Range { .. } | Self::Constant { .. } | Self::Incremental { .. } => None,
+        }
+    }
+
     fn try_compose(self, selection: &'a VectorSelection, count: usize) -> Result<SelectionRef<'a>> {
         match (self, selection) {
+            (base, VectorSelection::Repeated { index, count: len }) => {
+                if count > *len {
+                    return Err(paro_error::internal(format!(
+                        "vector view count exceeds repeated selection: count={count}, selection_count={len}"
+                    )));
+                }
+                Ok(SelectionRef::Constant {
+                    index: base.get(*index),
+                    count,
+                })
+            }
             (SelectionRef::Borrowed(child_sel), VectorSelection::Materialized(sel)) => {
                 Ok(SelectionRef::Owned(child_sel.try_slice(sel, count)?))
             }
@@ -86,7 +106,9 @@ impl<'a> SelectionRef<'a> {
                 result.try_fill_offset_from(offset, sel, count)?;
                 Ok(SelectionRef::Owned(result))
             }
-            (SelectionRef::Constant { count: _ }, _) => Ok(SelectionRef::Constant { count }),
+            (SelectionRef::Constant { index, .. }, _) => {
+                Ok(SelectionRef::Constant { index, count })
+            }
             (SelectionRef::Incremental { count: _ }, VectorSelection::Materialized(sel))
                 if count == sel.len() =>
             {
@@ -149,6 +171,7 @@ pub struct VectorView<'a> {
     sel: SelectionRef<'a>,
     validity: ValidityRef<'a>,
     data: DataRef,
+    physical_count: usize,
     _vector: PhantomData<&'a Vector>,
 }
 
@@ -171,6 +194,11 @@ impl<'a> VectorView<'a> {
     #[inline]
     pub fn data(&self) -> DataRef {
         self.data
+    }
+
+    #[inline]
+    pub fn physical_count(&self) -> usize {
+        self.physical_count
     }
 
     #[inline]
@@ -204,13 +232,19 @@ impl<'a> VectorView<'a> {
 
 #[derive(Debug, Clone)]
 pub struct VarlenView<'a> {
-    entries: *const InlineString,
+    logical_type: &'a LogicalType,
+    entries: *const StringView,
     sel: SelectionRef<'a>,
     validity: ValidityRef<'a>,
     _vector: PhantomData<&'a Vector>,
 }
 
 impl<'a> VarlenView<'a> {
+    #[inline]
+    pub fn logical_type(&self) -> &'a LogicalType {
+        self.logical_type
+    }
+
     #[inline]
     pub fn sel(&self) -> &SelectionRef<'a> {
         &self.sel
@@ -227,8 +261,68 @@ impl<'a> VarlenView<'a> {
     }
 
     #[inline]
-    pub fn get_inline_string(&self, idx: usize) -> InlineString {
+    pub fn bytes(&self, idx: usize) -> &[u8] {
+        // SAFETY: `entries` belongs to the borrowed vector, and the selected
+        // index is valid for this view. The returned slice is tied to `self`.
+        unsafe { (&*self.entries.add(self.sel.get(idx))).as_bytes() }
+    }
+
+    /// Prove once that this view contains UTF-8 logical values.
+    #[inline]
+    pub fn try_as_utf8(self) -> Result<Utf8View<'a>> {
+        if !self.logical_type.is_utf8_varlen() {
+            return Err(paro_error::type_mismatch(format!(
+                "UTF-8 view requires a textual varlen type, got {:?}",
+                self.logical_type
+            )));
+        }
+        Ok(Utf8View { inner: self })
+    }
+
+    /// Copy the physical view value out of the owning vector.
+    ///
+    /// # Safety
+    /// The result must not be used after the vector borrowed by this
+    /// `VarlenView` is dropped or its backing string heap is replaced.
+    #[inline]
+    pub unsafe fn value(&self, idx: usize) -> StringView {
         unsafe { *self.entries.add(self.sel.get(idx)) }
+    }
+}
+
+/// Varlen vector view whose logical type guarantees valid UTF-8 bytes.
+#[derive(Debug, Clone)]
+pub struct Utf8View<'a> {
+    inner: VarlenView<'a>,
+}
+
+impl<'a> Utf8View<'a> {
+    #[inline]
+    pub fn logical_type(&self) -> &'a LogicalType {
+        self.inner.logical_type()
+    }
+
+    #[inline]
+    pub fn sel(&self) -> &SelectionRef<'a> {
+        self.inner.sel()
+    }
+
+    #[inline]
+    pub fn validity(&self) -> &ValidityRef<'a> {
+        self.inner.validity()
+    }
+
+    #[inline]
+    pub fn is_valid(&self, idx: usize) -> bool {
+        self.inner.is_valid(idx)
+    }
+
+    /// Read a string without revalidating every row's bytes.
+    #[inline]
+    pub fn str(&self, idx: usize) -> &str {
+        // SAFETY: `try_as_utf8` proves that the vector's logical type carries
+        // the UTF-8 invariant, which all safe vector write paths preserve.
+        unsafe { std::str::from_utf8_unchecked(self.inner.bytes(idx)) }
     }
 }
 
@@ -284,6 +378,7 @@ pub struct DecodedVectorRef<'a> {
     sel: SelectionRef<'a>,
     data: DataRef,
     validity: ValidityRef<'a>,
+    physical_count: usize,
 }
 
 impl<'a> DecodedVectorRef<'a> {
@@ -318,6 +413,11 @@ impl<'a> DecodedVectorRef<'a> {
     #[inline]
     pub fn validity(&self) -> &ValidityRef<'a> {
         &self.validity
+    }
+
+    #[inline]
+    pub fn physical_count(&self) -> usize {
+        self.physical_count
     }
 
     #[inline]
@@ -432,13 +532,15 @@ impl Vector {
                 sel: SelectionRef::Incremental { count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
+                physical_count: self.len(),
                 _vector: PhantomData,
             }),
             VectorType::Constant => Ok(VectorView {
                 logical_type: &self.logical_type,
-                sel: SelectionRef::Constant { count },
+                sel: SelectionRef::Constant { index: 0, count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
+                physical_count: 1,
                 _vector: PhantomData,
             }),
             VectorType::Dictionary => {
@@ -450,6 +552,7 @@ impl Vector {
                     sel: child_view.sel.try_compose(&self.selection, count)?,
                     validity: child_view.validity,
                     data: child_view.data,
+                    physical_count: child_view.physical_count,
                     _vector: PhantomData,
                 })
             }
@@ -463,6 +566,7 @@ impl Vector {
                     sel: SelectionRef::Incremental { count },
                     validity: ValidityRef::Borrowed(&self.validity),
                     data: DataRef::SequenceI64 { start, increment },
+                    physical_count: count,
                     _vector: PhantomData,
                 })
             }
@@ -471,15 +575,28 @@ impl Vector {
 
     pub fn try_to_varlen_view(&self, count: usize) -> Result<VarlenView<'_>> {
         let view = self.try_to_view(count)?;
+        if view.logical_type.physical_type() != PhysicalType::Varchar {
+            return Err(paro_error::type_mismatch(format!(
+                "varlen view requires VARCHAR physical storage, got {:?}",
+                view.logical_type
+            )));
+        }
         let DataRef::Ptr(entries) = view.data else {
             panic!("to_varlen_view requires pointer-backed data");
         };
         Ok(VarlenView {
-            entries: entries as *const InlineString,
+            logical_type: view.logical_type,
+            entries: entries as *const StringView,
             sel: view.sel,
             validity: view.validity,
             _vector: PhantomData,
         })
+    }
+
+    /// Decode a textual varlen vector and prove its UTF-8 invariant once.
+    #[inline]
+    pub fn try_to_utf8_view(&self, count: usize) -> Result<Utf8View<'_>> {
+        self.try_to_varlen_view(count)?.try_as_utf8()
     }
 
     pub fn try_to_array_view(&self, count: usize) -> Result<ArrayView<'_>> {
@@ -500,6 +617,7 @@ impl Vector {
             sel: view.sel,
             data: view.data,
             validity: view.validity,
+            physical_count: view.physical_count,
         })
     }
 
@@ -622,7 +740,10 @@ mod tests {
         let vector = crate::test_utils::test_constant(LogicalType::BigInt, 42_i64, 4);
         let view = vector.try_to_view(4).unwrap();
 
-        assert!(matches!(view.sel(), SelectionRef::Constant { count: 4 }));
+        assert!(matches!(
+            view.sel(),
+            SelectionRef::Constant { index: 0, count: 4 }
+        ));
         assert_eq!(view.get_i64(0), 42);
         assert_eq!(view.get_i64(3), 42);
     }
@@ -692,7 +813,7 @@ mod tests {
         let constant_decoded = constant.try_decode_ref(4).unwrap();
         assert!(matches!(
             constant_decoded.sel(),
-            SelectionRef::Constant { count: 4 }
+            SelectionRef::Constant { index: 0, count: 4 }
         ));
 
         let range = flat.slice_ref(1, 2).expect("range slice");
@@ -729,8 +850,39 @@ mod tests {
         let dictionary = crate::test_utils::test_dictionary(base, vec![2_u32, 0]);
         let view = dictionary.try_to_varlen_view(2).unwrap();
 
-        assert_eq!(view.get_inline_string(0).as_str(), "gamma");
-        assert_eq!(view.get_inline_string(1).as_str(), "alpha");
+        assert_eq!(std::str::from_utf8(view.bytes(0)).unwrap(), "gamma");
+        assert_eq!(std::str::from_utf8(view.bytes(1)).unwrap(), "alpha");
+    }
+
+    #[test]
+    fn utf8_view_proves_text_type_once() {
+        let mut vector =
+            Vector::try_new(LogicalType::Varchar, 2, crate::test_utils::test_allocator()).unwrap();
+        vector.try_set_count(2).unwrap();
+        vector.try_set_string(0, "short").unwrap();
+        vector
+            .try_set_string(1, "a longer UTF-8 value 你好")
+            .unwrap();
+
+        let view = vector.try_to_utf8_view(2).unwrap();
+        assert_eq!(view.str(0), "short");
+        assert_eq!(view.str(1), "a longer UTF-8 value 你好");
+    }
+
+    #[test]
+    fn utf8_and_binary_safe_apis_reject_cross_type_access() {
+        let mut blob =
+            Vector::try_new(LogicalType::Blob, 1, crate::test_utils::test_allocator()).unwrap();
+        blob.try_set_blob(0, &[0xff]).unwrap();
+        assert!(blob.try_to_utf8_view(1).is_err());
+        assert!(blob.try_set_string(0, "text").is_err());
+
+        let mut text =
+            Vector::try_new(LogicalType::Varchar, 1, crate::test_utils::test_allocator()).unwrap();
+        assert!(text.try_set_blob(0, &[0xff]).is_err());
+
+        let fixed = crate::test_utils::test_i64_vector(&[1]);
+        assert!(fixed.try_to_varlen_view(1).is_err());
     }
 
     #[test]

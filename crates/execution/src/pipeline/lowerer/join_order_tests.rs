@@ -99,6 +99,59 @@ fn direct_rowset_probe_gets_hash_join_runtime_filter_gate() {
 }
 
 #[test]
+fn left_deep_probe_traces_runtime_filter_to_rowset_column() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        _ => panic!("expected hash join plan"),
+    };
+    let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source = lowerer.attach_hash_join_runtime_filters(
+        source,
+        &[prior_probe],
+        BreakerHandleId::new(3),
+        &spec,
+    );
+
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert_eq!(rowset.dynamic_runtime_filters.len(), 1);
+    assert_eq!(rowset.dynamic_runtime_filters[0].probe_column_id, 0);
+    assert_eq!(
+        rowset.dynamic_runtime_filters[0].handle,
+        BreakerHandleId::new(3)
+    );
+}
+
+#[test]
+fn left_deep_probe_does_not_trace_build_payload_to_rowset() {
+    let plan = hash_join_plan(JoinType::Inner);
+    let lowerer = PipelineLowerer::new(&plan);
+    let mut spec = match &plan.node(plan.root).kind {
+        PhysicalNodeKind::HashJoin(spec) => spec.clone(),
+        _ => panic!("expected hash join plan"),
+    };
+    let prior_probe = hash_join_probe_transform(BreakerHandleId::new(2), &spec);
+    spec.key_conditions[0].left =
+        Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer));
+    let source = SourceSpec::Rowset(RowsetSourceSpec::new(rowset_spec_for_test()));
+    let source = lowerer.attach_hash_join_runtime_filters(
+        source,
+        &[prior_probe],
+        BreakerHandleId::new(3),
+        &spec,
+    );
+
+    let SourceSpec::Rowset(rowset) = source else {
+        panic!("expected rowset source");
+    };
+    assert!(rowset.dynamic_runtime_filters.is_empty());
+}
+
+#[test]
 fn order_lowers_to_sort_build_emit_breaker_pipelines() {
     let plan = order_plan();
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -161,15 +214,8 @@ fn rowset_source_properties_keep_morsel_partitioning() {
     let build = PipelinePropertyAccumulator::start_from_source(&source)
         .close_with_sink(&SinkSpec::ClientResult(ClientResultSpec::default()));
 
-    assert_eq!(
-        build.properties.placement,
-        Placement::Partitioned(MorselPartitioning::rowset_segments())
-    );
-    assert_eq!(
-        build.properties.capabilities.morsel,
-        MorselCapability::Source
-    );
-    assert!(build.properties.capabilities.supports_late_materialization);
+    assert_eq!(build.capabilities.morsel, MorselCapability::Source);
+    assert!(build.capabilities.supports_late_materialization);
 }
 
 #[test]
@@ -187,8 +233,8 @@ fn dummy_and_empty_sources_are_single_task() {
         SourceSpec::Dummy(_)
     ));
     assert_eq!(
-        dummy_graph.pipelines[0].properties.placement,
-        Placement::SingleTask
+        dummy_graph.pipelines[0].properties.capabilities.parallelism,
+        crate::physical::properties::Parallelism::single()
     );
 
     let values = LogicalPlan::new(
@@ -215,8 +261,8 @@ fn dummy_and_empty_sources_are_single_task() {
         SourceSpec::Empty(_)
     ));
     assert_eq!(
-        empty_graph.pipelines[0].properties.placement,
-        Placement::SingleTask
+        empty_graph.pipelines[0].properties.capabilities.parallelism,
+        crate::physical::properties::Parallelism::single()
     );
 }
 
@@ -288,128 +334,4 @@ fn lowerer_rejects_unsupported_nodes_before_runtime() {
     let mut lowerer = PipelineLowerer::new(&plan);
 
     assert!(lowerer.lower_to_pipeline_graph(plan.root).is_err());
-}
-
-#[test]
-fn property_repair_insertion_points_are_explicit() {
-    let source = SourceSpec::Values(crate::physical::ValuesSpec {
-        table_index: 0,
-        expressions: Vec::new().into_boxed_slice(),
-        output_names: vec!["a".to_string()].into_boxed_slice(),
-        output_types: vec![LogicalType::Integer].into_boxed_slice(),
-    });
-    let accumulator = PipelinePropertyAccumulator::start_from_source(&source);
-    let required = crate::physical::properties::RequiredProperties {
-        ordering: OrderingRequirement::Fixed(OrderingSpec::new(vec![OrderingColumn {
-            column: 0,
-            direction: OrderingDirection::Asc,
-            nulls: crate::physical::properties::NullOrdering::Last,
-        }])),
-        partitioning: PartitioningRequirement::BatchIndex,
-        batch_index: BatchIndexRequirement::Required,
-        cardinality: Default::default(),
-    };
-    let build = accumulator.close_with_sink(&SinkSpec::ClientResult(ClientResultSpec { required }));
-
-    assert!(build
-        .repair
-        .repairs
-        .iter()
-        .any(|repair| matches!(repair, PropertyRepairKind::Sort(_))));
-    assert!(build
-        .repair
-        .repairs
-        .iter()
-        .any(|repair| matches!(repair, PropertyRepairKind::BatchIndexAdapter)));
-}
-
-#[test]
-fn blocking_property_repair_lowers_to_breaker_pipeline() {
-    let plan = linear_plan();
-    let required = crate::physical::properties::RequiredProperties {
-        ordering: OrderingRequirement::Fixed(OrderingSpec::new(vec![OrderingColumn {
-            column: 0,
-            direction: OrderingDirection::Asc,
-            nulls: crate::physical::properties::NullOrdering::Last,
-        }])),
-        partitioning: PartitioningRequirement::BatchIndex,
-        batch_index: BatchIndexRequirement::Required,
-        cardinality: Default::default(),
-    };
-    let mut lowerer = PipelineLowerer::new(&plan);
-    let mut pipelines = Vec::new();
-    let mut dependencies = Vec::new();
-    let root = lowerer
-        .lower_subtree_to_sink(
-            plan.root,
-            SinkSpec::ClientResult(ClientResultSpec { required }),
-            SinkSharing::Exclusive,
-            plan.node(plan.root).output.clone(),
-            &mut pipelines,
-            &mut dependencies,
-        )
-        .unwrap();
-
-    let graph = PipelineGraph {
-        pipelines,
-        dependencies,
-        handles: std::mem::take(&mut lowerer.handles).finish(),
-        control_regions: Vec::new(),
-        root: PipelineRoot::Pipeline(root),
-    };
-    graph.validate().unwrap();
-
-    assert!(graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.sink, SinkSpec::SortBuild(_))));
-    assert!(graph
-        .pipelines
-        .iter()
-        .any(|pipeline| matches!(pipeline.source, SourceSpec::SortEmit(_))));
-    assert!(graph.pipelines.iter().all(|pipeline| {
-        pipeline.transforms.iter().all(|transform| {
-            !matches!(
-                transform,
-                TransformSpec::PropertyRepair(crate::pipeline::graph::PropertyRepairSpec {
-                    kind: PropertyRepairKind::Sort(_) | PropertyRepairKind::MaterializationAdapter
-                })
-            )
-        })
-    }));
-}
-
-#[test]
-fn invalid_ordering_repair_fails_before_program_build() {
-    let plan = linear_plan();
-    let required = crate::physical::properties::RequiredProperties {
-        ordering: OrderingRequirement::Fixed(OrderingSpec::new(vec![OrderingColumn {
-            column: 99,
-            direction: OrderingDirection::Asc,
-            nulls: crate::physical::properties::NullOrdering::Last,
-        }])),
-        partitioning: PartitioningRequirement::Any,
-        batch_index: BatchIndexRequirement::Any,
-        cardinality: Default::default(),
-    };
-    let mut lowerer = PipelineLowerer::new(&plan);
-    let mut pipelines = Vec::new();
-    let mut dependencies = Vec::new();
-
-    let err = lowerer
-        .lower_subtree_to_sink(
-            plan.root,
-            SinkSpec::ClientResult(ClientResultSpec { required }),
-            SinkSharing::Exclusive,
-            plan.node(plan.root).output.clone(),
-            &mut pipelines,
-            &mut dependencies,
-        )
-        .expect_err("invalid repair ordering should not reach program build");
-
-    assert!(err
-        .to_string()
-        .contains("property repair sort references missing column 99"));
-    assert!(pipelines.is_empty());
-    assert!(dependencies.is_empty());
 }

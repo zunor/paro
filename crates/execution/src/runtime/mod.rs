@@ -73,15 +73,10 @@ where
             }
         }
         Expression::Window(expr) => {
-            for child in &expr.children {
-                visit_column_refs(child, visitor);
-            }
-            for partition in &expr.partitions {
-                visit_column_refs(partition, visitor);
-            }
-            for order in &expr.orders {
-                visit_column_refs(&order.expression, visitor);
-            }
+            paro_planner::expression::ExpressionIterator::enumerate_window_children(
+                expr,
+                |child| visit_column_refs(child, visitor),
+            );
         }
         Expression::Reference(_) | Expression::Parameter(_) | Expression::Constant(_) => {}
     }
@@ -135,10 +130,10 @@ pub use breaker::{
     AggregateHandle, BreakerHandleMetadata, BreakerHandleRegistry, CleanupReason, CleanupState,
     CleanupStatus, CompletionLatch, CteHandle, DelimHandle, ExternalTableHandle, HandleRef,
     JoinBuildHandle, JoinBuildId, JoinBuildMode, JoinBuildStats, JoinExternalModeConfig,
-    JoinPartitionSet, JoinSpillState, MaterializedHandle, ProbeSpillSet, RecursiveTableHandle,
-    RuntimeBreakerHandle, RuntimeCleanup, SetOperationHandle, SharedSinkCoordinator,
-    SharedSinkMergeEvent, SharedSinkProducerIndex, SharedSinkState, SortHandle, TopNHandle,
-    TypedBreakerHandle, WindowHandle,
+    JoinPartitionSet, JoinSpillState, MaterializedHandle, PartitionAggregateWindowHandle,
+    ProbeSpillSet, RecursiveTableHandle, RuntimeBreakerHandle, RuntimeCleanup, SetOperationHandle,
+    SharedSinkCoordinator, SharedSinkMergeEvent, SharedSinkProducerIndex, SharedSinkState,
+    SortHandle, TopNHandle, TypedBreakerHandle, WindowHandle,
 };
 pub use context::{
     BlockReason, Blocker, FinishTaskId, OperatorCallContext, OperatorCleanupContext,
@@ -166,6 +161,7 @@ pub use scheduling_policy::{
     FairnessPolicy, PipelineReadyEvent, PipelineReadyPriority, PipelineSchedulingPolicy,
     ReadyEntry, ReadyQueuePolicy, WakeStormPolicy,
 };
+pub(crate) use scratch::FinishTaskState;
 pub use scratch::{
     ChunkLayout, ChunkLayoutKind, ChunkLease, ExpressionScratchArena, ExpressionScratchLease,
     PendingChunkState, PipelineScratch, PipelineScratchLayout, PipelineTaskState, SinkResumeState,
@@ -173,21 +169,23 @@ pub use scratch::{
 };
 pub use sink::{
     CancelReason, ClientResultSinkExec, CopyToFileSinkExec, CteMaterializeSinkExec, DeleteSinkExec,
-    DelimCaptureSinkExec, DynSinkExec, ExternalTableSinkExec, FinishPoll, FinishTaskGroup,
-    FinishTaskPoll, FinishWork, HashAggregateBuildSinkExec, HashJoinBuildSinkExec, InsertSinkExec,
-    MaterializeSinkExec, MergePoll, NextFinishTask, ParallelFinishDriver,
-    PerfectHashAggregateSinkExec, PrepareFinishPoll, RecursiveTableAppendSinkExec,
-    SetOperationInputSinkExec, SinkExec, SinkPoll, SortBuildSinkExec, TopNBuildSinkExec,
-    UngroupedAggregateSinkExec, UpdateSinkExec, WindowBuildSinkExec,
+    DelimCaptureSinkExec, DynSinkExec, ExternalTableSinkExec, FinishCoordinatorParticipation,
+    FinishPoll, FinishTaskGroup, FinishTaskPoll, FinishWork, HashAggregateBuildSinkExec,
+    HashJoinBuildSinkExec, InsertSinkExec, MaterializeSinkExec, MergePoll, NextFinishTask,
+    ParallelFinishDriver, PartitionAggregateWindowBuildSinkExec, PerfectHashAggregateSinkExec,
+    PrepareFinishPoll, RecursiveTableAppendSinkExec, SetOperationInputSinkExec, SinkExec, SinkPoll,
+    SortBuildSinkExec, TopNBuildSinkExec, UngroupedAggregateSinkExec, UpdateSinkExec,
+    WindowBuildSinkExec,
 };
 pub use source::{
     AdaptiveSearchSourceExec, ChunkSourceExec, ClassicIeJoinSourceExec, CteScanSourceExec,
     DelimScanSourceExec, DummySourceExec, DynSourceExec, EmptySourceExec, ExpressionSourceExec,
     ExternalTableSourceExec, FullTextSearchSourceExec, GraphScanSourceExec,
     HashAggregateEmitSourceExec, HashJoinSpillReplaySourceExec, HashJoinUnmatchedSourceExec,
-    MaterializedSourceExec, PerfectHashAggregateEmitSourceExec, RecursiveTableScanSourceExec,
-    RowsetSourceDesc, RowsetSourceExec, SetOperationEmitSourceExec, SortEmitSourceExec, SourceExec,
-    SourcePoll, SparseVectorSearchSourceExec, TableFunctionSourceExec, TopNEmitSourceExec,
+    MaterializedSourceExec, PartitionAggregateWindowEmitSourceExec,
+    PerfectHashAggregateEmitSourceExec, RecursiveTableScanSourceExec, RowsetSourceDesc,
+    RowsetSourceExec, SetOperationEmitSourceExec, SortEmitSourceExec, SourceExec, SourcePoll,
+    SparseVectorSearchSourceExec, TableFunctionSourceExec, TopNEmitSourceExec,
     UngroupedAggregateEmitSourceExec, ValuesSourceExec, VectorSearchSourceExec,
     WindowEmitSourceExec,
 };
@@ -206,7 +204,6 @@ pub use state::{
     RecursiveTableScanSourceLocal, RowsetSourceGlobal, RowsetSourceLocal,
     SetOperationEmitSourceLocal, SetOperationInputSinkLocal, SinkGlobal, SinkLocal,
     SortBuildSinkLocal, SortEmitSourceLocal, SourceGlobal, SourceLocal,
-    StreamingAggregateTransformGlobal, StreamingAggregateTransformLocal,
     StreamingLimitTransformGlobal, StreamingLimitTransformLocal, StreamingTopNTransformGlobal,
     StreamingTopNTransformLocal, StreamingWindowTransformGlobal, StreamingWindowTransformLocal,
     TableFunctionSourceGlobal, TableFunctionSourceLocal, TopNBuildSinkLocal, TopNEmitSourceLocal,
@@ -221,9 +218,9 @@ pub use transform::{
     CrossProductProbeTransformExec, DynTransformExec, ExternalProjectTransformExec,
     FilterTransformExec, GraphExpandTransformExec, GraphProjectTransformExec,
     GraphShortestPathTransformExec, HashJoinProbeTransformExec, ProjectTransformExec,
-    PropertyRepairTransformExec, StreamingAggregateTransformExec, StreamingLimitTransformExec,
-    StreamingTopNTransformExec, StreamingWindowTransformExec, TransformExec, TransformFinishPoll,
-    TransformFlushPoll, TransformPoll,
+    RowFetchTransformExec, StreamingLimitTransformExec, StreamingTopNTransformExec,
+    StreamingWindowTransformExec, TransformExec, TransformFinishPoll, TransformFlushPoll,
+    TransformPoll,
 };
 pub use utility::{run_once as run_utility_once, UtilityRunResult};
 pub(crate) use work_group::WorkGroupCompletion;

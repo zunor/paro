@@ -26,6 +26,7 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::Result;
+use std::ops::Range;
 
 /// Builder for binary plain-encoded pages (variable-length strings).
 pub struct BinaryPlainPageBuilder {
@@ -215,6 +216,7 @@ impl BinaryPlainPageBuilder {
 }
 
 /// Decoder for binary plain-encoded pages.
+#[derive(Clone)]
 pub struct BinaryPlainPageDecoder {
     /// Page data
     data: Bytes,
@@ -228,6 +230,130 @@ pub struct BinaryPlainPageDecoder {
     parsed: bool,
 }
 
+/// Borrowed logical row range over one validated BinaryPlain page.
+///
+/// Only `BinaryPlainPageDecoder` constructs this type, after validating the
+/// page trailer and every offset. Cloning the range pins the immutable page;
+/// it never copies string payloads.
+#[derive(Debug, Clone)]
+pub(crate) struct BinaryPlainPageSlice {
+    data: Bytes,
+    offsets_pos: usize,
+    page_rows: usize,
+    first_row: usize,
+    rows: usize,
+}
+
+/// Sequential row boundaries within a validated BinaryPlain payload.
+///
+/// Random row access has to reload both adjacent offsets. Predicate kernels
+/// walk rows in order, so carrying the previous end turns the offset table
+/// into one linear load per row. Ranges are relative to
+/// [`BinaryPlainPageSlice::payload_ref`].
+pub(crate) struct BinaryPlainPayloadRowRanges<'a> {
+    page: &'a BinaryPlainPageSlice,
+    payload_start: usize,
+    row_idx: usize,
+    current: usize,
+}
+
+impl Iterator for BinaryPlainPayloadRowRanges<'_> {
+    type Item = Range<usize>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.row_idx >= self.page.rows {
+            return None;
+        }
+        let next_row_idx = self.row_idx.checked_add(1)?;
+        let page_row_end = self.page.first_row.checked_add(next_row_idx)?;
+        let end = self
+            .page
+            .offset_at(page_row_end)?
+            .checked_sub(self.payload_start)?;
+        let range = self.current..end;
+        self.current = end;
+        self.row_idx = next_row_idx;
+        Some(range)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.page.rows - self.row_idx;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for BinaryPlainPayloadRowRanges<'_> {}
+
+impl BinaryPlainPageSlice {
+    #[inline]
+    fn offset_at(&self, index: usize) -> Option<usize> {
+        if index == self.page_rows {
+            return Some(self.offsets_pos);
+        }
+        if index > self.page_rows {
+            return None;
+        }
+        let pos = self.offsets_pos.checked_add(index.checked_mul(4)?)?;
+        Some(u32::from_le_bytes(self.data.get(pos..pos + 4)?.try_into().ok()?) as usize)
+    }
+
+    #[inline]
+    pub(crate) fn row_value(&self, row_idx: usize) -> Option<Bytes> {
+        let value = self.row_value_ref(row_idx)?;
+        let offset = value.as_ptr() as usize - self.data.as_ptr() as usize;
+        Some(self.data.slice(offset..offset + value.len()))
+    }
+
+    #[inline]
+    pub(crate) fn row_value_ref(&self, row_idx: usize) -> Option<&[u8]> {
+        if row_idx >= self.rows {
+            return None;
+        }
+        let index = self.first_row + row_idx;
+        self.data
+            .get(self.offset_at(index)?..self.offset_at(index + 1)?)
+    }
+
+    /// Contiguous payload bytes covered by this logical row range.
+    ///
+    /// Row boundaries remain available through [`Self::row_value_ref`]. A
+    /// page-level predicate may search this slice once, but must reject
+    /// matches that cross one of those boundaries.
+    pub(crate) fn payload_ref(&self) -> Option<&[u8]> {
+        let start = self.offset_at(self.first_row)?;
+        let end = self.offset_at(self.first_row.checked_add(self.rows)?)?;
+        self.data.get(start..end)
+    }
+
+    pub(crate) fn payload_row_ranges(&self) -> Option<BinaryPlainPayloadRowRanges<'_>> {
+        Some(BinaryPlainPayloadRowRanges {
+            page: self,
+            payload_start: self.offset_at(self.first_row)?,
+            row_idx: 0,
+            current: 0,
+        })
+    }
+
+    /// Byte range of one logical row within [`Self::payload_ref`].
+    pub(crate) fn payload_row_range(&self, row_idx: usize) -> Option<Range<usize>> {
+        if row_idx >= self.rows {
+            return None;
+        }
+        let payload_start = self.offset_at(self.first_row)?;
+        let page_row = self.first_row.checked_add(row_idx)?;
+        let start = self.offset_at(page_row)?.checked_sub(payload_start)?;
+        let end = self
+            .offset_at(page_row.checked_add(1)?)?
+            .checked_sub(payload_start)?;
+        (start <= end).then_some(start..end)
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+}
+
 impl BinaryPlainPageDecoder {
     /// Create a new decoder.
     pub fn new(data: Bytes) -> Self {
@@ -238,6 +364,15 @@ impl BinaryPlainPageDecoder {
             cur_index: 0,
             parsed: false,
         }
+    }
+
+    /// Immutable encoded page backing this validated decoder.
+    ///
+    /// A prepared dictionary decoder can be cloned into many data-page
+    /// decoders without revalidating the global offset table. Exposing the
+    /// owner also lets storage-aware batches retain dictionary encoding.
+    pub(crate) fn encoded_data(&self) -> &Bytes {
+        &self.data
     }
 
     /// Initialize the decoder.
@@ -261,8 +396,38 @@ impl BinaryPlainPageDecoder {
             self.data[trailer_pos + 3],
         ]);
 
-        // Calculate offset table position
-        self.offsets_pos = self.data.len() - 4 - (self.num_elements as usize * 4);
+        // Calculate and validate the offset table before any hot-path lookup.
+        // Persisted offsets are untrusted; validating them once lets borrowed
+        // predicate batches use the page without repeating bounds checks.
+        let offsets_size = (self.num_elements as usize)
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted(
+                    "BinaryPlainPageDecoder: offset table size overflow",
+                )
+            })?;
+        self.offsets_pos = self
+            .data
+            .len()
+            .checked_sub(std::mem::size_of::<u32>() + offsets_size)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted("BinaryPlainPageDecoder: truncated offset table")
+            })?;
+        let mut previous = 0u32;
+        for idx in 0..self.num_elements {
+            let pos = self.offsets_pos + idx as usize * std::mem::size_of::<u32>();
+            let offset = u32::from_le_bytes(
+                self.data[pos..pos + std::mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("validated BinaryPlain offset entry"),
+            );
+            if offset < previous || offset as usize > self.offsets_pos {
+                return Err(paro_common::error::data_corrupted(
+                    "BinaryPlainPageDecoder: invalid string offset",
+                ));
+            }
+            previous = offset;
+        }
 
         self.parsed = true;
         self.cur_index = 0;
@@ -302,12 +467,24 @@ impl BinaryPlainPageDecoder {
 
     /// Get string at index.
     pub fn string_at(&self, idx: u32) -> Option<Bytes> {
+        let value = self.value_ref_at(idx)?;
+        let offset = value.as_ptr() as usize - self.data.as_ptr() as usize;
+        Some(self.data.slice(offset..offset + value.len()))
+    }
+
+    /// Borrow a validated value without cloning the page owner.
+    ///
+    /// The decoder owns the immutable page for the lifetime of the returned
+    /// slice. Predicate and dictionary kernels use this form in row loops so
+    /// reading a value does not perform shared-owner reference counting.
+    #[inline]
+    pub(crate) fn value_ref_at(&self, idx: u32) -> Option<&[u8]> {
         if !self.parsed || idx >= self.num_elements {
             return None;
         }
         let start = self.offset(idx) as usize;
         let end = self.offset(idx + 1) as usize;
-        Some(self.data.slice(start..end))
+        self.data.get(start..end)
     }
 
     /// Read the next batch of strings.
@@ -334,6 +511,27 @@ impl BinaryPlainPageDecoder {
         }
 
         Ok(result)
+    }
+
+    /// Advance over a batch while retaining the page's encoded offset layout.
+    /// The returned `Bytes` clone pins the immutable page without copying it.
+    pub(crate) fn next_encoded_batch(&mut self, n: usize) -> Result<BinaryPlainPageSlice> {
+        if !self.parsed {
+            return Err(paro_common::error::internal(
+                "BinaryPlainPageDecoder: not initialized",
+            ));
+        }
+        let remaining = (self.num_elements - self.cur_index) as usize;
+        let count = n.min(remaining);
+        let first_row = self.cur_index as usize;
+        self.cur_index += count as u32;
+        Ok(BinaryPlainPageSlice {
+            data: self.data.clone(),
+            offsets_pos: self.offsets_pos,
+            page_rows: self.num_elements as usize,
+            first_row,
+            rows: count,
+        })
     }
 
     /// Get the number of elements.
@@ -435,6 +633,60 @@ mod tests {
         assert_eq!(batch2.len(), 2);
         assert_eq!(batch2[0].as_ref(), b"four");
         assert_eq!(batch2[1].as_ref(), b"five");
+    }
+
+    #[test]
+    fn encoded_batch_borrows_page_and_advances_decoder() {
+        let mut builder = BinaryPlainPageBuilder::new(256);
+        builder.add_slice(b"one");
+        builder.add_slice(b"two");
+        builder.add_slice(b"three");
+        let page = builder.finish().unwrap();
+        let page_ptr = page.as_ptr();
+        let mut decoder = BinaryPlainPageDecoder::new(page);
+        decoder.init().unwrap();
+
+        let encoded = decoder.next_encoded_batch(2).unwrap();
+
+        assert_eq!(
+            (encoded.first_row, encoded.rows(), decoder.current_index()),
+            (0, 2, 2)
+        );
+        assert_eq!(encoded.data.as_ptr(), page_ptr);
+    }
+
+    #[test]
+    fn encoded_batch_exposes_payload_relative_row_ranges() {
+        let mut builder = BinaryPlainPageBuilder::new(256);
+        for value in [b"skip".as_slice(), b"", b"middle", b"tail"] {
+            builder.add_slice(value);
+        }
+        let mut decoder = BinaryPlainPageDecoder::new(builder.finish().unwrap());
+        decoder.init().unwrap();
+        decoder.seek_to_position(1).unwrap();
+
+        let encoded = decoder.next_encoded_batch(2).unwrap();
+
+        assert_eq!(encoded.payload_ref().unwrap(), b"middle");
+        assert_eq!(encoded.payload_row_range(0), Some(0..0));
+        assert_eq!(encoded.payload_row_range(1), Some(0..6));
+        assert_eq!(encoded.payload_row_range(2), None);
+    }
+
+    #[test]
+    fn decoder_rejects_truncated_and_out_of_range_offsets() {
+        let mut truncated =
+            BinaryPlainPageDecoder::new(Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]));
+        assert!(truncated.init().is_err());
+
+        let mut builder = BinaryPlainPageBuilder::new(256);
+        builder.add_slice(b"a");
+        builder.add_slice(b"b");
+        let mut corrupted = builder.finish().unwrap().to_vec();
+        let offsets_pos = 2;
+        corrupted[offsets_pos + 4..offsets_pos + 8].copy_from_slice(&3u32.to_le_bytes());
+        let mut decoder = BinaryPlainPageDecoder::new(Bytes::from(corrupted));
+        assert!(decoder.init().is_err());
     }
 
     #[test]

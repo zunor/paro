@@ -280,7 +280,7 @@ impl Binder {
             self.wrap_plan(root),
             node.select_list.clone(),
         )
-        .with_output_names(node.names.clone());
+        .with_visible_names(node.names.clone());
         root = LogicalOperator::Projection(projection);
 
         // =================================================================
@@ -329,18 +329,17 @@ mod tests {
     use paro_function::window::WindowFunction;
 
     fn row_number(partition_column: usize) -> WindowExpression {
-        WindowExpression {
-            function: WindowFunction::row_number(),
-            children: Vec::new(),
-            partitions: vec![Expression::ColumnRef(ColumnRefExpression::new(
+        WindowExpression::native(
+            WindowFunction::row_number(),
+            Vec::new(),
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
                 ColumnBinding::new(10, partition_column),
                 LogicalType::Integer,
             ))],
-            orders: Vec::new(),
-            frame: WindowFrame::default(),
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        }
+            Vec::new(),
+            WindowFrame::default(),
+            false,
+        )
     }
 
     #[test]

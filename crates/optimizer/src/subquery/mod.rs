@@ -5,3 +5,11 @@
 
 pub mod delim_join_elimination;
 pub mod empty_result;
+pub(crate) mod output_contract;
+pub mod partition_aggregate;
+pub mod scalar_aggregate_window;
+
+#[cfg(test)]
+pub(crate) mod partition_aggregate_tests;
+#[cfg(test)]
+mod scalar_aggregate_window_tests;

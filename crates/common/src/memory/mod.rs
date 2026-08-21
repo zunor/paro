@@ -39,7 +39,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
-    use crate::allocator::{DefaultAllocator, MemoryTag};
+    use crate::allocator::{Allocator, DefaultAllocator, MemoryTag};
 
     use super::*;
 
@@ -174,5 +174,26 @@ mod tests {
         assert_eq!(ledger.remove(AllocationId(1)), 0);
         assert_eq!(ledger.remove(AllocationId(1)), 128);
         assert!(ledger.is_empty());
+    }
+
+    #[test]
+    fn spill_owner_allocator_observes_bytes_without_consuming_capacity() {
+        let owner = Arc::new(TestOwner::default());
+        let allocator = MemoryOwnerAllocator::new(
+            Arc::new(DefaultAllocator::new()),
+            owner.clone(),
+            MemoryDomain::Host,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Spill,
+        );
+        let ptr = allocator.allocate(64).expect("spill allocation");
+        assert_eq!(owner.capacity.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.used.load(Ordering::SeqCst), 64);
+        let ptr = allocator.reallocate(ptr, 64, 96).expect("grow spill");
+        assert_eq!(owner.capacity.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.used.load(Ordering::SeqCst), 96);
+        allocator.free(ptr, 96);
+        assert_eq!(owner.capacity.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.used.load(Ordering::SeqCst), 0);
     }
 }

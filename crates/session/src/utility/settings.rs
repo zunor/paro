@@ -176,7 +176,7 @@ const SETTING_DESCRIPTORS: &[SettingDescriptor] = &[
         vartype: "bool",
         context: "user",
         unit: None,
-        default_value: |_| Value::Boolean(false),
+        default_value: |_| Value::Boolean(true),
         parse_value: parse_bool_value,
         apply_effective: apply_noop,
     },

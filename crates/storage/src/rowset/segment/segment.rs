@@ -19,18 +19,20 @@ use crate::rowset::column::{
 };
 use crate::rowset::page::CompressionType;
 use crate::rowset::page_reader::PageReader;
+use crate::rowset::scan_cost::ScanAccessCostModel;
 use crate::rowset::segment_statistics::SegmentStatistics;
 use crate::tablet::{ColumnId, TabletSchemaRef};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// Segment options for reading.
 #[derive(Debug, Clone)]
@@ -41,7 +43,9 @@ pub struct SegmentOptions {
     pub predicates: Vec<()>,
     pub page_cache: Option<Arc<PageCache>>,
     pub cache_decompressed: bool,
+    pub cache_decoded: bool,
     pub parallel_decompressor: Option<crate::compression::ParallelDecompressor>,
+    pub scan_access_cost: ScanAccessCostModel,
 }
 
 impl Default for SegmentOptions {
@@ -53,7 +57,9 @@ impl Default for SegmentOptions {
             predicates: Vec::new(),
             page_cache: None,
             cache_decompressed: false,
+            cache_decoded: false,
             parallel_decompressor: None,
+            scan_access_cost: ScanAccessCostModel::default(),
         }
     }
 }
@@ -88,12 +94,42 @@ impl SegmentOptions {
         self
     }
 
+    pub fn with_cache_decoded(mut self, enable: bool) -> Self {
+        self.cache_decoded = enable;
+        self
+    }
+
     pub fn with_parallel_decompressor(
         mut self,
         decompressor: crate::compression::ParallelDecompressor,
     ) -> Self {
         self.parallel_decompressor = Some(decompressor);
         self
+    }
+
+    pub fn with_scan_access_cost(mut self, model: ScanAccessCostModel) -> Self {
+        self.scan_access_cost = model;
+        self
+    }
+
+    pub(crate) fn runtime_equivalent(&self, other: &Self) -> bool {
+        self.verify_checksum == other.verify_checksum
+            && self.compression == other.compression
+            && self.column_ids == other.column_ids
+            && self.predicates.len() == other.predicates.len()
+            && self.cache_decompressed == other.cache_decompressed
+            && self.cache_decoded == other.cache_decoded
+            && self.scan_access_cost == other.scan_access_cost
+            && match (&self.page_cache, &other.page_cache) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.parallel_decompressor, &other.parallel_decompressor) {
+                (Some(left), Some(right)) => left.runtime_equivalent(right),
+                (None, None) => true,
+                _ => false,
+            }
     }
 }
 
@@ -127,7 +163,11 @@ pub struct Segment {
     pub(super) footer: SegmentFooter,
     pub(super) meta: SegmentMeta,
     pub(super) statistics: Option<SegmentStatistics>,
-    pub(super) column_readers: RwLock<HashMap<ColumnId, Arc<SharedColumnReader<CloneFile>>>>,
+    pub(super) column_readers: RwLock<HashMap<ColumnId, Arc<SharedColumnReader<PositionedFile>>>>,
+    /// One immutable file handle per loaded segment. Column iterators own only
+    /// a logical cursor and use positioned reads, so independent scan morsels
+    /// neither reopen the file nor share a mutable OS seek position.
+    pub(super) shared_file: Mutex<Option<Arc<File>>>,
     pub(super) short_key_index_decoder: RwLock<Option<Arc<ShortKeyIndexDecoder>>>,
     pub(super) indexes: SegmentIndexes,
     pub(super) index_stats: SegmentIndexStats,
@@ -138,25 +178,72 @@ pub struct Segment {
     pub(super) delete_vector_load_requests: AtomicU64,
 }
 
-/// A wrapper for `File` that implements `Clone` using `try_clone`.
+/// An independently seekable cursor over a shared immutable segment file.
+///
+/// `File::try_clone` duplicates the descriptor but may retain the same open
+/// file description and therefore the same seek offset. Analytical scans use
+/// many column iterators concurrently, so the cursor must live in userspace
+/// and every read must name its physical offset explicitly.
 #[derive(Debug)]
-pub struct CloneFile(pub File);
+pub struct PositionedFile {
+    file: Arc<File>,
+    position: u64,
+}
 
-impl Clone for CloneFile {
+impl PositionedFile {
+    pub(super) fn new(file: Arc<File>) -> Self {
+        Self { file, position: 0 }
+    }
+
+    fn position_with_delta(base: u64, delta: i64) -> std::io::Result<u64> {
+        if delta >= 0 {
+            base.checked_add(delta as u64)
+        } else {
+            base.checked_sub(delta.unsigned_abs())
+        }
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid seek"))
+    }
+
+    #[cfg(unix)]
+    fn read_positioned(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_at(buf, self.position)
+    }
+
+    #[cfg(windows)]
+    fn read_positioned(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::windows::fs::FileExt;
+        self.file.seek_read(buf, self.position)
+    }
+}
+
+impl Clone for PositionedFile {
     fn clone(&self) -> Self {
-        Self(self.0.try_clone().expect("Failed to clone file"))
+        Self {
+            file: Arc::clone(&self.file),
+            position: self.position,
+        }
     }
 }
 
-impl Read for CloneFile {
+impl Read for PositionedFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        let read = self.read_positioned(buf)?;
+        self.position = self.position.checked_add(read as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "file position overflow")
+        })?;
+        Ok(read)
     }
 }
 
-impl Seek for CloneFile {
+impl Seek for PositionedFile {
     fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
-        self.0.seek(pos)
+        self.position = match pos {
+            SeekFrom::Start(position) => position,
+            SeekFrom::Current(delta) => Self::position_with_delta(self.position, delta)?,
+            SeekFrom::End(delta) => Self::position_with_delta(self.file.metadata()?.len(), delta)?,
+        };
+        Ok(self.position)
     }
 }
 
@@ -175,6 +262,28 @@ impl std::fmt::Debug for Segment {
 }
 
 impl Segment {
+    fn shared_file_reader(&self) -> Result<PositionedFile> {
+        let mut shared = self.shared_file.lock().map_err(|_| {
+            paro_error::internal(format!(
+                "segment {} shared file lock is poisoned",
+                self.segment_id
+            ))
+        })?;
+        if shared.is_none() {
+            let file = File::open(&self.file_path).map_err(|error| {
+                paro_error::io_error(format!(
+                    "Failed to open segment file {:?}: {error}",
+                    self.file_path
+                ))
+            })?;
+            storage_metrics().record_segment_file_open();
+            *shared = Some(Arc::new(file));
+        }
+        Ok(PositionedFile::new(Arc::clone(
+            shared.as_ref().expect("shared segment file initialized"),
+        )))
+    }
+
     /// Get segment-level statistics if available.
     pub fn statistics(&self) -> Option<&SegmentStatistics> {
         self.statistics.as_ref()
@@ -297,13 +406,32 @@ impl Segment {
         }
 
         let ordinals: Vec<u64> = row_offsets.iter().map(|&o| o as u64).collect();
-        let mut result = Vec::with_capacity(column_ids.len());
-        for &col_id in column_ids {
-            let mut iter = self.new_column_iterator(col_id)?;
-            let batch = iter.read_by_rowids(&ordinals)?;
-            result.push((col_id, batch));
+        // A late materialization batch is commonly a small TopN result.  In
+        // that shape each column performs only a handful of page-local point
+        // reads, so dispatching one Rayon job per column costs more than the
+        // decode itself.  Keep small batches on the query worker and reserve
+        // column-parallel reads for enough independent cell work to amortize
+        // scheduler handoff.  This is deliberately based on total work, not a
+        // query or schema special case.
+        let cell_count = column_ids.len().saturating_mul(row_offsets.len());
+        if column_ids.len() > 1 && cell_count >= paro_common::vector::VECTOR_SIZE {
+            return column_ids
+                .par_iter()
+                .map(|&col_id| {
+                    let mut iter = self.new_column_iterator(col_id)?;
+                    let batch = iter.read_by_rowids(&ordinals)?;
+                    Ok((col_id, batch))
+                })
+                .collect();
         }
-        Ok(result)
+        column_ids
+            .iter()
+            .map(|&col_id| {
+                let mut iter = self.new_column_iterator(col_id)?;
+                let batch = iter.read_by_rowids(&ordinals)?;
+                Ok((col_id, batch))
+            })
+            .collect()
     }
 
     pub fn new_column_iterator(
@@ -321,12 +449,8 @@ impl Segment {
         {
             let readers = self.column_readers.read().unwrap();
             if let Some(reader) = readers.get(&column_id) {
-                let file = File::open(&self.file_path).map_err(|e| {
-                    paro_error::io_error(format!("Failed to open segment file: {}", e))
-                })?;
-                storage_metrics().record_segment_file_open();
                 return reader.new_iterator(
-                    CloneFile(file),
+                    self.shared_file_reader()?,
                     prefetcher,
                     Some(self.file_path.clone()),
                 );
@@ -335,19 +459,18 @@ impl Segment {
 
         let mut readers = self.column_readers.write().unwrap();
         if let Some(reader) = readers.get(&column_id) {
-            let file = File::open(&self.file_path)
-                .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
-            storage_metrics().record_segment_file_open();
-            return reader.new_iterator(CloneFile(file), prefetcher, Some(self.file_path.clone()));
+            return reader.new_iterator(
+                self.shared_file_reader()?,
+                prefetcher,
+                Some(self.file_path.clone()),
+            );
         }
 
         let col_meta = self.get_column_meta(column_id).ok_or_else(|| {
             paro_error::invalid_input(format!("Column {} not found in segment", column_id))
         })?;
 
-        let file = File::open(&self.file_path)
-            .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
-        storage_metrics().record_segment_file_open();
+        let file = self.shared_file_reader()?;
 
         let logical_type = self
             .schema
@@ -364,6 +487,7 @@ impl Segment {
             zonemap_index_pointer: col_meta.zonemap_index_pointer,
             dict_page_pointer: col_meta.dict_page_pointer,
             is_nullable: col_meta.is_nullable,
+            null_count: col_meta.null_count,
             type_size: logical_type
                 .and_then(|logical_type| fixed_row_width(logical_type).ok())
                 .or_else(|| col_meta.field_type.size()),
@@ -376,7 +500,7 @@ impl Segment {
 
         let mut column_reader = ColumnReader::create(
             reader_meta,
-            CloneFile(file.try_clone().unwrap()),
+            file.clone(),
             reader_opts,
             self.page_reader.clone(),
             prefetcher.clone(),
@@ -386,7 +510,7 @@ impl Segment {
         let _ = column_reader.new_iterator()?;
         let shared_reader = column_reader.into_shared();
         readers.insert(column_id, shared_reader.clone());
-        shared_reader.new_iterator(CloneFile(file), prefetcher, Some(self.file_path.clone()))
+        shared_reader.new_iterator(file, prefetcher, Some(self.file_path.clone()))
     }
 
     pub fn load_short_key_index(&self) -> Result<()> {
@@ -398,9 +522,7 @@ impl Segment {
             let footer = self.footer.short_key_index_footer.as_ref().ok_or_else(|| {
                 paro_error::data_corrupted("Short key footer missing for short key page")
             })?;
-            let mut file = File::open(&self.file_path)
-                .map_err(|e| paro_error::io_error(format!("Failed to open segment file: {}", e)))?;
-            storage_metrics().record_segment_file_open();
+            let mut file = self.shared_file_reader()?;
             file.seek(SeekFrom::Start(ptr.offset)).map_err(|e| {
                 paro_error::io_error(format!("Failed to seek to short key index: {}", e))
             })?;

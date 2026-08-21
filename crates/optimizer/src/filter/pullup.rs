@@ -16,6 +16,7 @@ use paro_planner::operator::{
 use paro_planner::plan::LogicalPlan;
 
 use crate::expression::join_has_evaluation_fence;
+use crate::expression::traversal::visit_expression;
 
 /// Filter pullup optimizer.
 ///
@@ -200,71 +201,51 @@ impl FilterPullup {
         expr: &mut Expression,
         proj_table_idx: usize,
     ) {
-        match expr {
-            Expression::ColumnRef(col) => {
-                let old_binding = col.binding;
+        let mut columns = Vec::new();
+        Self::collect_column_refs(expr, &mut columns);
 
-                // Find the corresponding column in projection expressions
-                let mut found = false;
-                for (proj_idx, proj_expr) in proj_expressions.iter().enumerate() {
-                    if let Expression::ColumnRef(proj_col) = proj_expr {
-                        let proj_binding = proj_col.binding;
+        let mut replacements = Vec::new();
+        for column in columns {
+            if replacements
+                .iter()
+                .any(|(binding, _)| *binding == column.binding)
+            {
+                continue;
+            }
 
-                        if old_binding == proj_binding {
-                            col.binding = ColumnBinding::new(proj_table_idx, proj_idx);
-                            found = true;
-                            break;
-                        }
-                    }
-                }
-                if !found {
-                    // Project a new column
-                    let new_col = Expression::ColumnRef(ColumnRefExpression::new(
-                        old_binding,
-                        col.return_type.clone(),
-                    ));
-                    col.binding = ColumnBinding::new(proj_table_idx, proj_expressions.len());
-                    proj_expressions.push(new_col);
-                }
-            }
-            Expression::Comparison(comp) => {
-                Self::replace_expression_binding(proj_expressions, &mut comp.left, proj_table_idx);
-                Self::replace_expression_binding(proj_expressions, &mut comp.right, proj_table_idx);
-            }
-            Expression::Conjunction(conj) => {
-                for child in &mut conj.children {
-                    Self::replace_expression_binding(proj_expressions, child, proj_table_idx);
-                }
-            }
-            Expression::Function(func) => {
-                for child in &mut func.children {
-                    Self::replace_expression_binding(proj_expressions, child, proj_table_idx);
-                }
-            }
-            Expression::Cast(cast) => {
-                Self::replace_expression_binding(proj_expressions, &mut cast.child, proj_table_idx);
-            }
-            Expression::Operator(op) => {
-                for child in &mut op.children {
-                    Self::replace_expression_binding(proj_expressions, child, proj_table_idx);
-                }
-            }
-            Expression::Case(case) => {
-                Self::replace_expression_binding(proj_expressions, &mut case.check, proj_table_idx);
-                Self::replace_expression_binding(
-                    proj_expressions,
-                    &mut case.result_if_true,
-                    proj_table_idx,
-                );
-                Self::replace_expression_binding(
-                    proj_expressions,
-                    &mut case.result_if_false,
-                    proj_table_idx,
-                );
-            }
-            // Constants and other expressions don't need binding replacement
-            _ => {}
+            let output_index = proj_expressions
+                .iter()
+                .position(|projected| {
+                    matches!(projected, Expression::ColumnRef(existing) if existing.binding == column.binding)
+                })
+                .unwrap_or_else(|| {
+                    let output_index = proj_expressions.len();
+                    proj_expressions.push(Expression::ColumnRef(column.clone()));
+                    output_index
+                });
+            replacements.push((column.binding, output_index));
         }
+
+        let rewritten = expr.clone().replace_column_ref(&|column| {
+            replacements
+                .iter()
+                .find(|(binding, _)| *binding == column.binding)
+                .map(|(_, output_index)| {
+                    Expression::ColumnRef(ColumnRefExpression::new(
+                        ColumnBinding::new(proj_table_idx, *output_index),
+                        column.return_type.clone(),
+                    ))
+                })
+        });
+        *expr = rewritten;
+    }
+
+    fn collect_column_refs(expr: &Expression, columns: &mut Vec<ColumnRefExpression>) {
+        visit_expression(expr, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                columns.push(column.clone());
+            }
+        });
     }
 
     /// Pull up through a Join operator.
@@ -771,7 +752,7 @@ mod tests {
         let order = paro_planner::operator::Order {
             child: Box::new(plan(&ctx, LogicalOperator::Filter(filter))),
             orders: vec![],
-            projection_map: Vec::new(),
+            projection_map: paro_planner::operator::ProjectionMap::all(),
         };
         let op = LogicalOperator::Order(order);
 

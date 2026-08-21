@@ -2021,7 +2021,7 @@ impl BoundIndex for ART {
     }
 
     fn evaluate_predicate(&self, predicate: &Predicate) -> PredicateResult {
-        if predicate.column_id() != self.column_id {
+        if predicate.index_column_id() != Some(self.column_id) {
             return PredicateResult::Unknown;
         }
         let logical_type = &self.logical_type;

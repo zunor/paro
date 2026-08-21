@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
-use paro_planner::operator::{Join, JoinType, LogicalOperator};
+use paro_planner::operator::{Join, JoinType, LogicalOperator, ProjectionMap};
 use paro_planner::plan::LogicalPlan;
 
 /// Choose a cheaper build side for joins.
@@ -56,9 +56,18 @@ impl BuildProbeSideOptimizer {
     }
 
     fn try_flip_comparison_join(&self, join: &mut paro_planner::operator::ComparisonJoin) {
-        // Only INNER joins participate in build/probe side selection here.
-        // Other join types keep their existing side contract.
-        if join.join_type != JoinType::Inner {
+        // Reduction joins have explicit right-preserving inverses, so they can
+        // choose the smaller build relation without changing multiplicity or
+        // their one-side output contract. Outer joins retain their current
+        // orientation because unmatched-row emission is a separate pipeline.
+        if !matches!(
+            join.join_type,
+            JoinType::Inner
+                | JoinType::Semi
+                | JoinType::Anti
+                | JoinType::RightSemi
+                | JoinType::RightAnti
+        ) {
             return;
         }
 
@@ -66,9 +75,48 @@ impl BuildProbeSideOptimizer {
             return;
         };
 
-        let left_cost = self.build_cost(join.left.as_ref());
-        let right_cost = self.build_cost(join.right.as_ref());
-        if right_cost <= left_cost {
+        let has_hash_key = join.conditions.iter().any(|condition| {
+            matches!(
+                condition.comparison,
+                paro_planner::operator::JoinComparisonType::Equal
+                    | paro_planner::operator::JoinComparisonType::NotDistinctFrom
+            )
+        });
+        let left_cost = self.comparison_build_cost(
+            join.left.as_ref(),
+            &join.left_projection_map,
+            join.conditions.iter().map(|condition| &condition.left),
+            has_hash_key,
+        );
+        let right_cost = self.comparison_build_cost(
+            join.right.as_ref(),
+            &join.right_projection_map,
+            join.conditions.iter().map(|condition| &condition.right),
+            has_hash_key,
+        );
+        let filtering_side = reduction_filtering_side(join.join_type);
+        // Control-region ownership constrains only a reduction's filtering
+        // input. Ordinary comparison joins never consult this witness, so do
+        // not turn the bottom-up pass into repeated full-subtree scans.
+        let filtering_contains_control_region = match filtering_side {
+            Some(JoinBuildSide::Left) => contains_control_region_boundary(join.left.as_ref()),
+            Some(JoinBuildSide::Right) => contains_control_region_boundary(join.right.as_ref()),
+            None => false,
+        };
+        let build_side = choose_join_build_side(
+            filtering_side,
+            JoinBuildCandidate {
+                serialized_work: left_cost,
+                contains_control_region: filtering_side == Some(JoinBuildSide::Left)
+                    && filtering_contains_control_region,
+            },
+            JoinBuildCandidate {
+                serialized_work: right_cost,
+                contains_control_region: filtering_side == Some(JoinBuildSide::Right)
+                    && filtering_contains_control_region,
+            },
+        );
+        if build_side == JoinBuildSide::Right {
             return;
         }
 
@@ -97,68 +145,229 @@ impl BuildProbeSideOptimizer {
 
     fn build_cost(&self, plan: &LogicalPlan) -> u128 {
         let cardinality = self.estimated_cardinality(plan) as u128;
-        let row_width = self.estimate_row_width(&plan.types()) as u128;
+        let row_width = estimate_row_width(&plan.types()) as u128;
         cardinality.saturating_mul(row_width.max(1))
     }
 
+    fn comparison_build_cost<'a>(
+        &self,
+        plan: &LogicalPlan,
+        projection: &ProjectionMap,
+        condition_expressions: impl Iterator<Item = &'a paro_planner::expression::Expression>,
+        has_hash_key: bool,
+    ) -> f64 {
+        let cardinality = self.estimated_cardinality(plan) as f64;
+        let plan_types = plan.types();
+        if !has_hash_key {
+            // Nested-loop joins materialize the complete build chunk. Unlike
+            // hash rows there is no independently serialized key/runtime
+            // suffix, so mirror the materialized row container directly.
+            return cardinality * estimate_row_width(&plan_types).max(1) as f64;
+        }
+        let projected_types = projection
+            .to_indices(plan_types.len())
+            .into_iter()
+            .filter_map(|index| plan_types.get(index).cloned());
+        let condition_types = condition_expressions.map(|expression| expression.return_type());
+        let projected_payload_width =
+            estimate_row_payload_width(&projected_types.collect::<Vec<_>>());
+        let condition_payload_width =
+            estimate_row_payload_width(&condition_types.collect::<Vec<_>>());
+
+        // Hash build rows store equality keys independently of the visible
+        // payload, followed by hash, next-pointer, and match-mask state. The
+        // former width-only estimate omitted these fixed bytes and therefore
+        // preferred very large narrow build inputs over substantially smaller
+        // relations. Charge the actual serialized shape used by
+        // `BuildRowLayout`; projected key columns deliberately remain in the
+        // payload because the join may expose them above the operator.
+        let row_width =
+            estimate_hash_build_row_width(projected_payload_width, condition_payload_width) as f64;
+        cardinality * row_width.max(1.0)
+    }
+
     fn estimated_cardinality(&self, plan: &LogicalPlan) -> usize {
-        plan.stats
-            .estimated_cardinality
-            .map(|estimate| estimate.expected.min(usize::MAX as u64) as usize)
-            .unwrap_or_else(|| self.default_cardinality())
+        estimate_plan_cardinality(self.session.as_ref(), plan)
+    }
+}
+
+/// Estimate one atomic logical input consistently for join enumeration and
+/// final build/probe orientation.
+pub(crate) fn estimate_plan_cardinality(session: &StatementContext, plan: &LogicalPlan) -> usize {
+    if let Some(estimate) = plan.stats.estimated_cardinality {
+        return estimate.expected.max(1).min(usize::MAX as u64) as usize;
     }
 
-    fn default_cardinality(&self) -> usize {
-        match self.session.get_setting("default_table_cardinality") {
-            Some(paro_common::runtime_value::Value::BigInt(v)) if *v > 0 => *v as usize,
-            Some(paro_common::runtime_value::Value::Integer(v)) if *v > 0 => *v as usize,
-            _ => 1000,
-        }
-    }
-
-    fn estimate_row_width(&self, types: &[LogicalType]) -> usize {
-        let mut width = 8;
-        for ty in types {
-            width += ty.type_size();
-            width += Self::type_penalty(ty);
-        }
-        width
-    }
-
-    fn type_penalty(ty: &LogicalType) -> usize {
-        match ty {
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb
-            | LogicalType::Blob => 8,
-            LogicalType::List(child) => 32 + Self::type_penalty(child),
-            LogicalType::Array(child, _) => 32 + Self::type_penalty(child),
-            LogicalType::Struct(fields) => {
-                16 + fields
-                    .iter()
-                    .map(|(_, ty)| Self::type_penalty(ty))
-                    .sum::<usize>()
+    match &plan.operator {
+        LogicalOperator::Get(get) => {
+            if let Some(rows) = get
+                .table
+                .as_ref()
+                .and_then(|table| table.get_storage())
+                .and_then(|storage| storage.total_rows().ok())
+            {
+                return rows.max(1);
             }
-            _ => 1,
+            default_cardinality(session)
         }
+        LogicalOperator::ExpressionGet(get) => get.expressions.len().max(1),
+        LogicalOperator::TableFunctionGet(_) => 100,
+        _ => default_cardinality(session),
+    }
+}
+
+fn default_cardinality(session: &StatementContext) -> usize {
+    match session.get_setting("default_table_cardinality") {
+        Some(paro_common::runtime_value::Value::BigInt(v)) if *v > 0 => *v as usize,
+        Some(paro_common::runtime_value::Value::Integer(v)) if *v > 0 => *v as usize,
+        _ => 1000,
+    }
+}
+
+pub(crate) fn contains_control_region_boundary(plan: &LogicalPlan) -> bool {
+    let owns_region = matches!(
+        &plan.operator,
+        LogicalOperator::Join(Join::Comparison(join))
+            if !join.duplicate_eliminated_columns.is_empty()
+    ) || matches!(
+        &plan.operator,
+        LogicalOperator::MaterializedCTE(_) | LogicalOperator::RecursiveCTE(_)
+    );
+    owns_region
+        || plan
+            .children()
+            .iter()
+            .any(|child| contains_control_region_boundary(child))
+}
+
+/// Physical side selected as the materialized join build input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinBuildSide {
+    Left,
+    Right,
+}
+
+/// Return the logical filtering input of a reduction join in its current
+/// physical child coordinates.
+pub(crate) fn reduction_filtering_side(join_type: JoinType) -> Option<JoinBuildSide> {
+    match join_type {
+        JoinType::Semi | JoinType::Anti => Some(JoinBuildSide::Right),
+        JoinType::RightSemi | JoinType::RightAnti => Some(JoinBuildSide::Left),
+        _ => None,
+    }
+}
+
+/// Inputs to the shared join-build orientation policy.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JoinBuildCandidate {
+    /// Cost of serializing this input into the physical build-row layout.
+    pub serialized_work: f64,
+    /// Whether moving this subtree to the probe side crosses a control region.
+    pub contains_control_region: bool,
+}
+
+/// Choose the physical build side for one comparison join.
+///
+/// Both DP enumeration and final build/probe lowering call this function. A
+/// reduction's filtering control region must remain a materialized build
+/// producer; otherwise the smaller serialized build input wins, with the
+/// current right-build convention breaking ties.
+pub(crate) fn choose_join_build_side(
+    filtering_side: Option<JoinBuildSide>,
+    left: JoinBuildCandidate,
+    right: JoinBuildCandidate,
+) -> JoinBuildSide {
+    if filtering_side == Some(JoinBuildSide::Left) && left.contains_control_region {
+        return JoinBuildSide::Left;
+    }
+    if filtering_side == Some(JoinBuildSide::Right) && right.contains_control_region {
+        return JoinBuildSide::Right;
+    }
+    if right.serialized_work <= left.serialized_work {
+        JoinBuildSide::Right
+    } else {
+        JoinBuildSide::Left
+    }
+}
+
+/// Estimate the bytes carried by one intermediate execution row.
+///
+/// Used by the final build/probe pass for cross products and tests.
+pub(crate) fn estimate_row_width(types: &[LogicalType]) -> usize {
+    estimate_row_width_from_payload(estimate_row_payload_width(types))
+}
+
+/// Add the fixed row-container header to an already estimated payload width.
+pub(crate) fn estimate_row_width_from_payload(payload_width: usize) -> usize {
+    std::mem::size_of::<u64>().saturating_add(payload_width)
+}
+
+/// Estimate one serialized comparison-hash-build row from its visible payload
+/// and independently stored condition values.
+///
+/// Join-order enumeration has relation payload widths rather than a completed
+/// logical join. Sharing this byte model keeps its build-side choice aligned
+/// with the final build/probe pass while allowing the latter to use the exact
+/// projected and condition types.
+pub(crate) fn estimate_hash_build_row_width(
+    projected_payload_width: usize,
+    condition_payload_width: usize,
+) -> usize {
+    const HASH_BUILD_RUNTIME_BYTES: usize =
+        std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + std::mem::size_of::<u8>();
+    8usize
+        .saturating_add(projected_payload_width)
+        .saturating_add(condition_payload_width)
+        .saturating_add(HASH_BUILD_RUNTIME_BYTES)
+}
+
+/// Estimate the schema-dependent bytes without a row-container header.
+/// Join-order costing combines multiple base relations into one intermediate,
+/// so the fixed header must be charged once for that intermediate rather than
+/// once per contributing relation.
+pub(crate) fn estimate_row_payload_width(types: &[LogicalType]) -> usize {
+    let mut width = 0;
+    for ty in types {
+        width += ty.type_size();
+        width += type_penalty(ty);
+    }
+    width
+}
+
+fn type_penalty(ty: &LogicalType) -> usize {
+    match ty {
+        LogicalType::Varchar
+        | LogicalType::VarcharCollation(_)
+        | LogicalType::TsVector
+        | LogicalType::TsQuery
+        | LogicalType::Json
+        | LogicalType::Jsonb
+        | LogicalType::Blob => 8,
+        LogicalType::List(child) => 32 + type_penalty(child),
+        LogicalType::Array(child, _) => 32 + type_penalty(child),
+        LogicalType::Struct(fields) => {
+            16 + fields.iter().map(|(_, ty)| type_penalty(ty)).sum::<usize>()
+        }
+        _ => 1,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::BuildProbeSideOptimizer;
+    use super::{
+        contains_control_region_boundary, estimate_plan_cardinality, BuildProbeSideOptimizer,
+    };
+    use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
     use paro_common::types::LogicalType;
     use paro_context::{test_support::TestStatementContextBuilder, StatementContext};
     use paro_planner::binder::context::BindContext;
     use paro_planner::expression::{ColumnRefExpression, Expression};
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Join, JoinComparisonType, JoinCondition,
+        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
         JoinType, LogicalOperator,
     };
     use paro_planner::plan::{CardinalityEstimate, LogicalPlan};
+    use paro_storage::table::table_factory::TableFactory;
     use std::sync::Arc;
 
     fn plan_with_cardinality(
@@ -200,6 +409,33 @@ mod tests {
             (0..types.len()).map(|idx| format!("c{idx}")).collect(),
             types,
         ))
+    }
+
+    #[test]
+    fn empty_stored_relation_is_estimated_as_one_row_not_session_default() {
+        let storage = Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer])
+                .unwrap(),
+        );
+        assert_eq!(storage.total_rows().unwrap(), 0);
+        let table = Arc::new(TableCatalogEntry::new(
+            "paro".to_string(),
+            "public".to_string(),
+            "empty_build_input".to_string(),
+            vec![ColumnDefinition::new("k".to_string(), LogicalType::Integer)],
+            storage,
+            CatalogObjectId::from_raw(90_001),
+            0,
+        ));
+        let get = LogicalPlan::synthetic(LogicalOperator::Get(Get::new(
+            0,
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+            table,
+        )));
+
+        assert_eq!(estimate_plan_cardinality(&make_test_session(), &get), 1);
     }
 
     #[test]
@@ -248,6 +484,192 @@ mod tests {
             }
             _ => panic!("expected comparison join"),
         }
+    }
+
+    #[test]
+    fn build_probe_charges_hash_row_state_before_choosing_a_large_narrow_build() {
+        let ctx = BindContext::new();
+        let filtered_fact = expression_get(
+            0,
+            1,
+            vec![
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+                LogicalType::Varchar,
+            ],
+        );
+        let dimension = expression_get(1, 1, vec![LogicalType::BigInt, LogicalType::Date]);
+        let mut join = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, filtered_fact, 320_000),
+            plan_with_cardinality(&ctx, dimension, 1_500_000),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::BigInt,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::BigInt,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        // Only the date payload is consumed above the join. The equality key
+        // remains independently stored in the physical build row.
+        join.right_projection_map = vec![1].into();
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(
+            join.right.stats.estimated_cardinality.unwrap().expected,
+            320_000,
+            "the smaller filtered input should become the hash build"
+        );
+        assert_eq!(join.right.types().len(), 5);
+    }
+
+    #[test]
+    fn build_probe_flips_reduction_join_to_smaller_preserved_build_side() {
+        let ctx = BindContext::new();
+        let preserved = expression_get(0, 1, vec![LogicalType::Integer]);
+        let filtering = expression_get(1, 64, vec![LogicalType::Integer]);
+        let join = ComparisonJoin::new(
+            JoinType::Semi,
+            plan_with_cardinality(&ctx, preserved, 1),
+            plan_with_cardinality(&ctx, filtering, 64),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::RightSemi);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 1);
+        assert!(join.left_projection_map.is_none());
+        assert!(join.right_projection_map.is_all());
+    }
+
+    #[test]
+    fn build_probe_keeps_control_region_off_reduction_probe_side() {
+        let ctx = BindContext::new();
+        let preserved = expression_get(0, 1, vec![LogicalType::Integer]);
+        let dependent_left = expression_get(1, 64, vec![LogicalType::Integer]);
+        let dependent_right = expression_get(2, 1, vec![LogicalType::Integer]);
+        let mut dependent = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, dependent_left, 64),
+            plan_with_cardinality(&ctx, dependent_right, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(2, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(1, 0), LogicalType::Integer),
+        )];
+        let join = ComparisonJoin::new(
+            JoinType::Semi,
+            plan_with_cardinality(&ctx, preserved, 1),
+            plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Semi);
+        assert_eq!(join.left.stats.estimated_cardinality.unwrap().expected, 1);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
+    }
+
+    #[test]
+    fn build_probe_normalizes_right_reduction_control_region_onto_build_side() {
+        let ctx = BindContext::new();
+        let dependent_left = expression_get(0, 64, vec![LogicalType::Integer]);
+        let dependent_right = expression_get(1, 1, vec![LogicalType::Integer]);
+        let mut dependent = ComparisonJoin::new(
+            JoinType::Inner,
+            plan_with_cardinality(&ctx, dependent_left, 64),
+            plan_with_cardinality(&ctx, dependent_right, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+        dependent.duplicate_eliminated_columns = vec![Expression::ColumnRef(
+            ColumnRefExpression::new(ColumnBinding::new(0, 0), LogicalType::Integer),
+        )];
+        let preserved = expression_get(2, 1, vec![LogicalType::Integer]);
+        let join = ComparisonJoin::new(
+            JoinType::RightSemi,
+            plan_with_cardinality(&ctx, LogicalOperator::Join(Join::Comparison(dependent)), 64),
+            plan_with_cardinality(&ctx, preserved, 1),
+            vec![JoinCondition::new(
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(0, 0),
+                    LogicalType::Integer,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(2, 0),
+                    LogicalType::Integer,
+                )),
+                JoinComparisonType::Equal,
+            )],
+        );
+
+        let result = BuildProbeSideOptimizer::new(make_test_session())
+            .optimize(LogicalOperator::Join(Join::Comparison(join)));
+        let LogicalOperator::Join(Join::Comparison(join)) = result else {
+            panic!("expected comparison join");
+        };
+        assert_eq!(join.join_type, JoinType::Semi);
+        assert!(contains_control_region_boundary(join.right.as_ref()));
+        assert_eq!(join.left.stats.estimated_cardinality.unwrap().expected, 1);
+        assert_eq!(join.right.stats.estimated_cardinality.unwrap().expected, 64);
     }
 
     #[test]

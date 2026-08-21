@@ -23,9 +23,12 @@ use crate::operators::aggregate::aggregate_kernel::{
 };
 use crate::operators::aggregate::aggregate_object::{create_aggregate_objects, AggregateObject};
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
+use crate::operators::aggregate::group_key_codec::{logical_group_types, physical_group_types};
 use crate::operators::aggregate::grouped_aggregate_data::reference_index;
 use paro_storage::buffer::BufferPool;
 
+use crate::operators::aggregate::group_hash::GroupHashScratch;
 use crate::operators::aggregate::ordered_helpers::empty_ordered_collectors_with_memory;
 use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
@@ -86,6 +89,21 @@ pub(crate) fn query_hash_table_memory(
     )
 }
 
+/// Perfect-hash tables are fixed-size, planner-admitted direct-address arrays.
+/// They have no partial spill representation, so classify their bounded memory
+/// honestly instead of advertising it to the revocable-memory reclaimer.
+pub(crate) fn query_perfect_hash_memory(
+    query: &crate::runtime::context::QueryRuntimeContext,
+) -> MemoryAccountingContext {
+    let owner: Arc<dyn paro_common::memory::MemoryOwner> = query.memory.clone();
+    MemoryAccountingContext::from_owner(
+        owner,
+        MemoryDomain::Host,
+        MemoryTag::HashTable,
+        MemoryAccountingClass::NonRevocable,
+    )
+}
+
 /// Map aggregate inputs to Vec<Vec<usize>>.
 pub(crate) fn aggregate_inputs(spec: &AggregateSpec) -> Vec<Vec<usize>> {
     spec.aggregate_inputs
@@ -100,8 +118,8 @@ pub(crate) fn group_payload_refs(spec: &AggregateSpec) -> Result<Vec<usize>> {
 }
 
 /// Extract logical types from group expressions.
-pub(crate) fn group_types(spec: &AggregateSpec) -> Vec<LogicalType> {
-    spec.groups.iter().map(Expression::return_type).collect()
+pub(crate) fn group_types(spec: &AggregateSpec) -> Result<Vec<LogicalType>> {
+    physical_group_types(spec)
 }
 
 /// Normalize grouping sets, deduplicating indices within each set.
@@ -150,6 +168,23 @@ pub(crate) fn has_aggregate_ordered(spec: &AggregateSpec) -> bool {
     spec.aggregate_orders
         .iter()
         .any(|orders| !orders.is_empty())
+}
+
+/// Whether DISTINCT key collection fully determines every aggregate group.
+///
+/// With only unfiltered, unordered DISTINCT aggregates, inserting the input
+/// into the regular aggregate table duplicates the same grouping work. The
+/// globally unique `(groups..., inputs...)` keys create every required group
+/// during DISTINCT finalization, including groups whose only input is NULL.
+pub(crate) fn can_skip_regular_aggregate_sink(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+) -> bool {
+    !aggregate_objects.is_empty()
+        && !has_aggregate_filters(spec)
+        && aggregate_objects
+            .iter()
+            .all(|object| object.is_distinct() && object.order_bys.is_empty())
 }
 
 /// Build per-aggregate filter selection vectors from the payload chunk.
@@ -212,14 +247,11 @@ pub(crate) fn projected_payload_chunk<'a>(
             query.allocator(MemoryTag::BaseTable),
         )?;
     }
-    executor.execute_all_kernel(
-        VectorKernelInput::from_eval_input(ExpressionEvalInput {
-            params: query.params.as_ref(),
-            columns: input,
-        }),
-        query,
-        payload,
-    )?;
+    let input = VectorKernelInput::from_eval_input(ExpressionEvalInput {
+        params: query.params.as_ref(),
+        columns: input,
+    });
+    executor.execute_all_kernel(input, query, payload)?;
     Ok(payload)
 }
 
@@ -281,12 +313,16 @@ pub(crate) fn build_groups_chunk_for_set(
             continue;
         }
         let row_count = groups.size();
-        let column = groups.column_mut(group_idx).ok_or_else(|| {
+        let column = groups.column(group_idx).ok_or_else(|| {
             paro_error::internal(format!(
                 "missing grouping column while applying grouping set: group_idx={group_idx}"
             ))
         })?;
-        column.validity_mut().try_set_all_invalid(row_count)?;
+        groups.data[group_idx] = Arc::new(Vector::try_constant_null(
+            column.logical_type().clone(),
+            row_count,
+            groups.allocator().clone(),
+        )?);
     }
     Ok(groups)
 }
@@ -412,6 +448,7 @@ pub(crate) fn create_ungrouped_runtime_state(
         allocator.clone(),
     )?;
     Ok(UngroupedAggregateRuntimeState {
+        distinct: DistinctAggregateState::new(aggregate_objects.len()),
         aggregate_objects,
         layout,
         aggregate_inputs,
@@ -436,7 +473,7 @@ pub(crate) fn create_hash_aggregate_tables(
     }
     let objects = aggregate_objects(spec)?;
     let inputs = aggregate_inputs(spec);
-    let group_types = group_types(spec);
+    let group_types = group_types(spec)?;
     let strategy = choose_hash_aggregate_table_strategy(spec, &group_types, parallelism)?;
     normalized_grouping_sets(spec)?
         .iter()
@@ -474,10 +511,12 @@ fn choose_hash_aggregate_table_strategy(
     parallelism: usize,
 ) -> Result<HashAggregateTableStrategy> {
     let grouping_sets = normalized_grouping_sets(spec)?;
+    let can_finalize_distinct_in_parallel =
+        can_skip_regular_aggregate_sink(spec, &aggregate_objects(spec)?);
     if parallelism <= 1
         || grouping_sets.len() != 1
         || has_aggregate_filters(spec)
-        || has_aggregate_distinct(spec)
+        || (has_aggregate_distinct(spec) && !can_finalize_distinct_in_parallel)
         || has_aggregate_ordered(spec)
     {
         return Ok(HashAggregateTableStrategy::Flat);
@@ -514,11 +553,11 @@ pub(crate) fn create_perfect_aggregate_table(
         ));
     };
     PerfectAggregateHashTable::new_with_memory(
-        group_types(spec),
+        logical_group_types(spec),
         aggregate_objects(spec)?,
         aggregate_inputs(spec),
         perfect.group_minima.to_vec(),
-        perfect.required_bits.to_vec(),
+        perfect.group_cardinalities.to_vec(),
         allocator,
         memory,
     )
@@ -529,9 +568,35 @@ pub(crate) fn update_hash_aggregate_tables(
     spec: &AggregateSpec,
     aggregate_objects: &[AggregateObject],
     payload: &Chunk,
-    group_refs: &[usize],
+    all_groups: &Chunk,
     grouping_sets: &[Box<[usize]>],
     tables: &mut [AggregateHashTable],
+    addresses: &mut Vector,
+    new_groups: &mut SelectionVector,
+) -> Result<()> {
+    let mut hash_scratch =
+        GroupHashScratch::try_new(payload.size().max(1), payload.allocator().clone())?;
+    update_hash_aggregate_tables_with_scratch(
+        spec,
+        aggregate_objects,
+        payload,
+        all_groups,
+        grouping_sets,
+        tables,
+        &mut hash_scratch,
+        addresses,
+        new_groups,
+    )
+}
+
+pub(crate) fn update_hash_aggregate_tables_with_scratch(
+    spec: &AggregateSpec,
+    aggregate_objects: &[AggregateObject],
+    payload: &Chunk,
+    all_groups: &Chunk,
+    grouping_sets: &[Box<[usize]>],
+    tables: &mut [AggregateHashTable],
+    hash_scratch: &mut GroupHashScratch,
     addresses: &mut Vector,
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
@@ -563,14 +628,10 @@ pub(crate) fn update_hash_aggregate_tables(
     } else {
         None
     };
-    let all_groups = build_groups_chunk(payload, group_refs)?;
     for (table, grouping_set) in tables.iter_mut().zip(grouping_sets.iter()) {
-        let groups = build_groups_chunk_for_set(
-            &all_groups,
-            grouping_set.as_ref(),
-            spec.grouping_key_count,
-        )?;
-        let hashes = table.hash_groups(&groups)?;
+        let groups =
+            build_groups_chunk_for_set(all_groups, grouping_set.as_ref(), spec.grouping_key_count)?;
+        let hashes = hash_scratch.hash(&groups)?;
         ensure_group_update_scratch(
             addresses,
             new_groups,
@@ -597,6 +658,9 @@ pub(crate) fn update_perfect_aggregate_table(
     new_groups: &mut SelectionVector,
 ) -> Result<()> {
     let groups = build_groups_chunk(payload, group_refs)?;
+    if !has_aggregate_filters(spec) && table.try_update_direct_groups(&groups, payload)? {
+        return Ok(());
+    }
     ensure_group_update_scratch(
         addresses,
         new_groups,
@@ -609,5 +673,31 @@ pub(crate) fn update_perfect_aggregate_table(
         table.update_aggregates_per_filter(payload, addresses, &filters)
     } else {
         table.update_aggregates(payload, addresses, None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::chunk::Chunk;
+    use paro_common::types::LogicalType;
+    use paro_common::vector::VectorType;
+
+    use super::build_groups_chunk_for_set;
+
+    #[test]
+    fn absent_grouping_key_is_null_for_dictionary_input() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let child = Arc::new(paro_common::test_utils::test_i32_vector(&[10, 20]));
+        let dictionary = paro_common::test_utils::test_dictionary(child, vec![1, 0]);
+        let groups = Chunk::from_arc_vectors(vec![Arc::new(dictionary)], allocator);
+
+        let grouped = build_groups_chunk_for_set(&groups, &[], 1).expect("grouping set");
+        let column = grouped.column(0).expect("grouping column");
+        assert_eq!(column.logical_type(), &LogicalType::Integer);
+        assert_eq!(column.vector_type(), VectorType::Constant);
+        assert!(column.is_null(0));
+        assert!(column.is_null(1));
     }
 }

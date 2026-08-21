@@ -9,7 +9,6 @@ use paro_common::error::{self as paro_error, Result};
 use crate::operators::external::batching::SubmissionBatchPolicy;
 use crate::operators::external::runtime_bridge::{RuntimeBridgeOutcome, TableSubmission};
 use crate::operators::external::table_state::TableOutputBatch;
-use crate::physical::properties::RequiredProperties;
 use crate::physical::specs::ExternalTableSpec;
 use crate::runtime::breaker::{ExternalTableHandle, HandleRef};
 use crate::runtime::context::{
@@ -25,7 +24,6 @@ use crate::runtime::state::{
 pub struct ExternalTableSinkExec {
     pub handle: HandleRef<ExternalTableHandle>,
     pub spec: ExternalTableSpec,
-    pub required: RequiredProperties,
 }
 
 impl ExternalTableSinkExec {

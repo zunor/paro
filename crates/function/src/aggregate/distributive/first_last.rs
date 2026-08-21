@@ -11,11 +11,13 @@
 //! - `any_value(x)` / `arbitrary(x)`: Returns any value (implementation uses first)
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateCombineType, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use std::ptr;
 
 /// State for first/last aggregation on fixed-size types.
 #[repr(C)]
@@ -263,6 +265,167 @@ define_last_impl!(last_i32, i32);
 define_last_impl!(last_i64, i64);
 define_last_impl!(last_f64, f64);
 
+#[derive(Default)]
+struct FirstStringState {
+    value: String,
+    is_set: bool,
+}
+
+mod first_string {
+    use super::*;
+
+    type State = FirstStringState;
+
+    pub unsafe fn initialize(state: *mut u8) {
+        ptr::write(state.cast::<State>(), State::default());
+    }
+
+    pub unsafe fn update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &AggregateStateInput,
+        count: usize,
+    ) {
+        let input = inputs[0]
+            .try_to_utf8_view(count)
+            .expect("first(VARCHAR) expects textual input");
+        for row in 0..count {
+            let state = &mut *states.state_ptr(row).cast::<State>();
+            if !state.is_set && input.is_valid(row) {
+                state.value.clear();
+                state.value.push_str(input.str(row));
+                state.is_set = true;
+            }
+        }
+    }
+
+    pub unsafe fn simple_update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        state: *mut u8,
+        count: usize,
+    ) {
+        let state = &mut *state.cast::<State>();
+        if state.is_set {
+            return;
+        }
+        let input = inputs[0]
+            .try_to_utf8_view(count)
+            .expect("first(VARCHAR) expects textual input");
+        for row in 0..count {
+            if input.is_valid(row) {
+                state.value.clear();
+                state.value.push_str(input.str(row));
+                state.is_set = true;
+                return;
+            }
+        }
+    }
+
+    pub unsafe fn combine(
+        source: &Vector,
+        target: &Vector,
+        input_data: &AggregateInputData,
+        count: usize,
+    ) {
+        let source_ptrs = source.flat_data::<*mut u8>();
+        let target_ptrs = target.flat_data::<*mut u8>();
+        for row in 0..count {
+            let source = &mut *(*source_ptrs.add(row)).cast::<State>();
+            let target = &mut *(*target_ptrs.add(row)).cast::<State>();
+            if target.is_set || !source.is_set {
+                continue;
+            }
+            if input_data.combine_type == AggregateCombineType::AllowDestructive {
+                std::mem::swap(target, source);
+            } else {
+                target.value.clone_from(&source.value);
+                target.is_set = true;
+            }
+        }
+    }
+
+    pub unsafe fn finalize(
+        states: &Vector,
+        _input_data: &AggregateInputData,
+        result: &mut Vector,
+        count: usize,
+    ) -> Result<()> {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for row in 0..count {
+            let state = &*(*state_ptrs.add(row)).cast::<State>();
+            if state.is_set {
+                result.set_null(row, false);
+                result.set_string(row, &state.value);
+            } else {
+                result.set_null(row, true);
+            }
+        }
+        Ok(())
+    }
+
+    pub unsafe fn destructor(states: &Vector, _input_data: &AggregateInputData, count: usize) {
+        let state_ptrs = states.flat_data::<*mut u8>();
+        for row in 0..count {
+            ptr::drop_in_place((*state_ptrs.add(row)).cast::<State>());
+        }
+    }
+
+    pub unsafe fn serialize(
+        state: *const u8,
+        _input_data: &AggregateInputData,
+        output: &mut Vec<u8>,
+    ) -> Result<()> {
+        let state = &*state.cast::<State>();
+        output.push(u8::from(state.is_set));
+        let length = u64::try_from(state.value.len())
+            .map_err(|_| paro_error::internal("FIRST string state exceeds u64"))?;
+        output.extend_from_slice(&length.to_le_bytes());
+        output.extend_from_slice(state.value.as_bytes());
+        Ok(())
+    }
+
+    pub unsafe fn deserialize(
+        input: &[u8],
+        _input_data: &AggregateInputData,
+        state: *mut u8,
+    ) -> Result<()> {
+        let (&marker, payload) = input
+            .split_first()
+            .ok_or_else(|| paro_error::internal("Truncated FIRST string state"))?;
+        if payload.len() < 8 {
+            return Err(paro_error::internal("Truncated FIRST string state length"));
+        }
+        let length = usize::try_from(u64::from_le_bytes(
+            payload[..8].try_into().expect("eight length bytes"),
+        ))
+        .map_err(|_| paro_error::internal("FIRST string state length exceeds usize"))?;
+        let bytes = payload
+            .get(8..)
+            .filter(|bytes| bytes.len() == length)
+            .ok_or_else(|| paro_error::internal("Invalid FIRST string state length"))?;
+        let value = String::from_utf8(bytes.to_vec()).map_err(|error| {
+            paro_error::internal(format!("Invalid FIRST string UTF-8: {error}"))
+        })?;
+        let is_set = match marker {
+            0 => false,
+            1 => true,
+            value => {
+                return Err(paro_error::internal(format!(
+                    "Invalid FIRST string state marker: {value}"
+                )));
+            }
+        };
+        if !is_set && !value.is_empty() {
+            return Err(paro_error::internal(
+                "Unset FIRST string state contains a value",
+            ));
+        }
+        ptr::write(state.cast::<State>(), State { value, is_set });
+        Ok(())
+    }
+}
+
 /// Get the FIRST aggregate function set.
 pub fn get_first_function() -> AggregateFunctionSet {
     let mut set = AggregateFunctionSet::new("first".to_string());
@@ -310,7 +473,23 @@ pub fn get_first_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.add_function(
+        AggregateFunction::new(
+            "first".to_string(),
+            vec![LogicalType::Varchar],
+            LogicalType::Varchar,
+            std::mem::size_of::<FirstStringState>(),
+            first_string::initialize,
+            first_string::update,
+            first_string::combine,
+            first_string::finalize,
+            Some(first_string::simple_update),
+            Some(first_string::destructor),
+        )
+        .with_state_serialization(first_string::serialize, first_string::deserialize),
+    );
+
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the LAST aggregate function set.
@@ -360,7 +539,7 @@ pub fn get_last_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 fn alias_function_set(mut set: AggregateFunctionSet, alias_name: &str) -> AggregateFunctionSet {
@@ -430,7 +609,7 @@ pub fn get_any_value_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 /// Get the ARBITRARY aggregate function set.
@@ -480,7 +659,7 @@ pub fn get_arbitrary_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]
@@ -564,6 +743,45 @@ mod tests {
 
             assert!(!result.is_null(0));
             assert_eq!(result.get_flat::<i32>(0), 10);
+        }
+    }
+
+    #[test]
+    fn first_varchar_roundtrips_owned_state() {
+        let (func, targets) = get_first_function().bind(&[LogicalType::Varchar]).unwrap();
+        assert_eq!(targets, [LogicalType::Varchar]);
+        let mut arena = test_arena();
+        let state_words = func.state_size.div_ceil(std::mem::size_of::<u64>());
+        let mut source = vec![0u64; state_words];
+        let mut restored = vec![0u64; state_words];
+
+        unsafe {
+            (func.initialize)(source.as_mut_ptr().cast());
+            let mut input = paro_common::test_utils::test_vector(LogicalType::Varchar);
+            input.set_count(3);
+            input.set_null(0, true);
+            input.set_string(1, "first");
+            input.set_string(2, "second");
+            let input_data = preserve_input_data(&func, &mut arena);
+            func.simple_update.unwrap()(&[&input], &input_data, source.as_mut_ptr().cast(), 3);
+
+            let mut serialized = Vec::new();
+            func.state_serialize.unwrap()(source.as_ptr().cast(), &input_data, &mut serialized)
+                .unwrap();
+            func.state_deserialize.unwrap()(&serialized, &input_data, restored.as_mut_ptr().cast())
+                .unwrap();
+
+            let mut states = paro_common::test_utils::test_vector(LogicalType::BigInt);
+            states.set_count(2);
+            let pointers = states.flat_data_mut::<*mut u8>();
+            *pointers = source.as_mut_ptr().cast();
+            *pointers.add(1) = restored.as_mut_ptr().cast();
+            let mut result = paro_common::test_utils::test_vector(LogicalType::Varchar);
+            result.set_count(2);
+            (func.finalize)(&states, &input_data, &mut result, 2).unwrap();
+            assert_eq!(result.get_string(0), Some("first"));
+            assert_eq!(result.get_string(1), Some("first"));
+            func.destructor.unwrap()(&states, &input_data, 2);
         }
     }
 

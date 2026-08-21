@@ -5,9 +5,13 @@
 
 mod build_store;
 pub(crate) mod hash_kernel;
+mod integer_index;
+mod pair_integer_index;
+mod reduction_extrema;
 
 pub mod ht_entry;
 pub mod scan_structure;
 pub mod table;
 
+pub(crate) use reduction_extrema::GroupedReductionExtrema;
 pub use table::{FullOuterScanState, JoinHashTable, JoinHashTableConfig};

@@ -1,25 +1,37 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::vector::VECTOR_SIZE;
+use paro_common::vector::{SelectionVector, VECTOR_SIZE};
+use paro_function::scalar::FunctionExecContext;
+use paro_planner::expression::Expression;
 use paro_storage::row::RowSpillReader;
 
+use crate::expression_executor::executor::{ExpressionExecutor, VectorKernelInput};
+use crate::operators::aggregate::group_key_codec::{decode_group_columns, has_encoded_group_keys};
+use crate::operators::aggregate::output_filter::copy_selected_rows;
+use crate::operators::aggregate::post_reduction::PostAggregateFilterLocal;
+use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::{
+    AggregateHTScanPosition, AggregateHashTable,
+};
 use crate::operators::output::ensure_source_output;
 use crate::physical::specs::AggregateSpec;
 use crate::runtime::breaker::{
     AggregateBuildCompactionReclaimer, AggregateFinalizedStateReclaimer, AggregateHandle,
     AggregateRuntimeState, HandleRef,
 };
-use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
+use crate::runtime::context::{OperatorCallContext, PipelineInitContext, QueryRuntimeContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{
-    BreakerHandleGlobal, HashAggregateEmitSourceLocal, SourceGlobal, SourceLocal,
+    HashAggregateEmitSourceGlobal, HashAggregateEmitSourceLocal, HashAggregateEmitWork,
+    SourceGlobal, SourceLocal,
 };
+use crate::runtime::ExpressionEvalInput;
 
 #[derive(Debug, Clone)]
 pub struct HashAggregateEmitSourceExec {
@@ -29,21 +41,64 @@ pub struct HashAggregateEmitSourceExec {
 
 impl HashAggregateEmitSourceExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SourceGlobal> {
-        Ok(SourceGlobal::HashAggregateEmit(Arc::new(
-            BreakerHandleGlobal {
-                handle: ctx.handles.get(self.handle)?,
-            },
-        )))
+        let handle = ctx.handles.get(self.handle)?;
+        let global = Arc::new(HashAggregateEmitSourceGlobal {
+            handle,
+            work: parking_lot::Mutex::new(None),
+            work_count: AtomicUsize::new(0),
+        });
+        if global.handle.is_finalized() {
+            initialize_work(ctx.query, &global)?;
+        }
+        Ok(SourceGlobal::HashAggregateEmit(global))
     }
 
     pub(crate) fn create_local(
         &self,
-        _ctx: &mut PipelineInitContext,
-        _global: &SourceGlobal,
+        ctx: &mut PipelineInitContext,
+        global: &SourceGlobal,
     ) -> Result<SourceLocal> {
-        Ok(SourceLocal::HashAggregateEmit(
-            HashAggregateEmitSourceLocal::default(),
-        ))
+        let mut local = HashAggregateEmitSourceLocal::default();
+        if let Some(post) = &self.spec.post_reduction {
+            let SourceGlobal::HashAggregateEmit(global) = global else {
+                return Err(paro_error::internal(
+                    "hash aggregate emit source global state mismatch",
+                ));
+            };
+            local.post_filter = Some(PostAggregateFilterLocal::new(
+                post,
+                &self.spec.having_filter,
+                global.handle.post_reduction_values()?,
+                ctx.query,
+            )?);
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            local.having_columns = (self.spec.grouping_key_count
+                ..self.spec.grouping_key_count + self.spec.aggregates.len())
+                .collect();
+        } else if !self.spec.having_filter.is_empty() {
+            if self.spec.having_filter.len() != 1 {
+                return Err(paro_error::internal(
+                    "aggregate HAVING lowering requires one normalized predicate",
+                ));
+            }
+            local.having_executor = Some(ExpressionExecutor::with_expressions_for_session(
+                &self.spec.having_filter,
+                ctx.query.session.as_ref(),
+            ));
+            local.having_selection = Some(paro_common::vector::SelectionVector::try_with_capacity(
+                VECTOR_SIZE,
+                ctx.query
+                    .allocator(paro_common::allocator::MemoryTag::BaseTable),
+            )?);
+            local.having_columns = (self.spec.grouping_key_count
+                ..self.spec.grouping_key_count + self.spec.aggregates.len())
+                .collect();
+        }
+        Ok(SourceLocal::HashAggregateEmit(local))
     }
 
     pub(crate) fn poll_next(
@@ -59,97 +114,322 @@ impl HashAggregateEmitSourceExec {
                 "hash aggregate emit source global state mismatch",
             ));
         };
-        if !global.handle.is_finalized() {
-            return Err(paro_error::internal(
-                "hash aggregate emit source polled before handle was finalized",
-            ));
-        }
         let SourceLocal::HashAggregateEmit(local) = local else {
             return Err(paro_error::internal(
                 "hash aggregate emit source local state mismatch",
             ));
         };
-        if local.tables.is_none() && local.spilled_outputs.is_none() {
-            ctx.query.memory.unregister_reclaimer_by_name(
-                &AggregateBuildCompactionReclaimer::name_for(&global.handle),
-            );
-            ctx.query.memory.unregister_reclaimer_by_name(
-                &AggregateFinalizedStateReclaimer::name_for(&global.handle),
-            );
-            let Some(state) = global.handle.take_state()? else {
-                return Ok(SourcePoll::Finished);
-            };
-            let AggregateRuntimeState::Hash(state) = state else {
+        initialize_work(ctx.query, global)?;
+        ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
+        loop {
+            if local.work.is_none() {
+                local.work = global.claim_work();
+                local.position = Default::default();
+                if local.work.is_none() {
+                    output.try_set_cardinality(0)?;
+                    return Ok(SourcePoll::Finished);
+                }
+            }
+            let Some(work) = local.work.as_mut() else {
                 return Err(paro_error::internal(
-                    "aggregate handle does not contain hash aggregate state",
+                    "hash aggregate emit source failed to claim initialized work",
                 ));
             };
-            if let Some(spilled_outputs) = state.spilled_outputs {
-                local.spilled_outputs = Some(
-                    spilled_outputs
-                        .into_iter()
-                        .map(|output| output.map(|output| output.into_reader()))
-                        .collect(),
-                );
-            } else {
-                local.positions = vec![Default::default(); state.tables.len()];
-                local.tables = Some(state.tables);
+            match work {
+                HashAggregateEmitWork::Table {
+                    grouping_idx,
+                    table,
+                } => {
+                    let encoded_groups = has_encoded_group_keys(&self.spec);
+                    let projected_state = !self.spec.state_output_projection.is_empty();
+                    if encoded_groups && projected_state {
+                        return Err(paro_error::internal(
+                            "aggregate state projection cannot be combined with encoded group keys",
+                        ));
+                    }
+                    let produced = if encoded_groups || projected_state {
+                        let scan_types = table.scan_output_types();
+                        let scratch = local
+                            .scan_chunk
+                            .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                        ensure_source_output(scratch, &scan_types, VECTOR_SIZE)?;
+                        let produced = scan_table_batch(
+                            table,
+                            &mut local.position,
+                            scratch,
+                            local.having_executor.as_mut(),
+                            local.having_selection.as_mut(),
+                            local.post_filter.as_mut(),
+                            ctx.query,
+                        )?;
+                        if produced && encoded_groups {
+                            decode_aggregate_output(&self.spec, scratch, output)?;
+                        } else if produced {
+                            project_aggregate_state_output(&self.spec, scratch, output)?;
+                        }
+                        produced
+                    } else {
+                        scan_table_batch(
+                            table,
+                            &mut local.position,
+                            output,
+                            local.having_executor.as_mut(),
+                            local.having_selection.as_mut(),
+                            local.post_filter.as_mut(),
+                            ctx.query,
+                        )?
+                    };
+                    if produced {
+                        populate_grouping_columns(&self.spec, output, *grouping_idx)?;
+                        return Ok(SourcePoll::Output);
+                    }
+                }
+                HashAggregateEmitWork::Spilled {
+                    grouping_idx,
+                    reader,
+                } => {
+                    let scratch = local
+                        .spilled_chunk
+                        .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                    let scanned = reader.read_next(scratch)?;
+                    if scanned > 0 {
+                        if let Some(selection) = local.having_selection.as_mut() {
+                            let aggregate_types = self
+                                .spec
+                                .aggregates
+                                .iter()
+                                .map(Expression::return_type)
+                                .collect::<Vec<_>>();
+                            let mut aggregate_view = Chunk::try_init_empty(
+                                &aggregate_types,
+                                scratch.allocator().clone(),
+                            )?;
+                            aggregate_view.reference_columns(scratch, &local.having_columns);
+                            let selected_count = if let Some(filter) = local.post_filter.as_mut() {
+                                filter.select(&aggregate_view, scanned, ctx.query, selection)?
+                            } else if let Some(executor) = local.having_executor.as_mut() {
+                                executor.select_kernel(
+                                    0,
+                                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                                        params: ctx.query.params.as_ref(),
+                                        columns: &aggregate_view,
+                                    })
+                                    .with_count(scanned),
+                                    ctx.query,
+                                    selection,
+                                )?
+                            } else {
+                                return Err(paro_error::internal(
+                                    "aggregate output selection has no predicate executor",
+                                ));
+                            };
+                            if selected_count == 0 {
+                                continue;
+                            }
+                            if has_encoded_group_keys(&self.spec)
+                                || !self.spec.state_output_projection.is_empty()
+                            {
+                                let filtered = local
+                                    .scan_chunk
+                                    .get_or_insert(Chunk::try_new(output.allocator().clone())?);
+                                ensure_source_output(filtered, &scratch.types(), VECTOR_SIZE)?;
+                                copy_selected_rows(scratch, filtered, selection, selected_count)?;
+                                if has_encoded_group_keys(&self.spec) {
+                                    decode_aggregate_output(&self.spec, filtered, output)?;
+                                } else {
+                                    project_aggregate_state_output(&self.spec, filtered, output)?;
+                                }
+                            } else {
+                                copy_selected_rows(scratch, output, selection, selected_count)?;
+                            }
+                        } else if has_encoded_group_keys(&self.spec) {
+                            decode_aggregate_output(&self.spec, scratch, output)?;
+                        } else if !self.spec.state_output_projection.is_empty() {
+                            project_aggregate_state_output(&self.spec, scratch, output)?;
+                        } else {
+                            copy_spilled_output_rows(scratch, output)?;
+                        }
+                        populate_grouping_columns(&self.spec, output, *grouping_idx)?;
+                        return Ok(SourcePoll::Output);
+                    }
+                }
             }
+            local.work = None;
         }
-        ensure_source_output(output, &self.spec.output_types, VECTOR_SIZE)?;
-        if local.spilled_outputs.is_some() {
-            return self.poll_spilled_outputs(local, output);
-        }
-        let tables = local.tables.as_mut().ok_or_else(|| {
-            paro_error::internal("hash aggregate emit source did not load hash tables")
-        })?;
-        while local.grouping_idx < tables.len() {
-            let table = &mut tables[local.grouping_idx];
-            let position = local.positions.get_mut(local.grouping_idx).ok_or_else(|| {
-                paro_error::internal(format!(
-                    "hash aggregate source position out of bounds: grouping_idx={}",
-                    local.grouping_idx
-                ))
-            })?;
-            if table.scan(position, output)? {
-                populate_grouping_columns(&self.spec, output, local.grouping_idx)?;
-                return Ok(SourcePoll::Output);
-            }
-            local.grouping_idx += 1;
-        }
-        output.try_set_cardinality(0)?;
-        Ok(SourcePoll::Finished)
     }
+}
 
-    fn poll_spilled_outputs(
-        &self,
-        local: &mut HashAggregateEmitSourceLocal,
-        output: &mut Chunk,
-    ) -> Result<SourcePoll> {
-        let spilled_outputs = local.spilled_outputs.as_mut().ok_or_else(|| {
-            paro_error::internal("hash aggregate emit source did not load spilled outputs")
+fn project_aggregate_state_output(
+    spec: &AggregateSpec,
+    source: &Chunk,
+    output: &mut Chunk,
+) -> Result<()> {
+    if spec.state_output_projection.len() != spec.output_types.len() {
+        return Err(paro_error::internal(format!(
+            "aggregate state output projection width mismatch: projection={} output={}",
+            spec.state_output_projection.len(),
+            spec.output_types.len()
+        )));
+    }
+    if source.size() > output.capacity() {
+        return Err(paro_error::internal(format!(
+            "aggregate projected output is too small: rows={} capacity={}",
+            source.size(),
+            output.capacity()
+        )));
+    }
+    for (output_idx, &source_idx) in spec.state_output_projection.iter().enumerate() {
+        let source_column = source.column(source_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "aggregate state projection source is out of bounds: output={output_idx} source={source_idx} columns={}",
+                source.column_count()
+            ))
         })?;
-        while local.grouping_idx < spilled_outputs.len() {
-            if let Some(reader) = spilled_outputs[local.grouping_idx].as_mut() {
-                if local.spilled_chunk.is_none() {
-                    local.spilled_chunk = Some(Chunk::try_new(output.allocator().clone())?);
-                }
-                let scratch = local
-                    .spilled_chunk
-                    .as_mut()
-                    .expect("spilled aggregate scratch chunk initialized");
-                let scanned = reader.read_next(scratch)?;
-                if scanned > 0 {
-                    copy_spilled_output_rows(scratch, output)?;
-                    populate_grouping_columns(&self.spec, output, local.grouping_idx)?;
-                    return Ok(SourcePoll::Output);
+        let expected = spec
+            .output_types
+            .get(output_idx)
+            .ok_or_else(|| paro_error::internal("aggregate projected output type is missing"))?;
+        if source_column.logical_type() != expected {
+            return Err(paro_error::internal(format!(
+                "aggregate state projection type mismatch at output {output_idx}: expected={expected:?} actual={:?}",
+                source_column.logical_type()
+            )));
+        }
+        let output_column_count = output.column_count();
+        let output_column = output.data.get_mut(output_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "aggregate projected output column is missing: index={output_idx} columns={output_column_count}",
+            ))
+        })?;
+        *output_column = Arc::clone(source_column);
+    }
+    output.try_set_cardinality(source.size())
+}
+
+fn scan_table_batch(
+    table: &mut AggregateHashTable,
+    position: &mut AggregateHTScanPosition,
+    output: &mut Chunk,
+    having_executor: Option<&mut ExpressionExecutor>,
+    having_selection: Option<&mut SelectionVector>,
+    post_filter: Option<&mut PostAggregateFilterLocal>,
+    query: &QueryRuntimeContext,
+) -> Result<bool> {
+    match (having_executor, having_selection, post_filter) {
+        (None, Some(selection), Some(filter)) => table.scan_with_aggregate_filter(
+            position,
+            output,
+            selection,
+            |aggregates, count, selection| filter.select(aggregates, count, query, selection),
+        ),
+        (Some(executor), Some(selection), None) => table.scan_with_aggregate_filter(
+            position,
+            output,
+            selection,
+            |aggregates, count, selection| {
+                executor.select_kernel(
+                    0,
+                    VectorKernelInput::from_eval_input(ExpressionEvalInput {
+                        params: query.params.as_ref(),
+                        columns: aggregates,
+                    })
+                    .with_count(count),
+                    query,
+                    selection,
+                )
+            },
+        ),
+        (None, None, None) => table.scan(position, output),
+        _ => Err(paro_error::internal(
+            "aggregate output predicate executor and selection state disagree",
+        )),
+    }
+}
+
+fn decode_aggregate_output(spec: &AggregateSpec, source: &Chunk, output: &mut Chunk) -> Result<()> {
+    decode_group_columns(spec, source, output)?;
+    let group_count = spec.grouping_key_count;
+    if source.column_count() < group_count + spec.aggregates.len() {
+        return Err(paro_error::internal(format!(
+            "encoded aggregate output is too narrow: groups={group_count}, aggregates={}, columns={}",
+            spec.aggregates.len(),
+            source.column_count()
+        )));
+    }
+    for aggregate_idx in 0..spec.aggregates.len() {
+        let column_idx = group_count + aggregate_idx;
+        let source_column = source.column(column_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "encoded aggregate source column not found: index={column_idx}"
+            ))
+        })?;
+        let output_column = output.column(column_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "decoded aggregate output column not found: index={column_idx}"
+            ))
+        })?;
+        if output_column.logical_type() != source_column.logical_type() {
+            return Err(paro_error::internal(format!(
+                "decoded aggregate output type mismatch at index {column_idx}: expected={:?}, actual={:?}",
+                output_column.logical_type(),
+                source_column.logical_type()
+            )));
+        }
+        output.data[column_idx] = Arc::clone(source_column);
+    }
+    output.try_set_cardinality(source.size())
+}
+
+fn initialize_work(
+    query: &QueryRuntimeContext,
+    global: &HashAggregateEmitSourceGlobal,
+) -> Result<()> {
+    let mut shared_work = global.work.lock();
+    if shared_work.is_some() {
+        return Ok(());
+    }
+    if !global.handle.is_finalized() {
+        return Err(paro_error::internal(
+            "hash aggregate emit source polled before handle was finalized",
+        ));
+    }
+    query
+        .memory
+        .unregister_reclaimer_by_name(&AggregateBuildCompactionReclaimer::name_for(&global.handle));
+    query
+        .memory
+        .unregister_reclaimer_by_name(&AggregateFinalizedStateReclaimer::name_for(&global.handle));
+
+    let mut work = std::collections::VecDeque::new();
+    if let Some(state) = global.handle.take_state()? {
+        let AggregateRuntimeState::Hash(state) = state else {
+            return Err(paro_error::internal(
+                "aggregate handle does not contain hash aggregate state",
+            ));
+        };
+        if let Some(spilled_outputs) = state.spilled_outputs {
+            for (grouping_idx, output) in spilled_outputs.into_iter().enumerate() {
+                if let Some(output) = output {
+                    work.push_back(HashAggregateEmitWork::Spilled {
+                        grouping_idx,
+                        reader: output.into_reader(),
+                    });
                 }
             }
-            local.grouping_idx += 1;
+        } else {
+            for (grouping_idx, table) in state.tables.into_iter().enumerate() {
+                for table in table.into_scan_partitions() {
+                    work.push_back(HashAggregateEmitWork::Table {
+                        grouping_idx,
+                        table,
+                    });
+                }
+            }
         }
-        output.try_set_cardinality(0)?;
-        Ok(SourcePoll::Finished)
     }
+    global.work_count.store(work.len(), Ordering::Release);
+    *shared_work = Some(work);
+    Ok(())
 }
 
 fn copy_spilled_output_rows(source: &Chunk, output: &mut Chunk) -> Result<()> {

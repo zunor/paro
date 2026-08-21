@@ -27,12 +27,16 @@ use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
 use crate::operators::aggregate::aggregate_kernel::destroy_states;
 use crate::operators::aggregate::aggregate_object::AggregateObject;
 use crate::operators::aggregate::aggregate_state::AggregateStateLayout;
+use crate::operators::aggregate::distinct_state::DistinctAggregateState;
 use crate::operators::aggregate::ordered_helpers::OrderedAggregateCollector;
 use crate::operators::aggregate::payload_spill::{
     AggregateSpilledPayload, AggregateSpilledState, AggregateStateEncoding,
     AggregateStateSpillBuffer,
 };
-use crate::operators::aggregate::perfect_aggregate_hashtable::PerfectAggregateHashTable;
+use crate::operators::aggregate::perfect_aggregate_hashtable::{
+    FinalizedPerfectAggregateTable, PerfectAggregateHashTable,
+};
+use crate::operators::aggregate::post_reduction::PostAggregateInputRollup;
 use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHashTable;
 use crate::operators::aggregate::row_format::AggregateGroupFormat;
 use crate::runtime::context::OperatorCleanupContext;
@@ -49,6 +53,7 @@ pub struct AggregateHandle {
     finalized: AtomicBool,
     reclaim_enabled: AtomicBool,
     reclaim_in_progress: AtomicBool,
+    post_reduction_values: OnceLock<Box<[Arc<Vector>]>>,
     cleanup: CleanupState,
 }
 
@@ -60,6 +65,7 @@ impl AggregateHandle {
             finalized: AtomicBool::new(false),
             reclaim_enabled: AtomicBool::new(false),
             reclaim_in_progress: AtomicBool::new(false),
+            post_reduction_values: OnceLock::new(),
             cleanup: CleanupState::default(),
         }
     }
@@ -101,6 +107,25 @@ impl AggregateHandle {
             paro_error::internal("aggregate handle has no initialized runtime state")
         })?;
         Ok(state.lock().take())
+    }
+
+    /// Publish immutable scalar values derived from the finalized group set.
+    pub fn set_post_reduction_values(&self, values: Box<[Arc<Vector>]>) -> Result<()> {
+        self.post_reduction_values.set(values).map_err(|_| {
+            paro_error::internal("aggregate post-reduction result was published more than once")
+        })
+    }
+
+    /// Read the post-reduction result after the build handle is finalized.
+    pub fn post_reduction_values(&self) -> Result<&[Arc<Vector>]> {
+        self.post_reduction_values
+            .get()
+            .map(Box::as_ref)
+            .ok_or_else(|| paro_error::internal("aggregate post-reduction result is not available"))
+    }
+
+    pub fn post_reduction_values_if_ready(&self) -> Option<&[Arc<Vector>]> {
+        self.post_reduction_values.get().map(Box::as_ref)
     }
 
     #[inline]
@@ -666,13 +691,19 @@ impl AggregateRuntimeState {
         match self {
             Self::Hash(state) => state.reclaimable_finalized_memory(),
             Self::Ungrouped(_) => 0,
-            Self::Perfect(state) => state.table.reclaimable_finalized_memory(),
+            Self::Perfect(state) => state.finalized_table.as_ref().map_or(
+                0,
+                FinalizedPerfectAggregateTable::reclaimable_finalized_memory,
+            ),
         }
     }
 
     fn reclaimable_build_memory(&self) -> usize {
         match self {
             Self::Hash(state) => state.reclaimable_build_memory(),
+            // Ungrouped state is constant-sized. Perfect state is a bounded,
+            // planner-admitted direct-address table accounted as non-revocable;
+            // neither advertises bytes that its reclaimer cannot release.
             Self::Ungrouped(_) | Self::Perfect(_) => 0,
         }
     }
@@ -693,11 +724,13 @@ impl AggregateRuntimeState {
         match self {
             Self::Hash(state) => state.reclaim_finalized_memory(target_bytes, buffer_pool, memory),
             Self::Ungrouped(_) => Ok(ReclaimStats::empty(target_bytes)),
-            Self::Perfect(state) => Ok(ReclaimStats::new(
-                target_bytes,
-                state.table.reclaim_finalized_memory(target_bytes),
-                0,
-            )),
+            Self::Perfect(state) => {
+                let reclaimed = state
+                    .finalized_table
+                    .as_mut()
+                    .map_or(0, |table| table.reclaim_finalized_memory(target_bytes));
+                Ok(ReclaimStats::new(target_bytes, reclaimed, 0))
+            }
         }
     }
 }
@@ -705,6 +738,11 @@ impl AggregateRuntimeState {
 #[derive(Debug)]
 pub struct HashAggregateRuntimeState {
     pub tables: Vec<AggregateHashTable>,
+    /// Completed local radix tables awaiting partition-parallel merge. Keeping
+    /// ownership here makes the merge phase visible to query memory reclaimers
+    /// without serializing every local through the pipeline coordinator.
+    pub(crate) pending_radix_merges: Vec<Vec<AggregateHashTable>>,
+    pub(crate) distinct: DistinctAggregateState,
     pub(crate) spilled_payloads: Vec<AggregateSpilledPayload>,
     pub(crate) spilled_states: Vec<AggregateSpilledState>,
     pub spilled_outputs: Option<Vec<Option<AggregateSpilledOutput>>>,
@@ -716,6 +754,11 @@ impl HashAggregateRuntimeState {
         for table in &mut self.tables {
             table.destroy()?;
         }
+        for local in &mut self.pending_radix_merges {
+            for table in local {
+                table.destroy()?;
+            }
+        }
         Ok(())
     }
 
@@ -723,6 +766,12 @@ impl HashAggregateRuntimeState {
         self.tables
             .iter()
             .map(AggregateHashTable::reclaimable_finalized_memory)
+            .chain(
+                self.pending_radix_merges
+                    .iter()
+                    .flatten()
+                    .map(AggregateHashTable::reclaimable_finalized_memory),
+            )
             .sum()
     }
 
@@ -730,6 +779,12 @@ impl HashAggregateRuntimeState {
         self.tables
             .iter()
             .map(AggregateHashTable::reclaimable_build_memory)
+            .chain(
+                self.pending_radix_merges
+                    .iter()
+                    .flatten()
+                    .map(AggregateHashTable::reclaimable_build_memory),
+            )
             .sum()
     }
 
@@ -739,6 +794,13 @@ impl HashAggregateRuntimeState {
         }
         let mut reclaimed = 0usize;
         for table in &mut self.tables {
+            if reclaimed >= target_bytes {
+                break;
+            }
+            reclaimed =
+                reclaimed.saturating_add(table.reclaim_build_memory(target_bytes - reclaimed));
+        }
+        for table in self.pending_radix_merges.iter_mut().flatten() {
             if reclaimed >= target_bytes {
                 break;
             }
@@ -846,12 +908,24 @@ impl AggregateSpilledOutput {
 
 #[derive(Debug)]
 pub struct PerfectHashAggregateRuntimeState {
-    pub table: PerfectAggregateHashTable,
+    pub(crate) build_table: Option<PerfectAggregateHashTable>,
+    pub(crate) finalized_table: Option<FinalizedPerfectAggregateTable>,
+    pub(crate) pending_tables: Vec<PerfectAggregateHashTable>,
+    pub(crate) input_rollup: Option<PostAggregateInputRollup>,
 }
 
 impl PerfectHashAggregateRuntimeState {
     fn destroy(&mut self) -> Result<()> {
-        self.table.destroy()
+        if let Some(table) = self.build_table.as_mut() {
+            table.destroy()?;
+        }
+        if let Some(table) = self.finalized_table.as_mut() {
+            table.destroy()?;
+        }
+        for table in &mut self.pending_tables {
+            table.destroy()?;
+        }
+        Ok(())
     }
 }
 
@@ -860,6 +934,7 @@ pub struct UngroupedAggregateRuntimeState {
     pub layout: AggregateStateLayout,
     pub aggregate_inputs: std::sync::Arc<[Vec<usize>]>,
     pub(crate) ordered_collectors: Vec<OrderedAggregateCollector>,
+    pub(crate) distinct: DistinctAggregateState,
     pub state_buffer: Vec<u64>,
     pub arena_allocator: ArenaAllocator,
     pub destroyed: bool,
@@ -960,6 +1035,8 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,
@@ -1215,6 +1292,8 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,
@@ -1288,6 +1367,8 @@ mod tests {
         handle
             .initialize(AggregateRuntimeState::Hash(HashAggregateRuntimeState {
                 tables: vec![table],
+                pending_radix_merges: Vec::new(),
+                distinct: Default::default(),
                 spilled_payloads: Vec::new(),
                 spilled_states: Vec::new(),
                 spilled_outputs: None,

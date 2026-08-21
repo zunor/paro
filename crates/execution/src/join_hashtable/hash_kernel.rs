@@ -11,18 +11,19 @@ use std::ptr;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::Result;
+use paro_common::hash::{
+    combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, HASH_SEED, NULL_HASH,
+};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector, VectorType};
+use paro_common::vector::{
+    DataRef, DecodedVectorRef, SelectionVector, VarlenView, Vector, VectorType,
+};
 use paro_planner::operator::join::JoinComparisonType;
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
 
 use super::build_store::BuildRowLayout;
-
-const HASH_SEED: u64 = 0xa076_1d64_78bd_642f;
-const FIELD_SEED: u64 = 0xe703_7ed1_a0b4_28db;
-const NULL_HASH: u64 = 0x9e37_79b9_7f4a_7c15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinKeyColumn {
@@ -95,17 +96,67 @@ impl JoinKeyColumn {
 #[derive(Debug, Clone)]
 pub(crate) struct JoinKeyLayout {
     columns: Box<[JoinKeyColumn]>,
+    matcher: JoinKeyMatcher,
+}
+
+/// Batch-local physical views of probe-side join keys.
+///
+/// Hash-chain equality is row-oriented, but resolving a `Vector` through its
+/// dynamic representation for every candidate repeats dictionary selection,
+/// validity, and type dispatch. Preparing those properties once per probe
+/// batch keeps the row loop limited to physical index resolution and value
+/// comparison. The borrowed views also make the lifetime contract explicit:
+/// they cannot outlive the probe chunk whose buffers they reference.
+pub(crate) struct PreparedProbeKeys<'a> {
+    shape: PreparedProbeKeyShape<'a>,
+}
+
+enum PreparedProbeKeyShape<'a> {
+    I64Pair {
+        left: DecodedVectorRef<'a>,
+        right: DecodedVectorRef<'a>,
+    },
+    Generic {
+        columns: Vec<PreparedProbeColumn<'a>>,
+    },
+}
+
+#[derive(Debug, Clone, Copy)]
+enum JoinKeyMatcher {
+    I64PairEqual { build_keys_may_be_null: bool },
+    Generic,
+}
+
+enum PreparedProbeColumn<'a> {
+    Fixed {
+        kind: JoinKeyColumn,
+        view: DecodedVectorRef<'a>,
+    },
+    Varlen(VarlenView<'a>),
+    ValueFallback(&'a Vector),
 }
 
 impl JoinKeyLayout {
-    pub(crate) fn new(key_types: &[LogicalType]) -> Self {
-        Self {
-            columns: key_types
-                .iter()
-                .map(JoinKeyColumn::from_type)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
+    pub(crate) fn new(
+        key_types: &[LogicalType],
+        comparisons: &[JoinComparisonType],
+        build_keys_may_be_null: bool,
+    ) -> Self {
+        let columns = key_types
+            .iter()
+            .map(JoinKeyColumn::from_type)
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let matcher = if columns.as_ref() == [JoinKeyColumn::I64, JoinKeyColumn::I64]
+            && comparisons == [JoinComparisonType::Equal, JoinComparisonType::Equal]
+        {
+            JoinKeyMatcher::I64PairEqual {
+                build_keys_may_be_null,
+            }
+        } else {
+            JoinKeyMatcher::Generic
+        };
+        Self { columns, matcher }
     }
 
     #[cfg(test)]
@@ -128,7 +179,7 @@ impl JoinKeyLayout {
             None,
             count,
             &mut hashes.as_mut_slice::<u64>()[..count],
-        );
+        )?;
         Ok(())
     }
 
@@ -138,9 +189,48 @@ impl JoinKeyLayout {
         selection: &SelectionVector,
         count: usize,
         hashes: &mut [u64],
-    ) {
+    ) -> Result<()> {
         debug_assert!(hashes.len() >= count);
-        self.hash_rows_into(keys, Some(selection), count, hashes);
+        self.hash_rows_into(keys, Some(selection), count, hashes)
+    }
+
+    pub(crate) fn prepare_probe_keys<'a>(&self, keys: &'a Chunk) -> Result<PreparedProbeKeys<'a>> {
+        if matches!(self.matcher, JoinKeyMatcher::I64PairEqual { .. }) {
+            let left = keys
+                .column(0)
+                .expect("hash join key column must exist")
+                .try_decode_ref(keys.size())?;
+            let right = keys
+                .column(1)
+                .expect("hash join key column must exist")
+                .try_decode_ref(keys.size())?;
+            return Ok(PreparedProbeKeys {
+                shape: PreparedProbeKeyShape::I64Pair { left, right },
+            });
+        }
+
+        let mut columns = Vec::with_capacity(self.columns.len());
+        for (col_idx, kind) in self.columns.iter().copied().enumerate() {
+            let vector = keys
+                .column(col_idx)
+                .expect("hash join key column must exist");
+            let prepared = match kind {
+                JoinKeyColumn::Varchar | JoinKeyColumn::Blob => {
+                    PreparedProbeColumn::Varlen(vector.try_to_varlen_view(keys.size())?)
+                }
+                JoinKeyColumn::ValueFallback { .. } => {
+                    PreparedProbeColumn::ValueFallback(vector.as_ref())
+                }
+                _ => PreparedProbeColumn::Fixed {
+                    kind,
+                    view: vector.try_decode_ref(keys.size())?,
+                },
+            };
+            columns.push(prepared);
+        }
+        Ok(PreparedProbeKeys {
+            shape: PreparedProbeKeyShape::Generic { columns },
+        })
     }
 
     fn hash_rows_into(
@@ -149,8 +239,11 @@ impl JoinKeyLayout {
         selection: Option<&SelectionVector>,
         count: usize,
         hashes: &mut [u64],
-    ) {
+    ) -> Result<()> {
         debug_assert!(hashes.len() >= count);
+        if matches!(self.matcher, JoinKeyMatcher::I64PairEqual { .. }) {
+            return hash_i64_pair_equal_into(keys, selection, count, hashes);
+        }
         let hashes = &mut hashes[..count];
         hashes.fill(HASH_SEED);
         let selected_rows = selection.map(|selection| &selection.as_slice()[..count]);
@@ -159,24 +252,48 @@ impl JoinKeyLayout {
             let vector = keys
                 .column(col_idx)
                 .expect("hash join key column must exist");
-            apply_column_hash(column_kind, vector, selected_rows, count, hashes);
+            apply_column_hash(column_kind, vector, selected_rows, count, hashes)?;
         }
+        Ok(())
     }
 
     pub(crate) fn keys_match_build_row(
         &self,
-        keys: &Chunk,
+        keys: &PreparedProbeKeys<'_>,
         probe_row_idx: usize,
         build_layout: &BuildRowLayout,
         row_ptr: usize,
         comparisons: &[JoinComparisonType],
     ) -> bool {
         let row_ptr = row_ptr as *const u8;
-        for (col_idx, column_kind) in self.columns.iter().copied().enumerate() {
-            let vector = keys
-                .column(col_idx)
-                .expect("hash join key column must exist");
-            let probe_null = vector.is_null(probe_row_idx);
+        if let (
+            JoinKeyMatcher::I64PairEqual {
+                build_keys_may_be_null,
+            },
+            PreparedProbeKeyShape::I64Pair { left, right },
+        ) = (self.matcher, &keys.shape)
+        {
+            if !left.is_valid(probe_row_idx) || !right.is_valid(probe_row_idx) {
+                return false;
+            }
+            let layout = build_layout.base();
+            if build_keys_may_be_null
+                && (row_value_is_null(layout, row_ptr, 0) || row_value_is_null(layout, row_ptr, 1))
+            {
+                return false;
+            }
+            return unsafe { left.get_value::<i64>(probe_row_idx) }
+                == read_row_i64(layout, row_ptr, 0)
+                && unsafe { right.get_value::<i64>(probe_row_idx) }
+                    == read_row_i64(layout, row_ptr, 1);
+        }
+
+        let PreparedProbeKeyShape::Generic { columns } = &keys.shape else {
+            debug_assert!(false, "join key matcher and prepared probe shape diverged");
+            return false;
+        };
+        for (col_idx, column) in columns.iter().enumerate() {
+            let probe_null = !column.is_valid(probe_row_idx);
             let build_null = row_value_is_null(build_layout.base(), row_ptr, col_idx);
 
             match comparisons[col_idx] {
@@ -193,14 +310,7 @@ impl JoinKeyLayout {
                 }
             }
 
-            if !self.typed_value_equals_build_row(
-                column_kind,
-                vector,
-                probe_row_idx,
-                build_layout,
-                row_ptr,
-                col_idx,
-            ) {
+            if !column.equals_build_row(probe_row_idx, build_layout, row_ptr, col_idx) {
                 return false;
             }
         }
@@ -240,82 +350,6 @@ impl JoinKeyLayout {
         }
     }
 
-    fn typed_value_equals_build_row(
-        &self,
-        column_kind: JoinKeyColumn,
-        vector: &Vector,
-        probe_row_idx: usize,
-        build_layout: &BuildRowLayout,
-        row_ptr: *const u8,
-        col_idx: usize,
-    ) -> bool {
-        match column_kind {
-            JoinKeyColumn::Boolean => {
-                vector.get_bool(probe_row_idx).unwrap()
-                    == read_row_bool(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I8 => {
-                vector.get_i8(probe_row_idx).unwrap()
-                    == read_row_i8(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I16 => {
-                vector.get_i16(probe_row_idx).unwrap()
-                    == read_row_i16(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I32 => {
-                vector.get_i32(probe_row_idx).unwrap()
-                    == read_row_i32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I64 => {
-                vector.get_i64(probe_row_idx).unwrap()
-                    == read_row_i64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::I128 => {
-                vector.get_i128(probe_row_idx).unwrap()
-                    == read_row_i128(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U8 => {
-                vector.get_u8(probe_row_idx).unwrap()
-                    == read_row_u8(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U16 => {
-                vector.get_u16(probe_row_idx).unwrap()
-                    == read_row_u16(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U32 => {
-                vector.get_u32(probe_row_idx).unwrap()
-                    == read_row_u32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U64 => {
-                vector.get_u64(probe_row_idx).unwrap()
-                    == read_row_u64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::U128 => {
-                vector.get_u128(probe_row_idx).unwrap()
-                    == read_row_u128(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::F32 => {
-                vector.get_f32(probe_row_idx).unwrap().to_bits()
-                    == read_row_u32(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::F64 => {
-                vector.get_f64(probe_row_idx).unwrap().to_bits()
-                    == read_row_u64(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::Varchar => {
-                vector.get_string(probe_row_idx).unwrap().as_bytes()
-                    == read_row_varlen_bytes(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::Blob => {
-                vector.get_blob(probe_row_idx).unwrap()
-                    == read_row_varlen_bytes(build_layout.base(), row_ptr, col_idx)
-            }
-            JoinKeyColumn::ValueFallback { .. } => {
-                vector.get_value(probe_row_idx) == build_layout.read_value(row_ptr, col_idx)
-            }
-        }
-    }
-
     #[cfg(test)]
     pub(crate) fn column_kinds_for_tests(&self) -> Vec<&'static str> {
         self.columns
@@ -342,13 +376,102 @@ impl JoinKeyLayout {
     }
 }
 
+impl PreparedProbeColumn<'_> {
+    #[inline]
+    fn is_valid(&self, row_idx: usize) -> bool {
+        match self {
+            Self::Fixed { view, .. } => view.is_valid(row_idx),
+            Self::Varlen(view) => view.is_valid(row_idx),
+            Self::ValueFallback(vector) => !vector.is_null(row_idx),
+        }
+    }
+
+    #[inline]
+    fn equals_build_row(
+        &self,
+        probe_row_idx: usize,
+        build_layout: &BuildRowLayout,
+        row_ptr: *const u8,
+        col_idx: usize,
+    ) -> bool {
+        let layout = build_layout.base();
+        match self {
+            Self::Fixed { kind, view } => match kind {
+                JoinKeyColumn::Boolean => {
+                    (unsafe { view.get_value::<bool>(probe_row_idx) })
+                        == read_row_bool(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I8 => {
+                    (unsafe { view.get_value::<i8>(probe_row_idx) })
+                        == read_row_i8(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I16 => {
+                    (unsafe { view.get_value::<i16>(probe_row_idx) })
+                        == read_row_i16(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I32 => {
+                    (unsafe { view.get_value::<i32>(probe_row_idx) })
+                        == read_row_i32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I64 => {
+                    (unsafe { view.get_value::<i64>(probe_row_idx) })
+                        == read_row_i64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::I128 => {
+                    (unsafe { view.get_value::<i128>(probe_row_idx) })
+                        == read_row_i128(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U8 => {
+                    (unsafe { view.get_value::<u8>(probe_row_idx) })
+                        == read_row_u8(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U16 => {
+                    (unsafe { view.get_value::<u16>(probe_row_idx) })
+                        == read_row_u16(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U32 => {
+                    (unsafe { view.get_value::<u32>(probe_row_idx) })
+                        == read_row_u32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U64 => {
+                    (unsafe { view.get_value::<u64>(probe_row_idx) })
+                        == read_row_u64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::U128 => {
+                    (unsafe { view.get_value::<u128>(probe_row_idx) })
+                        == read_row_u128(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::F32 => {
+                    (unsafe { view.get_value::<f32>(probe_row_idx) }).to_bits()
+                        == read_row_u32(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::F64 => {
+                    (unsafe { view.get_value::<f64>(probe_row_idx) }).to_bits()
+                        == read_row_u64(layout, row_ptr, col_idx)
+                }
+                JoinKeyColumn::Varchar
+                | JoinKeyColumn::Blob
+                | JoinKeyColumn::ValueFallback { .. } => {
+                    unreachable!("non-fixed join key stored in fixed probe view")
+                }
+            },
+            Self::Varlen(view) => {
+                view.bytes(probe_row_idx) == read_row_varlen_bytes(layout, row_ptr, col_idx)
+            }
+            Self::ValueFallback(vector) => {
+                vector.get_value(probe_row_idx) == build_layout.read_value(row_ptr, col_idx)
+            }
+        }
+    }
+}
+
 fn apply_column_hash(
     column_kind: JoinKeyColumn,
     vector: &Vector,
     selected_rows: Option<&[u32]>,
     count: usize,
     hashes: &mut [u64],
-) {
+) -> Result<()> {
     match column_kind {
         JoinKeyColumn::Boolean => apply_fixed_hash_column::<bool>(
             vector,
@@ -454,20 +577,54 @@ fn apply_column_hash(
             |value| hash_u64(value.to_bits()),
             |vector, row| vector.get_f64(row),
         ),
-        JoinKeyColumn::Varchar => {
-            apply_varlen_hash_column(vector, selected_rows, count, hashes, |vector, row| {
-                vector.get_string(row).map(str::as_bytes)
-            })
-        }
-        JoinKeyColumn::Blob => {
-            apply_varlen_hash_column(vector, selected_rows, count, hashes, |vector, row| {
-                vector.get_blob(row)
-            })
+        JoinKeyColumn::Varchar | JoinKeyColumn::Blob => {
+            apply_varlen_hash_column(vector, selected_rows, count, hashes)
         }
         JoinKeyColumn::ValueFallback { type_hash } => {
-            apply_value_fallback_hash_column(vector, selected_rows, count, hashes, type_hash)
+            apply_value_fallback_hash_column(vector, selected_rows, count, hashes, type_hash);
+            Ok(())
         }
+    }?;
+    Ok(())
+}
+
+/// Hash the common two-BIGINT equality shape in one decoded row loop.
+///
+/// The generic column-major path resolves dictionary selections and validity
+/// twice for every row. Composite foreign keys are frequent in analytical
+/// schemas, so both inputs are decoded once and the final hash is produced in
+/// a single loop. The expression remains identical to the generic path.
+fn hash_i64_pair_equal_into(
+    keys: &Chunk,
+    selection: Option<&SelectionVector>,
+    count: usize,
+    hashes: &mut [u64],
+) -> Result<()> {
+    let left = keys
+        .column(0)
+        .expect("two-column join key is missing its first column")
+        .try_decode_ref(keys.size())?;
+    let right = keys
+        .column(1)
+        .expect("two-column join key is missing its second column")
+        .try_decode_ref(keys.size())?;
+    let selected_rows = selection.map(|selection| &selection.as_slice()[..count]);
+
+    for out_idx in 0..count {
+        let row_idx = selected_rows.map_or(out_idx, |rows| rows[out_idx] as usize);
+        let left_hash = if left.is_valid(row_idx) {
+            hash_i64(unsafe { left.get_value::<i64>(row_idx) })
+        } else {
+            NULL_HASH
+        };
+        let right_hash = if right.is_valid(row_idx) {
+            hash_i64(unsafe { right.get_value::<i64>(row_idx) })
+        } else {
+            NULL_HASH
+        };
+        hashes[out_idx] = combine_hash(combine_hash(HASH_SEED, left_hash), right_hash);
     }
+    Ok(())
 }
 
 fn apply_fixed_hash_column<T: Copy>(
@@ -477,99 +634,86 @@ fn apply_fixed_hash_column<T: Copy>(
     hashes: &mut [u64],
     hash_value: impl Fn(T) -> u64,
     read_value: impl Fn(&Vector, usize) -> Option<T>,
-) {
-    match (selected_rows, vector.vector_type()) {
-        (None, VectorType::Flat) => {
-            let values = vector.as_slice::<T>();
-            for row_idx in 0..count {
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(values[row_idx])
-                };
-                hashes[row_idx] = combine_hash(hashes[row_idx], value_hash);
-            }
-        }
-        (Some(selection), VectorType::Flat) => {
-            let values = vector.as_slice::<T>();
-            for out_idx in 0..count {
-                let row_idx = selection[out_idx] as usize;
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(values[row_idx])
-                };
-                hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
-            }
-        }
-        (_, VectorType::Constant) => {
-            let value_hash = if vector.is_null(0) {
-                NULL_HASH
-            } else {
-                hash_value(vector.as_slice::<T>()[0])
-            };
-            for slot in hashes.iter_mut().take(count) {
-                *slot = combine_hash(*slot, value_hash);
-            }
-        }
-        (None, _) => {
-            for row_idx in 0..count {
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(
-                        read_value(vector, row_idx)
-                            .expect("hash join key vector must contain the expected type"),
-                    )
-                };
-                hashes[row_idx] = combine_hash(hashes[row_idx], value_hash);
-            }
-        }
-        (Some(selection), _) => {
-            for out_idx in 0..count {
-                let row_idx = selection[out_idx] as usize;
-                let value_hash = if vector.is_null(row_idx) {
-                    NULL_HASH
-                } else {
-                    hash_value(
-                        read_value(vector, row_idx)
-                            .expect("hash join key vector must contain the expected type"),
-                    )
-                };
-                hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
-            }
-        }
-    }
-}
-
-fn apply_varlen_hash_column<'a>(
-    vector: &'a Vector,
-    selected_rows: Option<&[u32]>,
-    count: usize,
-    hashes: &mut [u64],
-    read_value: impl Fn(&'a Vector, usize) -> Option<&'a [u8]>,
-) {
+) -> Result<()> {
+    let view = vector.try_to_view(vector.len())?;
     if vector.vector_type() == VectorType::Constant {
-        let value_hash = if vector.is_null(0) {
+        let value_hash = if !view.is_valid(0) {
             NULL_HASH
+        } else if let DataRef::Ptr(data) = view.data() {
+            hash_value(unsafe { *(data as *const T) })
         } else {
-            hash_bytes(read_value(vector, 0).unwrap_or_default())
+            hash_value(
+                read_value(vector, 0).expect("hash join key vector must contain the expected type"),
+            )
         };
         for slot in hashes.iter_mut().take(count) {
             *slot = combine_hash(*slot, value_hash);
         }
-        return;
+        return Ok(());
+    }
+
+    if let DataRef::Ptr(data) = view.data() {
+        let values = data as *const T;
+        let all_valid = view.validity().all_valid();
+        for out_idx in 0..count {
+            let logical_idx =
+                selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
+            let physical_idx = view.physical_index(logical_idx);
+            let value_hash = if all_valid || view.validity().is_valid(physical_idx) {
+                hash_value(unsafe { *values.add(physical_idx) })
+            } else {
+                NULL_HASH
+            };
+            hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
+        }
+        return Ok(());
     }
 
     for out_idx in 0..count {
         let row_idx = selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
-        let value_hash = if vector.is_null(row_idx) {
+        let value_hash = if !view.is_valid(row_idx) {
             NULL_HASH
         } else {
-            hash_bytes(read_value(vector, row_idx).unwrap_or_default())
+            hash_value(
+                read_value(vector, row_idx)
+                    .expect("hash join key vector must contain the expected type"),
+            )
         };
         hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
     }
+    Ok(())
+}
+
+fn apply_varlen_hash_column(
+    vector: &Vector,
+    selected_rows: Option<&[u32]>,
+    count: usize,
+    hashes: &mut [u64],
+) -> Result<()> {
+    let view = vector.try_to_varlen_view(vector.len())?;
+    if vector.vector_type() == VectorType::Constant {
+        let value_hash = if !view.is_valid(0) {
+            NULL_HASH
+        } else {
+            hash_bytes(view.bytes(0))
+        };
+        for slot in hashes.iter_mut().take(count) {
+            *slot = combine_hash(*slot, value_hash);
+        }
+        return Ok(());
+    }
+
+    let all_valid = view.validity().all_valid();
+    for out_idx in 0..count {
+        let row_idx = selected_rows.map_or(out_idx, |selection| selection[out_idx] as usize);
+        let value_hash = if all_valid || view.is_valid(row_idx) {
+            hash_bytes(view.bytes(row_idx))
+        } else {
+            NULL_HASH
+        };
+        hashes[out_idx] = combine_hash(hashes[out_idx], value_hash);
+    }
+    Ok(())
 }
 
 fn apply_value_fallback_hash_column(
@@ -736,67 +880,30 @@ fn hash_logical_type_signature(logical_type: &LogicalType) -> u64 {
     hash
 }
 
-#[inline]
-fn hash_i64(value: i64) -> u64 {
-    hash_u64(value as u64)
-}
-
-#[inline]
-fn hash_u128(value: u128) -> u64 {
-    combine_hash(hash_u64(value as u64), hash_u64((value >> 64) as u64))
-}
-
-#[inline]
-fn hash_u64(value: u64) -> u64 {
-    let left = value.wrapping_mul(0xa076_1d64_78bd_642f) ^ HASH_SEED;
-    let right = value.rotate_left(31).wrapping_mul(0xe703_7ed1_a0b4_28db) ^ FIELD_SEED;
-    mul_xor_mix(left, right)
-}
-
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hash = combine_hash(hash_u64(bytes.len() as u64), FIELD_SEED);
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in chunks.by_ref() {
-        let word = u64::from_le_bytes(chunk.try_into().expect("chunk length is exactly 8"));
-        hash = combine_hash(hash, hash_u64(word));
-    }
-    let remainder = chunks.remainder();
-    if !remainder.is_empty() {
-        let mut tail = [0u8; 8];
-        tail[..remainder.len()].copy_from_slice(remainder);
-        hash = combine_hash(hash, hash_u64(u64::from_le_bytes(tail)));
-    }
-    hash
-}
-
-#[inline]
-fn combine_hash(left: u64, right: u64) -> u64 {
-    mul_xor_mix(left ^ FIELD_SEED, right.wrapping_add(0x9e37_79b9_7f4a_7c15))
-}
-
-#[inline]
-fn mul_xor_mix(left: u64, right: u64) -> u64 {
-    let product = (left as u128).wrapping_mul(right as u128);
-    ((product >> 64) as u64) ^ (product as u64)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use paro_common::chunk::Chunk;
-    use paro_common::test_utils::{test_allocator, test_i32_vector_with_allocator, test_vector};
+    use paro_common::test_utils::{
+        test_allocator, test_i32_vector_with_allocator, test_i64_vector_with_allocator, test_vector,
+    };
     use std::sync::Arc;
 
     #[test]
     fn join_key_layout_selects_typed_integer_kernel() {
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer, LogicalType::Varchar]);
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::Integer, LogicalType::Varchar],
+            &[JoinComparisonType::Equal, JoinComparisonType::Equal],
+            false,
+        );
         assert_eq!(layout.column_kinds_for_tests(), vec!["i32", "varchar"]);
     }
 
     #[test]
     fn typed_hash_kernel_hashes_equal_values_identically() {
         let allocator = test_allocator();
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
+        let layout =
+            JoinKeyLayout::new(&[LogicalType::Integer], &[JoinComparisonType::Equal], false);
         let left = Chunk::from_arc_vectors(
             vec![Arc::new(test_i32_vector_with_allocator(
                 &[42],
@@ -826,14 +933,19 @@ mod tests {
         );
         nested.set_count(1);
         let chunk = Chunk::from_arc_vectors(vec![Arc::new(nested)], test_allocator());
-        let layout = JoinKeyLayout::new(&[LogicalType::List(Box::new(LogicalType::Integer))]);
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::List(Box::new(LogicalType::Integer))],
+            &[JoinComparisonType::Equal],
+            false,
+        );
         assert_ne!(layout.hash_key_at(&chunk, 0), 0);
     }
 
     #[test]
     fn hash_kernel_hashes_selected_rows_column_major() {
         let allocator = test_allocator();
-        let layout = JoinKeyLayout::new(&[LogicalType::Integer]);
+        let layout =
+            JoinKeyLayout::new(&[LogicalType::Integer], &[JoinComparisonType::Equal], false);
         let chunk = Chunk::from_arc_vectors(
             vec![Arc::new(test_i32_vector_with_allocator(
                 &[7, 42, 99],
@@ -844,9 +956,36 @@ mod tests {
         let selection =
             SelectionVector::try_from_indices(vec![2, 1], allocator).expect("selection");
         let mut hashes = vec![0; 2];
-        layout.hash_selected_into(&chunk, &selection, 2, &mut hashes);
+        layout
+            .hash_selected_into(&chunk, &selection, 2, &mut hashes)
+            .unwrap();
 
         assert_eq!(hashes[0], layout.hash_key_at(&chunk, 2));
         assert_eq!(hashes[1], layout.hash_key_at(&chunk, 1));
+    }
+
+    #[test]
+    fn two_bigint_kernel_preserves_generic_hashes_for_selected_and_null_rows() {
+        let allocator = test_allocator();
+        let layout = JoinKeyLayout::new(
+            &[LogicalType::BigInt, LogicalType::BigInt],
+            &[JoinComparisonType::Equal, JoinComparisonType::Equal],
+            true,
+        );
+        let left = test_i64_vector_with_allocator(&[7, 42, 99], allocator.clone());
+        let mut right = test_i64_vector_with_allocator(&[70, 420, 990], allocator.clone());
+        right.validity_mut().set_null(1);
+        let chunk =
+            Chunk::from_arc_vectors(vec![Arc::new(left), Arc::new(right)], allocator.clone());
+        let selection =
+            SelectionVector::try_from_indices(vec![2, 1, 0], allocator).expect("selection");
+        let mut hashes = vec![0; 3];
+        layout
+            .hash_selected_into(&chunk, &selection, 3, &mut hashes)
+            .expect("pair hash");
+
+        assert_eq!(hashes[0], layout.hash_key_at(&chunk, 2));
+        assert_eq!(hashes[1], layout.hash_key_at(&chunk, 1));
+        assert_eq!(hashes[2], layout.hash_key_at(&chunk, 0));
     }
 }

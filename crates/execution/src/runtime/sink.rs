@@ -32,7 +32,7 @@ pub use crate::operators::set::{
 };
 pub use crate::operators::sort::build::SortBuildSinkExec;
 pub use crate::operators::sort::topn_build::TopNBuildSinkExec;
-pub use crate::operators::window::build::WindowBuildSinkExec;
+pub use crate::operators::window::{PartitionAggregateWindowBuildSinkExec, WindowBuildSinkExec};
 
 #[derive(Debug)]
 pub enum SinkExec {
@@ -45,6 +45,7 @@ pub enum SinkExec {
     SortBuild(SortBuildSinkExec),
     TopNBuild(TopNBuildSinkExec),
     WindowBuild(WindowBuildSinkExec),
+    PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkExec),
     SetOperationInput(SetOperationInputSinkExec),
     CteMaterialize(CteMaterializeSinkExec),
     DelimCapture(DelimCaptureSinkExec),
@@ -69,6 +70,7 @@ impl SinkExec {
             Self::SortBuild(_) => "SORT_BUILD",
             Self::TopNBuild(_) => "TOP_N_BUILD",
             Self::WindowBuild(_) => "WINDOW_BUILD",
+            Self::PartitionAggregateWindowBuild(_) => "PARTITION_AGGREGATE_WINDOW_BUILD",
             Self::SetOperationInput(_) => "SET_OPERATION_INPUT",
             Self::CteMaterialize(_) => "CTE_MATERIALIZE",
             Self::DelimCapture(_) => "DELIM_CAPTURE",
@@ -80,6 +82,21 @@ impl SinkExec {
             Self::CopyToFile(_) => "COPY_TO_FILE",
             Self::Dyn(_) => "DYN_SINK",
         }
+    }
+
+    /// Whether omitting an empty task-local sink state is an exact identity operation.
+    ///
+    /// This capability is deliberately narrow. It is consumed only after a dependency-gated
+    /// source proves that it has no rows. Unknown/plugin sinks keep the ordinary data-task path.
+    pub(crate) fn empty_local_merge_is_identity(&self) -> bool {
+        matches!(
+            self,
+            Self::ClientResult(_)
+                | Self::Materialize(_)
+                | Self::HashJoinBuild(_)
+                | Self::TopNBuild(_)
+                | Self::PartitionAggregateWindowBuild(_)
+        )
     }
 
     #[inline]
@@ -94,6 +111,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.create_global(ctx),
             Self::TopNBuild(exec) => exec.create_global(ctx),
             Self::WindowBuild(exec) => exec.create_global(ctx),
+            Self::PartitionAggregateWindowBuild(exec) => exec.create_global(ctx),
             Self::SetOperationInput(exec) => exec.create_global(ctx),
             Self::CteMaterialize(exec) => exec.create_global(ctx),
             Self::DelimCapture(exec) => exec.create_global(ctx),
@@ -123,6 +141,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.create_local(ctx, global),
             Self::TopNBuild(exec) => exec.create_local(ctx, global),
             Self::WindowBuild(exec) => exec.create_local(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.create_local(ctx, global),
             Self::SetOperationInput(exec) => exec.create_local(ctx, global),
             Self::CteMaterialize(exec) => exec.create_local(ctx, global),
             Self::DelimCapture(exec) => exec.create_local(ctx, global),
@@ -154,6 +173,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.consume(ctx, global, local, input),
             Self::TopNBuild(exec) => exec.consume(ctx, global, local, input),
             Self::WindowBuild(exec) => exec.consume(ctx, global, local, input),
+            Self::PartitionAggregateWindowBuild(exec) => exec.consume(ctx, global, local, input),
             Self::SetOperationInput(exec) => exec.consume(ctx, global, local, input),
             Self::CteMaterialize(exec) => exec.consume(ctx, global, local, input),
             Self::DelimCapture(exec) => exec.consume(ctx, global, local, input),
@@ -184,6 +204,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.merge_local(ctx, global, local),
             Self::TopNBuild(exec) => exec.merge_local(ctx, global, local),
             Self::WindowBuild(exec) => exec.merge_local(ctx, global, local),
+            Self::PartitionAggregateWindowBuild(exec) => exec.merge_local(ctx, global, local),
             Self::SetOperationInput(exec) => exec.merge_local(ctx, global, local),
             Self::CteMaterialize(exec) => exec.merge_local(ctx, global, local),
             Self::DelimCapture(exec) => exec.merge_local(ctx, global, local),
@@ -213,6 +234,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.prepare_finish(ctx, global),
             Self::TopNBuild(exec) => exec.prepare_finish(ctx, global),
             Self::WindowBuild(exec) => exec.prepare_finish(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.prepare_finish(ctx, global),
             Self::SetOperationInput(exec) => exec.prepare_finish(ctx, global),
             Self::CteMaterialize(exec) => exec.prepare_finish(ctx, global),
             Self::DelimCapture(exec) => exec.prepare_finish(ctx, global),
@@ -242,6 +264,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.finish_work(ctx, global),
             Self::TopNBuild(exec) => exec.finish_work(ctx, global),
             Self::WindowBuild(exec) => exec.finish_work(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.finish_work(ctx, global),
             Self::SetOperationInput(exec) => exec.finish_work(ctx, global),
             Self::CteMaterialize(exec) => exec.finish_work(ctx, global),
             Self::DelimCapture(exec) => exec.finish_work(ctx, global),
@@ -271,6 +294,7 @@ impl SinkExec {
             Self::SortBuild(exec) => exec.finish(ctx, global),
             Self::TopNBuild(exec) => exec.finish(ctx, global),
             Self::WindowBuild(exec) => exec.finish(ctx, global),
+            Self::PartitionAggregateWindowBuild(exec) => exec.finish(ctx, global),
             Self::SetOperationInput(exec) => exec.finish(ctx, global),
             Self::CteMaterialize(exec) => exec.finish(ctx, global),
             Self::DelimCapture(exec) => exec.finish(ctx, global),
@@ -342,9 +366,33 @@ pub enum FinishWork {
 
 #[derive(Debug, Clone)]
 pub struct FinishTaskGroup {
-    pub task_count_hint: usize,
+    /// Exact number of tasks the driver will issue before returning Drained.
+    pub task_count: usize,
     pub driver: Arc<dyn ParallelFinishDriver>,
     pub memory_class: MemoryClass,
+    pub coordinator_participation: FinishCoordinatorParticipation,
+}
+
+/// How aggressively the pipeline-completion thread should help a parallel
+/// finish group while scheduler workers consume the same producer.
+///
+/// This is an operator policy rather than a scheduler heuristic: some finish
+/// tasks are independent partitions that benefit from immediate draining,
+/// while reductions over shared state need the coordinator to yield after one
+/// task so sibling workers can make progress in parallel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FinishCoordinatorParticipation {
+    DrainAvailable,
+    SingleTask,
+}
+
+impl FinishCoordinatorParticipation {
+    pub fn max_tasks(self) -> usize {
+        match self {
+            Self::DrainAvailable => usize::MAX,
+            Self::SingleTask => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -372,6 +420,14 @@ pub trait ParallelFinishDriver: Send + Sync + std::fmt::Debug {
         ctx: &mut OperatorFinishContext,
     ) -> Result<FinishTaskPoll>;
 
+    /// Publish the completed group's result after every issued task succeeds.
+    /// The runtime calls this exactly once and never calls it after task error
+    /// or cancellation, so drivers do not reconstruct group completion from
+    /// worker-local counters.
+    fn finish_group(&self, _ctx: &mut OperatorFinishContext) -> Result<()> {
+        Ok(())
+    }
+
     fn cancel_group(&self, _ctx: &mut OperatorCleanupContext, _reason: CancelReason) -> Result<()> {
         Ok(())
     }
@@ -397,7 +453,7 @@ impl FinishTaskGroupRunner {
         run: impl for<'a> Fn(&mut OperatorFinishContext<'a>) -> Result<()> + Send + Sync + 'static,
     ) -> FinishTaskGroup {
         FinishTaskGroup {
-            task_count_hint: 1,
+            task_count: 1,
             driver: Arc::new(Self {
                 label,
                 issued: AtomicBool::new(false),
@@ -405,6 +461,7 @@ impl FinishTaskGroupRunner {
                 run: Box::new(run),
             }),
             memory_class,
+            coordinator_participation: FinishCoordinatorParticipation::DrainAvailable,
         }
     }
 }

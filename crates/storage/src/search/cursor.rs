@@ -19,6 +19,8 @@ use super::stats::{
 };
 use super::tail::exact_merge::TailWindow;
 
+pub use crate::rowset::PhysicalRowRef;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableReadSnapshot {
     pub table_id: TableId,
@@ -350,40 +352,7 @@ impl SearchReadSnapshot {
         self.overlay_delete_vectors
             .as_ref()
             .and_then(|delete_vectors| delete_vectors.get(&(row.rowset_id, row.segment_id)))
-            .is_some_and(|delete_vector| delete_vector.is_deleted(row.row_id))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct PhysicalRowRef {
-    pub rowset_id: RowsetId,
-    pub segment_id: SegmentId,
-    pub row_id: u32,
-}
-
-impl PhysicalRowRef {
-    pub const fn new(rowset_id: RowsetId, segment_id: SegmentId, row_id: u32) -> Self {
-        Self {
-            rowset_id,
-            segment_id,
-            row_id,
-        }
-    }
-
-    pub const fn segment_key(self) -> (RowsetId, SegmentId) {
-        (self.rowset_id, self.segment_id)
-    }
-}
-
-impl From<crate::tablet::PhysicalRowRef> for PhysicalRowRef {
-    fn from(value: crate::tablet::PhysicalRowRef) -> Self {
-        Self::new(value.rowset_id, value.segment_id, value.row_offset)
-    }
-}
-
-impl From<PhysicalRowRef> for crate::tablet::PhysicalRowRef {
-    fn from(value: PhysicalRowRef) -> Self {
-        Self::new(value.rowset_id, value.segment_id, value.row_id)
+            .is_some_and(|delete_vector| delete_vector.is_deleted(row.row_offset))
     }
 }
 
@@ -479,7 +448,7 @@ mod tests {
 
     #[test]
     fn physical_row_ref_round_trips_with_existing_tablet_type() {
-        let row = PhysicalRowRef::new(7, 3, 11);
+        let row = PhysicalRowRef::new(7, 3, crate::rowset::SegmentRowId::from_raw(11));
         let tablet_row: crate::tablet::PhysicalRowRef = row.into();
         assert_eq!(tablet_row.rowset_id, 7);
         assert_eq!(tablet_row.segment_id, 3);
@@ -492,10 +461,24 @@ mod tests {
 
     #[test]
     fn candidate_batch_rejects_misaligned_scores() {
-        let err = CandidateBatch::try_new(vec![PhysicalRowRef::new(1, 0, 0)], vec![0.1, 0.2]);
+        let err = CandidateBatch::try_new(
+            vec![PhysicalRowRef::new(
+                1,
+                0,
+                crate::rowset::SegmentRowId::from_raw(0),
+            )],
+            vec![0.1, 0.2],
+        );
         assert!(err.is_err());
 
-        let filter_batch = CandidateBatch::try_new(vec![PhysicalRowRef::new(1, 0, 0)], vec![]);
+        let filter_batch = CandidateBatch::try_new(
+            vec![PhysicalRowRef::new(
+                1,
+                0,
+                crate::rowset::SegmentRowId::from_raw(0),
+            )],
+            vec![],
+        );
         assert!(filter_batch.is_ok());
         assert_eq!(filter_batch.unwrap().len(), 1);
     }

@@ -37,12 +37,14 @@ pub mod effect;
 pub mod error;
 pub mod expression_type;
 pub mod filter_propagate;
+pub mod hash;
 pub mod identity;
 pub mod journal;
 pub mod logging;
 pub mod memory;
 pub mod runtime_value;
 pub mod sort_key;
+pub mod string_pattern;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 pub mod typed_parameters;

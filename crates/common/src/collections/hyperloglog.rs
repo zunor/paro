@@ -4,12 +4,12 @@
 //! ## Implementation Notes
 //! - Algorithms from "New cardinality estimation algorithms for HyperLogLog sketches"
 //!   by Otmar Ertl, arXiv:1702.01284
-//! - P = 6, M = 64 registers (compact representation)
+//! - P = 10, M = 1024 registers
 //! - Uses Sigma/Tau functions for improved accuracy (from Redis)
 //!
 //! ## Known Limitations
 //! - Does not support Vector-based batch updates (will be added when needed)
-//! - Only supports HLL_V2 format for serialization
+//! - Only supports HLL_V3 format for serialization
 
 use std::f64::consts::PI;
 use std::io::{Read, Write};
@@ -24,6 +24,8 @@ pub enum HllStorageType {
     HllV1 = 1,
     /// Our own compact implementation
     HllV2 = 2,
+    /// Precision-tagged register representation
+    HllV3 = 3,
 }
 
 impl TryFrom<u8> for HllStorageType {
@@ -33,6 +35,7 @@ impl TryFrom<u8> for HllStorageType {
         match value {
             1 => Ok(HllStorageType::HllV1),
             2 => Ok(HllStorageType::HllV2),
+            3 => Ok(HllStorageType::HllV3),
             _ => Err(paro_error::internal(format!(
                 "Unknown HyperLogLog storage type: {}",
                 value
@@ -63,18 +66,18 @@ impl TryFrom<u8> for HllStorageType {
 /// ```
 #[derive(Clone)]
 pub struct HyperLogLog {
-    /// Register array (M = 64 registers)
+    /// Register array (M = 1024 registers)
     k: [u8; Self::M],
 }
 
 impl HyperLogLog {
-    /// Number of bits used for register index (P = 6)
-    pub const P: usize = 6;
+    /// Number of bits used for register index (P = 10)
+    pub const P: usize = 10;
 
     /// Number of bits used for leading zeros count (Q = 64 - P = 58)
     pub const Q: usize = 64 - Self::P;
 
-    /// Number of registers (M = 2^P = 64)
+    /// Number of registers (M = 2^P = 1024)
     pub const M: usize = 1 << Self::P;
 
     /// Alpha constant: 1 / (2 * ln(2))
@@ -87,7 +90,7 @@ impl HyperLogLog {
 
     /// Get the error rate for this HLL configuration.
     ///
-    /// For P=6, M=64, the error rate is approximately 15.6%.
+    /// For P=10, M=1024, the error rate is approximately 3.9%.
     #[inline]
     pub fn error_rate() -> f64 {
         (PI / 2.0).sqrt() / (Self::M as f64).sqrt()
@@ -178,8 +181,9 @@ impl HyperLogLog {
 
     /// Serialize the HyperLogLog to a writer.
     pub fn serialize<W: Write>(&self, w: &mut W) -> Result<()> {
-        // Write storage type (HLL_V2)
-        w.write_all(&[HllStorageType::HllV2 as u8])?;
+        // Precision is part of the storage contract: a register array cannot
+        // be interpreted correctly after P changes.
+        w.write_all(&[HllStorageType::HllV3 as u8, Self::P as u8])?;
         // Write register data
         w.write_all(&self.k)?;
         Ok(())
@@ -199,7 +203,19 @@ impl HyperLogLog {
                     "HyperLogLog V1 format deserialization not supported",
                 ))
             }
-            HllStorageType::HllV2 => {
+            HllStorageType::HllV2 => Err(paro_error::not_implemented(
+                "HyperLogLog V2 format deserialization not supported",
+            )),
+            HllStorageType::HllV3 => {
+                let mut precision = [0u8; 1];
+                r.read_exact(&mut precision)?;
+                if precision[0] as usize != Self::P {
+                    return Err(paro_error::internal(format!(
+                        "HyperLogLog precision mismatch: stored P={}, expected P={}",
+                        precision[0],
+                        Self::P
+                    )));
+                }
                 let mut hll = Self::new();
                 r.read_exact(&mut hll.k)?;
                 Ok(hll)
@@ -209,7 +225,7 @@ impl HyperLogLog {
 
     /// Serialize to a byte vector.
     pub fn to_bytes(&self) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(1 + Self::M);
+        let mut buf = Vec::with_capacity(2 + Self::M);
         // This cannot fail for Vec
         let _ = self.serialize(&mut buf);
         buf
@@ -452,6 +468,8 @@ mod tests {
         }
 
         let bytes = hll.to_bytes();
+        assert_eq!(bytes[0], HllStorageType::HllV3 as u8);
+        assert_eq!(bytes[1], HyperLogLog::P as u8);
         let restored = HyperLogLog::from_bytes(&bytes).expect("Deserialization failed");
 
         assert_eq!(hll.count(), restored.count());
@@ -478,9 +496,9 @@ mod tests {
     #[test]
     fn test_error_rate() {
         let error_rate = HyperLogLog::error_rate();
-        // For P=6, M=64, error rate should be approximately 15.6%
+        // For P=10, M=1024, error rate should be approximately 3.9%.
         assert!(
-            error_rate > 0.15 && error_rate < 0.17,
+            error_rate > 0.03 && error_rate < 0.05,
             "Error rate {} not in expected range",
             error_rate
         );
@@ -490,6 +508,19 @@ mod tests {
     fn test_deserialize_invalid_type() {
         let bytes = [0xFF, 0, 0, 0]; // Invalid storage type
         let result = HyperLogLog::from_bytes(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_legacy_precisionless_format() {
+        let result = HyperLogLog::from_bytes(&[HllStorageType::HllV2 as u8]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_rejects_different_precision() {
+        let result =
+            HyperLogLog::from_bytes(&[HllStorageType::HllV3 as u8, (HyperLogLog::P - 1) as u8]);
         assert!(result.is_err());
     }
 }

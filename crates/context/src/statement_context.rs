@@ -139,16 +139,16 @@ impl StatementContext {
         }
     }
 
-    pub fn shared_plan_cache(&self) -> Option<&Arc<dyn crate::SharedPlanCacheHandle>> {
-        self.services.plan_cache.as_ref()
-    }
-
     pub fn connection_info_provider(&self) -> Option<&Arc<dyn crate::ConnectionInfoProvider>> {
         self.services.connection_info.as_ref()
     }
 
     pub fn buffer_pool(&self) -> &Arc<paro_storage::buffer::BufferPool> {
         &self.services.infra.buffer_pool
+    }
+
+    pub fn page_cache(&self) -> &Arc<paro_storage::buffer::PageCache> {
+        &self.services.infra.page_cache
     }
 
     pub fn buffer_manager(&self) -> &Arc<dyn paro_storage::buffer::BufferManager> {

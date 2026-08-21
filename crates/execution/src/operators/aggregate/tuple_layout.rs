@@ -9,9 +9,10 @@ use std::str;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::hash::{combine_hash, hash_bytes, hash_i64, hash_u128, hash_u64, NULL_HASH};
 use paro_common::memory::{AccountedVec, MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::Vector;
 
 use super::aggregate_object::AggregateObject;
@@ -19,6 +20,8 @@ use super::aggregate_state::AggregateStateLayout;
 use super::row_format::AggregateGroupFormat;
 
 const MIN_ALIGNMENT: usize = 8;
+const MIN_VARLEN_HEAP_CAPACITY: usize = 4 * 1024;
+const VARLEN_DEDUP_CACHE_SLOTS: usize = 256;
 
 /// Row-local reference to variable-length bytes in [`VarlenHeap`].
 #[repr(C)]
@@ -107,6 +110,14 @@ impl VarlenRef {
 #[derive(Debug)]
 pub struct VarlenHeap {
     data: AccountedVec<u8>,
+    dedup_cache: Option<AccountedVec<VarlenDedupEntry>>,
+    memory: MemoryAccountingContext,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct VarlenDedupEntry {
+    fingerprint: u64,
+    value: VarlenRef,
 }
 
 impl Default for VarlenHeap {
@@ -124,28 +135,30 @@ impl VarlenHeap {
     }
 
     pub fn new_with_memory(memory: MemoryAccountingContext) -> Self {
+        let data = memory
+            .grant()
+            .map(|grant| {
+                AccountedVec::new_with_accounting(grant, memory.tag(), memory.accounting_class())
+            })
+            .unwrap_or_else(|_| {
+                AccountedVec::new_with_accounting(
+                    paro_common::memory::MemoryGrant::detached(usize::MAX / 4, memory.domain()),
+                    memory.tag(),
+                    memory.accounting_class(),
+                )
+            });
         Self {
-            data: memory
-                .grant()
-                .map(|grant| {
-                    AccountedVec::new_with_accounting(
-                        grant,
-                        memory.tag(),
-                        memory.accounting_class(),
-                    )
-                })
-                .unwrap_or_else(|_| {
-                    AccountedVec::new_with_accounting(
-                        paro_common::memory::MemoryGrant::detached(usize::MAX / 4, memory.domain()),
-                        memory.tag(),
-                        memory.accounting_class(),
-                    )
-                }),
+            data,
+            dedup_cache: None,
+            memory,
         }
     }
 
     pub fn reset(&mut self) {
         self.data.clear();
+        if let Some(cache) = &mut self.dedup_cache {
+            cache.as_mut_slice().fill(VarlenDedupEntry::default());
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -160,6 +173,19 @@ impl VarlenHeap {
         self.data.capacity().saturating_sub(self.data.len())
     }
 
+    pub fn dedup_cache_memory_usage(&self) -> usize {
+        self.dedup_cache
+            .as_ref()
+            .map_or(0, |cache| cache.capacity() * size_of::<VarlenDedupEntry>())
+    }
+
+    pub fn release_dedup_cache(&mut self) {
+        if let Some(mut cache) = self.dedup_cache.take() {
+            cache.clear();
+            cache.shrink_to_fit_and_refund();
+        }
+    }
+
     pub fn shrink_to_fit_and_refund(&mut self) {
         self.data.shrink_to_fit_and_refund();
     }
@@ -171,13 +197,53 @@ impl VarlenHeap {
     pub fn append(&mut self, bytes: &[u8]) -> Result<usize> {
         let offset = self.data.len();
         let len = bytes.len();
-        let _ = offset.checked_add(len).ok_or_else(|| {
+        let required = offset.checked_add(len).ok_or_else(|| {
             paro_error::internal(format!(
                 "VarlenHeap overflow when appending bytes: offset={offset}, len={len}"
             ))
         })?;
+        if required > self.data.capacity() {
+            let target_capacity = self
+                .data
+                .capacity()
+                .saturating_mul(2)
+                .max(MIN_VARLEN_HEAP_CAPACITY)
+                .max(required);
+            self.data.try_reserve(target_capacity - offset)?;
+        }
         self.data.try_extend_from_slice(bytes)?;
         Ok(offset)
+    }
+
+    /// Store an out-of-line value, reusing a recent equal value when possible.
+    ///
+    /// Group tuples often repeat low-cardinality strings across otherwise
+    /// distinct rows. A bounded direct-mapped cache captures that locality
+    /// without retaining an unbounded dictionary alongside the hash table.
+    pub fn intern(&mut self, bytes: &[u8]) -> Result<VarlenRef> {
+        debug_assert!(bytes.len() > VarlenRef::inline_capacity());
+        self.ensure_dedup_cache()?;
+
+        let hash = hash_bytes(bytes);
+        let slot = hash as usize & (VARLEN_DEDUP_CACHE_SLOTS - 1);
+        let fingerprint = hash | 1;
+        let cached = self
+            .dedup_cache
+            .as_ref()
+            .expect("varlen dedup cache initialized")[slot];
+        if cached.fingerprint == fingerprint
+            && read_varlen_ref_bytes(&cached.value, self).is_ok_and(|value| value == bytes)
+        {
+            return Ok(cached.value);
+        }
+
+        let offset = self.append(bytes)?;
+        let value = VarlenRef::from_heap(offset, bytes.len())?;
+        self.dedup_cache
+            .as_mut()
+            .expect("varlen dedup cache initialized")[slot] =
+            VarlenDedupEntry { fingerprint, value };
+        Ok(value)
     }
 
     pub fn get(&self, offset: usize, len: usize) -> Result<&[u8]> {
@@ -193,6 +259,22 @@ impl VarlenHeap {
             )));
         }
         Ok(&self.data.as_slice()[offset..end])
+    }
+
+    fn ensure_dedup_cache(&mut self) -> Result<()> {
+        if self.dedup_cache.is_some() {
+            return Ok(());
+        }
+        debug_assert!(VARLEN_DEDUP_CACHE_SLOTS.is_power_of_two());
+        let cache_memory = self.memory.with_class(MemoryAccountingClass::Metadata);
+        let mut cache = AccountedVec::new_with_accounting(
+            cache_memory.grant()?,
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Metadata,
+        );
+        cache.try_resize_with(VARLEN_DEDUP_CACHE_SLOTS, VarlenDedupEntry::default)?;
+        self.dedup_cache = Some(cache);
+        Ok(())
     }
 }
 
@@ -213,6 +295,24 @@ pub struct TupleLayout {
 }
 
 impl TupleLayout {
+    /// Bytes occupied by the validity mask and group keys before aggregate
+    /// states begin. The result includes the alignment required by the state
+    /// section, so physical-key planning can reject encodings that only move
+    /// padding around without shrinking a stored hash-table row.
+    pub(crate) fn group_storage_width(group_types: &[LogicalType]) -> Result<usize> {
+        let mut current_offset = validity_mask_size(group_types.len());
+        for group_type in group_types {
+            let width = group_storage_width(group_type)?;
+            current_offset = align_to(current_offset, group_alignment(group_type)?)?;
+            current_offset = current_offset.checked_add(width).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "TupleLayout overflow building group storage: offset={current_offset}, width={width}"
+                ))
+            })?;
+        }
+        align_to(current_offset, MIN_ALIGNMENT)
+    }
+
     /// Build row layout from group key types and aggregate objects.
     pub fn build(
         group_types: &[LogicalType],
@@ -237,6 +337,7 @@ impl TupleLayout {
         }
 
         let agg_state_offset = align_to(current_offset, MIN_ALIGNMENT)?;
+        debug_assert_eq!(agg_state_offset, Self::group_storage_width(group_types)?);
         let aggregate_state_layout = AggregateStateLayout::new(aggregate_objects)?;
         let row_format = AggregateGroupFormat::new(
             group_types.iter().cloned(),
@@ -339,8 +440,7 @@ impl TupleLayout {
                 let varlen_ref = if bytes.len() <= VarlenRef::inline_capacity() {
                     VarlenRef::from_inline(bytes)?
                 } else {
-                    let offset = varlen_heap.append(bytes)?;
-                    VarlenRef::from_heap(offset, bytes.len())?
+                    varlen_heap.intern(bytes)?
                 };
                 unsafe {
                     std::ptr::write_unaligned(target as *mut VarlenRef, varlen_ref);
@@ -377,6 +477,90 @@ impl TupleLayout {
         } else {
             read_fixed_group_value(value_ptr, group_type)
         }
+    }
+
+    /// Gather one serialized group column into a flat vector.
+    ///
+    /// Fixed-width keys are copied directly into the vector's physical buffer,
+    /// avoiding a `Value` allocation and dispatch for every group. Variable-
+    /// length keys retain the typed deserializer because their row references
+    /// may point into the aggregate heap.
+    ///
+    /// # Safety
+    /// `row_base` must reference `count` initialized rows separated by
+    /// `row_stride` bytes, each encoded with this layout.
+    pub unsafe fn gather_group_column(
+        &self,
+        row_base: *const u8,
+        row_stride: usize,
+        count: usize,
+        group_idx: usize,
+        varlen_heap: &VarlenHeap,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let group_type = self.group_types.get(group_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "Group index out of bounds in TupleLayout gather: idx={group_idx}, count={}",
+                self.group_count()
+            ))
+        })?;
+        if result.logical_type() != group_type {
+            return Err(paro_error::internal(format!(
+                "Group gather type mismatch: expected={group_type:?}, actual={:?}",
+                result.logical_type()
+            )));
+        }
+        result.try_set_count(count)?;
+        result.validity_mut().try_set_all_valid(count)?;
+
+        if self.varlen_groups[group_idx] {
+            let (entries, validity, heap) = result.try_begin_varlen_write(count)?;
+            for row_idx in 0..count {
+                // SAFETY: guaranteed by this method's caller contract.
+                let row_ptr = unsafe { row_base.add(row_idx * row_stride) };
+                if !row_is_valid(row_ptr, group_idx) {
+                    unsafe {
+                        *entries.add(row_idx) = StringView::empty();
+                    }
+                    validity.set_null(row_idx);
+                    continue;
+                }
+                let value_ptr = unsafe { row_ptr.add(self.group_offsets[group_idx]) };
+                let varlen_ref = unsafe { std::ptr::read_unaligned(value_ptr as *const VarlenRef) };
+                let bytes = read_varlen_ref_bytes(&varlen_ref, varlen_heap)?;
+                // SAFETY: `heap` is retained by the target vector.
+                let value = heap.try_add_blob(bytes)?;
+                unsafe {
+                    *entries.add(row_idx) = value;
+                }
+                validity.set_valid(row_idx);
+            }
+            return Ok(());
+        }
+
+        let width = group_storage_width(group_type)?;
+        // SAFETY: the logical-type equality above guarantees that the vector's
+        // flat physical width matches `width`, and it has capacity for `count` rows.
+        let target = unsafe { result.flat_data_mut::<u8>() };
+        for row_idx in 0..count {
+            // SAFETY: guaranteed by this method's caller contract, and the
+            // target vector owns at least `count * width` physical bytes.
+            let row_ptr = unsafe { row_base.add(row_idx * row_stride) };
+            if !row_is_valid(row_ptr, group_idx) {
+                result.validity_mut().try_set_null(row_idx)?;
+                continue;
+            }
+            // SAFETY: the source row follows this layout, the destination slot is
+            // within the initialized vector capacity, and the ranges do not overlap.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    row_ptr.add(self.group_offsets[group_idx]),
+                    target.add(row_idx * width),
+                    width,
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Deserialize full group key from one row.
@@ -444,6 +628,290 @@ impl TupleLayout {
         Ok(true)
     }
 
+    /// Compare group keys stored in two rows that share this tuple layout.
+    ///
+    /// # Safety
+    /// `left` and `right` must point to initialized rows encoded by this
+    /// layout, and each varlen heap must own the references in its row.
+    pub unsafe fn compare_serialized_groups(
+        &self,
+        left: *const u8,
+        left_heap: &VarlenHeap,
+        right: *const u8,
+        right_heap: &VarlenHeap,
+    ) -> Result<bool> {
+        unsafe {
+            self.compare_serialized_group_values_unchecked(
+                left,
+                left_heap,
+                self,
+                right,
+                right_heap,
+                self.group_count(),
+            )
+        }
+    }
+
+    /// Compare the first `prefix_count` group values in two rows that share
+    /// this tuple layout.
+    ///
+    /// # Safety
+    /// `left` and `right` must point to initialized rows encoded by this
+    /// layout, and `varlen_heap` must own the references in both rows.
+    pub unsafe fn compare_serialized_group_prefixes(
+        &self,
+        left: *const u8,
+        right: *const u8,
+        prefix_count: usize,
+        varlen_heap: &VarlenHeap,
+    ) -> Result<bool> {
+        if prefix_count > self.group_count() {
+            return Err(paro_error::internal(format!(
+                "Serialized group comparison prefix exceeds layout: prefix={prefix_count}, groups={}",
+                self.group_count()
+            )));
+        }
+        unsafe {
+            self.compare_serialized_group_values_unchecked(
+                left,
+                varlen_heap,
+                self,
+                right,
+                varlen_heap,
+                prefix_count,
+            )
+        }
+    }
+
+    /// Hash the first `prefix_count` groups directly from a serialized row.
+    ///
+    /// DISTINCT aggregation stores `(group keys..., aggregate inputs...)` as one
+    /// tuple. Hashing the group prefix in row form lets finalization probe the
+    /// result table without deserializing those keys into vectors first.
+    ///
+    /// # Safety
+    /// `row_ptr` must point to an initialized row encoded by this layout and
+    /// `varlen_heap` must own every out-of-line reference in that row.
+    pub unsafe fn hash_serialized_group_prefix(
+        &self,
+        row_ptr: *const u8,
+        prefix_count: usize,
+        varlen_heap: &VarlenHeap,
+    ) -> Result<u64> {
+        if prefix_count > self.group_count() {
+            return Err(paro_error::internal(format!(
+                "Serialized group hash prefix exceeds layout: prefix={prefix_count}, groups={}",
+                self.group_count()
+            )));
+        }
+        if prefix_count == 0 {
+            return Ok(NULL_HASH);
+        }
+
+        let mut hash = unsafe { self.hash_serialized_group_value(row_ptr, 0, varlen_heap)? };
+        for group_idx in 1..prefix_count {
+            let value_hash =
+                unsafe { self.hash_serialized_group_value(row_ptr, group_idx, varlen_heap)? };
+            hash = combine_hash(hash, value_hash);
+        }
+        Ok(hash)
+    }
+
+    /// Compare this complete target key with a prefix of another serialized key.
+    ///
+    /// # Safety
+    /// Both row pointers must reference initialized rows encoded by their
+    /// corresponding layouts and heaps.
+    pub unsafe fn compare_serialized_group_prefix(
+        &self,
+        target: *const u8,
+        target_heap: &VarlenHeap,
+        source_layout: &TupleLayout,
+        source: *const u8,
+        source_heap: &VarlenHeap,
+    ) -> Result<bool> {
+        self.validate_serialized_prefix(source_layout)?;
+        unsafe {
+            self.compare_serialized_group_values_unchecked(
+                target,
+                target_heap,
+                source_layout,
+                source,
+                source_heap,
+                self.group_count(),
+            )
+        }
+    }
+
+    /// Compare a validated prefix without repeating schema checks in the value loop.
+    ///
+    /// # Safety
+    /// Both rows must follow their respective layouts, both heaps must own all
+    /// referenced varlen values, and the first `prefix_count` group types in
+    /// both layouts must be equal.
+    unsafe fn compare_serialized_group_values_unchecked(
+        &self,
+        left: *const u8,
+        left_heap: &VarlenHeap,
+        right_layout: &TupleLayout,
+        right: *const u8,
+        right_heap: &VarlenHeap,
+        prefix_count: usize,
+    ) -> Result<bool> {
+        debug_assert!(prefix_count <= self.group_count());
+        debug_assert!(prefix_count <= right_layout.group_count());
+        debug_assert_eq!(
+            &self.group_types[..prefix_count],
+            &right_layout.group_types[..prefix_count]
+        );
+
+        for group_idx in 0..prefix_count {
+            let left_valid = row_is_valid(left, group_idx);
+            let right_valid = row_is_valid(right, group_idx);
+            if left_valid != right_valid {
+                return Ok(false);
+            }
+            if !left_valid {
+                continue;
+            }
+
+            let left_value = unsafe { left.add(self.group_offsets[group_idx]) };
+            let right_value = unsafe { right.add(right_layout.group_offsets[group_idx]) };
+            if self.varlen_groups[group_idx] {
+                let left_ref = unsafe { std::ptr::read_unaligned(left_value as *const VarlenRef) };
+                let right_ref =
+                    unsafe { std::ptr::read_unaligned(right_value as *const VarlenRef) };
+                if read_varlen_ref_bytes(&left_ref, left_heap)?
+                    != read_varlen_ref_bytes(&right_ref, right_heap)?
+                {
+                    return Ok(false);
+                }
+            } else {
+                let width = group_storage_width(&self.group_types[group_idx])?;
+                let left_bytes = unsafe { std::slice::from_raw_parts(left_value, width) };
+                let right_bytes = unsafe { std::slice::from_raw_parts(right_value, width) };
+                if left_bytes != right_bytes {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// Copy a serialized source prefix into a complete target key, relocating
+    /// out-of-line values into the target heap.
+    ///
+    /// # Safety
+    /// `source` must reference an initialized source-layout row backed by
+    /// `source_heap`; `target` must have writable storage for this layout.
+    pub unsafe fn copy_serialized_group_prefix(
+        &self,
+        source_layout: &TupleLayout,
+        source: *const u8,
+        source_heap: &VarlenHeap,
+        target: *mut u8,
+        target_heap: &mut VarlenHeap,
+    ) -> Result<()> {
+        self.validate_serialized_prefix(source_layout)?;
+        if self.validity_width > 0 {
+            unsafe {
+                std::ptr::write_bytes(target, 0, self.validity_width);
+            }
+        }
+        for group_idx in 0..self.group_count() {
+            let group_type = &self.group_types[group_idx];
+            let width = group_storage_width(group_type)?;
+            let target_value = unsafe { target.add(self.group_offsets[group_idx]) };
+            if !row_is_valid(source, group_idx) {
+                unsafe {
+                    std::ptr::write_bytes(target_value, 0, width);
+                }
+                continue;
+            }
+            set_validity(target, group_idx, true);
+
+            let source_value = unsafe { source.add(source_layout.group_offsets[group_idx]) };
+            if !self.varlen_groups[group_idx] {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(source_value, target_value, width);
+                }
+                continue;
+            }
+
+            let source_ref = unsafe { std::ptr::read_unaligned(source_value as *const VarlenRef) };
+            let bytes = read_varlen_ref_bytes(&source_ref, source_heap)?;
+            let target_ref = if bytes.len() <= VarlenRef::inline_capacity() {
+                VarlenRef::from_inline(bytes)?
+            } else {
+                target_heap.intern(bytes)?
+            };
+            unsafe {
+                std::ptr::write_unaligned(target_value as *mut VarlenRef, target_ref);
+            }
+        }
+        Ok(())
+    }
+
+    /// Copy group keys between serialized rows, relocating varlen references
+    /// into the target heap. Aggregate states and the stored hash are untouched.
+    ///
+    /// # Safety
+    /// `source` must point to an initialized row encoded by this layout and
+    /// backed by `source_heap`; `target` must have writable storage for one row.
+    pub unsafe fn copy_serialized_groups(
+        &self,
+        source: *const u8,
+        source_heap: &VarlenHeap,
+        target: *mut u8,
+        target_heap: &mut VarlenHeap,
+    ) -> Result<()> {
+        if self.validity_width > 0 {
+            unsafe {
+                std::ptr::copy_nonoverlapping(source, target, self.validity_width);
+            }
+        }
+        for group_idx in 0..self.group_count() {
+            let group_type = &self.group_types[group_idx];
+            let width = group_storage_width(group_type)?;
+            let offset = self.group_offsets[group_idx];
+            let source_value = unsafe { source.add(offset) };
+            let target_value = unsafe { target.add(offset) };
+            if !row_is_valid(source, group_idx) {
+                unsafe {
+                    std::ptr::write_bytes(target_value, 0, width);
+                }
+                continue;
+            }
+            if !self.varlen_groups[group_idx] {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(source_value, target_value, width);
+                }
+                continue;
+            }
+
+            let source_ref = unsafe { std::ptr::read_unaligned(source_value as *const VarlenRef) };
+            let bytes = read_varlen_ref_bytes(&source_ref, source_heap)?;
+            let target_ref = if bytes.len() <= VarlenRef::inline_capacity() {
+                VarlenRef::from_inline(bytes)?
+            } else {
+                target_heap.intern(bytes)?
+            };
+            unsafe {
+                std::ptr::write_unaligned(target_value as *mut VarlenRef, target_ref);
+            }
+        }
+        Ok(())
+    }
+
+    /// Return whether a group key is non-null in a serialized row.
+    ///
+    /// # Safety
+    /// `row_ptr` must point to an initialized row encoded by this layout.
+    pub unsafe fn serialized_group_is_valid(&self, row_ptr: *const u8, group_idx: usize) -> bool {
+        debug_assert!(group_idx < self.group_count());
+        row_is_valid(row_ptr, group_idx)
+    }
+
     pub fn store_hash(&self, row_ptr: *mut u8, hash: u64) {
         unsafe {
             std::ptr::write_unaligned(row_ptr.add(self.hash_offset) as *mut u64, hash);
@@ -452,6 +920,97 @@ impl TupleLayout {
 
     pub fn load_hash(&self, row_ptr: *const u8) -> u64 {
         unsafe { std::ptr::read_unaligned(row_ptr.add(self.hash_offset) as *const u64) }
+    }
+
+    pub(crate) fn validate_serialized_prefix(&self, source_layout: &TupleLayout) -> Result<()> {
+        if source_layout.group_count() < self.group_count()
+            || source_layout.group_types[..self.group_count()] != self.group_types
+        {
+            return Err(paro_error::internal(format!(
+                "Serialized group prefix layout mismatch: target={:?}, source={:?}",
+                self.group_types, source_layout.group_types
+            )));
+        }
+        Ok(())
+    }
+
+    unsafe fn hash_serialized_group_value(
+        &self,
+        row_ptr: *const u8,
+        group_idx: usize,
+        varlen_heap: &VarlenHeap,
+    ) -> Result<u64> {
+        if !row_is_valid(row_ptr, group_idx) {
+            return Ok(NULL_HASH);
+        }
+        let logical_type = self.group_types.get(group_idx).ok_or_else(|| {
+            paro_error::internal(format!(
+                "Serialized group hash index out of bounds: index={group_idx}, groups={}",
+                self.group_count()
+            ))
+        })?;
+        let value = unsafe { row_ptr.add(self.group_offsets[group_idx]) };
+        if self.varlen_groups[group_idx] {
+            let varlen_ref = unsafe { std::ptr::read_unaligned(value as *const VarlenRef) };
+            return Ok(hash_bytes(read_varlen_ref_bytes(&varlen_ref, varlen_heap)?));
+        }
+
+        let hash = match logical_type {
+            LogicalType::Boolean => hash_u64(u64::from(unsafe {
+                std::ptr::read_unaligned(value as *const u8) != 0
+            })),
+            LogicalType::TinyInt => {
+                hash_i64(unsafe { std::ptr::read_unaligned(value as *const i8) } as i64)
+            }
+            LogicalType::SmallInt => {
+                hash_i64(unsafe { std::ptr::read_unaligned(value as *const i16) } as i64)
+            }
+            LogicalType::Integer | LogicalType::Date => {
+                hash_i64(unsafe { std::ptr::read_unaligned(value as *const i32) } as i64)
+            }
+            LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time => {
+                hash_i64(unsafe { std::ptr::read_unaligned(value as *const i64) })
+            }
+            LogicalType::HugeInt | LogicalType::Interval => {
+                hash_u128(unsafe { std::ptr::read_unaligned(value as *const i128) } as u128)
+            }
+            LogicalType::UTinyInt => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const u8) } as u64)
+            }
+            LogicalType::USmallInt => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const u16) } as u64)
+            }
+            LogicalType::UInteger => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const u32) } as u64)
+            }
+            LogicalType::UBigInt => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const u64) })
+            }
+            LogicalType::UHugeInt | LogicalType::Uuid => {
+                hash_u128(unsafe { std::ptr::read_unaligned(value as *const u128) })
+            }
+            LogicalType::Float => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const f32) }.to_bits() as u64)
+            }
+            LogicalType::Double => {
+                hash_u64(unsafe { std::ptr::read_unaligned(value as *const f64) }.to_bits())
+            }
+            LogicalType::Decimal { precision, .. } if *precision <= 18 => {
+                hash_i64(unsafe { std::ptr::read_unaligned(value as *const i64) })
+            }
+            LogicalType::Decimal { .. } => {
+                hash_u128(unsafe { std::ptr::read_unaligned(value as *const i128) } as u128)
+            }
+            _ => {
+                return Err(paro_error::internal(format!(
+                    "Unsupported serialized group hash type: {logical_type:?}"
+                )));
+            }
+        };
+        Ok(hash)
     }
 }
 
@@ -498,7 +1057,7 @@ fn group_storage_width(logical_type: &LogicalType) -> Result<usize> {
     if is_varlen_group_type(logical_type) {
         return Ok(size_of::<VarlenRef>());
     }
-    let width = logical_type.physical_size();
+    let width = logical_type.type_size();
     if width == 0 {
         return Err(paro_error::internal(format!(
             "Unsupported group key type in TupleLayout: {logical_type:?}"
@@ -531,6 +1090,10 @@ fn align_to(value: usize, alignment: usize) -> Result<usize> {
             ))
         })
 }
+
+#[path = "tuple_layout_scatter.rs"]
+mod scatter;
+pub(crate) use scatter::TupleScatterSource;
 
 fn varlen_bytes<'a>(
     column: &'a Vector,
@@ -884,6 +1447,39 @@ mod tests {
         assert!(layout.hash_offset >= layout.agg_state_offset + 16);
         assert!(layout.row_width >= layout.hash_offset + 8);
         assert_eq!(layout.row_width % 8, 0);
+    }
+
+    #[test]
+    fn varlen_heap_grows_amortized() {
+        let mut heap = VarlenHeap::new();
+        for _ in 0..128 {
+            heap.append(b"x").expect("append varlen byte");
+        }
+        assert_eq!(heap.len(), 128);
+        assert!(heap.capacity() >= MIN_VARLEN_HEAP_CAPACITY);
+    }
+
+    #[test]
+    fn varlen_heap_interns_recent_values_with_bounded_metadata() {
+        let mut heap = VarlenHeap::new();
+        let value = b"a repeated heap-backed group key";
+        let first = heap.intern(value).expect("intern first value");
+        let second = heap.intern(value).expect("intern repeated value");
+
+        assert_eq!(first, second);
+        assert_eq!(heap.len(), value.len());
+        assert_eq!(
+            heap.dedup_cache_memory_usage(),
+            VARLEN_DEDUP_CACHE_SLOTS * size_of::<VarlenDedupEntry>()
+        );
+
+        heap.reset();
+        let after_reset = heap.intern(value).expect("intern after reset");
+        assert_eq!(after_reset.heap_offset(), Some(0));
+        assert_eq!(heap.len(), value.len());
+
+        heap.release_dedup_cache();
+        assert_eq!(heap.dedup_cache_memory_usage(), 0);
     }
 
     #[test]

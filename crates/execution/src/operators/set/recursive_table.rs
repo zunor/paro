@@ -6,7 +6,6 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::physical::properties::RequiredProperties;
 use crate::runtime::breaker::{HandleRef, RecursiveTableHandle};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -17,7 +16,6 @@ use crate::runtime::state::{
 #[derive(Debug, Clone)]
 pub struct RecursiveTableAppendSinkExec {
     pub handle: HandleRef<RecursiveTableHandle>,
-    pub required: RequiredProperties,
 }
 
 impl RecursiveTableAppendSinkExec {

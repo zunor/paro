@@ -6,7 +6,8 @@
 //!
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateEmptyInput, AggregateFunction, AggregateFunctionSet, AggregateInputData,
+    AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -190,7 +191,7 @@ pub fn get_min_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 pub fn get_max_function() -> AggregateFunctionSet {
@@ -239,7 +240,7 @@ pub fn get_max_function() -> AggregateFunctionSet {
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

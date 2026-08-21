@@ -7,17 +7,18 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_planner::binder::ir::OrderByNode;
 use paro_planner::expression::Expression;
-use paro_planner::operator::join::{JoinCondition, JoinType};
+use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
 
-use crate::physical::properties::{PipelineProperties, RequiredProperties};
+use crate::physical::properties::PipelineProperties;
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
-    AdaptiveSearchSpec, AggregateSpec, ChunkScanSpec, ClassicIeJoinSpec, CopyToFileSpec,
-    DeleteSpec, DummyScanSpec, EmptyResultSpec, ExpressionScanSpec, ExternalProjectSpec,
-    ExternalTableSpec, FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec,
-    GraphScanSpec, GraphShortestPathSpec, InsertSpec, LimitSpec, ProjectSpec, RowsetScanSpec,
-    SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec, TableFunctionScanSpec,
-    TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
+    AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ChunkScanSpec,
+    ClassicIeJoinSpec, CopyToFileSpec, DeleteSpec, DummyScanSpec, EmptyResultSpec,
+    ExpressionScanSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
+    GraphExpandSpec, GraphProjectSpec, GraphScanSpec, GraphShortestPathSpec,
+    HashReductionCascadeSpec, InsertSpec, LimitSpec, PartitionAggregateWindowSpec, ProjectSpec,
+    RowFetchSpec, RowsetScanSpec, SetOperationInputSide, SetOperationSpec, SparseVectorSearchSpec,
+    TableFunctionScanSpec, TopNSpec, UpdateSpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
 use super::handles::{BreakerHandleCatalog, BreakerHandleId, BreakerHandleKind};
@@ -397,6 +398,7 @@ pub enum SourceSpec {
     SortEmit(SortEmitSourceSpec),
     TopNEmit(TopNEmitSourceSpec),
     WindowEmit(WindowEmitSourceSpec),
+    PartitionAggregateWindowEmit(PartitionAggregateWindowEmitSourceSpec),
     SetOperationEmit(SetOperationEmitSourceSpec),
     CteScan(CteScanSourceSpec),
     DelimScan(DelimScanSourceSpec),
@@ -479,6 +481,10 @@ impl SourceSpec {
                 spec.spec.output_names.to_vec(),
                 spec.spec.output_types.to_vec(),
             ),
+            Self::PartitionAggregateWindowEmit(spec) => RowType::new(
+                spec.spec.output_names.to_vec(),
+                spec.spec.output_types.to_vec(),
+            ),
             Self::SetOperationEmit(spec) => RowType::new(
                 spec.spec.output_names.to_vec(),
                 spec.spec.output_types.to_vec(),
@@ -500,6 +506,9 @@ impl SourceSpec {
             Self::Rowset(source) => {
                 for filter in &source.dynamic_runtime_filters {
                     visit(filter.handle, BreakerHandleKind::HashJoinBuild)?;
+                }
+                for filter in &source.dynamic_scalar_filters {
+                    visit(filter.handle, BreakerHandleKind::Materialized)?;
                 }
             }
             Self::Materialized(source) => {
@@ -536,6 +545,9 @@ impl SourceSpec {
             Self::WindowEmit(source) => {
                 visit(source.handle, BreakerHandleKind::Window)?;
             }
+            Self::PartitionAggregateWindowEmit(source) => {
+                visit(source.handle, BreakerHandleKind::PartitionAggregateWindow)?;
+            }
             Self::SetOperationEmit(source) => {
                 visit(source.handle, BreakerHandleKind::SetOperation)?;
             }
@@ -561,6 +573,7 @@ impl SourceSpec {
 pub struct RowsetSourceSpec {
     pub scan: RowsetScanSpec,
     pub dynamic_runtime_filters: Box<[RowsetDynamicRuntimeFilterSpec]>,
+    pub dynamic_scalar_filters: Box<[RowsetDynamicScalarFilterSpec]>,
 }
 
 impl RowsetSourceSpec {
@@ -568,6 +581,7 @@ impl RowsetSourceSpec {
         Self {
             scan,
             dynamic_runtime_filters: Vec::new().into_boxed_slice(),
+            dynamic_scalar_filters: Vec::new().into_boxed_slice(),
         }
     }
 
@@ -579,6 +593,15 @@ impl RowsetSourceSpec {
         filters.push(filter);
         self.dynamic_runtime_filters = filters.into_boxed_slice();
     }
+
+    pub fn add_dynamic_scalar_filter(&mut self, filter: RowsetDynamicScalarFilterSpec) {
+        let mut filters = self.dynamic_scalar_filters.to_vec();
+        if filters.iter().any(|existing| existing == &filter) {
+            return;
+        }
+        filters.push(filter);
+        self.dynamic_scalar_filters = filters.into_boxed_slice();
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -586,6 +609,28 @@ pub struct RowsetDynamicRuntimeFilterSpec {
     pub handle: BreakerHandleId,
     pub build_key_index: usize,
     pub probe_column_id: u32,
+}
+
+/// Scan predicate derived from a materialized scalar join input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowsetDynamicScalarFilterSpec {
+    pub handle: BreakerHandleId,
+    pub build_column_index: usize,
+    pub probe_column_id: u32,
+    pub probe_type: LogicalType,
+    pub comparison: JoinComparisonType,
+    pub semantics: ScalarFilterSemantics,
+}
+
+/// Whether a scalar scan predicate is merely a pruning hint or is the
+/// relational predicate's semantic authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFilterSemantics {
+    /// The bound is rounded outward and the nested-loop join rechecks it.
+    Conservative,
+    /// The build subtree is structurally guaranteed to emit one row and the
+    /// storage predicate exactly implements the join comparison.
+    ExactSingleRow,
 }
 
 #[derive(Debug, Clone)]
@@ -614,13 +659,17 @@ pub struct NljUnmatchedSourceSpec {
 pub struct HashJoinSpillReplaySourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
-    pub conditions: Box<[JoinCondition]>,
+    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub key_conditions: Box<[JoinCondition]>,
+    pub build_residual_conditions: Box<[JoinCondition]>,
+    pub probe_residual_count: usize,
     pub probe_types: Box<[LogicalType]>,
     pub build_payload_types: Box<[LogicalType]>,
+    pub build_output_count: usize,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -628,9 +677,9 @@ pub struct HashJoinUnmatchedSourceSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub left_output_types: Box<[LogicalType]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -672,6 +721,12 @@ pub struct WindowEmitSourceSpec {
 }
 
 #[derive(Debug, Clone)]
+pub struct PartitionAggregateWindowEmitSourceSpec {
+    pub handle: BreakerHandleId,
+    pub spec: PartitionAggregateWindowSpec,
+}
+
+#[derive(Debug, Clone)]
 pub struct SetOperationEmitSourceSpec {
     pub handle: BreakerHandleId,
     pub spec: SetOperationSpec,
@@ -709,13 +764,12 @@ pub enum TransformSpec {
     CrossProductProbe(CrossProductProbeSpec),
     Limit(LimitSpec),
     StreamingTopN(TopNSpec),
-    StreamingAggregate(AggregateSpec),
     StreamingWindow(WindowSpec),
     ExternalProject(ExternalProjectSpec),
     GraphExpand(GraphExpandSpec),
+    RowFetch(RowFetchSpec),
     GraphProject(GraphProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
-    PropertyRepair(PropertyRepairSpec),
 }
 
 impl TransformSpec {
@@ -732,9 +786,6 @@ impl TransformSpec {
             Self::StreamingTopN(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
-            Self::StreamingAggregate(spec) => {
-                RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
-            }
             Self::StreamingWindow(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
@@ -744,6 +795,20 @@ impl TransformSpec {
             Self::GraphExpand(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
+            Self::RowFetch(spec) => spec.projection.as_ref().map_or_else(
+                || {
+                    RowType::new(
+                        spec.raw_output_names.to_vec(),
+                        spec.raw_output_types.to_vec(),
+                    )
+                },
+                |projection| {
+                    RowType::new(
+                        projection.output_names.to_vec(),
+                        projection.output_types.to_vec(),
+                    )
+                },
+            ),
             Self::GraphProject(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
@@ -762,7 +827,7 @@ impl TransformSpec {
             Self::CrossProductProbe(spec) => {
                 RowType::new(spec.output_names.to_vec(), spec.output_types.to_vec())
             }
-            Self::Filter(_) | Self::Limit(_) | Self::PropertyRepair(_) => input.clone(),
+            Self::Filter(_) | Self::Limit(_) => input.clone(),
         }
     }
 
@@ -791,19 +856,17 @@ impl TransformSpec {
 }
 
 #[derive(Debug, Clone)]
-pub struct PropertyRepairSpec {
-    pub kind: crate::physical::properties::PropertyRepairKind,
-}
-
-#[derive(Debug, Clone)]
 pub struct HashJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
-    pub conditions: Box<[JoinCondition]>,
+    pub anti_join_mode: paro_planner::operator::join::AntiJoinMode,
+    pub key_conditions: Box<[JoinCondition]>,
+    pub build_residual_conditions: Box<[JoinCondition]>,
+    pub probe_residual_count: usize,
     pub left_projection: Box<[usize]>,
-    pub right_projection: Box<[usize]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
+    pub reduction_cascade: Option<HashReductionCascadeSpec>,
 }
 
 #[derive(Debug, Clone)]
@@ -811,7 +874,7 @@ pub struct NestedLoopJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
     pub arbitrary_condition: Option<Expression>,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
@@ -825,7 +888,7 @@ pub struct SortRangeJoinProbeSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
     pub conditions: Box<[JoinCondition]>,
-    pub mark_null_condition_start: Option<usize>,
+    pub mark_semantics: paro_planner::operator::MarkJoinSemantics,
     pub left_projection: Box<[usize]>,
     pub right_projection: Box<[usize]>,
     pub right_output_types: Box<[LogicalType]>,
@@ -853,6 +916,7 @@ pub enum SinkSpec {
     SortBuild(SortBuildSinkSpec),
     TopNBuild(TopNBuildSinkSpec),
     WindowBuild(WindowBuildSinkSpec),
+    PartitionAggregateWindowBuild(PartitionAggregateWindowBuildSinkSpec),
     SetOperationInput(SetOperationInputSinkSpec),
     CteMaterialize(CteMaterializeSinkSpec),
     DelimCapture(DelimCaptureSinkSpec),
@@ -865,31 +929,6 @@ pub enum SinkSpec {
 }
 
 impl SinkSpec {
-    #[inline]
-    pub fn required_properties(&self) -> RequiredProperties {
-        match self {
-            Self::ClientResult(spec) => spec.required.clone(),
-            Self::Materialize(spec) => spec.required.clone(),
-            Self::CrossProductBuild(spec) => spec.required.clone(),
-            Self::HashJoinBuild(spec) => spec.required.clone(),
-            Self::HashAggregateBuild(spec) => spec.required.clone(),
-            Self::UngroupedAggregate(spec) => spec.required.clone(),
-            Self::PerfectHashAggregate(spec) => spec.required.clone(),
-            Self::SortBuild(spec) => spec.required.clone(),
-            Self::TopNBuild(spec) => spec.required.clone(),
-            Self::WindowBuild(spec) => spec.required.clone(),
-            Self::SetOperationInput(spec) => spec.required.clone(),
-            Self::CteMaterialize(spec) => spec.required.clone(),
-            Self::DelimCapture(spec) => spec.required.clone(),
-            Self::RecursiveTableAppend(spec) => spec.required.clone(),
-            Self::ExternalTable(spec) => spec.required.clone(),
-            Self::Insert(spec) => spec.required.clone(),
-            Self::Update(spec) => spec.required.clone(),
-            Self::Delete(spec) => spec.required.clone(),
-            Self::CopyToFile(spec) => spec.required.clone(),
-        }
-    }
-
     #[inline]
     pub fn visit_expected_handles(
         &self,
@@ -923,6 +962,9 @@ impl SinkSpec {
             Self::WindowBuild(sink) => {
                 visit(sink.handle, BreakerHandleKind::Window)?;
             }
+            Self::PartitionAggregateWindowBuild(sink) => {
+                visit(sink.handle, BreakerHandleKind::PartitionAggregateWindow)?;
+            }
             Self::SetOperationInput(sink) => {
                 visit(sink.handle, BreakerHandleKind::SetOperation)?;
             }
@@ -952,30 +994,30 @@ impl SinkSpec {
 }
 
 #[derive(Debug, Clone, Default)]
-pub struct ClientResultSpec {
-    pub required: RequiredProperties,
-}
+pub struct ClientResultSpec;
 
 #[derive(Debug, Clone)]
 pub struct MaterializeSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CrossProductBuildSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct HashJoinBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub join_type: JoinType,
-    pub conditions: Box<[JoinCondition]>,
+    pub build_keys_unique: bool,
+    pub build_time_integer_index: Option<BuildTimeIntegerJoinIndexSpec>,
+    pub key_conditions: Box<[JoinCondition]>,
+    pub residual_conditions: Box<[JoinCondition]>,
     pub build_projection: Box<[usize]>,
     pub build_payload_types: Box<[LogicalType]>,
-    pub required: RequiredProperties,
+    pub build_output_count: usize,
+    pub grouped_reduction_channels: Option<usize>,
     pub force_external: bool,
 }
 
@@ -983,21 +1025,18 @@ pub struct HashJoinBuildSinkSpec {
 pub struct HashAggregateBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct UngroupedAggregateSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct PerfectHashAggregateSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: AggregateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1009,21 +1048,24 @@ pub struct SortBuildSinkSpec {
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub force_external: bool,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct TopNBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: TopNSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct WindowBuildSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: WindowSpec,
-    pub required: RequiredProperties,
+}
+
+#[derive(Debug, Clone)]
+pub struct PartitionAggregateWindowBuildSinkSpec {
+    pub handle: BreakerHandleId,
+    pub spec: PartitionAggregateWindowSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -1031,13 +1073,11 @@ pub struct SetOperationInputSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: SetOperationSpec,
     pub side: SetOperationInputSide,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CteMaterializeSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
@@ -1045,44 +1085,37 @@ pub struct DelimCaptureSinkSpec {
     pub handle: BreakerHandleId,
     pub duplicate_keys: Box<[Expression]>,
     pub cached_outer: Option<BreakerHandleId>,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct RecursiveTableAppendSinkSpec {
     pub handle: BreakerHandleId,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExternalTableSinkSpec {
     pub handle: BreakerHandleId,
     pub spec: ExternalTableSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct InsertSinkSpec {
     pub spec: InsertSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct UpdateSinkSpec {
     pub spec: UpdateSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct DeleteSinkSpec {
     pub spec: DeleteSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone)]
 pub struct CopyToFileSinkSpec {
     pub spec: CopyToFileSpec,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

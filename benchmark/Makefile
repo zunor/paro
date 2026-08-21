@@ -142,7 +142,7 @@ ci: ## Run CI benchmark suite (default: SUITE=pr-smoke)
 		$(if $(PID),--pid $(PID))
 
 test: ## Run benchmark harness unit tests
-	$(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
+	PYTHONPATH=.. $(PYTHON) -m unittest discover -s tests -p 'test_*.py' -v
 
 ping: ## Verify Paro connectivity from config.toml
 	@$(PYTHON) -c "\

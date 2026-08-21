@@ -5,7 +5,7 @@
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
-use paro_common::types::{InlineString, LogicalType};
+use paro_common::types::{LogicalType, StringView};
 use paro_common::vector::DecodedVectorRef;
 use paro_storage::statistics::{BaseStatistics, StringStats};
 
@@ -92,7 +92,7 @@ impl PerfectHashKeyDomain {
                 })
             }
             LogicalType::Varchar => {
-                let value = unsafe { *group.get_data::<InlineString>().add(physical_idx) };
+                let value = unsafe { *group.get_data::<StringView>().add(physical_idx) };
                 encode_single_byte_varchar(value.as_bytes()).ok_or_else(|| {
                     paro_error::internal(format!(
                         "Single-byte perfect-hash key received VARCHAR length {}",

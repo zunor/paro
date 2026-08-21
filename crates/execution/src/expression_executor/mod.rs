@@ -5,6 +5,7 @@
 
 mod comparison;
 mod execution_state;
+mod like_pattern;
 mod predicate;
 mod program;
 
@@ -13,8 +14,10 @@ pub(crate) mod rows;
 pub mod physical {
     pub use super::program::{
         expression_fingerprint, expression_list_fingerprints, ExpressionBackend,
-        ExpressionProgramCache, ExpressionProgramCacheKey, ExpressionProgramVersion,
-        ExpressionScratchLayout, ExpressionScratchSlot, PhysicalExpressionProgram,
+        ExpressionProgramCache, ExpressionProgramVersion, ExpressionScratchLayout,
+        ExpressionScratchSlot, PhysicalExpressionProgram,
     };
 }
 pub mod state;
+
+pub(crate) use comparison::compile_comparison_dispatch;

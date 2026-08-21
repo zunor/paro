@@ -13,6 +13,7 @@ pub mod dml;
 pub mod external;
 pub mod graph;
 pub mod join;
+pub mod row_fetch;
 pub mod scan;
 pub mod search;
 pub mod sort;
@@ -24,6 +25,7 @@ pub use dml::*;
 pub use external::*;
 pub use graph::*;
 pub use join::*;
+pub use row_fetch::*;
 pub use scan::*;
 pub use search::*;
 pub use sort::*;
@@ -54,6 +56,7 @@ pub enum PhysicalNodeKind {
     SetOperation(SetOperationSpec),
     Aggregate(AggregateSpec),
     Window(WindowSpec),
+    PartitionAggregateWindow(PartitionAggregateWindowSpec),
     ChunkScan(ChunkScanSpec),
     ExpressionScan(ExpressionScanSpec),
     TableFunctionScan(TableFunctionScanSpec),
@@ -63,6 +66,7 @@ pub enum PhysicalNodeKind {
     AdaptiveSearch(AdaptiveSearchSpec),
     GraphScan(GraphScanSpec),
     GraphExpand(GraphExpandSpec),
+    RowFetch(RowFetchSpec),
     GraphProject(GraphProjectSpec),
     GraphShortestPath(GraphShortestPathSpec),
     ExternalProject(ExternalProjectSpec),
@@ -100,6 +104,7 @@ impl PhysicalNodeKind {
             Self::SetOperation(_) => "SET_OPERATION",
             Self::Aggregate(_) => "AGGREGATE",
             Self::Window(_) => "WINDOW",
+            Self::PartitionAggregateWindow(_) => "PARTITION_AGGREGATE_WINDOW",
             Self::ChunkScan(_) => "CHUNK_SCAN",
             Self::ExpressionScan(_) => "EXPRESSION_SCAN",
             Self::TableFunctionScan(_) => "TABLE_FUNCTION_SCAN",
@@ -109,6 +114,7 @@ impl PhysicalNodeKind {
             Self::AdaptiveSearch(_) => "ADAPTIVE_SEARCH",
             Self::GraphScan(_) => "GRAPH_SCAN",
             Self::GraphExpand(_) => "GRAPH_EXPAND",
+            Self::RowFetch(_) => "ROW_FETCH",
             Self::GraphProject(_) => "GRAPH_PROJECT",
             Self::GraphShortestPath(_) => "GRAPH_SHORTEST_PATH",
             Self::ExternalProject(_) => "EXTERNAL_PROJECT",

@@ -10,13 +10,14 @@ use std::sync::Arc;
 use paro_common::allocator::default_allocator;
 use paro_common::error::Result;
 use paro_common::runtime_value::Value;
+use paro_common::string_pattern::PreparedLikePattern;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use paro_function::scalar::cast::{CastContextDependency, CastExecCtx};
-use paro_function::scalar::FunctionExecContext;
+use paro_function::scalar::{FunctionExecContext, ScalarPredicateProjection};
 use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, OperatorType};
 use paro_planner::operator::get::Get;
-use paro_storage::index::{Predicate, PredicateTree};
+use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 
 pub fn build_predicate_tree(
     filters: &[Expression],
@@ -118,30 +119,44 @@ fn build_comparison_predicate(
     cmp: &paro_planner::expression::ComparisonExpression,
     get: &Get,
 ) -> Result<Option<PredicateTree>> {
-    let left_col = extract_scan_column_index(&cmp.left);
-    let right_col = extract_scan_column_index(&cmp.right);
+    let left_col = extract_scan_column_operand(&cmp.left);
+    let right_col = extract_scan_column_operand(&cmp.right);
+
+    if let (Some(left_col), Some(right_col)) = (left_col, right_col) {
+        let (ScanColumnTransform::Identity, ScanColumnTransform::Identity) =
+            (left_col.transform, right_col.transform)
+        else {
+            return Ok(None);
+        };
+        return build_column_comparison_predicate(
+            cmp.comparison_type,
+            get,
+            left_col.column_idx,
+            right_col.column_idx,
+        );
+    }
 
     let (col_idx, value, comparison) = match (left_col, right_col) {
         (Some(col), None) => {
-            let Some(value) = extract_constant_value(&cmp.right, get, col)? else {
+            let Some(value) = extract_comparison_constant(&cmp.right, get, col)? else {
                 return Ok(None);
             };
-            (col, value, cmp.comparison_type)
+            (col.column_idx, value, cmp.comparison_type)
         }
         (None, Some(col)) => {
-            let Some(value) = extract_constant_value(&cmp.left, get, col)? else {
-                return Ok(None);
-            };
             let Some(flipped) = flip_comparison(cmp.comparison_type) else {
                 return Ok(None);
             };
-            (col, value, flipped)
+            let Some(value) = extract_comparison_constant(&cmp.left, get, col)? else {
+                return Ok(None);
+            };
+            (col.column_idx, value, flipped)
         }
         _ => return Ok(None),
     };
 
-    let column_id = match get.column_ids.get(col_idx) {
-        Some(id) => *id as u32,
+    let column_id = match get.stored_column(col_idx) {
+        Some(id) => id as u32,
         None => return Ok(None),
     };
 
@@ -158,11 +173,136 @@ fn build_comparison_predicate(
     Ok(Some(PredicateTree::Leaf(predicate)))
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ScanColumnOperand {
+    column_idx: usize,
+    transform: ScanColumnTransform,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ScanColumnTransform {
+    Identity,
+    /// SQL DATE values are represented by midnight timestamps under this
+    /// widening cast. A timestamp constant can be mapped back only when it is
+    /// exactly representable as a DATE; otherwise the comparison stays in the
+    /// execution layer.
+    DateToTimestamp,
+}
+
+fn extract_scan_column_operand(expr: &Expression) -> Option<ScanColumnOperand> {
+    if let Some(column_idx) = extract_scan_column_index(expr) {
+        return Some(ScanColumnOperand {
+            column_idx,
+            transform: ScanColumnTransform::Identity,
+        });
+    }
+    let Expression::Cast(cast) = expr else {
+        return None;
+    };
+    if cast.cast_info.context_dependency() != CastContextDependency::Independent
+        || cast.child.return_type() != LogicalType::Date
+        || cast.target_type != LogicalType::Timestamp
+    {
+        return None;
+    }
+    Some(ScanColumnOperand {
+        column_idx: extract_scan_column_index(cast.child.as_ref())?,
+        transform: ScanColumnTransform::DateToTimestamp,
+    })
+}
+
+fn extract_comparison_constant(
+    expr: &Expression,
+    get: &Get,
+    operand: ScanColumnOperand,
+) -> Result<Option<Value>> {
+    match operand.transform {
+        ScanColumnTransform::Identity => extract_constant_value(expr, get, operand.column_idx),
+        ScanColumnTransform::DateToTimestamp => {
+            const MICROS_PER_DAY: i64 = 86_400_000_000;
+            if get.column_types.get(operand.column_idx) != Some(&LogicalType::Date) {
+                return Ok(None);
+            }
+            let Some(Value::Timestamp(timestamp)) = evaluate_bound_constant(expr)? else {
+                return Ok(None);
+            };
+            if timestamp.rem_euclid(MICROS_PER_DAY) != 0 {
+                return Ok(None);
+            }
+            let Ok(days) = i32::try_from(timestamp.div_euclid(MICROS_PER_DAY)) else {
+                return Ok(None);
+            };
+            Ok(Some(Value::Date(days)))
+        }
+    }
+}
+
+fn build_column_comparison_predicate(
+    comparison: ComparisonType,
+    get: &Get,
+    left_col: usize,
+    right_col: usize,
+) -> Result<Option<PredicateTree>> {
+    let (Some(left_type), Some(right_type)) = (
+        get.column_types.get(left_col),
+        get.column_types.get(right_col),
+    ) else {
+        return Ok(None);
+    };
+    if left_type != right_type || !supports_raw_column_comparison(left_type) {
+        return Ok(None);
+    }
+    let comparison = match comparison {
+        ComparisonType::Equal => PredicateComparison::Equal,
+        ComparisonType::NotEqual => PredicateComparison::NotEqual,
+        ComparisonType::LessThan => PredicateComparison::LessThan,
+        ComparisonType::LessThanOrEqual => PredicateComparison::LessThanOrEqual,
+        ComparisonType::GreaterThan => PredicateComparison::GreaterThan,
+        ComparisonType::GreaterThanOrEqual => PredicateComparison::GreaterThanOrEqual,
+        ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => return Ok(None),
+    };
+    let (Some(left_column_id), Some(right_column_id)) =
+        (get.stored_column(left_col), get.stored_column(right_col))
+    else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateTree::Leaf(Predicate::ColumnComparison {
+        left_column_id: left_column_id as u32,
+        right_column_id: right_column_id as u32,
+        comparison,
+    })))
+}
+
+fn supports_raw_column_comparison(logical_type: &LogicalType) -> bool {
+    matches!(
+        logical_type,
+        LogicalType::Date
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+            | LogicalType::Time
+            | LogicalType::Decimal { .. }
+            | LogicalType::Interval
+            | LogicalType::Uuid
+    )
+}
+
 fn build_operator_predicate(
     op: &paro_planner::expression::OperatorExpression,
     get: &Get,
 ) -> Result<Option<PredicateTree>> {
     match op.operator_type {
+        OperatorType::Like => build_like_predicate(op, get, false),
+        OperatorType::Not => {
+            let Some(Expression::Operator(child)) = op.children.first() else {
+                return Ok(None);
+            };
+            if child.operator_type != OperatorType::Like || op.children.len() != 1 {
+                return Ok(None);
+            }
+            build_like_predicate(child, get, true)
+        }
         OperatorType::IsNull | OperatorType::IsNotNull => {
             let child = match op.children.get(0) {
                 Some(child) => child,
@@ -172,8 +312,8 @@ fn build_operator_predicate(
                 Some(idx) => idx,
                 None => return Ok(None),
             };
-            let column_id = match get.column_ids.get(col_idx) {
-                Some(id) => *id as u32,
+            let column_id = match get.stored_column(col_idx) {
+                Some(id) => id as u32,
                 None => return Ok(None),
             };
             let predicate = match op.operator_type {
@@ -187,6 +327,9 @@ fn build_operator_predicate(
             if op.children.len() < 2 {
                 return Ok(None);
             }
+            if let Some(predicate) = build_projected_prefix_membership(op, get)? {
+                return Ok(Some(predicate));
+            }
             let col_idx = match extract_scan_column_index(&op.children[0]) {
                 Some(idx) => idx,
                 None => return Ok(None),
@@ -198,8 +341,8 @@ fn build_operator_predicate(
                 };
                 values.push(value);
             }
-            let column_id = match get.column_ids.get(col_idx) {
-                Some(id) => *id as u32,
+            let column_id = match get.stored_column(col_idx) {
+                Some(id) => id as u32,
                 None => return Ok(None),
             };
             Ok(Some(PredicateTree::Leaf(Predicate::In {
@@ -209,6 +352,131 @@ fn build_operator_predicate(
         }
         _ => Ok(None),
     }
+}
+
+/// Rewrite a membership predicate over a leading fixed-width UTF-8 substring
+/// into an equivalent binary prefix predicate over the source column.
+///
+/// An ASCII result of exactly `length` bytes can only be produced when the
+/// source begins with those same ASCII codepoints. Restricting the rewrite to
+/// that domain keeps it exact for arbitrary UTF-8 source strings; shorter,
+/// longer, or non-ASCII constants stay on the general expression path.
+fn build_projected_prefix_membership(
+    op: &paro_planner::expression::OperatorExpression,
+    get: &Get,
+) -> Result<Option<PredicateTree>> {
+    let Some(Expression::Function(function)) = op.children.first() else {
+        return Ok(None);
+    };
+    let Some(ScalarPredicateProjection::Utf8Substring {
+        source_argument,
+        start: 1,
+        length: Some(length),
+    }) = function.function.predicate_projection.as_ref()
+    else {
+        return Ok(None);
+    };
+    let Ok(length) = usize::try_from(*length) else {
+        return Ok(None);
+    };
+    if length == 0 {
+        return Ok(None);
+    }
+    let Some(source) = function.children.get(*source_argument) else {
+        return Ok(None);
+    };
+    let Some(col_idx) = extract_scan_column_index(source) else {
+        return Ok(None);
+    };
+    if get.column_types.get(col_idx) != Some(&LogicalType::Varchar) {
+        return Ok(None);
+    }
+
+    let mut prefixes = Vec::with_capacity(op.children.len() - 1);
+    for child in &op.children[1..] {
+        let Some(Value::Varchar(value)) = evaluate_bound_constant(child)? else {
+            return Ok(None);
+        };
+        if !value.is_ascii() || value.len() != length {
+            return Ok(None);
+        }
+        prefixes.push(value);
+    }
+    prefixes.sort_unstable();
+    prefixes.dedup();
+    let Some(column_id) = get.stored_column(col_idx) else {
+        return Ok(None);
+    };
+    Ok(Some(PredicateTree::leaf(Predicate::StringPrefixIn {
+        column_id: column_id as u32,
+        prefixes,
+    })))
+}
+
+fn build_like_predicate(
+    op: &paro_planner::expression::OperatorExpression,
+    get: &Get,
+    negated: bool,
+) -> Result<Option<PredicateTree>> {
+    let [value, pattern] = op.children.as_slice() else {
+        return Ok(None);
+    };
+    let Some(col_idx) = extract_scan_column_index(value) else {
+        return Ok(None);
+    };
+    if get.column_types.get(col_idx) != Some(&LogicalType::Varchar) {
+        return Ok(None);
+    }
+    let Some(Value::Varchar(pattern)) = evaluate_bound_constant(pattern)? else {
+        return Ok(None);
+    };
+    let Some(column_id) = get.stored_column(col_idx) else {
+        return Ok(None);
+    };
+    let column_id = column_id as u32;
+    if let Some(prefix) = extract_like_prefix(&pattern) {
+        return Ok(Some(PredicateTree::leaf(Predicate::StringPrefix {
+            column_id,
+            prefix,
+            negated,
+        })));
+    }
+    if PreparedLikePattern::try_new(&pattern, false).is_none() {
+        return Ok(None);
+    }
+    Ok(Some(PredicateTree::leaf(Predicate::StringLike {
+        column_id,
+        pattern,
+        negated,
+    })))
+}
+
+/// Return the literal prefix when a LIKE pattern consists only of literal
+/// characters followed by one or more unescaped `%` wildcards.
+fn extract_like_prefix(pattern: &str) -> Option<String> {
+    let mut chars = pattern.chars();
+    let mut prefix = String::with_capacity(pattern.len());
+    let mut saw_suffix_wildcard = false;
+    while let Some(token) = chars.next() {
+        match token {
+            '\\' => {
+                let literal = chars.next().unwrap_or('\\');
+                if saw_suffix_wildcard {
+                    return None;
+                }
+                prefix.push(literal);
+            }
+            '%' => saw_suffix_wildcard = true,
+            '_' => return None,
+            literal => {
+                if saw_suffix_wildcard {
+                    return None;
+                }
+                prefix.push(literal);
+            }
+        }
+    }
+    saw_suffix_wildcard.then_some(prefix)
 }
 
 fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Result<Option<Value>> {
@@ -238,7 +506,7 @@ fn extract_constant_value(expr: &Expression, get: &Get, col_idx: usize) -> Resul
     }
 }
 
-fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
+pub(crate) fn evaluate_bound_constant(expr: &Expression) -> Result<Option<Value>> {
     match expr {
         Expression::Constant(constant) => Ok(Some(constant.value.clone())),
         Expression::Cast(cast) => {
@@ -309,10 +577,50 @@ pub fn extract_scan_column_index(expr: &Expression) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use paro_function::scalar::cast::date_casts::{parse_date_text, varchar_to_date};
+    use paro_function::scalar::cast::date_casts::{
+        date_to_timestamp, parse_date_text, varchar_to_date,
+    };
     use paro_function::scalar::cast::decimal_casts::bind_decimal_casts;
     use paro_function::scalar::cast::{BindCastInput, BoundCastInfo, CastFunctionSet};
-    use paro_planner::expression::{CastExpression, ConstantExpression};
+    use paro_function::scalar::string::get_substring_functions;
+    use paro_function::scalar::ScalarBindInput;
+    use paro_planner::expression::{
+        CastExpression, ConstantExpression, FunctionExpression, OperatorExpression,
+        ReferenceExpression,
+    };
+    use paro_planner::operator::Get;
+
+    #[test]
+    fn fixed_width_column_comparison_is_pushed_to_storage() {
+        let get = Get::new_without_table(
+            7,
+            vec!["commit_date".to_string(), "receipt_date".to_string()],
+            vec![LogicalType::Date, LogicalType::Date],
+        );
+        let expression =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::LessThan,
+                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                    0,
+                    LogicalType::Date,
+                )),
+                Expression::Reference(paro_planner::expression::ReferenceExpression::new(
+                    1,
+                    LogicalType::Date,
+                )),
+            ));
+
+        let predicate = build_predicate(&expression, &get).unwrap();
+
+        assert_eq!(
+            predicate,
+            Some(PredicateTree::leaf(Predicate::ColumnComparison {
+                left_column_id: 0,
+                right_column_id: 1,
+                comparison: PredicateComparison::LessThan,
+            }))
+        );
+    }
 
     #[test]
     fn combining_predicates_flattens_and_removes_duplicates() {
@@ -351,6 +659,41 @@ mod tests {
         assert_eq!(
             evaluate_bound_constant(&expr).unwrap(),
             Some(Value::Date(parse_date_text("1994-01-01").unwrap()))
+        );
+    }
+
+    #[test]
+    fn exactly_representable_date_timestamp_comparison_is_pushed() {
+        const MICROS_PER_DAY: i64 = 86_400_000_000;
+        let get = Get::new_without_table(7, vec!["shipdate".to_string()], vec![LogicalType::Date]);
+        let date_column = Expression::Reference(ReferenceExpression::new(0, LogicalType::Date));
+        let timestamp_column = Expression::Cast(CastExpression::new(
+            date_column,
+            LogicalType::Timestamp,
+            BoundCastInfo::fixed(date_to_timestamp),
+            false,
+        ));
+        let comparison = |timestamp| {
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::LessThanOrEqual,
+                timestamp_column.clone(),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Timestamp(timestamp),
+                    LogicalType::Timestamp,
+                )),
+            ))
+        };
+
+        assert_eq!(
+            build_predicate(&comparison(10_000 * MICROS_PER_DAY), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::Le {
+                column_id: 0,
+                value: Value::Date(10_000),
+            }))
+        );
+        assert_eq!(
+            build_predicate(&comparison(10_000 * MICROS_PER_DAY + 1), &get).unwrap(),
+            None,
         );
     }
 
@@ -401,5 +744,163 @@ mod tests {
         ));
 
         assert_eq!(evaluate_bound_constant(&expr).unwrap(), None);
+    }
+
+    fn like_expression(pattern: &str, negated: bool) -> Expression {
+        let like = Expression::Operator(OperatorExpression::new(
+            OperatorType::Like,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar(pattern.to_string()),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+        if negated {
+            Expression::Operator(OperatorExpression::new_unary(
+                OperatorType::Not,
+                like,
+                LogicalType::Boolean,
+            ))
+        } else {
+            like
+        }
+    }
+
+    #[test]
+    fn literal_suffix_like_is_pushed_as_an_exact_prefix_predicate() {
+        let get = Get::new_without_table(7, vec!["type".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM POLISHED%", true), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefix {
+                column_id: 0,
+                prefix: "MEDIUM POLISHED".to_string(),
+                negated: true,
+            }))
+        );
+        assert_eq!(
+            build_predicate(&like_expression(r"MEDIUM\%%", false), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefix {
+                column_id: 0,
+                prefix: "MEDIUM%".to_string(),
+                negated: false,
+            }))
+        );
+    }
+
+    #[test]
+    fn constant_ascii_like_is_pushed_with_compiled_pattern_semantics() {
+        let get = Get::new_without_table(7, vec!["type".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM%POLISHED%", false), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringLike {
+                column_id: 0,
+                pattern: "MEDIUM%POLISHED%".to_string(),
+                negated: false,
+            }))
+        );
+        assert_eq!(
+            build_predicate(&like_expression("%special%requests%", true), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringLike {
+                column_id: 0,
+                pattern: "%special%requests%".to_string(),
+                negated: true,
+            }))
+        );
+        assert_eq!(
+            build_predicate(&like_expression("MEDIUM_POLISHED%", false), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&like_expression("%绿色%", false), &get).unwrap(),
+            None
+        );
+    }
+
+    fn substring_in_expression(values: &[&str], start: i64, length: i64) -> Expression {
+        let set = get_substring_functions();
+        let (function, _) = set
+            .bind(&[
+                LogicalType::Varchar,
+                LogicalType::BigInt,
+                LogicalType::BigInt,
+            ])
+            .unwrap();
+        let function = function
+            .bind(&ScalarBindInput::new(
+                vec![
+                    LogicalType::Varchar,
+                    LogicalType::BigInt,
+                    LogicalType::BigInt,
+                ],
+                vec![
+                    None,
+                    Some(Value::BigInt(start)),
+                    Some(Value::BigInt(length)),
+                ],
+            ))
+            .unwrap();
+        let constant_bigint = |value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::BigInt(value),
+                LogicalType::BigInt,
+            ))
+        };
+        let substring = Expression::Function(FunctionExpression::new(
+            function,
+            vec![
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Varchar)),
+                constant_bigint(start),
+                constant_bigint(length),
+            ],
+            LogicalType::Varchar,
+        ));
+        let mut children = vec![substring];
+        children.extend(values.iter().map(|value| {
+            Expression::Constant(ConstantExpression::new(
+                Value::Varchar((*value).to_string()),
+                LogicalType::Varchar,
+            ))
+        }));
+        Expression::Operator(OperatorExpression::new(
+            OperatorType::In,
+            children,
+            LogicalType::Boolean,
+        ))
+    }
+
+    #[test]
+    fn leading_fixed_ascii_substring_membership_is_pushed_as_prefix_union() {
+        let get = Get::new_without_table(7, vec!["phone".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["31", "13", "31"], 1, 2), &get).unwrap(),
+            Some(PredicateTree::leaf(Predicate::StringPrefixIn {
+                column_id: 0,
+                prefixes: vec!["13".to_string(), "31".to_string()],
+            }))
+        );
+    }
+
+    #[test]
+    fn substring_membership_rewrite_declines_non_equivalent_domains() {
+        let get = Get::new_without_table(7, vec!["phone".to_string()], vec![LogicalType::Varchar]);
+
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["13"], 2, 2), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["1"], 1, 2), &get).unwrap(),
+            None
+        );
+        assert_eq!(
+            build_predicate(&substring_in_expression(&["你好"], 1, 2), &get).unwrap(),
+            None
+        );
     }
 }

@@ -5,12 +5,13 @@ use paro_scheduler::scheduler::TaskScheduler;
 use std::sync::Arc;
 
 use crate::QueryMemoryCoordinator;
-use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_storage::buffer::{BufferManager, BufferPool, PageCache};
 
 #[derive(Clone)]
 pub struct ExecutionResources {
     pub scheduler: Arc<TaskScheduler>,
     pub buffer_pool: Arc<BufferPool>,
+    pub page_cache: Arc<PageCache>,
     pub buffer_manager: Arc<dyn BufferManager>,
     pub query_memory_coordinator: Option<Arc<dyn QueryMemoryCoordinator>>,
 }

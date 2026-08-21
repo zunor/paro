@@ -58,6 +58,8 @@ parking_lot = "0.12"
 num_cpus = "1.16"
 serde_json = { workspace = true }
 tokio-util = { workspace = true }
+smallvec = "1.13"
+arc-swap = "1.7"
 
 [dev-dependencies]
 paro-common = { workspace = true, features = ["test-support"] }

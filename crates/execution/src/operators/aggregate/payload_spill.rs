@@ -14,6 +14,7 @@ use std::sync::Arc;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::MemoryAccountingContext;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
@@ -44,6 +45,15 @@ pub(crate) enum AggregateStateEncoding {
     FunctionSerialized,
 }
 
+/// Shared external-aggregate partitioning policy.
+///
+/// The upper bound matches the aggregate table's radix implementation. A
+/// consumer can repartition a pathological partition later without changing
+/// the raw-payload format.
+pub(crate) fn aggregate_spill_radix_bits(parallelism: usize) -> usize {
+    parallelism.next_power_of_two().trailing_zeros().clamp(1, 4) as usize
+}
+
 impl AggregatePayloadSpillBuffer {
     pub(crate) fn new(
         buffer_pool: Arc<BufferPool>,
@@ -51,6 +61,7 @@ impl AggregatePayloadSpillBuffer {
         radix_bits: usize,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         let format = AggregatePayloadFormat::new(payload_types);
         let layout = Arc::new(RowLayout::from_types(
             format.logical_types().to_vec(),
@@ -102,7 +113,6 @@ impl AggregatePayloadSpillBuffer {
         self.builder.append(&spill_chunk)
     }
 
-    #[cfg(test)]
     #[inline]
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.builder.size_in_bytes()
@@ -131,6 +141,7 @@ impl AggregateStateSpillBuffer {
         radix_bits: usize,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         let format = AggregateStateFormat::new(group_types, state_width);
         let layout = Arc::new(RowLayout::from_types(
             format.logical_types().to_vec(),
@@ -221,6 +232,17 @@ impl AggregateSpilledPayload {
     #[inline]
     pub(crate) fn size_in_bytes(&self) -> usize {
         self.rows.size_in_bytes()
+    }
+
+    /// Increase the radix fan-out while preserving the original grouping
+    /// hash. Consumers use this when one replay partition still exceeds its
+    /// bounded working-memory grant. Consuming `self` keeps the transition
+    /// atomic: a failed repartition leaves no second live directory published.
+    pub(crate) fn into_repartitioned(self, radix_bits: usize) -> Result<Self> {
+        Ok(Self {
+            format: self.format,
+            rows: self.rows.into_repartitioned(radix_bits)?,
+        })
     }
 
     pub(crate) fn replay_partition_payloads(
@@ -399,8 +421,9 @@ mod tests {
         aggregate_objects, build_groups_chunk, create_hash_aggregate_tables, group_payload_refs,
         group_types, normalized_grouping_sets, update_hash_aggregate_tables,
     };
+    use crate::operators::aggregate::group_hash::hash_group_columns;
     use crate::operators::aggregate::radix_partitioned_aggregate_hashtable::AggregateHTScanPosition;
-    use crate::physical::specs::AggregateSpec;
+    use crate::physical::specs::{AggregateSpec, GroupKeyEncoding};
 
     fn reference(index: usize, ty: LogicalType) -> Expression {
         Expression::Reference(ReferenceExpression::new(index, ty))
@@ -417,18 +440,46 @@ mod tests {
     fn grouped_count_spec() -> AggregateSpec {
         AggregateSpec {
             grouping_key_count: 1,
+            state_output_projection: Box::new([]),
+            estimated_input_rows: None,
             projection_exprs: Box::new([]),
             payload_types: Box::new([LogicalType::Integer]),
             groups: Box::new([reference(0, LogicalType::Integer)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
             grouping_sets: Box::new([]),
             aggregates: Box::new([count_star_expression()]),
             grouping_functions: Box::new([]),
             aggregate_inputs: Box::new([Box::new([])]),
             aggregate_filters: Box::new([None]),
             aggregate_orders: Box::new([Box::new([])]),
+            post_reduction: None,
+            having_filter: Box::new([]),
             perfect_hash: None,
             output_names: Box::new(["k".to_string(), "count".to_string()]),
             output_types: Box::new([LogicalType::Integer, LogicalType::BigInt]),
+        }
+    }
+
+    fn grouped_varchar_count_spec() -> AggregateSpec {
+        AggregateSpec {
+            grouping_key_count: 1,
+            state_output_projection: Box::new([]),
+            estimated_input_rows: None,
+            projection_exprs: Box::new([]),
+            payload_types: Box::new([LogicalType::Varchar]),
+            groups: Box::new([reference(0, LogicalType::Varchar)]),
+            group_key_encodings: Box::new([GroupKeyEncoding::Identity]),
+            grouping_sets: Box::new([]),
+            aggregates: Box::new([count_star_expression()]),
+            grouping_functions: Box::new([]),
+            aggregate_inputs: Box::new([Box::new([])]),
+            aggregate_filters: Box::new([None]),
+            aggregate_orders: Box::new([Box::new([])]),
+            post_reduction: None,
+            having_filter: Box::new([]),
+            perfect_hash: None,
+            output_names: Box::new(["k".to_string(), "count".to_string()]),
+            output_types: Box::new([LogicalType::Varchar, LogicalType::BigInt]),
         }
     }
 
@@ -485,11 +536,12 @@ mod tests {
         for partition_idx in 0..spilled.partition_count() {
             spilled
                 .replay_partition_payloads(partition_idx, allocator.clone(), |payload_batch| {
+                    let groups = build_groups_chunk(payload_batch, &group_refs)?;
                     update_hash_aggregate_tables(
                         &spec,
                         &aggregate_objects,
                         payload_batch,
-                        &group_refs,
+                        &groups,
                         &grouping_sets,
                         &mut tables,
                         &mut addresses,
@@ -522,6 +574,113 @@ mod tests {
             .collect::<Vec<_>>();
         actual.sort_unstable();
         assert_eq!(actual, vec![(1, 2), (2, 2), (3, 1)]);
+    }
+
+    #[test]
+    fn aggregate_payload_spill_preserves_varchar_group_keys_across_batches() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let buffer_pool = Arc::new(BufferPool::new(64 * 1024 * 1024));
+        let memory = MemoryAccountingContext::detached(
+            MemoryTag::HashTable,
+            MemoryAccountingClass::Revocable,
+        );
+        let spec = grouped_varchar_count_spec();
+        let aggregate_objects = aggregate_objects(&spec).expect("aggregate objects");
+        let group_refs = group_payload_refs(&spec).expect("group refs");
+        let grouping_sets = normalized_grouping_sets(&spec)
+            .expect("grouping sets")
+            .into_iter()
+            .map(Vec::into_boxed_slice)
+            .collect::<Vec<_>>();
+        let values = [
+            "PERU",
+            "UNITED KINGDOM",
+            "A deliberately long grouping key that lives outside the inline string payload",
+        ];
+        let row_count = VECTOR_SIZE * 3 + 17;
+        let mut spill = AggregatePayloadSpillBuffer::new(
+            Arc::clone(&buffer_pool),
+            [LogicalType::Varchar],
+            3,
+            memory.clone(),
+        )
+        .expect("spill");
+        for batch_start in (0..row_count).step_by(VECTOR_SIZE) {
+            let batch_size = (row_count - batch_start).min(VECTOR_SIZE);
+            let mut payload =
+                Chunk::try_initialize(&[LogicalType::Varchar], batch_size, allocator.clone())
+                    .expect("payload");
+            payload.set_cardinality(batch_size);
+            for row_idx in 0..batch_size {
+                let value = values[(batch_start + row_idx) % values.len()];
+                payload
+                    .column_mut(0)
+                    .expect("group column")
+                    .set_value(row_idx, &Value::Varchar(value.to_string()));
+            }
+            let groups = build_groups_chunk(&payload, &group_refs).expect("groups");
+            let hashes = hash_group_columns(&groups).expect("hashes");
+            spill
+                .append_payload(&payload, &hashes)
+                .expect("append spill");
+        }
+
+        let spilled = spill.seal();
+        let mut tables =
+            create_hash_aggregate_tables(&spec, allocator.clone(), memory, 1).expect("tables");
+        let mut addresses =
+            paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, VECTOR_SIZE);
+        let mut new_groups = paro_common::test_utils::test_selection_with_capacity(VECTOR_SIZE);
+        for partition_idx in 0..spilled.partition_count() {
+            spilled
+                .replay_partition_payloads(partition_idx, allocator.clone(), |payload_batch| {
+                    let groups = build_groups_chunk(payload_batch, &group_refs)?;
+                    update_hash_aggregate_tables(
+                        &spec,
+                        &aggregate_objects,
+                        payload_batch,
+                        &groups,
+                        &grouping_sets,
+                        &mut tables,
+                        &mut addresses,
+                        &mut new_groups,
+                    )
+                })
+                .expect("replay partition");
+        }
+
+        let mut output = Chunk::try_initialize(
+            &[LogicalType::Varchar, LogicalType::BigInt],
+            values.len(),
+            allocator,
+        )
+        .expect("output");
+        let mut position = AggregateHTScanPosition::default();
+        let mut actual = Vec::new();
+        while tables[0].scan(&mut position, &mut output).expect("scan") {
+            actual.extend((0..output.size()).map(|row| {
+                (
+                    output
+                        .column(0)
+                        .unwrap()
+                        .get_string(row)
+                        .unwrap()
+                        .to_string(),
+                    output.column(1).unwrap().get_i64(row).unwrap(),
+                )
+            }));
+        }
+        actual.sort_unstable();
+        let mut expected = values
+            .iter()
+            .enumerate()
+            .map(|(value_idx, value)| {
+                let count = (value_idx..row_count).step_by(values.len()).count() as i64;
+                ((*value).to_string(), count)
+            })
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
     }
 
     #[test]
@@ -558,11 +717,12 @@ mod tests {
         let mut addresses =
             paro_common::test_utils::test_vector_with_capacity(LogicalType::BigInt, 5);
         let mut new_groups = paro_common::test_utils::test_selection_with_capacity(5);
+        let groups = build_groups_chunk(&payload, &group_refs).expect("groups");
         update_hash_aggregate_tables(
             &spec,
             &aggregate_objects,
             &payload,
-            &group_refs,
+            &groups,
             &grouping_sets,
             &mut source_tables,
             &mut addresses,
@@ -575,7 +735,7 @@ mod tests {
             .total_size();
         let mut spill = AggregateStateSpillBuffer::new(
             Arc::clone(&buffer_pool),
-            group_types(&spec),
+            group_types(&spec).expect("group types"),
             state_width,
             AggregateStateEncoding::RawBytes,
             1,

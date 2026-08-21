@@ -9,21 +9,18 @@ use std::mem;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_function::window::WindowFunctionType;
-use paro_planner::binder::ir::OrderByNode;
-use paro_planner::expression::{AggregateType, Expression, ReferenceExpression};
+use paro_planner::expression::Expression;
 use paro_planner::operator::join::{JoinComparisonType, JoinType};
 
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::plan::PhysicalPlan;
-use crate::physical::properties::{
-    NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec, PropertyRepairKind,
-};
+use crate::physical::properties::{NullOrdering, OrderingColumn, OrderingDirection, OrderingSpec};
 use crate::physical::row_type::RowType;
 use crate::physical::specs::{
     AggregateSpec, ClassicIeJoinSpec, CrossProductSpec, DelimJoinSideSpec, DelimJoinSpec,
     DelimScanTarget, ExternalTableSpec, HashJoinSpec, MaterializedCteSpec, NestedLoopJoinSpec,
-    PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide, SetOperationSpec, SortRangeJoinSpec,
-    SortSpec, TopNSpec, WindowSpec,
+    PartitionAggregateWindowSpec, PhysicalNodeKind, RecursiveCteSpec, SetOperationInputSide,
+    SetOperationSpec, SortRangeJoinSpec, SortSpec, TopNSpec, WindowSpec,
 };
 
 use super::graph::{
@@ -34,17 +31,19 @@ use super::graph::{
     HashAggregateBuildSinkSpec, HashAggregateEmitSourceSpec, HashJoinBuildSinkSpec,
     HashJoinProbeSpec, HashJoinSpillReplaySourceSpec, HashJoinUnmatchedSourceSpec, InsertSinkSpec,
     MaterializeSinkSpec, MaterializedSourceSpec, NestedLoopJoinProbeSpec,
+    PartitionAggregateWindowBuildSinkSpec, PartitionAggregateWindowEmitSourceSpec,
     PerfectHashAggregateEmitSourceSpec, PerfectHashAggregateSinkSpec, PipelineDependency,
     PipelineGraph, PipelineId, PipelineRoot, PipelineSpec, PipelineSubgraphRoot, RecursiveCteDedup,
     RecursiveCteRegion, RecursiveTableAppendSinkSpec, RecursiveTableScanSourceSpec,
-    RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetSourceSpec,
-    SetOperationEmitSourceSpec, SetOperationInputSinkSpec, SharedSinkId, SinkSharing, SinkSpec,
-    SortBuildSinkSpec, SortEmitSourceSpec, SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec,
-    TopNEmitSourceSpec, TransformSpec, UngroupedAggregateEmitSourceSpec,
-    UngroupedAggregateSinkSpec, UpdateSinkSpec, WindowBuildSinkSpec, WindowEmitSourceSpec,
+    RecursiveTermination, RowsetDynamicRuntimeFilterSpec, RowsetDynamicScalarFilterSpec,
+    RowsetSourceSpec, ScalarFilterSemantics, SetOperationEmitSourceSpec, SetOperationInputSinkSpec,
+    SharedSinkId, SinkSharing, SinkSpec, SortBuildSinkSpec, SortEmitSourceSpec,
+    SortRangeJoinProbeSpec, SourceSpec, TopNBuildSinkSpec, TopNEmitSourceSpec, TransformSpec,
+    UngroupedAggregateEmitSourceSpec, UngroupedAggregateSinkSpec, UpdateSinkSpec,
+    WindowBuildSinkSpec, WindowEmitSourceSpec,
 };
 use super::handles::{BreakerHandleCatalogBuilder, BreakerHandleId, BreakerHandleKind};
-use super::properties::{repair_transform, PipelinePropertyAccumulator};
+use super::properties::{source_supports_parallel_probe_fusion, PipelinePropertyAccumulator};
 
 pub struct PipelineLowerer<'a> {
     plan: &'a PhysicalPlan,
@@ -66,9 +65,15 @@ pub(crate) struct BreakerTail {
     pub(crate) output: RowType,
 }
 
-pub(crate) struct PendingProbeBuild {
+pub(crate) struct PendingProbeDependency {
     pub(crate) producer: PipelineId,
     pub(crate) handle: super::handles::BreakerHandleId,
+    pub(crate) kind: DependencyKind,
+}
+
+pub(crate) struct BreakerProbeSource {
+    pub(crate) source: SourceSpec,
+    pub(crate) dependencies: Vec<PendingProbeDependency>,
 }
 
 pub(crate) struct PipelineChain {
@@ -99,10 +104,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Insert(InsertSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Insert(InsertSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -110,10 +112,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Update(UpdateSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Update(UpdateSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -121,10 +120,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::Delete(DeleteSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::Delete(DeleteSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }
@@ -132,10 +128,7 @@ impl<'a> PipelineLowerer<'a> {
                 let child = self.only_child(root)?;
                 return self.lower_terminal_sink(
                     child,
-                    SinkSpec::CopyToFile(CopyToFileSinkSpec {
-                        spec: spec.clone(),
-                        required: Default::default(),
-                    }),
+                    SinkSpec::CopyToFile(CopyToFileSinkSpec { spec: spec.clone() }),
                     self.plan.node(root).output.clone(),
                 );
             }

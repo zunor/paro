@@ -43,7 +43,6 @@ pub(crate) fn test_session(search_path: Vec<CatalogSearchEntry>) -> Arc<Statemen
             graph_index: base.services.graph_index.clone(),
             python_runtime: base.services.python_runtime.clone(),
             governance: base.services.governance.clone(),
-            plan_cache: base.services.plan_cache.clone(),
             connection_info: base.services.connection_info.clone(),
         }),
         graph_registry: base.graph_registry.clone(),

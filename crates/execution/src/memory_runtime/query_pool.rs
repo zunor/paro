@@ -46,13 +46,11 @@ pub struct QueryMemoryPool {
     capacity_bytes: AtomicUsize,
     capacity_gate: AtomicUsize,
     issued_bytes: AtomicUsize,
-    published_used_bytes: AtomicUsize,
     non_revocable_bytes: AtomicUsize,
     revocable_bytes: AtomicUsize,
     spill_bytes: AtomicUsize,
     prefetch_bytes: AtomicUsize,
     metadata_bytes: AtomicUsize,
-    tag_bytes: [AtomicUsize; MEMORY_TAG_COUNT],
     domain_tag_bytes: [[AtomicUsize; MEMORY_TAG_COUNT]; MEMORY_DOMAIN_COUNT],
     leaked_grant_bytes: AtomicUsize,
     local_refill_count: AtomicUsize,
@@ -75,13 +73,11 @@ impl QueryMemoryPool {
             capacity_bytes: AtomicUsize::new(capacity_bytes),
             capacity_gate: AtomicUsize::new(0),
             issued_bytes: AtomicUsize::new(0),
-            published_used_bytes: AtomicUsize::new(0),
             non_revocable_bytes: AtomicUsize::new(0),
             revocable_bytes: AtomicUsize::new(0),
             spill_bytes: AtomicUsize::new(0),
             prefetch_bytes: AtomicUsize::new(0),
             metadata_bytes: AtomicUsize::new(0),
-            tag_bytes: std::array::from_fn(|_| AtomicUsize::new(0)),
             domain_tag_bytes: std::array::from_fn(|_| std::array::from_fn(|_| AtomicUsize::new(0))),
             leaked_grant_bytes: AtomicUsize::new(0),
             local_refill_count: AtomicUsize::new(0),
@@ -220,7 +216,11 @@ impl QueryMemoryPool {
     }
 
     pub fn published_used_bytes(&self) -> usize {
-        self.published_used_bytes.load(Ordering::Relaxed)
+        self.non_revocable_bytes()
+            .saturating_add(self.revocable_bytes())
+            .saturating_add(self.spill_bytes())
+            .saturating_add(self.prefetch_bytes())
+            .saturating_add(self.metadata_bytes())
     }
 
     pub fn non_revocable_bytes(&self) -> usize {
@@ -288,7 +288,12 @@ impl QueryMemoryPool {
         MemoryTag::all()
             .iter()
             .filter_map(|tag| {
-                let bytes = self.tag_bytes[tag.as_index()].load(Ordering::Relaxed);
+                let bytes = MemoryDomain::all().iter().fold(0usize, |total, domain| {
+                    total.saturating_add(
+                        self.domain_tag_bytes[domain.as_index()][tag.as_index()]
+                            .load(Ordering::Relaxed),
+                    )
+                });
                 (bytes > 0).then_some(MemoryTagBytes { tag: *tag, bytes })
             })
             .collect()
@@ -691,8 +696,6 @@ impl MemoryOwner for QueryMemoryPool {
     ) {
         self.add_class_bytes(class, bytes);
         self.add_tag_bytes(domain, tag, bytes);
-        self.published_used_bytes
-            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn release_allocation(
@@ -704,11 +707,6 @@ impl MemoryOwner for QueryMemoryPool {
     ) {
         self.sub_class_bytes(class, bytes);
         self.sub_tag_bytes(domain, tag, bytes);
-        let _ = self.published_used_bytes.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |current| Some(current.saturating_sub(bytes)),
-        );
     }
 
     fn reclassify_allocation(
@@ -780,13 +778,11 @@ impl QueryMemoryPool {
     }
 
     fn add_tag_bytes(&self, domain: MemoryDomain, tag: MemoryTag, bytes: usize) {
-        self.tag_bytes[tag.as_index()].fetch_add(bytes, Ordering::Relaxed);
         self.domain_tag_bytes[domain.as_index()][tag.as_index()]
             .fetch_add(bytes, Ordering::Relaxed);
     }
 
     fn sub_tag_bytes(&self, domain: MemoryDomain, tag: MemoryTag, bytes: usize) {
-        saturating_sub(&self.tag_bytes[tag.as_index()], bytes);
         saturating_sub(
             &self.domain_tag_bytes[domain.as_index()][tag.as_index()],
             bytes,

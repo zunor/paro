@@ -3,9 +3,7 @@
 
 use std::sync::Arc;
 
-use paro_catalog::entry::{
-    CatalogObjectId, CatalogType, ColumnDefinition, SchemaEntryMeta, TableCatalogEntry, TableType,
-};
+use paro_catalog::entry::{CatalogObjectId, ColumnDefinition, TableCatalogEntry};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::RoutineCallIdentity;
@@ -16,7 +14,7 @@ use paro_external::routine::spec::{
 use paro_function::aggregate::distributive::count::get_count_star_function;
 use paro_function::window::WindowFunction;
 use paro_planner::binder::context::BindContext;
-use paro_planner::binder::ir::CTEMaterialize;
+use paro_planner::binder::ir::{CTEMaterialize, OrderByNode};
 use paro_planner::expression::{
     AggregateExpression, ConstantExpression, Expression, OrderByExpression, ReferenceExpression,
     WindowExpression, WindowFrame,
@@ -28,9 +26,10 @@ use paro_planner::operator::join::{
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, CTERef, DelimGet, Distinct, EmptyResult, ExpressionGet, Filter,
     Limit, LogicalOperator, MaterializedCTE, Order as LogicalOrder, Projection, RecursiveCTE,
-    TopN as LogicalTopN, Window as LogicalWindow,
+    SetOperation as LogicalSetOperation, TopN as LogicalTopN, Window as LogicalWindow,
 };
 use paro_planner::plan::{LogicalPlan, PlanNodeId};
+use paro_storage::table::table_factory::TableFactory;
 
 use crate::operators::external::runtime_bridge::{
     ExternalRoutineDescriptor, ExternalRuntimeBridge,
@@ -40,11 +39,7 @@ use crate::physical::generator::{PhysicalPlanGenerator, PlanBuildContext};
 use crate::physical::ids::PhysicalPlanNodeId;
 use crate::physical::node::{OperatorLabel, PhysicalPlanNode};
 use crate::physical::plan::{PhysicalPlan, PhysicalPlanNodeArena};
-use crate::physical::properties::{
-    BatchIndexRequirement, MorselCapability, MorselPartitioning, OrderingColumn, OrderingDirection,
-    OrderingRequirement, OrderingSpec, PartitioningRequirement, Placement, PlanPropertyMap,
-    PropertyRepairKind,
-};
+use crate::physical::properties::{MorselCapability, PlanPropertyMap};
 use crate::physical::specs::{ExternalProjectSpec, ExternalTableSpec, PhysicalNodeKind};
 use crate::physical::{RowType, RowsetScanSpec};
 
@@ -72,7 +67,7 @@ fn linear_plan() -> crate::physical::PhysicalPlan {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, filter, vec![project_expr]).with_output_names(vec!["a".into()]),
+            Projection::new(1, filter, vec![project_expr]).with_visible_names(vec!["a".into()]),
         ),
     );
     let limit = LogicalPlan::new(
@@ -99,7 +94,8 @@ fn projection_changes_schema_plan() -> crate::physical::PhysicalPlan {
     let project = LogicalPlan::new(
         &ctx,
         LogicalOperator::Projection(
-            Projection::new(1, values, vec![project_expr]).with_output_names(vec!["b".to_string()]),
+            Projection::new(1, values, vec![project_expr])
+                .with_visible_names(vec!["b".to_string()]),
         ),
     );
 
@@ -143,6 +139,119 @@ fn grouped_aggregate_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&aggregate).unwrap()
 }
 
+fn aggregate_probe_hash_join_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let aggregate_input = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(LogicalAggregate::new(
+            1,
+            2,
+            3,
+            aggregate_input,
+            vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::Integer,
+            ))],
+            Vec::new(),
+            vec![Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))],
+            Vec::new(),
+        )),
+    );
+    let build = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            4,
+            vec![],
+            vec!["k".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            aggregate,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&join).unwrap()
+}
+
+fn ungrouped_aggregate_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["a".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let aggregate = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Aggregate(LogicalAggregate::new(
+            1,
+            2,
+            3,
+            values,
+            Vec::new(),
+            Vec::new(),
+            vec![Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))],
+            Vec::new(),
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    let generated = generator.generate(&aggregate).unwrap();
+    let PhysicalNodeKind::Aggregate(spec) = &generated.node(generated.root).kind else {
+        panic!("expected ungrouped aggregate root");
+    };
+
+    let mut nodes = PhysicalPlanNodeArena::default();
+    let mut children = PlanChildrenArena::default();
+    let child = nodes.push(PhysicalPlanNode {
+        id: PhysicalPlanNodeId::INVALID,
+        output: RowType::new(vec!["a".to_string()], vec![LogicalType::Integer]),
+        cardinality: None,
+        kind: PhysicalNodeKind::RowsetScan(rowset_spec_for_test()),
+        children: PlanChildren::Empty,
+        label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "ROWSET_SCAN"),
+    });
+    let root = nodes.push(PhysicalPlanNode {
+        id: PhysicalPlanNodeId::INVALID,
+        output: generated.node(generated.root).output.clone(),
+        cardinality: None,
+        kind: PhysicalNodeKind::Aggregate(spec.clone()),
+        children: children.pack(vec![child]),
+        label: OperatorLabel::new(PlanNodeId::SYNTHETIC, "UNGROUPED_AGGREGATE"),
+    });
+    PhysicalPlan::new(root, nodes, children, PlanPropertyMap::default())
+}
+
 fn topn_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let values = LogicalPlan::new(
@@ -166,6 +275,110 @@ fn topn_plan() -> crate::physical::PhysicalPlan {
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
     generator.generate(&topn).unwrap()
+}
+
+#[derive(Clone, Copy)]
+enum SingleTaskEmitBreaker {
+    TopN,
+    Sort,
+    Window,
+    SetOperation,
+}
+
+impl SingleTaskEmitBreaker {
+    fn variants() -> [Self; 4] {
+        [Self::TopN, Self::Sort, Self::Window, Self::SetOperation]
+    }
+
+    fn matches_source(self, source: &SourceSpec) -> bool {
+        matches!(
+            (self, source),
+            (Self::TopN, SourceSpec::TopNEmit(_))
+                | (Self::Sort, SourceSpec::SortEmit(_))
+                | (Self::Window, SourceSpec::WindowEmit(_))
+                | (Self::SetOperation, SourceSpec::SetOperationEmit(_))
+        )
+    }
+}
+
+fn single_task_breaker_probe_hash_join_plan(
+    breaker: SingleTaskEmitBreaker,
+) -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = |table_index| {
+        LogicalPlan::new(
+            &ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                table_index,
+                vec![],
+                vec!["k".to_string()],
+                vec![LogicalType::Integer],
+            )),
+        )
+    };
+    let order = || OrderByNode {
+        expression: Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        ascending: true,
+        nulls_first: false,
+    };
+    let probe = match breaker {
+        SingleTaskEmitBreaker::TopN => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::TopN(LogicalTopN::new(values(0), vec![order()], 2, 0)),
+        ),
+        SingleTaskEmitBreaker::Sort => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Order(LogicalOrder::new(values(0), vec![order()])),
+        ),
+        SingleTaskEmitBreaker::Window => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::Window(LogicalWindow::new(
+                2,
+                vec![WindowExpression::native(
+                    WindowFunction::rank(),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![OrderByExpression {
+                        expression: Expression::Reference(ReferenceExpression::new(
+                            0,
+                            LogicalType::Integer,
+                        )),
+                        ascending: true,
+                        nulls_first: false,
+                    }],
+                    WindowFrame::default(),
+                    false,
+                )],
+                values(0),
+            )),
+        ),
+        SingleTaskEmitBreaker::SetOperation => LogicalPlan::new(
+            &ctx,
+            LogicalOperator::SetOperation(LogicalSetOperation::union(
+                2,
+                values(0),
+                values(1),
+                false,
+                vec![LogicalType::Integer],
+            )),
+        ),
+    };
+    let build = values(3);
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            probe,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&join).unwrap()
 }
 
 fn hash_join_plan(join_type: JoinType) -> crate::physical::PhysicalPlan {
@@ -328,7 +541,7 @@ fn project_above_nested_loop_join_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["lv".to_string()]),
+            .with_visible_names(vec!["lv".to_string()]),
         ),
     );
 
@@ -496,7 +709,7 @@ fn hash_join_with_projected_cross_product_probe_plan() -> crate::physical::Physi
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["ak".to_string()]),
+            .with_visible_names(vec!["ak".to_string()]),
         ),
     );
     let condition = JoinCondition::equality(
@@ -620,6 +833,78 @@ fn recursive_cte_plan(union_all: bool) -> crate::physical::PhysicalPlan {
     generator.generate(&cte).unwrap()
 }
 
+fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let anchor = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["node".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let recursive_ref = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::CTERef(CTERef::new(
+            9,
+            1,
+            vec!["node".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let edges = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["src".to_string(), "dst".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            recursive_ref,
+            edges,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+    let recursive = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                2,
+                join,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    2,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_visible_names(vec!["node".to_string()]),
+        ),
+    );
+    let cte = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::RecursiveCTE(RecursiveCTE {
+            cte_index: 9,
+            cte_name: "walk".to_string(),
+            column_names: vec!["node".to_string()],
+            column_types: vec![LogicalType::Integer],
+            union_all: true,
+            anchor: Box::new(anchor),
+            recursive: Box::new(recursive),
+        }),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&cte).unwrap()
+}
+
 fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let cte = recursive_cte_logical_plan(&ctx, true);
@@ -634,7 +919,7 @@ fn projected_recursive_cte_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["v".to_string()]),
+            .with_visible_names(vec!["v".to_string()]),
         ),
     );
 
@@ -731,6 +1016,74 @@ fn left_delim_join_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&plan).unwrap()
 }
 
+fn hash_join_with_delim_probe_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let capture = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["capture".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let dependent = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::DelimGet(DelimGet::new(99, vec![LogicalType::Integer])),
+    );
+    let mut delim_join = ComparisonJoin::new(
+        JoinType::Inner,
+        capture,
+        dependent,
+        vec![JoinCondition::equality(
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+        )],
+    );
+    delim_join.duplicate_eliminated_columns = vec![Expression::Reference(
+        ReferenceExpression::new(0, LogicalType::Integer),
+    )];
+    let delim_probe = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(delim_join)));
+    let probe = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                2,
+                delim_probe,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_visible_names(vec!["projected_capture".to_string()]),
+        ),
+    );
+    let build = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            1,
+            vec![],
+            vec!["build".to_string()],
+            vec![LogicalType::Integer],
+        )),
+    );
+    let outer = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            probe,
+            build,
+            vec![JoinCondition::equality(
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+            )],
+        )),
+    );
+
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
+    generator.generate(&outer).unwrap()
+}
+
 fn left_delim_join_with_recursive_dependent_plan() -> crate::physical::PhysicalPlan {
     let ctx = BindContext::new();
     let left = LogicalPlan::new(
@@ -806,7 +1159,7 @@ fn projection_above_hash_join_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["lv".to_string()]),
+            .with_visible_names(vec!["lv".to_string()]),
         ),
     );
 
@@ -896,7 +1249,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
                     Expression::Reference(ReferenceExpression::new(1, LogicalType::Integer)),
                 ],
             )
-            .with_output_names(vec!["a".to_string()]),
+            .with_visible_names(vec!["a".to_string()]),
         ),
     );
     let order = paro_planner::binder::ir::OrderByNode {
@@ -919,7 +1272,7 @@ fn order_with_final_projection_plan() -> crate::physical::PhysicalPlan {
                     LogicalType::Integer,
                 ))],
             )
-            .with_output_names(vec!["a".to_string()]),
+            .with_visible_names(vec!["a".to_string()]),
         ),
     );
 
@@ -942,14 +1295,14 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
         &ctx,
         LogicalOperator::Window(LogicalWindow::new(
             1,
-            vec![WindowExpression {
-                function: WindowFunction::rank(),
-                children: Vec::new(),
-                partitions: vec![Expression::Reference(ReferenceExpression::new(
+            vec![WindowExpression::native(
+                WindowFunction::rank(),
+                Vec::new(),
+                vec![Expression::Reference(ReferenceExpression::new(
                     0,
                     LogicalType::Integer,
                 ))],
-                orders: vec![OrderByExpression {
+                vec![OrderByExpression {
                     expression: Expression::Reference(ReferenceExpression::new(
                         1,
                         LogicalType::Integer,
@@ -957,10 +1310,9 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
                     ascending: true,
                     nulls_first: false,
                 }],
-                frame: WindowFrame::default(),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }],
+                WindowFrame::default(),
+                false,
+            )],
             values,
         )),
     );
@@ -969,23 +1321,55 @@ fn partitioned_window_plan() -> crate::physical::PhysicalPlan {
     generator.generate(&window).unwrap()
 }
 
-fn rowset_spec_for_test() -> RowsetScanSpec {
-    let table = Arc::new(TableCatalogEntry {
-        base: SchemaEntryMeta::new(
-            CatalogType::Table,
-            "test".to_string(),
-            "main".to_string(),
-            "t".to_string(),
-            CatalogObjectId::from_raw(10_001),
+fn partition_aggregate_window_plan() -> crate::physical::PhysicalPlan {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
             0,
+            vec![],
+            vec!["grp".to_string(), "v".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        )),
+    );
+    let aggregate =
+        AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
+    let window = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Window(LogicalWindow::new(
+            1,
+            vec![WindowExpression::aggregate(
+                aggregate,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+                Vec::new(),
+                WindowFrame::default(),
+            )],
+            values,
+        )),
+    );
+
+    PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&window)
+        .unwrap()
+}
+
+fn rowset_spec_for_test() -> RowsetScanSpec {
+    let table = Arc::new(TableCatalogEntry::new(
+        "test".to_string(),
+        "main".to_string(),
+        "t".to_string(),
+        vec![ColumnDefinition::new("a".to_string(), LogicalType::Integer)],
+        Arc::new(
+            TableFactory::default()
+                .create_table(&[LogicalType::Integer])
+                .unwrap(),
         ),
-        table_type: TableType::BaseTable,
-        columns: vec![ColumnDefinition::new("a".to_string(), LogicalType::Integer)],
-        constraints: Vec::new(),
-        storage: None,
-        storage_descriptor: None,
-        statistics: None,
-    });
+        CatalogObjectId::from_raw(10_001),
+        0,
+    ));
 
     RowsetScanSpec {
         table_index: 0,
@@ -993,13 +1377,17 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         returned_types: vec![LogicalType::Integer].into_boxed_slice(),
         relation_name: Some("t".to_string()),
         relation_alias: None,
-        column_ids: vec![0].into_boxed_slice(),
+        column_projection: crate::physical::specs::RowsetColumnProjection::new(vec![0]),
         emit_row_id: false,
         column_types: vec![LogicalType::Integer].into_boxed_slice(),
         table,
         predicate: None,
         residual_predicates: Vec::new().into_boxed_slice(),
-        late_materialize: false,
+        access_policy: crate::physical::specs::RowsetScanAccessPolicy::new(
+            true,
+            None,
+            Default::default(),
+        ),
         scan_order: None,
         runtime_filter_expressions: Vec::new().into_boxed_slice(),
     }

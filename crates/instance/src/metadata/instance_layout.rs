@@ -51,6 +51,10 @@ impl InstanceLayout {
         self.root.join("databases")
     }
 
+    pub fn temporary_dir(&self) -> PathBuf {
+        self.root.join("temporary")
+    }
+
     pub fn managed_database_dir(&self, database_id: u64) -> PathBuf {
         self.databases_dir().join(format!("db-{database_id}"))
     }
@@ -85,6 +89,7 @@ mod tests {
             PathBuf::from("/tmp/paro/instance/meta/run_state.json")
         );
         assert_eq!(layout.databases_dir(), PathBuf::from("/tmp/paro/databases"));
+        assert_eq!(layout.temporary_dir(), PathBuf::from("/tmp/paro/temporary"));
         assert_eq!(
             layout.managed_database_dir(7),
             PathBuf::from("/tmp/paro/databases/db-7")

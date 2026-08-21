@@ -6,6 +6,7 @@
 //!
 
 use crate::expression::Expression;
+use crate::operator::ProjectionMap;
 use crate::plan::LogicalPlan;
 
 /// Filter represents a filter operation (WHERE clause).
@@ -13,18 +14,17 @@ use crate::plan::LogicalPlan;
 pub struct Filter {
     pub expressions: Vec<Expression>,
     pub child: Box<LogicalPlan>,
-    /// Projection map for column lifetime optimization.
-    /// Empty vector means all columns are preserved.
-    /// Non-empty vector contains indices of columns to keep.
-    pub projection_map: Vec<usize>,
+    /// Exact output projection derived by column lifetime analysis.
+    pub projection_map: ProjectionMap,
 }
 
 impl Filter {
     pub fn new(child: LogicalPlan, expressions: Vec<Expression>) -> Self {
+        let projection_map = ProjectionMap::all();
         Self {
             expressions,
             child: Box::new(child),
-            projection_map: Vec::new(),
+            projection_map,
         }
     }
 }
@@ -39,14 +39,16 @@ mod tests {
     fn test_filter_has_projection_map() {
         let ctx = BindContext::new();
         let filter = Filter::new(LogicalPlan::dummy_scan(&ctx), vec![]);
-        assert!(filter.projection_map.is_empty());
+        assert!(filter
+            .projection_map
+            .is_identity(filter.child.types().len()));
     }
 
     #[test]
     fn test_filter_projection_map_can_be_set() {
         let ctx = BindContext::new();
         let mut filter = Filter::new(LogicalPlan::dummy_scan(&ctx), vec![]);
-        filter.projection_map = vec![0, 2, 4];
-        assert_eq!(filter.projection_map, vec![0, 2, 4]);
+        filter.projection_map = vec![0, 2, 4].into();
+        assert_eq!(filter.projection_map.as_columns(), Some(&[0, 2, 4][..]));
     }
 }

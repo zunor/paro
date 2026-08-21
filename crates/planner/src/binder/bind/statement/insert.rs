@@ -179,7 +179,7 @@ pub fn bind_insert(binder: &mut Binder, stmt: InsertStmt) -> Result<BoundStateme
 
     let on_conflict = if let Some(on_conflict) = stmt.on_conflict {
         let key_columns: Vec<usize> = table
-            .constraints
+            .constraints()
             .iter()
             .find(|constraint| constraint.constraint_type == ConstraintType::PrimaryKey)
             .map(|constraint| constraint.columns.clone())

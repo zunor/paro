@@ -91,6 +91,19 @@ impl MemoryAccountingContext {
         self.owner.is_some()
     }
 
+    /// Whether two long-lived structures publish allocations to exactly the
+    /// same accounting target.
+    pub fn has_same_target(&self, other: &Self) -> bool {
+        self.domain == other.domain
+            && self.tag == other.tag
+            && self.class == other.class
+            && match (&self.owner, &other.owner) {
+                (None, None) => true,
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+                _ => false,
+            }
+    }
+
     pub fn retain(&self, bytes: usize) -> MemoryResult<MemoryReleaseHandle> {
         if bytes == 0 {
             return Ok(MemoryReleaseHandle::new(
@@ -103,6 +116,16 @@ impl MemoryAccountingContext {
         }
 
         if let Some(owner) = &self.owner {
+            if self.class == MemoryAccountingClass::Spill {
+                owner.record_allocation(self.domain, self.tag, self.class, bytes);
+                return Ok(MemoryReleaseHandle::new_observed(
+                    self.owner.clone(),
+                    self.domain,
+                    self.tag,
+                    self.class,
+                    bytes,
+                ));
+            }
             owner.acquire_capacity(self.domain, bytes)?;
             owner.record_allocation(self.domain, self.tag, self.class, bytes);
         }
@@ -121,6 +144,19 @@ impl MemoryAccountingContext {
             super::MemoryGrant::new(0, self.domain, owner)
         } else {
             Ok(super::MemoryGrant::detached(usize::MAX / 4, self.domain))
+        }
+    }
+
+    /// Reserve a bounded structure's complete capacity with one owner call.
+    ///
+    /// Callers can split the returned grant among independently owned fields.
+    /// This preserves exact per-allocation publication while avoiding one
+    /// contended capacity acquisition for every fixed-size child buffer.
+    pub fn reserve_grant(&self, bytes: usize) -> MemoryResult<super::MemoryGrant> {
+        if let Some(owner) = self.owner() {
+            super::MemoryGrant::new(bytes, self.domain, owner)
+        } else {
+            Ok(super::MemoryGrant::detached(bytes, self.domain))
         }
     }
 

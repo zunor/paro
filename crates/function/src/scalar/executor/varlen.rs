@@ -2,38 +2,30 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use paro_common::error::Result;
-use paro_common::types::InlineString;
+use paro_common::types::StringView;
 use paro_common::vector::{StringHeap, ValidityMask, Vector};
 
 pub struct VarcharResultWriter<'a> {
-    entries: *mut InlineString,
+    entries: *mut StringView,
     validity: &'a mut ValidityMask,
     heap: &'a mut StringHeap,
 }
 
 impl<'a> VarcharResultWriter<'a> {
-    pub fn new(result: &'a mut Vector, count: usize) -> Self {
-        let (entries, validity, heap) = result.begin_varlen_write(count);
-        Self {
+    pub fn try_new(result: &'a mut Vector, count: usize) -> Result<Self> {
+        debug_assert!(result.logical_type().is_utf8_varlen());
+        let (entries, validity, heap) = result.try_begin_varlen_write(count)?;
+        Ok(Self {
             entries,
             validity,
             heap,
-        }
+        })
     }
 
     #[inline]
     pub fn write_str(&mut self, row: usize, value: &str) -> Result<()> {
-        let entry = self.heap.try_add_string(value)?;
-        unsafe {
-            *self.entries.add(row) = entry;
-        }
-        self.validity.set_valid(row);
-        Ok(())
-    }
-
-    #[inline]
-    pub fn write_bytes(&mut self, row: usize, value: &[u8]) -> Result<()> {
-        let entry = self.heap.try_add_blob(value)?;
+        // SAFETY: the writer stores the view and its heap in the same vector.
+        let entry = unsafe { self.heap.try_add_string(value) }?;
         unsafe {
             *self.entries.add(row) = entry;
         }
@@ -44,7 +36,7 @@ impl<'a> VarcharResultWriter<'a> {
     #[inline]
     pub fn set_null(&mut self, row: usize) {
         unsafe {
-            *self.entries.add(row) = InlineString::empty();
+            *self.entries.add(row) = StringView::empty();
         }
         self.validity.set_null(row);
     }
@@ -59,15 +51,15 @@ pub fn execute_varchar_unary_to_varchar<F>(
 where
     F: FnMut(&str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let view = input.try_to_varlen_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let view = input.try_to_utf8_view(count)?;
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !view.is_valid(row) {
             writer.set_null(row);
             continue;
         }
-        op(view.get_inline_string(row).as_str(), row, &mut writer)?;
+        op(view.str(row), row, &mut writer)?;
     }
 
     Ok(())
@@ -82,7 +74,7 @@ pub fn execute_varchar_unary_to_i64<F>(
 where
     F: FnMut(&str) -> i64,
 {
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -90,7 +82,7 @@ where
             result.set_null(row, true);
             continue;
         }
-        result.set_i64(row, op(view.get_inline_string(row).as_str()));
+        result.set_i64(row, op(view.str(row)));
     }
 
     Ok(())
@@ -106,8 +98,8 @@ pub fn execute_varchar_binary_to_bool<F>(
 where
     F: FnMut(&str, &str) -> bool,
 {
-    let left = left.try_to_varlen_view(count)?;
-    let right = right.try_to_varlen_view(count)?;
+    let left = left.try_to_utf8_view(count)?;
+    let right = right.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -115,13 +107,7 @@ where
             result.set_null(row, true);
             continue;
         }
-        result.set_bool(
-            row,
-            op(
-                left.get_inline_string(row).as_str(),
-                right.get_inline_string(row).as_str(),
-            ),
-        );
+        result.set_bool(row, op(left.str(row), right.str(row)));
     }
 
     Ok(())
@@ -137,8 +123,8 @@ pub fn execute_varchar_binary_to_i64<F>(
 where
     F: FnMut(&str, &str) -> i64,
 {
-    let left = left.try_to_varlen_view(count)?;
-    let right = right.try_to_varlen_view(count)?;
+    let left = left.try_to_utf8_view(count)?;
+    let right = right.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
@@ -146,13 +132,7 @@ where
             result.set_null(row, true);
             continue;
         }
-        result.set_i64(
-            row,
-            op(
-                left.get_inline_string(row).as_str(),
-                right.get_inline_string(row).as_str(),
-            ),
-        );
+        result.set_i64(row, op(left.str(row), right.str(row)));
     }
 
     Ok(())
@@ -168,21 +148,16 @@ pub fn execute_varchar_binary_to_varchar<F>(
 where
     F: FnMut(&str, &str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let left = left.try_to_varlen_view(count)?;
-    let right = right.try_to_varlen_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let left = left.try_to_utf8_view(count)?;
+    let right = right.try_to_utf8_view(count)?;
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !left.is_valid(row) || !right.is_valid(row) {
             writer.set_null(row);
             continue;
         }
-        op(
-            left.get_inline_string(row).as_str(),
-            right.get_inline_string(row).as_str(),
-            row,
-            &mut writer,
-        )?;
+        op(left.str(row), right.str(row), row, &mut writer)?;
     }
 
     Ok(())
@@ -199,10 +174,10 @@ pub fn execute_varchar_ternary_to_varchar<F>(
 where
     F: FnMut(&str, &str, &str, usize, &mut VarcharResultWriter<'_>) -> Result<()>,
 {
-    let first = first.try_to_varlen_view(count)?;
-    let second = second.try_to_varlen_view(count)?;
-    let third = third.try_to_varlen_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let first = first.try_to_utf8_view(count)?;
+    let second = second.try_to_utf8_view(count)?;
+    let third = third.try_to_utf8_view(count)?;
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !first.is_valid(row) || !second.is_valid(row) || !third.is_valid(row) {
@@ -210,9 +185,9 @@ where
             continue;
         }
         op(
-            first.get_inline_string(row).as_str(),
-            second.get_inline_string(row).as_str(),
-            third.get_inline_string(row).as_str(),
+            first.str(row),
+            second.str(row),
+            third.str(row),
             row,
             &mut writer,
         )?;

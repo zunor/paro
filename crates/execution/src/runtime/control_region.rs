@@ -208,6 +208,8 @@ impl RecursiveCteControllerState {
 
         self.handles
             .reset_materialized_handles_produced_by(&self.programs.recursive_pipeline_ids);
+        let iteration_shared_sinks =
+            SharedSinkRuntimeSet::from_programs(self.programs.recursive.iter().map(Arc::as_ref))?;
         let runtimes = self
             .programs
             .recursive
@@ -218,7 +220,7 @@ impl RecursiveCteControllerState {
                     self.handles.clone(),
                     self.params.clone(),
                     query,
-                    &self.shared_sinks,
+                    &iteration_shared_sinks,
                 )
                 .map(Arc::new)
             })
@@ -611,9 +613,19 @@ pub struct SharedSinkRuntimeSet {
 
 impl SharedSinkRuntimeSet {
     pub fn from_graph(graph: &PipelineGraph) -> Result<Self> {
+        Self::from_sink_sharing(graph.pipelines.iter().map(|pipeline| pipeline.sink_sharing))
+    }
+
+    pub fn from_programs<'a>(
+        programs: impl IntoIterator<Item = &'a PipelineProgram>,
+    ) -> Result<Self> {
+        Self::from_sink_sharing(programs.into_iter().map(|program| program.sink_sharing))
+    }
+
+    fn from_sink_sharing(sharing: impl IntoIterator<Item = SinkSharing>) -> Result<Self> {
         let mut coordinators = HashMap::<SharedSinkId, Arc<SharedSinkCoordinator>>::new();
-        for pipeline in &graph.pipelines {
-            let SinkSharing::Shared(id) = pipeline.sink_sharing else {
+        for sharing in sharing {
+            let SinkSharing::Shared(id) = sharing else {
                 continue;
             };
             let coordinator = coordinators

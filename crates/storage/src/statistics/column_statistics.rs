@@ -44,7 +44,7 @@ pub struct ColumnStatistics {
     /// Base statistics (min/max, null flags, etc.)
     stats: BaseStatistics,
     /// Optional distinct statistics (HyperLogLog-based)
-    distinct_stats: Option<DistinctStatistics>,
+    distinct_stats: Option<Arc<DistinctStatistics>>,
 }
 
 impl ColumnStatistics {
@@ -54,7 +54,7 @@ impl ColumnStatistics {
     /// will be automatically created.
     pub fn new(stats: BaseStatistics) -> Self {
         let distinct_stats = if DistinctStatistics::type_is_supported(stats.get_type()) {
-            Some(DistinctStatistics::new())
+            Some(Arc::new(DistinctStatistics::new()))
         } else {
             None
         };
@@ -72,7 +72,7 @@ impl ColumnStatistics {
     ) -> Self {
         Self {
             stats,
-            distinct_stats,
+            distinct_stats: distinct_stats.map(Arc::new),
         }
     }
 
@@ -101,32 +101,20 @@ impl ColumnStatistics {
         if let (Some(self_distinct), Some(other_distinct)) =
             (&mut self.distinct_stats, &other.distinct_stats)
         {
-            self_distinct.merge(other_distinct);
+            Arc::make_mut(self_distinct).merge(other_distinct);
         }
     }
 
     /// Update distinct statistics with hash values.
     ///
-    /// This method uses sampling to speed up updates.
     /// Does nothing if distinct statistics are not available.
     ///
     /// # Arguments
     /// * `hashes` - Hash values of the data
     /// * `count` - Number of values
-    /// * `is_integral` - Whether the data type is integral (affects sample rate)
-    pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize, is_integral: bool) {
+    pub fn update_distinct_statistics(&mut self, hashes: &[u64], count: usize) {
         if let Some(distinct) = &mut self.distinct_stats {
-            distinct.update_sample(hashes, count, is_integral);
-        }
-    }
-
-    /// Update distinct statistics without sampling.
-    ///
-    /// All provided hash values are inserted into the HyperLogLog.
-    /// Does nothing if distinct statistics are not available.
-    pub fn update_distinct_statistics_full(&mut self, hashes: &[u64], count: usize) {
-        if let Some(distinct) = &mut self.distinct_stats {
-            distinct.update(hashes, count);
+            Arc::make_mut(distinct).update(hashes, count);
         }
     }
 
@@ -149,28 +137,28 @@ impl ColumnStatistics {
     ///
     /// Returns None if distinct statistics are not available.
     pub fn distinct_stats(&self) -> Option<&DistinctStatistics> {
-        self.distinct_stats.as_ref()
+        self.distinct_stats.as_deref()
     }
 
     /// Get a mutable reference to the distinct statistics.
     ///
     /// Returns None if distinct statistics are not available.
     pub fn distinct_stats_mut(&mut self) -> Option<&mut DistinctStatistics> {
-        self.distinct_stats.as_mut()
+        self.distinct_stats.as_mut().map(Arc::make_mut)
     }
 
     /// Set the distinct statistics.
     ///
     /// This replaces any existing distinct statistics.
     pub fn set_distinct(&mut self, distinct_stats: Option<DistinctStatistics>) {
-        self.distinct_stats = distinct_stats;
+        self.distinct_stats = distinct_stats.map(Arc::new);
     }
 
     /// Create a copy of this ColumnStatistics.
     pub fn copy(&self) -> Self {
         Self {
             stats: self.stats.copy(),
-            distinct_stats: self.distinct_stats.as_ref().map(|d| d.copy()),
+            distinct_stats: self.distinct_stats.clone(),
         }
     }
 
@@ -226,7 +214,7 @@ impl ColumnStatistics {
 
         // Deserialize distinct statistics if present
         let distinct_stats = if has_distinct {
-            Some(DistinctStatistics::deserialize(r)?)
+            Some(Arc::new(DistinctStatistics::deserialize(r)?))
         } else {
             None
         };
@@ -338,8 +326,8 @@ mod tests {
         // Update distinct statistics
         let hashes1: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
         let hashes2: Vec<u64> = (100..200u64).map(murmur_hash_mix).collect();
-        stats1.update_distinct_statistics_full(&hashes1, hashes1.len());
-        stats2.update_distinct_statistics_full(&hashes2, hashes2.len());
+        stats1.update_distinct_statistics(&hashes1, hashes1.len());
+        stats2.update_distinct_statistics(&hashes2, hashes2.len());
 
         let count1 = stats1.get_distinct_count();
         let count2 = stats2.get_distinct_count();
@@ -366,7 +354,7 @@ mod tests {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
 
         let hashes: Vec<u64> = (0..1000u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics(&hashes, hashes.len(), true);
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let count = stats.get_distinct_count();
         assert!(count > 0, "Distinct count should be positive");
@@ -378,7 +366,7 @@ mod tests {
         stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics_full(&hashes, hashes.len());
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let copy = stats.copy();
 
@@ -394,12 +382,31 @@ mod tests {
     }
 
     #[test]
+    fn copy_shares_distinct_sketch_until_mutation() {
+        let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
+        stats.update_distinct_statistics(&[murmur_hash_mix(1)], 1);
+        let mut copy = stats.copy();
+        let original = stats.distinct_stats.as_ref().unwrap();
+        let shared = copy.distinct_stats.as_ref().unwrap();
+        assert!(Arc::ptr_eq(original, shared));
+
+        copy.update_distinct_statistics(&[murmur_hash_mix(2)], 1);
+
+        assert!(!Arc::ptr_eq(
+            stats.distinct_stats.as_ref().unwrap(),
+            copy.distinct_stats.as_ref().unwrap()
+        ));
+        assert_eq!(stats.distinct_stats().unwrap().get_total_count(), 1);
+        assert_eq!(copy.distinct_stats().unwrap().get_total_count(), 2);
+    }
+
+    #[test]
     fn test_serialize_deserialize() {
         let mut stats = ColumnStatistics::new(BaseStatistics::create_empty(LogicalType::Integer));
         stats.statistics_mut().observe_value(&Value::Integer(42));
 
         let hashes: Vec<u64> = (0..100u64).map(murmur_hash_mix).collect();
-        stats.update_distinct_statistics_full(&hashes, hashes.len());
+        stats.update_distinct_statistics(&hashes, hashes.len());
 
         let bytes = stats.to_bytes().expect("Serialization failed");
         let restored = ColumnStatistics::from_bytes(&bytes, LogicalType::Integer)

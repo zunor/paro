@@ -509,6 +509,7 @@ impl Session {
                 infra: Arc::new(ExecutionResources {
                     scheduler: self.instance.get_scheduler().clone(),
                     buffer_pool: self.instance.get_buffer_pool().clone(),
+                    page_cache: self.instance.get_page_cache().clone(),
                     buffer_manager: self.instance.get_buffer_manager().clone(),
                     query_memory_coordinator: Some(self.instance.get_memory_arbitrator().clone()),
                 }),
@@ -516,7 +517,6 @@ impl Session {
                 graph_index: self.instance.graph_manager().clone(),
                 python_runtime: Some(self.instance.python_runtime().clone()),
                 governance: paro_context::QueryResourceGovernance::default(),
-                plan_cache: None,
                 connection_info: None,
             }),
             graph_registry: self.instance.graph_manager().clone(),
@@ -878,7 +878,8 @@ impl Session {
         let control = self
             .execution_control
             .begin_statement(self.current_statement_timeout())?;
-        let ctx = ActiveQueryContext::new(query, control);
+        let foreground_maintenance = self.current_database.enter_foreground_maintenance_guard();
+        let ctx = ActiveQueryContext::new(query, control, foreground_maintenance);
         self.active_query = Some(ctx);
         Ok(())
     }

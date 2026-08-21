@@ -2,11 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-
 pub(crate) fn is_streaming_window_supported(spec: &WindowSpec) -> bool {
     spec.expressions.iter().all(|expr| {
-        expr.function.function_type == WindowFunctionType::RowNumber
-            && expr.children.is_empty()
+        expr.native_invocation()
+            .is_some_and(|(function, arguments)| {
+                function.function_type == WindowFunctionType::RowNumber && arguments.is_empty()
+            })
             && expr.partitions.is_empty()
             && expr.orders.is_empty()
     })
@@ -65,14 +66,18 @@ pub(crate) fn hash_join_probe_transform(
     handle: BreakerHandleId,
     spec: &HashJoinSpec,
 ) -> TransformSpec {
+    debug_assert!(spec.probe_residual_count <= spec.build_residual_conditions.len());
     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
         handle,
         join_type: spec.join_type,
-        conditions: spec.conditions.clone(),
+        anti_join_mode: spec.anti_join_mode,
+        key_conditions: spec.key_conditions.clone(),
+        build_residual_conditions: spec.build_residual_conditions.clone(),
+        probe_residual_count: spec.probe_residual_count,
         left_projection: spec.left_projection.clone(),
-        right_projection: spec.right_projection.clone(),
         output_names: spec.output_names.clone(),
         output_types: spec.output_types.clone(),
+        reduction_cascade: spec.reduction_cascade.clone(),
     })
 }
 
@@ -96,7 +101,7 @@ pub(crate) fn nlj_probe_transform(
         handle,
         join_type: spec.join_type,
         conditions: spec.conditions.clone(),
-        mark_null_condition_start: spec.mark_null_condition_start,
+        mark_semantics: spec.mark_semantics,
         arbitrary_condition: spec.arbitrary_condition.clone(),
         left_projection: spec.left_projection.clone(),
         right_projection: spec.right_projection.clone(),
@@ -114,7 +119,7 @@ pub(crate) fn sort_range_probe_transform(
         handle,
         join_type: spec.join_type,
         conditions: spec.conditions.clone(),
-        mark_null_condition_start: spec.mark_null_condition_start,
+        mark_semantics: spec.mark_semantics,
         left_projection: spec.left_projection.clone(),
         right_projection: spec.right_projection.clone(),
         right_output_types: spec.right_output_types.clone(),
@@ -132,105 +137,47 @@ pub(crate) fn needs_nlj_unmatched_source(join_type: JoinType) -> bool {
 
 pub(crate) fn aggregate_build_sink_spec(handle: BreakerHandleId, spec: AggregateSpec) -> SinkSpec {
     if spec.grouping_key_count == 0 {
-        return SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec {
-            handle,
-            spec,
-            required: Default::default(),
-        });
+        return SinkSpec::UngroupedAggregate(UngroupedAggregateSinkSpec { handle, spec });
     }
     if spec.perfect_hash.is_some() {
-        return SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec {
-            handle,
-            spec,
-            required: Default::default(),
-        });
+        return SinkSpec::PerfectHashAggregate(PerfectHashAggregateSinkSpec { handle, spec });
     }
-    SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec {
-        handle,
-        spec,
-        required: Default::default(),
-    })
+    SinkSpec::HashAggregateBuild(HashAggregateBuildSinkSpec { handle, spec })
 }
 
 pub(crate) fn aggregate_emit_source_spec(
     handle: BreakerHandleId,
     spec: AggregateSpec,
 ) -> SourceSpec {
+    match aggregate_emit_kind(&spec) {
+        AggregateEmitKind::Ungrouped => {
+            SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec { handle, spec })
+        }
+        AggregateEmitKind::PerfectHash => {
+            SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
+                handle,
+                spec,
+            })
+        }
+        AggregateEmitKind::Hash => {
+            SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec { handle, spec })
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AggregateEmitKind {
+    Hash,
+    Ungrouped,
+    PerfectHash,
+}
+
+pub(crate) fn aggregate_emit_kind(spec: &AggregateSpec) -> AggregateEmitKind {
     if spec.grouping_key_count == 0 {
-        return SourceSpec::UngroupedAggregateEmit(UngroupedAggregateEmitSourceSpec {
-            handle,
-            spec,
-        });
+        AggregateEmitKind::Ungrouped
+    } else if spec.perfect_hash.is_some() {
+        AggregateEmitKind::PerfectHash
+    } else {
+        AggregateEmitKind::Hash
     }
-    if spec.perfect_hash.is_some() {
-        return SourceSpec::PerfectHashAggregateEmit(PerfectHashAggregateEmitSourceSpec {
-            handle,
-            spec,
-        });
-    }
-    SourceSpec::HashAggregateEmit(HashAggregateEmitSourceSpec { handle, spec })
-}
-
-pub(crate) fn is_streaming_aggregate_supported(spec: &AggregateSpec) -> bool {
-    spec.grouping_key_count == 0
-        && spec.aggregate_filters.iter().all(Option::is_none)
-        && spec.aggregate_orders.iter().all(|orders| orders.is_empty())
-        && spec.aggregates.iter().all(|aggregate| {
-            matches!(
-                aggregate,
-                Expression::Aggregate(bound) if bound.aggr_type == AggregateType::NonDistinct
-            )
-        })
-}
-
-#[cfg(test)]
-pub(crate) fn ensure_streaming_aggregate_supported(spec: &AggregateSpec) -> Result<()> {
-    if spec.grouping_key_count != 0 {
-        return Err(paro_error::not_implemented(
-            "grouped aggregate lowering requires typed breaker execution migration",
-        ));
-    }
-    debug_assert_eq!(
-        spec.grouping_key_count, 0,
-        "grouped aggregate must use breaker lowering"
-    );
-    if !spec.aggregate_filters.iter().all(Option::is_none)
-        || !spec.aggregate_orders.iter().all(|orders| orders.is_empty())
-    {
-        return Err(paro_error::not_implemented(
-            "streaming aggregate requires no FILTER or ORDER BY modifiers",
-        ));
-    }
-    if spec.aggregates.len() != spec.aggregate_inputs.len() {
-        return Err(paro_error::internal(
-            "aggregate spec input mapping must match aggregate count",
-        ));
-    }
-
-    for (aggregate, inputs) in spec.aggregates.iter().zip(spec.aggregate_inputs.iter()) {
-        let Expression::Aggregate(bound) = aggregate else {
-            return Err(paro_error::not_implemented(
-                "streaming aggregate requires aggregate expressions",
-            ));
-        };
-        if bound.children.len() != inputs.len() {
-            return Err(paro_error::not_implemented(
-                "malformed aggregate input mapping requires typed breaker execution migration",
-            ));
-        }
-        debug_assert_eq!(
-            bound.children.len(),
-            inputs.len(),
-            "aggregate child references must match lowered input mapping"
-        );
-        if bound.aggr_type != AggregateType::NonDistinct
-            || bound.filter.is_some()
-            || !bound.order_bys.is_empty()
-        {
-            return Err(paro_error::not_implemented(
-                "DISTINCT, FILTER or ordered aggregate lowering requires typed breaker execution migration",
-            ));
-        }
-    }
-    Ok(())
 }

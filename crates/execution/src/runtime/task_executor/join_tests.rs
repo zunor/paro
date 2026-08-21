@@ -2,12 +2,164 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use paro_planner::operator::MarkJoinSemantics;
 
 fn value_to_i32(value: &Value) -> Option<i32> {
     match value {
         Value::Integer(value) => Some(*value),
         _ => None,
     }
+}
+
+fn run_null_aware_anti_join(
+    build_rows: Vec<Vec<Expression>>,
+    probe_rows: Vec<Vec<Expression>>,
+) -> Vec<Option<i32>> {
+    let output = QueryOutputPort::unbounded();
+    let query = query_context(output.clone());
+    let mut handles = BreakerHandleCatalogBuilder::default();
+    let handle = handles.register(
+        BreakerHandleKind::HashJoinBuild,
+        RowType::new(
+            vec!["key".to_string(), "payload".to_string()],
+            vec![LogicalType::Integer, LogicalType::Integer],
+        ),
+        Default::default(),
+    );
+    let build_id = PipelineId::new(0);
+    let probe_id = PipelineId::new(1);
+    handles.set_producer(handle, build_id).unwrap();
+    handles.add_consumer(handle, probe_id).unwrap();
+    let graph = PipelineGraph {
+        pipelines: vec![
+            PipelineSpec {
+                id: build_id,
+                source: SourceSpec::Values(values_spec(
+                    build_rows,
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                )),
+                transforms: Vec::new(),
+                sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
+                    handle,
+                    join_type: JoinType::Anti,
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
+                    build_projection: vec![1].into_boxed_slice(),
+                    build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    build_output_count: 1,
+                    force_external: false,
+                }),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(
+                    vec!["key".to_string(), "payload".to_string()],
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                ),
+            },
+            PipelineSpec {
+                id: probe_id,
+                source: SourceSpec::Values(values_spec(
+                    probe_rows,
+                    vec![LogicalType::Integer, LogicalType::Integer],
+                )),
+                transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
+                    handle,
+                    join_type: JoinType::Anti,
+                    anti_join_mode: AntiJoinMode::NullAware,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
+                    left_projection: vec![1].into_boxed_slice(),
+                    output_names: vec!["payload".to_string()].into_boxed_slice(),
+                    output_types: vec![LogicalType::Integer].into_boxed_slice(),
+                    reduction_cascade: None,
+                })],
+                sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+                sink_sharing: SinkSharing::Exclusive,
+                properties: PipelineProperties::default(),
+                output: RowType::new(vec!["payload".to_string()], vec![LogicalType::Integer]),
+            },
+        ],
+        dependencies: vec![PipelineDependency {
+            producer: build_id,
+            consumer: probe_id,
+            kind: DependencyKind::BuildBeforeProbe,
+        }],
+        handles: handles.finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(probe_id),
+    };
+    let (build_runtime, probe_runtime) = runtimes_from_graph(&query, &graph);
+    let thread = ThreadContext::single_threaded();
+    let wake = OperatorWakeScope {
+        task_id: PipelineTaskId(29),
+        generation: WakeGeneration(0),
+    };
+    let mut profiler = OperatorProfiler::disabled();
+    let build_task = build_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("build task");
+    run_to_done(
+        &mut PipelineTaskExecutor::new(build_runtime, build_task),
+        &query,
+        &thread,
+        &wake,
+        &mut profiler,
+    );
+    let probe_task = probe_runtime
+        .create_task_state(&query, paro_common::test_utils::test_allocator())
+        .expect("probe task");
+    run_to_done(
+        &mut PipelineTaskExecutor::new(probe_runtime, probe_task),
+        &query,
+        &thread,
+        &wake,
+        &mut profiler,
+    );
+    let mut values = Vec::new();
+    while let Some(chunk) = output.pop_front() {
+        for row_idx in 0..chunk.size() {
+            values.push(value_to_i32(&chunk.data[0].get_value(row_idx)));
+        }
+    }
+    values
+}
+
+#[test]
+fn null_aware_anti_join_preserves_not_in_three_valued_logic() {
+    let null_int = || {
+        Expression::Constant(ConstantExpression::new(
+            Value::Null(LogicalType::Integer),
+            LogicalType::Integer,
+        ))
+    };
+    let probe_rows = || {
+        vec![
+            vec![int_constant(1), int_constant(10)],
+            vec![int_constant(2), int_constant(20)],
+            vec![null_int(), int_constant(30)],
+        ]
+    };
+
+    assert_eq!(
+        run_null_aware_anti_join(vec![vec![int_constant(2), int_constant(200)]], probe_rows(),),
+        vec![Some(10)]
+    );
+    assert_eq!(
+        run_null_aware_anti_join(Vec::new(), probe_rows()),
+        vec![Some(10), Some(20), Some(30)]
+    );
+    assert!(run_null_aware_anti_join(
+        vec![
+            vec![int_constant(2), int_constant(200)],
+            vec![null_int(), int_constant(300)],
+        ],
+        probe_rows(),
+    )
+    .is_empty());
 }
 
 #[test]
@@ -18,7 +170,6 @@ fn hash_join_output_more_yields_between_output_chunks() {
         vec!["lv".to_string(), "rv".to_string()],
         vec![LogicalType::Integer, LogicalType::Integer],
     );
-
     let mut handles = BreakerHandleCatalogBuilder::default();
     let handle = handles.register(
         BreakerHandleKind::HashJoinBuild,
@@ -32,7 +183,6 @@ fn hash_join_output_more_yields_between_output_chunks() {
     let probe_id = PipelineId::new(1);
     handles.set_producer(handle, build_id).unwrap();
     handles.add_consumer(handle, probe_id).unwrap();
-
     let build_rows = (0..(paro_common::vector::VECTOR_SIZE * 2 + 7))
         .map(|idx| vec![int_constant(1), int_constant(idx as i32)])
         .collect::<Vec<_>>();
@@ -48,10 +198,14 @@ fn hash_join_output_more_yields_between_output_chunks() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    required: Default::default(),
+                    build_output_count: 1,
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
@@ -70,12 +224,15 @@ fn hash_join_output_more_yields_between_output_chunks() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    anti_join_mode: AntiJoinMode::Regular,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -194,10 +351,14 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
         sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
             handle,
             join_type: JoinType::Inner,
-            conditions: vec![join_condition()].into_boxed_slice(),
+            build_keys_unique: false,
+            build_time_integer_index: None,
+            key_conditions: vec![join_condition()].into_boxed_slice(),
+            residual_conditions: Box::default(),
+            grouped_reduction_channels: None,
             build_projection: vec![1].into_boxed_slice(),
             build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-            required: Default::default(),
+            build_output_count: 1,
             force_external: false,
         }),
         sink_sharing: SinkSharing::Exclusive,
@@ -228,9 +389,11 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: first_handle,
                         join_type: JoinType::Inner,
-                        conditions: vec![join_condition()].into_boxed_slice(),
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: vec![join_condition()].into_boxed_slice(),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
                         left_projection: vec![0, 1].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["k".into(), "probe".into(), "first".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -239,13 +402,16 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                             LogicalType::Integer,
                         ]
                         .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: second_handle,
                         join_type: JoinType::Inner,
-                        conditions: vec![join_condition()].into_boxed_slice(),
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: vec![join_condition()].into_boxed_slice(),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
                         left_projection: vec![1, 2].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["probe".into(), "first".into(), "second".into()]
                             .into_boxed_slice(),
                         output_types: vec![
@@ -254,6 +420,7 @@ fn nested_hash_join_output_more_drains_downstream_before_upstream() {
                             LogicalType::Integer,
                         ]
                         .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                 ],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -402,10 +569,14 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle: hash_handle,
                     join_type: JoinType::Inner,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    required: Default::default(),
+                    build_output_count: 1,
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
@@ -421,7 +592,6 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                 transforms: Vec::new(),
                 sink: SinkSpec::CrossProductBuild(CrossProductBuildSinkSpec {
                     handle: cross_handle,
-                    required: Default::default(),
                 }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
@@ -445,12 +615,15 @@ fn hash_join_output_more_drains_cross_product_before_reusing_input() {
                     TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                         handle: hash_handle,
                         join_type: JoinType::Inner,
-                        conditions: vec![join_condition()].into_boxed_slice(),
+                        anti_join_mode: AntiJoinMode::Regular,
+                        key_conditions: vec![join_condition()].into_boxed_slice(),
+                        build_residual_conditions: Box::default(),
+                        probe_residual_count: 0,
                         left_projection: vec![1].into_boxed_slice(),
-                        right_projection: vec![0].into_boxed_slice(),
                         output_names: vec!["nation".into(), "payload".into()].into_boxed_slice(),
                         output_types: vec![LogicalType::Integer, LogicalType::Integer]
                             .into_boxed_slice(),
+                        reduction_cascade: None,
                     }),
                     TransformSpec::CrossProductProbe(CrossProductProbeSpec {
                         handle: cross_handle,
@@ -621,10 +794,7 @@ fn sort_range_join_uses_sorted_range_probe_candidates() {
                     ],
                 )),
                 transforms: Vec::new(),
-                sink: SinkSpec::Materialize(MaterializeSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: RowType::new(
@@ -653,7 +823,7 @@ fn sort_range_join_uses_sorted_range_probe_candidates() {
                     handle,
                     join_type: JoinType::Inner,
                     conditions: conditions.into_boxed_slice(),
-                    mark_null_condition_start: None,
+                    mark_semantics: MarkJoinSemantics::NotMark,
                     left_projection: vec![2].into_boxed_slice(),
                     right_projection: vec![2].into_boxed_slice(),
                     right_output_types: vec![
@@ -760,10 +930,14 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Single,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    required: Default::default(),
+                    build_output_count: 1,
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
@@ -782,12 +956,15 @@ fn hash_join_single_probe_errors_on_duplicate_build_matches() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Single,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    anti_join_mode: AntiJoinMode::Regular,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -888,10 +1065,14 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 sink: SinkSpec::HashJoinBuild(HashJoinBuildSinkSpec {
                     handle,
                     join_type: JoinType::Right,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    build_keys_unique: false,
+                    build_time_integer_index: None,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    residual_conditions: Box::default(),
+                    grouped_reduction_channels: None,
                     build_projection: vec![1].into_boxed_slice(),
                     build_payload_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    required: Default::default(),
+                    build_output_count: 1,
                     force_external: false,
                 }),
                 sink_sharing: SinkSharing::Exclusive,
@@ -910,12 +1091,15 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                 transforms: vec![TransformSpec::HashJoinProbe(HashJoinProbeSpec {
                     handle,
                     join_type: JoinType::Right,
-                    conditions: vec![join_condition()].into_boxed_slice(),
+                    anti_join_mode: AntiJoinMode::Regular,
+                    key_conditions: vec![join_condition()].into_boxed_slice(),
+                    build_residual_conditions: Box::default(),
+                    probe_residual_count: 0,
                     left_projection: vec![1].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 })],
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
                 sink_sharing: SinkSharing::Exclusive,
@@ -928,10 +1112,10 @@ fn hash_join_unmatched_source_emits_right_side_rows_after_probe() {
                     handle,
                     join_type: JoinType::Right,
                     left_output_types: vec![LogicalType::Integer].into_boxed_slice(),
-                    right_projection: vec![0].into_boxed_slice(),
                     output_names: vec!["lv".to_string(), "rv".to_string()].into_boxed_slice(),
                     output_types: vec![LogicalType::Integer, LogicalType::Integer]
                         .into_boxed_slice(),
+                    reduction_cascade: None,
                 }),
                 transforms: Vec::new(),
                 sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -1020,7 +1204,6 @@ fn project_filter_limit_chain_pushes_without_dyn_dispatch() {
                 projection_map: vec![1].into_boxed_slice(),
             }),
             TransformSpec::Project(ProjectSpec {
-                table_index: 0,
                 expressions: vec![reference(0, LogicalType::Integer)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
             }),
@@ -1220,148 +1403,4 @@ fn table_function_source_runs_bound_function_in_typed_source_path() {
     assert_eq!(chunk.size(), 2);
     assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(5));
     assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(6));
-}
-
-#[test]
-fn topn_aggregate_and_window_stream_through_typed_transforms() {
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Values(values_spec(
-            vec![
-                vec![int_constant(3)],
-                vec![int_constant(1)],
-                vec![int_constant(2)],
-            ],
-            vec![LogicalType::Integer],
-        )),
-        transforms: vec![TransformSpec::StreamingTopN(TopNSpec {
-            orders: vec![OrderByNode {
-                expression: reference(0, LogicalType::Integer),
-                ascending: true,
-                nulls_first: true,
-            }]
-            .into_boxed_slice(),
-            limit: 2,
-            offset: 0,
-            hnsw_ef_hint: None,
-            output_names: vec!["v".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::Integer].into_boxed_slice(),
-        })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: RowType::new(vec!["v".to_string()], vec![LogicalType::Integer]),
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let thread = ThreadContext::single_threaded();
-    let wake = OperatorWakeScope {
-        task_id: PipelineTaskId(17),
-        generation: WakeGeneration(0),
-    };
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    let chunk = output.pop_front().expect("topn output");
-    assert_eq!(chunk.size(), 2);
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(1));
-    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(2));
-
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let aggregate = Expression::Aggregate(AggregateExpression::new(
-        get_count_star_function(),
-        vec![],
-        LogicalType::BigInt,
-    ));
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Values(values_spec(
-            vec![
-                vec![int_constant(10)],
-                vec![int_constant(20)],
-                vec![int_constant(30)],
-            ],
-            vec![LogicalType::Integer],
-        )),
-        transforms: vec![TransformSpec::StreamingAggregate(AggregateSpec {
-            grouping_key_count: 0,
-            projection_exprs: Box::new([]),
-            payload_types: Box::new([]),
-            groups: Box::new([]),
-            grouping_sets: Box::new([]),
-            aggregates: vec![aggregate].into_boxed_slice(),
-            grouping_functions: Box::new([]),
-            aggregate_inputs: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            aggregate_filters: vec![None].into_boxed_slice(),
-            aggregate_orders: vec![Vec::<usize>::new().into_boxed_slice()].into_boxed_slice(),
-            perfect_hash: None,
-            output_names: vec!["count".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::BigInt].into_boxed_slice(),
-        })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: RowType::new(vec!["count".to_string()], vec![LogicalType::BigInt]),
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    let chunk = output.pop_front().expect("aggregate output");
-    assert_eq!(chunk.size(), 1);
-    assert_eq!(chunk.column(0).unwrap().get_i64(0), Some(3));
-
-    let output = QueryOutputPort::unbounded();
-    let query = query_context(output.clone());
-    let row_number = WindowFunction::row_number();
-    let spec = PipelineSpec {
-        id: PipelineId::new(0),
-        source: SourceSpec::Values(values_spec(
-            vec![vec![int_constant(10)], vec![int_constant(20)]],
-            vec![LogicalType::Integer],
-        )),
-        transforms: vec![TransformSpec::StreamingWindow(WindowSpec {
-            window_index: 0,
-            expressions: vec![WindowExpression {
-                function: row_number.clone(),
-                children: Vec::new(),
-                partitions: Vec::new(),
-                orders: Vec::new(),
-                frame: WindowFrame::get_default_frame(&row_number),
-                ignore_nulls: false,
-                return_type: LogicalType::BigInt,
-            }]
-            .into_boxed_slice(),
-            input_width: 1,
-            output_names: vec!["v".to_string(), "rn".to_string()].into_boxed_slice(),
-            output_types: vec![LogicalType::Integer, LogicalType::BigInt].into_boxed_slice(),
-        })],
-        sink: SinkSpec::ClientResult(ClientResultSpec::default()),
-        sink_sharing: SinkSharing::Exclusive,
-        properties: PipelineProperties::default(),
-        output: RowType::new(
-            vec!["v".to_string(), "rn".to_string()],
-            vec![LogicalType::Integer, LogicalType::BigInt],
-        ),
-    };
-    let runtime = runtime_from_spec(&query, spec);
-    let task = runtime
-        .create_task_state(&query, paro_common::test_utils::test_allocator())
-        .expect("task state");
-    let mut executor = PipelineTaskExecutor::new(runtime, task);
-    let mut profiler = OperatorProfiler::disabled();
-    run_to_done(&mut executor, &query, &thread, &wake, &mut profiler);
-    let chunk = output.pop_front().expect("window output");
-    assert_eq!(chunk.column(0).unwrap().get_i32(0), Some(10));
-    assert_eq!(chunk.column(1).unwrap().get_i64(0), Some(1));
-    assert_eq!(chunk.column(0).unwrap().get_i32(1), Some(20));
-    assert_eq!(chunk.column(1).unwrap().get_i64(1), Some(2));
 }

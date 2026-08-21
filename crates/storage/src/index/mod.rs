@@ -54,6 +54,7 @@ pub mod zonemap;
 
 mod bound_index;
 mod evaluator;
+mod fixed_membership;
 mod fixed_size_allocator;
 mod fixed_size_buffer;
 mod index;
@@ -69,6 +70,10 @@ mod predicate_result;
 
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 pub use evaluator::IndexEvaluator;
+pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
+pub(crate) use fixed_membership::{
+    FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,
+};
 pub use fixed_size_allocator::{
     FixedSizeAllocator, FixedSizeAllocatorInfo, DEFAULT_BLOCK_SIZE, VACUUM_THRESHOLD,
 };
@@ -96,7 +101,8 @@ pub use index_type::{
 pub use index_type_set::IndexTypeSet;
 pub use page_layout::PageLayout;
 pub use predicate::{
-    collect_predicate_columns, compare_bytes, value_to_bytes, Predicate, PredicateTree,
+    collect_predicate_columns, compare_bytes, value_to_bytes, Predicate, PredicateComparison,
+    PredicateTree,
 };
 pub use predicate_result::{
     decode_page_ranges, encode_page_ranges, intersect, to_row_ranges, union, PageRange,
@@ -124,4 +130,6 @@ pub use short_key::{
     KEY_MAXIMAL_MARKER, KEY_MINIMAL_MARKER, KEY_NORMAL_MARKER, KEY_NULL_FIRST_MARKER,
     KEY_NULL_LAST_MARKER,
 };
-pub use zonemap::{ZoneMapEntry, ZoneMapIndex, ZoneMapIndexReader, ZoneMapIndexWriter};
+pub use zonemap::{
+    BoundsPrecision, ZoneMapEntry, ZoneMapIndex, ZoneMapIndexReader, ZoneMapIndexWriter,
+};

@@ -44,23 +44,6 @@ pub struct GraphExpandSpec {
 }
 
 #[derive(Debug, Clone)]
-pub struct GraphRowidMapping {
-    pub table_index: usize,
-    pub rowid_col_idx: usize,
-    pub table_name: String,
-    pub schema_name: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct GraphProjectSpec {
-    pub expressions: Box<[Expression]>,
-    pub filters: Box<[Expression]>,
-    pub rowid_mappings: Box<[GraphRowidMapping]>,
-    pub output_names: Box<[String]>,
-    pub output_types: Box<[LogicalType]>,
-}
-
-#[derive(Debug, Clone)]
 pub struct GraphShortestPathSpec {
     pub graph_name: String,
     pub edge_info: EdgeTableInfo,

@@ -21,7 +21,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 use super::base_statistics::{BaseStatistics, StatsData};
-use super::types::StatsInfo;
+use super::types::{StatisticsBound, StatsInfo};
 
 /// Maximum string length for min/max storage.
 /// Strings longer than this are truncated for statistics purposes.
@@ -45,10 +45,8 @@ pub struct StringStatsData {
     pub max_len: usize,
     /// Whether or not the column can contain unicode characters.
     pub has_unicode: bool,
-    /// Whether or not the maximum string length is known.
-    pub has_max_string_length: bool,
-    /// The maximum string length in bytes.
-    pub max_string_length: u32,
+    /// Correctness-safe maximum string length for the complete population.
+    max_string_length: StatisticsBound<u32>,
 }
 
 impl Default for StringStatsData {
@@ -70,8 +68,7 @@ impl StringStatsData {
             min_len: 0,
             max_len: MAX_STRING_MINMAX_SIZE,
             has_unicode: true,
-            has_max_string_length: false,
-            max_string_length: 0,
+            max_string_length: StatisticsBound::Unknown,
         }
     }
 
@@ -87,23 +84,18 @@ impl StringStatsData {
             min_len: MAX_STRING_MINMAX_SIZE,
             max_len: 0,
             has_unicode: false,
-            has_max_string_length: true,
-            max_string_length: 0,
+            max_string_length: StatisticsBound::Guaranteed(0),
         }
     }
 
     /// Check if the statistics has a maximum string length defined.
     pub fn has_max_string_length(&self) -> bool {
-        self.has_max_string_length
+        self.max_string_length.is_guaranteed()
     }
 
     /// Get the maximum string length, if known.
     pub fn max_string_length(&self) -> Option<u32> {
-        if self.has_max_string_length {
-            Some(self.max_string_length)
-        } else {
-            None
-        }
+        self.max_string_length.guaranteed().copied()
     }
 
     /// Check if the strings can contain unicode characters.
@@ -133,14 +125,12 @@ impl StringStatsData {
 
     /// Reset the max string length so has_max_string_length() returns false.
     pub fn reset_max_string_length(&mut self) {
-        self.has_max_string_length = false;
-        self.max_string_length = 0;
+        self.max_string_length.clear();
     }
 
     /// Set the maximum string length.
     pub fn set_max_string_length(&mut self, length: u32) {
-        self.has_max_string_length = true;
-        self.max_string_length = length;
+        self.max_string_length.set_guaranteed(length);
     }
 
     /// Mark that the column can contain unicode characters.
@@ -178,8 +168,8 @@ impl StringStatsData {
         let len = bytes.len();
 
         // Update max string length
-        if self.has_max_string_length && len as u32 > self.max_string_length {
-            self.max_string_length = len as u32;
+        if let Some(maximum) = self.max_string_length.guaranteed_mut() {
+            *maximum = (*maximum).max(len as u32);
         }
 
         // Check for unicode
@@ -211,12 +201,8 @@ impl StringStatsData {
         }
 
         // Merge max string length
-        if self.has_max_string_length && other.has_max_string_length {
-            self.max_string_length = self.max_string_length.max(other.max_string_length);
-        } else {
-            // If either doesn't have max string length, we don't know the max
-            self.has_max_string_length = false;
-        }
+        self.max_string_length
+            .merge_with(&other.max_string_length, |left, right| (*left).max(*right));
 
         // Merge min
         let cmp_min = Self::compare_bytes(other.min_bytes(), self.min_bytes());
@@ -265,11 +251,19 @@ impl StringStatsData {
         result.push(self.max_len as u8);
 
         // flags (1 byte): bit 0 = has_unicode, bit 1 = has_max_string_length
-        let flags = (self.has_unicode as u8) | ((self.has_max_string_length as u8) << 1);
+        let flags =
+            (self.has_unicode as u8) | ((self.max_string_length.is_guaranteed() as u8) << 1);
         result.push(flags);
 
         // max_string_length (4 bytes)
-        result.extend_from_slice(&self.max_string_length.to_le_bytes());
+        result.extend_from_slice(
+            &self
+                .max_string_length
+                .guaranteed()
+                .copied()
+                .unwrap_or_default()
+                .to_le_bytes(),
+        );
 
         result
     }
@@ -323,8 +317,11 @@ impl StringStatsData {
             min_len: min_len.min(MAX_STRING_MINMAX_SIZE),
             max_len: max_len.min(MAX_STRING_MINMAX_SIZE),
             has_unicode,
-            has_max_string_length,
-            max_string_length,
+            max_string_length: if has_max_string_length {
+                StatisticsBound::Guaranteed(max_string_length)
+            } else {
+                StatisticsBound::Unknown
+            },
         })
     }
 }
@@ -337,7 +334,7 @@ mod tests {
     fn test_string_stats_data_new_unknown() {
         let stats = StringStatsData::new_unknown();
         assert!(stats.has_unicode);
-        assert!(!stats.has_max_string_length);
+        assert!(!stats.has_max_string_length());
         assert_eq!(stats.min, [0x00; MAX_STRING_MINMAX_SIZE]);
         assert_eq!(stats.max, [0xFF; MAX_STRING_MINMAX_SIZE]);
     }
@@ -346,8 +343,8 @@ mod tests {
     fn test_string_stats_data_new_empty() {
         let stats = StringStatsData::new_empty();
         assert!(!stats.has_unicode);
-        assert!(stats.has_max_string_length);
-        assert_eq!(stats.max_string_length, 0);
+        assert!(stats.has_max_string_length());
+        assert_eq!(stats.max_string_length(), Some(0));
         assert_eq!(stats.min, [0xFF; MAX_STRING_MINMAX_SIZE]);
         assert_eq!(stats.max, [0x00; MAX_STRING_MINMAX_SIZE]);
     }
@@ -443,6 +440,21 @@ mod tests {
     }
 
     #[test]
+    fn test_string_stats_data_merge_propagates_unknown_max_length() {
+        let mut known = StringStatsData::new_empty();
+        known.update("known");
+        let unknown = StringStatsData::new_unknown();
+
+        let mut known_then_unknown = known.clone();
+        known_then_unknown.merge(&unknown);
+        assert_eq!(known_then_unknown.max_string_length(), None);
+
+        let mut unknown_then_known = unknown;
+        unknown_then_known.merge(&known);
+        assert_eq!(unknown_then_known.max_string_length(), None);
+    }
+
+    #[test]
     fn test_string_stats_data_is_constant() {
         let mut stats = StringStatsData::new_empty();
         stats.update("same");
@@ -476,10 +488,10 @@ mod tests {
         assert_eq!(deserialized.max_string(), stats.max_string());
         assert_eq!(deserialized.has_unicode, stats.has_unicode);
         assert_eq!(
-            deserialized.has_max_string_length,
-            stats.has_max_string_length
+            deserialized.has_max_string_length(),
+            stats.has_max_string_length()
         );
-        assert_eq!(deserialized.max_string_length, stats.max_string_length);
+        assert_eq!(deserialized.max_string_length(), stats.max_string_length());
     }
 
     #[test]
@@ -507,10 +519,10 @@ mod tests {
     fn test_string_stats_data_reset_max_length() {
         let mut stats = StringStatsData::new_empty();
         stats.update("hello");
-        assert!(stats.has_max_string_length);
+        assert!(stats.has_max_string_length());
 
         stats.reset_max_string_length();
-        assert!(!stats.has_max_string_length);
+        assert!(!stats.has_max_string_length());
         assert_eq!(stats.max_string_length(), None);
     }
 
@@ -740,11 +752,9 @@ impl StringStats {
     /// Convert statistics to a string representation.
     pub fn to_string(stats: &BaseStatistics) -> String {
         if let StatsData::String(data) = stats.stats_data() {
-            let max_len_str = if data.has_max_string_length {
-                data.max_string_length.to_string()
-            } else {
-                "?".to_string()
-            };
+            let max_len_str = data
+                .max_string_length()
+                .map_or_else(|| "?".to_string(), |length| length.to_string());
             format!(
                 "[Min: {}, Max: {}, Has Unicode: {}, Max String Length: {}]",
                 data.min_string(),

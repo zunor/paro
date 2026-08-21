@@ -616,6 +616,17 @@ fn test_dictionary_marks_generic_selection_source() {
 }
 
 #[test]
+fn test_dictionary_rejects_selection_outside_child_cardinality() {
+    let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20]));
+    let selection = crate::test_utils::test_selection(vec![0, 2]);
+
+    let error = Vector::try_dictionary(base, selection)
+        .expect_err("out-of-bounds dictionary selection must be rejected");
+
+    assert!(error.to_string().contains("outside child cardinality 2"));
+}
+
+#[test]
 fn test_generic_dictionary_overlay_strips_storage_provenance() {
     let base = Arc::new(crate::test_utils::test_i64_vector(&[10, 20, 30, 40]));
     let storage_dict = Arc::new(crate::test_utils::test_with_dictionary(
@@ -1206,6 +1217,20 @@ fn test_try_copy_selection_range_avoids_selection_materialization() {
 }
 
 #[test]
+fn test_broadcast_ref_keeps_repeated_mapping_symbolic() {
+    let source = Arc::new(crate::test_utils::test_i32_vector(&[10, 20, 30, 40]));
+    let broadcast = Vector::try_broadcast_ref(source, 2, 4).unwrap();
+
+    assert!(matches!(
+        broadcast.selection(),
+        VectorSelection::Repeated { index: 2, count: 4 }
+    ));
+    assert_eq!(broadcast.len(), 4);
+    assert_eq!(broadcast.get_i32(0), Some(30));
+    assert_eq!(broadcast.get_i32(3), Some(30));
+}
+
+#[test]
 fn test_try_copy_selection_materialized_rows() {
     let source = crate::test_utils::test_i32_vector(&[10, 20, 30, 40]);
     let selection = crate::test_utils::test_selection(vec![3, 1, 2]);
@@ -1239,7 +1264,7 @@ fn test_try_copy_selection_ref_owned_and_constant_rows() {
 
     let mut repeated = crate::test_utils::test_vector_with_capacity(LogicalType::Integer, 3);
     repeated
-        .try_copy_selection_ref(0, &source, SelectionRef::Constant { count: 3 }, 3)
+        .try_copy_selection_ref(0, &source, SelectionRef::Constant { index: 0, count: 3 }, 3)
         .unwrap();
 
     assert_eq!(repeated.len(), 3);
@@ -1268,6 +1293,7 @@ fn test_try_copy_selection_deep_dictionary_composition_materializes_fallibly() {
             provenance_id: None,
             source: DictionarySource::GenericSelection,
         }),
+        lifetime_owners: None,
     };
     let outer_selection = crate::test_utils::test_selection(vec![1, 3, 0]);
     let dictionary = Vector {
@@ -1285,6 +1311,7 @@ fn test_try_copy_selection_deep_dictionary_composition_materializes_fallibly() {
             provenance_id: None,
             source: DictionarySource::GenericSelection,
         }),
+        lifetime_owners: None,
     };
     let overlay = crate::test_utils::test_selection(vec![2, 0]);
     let mut selected = crate::test_utils::test_vector_with_capacity(LogicalType::Integer, 2);
@@ -1380,6 +1407,79 @@ fn test_try_copy_list_range_handles_null_empty_and_dictionary_rows() {
         )
     );
     assert_eq!(dest.child().unwrap().len(), 2);
+}
+
+#[test]
+fn constant_list_uses_the_canonical_nested_representation() {
+    let list_type = LogicalType::List(Box::new(LogicalType::Integer));
+    let value = Value::List(
+        vec![Value::Integer(10), Value::Integer(20)],
+        LogicalType::Integer,
+    );
+    let constant = Vector::try_constant_from_value(
+        list_type.clone(),
+        value.clone(),
+        3,
+        crate::test_utils::test_allocator(),
+    )
+    .unwrap();
+
+    assert_eq!(constant.vector_type(), VectorType::Constant);
+    assert_eq!(constant.len(), 3);
+    assert_eq!(constant.get_value(0), value);
+    assert_eq!(constant.get_value(2), value);
+
+    let mut materialized = Vector::try_new(list_type, 3, constant.allocator().clone()).unwrap();
+    materialized.try_copy_range(0, &constant, 0, 3).unwrap();
+    assert_eq!(materialized.get_value(0), value);
+    assert_eq!(materialized.get_value(2), value);
+}
+
+#[test]
+fn constant_array_and_struct_children_have_one_physical_row() {
+    let allocator = crate::test_utils::test_allocator();
+    let array_type = LogicalType::Array(Box::new(LogicalType::Float), 3);
+    let array_value = Value::Array(
+        vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+        LogicalType::Float,
+        3,
+    );
+    let array = Vector::try_constant_from_value(
+        array_type.clone(),
+        array_value.clone(),
+        2,
+        allocator.clone(),
+    )
+    .unwrap();
+    assert_eq!(array.child().unwrap().len(), 3);
+    let mut arrays = Vector::try_new(array_type, 2, allocator.clone()).unwrap();
+    arrays.try_copy_range(0, &array, 0, 2).unwrap();
+    assert_eq!(arrays.get_value(1), array_value);
+
+    let fields = vec![
+        ("id".to_string(), LogicalType::Integer),
+        ("label".to_string(), LogicalType::Varchar),
+    ];
+    let struct_type = LogicalType::Struct(fields.clone());
+    let struct_value = Value::Struct(
+        vec![Value::Integer(7), Value::Varchar("seven".to_string())],
+        fields,
+    );
+    let structure = Vector::try_constant_from_value(
+        struct_type.clone(),
+        struct_value.clone(),
+        2,
+        allocator.clone(),
+    )
+    .unwrap();
+    assert!(structure
+        .children()
+        .unwrap()
+        .iter()
+        .all(|child| child.len() == 1));
+    let mut structures = Vector::try_new(struct_type, 2, allocator).unwrap();
+    structures.try_copy_range(0, &structure, 0, 2).unwrap();
+    assert_eq!(structures.get_value(1), struct_value);
 }
 
 #[test]
@@ -1763,4 +1863,144 @@ fn test_try_copy_at_list_child_growth_propagates_allocation_error() {
     let err = dst.try_copy_at(0, &src, 0).unwrap_err();
 
     assert!(err.to_string().contains("injected allocation failure"));
+}
+
+#[test]
+fn test_try_copy_at_array_out_of_order_preserves_written_extent() {
+    let source = crate::test_utils::test_embeddings_vector(
+        &[vec![1.0_f32, 2.0, 3.0], vec![4.0_f32, 5.0, 6.0]],
+        3,
+    );
+    let mut destination = Vector::try_new(
+        LogicalType::Array(Box::new(LogicalType::Float), 3),
+        4,
+        source.allocator().clone(),
+    )
+    .unwrap();
+    destination.try_set_count(4).unwrap();
+
+    destination.try_copy_at(3, &source, 0).unwrap();
+    destination.try_copy_at(1, &source, 1).unwrap();
+
+    let child = destination.child().expect("array child");
+    assert_eq!(child.len(), 12);
+    assert_eq!(child.validity().len(), 12);
+    assert_eq!(
+        destination.get_value(3),
+        Value::Array(
+            vec![Value::Float(1.0), Value::Float(2.0), Value::Float(3.0)],
+            LogicalType::Float,
+            3,
+        )
+    );
+    assert_eq!(
+        destination.get_value(1),
+        Value::Array(
+            vec![Value::Float(4.0), Value::Float(5.0), Value::Float(6.0)],
+            LogicalType::Float,
+            3,
+        )
+    );
+}
+
+#[test]
+fn test_try_set_len_rejects_flat_capacity_overflow() {
+    let mut vector =
+        Vector::try_new(LogicalType::Integer, 4, Arc::new(DefaultAllocator::new())).unwrap();
+
+    let error = vector.try_set_len(5).unwrap_err();
+
+    assert!(error.to_string().contains("vector length exceeds capacity"));
+    assert_eq!(vector.len(), 0);
+}
+
+#[test]
+fn direct_varlen_writer_reports_capacity_overflow() {
+    let mut vector =
+        Vector::try_new(LogicalType::Varchar, 1, Arc::new(DefaultAllocator::new())).unwrap();
+
+    let error = match vector.try_begin_varlen_write(2) {
+        Ok(_) => panic!("varlen writer exceeded its vector capacity"),
+        Err(error) => error,
+    };
+
+    assert!(error.to_string().contains("vector length exceeds capacity"));
+    assert_eq!(vector.len(), 0);
+}
+
+#[test]
+fn string_literal_vectors_use_owned_varlen_storage() {
+    let allocator = Arc::new(DefaultAllocator::new());
+    let mut source = Vector::try_new(LogicalType::StringLiteral, 1, allocator.clone()).unwrap();
+    source.try_set_count(1).unwrap();
+    source
+        .try_set_string(0, "a string literal longer than the inline payload")
+        .unwrap();
+
+    assert_eq!(source.buffer.element_size(), crate::types::StringView::SIZE);
+    assert_eq!(
+        source.get_value(0),
+        Value::Varchar("a string literal longer than the inline payload".into())
+    );
+
+    let mut destination = Vector::try_new(LogicalType::StringLiteral, 1, allocator).unwrap();
+    destination.try_copy_range(0, &source, 0, 1).unwrap();
+    drop(source);
+    assert_eq!(
+        destination.get_string(0),
+        Some("a string literal longer than the inline payload")
+    );
+}
+
+#[test]
+fn unresolved_unknown_type_has_no_physical_vector_layout() {
+    let result = Vector::try_new(LogicalType::Unknown, 1, Arc::new(DefaultAllocator::new()));
+    assert!(result.is_err());
+}
+
+#[test]
+fn zero_copy_retyping_cannot_strengthen_blob_bytes_to_utf8() {
+    let allocator = Arc::new(DefaultAllocator::new());
+    let mut blob = Vector::try_new(LogicalType::Blob, 1, allocator).unwrap();
+    blob.try_set_count(1).unwrap();
+    blob.try_set_blob(0, &[0xff]).unwrap();
+
+    assert!(blob.try_reference_as(LogicalType::Varchar).is_err());
+
+    let text = crate::test_utils::test_string_vector(&["valid UTF-8"]);
+    let binary = text.try_reference_as(LogicalType::Blob).unwrap();
+    assert_eq!(binary.get_blob(0), Some(b"valid UTF-8".as_slice()));
+}
+
+#[derive(Debug)]
+struct LifetimeDropFlag(Arc<AtomicBool>);
+
+impl Drop for LifetimeDropFlag {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+#[test]
+fn shallow_and_dictionary_references_retain_opaque_lifetime_owner() {
+    let dropped = Arc::new(AtomicBool::new(false));
+    let owner: Arc<dyn VectorLifetimeOwner> = Arc::new(LifetimeDropFlag(Arc::clone(&dropped)));
+    let source = crate::test_utils::test_i32_vector(&[10, 20, 30]);
+    let retained = source.reference_with_lifetime_owner(Arc::clone(&owner));
+    let inner = Vector::try_dictionary(
+        Arc::new(retained),
+        crate::test_utils::test_selection(vec![2, 0, 1]),
+    )
+    .expect("inner dictionary");
+    let outer = Vector::try_dictionary(
+        Arc::new(inner),
+        crate::test_utils::test_selection(vec![1, 0]),
+    )
+    .expect("canonicalized dictionary");
+    drop(owner);
+
+    assert!(!dropped.load(Ordering::SeqCst));
+    assert_eq!(outer.get_i32(0), Some(10));
+    drop(outer);
+    assert!(dropped.load(Ordering::SeqCst));
 }

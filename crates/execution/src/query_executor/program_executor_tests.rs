@@ -318,7 +318,7 @@ fn fetch_driven_aggregate_dag_keeps_root_output_bounded() {
 }
 
 #[test]
-fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
+fn parallel_scheduler_consumes_chunk_morsels_in_completed_and_streaming_paths() {
     let allocator = paro_common::test_utils::test_allocator();
     let chunks = (0..64).map(|value| i32_chunk(&[value])).collect::<Vec<_>>();
     let output_type = LogicalType::Integer;
@@ -371,7 +371,7 @@ fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
     session.scheduler().set_threads(4).expect("worker threads");
 
     let execution = execute_program(
-        session,
+        session.clone(),
         &statement,
         Arc::new(ParameterBindings::empty()),
         Arc::new(QueryMemoryPool::unbounded()),
@@ -385,6 +385,82 @@ fn completed_output_parallel_scheduler_consumes_chunk_morsels() {
     }
     values.sort_unstable();
     assert_eq!(values, (0..64).collect::<Vec<_>>());
+
+    let execution = start_program(
+        session,
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("start streaming parallel scheduler program");
+    assert!(execution.driver.is_none());
+    assert!(execution.background.is_some());
+    let output = execution.query.output.clone();
+    let mut handler = ResultHandler::from_program_execution(
+        vec!["v".to_string()],
+        vec![LogicalType::Integer],
+        execution,
+        paro_common::test_utils::test_allocator(),
+        None,
+    )
+    .expect("parallel result handler");
+    let mut values = Vec::new();
+    while let Some(chunk) = handler.fetch().expect("fetch parallel output") {
+        for row in 0..chunk.size() {
+            values.push(chunk.column(0).unwrap().get_i32(row).unwrap());
+        }
+    }
+    values.sort_unstable();
+    assert_eq!(values, (0..64).collect::<Vec<_>>());
+    assert!(output.stats().peak_queue_chunks <= 2);
+}
+
+#[test]
+fn parallel_scheduler_drains_hash_aggregate_shared_workers_once() {
+    let row_count = VECTOR_SIZE * 8 + 17;
+    let statement = statement_from_logical(grouped_aggregate_logical_plan(row_count));
+    assert_pipeline_count_at_least(&statement, 2);
+
+    let session = TestStatementContextBuilder::minimal()
+        .with_limits(RuntimeLimits {
+            max_threads: 4,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: false,
+            temporary_directory: String::new(),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: true,
+        })
+        .build();
+    session.scheduler().set_threads(4).expect("worker threads");
+
+    let execution = execute_program(
+        session,
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("execute parallel hash aggregate");
+
+    let mut groups = Vec::with_capacity(row_count);
+    while let Some(chunk) = execution.query.output.pop_front() {
+        for row in 0..chunk.size() {
+            groups.push((
+                chunk.column(0).unwrap().get_i32(row).unwrap(),
+                chunk.column(1).unwrap().get_i64(row).unwrap(),
+            ));
+        }
+    }
+    groups.sort_unstable_by_key(|(key, _)| *key);
+
+    assert_eq!(groups.len(), row_count);
+    assert!(groups
+        .iter()
+        .enumerate()
+        .all(|(key, group)| *group == (key as i32, 1)));
 }
 
 #[test]
@@ -658,7 +734,7 @@ fn completed_output_cleans_breakers_on_blocked_internal_error() {
 
     assert!(err
         .message()
-        .contains("completed-output/control-region pipeline blocked on root output backpressure"));
+        .contains("synchronously driven pipeline blocked on output backpressure"));
     assert_handle_status(&handles, handle, CleanupStatus::Failed);
 }
 
@@ -971,10 +1047,7 @@ fn materialized_graph(
                 id: PipelineId::new(0),
                 source: SourceSpec::Chunk(chunk_spec),
                 transforms: Vec::new(),
-                sink: SinkSpec::Materialize(MaterializeSinkSpec {
-                    handle,
-                    required: Default::default(),
-                }),
+                sink: SinkSpec::Materialize(MaterializeSinkSpec { handle }),
                 sink_sharing: SinkSharing::Exclusive,
                 properties: PipelineProperties::default(),
                 output: row_type.clone(),

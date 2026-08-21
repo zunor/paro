@@ -19,6 +19,7 @@ use super::topn_heap::{TopNBoundaryValue, TopNHeap};
 pub struct SortEmitSourceLocal {
     pub state: Option<Arc<SortSealedState>>,
     pub current_position: usize,
+    pub materialized_chunk_idx: usize,
     pub merger_lstate: SortedRunMergerLocalState,
 }
 
@@ -27,6 +28,7 @@ impl Default for SortEmitSourceLocal {
         Self {
             state: None,
             current_position: 0,
+            materialized_chunk_idx: 0,
             merger_lstate: SortedRunMergerLocalState::new(),
         }
     }

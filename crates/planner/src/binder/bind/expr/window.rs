@@ -3,10 +3,12 @@
 
 //! Binds window functions, partition/order, and frames. Named windows and `EXCLUDE` are not supported yet.
 
-use crate::binder::bind::expr;
+use super::call::{apply_implicit_casts, bind_window_aggregate_invocation};
+use crate::binder::bind::expr::{self, ExpressionBinder};
 use crate::binder::Binder;
 use crate::expression::{
-    Expression, OrderByExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+    CastExpression, Expression, ExpressionIterator, ExpressionVisitDecision, OrderByExpression,
+    WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -19,6 +21,7 @@ use paro_parser::ast::{
 /// Bind a window expression.
 pub fn bind_window_expression(
     binder: &mut Binder,
+    schema: Option<&str>,
     func_name: &str,
     args: Vec<Expr>,
     distinct: bool,
@@ -27,26 +30,8 @@ pub fn bind_window_expression(
     over: Window,
     ignore_nulls: bool,
 ) -> Result<Expression> {
-    if distinct || filter.is_some() || !arg_order_bys.is_empty() {
-        return Err(paro_error::not_implemented(
-            "Aggregate DISTINCT/FILTER/WITHIN GROUP on window functions",
-        ));
-    }
-
-    // 1. Bind function arguments
-    let mut bound_args = Vec::new();
-    let mut arg_types = Vec::new();
-
-    for arg in args {
-        let bound = expr::bind_expression(binder, arg)?;
-        arg_types.push(bound.return_type());
-        bound_args.push(bound);
-    }
-
-    // 2. Resolve window function
-    let window_func = resolve_window_function(func_name, &arg_types)?;
-
-    // 3. Parse window specification
+    // Parse the window specification before function binding so both native
+    // and aggregate invocations share one clause-binding path.
     let spec = match over {
         Window::WindowSpec(spec) => spec,
         Window::WindowReference(_name) => {
@@ -56,30 +41,90 @@ pub fn bind_window_expression(
         }
     };
 
-    // 4. Bind PARTITION BY
     let partitions = bind_partition_by(binder, spec.partition_by)?;
-
-    // 5. Bind ORDER BY
     let orders = bind_order_by(binder, spec.order_by)?;
 
-    // 6. Bind window frame
-    let frame = bind_window_frame(binder, spec.window_frame, &window_func)?;
+    let native_namespace = schema.is_none_or(|schema| schema.eq_ignore_ascii_case("pg_catalog"));
+    if native_namespace && is_native_window_function(func_name) {
+        if distinct || filter.is_some() || !arg_order_bys.is_empty() {
+            return Err(paro_error::syntax(format!(
+                "native window function '{}' does not accept aggregate modifiers",
+                func_name
+            )));
+        }
+        let mut bound_args = Vec::with_capacity(args.len());
+        let mut arg_types = Vec::with_capacity(args.len());
+        for arg in args {
+            let bound = expr::bind_expression(binder, arg)?;
+            arg_types.push(bound.return_type());
+            bound_args.push(bound);
+        }
+        let window_func = resolve_native_window_function(func_name, &arg_types)?;
+        apply_implicit_casts(
+            &mut bound_args,
+            &arg_types,
+            &window_func.arguments,
+            binder.cast_functions.as_ref(),
+        )?;
+        let default_frame = WindowFrame::get_default_frame(&window_func);
+        let frame = bind_window_frame(binder, spec.window_frame, default_frame)?;
+        return Ok(Expression::Window(WindowExpression::native(
+            window_func,
+            bound_args,
+            partitions,
+            orders,
+            frame,
+            ignore_nulls,
+        )));
+    }
 
-    let return_type = window_func.return_type.clone();
+    if ignore_nulls {
+        return Err(paro_error::syntax(format!(
+            "aggregate window function '{}' does not accept IGNORE NULLS",
+            func_name
+        )));
+    }
+    if distinct || !arg_order_bys.is_empty() {
+        return Err(paro_error::not_implemented(
+            "DISTINCT and argument ORDER BY on aggregate windows",
+        ));
+    }
 
-    Ok(Expression::Window(WindowExpression {
-        function: window_func,
-        children: bound_args,
-        partitions,
-        orders,
-        frame,
-        ignore_nulls,
-        return_type,
-    }))
+    let aggregate = bind_window_aggregate_invocation(
+        binder,
+        schema,
+        func_name,
+        args,
+        distinct,
+        filter,
+        arg_order_bys,
+    )?;
+    let frame = bind_window_frame(binder, spec.window_frame, WindowFrame::default())?;
+
+    Ok(Expression::Window(WindowExpression::aggregate(
+        aggregate, partitions, orders, frame,
+    )))
 }
 
-/// Resolve window function by name and argument types.
-fn resolve_window_function(name: &str, arg_types: &[LogicalType]) -> Result<WindowFunction> {
+fn is_native_window_function(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "row_number"
+            | "rank"
+            | "dense_rank"
+            | "percent_rank"
+            | "cume_dist"
+            | "ntile"
+            | "lead"
+            | "lag"
+            | "first_value"
+            | "last_value"
+            | "nth_value"
+    )
+}
+
+/// Resolve a native window function by name and argument types.
+fn resolve_native_window_function(name: &str, arg_types: &[LogicalType]) -> Result<WindowFunction> {
     let name_lower = name.to_lowercase();
 
     match name_lower.as_str() {
@@ -202,7 +247,7 @@ fn bind_order_by(
 fn bind_window_frame(
     binder: &mut Binder,
     frame: Option<AstWindowFrame>,
-    func: &WindowFunction,
+    default_frame: WindowFrame,
 ) -> Result<WindowFrame> {
     match frame {
         Some(frame) => {
@@ -212,9 +257,11 @@ fn bind_window_frame(
                 WindowFrameUnits::Range => WindowFrameType::Range,
             };
 
-            let (start_bound, start_is_preceding) = bind_frame_bound(binder, &frame.start_bound)?;
+            let (start_bound, start_is_preceding) =
+                bind_frame_bound(binder, &frame.start_bound, frame_type)?;
 
-            let (end_bound, end_is_preceding) = bind_frame_bound(binder, &frame.end_bound)?;
+            let (end_bound, end_is_preceding) =
+                bind_frame_bound(binder, &frame.end_bound, frame_type)?;
 
             Ok(WindowFrame {
                 frame_type,
@@ -224,10 +271,7 @@ fn bind_window_frame(
                 end_is_preceding,
             })
         }
-        None => {
-            // Default frame depends on function type
-            Ok(get_default_frame(func))
-        }
+        None => Ok(default_frame),
     }
 }
 
@@ -268,31 +312,134 @@ fn validate_window_frame_bounds(frame: &AstWindowFrame) -> Result<()> {
 fn bind_frame_bound(
     binder: &mut Binder,
     bound: &AstWindowFrameBound,
+    frame_type: WindowFrameType,
 ) -> Result<(WindowFrameBound, bool)> {
     match bound {
         AstWindowFrameBound::CurrentRow => Ok((WindowFrameBound::CurrentRow, false)),
         AstWindowFrameBound::Preceding(None) => Ok((WindowFrameBound::Unbounded, true)),
         AstWindowFrameBound::Following(None) => Ok((WindowFrameBound::Unbounded, false)),
         AstWindowFrameBound::Preceding(Some(expr)) => {
-            let bound_expr = expr::bind_expression(binder, (**expr).clone())?;
+            let bound_expr = bind_frame_offset(binder, (**expr).clone(), frame_type)?;
             Ok((WindowFrameBound::Offset(Box::new(bound_expr)), true))
         }
         AstWindowFrameBound::Following(Some(expr)) => {
-            let bound_expr = expr::bind_expression(binder, (**expr).clone())?;
+            let bound_expr = bind_frame_offset(binder, (**expr).clone(), frame_type)?;
             Ok((WindowFrameBound::Offset(Box::new(bound_expr)), false))
         }
     }
 }
 
-/// Get default frame for a window function.
-fn get_default_frame(func: &WindowFunction) -> WindowFrame {
-    WindowFrame::get_default_frame(func)
+fn bind_frame_offset(
+    binder: &mut Binder,
+    expression: Expr,
+    frame_type: WindowFrameType,
+) -> Result<Expression> {
+    let mut offset_binder = ExpressionBinder::new(binder);
+    offset_binder.allow_aggregates = false;
+    offset_binder.allow_window = false;
+    offset_binder.allow_default = false;
+    let mut bound = offset_binder.bind(expression)?;
+
+    let mut row_dependent = offset_binder.has_bound_columns();
+    drop(offset_binder);
+    ExpressionIterator::visit(&bound, &mut |node| match node {
+        Expression::ColumnRef(_)
+        | Expression::Aggregate(_)
+        | Expression::Window(_)
+        | Expression::Subquery(_) => {
+            row_dependent = true;
+            ExpressionVisitDecision::SkipChildren
+        }
+        _ => ExpressionVisitDecision::Descend,
+    });
+    if row_dependent {
+        return Err(paro_error::windowing_error(
+            "window frame offset must not contain row-dependent variables",
+        ));
+    }
+
+    if frame_type == WindowFrameType::Rows {
+        bound = CastExpression::add_cast_if_needed(
+            bound,
+            LogicalType::BigInt,
+            binder.cast_functions.as_ref(),
+        )?;
+    }
+    Ok(bound)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::binder::test_utils::test_binder_with_search_path;
+    use crate::operator::LogicalOperator;
+    use crate::plan::LogicalPlan;
+    use paro_catalog::collection::InstallMode;
+    use paro_catalog::entry::{AggregateFunctionCatalogEntry, CatalogEntryEnum, CatalogType};
+    use paro_catalog::search_path::CatalogSearchEntry;
+    use paro_function::aggregate::distributive::{
+        count::get_count_star_function, minmax::get_min_function, sum::get_sum_function,
+    };
+    use paro_function::aggregate::AggregateFunctionSet;
     use paro_parser::ast::Literal;
+    use std::sync::Arc;
+
+    fn bind_window_plan(sql: &str) -> Result<LogicalPlan> {
+        let mut binder =
+            test_binder_with_search_path(vec![CatalogSearchEntry::schema_only("public")]);
+        install_test_aggregate(&binder, get_min_function());
+        install_test_aggregate(&binder, get_sum_function());
+        let mut count_star = AggregateFunctionSet::new("count_star".to_string());
+        count_star.add_function(get_count_star_function());
+        install_test_aggregate(&binder, count_star);
+        let statement = paro_parser::parse_one(sql)?.stmt;
+        Ok(binder.bind(statement)?.plan)
+    }
+
+    fn bind_single_window(sql: &str) -> Result<WindowExpression> {
+        let plan = bind_window_plan(sql)?;
+        find_single_window(&plan.operator)
+            .cloned()
+            .ok_or_else(|| paro_error::internal("expected one planned window"))
+    }
+
+    fn find_single_window(operator: &LogicalOperator) -> Option<&WindowExpression> {
+        if let LogicalOperator::Window(window) = operator {
+            let [expression] = window.expressions.as_slice() else {
+                return None;
+            };
+            return Some(expression);
+        }
+        operator
+            .children()
+            .into_iter()
+            .find_map(|child| find_single_window(&child.operator))
+    }
+
+    fn install_test_aggregate(
+        binder: &Binder,
+        set: paro_function::aggregate::AggregateFunctionSet,
+    ) {
+        let txn = binder.catalog_txn_view();
+        let schema = binder
+            .catalog()
+            .get_schema(&txn, "public")
+            .expect("public schema should exist");
+        let entry = Arc::new(AggregateFunctionCatalogEntry::new(
+            schema.base.catalog.clone(),
+            schema.base.name.clone(),
+            set,
+            schema.object_id_allocator().allocate(),
+            0,
+        ));
+        let _ = schema
+            .collection(CatalogType::AggregateFunction)
+            .expect("aggregate function collection")
+            .install_committed(
+                Arc::new(CatalogEntryEnum::AggregateFunction(entry)),
+                InstallMode::RejectExisting,
+            );
+    }
 
     fn offset_bound(following: bool) -> AstWindowFrameBound {
         let offset = Box::new(Expr::Literal {
@@ -356,5 +503,149 @@ mod tests {
         let frame = frame(offset_bound(false), offset_bound(false));
         validate_window_frame_bounds(&frame)
             .expect("same-direction offsets are structurally valid");
+    }
+
+    #[test]
+    fn binds_full_partition_aggregate_window_to_real_kernel() {
+        let window = bind_single_window(
+            "SELECT min(x) OVER (PARTITION BY g) \
+             FROM (VALUES (1.25::DECIMAL(9,2), 1)) AS t(x, g)",
+        )
+        .expect("bind aggregate window");
+        let aggregate = window.aggregate_invocation().expect("aggregate invocation");
+
+        assert_eq!(aggregate.function.name, "min");
+        assert!(aggregate
+            .function
+            .execution_semantics_equal(&aggregate.function));
+        assert_eq!(aggregate.children.len(), 1);
+        assert_eq!(
+            aggregate.children[0].return_type(),
+            LogicalType::Decimal {
+                precision: 9,
+                scale: 2,
+            }
+        );
+        assert_eq!(window.partitions.len(), 1);
+        assert!(window.orders.is_empty());
+        assert!(window.frame.covers_whole_partition(false));
+        window.verify_bound_contract().expect("bound contract");
+    }
+
+    #[test]
+    fn aggregate_window_accepts_explicit_double_unbounded_rows_frame() {
+        let window = bind_single_window(
+            "SELECT sum(x) OVER (PARTITION BY g ROWS BETWEEN UNBOUNDED PRECEDING \
+             AND UNBOUNDED FOLLOWING) FROM (VALUES (1, 1)) AS t(x, g)",
+        )
+        .expect("bind explicit full frame");
+        assert!(window.aggregate_invocation().is_some());
+        assert!(window.frame.covers_whole_partition(false));
+    }
+
+    #[test]
+    fn count_star_window_uses_zero_argument_aggregate_kernel() {
+        let window =
+            bind_single_window("SELECT count(*) OVER (PARTITION BY g) FROM (VALUES (1)) AS t(g)")
+                .expect("bind count-star window");
+        let aggregate = window.aggregate_invocation().expect("aggregate invocation");
+
+        assert_eq!(aggregate.function.name, "count_star");
+        assert!(aggregate.children.is_empty());
+        assert_eq!(window.return_type(), LogicalType::BigInt);
+        window.verify_bound_contract().expect("bound contract");
+    }
+
+    #[test]
+    fn aggregate_window_preserves_ordered_and_bounded_frames_for_the_sort_fallback() {
+        for sql in [
+            "SELECT sum(x) OVER (ORDER BY g) FROM (VALUES (1, 1)) AS t(x, g)",
+            "SELECT sum(x) OVER (ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) \
+             FROM (VALUES (1)) AS t(x)",
+        ] {
+            let window = bind_single_window(sql).expect("bind aggregate window fallback");
+            assert!(window.aggregate_invocation().is_some());
+            assert!(!window
+                .frame
+                .covers_whole_partition(!window.orders.is_empty()));
+            window.verify_bound_contract().expect("bound contract");
+        }
+    }
+
+    #[test]
+    fn aggregate_window_accepts_query_level_aggregate_inputs() {
+        let plan = bind_window_plan(
+            "SELECT sum(sum(x)) OVER (PARTITION BY g ORDER BY g) \
+             FROM (VALUES (1, 1), (2, 1)) AS t(x, g) GROUP BY g",
+        )
+        .expect("bind grouped aggregate under window");
+        let window = find_single_window(&plan.operator).expect("planned window");
+        let aggregate = window.aggregate_invocation().expect("aggregate window");
+
+        assert!(matches!(
+            aggregate.children.as_slice(),
+            [Expression::ColumnRef(_)]
+        ));
+        assert!(plan_contains_grouped_aggregate(&plan.operator));
+        window.verify_bound_contract().expect("bound contract");
+    }
+
+    #[test]
+    fn rows_frame_offsets_are_row_independent_bigints() {
+        let window = bind_single_window(
+            "SELECT sum(x) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+             FROM (VALUES (1), (2)) AS t(x)",
+        )
+        .expect("bind constant ROWS offset");
+        let WindowFrameBound::Offset(offset) = &window.frame.start_bound else {
+            panic!("expected ROWS frame offset");
+        };
+        assert_eq!(offset.return_type(), LogicalType::BigInt);
+
+        let error = bind_window_plan(
+            "SELECT sum(x) OVER (ORDER BY x ROWS BETWEEN x PRECEDING AND CURRENT ROW) \
+             FROM (VALUES (1), (2)) AS t(x)",
+        )
+        .expect_err("row-dependent ROWS offset must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("window frame offset must not contain row-dependent variables"),
+            "{error}"
+        );
+    }
+
+    fn plan_contains_grouped_aggregate(operator: &LogicalOperator) -> bool {
+        matches!(operator, LogicalOperator::Aggregate(_))
+            || operator
+                .children()
+                .into_iter()
+                .any(|child| plan_contains_grouped_aggregate(&child.operator))
+    }
+
+    #[test]
+    fn native_window_binding_remains_native() {
+        let window = bind_single_window(
+            "SELECT row_number() OVER (PARTITION BY g ORDER BY x) \
+             FROM (VALUES (1, 1)) AS t(x, g)",
+        )
+        .expect("bind native window");
+        let (function, arguments) = window.native_invocation().expect("native invocation");
+        assert_eq!(function.name, "row_number");
+        assert!(arguments.is_empty());
+        assert_eq!(window.orders.len(), 1);
+    }
+
+    #[test]
+    fn native_window_arguments_are_cast_to_the_bound_contract() {
+        let window =
+            bind_single_window("SELECT ntile(4) OVER (ORDER BY x) FROM (VALUES (1)) AS t(x)")
+                .expect("bind ntile window");
+        let (function, arguments) = window.native_invocation().expect("native invocation");
+
+        assert_eq!(function.name, "ntile");
+        assert_eq!(arguments.len(), 1);
+        assert_eq!(arguments[0].return_type(), LogicalType::BigInt);
+        window.verify_bound_contract().expect("bound contract");
     }
 }

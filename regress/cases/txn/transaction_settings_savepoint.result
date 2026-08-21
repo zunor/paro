@@ -66,7 +66,7 @@ ROLLBACK
 
 SELECT name, setting, short_desc AS description
 FROM pg_settings
-WHERE name <> 'threads'
+WHERE name NOT IN ('threads', 'temp_directory')
 ORDER BY name;
 name	setting	description
 application_name	session-app	Name of the application connected to this session
@@ -78,12 +78,15 @@ force_external	false	Force spill-capable operators onto external paths
 max_temp_directory_size	unlimited	Maximum size of the temporary spill directory
 memory_limit	1073741824	Maximum memory available to the current session
 optimizer_verify	false	Enable optimizer verification outside debug builds
-parallel_scheduler	false	Enable the worker-pool pipeline scheduler for morsel-capable pipelines
+parallel_scheduler	true	Enable the worker-pool pipeline scheduler for morsel-capable pipelines
 rowset_scan_pushdown	true	Enable rowset predicate pushdown, late materialization, and scan-order lowering
 search_path	"$user", public	Sets the schema search order for names
 statement_timeout	0	Maximum execution time for a single statement
-temp_directory	(empty)	Directory used for temporary spill files
 use_new_agg_spill	true	Enable the newer hash aggregate spill path
+
+SELECT current_setting('temp_directory') <> '(empty)' AS has_default_temp_directory;
+has_default_temp_directory
+true
 
 DISCARD ALL;
 DISCARD ALL

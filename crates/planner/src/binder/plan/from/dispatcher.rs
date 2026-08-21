@@ -265,7 +265,7 @@ mod tests {
             panic!("external table child must be a projection");
         };
         assert_eq!(
-            projection.output_names,
+            projection.visible_names,
             vec!["__external_arg_1".to_string()]
         );
     }

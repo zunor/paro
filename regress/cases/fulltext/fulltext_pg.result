@@ -76,14 +76,14 @@ ORDER BY ts_rank(
 ) DESC
 LIMIT 2;
 QUERY PLAN
-PROJECTION  (rows=0)
+PROJECTION  (rows=1)
   Output: id
-  ->  TOP_N  (rows=0)
+  ->  TOP_N  (rows=1)
     Sort Key: #1 DESC NULLS FIRST
     Limit: 2
-    ->  PROJECTION  (rows=0)
+    ->  PROJECTION  (rows=1)
       Output: id, __paro_hidden_1
-      ->  FULLTEXT_SCAN on public.ft_docs  (rows=4)
+      ->  FULLTEXT_SCAN on public.ft_docs  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>

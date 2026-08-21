@@ -11,8 +11,8 @@
 //! - NULL `expr` rows are ignored.
 
 use crate::aggregate::{
-    AggregateCombineType, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateCombineType, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -187,13 +187,14 @@ mod string_agg_one_arg {
             &LogicalType::Varchar,
             "string_agg(expr) expects VARCHAR input"
         );
+        let input = input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr) expects textual input");
         for i in 0..count {
-            if input.is_null(i) {
+            if !input.is_valid(i) {
                 continue;
             }
-            let Some(value) = input.get_string(i) else {
-                continue;
-            };
+            let value = input.str(i);
             let state_ptr = states.state_ptr(i);
             let state = &mut *(state_ptr as *mut State);
             append_value(state, value, ",");
@@ -215,15 +216,16 @@ mod string_agg_one_arg {
             &LogicalType::Varchar,
             "string_agg(expr) expects VARCHAR input"
         );
+        let input = input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr) expects textual input");
         let state = &mut *(state as *mut State);
 
         for i in 0..count {
-            if input.is_null(i) {
+            if !input.is_valid(i) {
                 continue;
             }
-            let Some(value) = input.get_string(i) else {
-                continue;
-            };
+            let value = input.str(i);
             append_value(state, value, ",");
             if state.combine_separator.is_none() {
                 state.combine_separator = Some(",".to_string());
@@ -326,18 +328,22 @@ mod string_agg_two_args {
             &LogicalType::Varchar,
             "string_agg(expr, sep) expects VARCHAR separator"
         );
+        let value_input = value_input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr, sep) expects textual expr");
+        let sep_input = sep_input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr, sep) expects textual separator");
         for i in 0..count {
-            if value_input.is_null(i) {
+            if !value_input.is_valid(i) {
                 continue;
             }
-            let Some(value) = value_input.get_string(i) else {
-                continue;
-            };
-            let separator_is_null = sep_input.is_null(i);
+            let value = value_input.str(i);
+            let separator_is_null = !sep_input.is_valid(i);
             let separator = if separator_is_null {
                 ""
             } else {
-                sep_input.get_string(i).unwrap_or("")
+                sep_input.str(i)
             };
 
             let state_ptr = states.state_ptr(i);
@@ -367,20 +373,24 @@ mod string_agg_two_args {
             &LogicalType::Varchar,
             "string_agg(expr, sep) expects VARCHAR separator"
         );
+        let value_input = value_input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr, sep) expects textual expr");
+        let sep_input = sep_input
+            .try_to_utf8_view(count)
+            .expect("string_agg(expr, sep) expects textual separator");
         let state = &mut *(state as *mut State);
 
         for i in 0..count {
-            if value_input.is_null(i) {
+            if !value_input.is_valid(i) {
                 continue;
             }
-            let Some(value) = value_input.get_string(i) else {
-                continue;
-            };
-            let separator_is_null = sep_input.is_null(i);
+            let value = value_input.str(i);
+            let separator_is_null = !sep_input.is_valid(i);
             let separator = if separator_is_null {
                 ""
             } else {
-                sep_input.get_string(i).unwrap_or("")
+                sep_input.str(i)
             };
 
             append_value(state, value, separator);
@@ -487,7 +497,7 @@ pub fn get_string_agg_function() -> AggregateFunctionSet {
         .with_state_serialization(serialize_state, deserialize_state),
     );
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 #[cfg(test)]

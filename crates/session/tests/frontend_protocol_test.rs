@@ -62,6 +62,7 @@ impl ResultSink for MockCopyOutSink {
 impl ProtocolResultSink for MockCopyOutSink {
     fn create_copy_out_sink(
         &mut self,
+        _cancellation: &paro_session::StatementCancellation,
         _options: &paro_function::copy::CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
         Ok(Box::new(MockCopyOutProtocol { sink: self }))
@@ -129,7 +130,10 @@ impl ResultSink for MockCopyInSink {
 }
 
 impl ProtocolResultSink for MockCopyInSink {
-    fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+    fn create_copy_in_source(
+        &mut self,
+        _cancellation: &paro_session::StatementCancellation,
+    ) -> Result<Box<dyn CopyProtocolSource + '_>> {
         Ok(Box::new(MockCopyInProtocol { sink: self }))
     }
 }

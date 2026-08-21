@@ -11,8 +11,8 @@
 //! - `stddev` is an alias of `stddev_samp`.
 
 use crate::aggregate::{
-    AggregateFinalizeFn, AggregateFunction, AggregateFunctionSet, AggregateInputData,
-    AggregateStateInput,
+    AggregateEmptyInput, AggregateFinalizeFn, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateStateInput,
 };
 use paro_common::error::Result;
 use paro_common::types::LogicalType;
@@ -264,7 +264,7 @@ fn build_variance_set(name: &str, finalize: AggregateFinalizeFn) -> AggregateFun
         None,
     ));
 
-    set
+    set.with_empty_input(AggregateEmptyInput::Null)
 }
 
 fn alias_set(mut set: AggregateFunctionSet, alias_name: &str) -> AggregateFunctionSet {

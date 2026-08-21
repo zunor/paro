@@ -28,6 +28,10 @@ pub(crate) fn flatten_dependent_joins_in_plan(
             proj.child = Box::new(flatten_dependent_joins_in_plan(binder, *proj.child)?);
             LogicalOperator::Projection(proj)
         }
+        LogicalOperator::RowFetch(mut fetch) => {
+            fetch.child = Box::new(flatten_dependent_joins_in_plan(binder, *fetch.child)?);
+            LogicalOperator::RowFetch(fetch)
+        }
         LogicalOperator::ExternalProject(mut project) => {
             project.child = Box::new(flatten_dependent_joins_in_plan(binder, *project.child)?);
             LogicalOperator::ExternalProject(project)

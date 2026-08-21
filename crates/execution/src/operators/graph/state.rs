@@ -9,9 +9,11 @@ use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
+use paro_planner::operator::graph_expand::graph_path_element_list_type;
 use paro_storage::index::graph::GraphReadSnapshot;
 use paro_storage::table::table_handle::TableHandle;
-use paro_storage::tablet::TabletReader;
+use paro_storage::table::StorageSnapshot;
+use paro_storage::tablet::{TabletReader, TabletRowIdReader};
 
 use crate::expression_executor::executor::ExpressionExecutor;
 
@@ -67,29 +69,24 @@ pub(crate) fn graph_path_list_value(elements: &[GraphPathElement]) -> Value {
     )
 }
 
-pub(crate) fn graph_path_element_list_type() -> LogicalType {
-    LogicalType::List(Box::new(graph_path_element_type()))
-}
-
 fn graph_path_element_value(element: &GraphPathElement) -> Value {
+    let LogicalType::Struct(fields) = graph_path_element_type() else {
+        unreachable!("graph path element type is a struct")
+    };
     Value::Struct(
         vec![
             Value::UBigInt(element.table_oid),
             Value::UBigInt(element.rowid),
         ],
-        graph_path_element_fields(),
+        fields,
     )
 }
 
 fn graph_path_element_type() -> LogicalType {
-    LogicalType::Struct(graph_path_element_fields())
-}
-
-fn graph_path_element_fields() -> Vec<(String, LogicalType)> {
-    vec![
-        ("table_oid".to_string(), LogicalType::UBigInt),
-        ("rowid".to_string(), LogicalType::UBigInt),
-    ]
+    let LogicalType::List(element) = graph_path_element_list_type() else {
+        unreachable!("graph path payload type is a list")
+    };
+    *element
 }
 
 #[derive(Debug)]
@@ -165,25 +162,27 @@ pub struct GraphShortestPathTransformLocal {
 }
 
 #[derive(Debug)]
-pub struct GraphProjectTableFetchPlan {
+pub struct RowFetchTablePlan {
     pub table_index: usize,
     pub table_name: String,
     pub rowid_col_idx: usize,
     pub storage: Arc<TableHandle>,
-    pub reader: Option<TabletReader>,
+    pub storage_snapshot: Arc<StorageSnapshot>,
+    pub reader: Option<TabletRowIdReader>,
     pub rowids: Vec<u64>,
-    pub column_types: Box<[LogicalType]>,
     pub required_columns: Box<[usize]>,
     pub column_ids: Box<[u32]>,
-    pub full_cols: Vec<Option<Arc<Vector>>>,
 }
 
 #[derive(Debug)]
-pub struct GraphProjectMaterializedRuntime {
-    pub table_fetches: Box<[GraphProjectTableFetchPlan]>,
+pub struct RowFetchMaterializedRuntime {
+    pub table_fetches: Box<[RowFetchTablePlan]>,
     pub path_columns: Box<[usize]>,
     pub filter_executors: Vec<ExpressionExecutor>,
-    pub project_executor: ExpressionExecutor,
+    /// Pure column projections publish the fetched vectors by reference and
+    /// avoid allocating result buffers which would immediately be replaced.
+    pub direct_project_columns: Option<Box<[usize]>>,
+    pub project_executor: Option<ExpressionExecutor>,
 }
 
 #[derive(Debug, Default)]
@@ -191,5 +190,5 @@ pub struct GraphProjectTransformLocal {
     pub filter_selection: Option<SelectionVector>,
     pub raw_filter_executors: Vec<ExpressionExecutor>,
     pub raw_project_executor: Option<ExpressionExecutor>,
-    pub materialized: Option<GraphProjectMaterializedRuntime>,
+    pub materialized: Option<RowFetchMaterializedRuntime>,
 }

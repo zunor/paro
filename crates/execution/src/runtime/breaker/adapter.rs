@@ -9,8 +9,6 @@ use std::sync::Arc;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 
-use crate::physical::properties::RequiredProperties;
-
 use super::{FoundBits, HandleRef, MaterializedHandle, MaterializedReader};
 use crate::runtime::context::{OperatorCallContext, OperatorFinishContext, PipelineInitContext};
 use crate::runtime::sink::{FinishPoll, FinishWork, MergePoll, PrepareFinishPoll, SinkPoll};
@@ -119,7 +117,6 @@ impl MaterializedSourceExec {
 #[derive(Debug, Clone)]
 pub struct MaterializeSinkExec {
     pub handle: HandleRef<MaterializedHandle>,
-    pub required: RequiredProperties,
 }
 
 #[derive(Debug)]

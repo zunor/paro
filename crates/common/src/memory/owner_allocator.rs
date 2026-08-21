@@ -10,8 +10,12 @@ use crate::error::Result;
 
 use super::{MemoryAccountingClass, MemoryDomain, MemoryOwner};
 
-/// `Allocator` facade that hard-gates vector/chunk allocations through a
-/// `MemoryOwner` before touching the physical allocator.
+/// `Allocator` facade that accounts vector/chunk allocations to a `MemoryOwner`.
+///
+/// Working-set classes acquire capacity before touching the physical allocator.
+/// [`MemoryAccountingClass::Spill`] remains observational: spill/reclaim
+/// workspace must still be allocatable after the working-set grant is exhausted,
+/// while its physical bytes remain visible to accounting and diagnostics.
 #[derive(Clone)]
 pub struct MemoryOwnerAllocator {
     inner: Arc<dyn Allocator>,
@@ -57,6 +61,11 @@ impl MemoryOwnerAllocator {
     pub fn accounting_class(&self) -> MemoryAccountingClass {
         self.class
     }
+
+    #[inline]
+    fn capacity_accounted(&self) -> bool {
+        self.class != MemoryAccountingClass::Spill
+    }
 }
 
 impl Allocator for MemoryOwnerAllocator {
@@ -65,7 +74,9 @@ impl Allocator for MemoryOwnerAllocator {
             return Ok(std::ptr::null_mut());
         }
 
-        self.owner.acquire_capacity(self.domain, size)?;
+        if self.capacity_accounted() {
+            self.owner.acquire_capacity(self.domain, size)?;
+        }
         match self.inner.allocate(size) {
             Ok(ptr) => {
                 self.owner
@@ -73,7 +84,9 @@ impl Allocator for MemoryOwnerAllocator {
                 Ok(ptr)
             }
             Err(error) => {
-                self.owner.release_capacity(self.domain, size);
+                if self.capacity_accounted() {
+                    self.owner.release_capacity(self.domain, size);
+                }
                 Err(error)
             }
         }
@@ -84,7 +97,9 @@ impl Allocator for MemoryOwnerAllocator {
             return Ok(std::ptr::null_mut());
         }
 
-        self.owner.acquire_capacity(self.domain, size)?;
+        if self.capacity_accounted() {
+            self.owner.acquire_capacity(self.domain, size)?;
+        }
         match self.inner.allocate_zeroed(size) {
             Ok(ptr) => {
                 self.owner
@@ -92,7 +107,9 @@ impl Allocator for MemoryOwnerAllocator {
                 Ok(ptr)
             }
             Err(error) => {
-                self.owner.release_capacity(self.domain, size);
+                if self.capacity_accounted() {
+                    self.owner.release_capacity(self.domain, size);
+                }
                 Err(error)
             }
         }
@@ -105,7 +122,9 @@ impl Allocator for MemoryOwnerAllocator {
         self.inner.free(ptr, size);
         self.owner
             .release_allocation(self.domain, self.tag, self.class, size);
-        self.owner.release_capacity(self.domain, size);
+        if self.capacity_accounted() {
+            self.owner.release_capacity(self.domain, size);
+        }
     }
 
     fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> Result<*mut u8> {
@@ -121,7 +140,7 @@ impl Allocator for MemoryOwnerAllocator {
         }
 
         let grow_delta = new_size.saturating_sub(old_size);
-        if grow_delta > 0 {
+        if grow_delta > 0 && self.capacity_accounted() {
             self.owner.acquire_capacity(self.domain, grow_delta)?;
         }
 
@@ -134,12 +153,14 @@ impl Allocator for MemoryOwnerAllocator {
                     let shrink_delta = old_size - new_size;
                     self.owner
                         .release_allocation(self.domain, self.tag, self.class, shrink_delta);
-                    self.owner.release_capacity(self.domain, shrink_delta);
+                    if self.capacity_accounted() {
+                        self.owner.release_capacity(self.domain, shrink_delta);
+                    }
                 }
                 Ok(new_ptr)
             }
             Err(error) => {
-                if grow_delta > 0 {
+                if grow_delta > 0 && self.capacity_accounted() {
                     self.owner.release_capacity(self.domain, grow_delta);
                 }
                 Err(error)

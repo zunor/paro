@@ -1,0 +1,1073 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Allocation-free row verification for binary-comparable varlen predicates.
+
+use std::cell::RefCell;
+use std::ops::Range;
+
+use bytes::Bytes;
+use paro_common::error::{self as paro_error, Result};
+use paro_common::string_pattern::{PreparedLikePattern, PreparedLikeSearchAnchor};
+
+use crate::index::{FixedMembershipBuildPolicy, FixedMembershipSet};
+use crate::rowset::BatchRowOrdinal;
+
+use super::predicate_column::PredicateColumnBatch;
+use super::segment_predicate::ComparisonOperator;
+
+#[derive(Debug)]
+struct VarlenBound {
+    value: Box<[u8]>,
+    inclusive: bool,
+}
+
+#[derive(Debug)]
+struct DictionaryPredicateCache {
+    dictionary: Bytes,
+    matches: Box<[bool]>,
+}
+
+/// Normalized union of binary string prefixes.
+///
+/// Short equal-width domains use the fixed-width dense/sorted membership
+/// representation; long equal-width domains use a binary search over borrowed
+/// leading bytes. Mixed-width domains retain general `starts_with` semantics.
+/// Redundant prefixes are removed once during compilation.
+#[derive(Debug)]
+pub(super) struct VarlenMatcher {
+    strategy: VarlenMatchStrategy,
+    dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
+}
+
+#[derive(Debug)]
+enum VarlenMatchStrategy {
+    PrefixMembership(PrefixMembership),
+    Like {
+        pattern: PreparedLikePattern,
+        negated: bool,
+    },
+}
+
+#[derive(Debug)]
+struct PrefixMembership {
+    prefixes: Vec<Box<[u8]>>,
+    uniform_width: Option<usize>,
+    packed: Option<PackedPrefixMembership>,
+}
+
+#[derive(Debug)]
+enum PackedPrefixMembership {
+    I32(FixedMembershipSet<i32>),
+    I64(FixedMembershipSet<i64>),
+    I128(FixedMembershipSet<i128>),
+}
+
+impl PackedPrefixMembership {
+    fn new(width: usize, prefixes: &[Box<[u8]>]) -> Self {
+        let policy = FixedMembershipBuildPolicy::new(1 << 16, 256);
+        match width {
+            1..=4 => Self::I32(FixedMembershipSet::from_values_with_policy(
+                prefixes
+                    .iter()
+                    .map(|prefix| pack_prefix(prefix) as i32)
+                    .collect(),
+                policy,
+            )),
+            5..=7 => Self::I64(FixedMembershipSet::from_values_with_policy(
+                prefixes
+                    .iter()
+                    .map(|prefix| pack_prefix(prefix) as i64)
+                    .collect(),
+                policy,
+            )),
+            8 => Self::I128(FixedMembershipSet::from_values_with_policy(
+                prefixes.iter().map(|prefix| pack_prefix(prefix)).collect(),
+                policy,
+            )),
+            _ => unreachable!("packed prefix width is bounded by construction"),
+        }
+    }
+
+    #[inline]
+    fn contains(&self, prefix: &[u8]) -> bool {
+        let packed = pack_prefix(prefix);
+        match self {
+            Self::I32(values) => values.contains(packed as i32),
+            Self::I64(values) => values.contains(packed as i64),
+            Self::I128(values) => values.contains(packed),
+        }
+    }
+}
+
+impl VarlenMatcher {
+    pub(super) fn prefix_membership(prefixes: impl IntoIterator<Item = Box<[u8]>>) -> Self {
+        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
+        prefixes.sort_unstable();
+        prefixes.dedup();
+        let mut normalized = Vec::<Box<[u8]>>::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            if !normalized
+                .iter()
+                .any(|existing| prefix.starts_with(existing.as_ref()))
+            {
+                normalized.push(prefix);
+            }
+        }
+        let uniform_width = normalized
+            .first()
+            .map(|prefix| prefix.len())
+            .filter(|width| normalized.iter().all(|prefix| prefix.len() == *width));
+        let packed = uniform_width
+            .filter(|width| (1..=8).contains(width))
+            .map(|width| PackedPrefixMembership::new(width, &normalized));
+        Self {
+            strategy: VarlenMatchStrategy::PrefixMembership(PrefixMembership {
+                prefixes: normalized,
+                uniform_width,
+                packed,
+            }),
+            dictionary_cache: RefCell::new(None),
+        }
+    }
+
+    pub(super) fn like(pattern: &str, negated: bool) -> Option<Self> {
+        Some(Self {
+            strategy: VarlenMatchStrategy::Like {
+                pattern: PreparedLikePattern::try_new(pattern, false)?,
+                negated,
+            },
+            dictionary_cache: RefCell::new(None),
+        })
+    }
+
+    #[inline]
+    pub(super) fn matches(&self, value: &[u8]) -> bool {
+        match &self.strategy {
+            VarlenMatchStrategy::PrefixMembership(membership) => membership.matches(value),
+            VarlenMatchStrategy::Like { pattern, negated } => {
+                pattern.matches_bytes(value) != *negated
+            }
+        }
+    }
+
+    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
+        match &self.strategy {
+            VarlenMatchStrategy::PrefixMembership(membership) => (2, membership.prefixes.len()),
+            VarlenMatchStrategy::Like { .. } => (4, 1),
+        }
+    }
+
+    pub(super) fn filter_batch(
+        &self,
+        batch: &PredicateColumnBatch,
+        rows: usize,
+        selection: &mut Vec<BatchRowOrdinal>,
+        seed: bool,
+    ) -> Result<()> {
+        if let Some(batch) = batch.storage_dictionary() {
+            let mut cache = self.dictionary_cache.borrow_mut();
+            let dictionary = batch.encoded_dictionary();
+            let cache_matches = cache.as_ref().is_some_and(|cache| {
+                cache.dictionary.len() == dictionary.len()
+                    && cache.dictionary.as_ptr() == dictionary.as_ptr()
+            });
+            if !cache_matches {
+                let matches = (0..batch.dictionary_len())
+                    .map(|code| self.matches(batch.dictionary_value(code)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                *cache = Some(DictionaryPredicateCache {
+                    dictionary: dictionary.clone(),
+                    matches,
+                });
+            }
+            batch.filter_codes(
+                &cache
+                    .as_ref()
+                    .expect("dictionary cache initialized")
+                    .matches,
+                selection,
+                seed,
+            );
+            return Ok(());
+        }
+        if let VarlenMatchStrategy::Like { pattern, negated } = &self.strategy {
+            if let Some(batch) = batch.raw_varlen() {
+                if filter_raw_like_with_anchor(batch, rows, selection, seed, pattern, *negated) {
+                    return Ok(());
+                }
+            }
+        }
+        filter_varlen_batch(batch, rows, selection, seed, |value| self.matches(value))
+    }
+}
+
+impl PrefixMembership {
+    #[inline]
+    fn matches(&self, value: &[u8]) -> bool {
+        if let (Some(width), Some(packed)) = (self.uniform_width, &self.packed) {
+            let Some(prefix) = value.get(..width) else {
+                return false;
+            };
+            return packed.contains(prefix);
+        }
+        if let Some(width) = self.uniform_width {
+            let Some(value_prefix) = value.get(..width) else {
+                return false;
+            };
+            return self
+                .prefixes
+                .binary_search_by(|prefix| prefix.as_ref().cmp(value_prefix))
+                .is_ok();
+        }
+        self.prefixes
+            .iter()
+            .any(|prefix| value.starts_with(prefix.as_ref()))
+    }
+}
+
+#[inline]
+fn pack_prefix(prefix: &[u8]) -> i128 {
+    prefix.iter().fold(0_i128, |packed, byte| {
+        (packed << u8::BITS) | i128::from(*byte)
+    })
+}
+
+/// Normalized conjunction over one binary-comparable varlen column.
+///
+/// Bounds and membership values are owned once at predicate compilation. Batch
+/// evaluation compares borrowed vector bytes directly, so it never constructs
+/// a row-level `Value` or `String`.
+#[derive(Debug)]
+pub(super) struct VarlenConjunction {
+    equality: Option<Box<[u8]>>,
+    lower: Option<VarlenBound>,
+    upper: Option<VarlenBound>,
+    inclusions: Option<Vec<Box<[u8]>>>,
+    exclusions: Vec<Box<[u8]>>,
+    required_prefix: Option<Box<[u8]>>,
+    excluded_prefixes: Vec<Box<[u8]>>,
+    contradiction: bool,
+    dictionary_cache: RefCell<Option<DictionaryPredicateCache>>,
+}
+
+impl VarlenConjunction {
+    pub(super) fn new(operator: ComparisonOperator, rhs: &[u8]) -> Self {
+        let mut conjunction = Self::empty();
+        conjunction.add(operator, rhs.into());
+        conjunction
+    }
+
+    pub(super) fn from_in(values: impl IntoIterator<Item = Box<[u8]>>) -> Self {
+        let mut values = values.into_iter().collect::<Vec<_>>();
+        values.sort_unstable();
+        values.dedup();
+        let contradiction = values.is_empty();
+        Self {
+            inclusions: Some(values),
+            contradiction,
+            ..Self::empty()
+        }
+    }
+
+    pub(super) fn from_range(lower: &[u8], upper: &[u8]) -> Self {
+        let mut conjunction = Self::new(ComparisonOperator::GreaterThanOrEqual, lower);
+        conjunction.add(ComparisonOperator::LessThanOrEqual, upper.into());
+        conjunction
+    }
+
+    pub(super) fn from_prefix(prefix: &[u8], negated: bool) -> Self {
+        let mut conjunction = Self::empty();
+        conjunction.add_prefix(prefix.into(), negated);
+        conjunction
+    }
+
+    fn empty() -> Self {
+        Self {
+            equality: None,
+            lower: None,
+            upper: None,
+            inclusions: None,
+            exclusions: Vec::new(),
+            required_prefix: None,
+            excluded_prefixes: Vec::new(),
+            contradiction: false,
+            dictionary_cache: RefCell::new(None),
+        }
+    }
+
+    fn add_prefix(&mut self, prefix: Box<[u8]>, negated: bool) {
+        self.dictionary_cache.get_mut().take();
+        if negated {
+            if prefix.is_empty() {
+                self.contradiction = true;
+            } else if !self
+                .excluded_prefixes
+                .iter()
+                .any(|existing| prefix.starts_with(existing))
+            {
+                self.excluded_prefixes
+                    .retain(|existing| !existing.starts_with(&prefix));
+                self.excluded_prefixes.push(prefix);
+            }
+        } else {
+            match self.required_prefix.as_deref() {
+                Some(existing) if existing.starts_with(&prefix) => {}
+                Some(existing) if prefix.starts_with(existing) => {
+                    self.required_prefix = Some(prefix)
+                }
+                Some(_) => self.contradiction = true,
+                None => self.required_prefix = Some(prefix),
+            }
+        }
+        self.validate();
+    }
+
+    fn add(&mut self, operator: ComparisonOperator, rhs: Box<[u8]>) {
+        self.dictionary_cache.get_mut().take();
+        match operator {
+            ComparisonOperator::Equal => match self.equality.as_deref() {
+                Some(existing) if existing != rhs.as_ref() => self.contradiction = true,
+                Some(_) => {}
+                None => self.equality = Some(rhs),
+            },
+            ComparisonOperator::NotEqual => {
+                if !self
+                    .exclusions
+                    .iter()
+                    .any(|value| value.as_ref() == rhs.as_ref())
+                {
+                    self.exclusions.push(rhs);
+                }
+            }
+            ComparisonOperator::LessThan | ComparisonOperator::LessThanOrEqual => {
+                Self::tighten_upper(
+                    &mut self.upper,
+                    VarlenBound {
+                        value: rhs,
+                        inclusive: matches!(operator, ComparisonOperator::LessThanOrEqual),
+                    },
+                );
+            }
+            ComparisonOperator::GreaterThan | ComparisonOperator::GreaterThanOrEqual => {
+                Self::tighten_lower(
+                    &mut self.lower,
+                    VarlenBound {
+                        value: rhs,
+                        inclusive: matches!(operator, ComparisonOperator::GreaterThanOrEqual),
+                    },
+                );
+            }
+        }
+        self.validate();
+    }
+
+    pub(super) fn merge(&mut self, mut incoming: Self) {
+        self.dictionary_cache.get_mut().take();
+        if incoming.contradiction {
+            self.contradiction = true;
+        }
+        if let Some(value) = incoming.equality.take() {
+            self.add(ComparisonOperator::Equal, value);
+        }
+        if let Some(bound) = incoming.lower.take() {
+            self.add(
+                if bound.inclusive {
+                    ComparisonOperator::GreaterThanOrEqual
+                } else {
+                    ComparisonOperator::GreaterThan
+                },
+                bound.value,
+            );
+        }
+        if let Some(bound) = incoming.upper.take() {
+            self.add(
+                if bound.inclusive {
+                    ComparisonOperator::LessThanOrEqual
+                } else {
+                    ComparisonOperator::LessThan
+                },
+                bound.value,
+            );
+        }
+        if let Some(incoming_values) = incoming.inclusions.take() {
+            if let Some(values) = &mut self.inclusions {
+                values.retain(|value| incoming_values.binary_search(value).is_ok());
+            } else {
+                self.inclusions = Some(incoming_values);
+            }
+        }
+        for value in incoming.exclusions.drain(..) {
+            self.add(ComparisonOperator::NotEqual, value);
+        }
+        if let Some(prefix) = incoming.required_prefix.take() {
+            self.add_prefix(prefix, false);
+        }
+        for prefix in incoming.excluded_prefixes.drain(..) {
+            self.add_prefix(prefix, true);
+        }
+        self.validate();
+    }
+
+    fn tighten_lower(current: &mut Option<VarlenBound>, incoming: VarlenBound) {
+        if current.as_ref().is_none_or(|existing| {
+            incoming.value > existing.value
+                || (incoming.value == existing.value && !incoming.inclusive && existing.inclusive)
+        }) {
+            *current = Some(incoming);
+        }
+    }
+
+    fn tighten_upper(current: &mut Option<VarlenBound>, incoming: VarlenBound) {
+        if current.as_ref().is_none_or(|existing| {
+            incoming.value < existing.value
+                || (incoming.value == existing.value && !incoming.inclusive && existing.inclusive)
+        }) {
+            *current = Some(incoming);
+        }
+    }
+
+    fn validate(&mut self) {
+        if let (Some(lower), Some(upper)) = (&self.lower, &self.upper) {
+            self.contradiction |= lower.value > upper.value
+                || (lower.value == upper.value && (!lower.inclusive || !upper.inclusive));
+        }
+        if let Some(value) = self.equality.as_deref() {
+            self.contradiction |= self
+                .exclusions
+                .iter()
+                .any(|excluded| excluded.as_ref() == value)
+                || self.inclusions.as_ref().is_some_and(|values| {
+                    values
+                        .binary_search_by(|item| item.as_ref().cmp(value))
+                        .is_err()
+                })
+                || self.lower.as_ref().is_some_and(|bound| {
+                    value < bound.value.as_ref()
+                        || (value == bound.value.as_ref() && !bound.inclusive)
+                })
+                || self.upper.as_ref().is_some_and(|bound| {
+                    value > bound.value.as_ref()
+                        || (value == bound.value.as_ref() && !bound.inclusive)
+                })
+                || self
+                    .required_prefix
+                    .as_deref()
+                    .is_some_and(|prefix| !value.starts_with(prefix))
+                || self
+                    .excluded_prefixes
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix));
+        }
+        self.contradiction |= self.required_prefix.as_deref().is_some_and(|required| {
+            self.excluded_prefixes
+                .iter()
+                .any(|excluded| required.starts_with(excluded.as_ref()))
+        });
+        if let Some(values) = &mut self.inclusions {
+            let equality = self.equality.as_deref();
+            let lower = self.lower.as_ref();
+            let upper = self.upper.as_ref();
+            let exclusions = &self.exclusions;
+            let required_prefix = self.required_prefix.as_deref();
+            let excluded_prefixes = &self.excluded_prefixes;
+            values.retain(|value| {
+                let value = value.as_ref();
+                equality.is_none_or(|expected| value == expected)
+                    && lower.is_none_or(|bound| {
+                        value > bound.value.as_ref()
+                            || (bound.inclusive && value == bound.value.as_ref())
+                    })
+                    && upper.is_none_or(|bound| {
+                        value < bound.value.as_ref()
+                            || (bound.inclusive && value == bound.value.as_ref())
+                    })
+                    && !exclusions.iter().any(|excluded| excluded.as_ref() == value)
+                    && required_prefix.is_none_or(|prefix| value.starts_with(prefix))
+                    && !excluded_prefixes
+                        .iter()
+                        .any(|prefix| value.starts_with(prefix.as_ref()))
+            });
+            self.contradiction |= values.is_empty();
+        }
+    }
+
+    #[inline]
+    pub(super) fn matches(&self, value: &[u8]) -> bool {
+        if self.contradiction {
+            return false;
+        }
+        // Validation folds every other constraint into exact equality and IN
+        // domains, so these canonical forms need only one comparison here.
+        if let Some(expected) = self.equality.as_deref() {
+            return value == expected;
+        }
+        if let Some(values) = &self.inclusions {
+            return values
+                .binary_search_by(|candidate| candidate.as_ref().cmp(value))
+                .is_ok();
+        }
+        self.lower.as_ref().is_none_or(|bound| {
+            value > bound.value.as_ref() || (bound.inclusive && value == bound.value.as_ref())
+        }) && self.upper.as_ref().is_none_or(|bound| {
+            value < bound.value.as_ref() || (bound.inclusive && value == bound.value.as_ref())
+        }) && !self
+            .exclusions
+            .iter()
+            .any(|excluded| excluded.as_ref() == value)
+            && self
+                .required_prefix
+                .as_deref()
+                .is_none_or(|prefix| value.starts_with(prefix))
+            && !self
+                .excluded_prefixes
+                .iter()
+                .any(|prefix| value.starts_with(prefix.as_ref()))
+    }
+
+    /// Static fallback ordering used when the storage layer has no histogram
+    /// estimate for this predicate.
+    pub(super) fn evaluation_priority(&self) -> (u8, usize) {
+        if self.contradiction {
+            return (0, 0);
+        }
+        if self.equality.is_some() {
+            return (1, 1);
+        }
+        if let Some(values) = &self.inclusions {
+            return (2, values.len());
+        }
+        if self.required_prefix.is_some() || (self.lower.is_some() && self.upper.is_some()) {
+            return (3, 0);
+        }
+        if self.lower.is_some() || self.upper.is_some() {
+            return (4, 0);
+        }
+        if !self.exclusions.is_empty() || !self.excluded_prefixes.is_empty() {
+            return (6, self.exclusions.len() + self.excluded_prefixes.len());
+        }
+        (7, 0)
+    }
+
+    pub(super) fn filter_batch(
+        &self,
+        batch: &PredicateColumnBatch,
+        rows: usize,
+        selection: &mut Vec<BatchRowOrdinal>,
+        seed: bool,
+    ) -> Result<()> {
+        if let Some(batch) = batch.storage_dictionary() {
+            let mut cache = self.dictionary_cache.borrow_mut();
+            let dictionary = batch.encoded_dictionary();
+            let cache_matches = cache.as_ref().is_some_and(|cache| {
+                cache.dictionary.len() == dictionary.len()
+                    && cache.dictionary.as_ptr() == dictionary.as_ptr()
+            });
+            if !cache_matches {
+                let matches = (0..batch.dictionary_len())
+                    .map(|code| self.matches(batch.dictionary_value(code)))
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice();
+                *cache = Some(DictionaryPredicateCache {
+                    dictionary: dictionary.clone(),
+                    matches,
+                });
+            }
+            batch.filter_codes(
+                &cache
+                    .as_ref()
+                    .expect("dictionary cache initialized")
+                    .matches,
+                selection,
+                seed,
+            );
+            return Ok(());
+        }
+        if self.contradiction {
+            selection.clear();
+            return Ok(());
+        }
+        if let Some(expected) = self.equality.as_deref() {
+            return filter_varlen_batch(batch, rows, selection, seed, |value| value == expected);
+        }
+        if let Some(values) = &self.inclusions {
+            return filter_varlen_batch(batch, rows, selection, seed, |value| {
+                values
+                    .binary_search_by(|candidate| candidate.as_ref().cmp(value))
+                    .is_ok()
+            });
+        }
+        if self.lower.is_none()
+            && self.upper.is_none()
+            && self.required_prefix.is_none()
+            && self.excluded_prefixes.is_empty()
+        {
+            return filter_varlen_batch(batch, rows, selection, seed, |value| {
+                !self
+                    .exclusions
+                    .iter()
+                    .any(|excluded| excluded.as_ref() == value)
+            });
+        }
+        if self.lower.is_none()
+            && self.upper.is_none()
+            && self.exclusions.is_empty()
+            && self.required_prefix.is_none()
+        {
+            return filter_varlen_batch(batch, rows, selection, seed, |value| {
+                !self
+                    .excluded_prefixes
+                    .iter()
+                    .any(|prefix| value.starts_with(prefix.as_ref()))
+            });
+        }
+        filter_varlen_batch(batch, rows, selection, seed, |value| self.matches(value))
+    }
+}
+
+fn filter_varlen_batch(
+    batch: &PredicateColumnBatch,
+    rows: usize,
+    selection: &mut Vec<BatchRowOrdinal>,
+    seed: bool,
+    matches: impl Fn(&[u8]) -> bool,
+) -> Result<()> {
+    if let Some(batch) = batch.raw_varlen() {
+        let row_matches = |row_idx: usize| batch.row_value(row_idx).is_some_and(&matches);
+        if seed {
+            selection.extend(
+                (0..rows)
+                    .filter(|row_idx| row_matches(*row_idx))
+                    .map(BatchRowOrdinal::from_validated_index),
+            );
+        } else {
+            selection.retain(|row_idx| row_matches(row_idx.index()));
+        }
+        return Ok(());
+    }
+    let vector = batch
+        .decoded()
+        .ok_or_else(|| paro_error::internal("varlen predicate received a fixed-width batch"))?;
+    let view = vector.try_to_varlen_view(rows)?;
+    let row_matches = |row_idx: usize| view.is_valid(row_idx) && matches(view.bytes(row_idx));
+    if seed {
+        selection.extend(
+            (0..rows)
+                .filter(|row_idx| row_matches(*row_idx))
+                .map(BatchRowOrdinal::from_validated_index),
+        );
+    } else {
+        selection.retain(|row_idx| row_matches(row_idx.index()));
+    }
+    Ok(())
+}
+
+/// Search a contiguous BinaryPlain payload once, then verify only rows that
+/// contain the compiled necessary literal. A hit spanning two adjacent values
+/// is deliberately discarded before the complete LIKE matcher runs.
+fn filter_raw_like_with_anchor(
+    batch: &super::predicate_column::RawVarlenPredicateBatch,
+    rows: usize,
+    selection: &mut Vec<BatchRowOrdinal>,
+    seed: bool,
+    pattern: &PreparedLikePattern,
+    negated: bool,
+) -> bool {
+    if rows == 0 || (!seed && selection.is_empty()) {
+        return true;
+    }
+    let Some(anchor) = pattern.search_anchor() else {
+        return false;
+    };
+    let Some(payload) = batch.contiguous_payload() else {
+        return false;
+    };
+    let Some(scan_range) = anchor_scan_range(batch, payload.len(), rows, selection, seed) else {
+        return false;
+    };
+    let literal_len = anchor.literal().len();
+    if literal_len == 0 {
+        return false;
+    }
+
+    if seed {
+        let Some(row_ranges) = batch.contiguous_row_ranges() else {
+            return false;
+        };
+        debug_assert_eq!(row_ranges.len(), rows);
+        let mut next_hit = anchor_hit_from(anchor, payload, scan_range.start, scan_range.end);
+        selection.reserve(rows);
+        for (row_idx, row_range) in row_ranges.enumerate() {
+            let is_null = batch.is_null(row_idx);
+            let like_matches = !is_null
+                && row_range.len() >= literal_len
+                && page_anchor_row_matches(
+                    anchor,
+                    payload,
+                    scan_range.end,
+                    literal_len,
+                    row_range,
+                    pattern,
+                    &mut next_hit,
+                );
+            if !is_null && like_matches != negated {
+                selection.push(BatchRowOrdinal::from_validated_index(row_idx));
+            }
+        }
+        return true;
+    }
+
+    let mut next_hit = anchor_hit_from(anchor, payload, scan_range.start, scan_range.end);
+    let mut row_matches = |row_idx: usize| {
+        let Some(value) = batch.stored_row_value(row_idx) else {
+            return false;
+        };
+        let Some(row_range) = batch.contiguous_row_range(row_idx) else {
+            return false;
+        };
+        if row_range.end > payload.len() || row_range.len() != value.len() {
+            return false;
+        }
+        if batch.is_null(row_idx) {
+            return false;
+        }
+        if row_range.len() < literal_len {
+            // A necessary literal cannot fit in this value. Preserve the
+            // existing page cursor; the next sufficiently wide row will jump
+            // straight to its own boundary.
+            return negated;
+        }
+
+        let like_matches = page_anchor_row_matches(
+            anchor,
+            payload,
+            scan_range.end,
+            literal_len,
+            row_range,
+            pattern,
+            &mut next_hit,
+        );
+        like_matches != negated
+    };
+
+    selection.retain(|row_idx| row_matches(row_idx.index()));
+    true
+}
+
+#[inline]
+fn page_anchor_row_matches(
+    anchor: PreparedLikeSearchAnchor<'_>,
+    payload: &[u8],
+    scan_end: usize,
+    literal_len: usize,
+    row_range: Range<usize>,
+    pattern: &PreparedLikePattern,
+    next_hit: &mut Option<usize>,
+) -> bool {
+    if next_hit.is_some_and(|hit| hit < row_range.start) {
+        // All earlier hits belong to already processed rows or an unselected
+        // gap. Jump directly to this row rather than enumerating overlapping
+        // matches one byte at a time.
+        *next_hit = anchor_hit_from(anchor, payload, row_range.start, scan_end);
+    }
+    let mut candidate = false;
+    if let Some(hit) = *next_hit {
+        if hit < row_range.end {
+            if hit
+                .checked_add(literal_len)
+                .is_some_and(|hit_end| hit_end <= row_range.end)
+            {
+                candidate = true;
+            } else {
+                // A page-level hit crosses this value boundary. Resume at the
+                // next row so an overlapping match beginning there is visible.
+                *next_hit = anchor_hit_from(anchor, payload, row_range.end, scan_end);
+            }
+        }
+    }
+    candidate && pattern.matches_bytes(&payload[row_range])
+}
+
+/// Restrict a retained-selection scan to the selected row span and avoid
+/// reading a large unselected gap merely to save a few matcher invocations.
+fn anchor_scan_range(
+    batch: &super::predicate_column::RawVarlenPredicateBatch,
+    payload_len: usize,
+    rows: usize,
+    selection: &[BatchRowOrdinal],
+    seed: bool,
+) -> Option<Range<usize>> {
+    const MAX_SCAN_AMPLIFICATION: usize = 4;
+    if seed {
+        return Some(0..payload_len);
+    }
+    if !selection.windows(2).all(|rows| rows[0] < rows[1]) {
+        return None;
+    }
+    let first = batch.contiguous_row_range(selection.first()?.index())?;
+    let last = batch.contiguous_row_range(selection.last()?.index())?;
+    if selection.last()?.index() >= rows || first.start > last.end || last.end > payload_len {
+        return None;
+    }
+    let selected_bytes = selection.iter().try_fold(0usize, |bytes, &row_idx| {
+        let row_idx = row_idx.index();
+        if row_idx >= rows {
+            return None;
+        }
+        bytes.checked_add(batch.contiguous_row_range(row_idx)?.len())
+    })?;
+    let span = first.start..last.end;
+    (span.len() <= selected_bytes.saturating_mul(MAX_SCAN_AMPLIFICATION)).then_some(span)
+}
+
+#[inline]
+fn anchor_hit_from(
+    anchor: PreparedLikeSearchAnchor<'_>,
+    payload: &[u8],
+    start: usize,
+    limit: usize,
+) -> Option<usize> {
+    payload
+        .get(start..limit)
+        .and_then(|suffix| anchor.find_in(suffix))
+        .and_then(|relative| start.checked_add(relative))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rowset::column::ColumnBatch;
+    use crate::rowset::encoding::{BinaryPlainPageBuilder, BinaryPlainPageDecoder};
+    use paro_common::allocator::{default_allocator, Allocator};
+    use paro_common::types::LogicalType;
+    use std::sync::Arc;
+
+    fn binary_plain_batch(values: &[&str], nulls: Option<&'static [u8]>) -> PredicateColumnBatch {
+        let mut builder = BinaryPlainPageBuilder::new(1024);
+        for value in values {
+            assert!(builder.add_slice(value.as_bytes()));
+        }
+        let mut decoder = BinaryPlainPageDecoder::new(builder.finish().unwrap());
+        decoder.init().unwrap();
+        let encoded = decoder.next_encoded_batch(values.len()).unwrap();
+        let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        PredicateColumnBatch::prepare(
+            &LogicalType::Varchar,
+            super::super::predicate_column::PredicateColumnAccess::Typed { raw_width: None },
+            ColumnBatch::with_storage_binary_plain(encoded, nulls.map(bytes::Bytes::from_static)),
+            values.len(),
+            allocator,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn conjunction_normalizes_bounds_membership_and_exclusions() {
+        let mut values = VarlenConjunction::from_in(
+            [
+                b"a".as_slice(),
+                b"b".as_slice(),
+                b"c".as_slice(),
+                b"d".as_slice(),
+            ]
+            .into_iter()
+            .map(Box::<[u8]>::from),
+        );
+        values.merge(VarlenConjunction::new(
+            ComparisonOperator::GreaterThan,
+            b"a",
+        ));
+        values.merge(VarlenConjunction::new(ComparisonOperator::NotEqual, b"c"));
+
+        assert!(!values.matches(b"a"));
+        assert!(values.matches(b"b"));
+        assert!(!values.matches(b"c"));
+        assert!(values.matches(b"d"));
+    }
+
+    #[test]
+    fn conjunction_normalizes_required_and_excluded_prefixes() {
+        let mut values = VarlenConjunction::from_prefix(b"MEDIUM", false);
+        values.merge(VarlenConjunction::from_prefix(b"MEDIUM POLISHED", true));
+
+        assert!(values.matches(b"MEDIUM BRUSHED"));
+        assert!(!values.matches(b"MEDIUM POLISHED COPPER"));
+        assert!(!values.matches(b"LARGE BRUSHED"));
+
+        values.merge(VarlenConjunction::from_prefix(b"MEDIUM POLISHED", false));
+        assert!(!values.matches(b"MEDIUM POLISHED COPPER"));
+    }
+
+    #[test]
+    fn short_uniform_prefixes_compile_to_fixed_membership() {
+        let prefixes = VarlenMatcher::prefix_membership(
+            [b"13".as_slice(), b"31".as_slice(), b"18".as_slice()]
+                .into_iter()
+                .map(Box::<[u8]>::from),
+        );
+
+        assert!(matches!(
+            &prefixes.strategy,
+            VarlenMatchStrategy::PrefixMembership(PrefixMembership {
+                packed: Some(PackedPrefixMembership::I32(_)),
+                ..
+            })
+        ));
+        assert!(prefixes.matches(b"13-555-1234"));
+        assert!(prefixes.matches(b"31"));
+        assert!(!prefixes.matches(b"3"));
+        assert!(!prefixes.matches(b"99-555-1234"));
+    }
+
+    #[test]
+    fn compiled_like_supports_suffix_contains_order_and_negation() {
+        let suffix = VarlenMatcher::like("%BRASS", false).unwrap();
+        let contains = VarlenMatcher::like("%green%", false).unwrap();
+        let excluded = VarlenMatcher::like("%special%requests%", true).unwrap();
+
+        assert!(suffix.matches(b"ECONOMY ANODIZED BRASS"));
+        assert!(contains.matches(b"forest green part"));
+        assert!(!excluded.matches(b"special pending requests"));
+        assert!(excluded.matches(b"requests before special"));
+        assert!(VarlenMatcher::like("A_B", false).is_none());
+    }
+
+    #[test]
+    fn page_anchor_filters_candidates_without_crossing_row_boundaries() {
+        let batch = binary_plain_batch(
+            &[
+                "special pending requests",
+                "spec",
+                "ial requests",
+                "ordinary request",
+                "requests before special",
+            ],
+            None,
+        );
+        let matcher = VarlenMatcher::like("%special%requests%", false).unwrap();
+        let mut selection = Vec::new();
+
+        matcher
+            .filter_batch(&batch, 5, &mut selection, true)
+            .unwrap();
+
+        assert_eq!(selection, [0]);
+    }
+
+    #[test]
+    fn page_anchor_preserves_match_overlapping_a_previous_row_hit() {
+        let batch = binary_plain_batch(&["aa", "aaa"], None);
+        let matcher = VarlenMatcher::like("%aaa%", false).unwrap();
+        let mut selection = Vec::new();
+
+        matcher
+            .filter_batch(&batch, 2, &mut selection, true)
+            .unwrap();
+
+        assert_eq!(selection, [1]);
+    }
+
+    #[test]
+    fn page_anchor_skips_rows_shorter_than_its_necessary_literal() {
+        let batch = binary_plain_batch(&["a", "a", "aaaa", "a"], None);
+        let positive = VarlenMatcher::like("%aaaa%", false).unwrap();
+        let negative = VarlenMatcher::like("%aaaa%", true).unwrap();
+        let mut matches = Vec::new();
+        let mut non_matches = Vec::new();
+
+        positive
+            .filter_batch(&batch, 4, &mut matches, true)
+            .unwrap();
+        negative
+            .filter_batch(&batch, 4, &mut non_matches, true)
+            .unwrap();
+
+        assert_eq!(matches, [2]);
+        assert_eq!(non_matches, [0, 1, 3]);
+    }
+
+    #[test]
+    fn negated_page_anchor_keeps_non_candidates_and_rejects_nulls() {
+        let batch = binary_plain_batch(
+            &[
+                "special requests",
+                "plain",
+                "special later requests",
+                "plain",
+            ],
+            Some(&[0, 0, 0, 1]),
+        );
+        let matcher = VarlenMatcher::like("%special%requests%", true).unwrap();
+        let mut selection = [0, 1, 3]
+            .map(BatchRowOrdinal::from_validated_index)
+            .to_vec();
+
+        matcher
+            .filter_batch(&batch, 4, &mut selection, false)
+            .unwrap();
+
+        assert_eq!(selection, [1]);
+    }
+
+    #[test]
+    fn negated_seed_anchor_rejects_nulls_without_a_complement_buffer() {
+        let batch = binary_plain_batch(
+            &["plain", "special requests", "plain", "ordinary"],
+            Some(&[0, 0, 1, 0]),
+        );
+        let matcher = VarlenMatcher::like("%special%requests%", true).unwrap();
+        let mut selection = Vec::new();
+
+        matcher
+            .filter_batch(&batch, 4, &mut selection, true)
+            .unwrap();
+
+        assert_eq!(selection, [0, 3]);
+    }
+
+    #[test]
+    fn retained_anchor_scan_declines_sparse_wide_spans() {
+        let batch = binary_plain_batch(
+            &[
+                "a",
+                "this unselected row occupies a much wider payload range",
+                "b",
+            ],
+            None,
+        );
+        let payload_len = batch
+            .raw_varlen()
+            .unwrap()
+            .contiguous_payload()
+            .unwrap()
+            .len();
+
+        assert!(anchor_scan_range(
+            batch.raw_varlen().unwrap(),
+            payload_len,
+            3,
+            &[0, 2].map(BatchRowOrdinal::from_validated_index),
+            false,
+        )
+        .is_none());
+        assert!(anchor_scan_range(
+            batch.raw_varlen().unwrap(),
+            payload_len,
+            3,
+            &[2, 0].map(BatchRowOrdinal::from_validated_index),
+            false,
+        )
+        .is_none());
+        assert_eq!(
+            anchor_scan_range(
+                batch.raw_varlen().unwrap(),
+                payload_len,
+                3,
+                &[0, 1, 2].map(BatchRowOrdinal::from_validated_index),
+                false,
+            ),
+            Some(0..payload_len)
+        );
+    }
+}

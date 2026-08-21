@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::allocator::Allocator;
 use crate::error::{self as paro_error, Result};
-use crate::types::{InlineString, LogicalType, INLINE_LENGTH};
+use crate::types::{LogicalType, StringView};
 
 use super::{SelectionRef, SelectionVector, StringHeap, Vector, VectorSelection, VectorType};
 
@@ -59,7 +59,7 @@ impl<'a> CopySourceRows<'a> {
             SelectionRef::Borrowed(selection) => Self::BorrowedMaterialized(selection),
             SelectionRef::Owned(selection) => Self::OwnedMaterialized(selection),
             SelectionRef::Range { offset, .. } => Self::Range { offset },
-            SelectionRef::Constant { .. } => Self::Constant { index: 0 },
+            SelectionRef::Constant { index, .. } => Self::Constant { index },
             SelectionRef::Incremental { .. } => Self::Incremental { start: 0 },
         }
     }
@@ -177,8 +177,7 @@ impl Vector {
             return Ok(());
         }
 
-        if Self::is_inline_varlen_type(&self.logical_type) && self.logical_type != LogicalType::Blob
-        {
+        if Self::is_varlen_type(&self.logical_type) && self.logical_type != LogicalType::Blob {
             if let Some(s) = source.vector.get_string(source.row_idx) {
                 self.try_set_string(idx, s)?;
             } else {
@@ -302,14 +301,14 @@ impl Vector {
             {
                 self.try_copy_dictionary_fixed_range(dst_offset, source, src_offset, count)?;
             }
-            _ if Self::is_inline_varlen_type(&self.logical_type)
+            _ if Self::is_varlen_type(&self.logical_type)
                 && source.logical_type == self.logical_type
                 && dst_offset == 0
                 && dst_end >= self.count =>
             {
                 self.try_copy_varlen_range_rebuild_heap(dst_offset, source, src_offset, count)?;
             }
-            _ if Self::is_inline_varlen_type(&self.logical_type)
+            _ if Self::is_varlen_type(&self.logical_type)
                 && source.logical_type == self.logical_type
                 && dst_offset >= self.count =>
             {
@@ -349,6 +348,20 @@ impl Vector {
                 }
                 SelectionRef::Range {
                     offset: *offset,
+                    count,
+                }
+            }
+            VectorSelection::Repeated {
+                index,
+                count: selection_count,
+            } => {
+                if count > *selection_count {
+                    return Err(paro_error::internal(format!(
+                        "copy selection count exceeds repeated selection: count={count}, selection_count={selection_count}"
+                    )));
+                }
+                SelectionRef::Constant {
+                    index: *index,
                     count,
                 }
             }
@@ -552,6 +565,9 @@ impl Vector {
     ) -> Result<CopySourceRows<'a>> {
         match base_selection {
             VectorSelection::None => Ok(rows),
+            VectorSelection::Repeated { index, .. } => {
+                Ok(CopySourceRows::Constant { index: *index })
+            }
             VectorSelection::Range { offset, .. } => match rows {
                 CopySourceRows::Range { offset: row_offset }
                 | CopySourceRows::Incremental { start: row_offset } => Ok(CopySourceRows::Range {
@@ -743,27 +759,18 @@ impl Vector {
     }
 
     #[inline]
-    pub(super) fn is_inline_varlen_type(logical_type: &LogicalType) -> bool {
-        matches!(
-            logical_type,
-            LogicalType::Varchar
-                | LogicalType::VarcharCollation(_)
-                | LogicalType::TsVector
-                | LogicalType::TsQuery
-                | LogicalType::Json
-                | LogicalType::Jsonb
-                | LogicalType::Blob
-        )
+    pub(super) fn is_varlen_type(logical_type: &LogicalType) -> bool {
+        logical_type.physical_type() == crate::types::PhysicalType::Varchar
     }
 
     #[inline]
     fn is_fixed_payload_type(logical_type: &LogicalType) -> bool {
-        !Self::is_inline_varlen_type(logical_type)
+        !Self::is_varlen_type(logical_type)
             && !matches!(
                 logical_type,
                 LogicalType::Array(_, _) | LogicalType::List(_) | LogicalType::Struct(_)
             )
-            && logical_type.physical_size() > 0
+            && logical_type.type_size() > 0
     }
 
     #[inline]
@@ -784,18 +791,22 @@ impl Vector {
         bytes: &[u8],
         heap: &mut Option<StringHeap>,
         allocator: Arc<dyn Allocator>,
-    ) -> Result<InlineString> {
-        if bytes.len() <= INLINE_LENGTH {
-            return Ok(InlineString::from_bytes(bytes));
+    ) -> Result<StringView> {
+        if let Some(value) = StringView::try_inline(bytes) {
+            return Ok(value);
         }
 
         if heap.is_none() {
             *heap = Some(StringHeap::with_allocator(1024, allocator));
         }
 
-        heap.as_mut()
-            .expect("invariant: heap was initialized")
-            .try_add_blob(bytes)
+        // SAFETY: the heap is installed alongside the returned entry in the
+        // destination vector and therefore owns its out-of-line bytes.
+        unsafe {
+            heap.as_mut()
+                .expect("invariant: heap was initialized")
+                .try_add_blob(bytes)
+        }
     }
 
     fn try_copy_flat_fixed_range(
@@ -805,7 +816,7 @@ impl Vector {
         src_offset: usize,
         count: usize,
     ) -> Result<()> {
-        let element_size = self.logical_type.physical_size();
+        let element_size = self.logical_type.type_size();
         let bytes = element_size.checked_mul(count).ok_or_else(|| {
             paro_error::internal(format!(
                 "copy range byte count overflow: element_size={element_size}, count={count}"
@@ -813,7 +824,7 @@ impl Vector {
         })?;
 
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
         self.validity
             .try_copy_range_from(dst_offset, &source.validity, src_offset, count)?;
 
@@ -841,10 +852,10 @@ impl Vector {
             .child
             .as_ref()
             .expect("Dictionary vector missing child");
-        let element_size = self.logical_type.physical_size();
+        let element_size = self.logical_type.type_size();
 
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         unsafe {
             let src_base = child.buffer.data();
@@ -877,19 +888,19 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         let mut heap: Option<StringHeap> = None;
         let allocator = self.buffer.allocator().clone();
 
         unsafe {
-            let entries = self.buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *mut StringView;
             for i in 0..count {
                 let dst_idx = dst_offset + i;
                 let src_idx = src_offset + i;
                 if source.is_null(src_idx) {
                     self.validity.try_set_null(dst_idx)?;
-                    *entries.add(dst_idx) = InlineString::empty();
+                    *entries.add(dst_idx) = StringView::empty();
                     continue;
                 }
 
@@ -917,7 +928,7 @@ impl Vector {
         count: usize,
     ) -> Result<()> {
         self.try_make_exclusive()?;
-        self.validity.try_resize(dst_offset + count)?;
+        self.validity.try_ensure_capacity(dst_offset + count)?;
 
         let allocator = self.buffer.allocator().clone();
         if self
@@ -935,16 +946,17 @@ impl Vector {
                 allocator.clone(),
             );
             let rebuilt_buffer = super::VectorBuffer::try_with_allocator(
-                std::mem::size_of::<InlineString>(),
+                StringView::SIZE,
                 self.buffer.capacity(),
                 allocator,
             )?;
 
             unsafe {
-                let old_entries = self.buffer.data() as *const InlineString;
-                let new_entries = rebuilt_buffer.data() as *mut InlineString;
+                let old_entries = self.buffer.data() as *const StringView;
+                let new_entries = rebuilt_buffer.data() as *mut StringView;
                 for row_idx in 0..self.count {
                     let entry = *old_entries.add(row_idx);
+                    // SAFETY: `rebuilt_heap` becomes the owner of `new_entries`.
                     *new_entries.add(row_idx) = rebuilt_heap.try_add_blob(entry.as_bytes())?;
                 }
 
@@ -953,7 +965,7 @@ impl Vector {
                     let src_idx = src_offset + i;
                     if source.is_null(src_idx) {
                         self.validity.try_set_null(dst_idx)?;
-                        *new_entries.add(dst_idx) = InlineString::empty();
+                        *new_entries.add(dst_idx) = StringView::empty();
                         continue;
                     }
 
@@ -964,6 +976,7 @@ impl Vector {
                                 "copy range missing varlen value at row {src_idx}"
                             ))
                         })?;
+                    // SAFETY: `rebuilt_heap` becomes the owner of `new_entries`.
                     *new_entries.add(dst_idx) = rebuilt_heap.try_add_blob(bytes)?;
                 }
             }
@@ -978,13 +991,13 @@ impl Vector {
         }
 
         unsafe {
-            let entries = self.buffer.data() as *mut InlineString;
+            let entries = self.buffer.data() as *mut StringView;
             for i in 0..count {
                 let dst_idx = dst_offset + i;
                 let src_idx = src_offset + i;
                 if source.is_null(src_idx) {
                     self.validity.try_set_null(dst_idx)?;
-                    *entries.add(dst_idx) = InlineString::empty();
+                    *entries.add(dst_idx) = StringView::empty();
                     continue;
                 }
 
@@ -995,13 +1008,14 @@ impl Vector {
                             "copy range missing varlen value at row {src_idx}"
                         ))
                     })?;
-                *entries.add(dst_idx) = if bytes.len() <= INLINE_LENGTH {
-                    InlineString::from_bytes(bytes)
+                *entries.add(dst_idx) = if let Some(value) = StringView::try_inline(bytes) {
+                    value
                 } else {
                     let allocator = self.buffer.allocator().clone();
                     let heap = self.string_heap.get_or_insert_with(|| {
                         Arc::new(StringHeap::with_allocator(count.max(1), allocator))
                     });
+                    // SAFETY: this heap is retained by the destination vector.
                     Arc::get_mut(heap)
                         .expect("varlen append heap should be unique after shared path")
                         .try_add_blob(bytes)?
@@ -1062,9 +1076,7 @@ impl Vector {
         count: usize,
         required_count: usize,
     ) -> Result<()> {
-        if self.validity.len() < required_count {
-            self.validity.try_resize(required_count)?;
-        }
+        self.validity.try_ensure_capacity(required_count)?;
         for logical_idx in 0..count {
             let src_idx = src_rows.source_index(logical_idx);
             let dst_idx = dst_rows.destination_index(logical_idx);
@@ -1264,9 +1276,7 @@ impl Vector {
         required_count: usize,
         dest_child_start: usize,
     ) -> Result<()> {
-        if self.validity.len() < required_count {
-            self.validity.try_resize(required_count)?;
-        }
+        self.validity.try_ensure_capacity(required_count)?;
         let mut dest_child_offset = dest_child_start;
         for logical_idx in 0..count {
             let src_idx = src_rows.source_index(logical_idx);
@@ -1465,8 +1475,15 @@ impl Vector {
                     source.row_idx
                 ))
             })?;
+            let required_child_count = dest_offset.checked_add(array_size).ok_or_else(|| {
+                paro_error::internal(format!(
+                    "array destination child count overflow: offset={dest_offset}, array_size={array_size}"
+                ))
+            })?;
             dest_child.try_copy_range(dest_offset, src_child, src_offset, array_size)?;
-            dest_child.try_set_count(dest_offset + array_size)?;
+            if dest_child.len() < required_child_count {
+                dest_child.try_set_count(required_child_count)?;
+            }
         }
         self.try_set_null(idx, false)
     }

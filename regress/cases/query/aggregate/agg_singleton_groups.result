@@ -1,0 +1,174 @@
+DROP TABLE IF EXISTS singleton_orders_large;
+DROP TABLE
+
+DROP TABLE IF EXISTS singleton_customer;
+DROP TABLE
+
+DROP TABLE IF EXISTS nullable_singleton_customer;
+DROP TABLE
+
+DROP TABLE IF EXISTS prefix_nullable_singleton_customer;
+DROP TABLE
+
+CREATE TABLE singleton_customer (
+    customer_key BIGINT,
+    UNIQUE (customer_key) NOT ENFORCED
+);
+CREATE TABLE
+
+CREATE TABLE singleton_orders (
+    order_key BIGINT,
+    customer_key BIGINT,
+    comment VARCHAR,
+    UNIQUE (order_key) NOT ENFORCED
+);
+CREATE TABLE
+
+CREATE TABLE singleton_orders_large (
+    order_key BIGINT,
+    customer_key BIGINT,
+    comment VARCHAR,
+    UNIQUE (order_key) NOT ENFORCED
+);
+CREATE TABLE
+
+CREATE TABLE nullable_singleton_customer (
+    customer_key BIGINT,
+    UNIQUE (customer_key) NOT ENFORCED
+);
+CREATE TABLE
+
+CREATE TABLE prefix_nullable_singleton_customer (
+    phone VARCHAR,
+    customer_key BIGINT,
+    UNIQUE (customer_key) NOT ENFORCED
+);
+CREATE TABLE
+
+INSERT INTO singleton_customer VALUES (1), (2), (3);
+INSERT 0 3
+
+INSERT INTO singleton_orders VALUES
+    (10, 1, 'ordinary order'),
+    (11, 1, 'special handling requests'),
+    (12, 2, NULL);
+INSERT 0 3
+
+INSERT INTO singleton_orders_large
+SELECT i, (i % 2) + 1,
+       CASE WHEN i % 10 = 0 THEN 'special handling requests' ELSE 'ordinary order' END
+FROM generate_series(1, 4096) AS generated(i);
+INSERT 0 4096
+
+INSERT INTO nullable_singleton_customer VALUES (1), (NULL), (NULL);
+INSERT 0 3
+
+INSERT INTO prefix_nullable_singleton_customer VALUES
+    ('13-a', 1), ('13-b', NULL), ('13-c', NULL);
+INSERT 0 3
+
+EXPLAIN SELECT c_count, count(*) AS customer_distribution
+FROM (
+    SELECT c.customer_key, count(o.order_key) AS c_count
+    FROM singleton_customer AS c
+    LEFT JOIN singleton_orders_large AS o
+      ON c.customer_key = o.customer_key
+     AND o.comment NOT LIKE '%special%requests%'
+    GROUP BY c.customer_key
+) AS counts
+GROUP BY c_count
+ORDER BY c_count;
+QUERY PLAN
+ORDER_BY  (rows=2)
+  Sort Key: #0 ASC NULLS LAST
+  ->  PROJECTION  (rows=2)
+    Output: c_count, customer_distribution
+    ->  AGGREGATE  (rows=2)
+      Group Key: #0
+      Aggregates: count_star(*)
+      Output: aggr_0, aggr_1
+      ->  PROJECTION  (rows=3)
+        Output: c_count
+        ->  HASH_JOIN  (rows=3)
+          Join Type: LEFT
+          Join Condition: #0 = #0
+          ->  ROWSET_SCAN on public.singleton_customer c  (rows=3)
+            Columns: customer_key
+          ->  AGGREGATE  (rows=2)
+            Group Key: #0
+            Aggregates: count_star(*)
+            Output: aggr_0, aggr_1
+            ->  ROWSET_SCAN on public.singleton_orders_large o  (rows=4050)
+              Columns: customer_key
+              Pushed Predicate: col#2 NOT LIKE "%special%requests%"
+
+SELECT c_count, count(*) AS customer_distribution
+FROM (
+    SELECT c.customer_key, count(o.order_key) AS c_count
+    FROM singleton_customer AS c
+    LEFT JOIN singleton_orders AS o
+      ON c.customer_key = o.customer_key
+     AND o.comment NOT LIKE '%special%requests%'
+    GROUP BY c.customer_key
+) AS counts
+GROUP BY c_count
+ORDER BY c_count;
+c_count	customer_distribution
+0	2
+1	1
+
+SELECT order_sum, count(*) AS customer_distribution
+FROM (
+    SELECT c.customer_key, sum(o.order_key) AS order_sum
+    FROM singleton_customer AS c
+    LEFT JOIN singleton_orders AS o
+      ON c.customer_key = o.customer_key
+     AND o.comment NOT LIKE '%special%requests%'
+    GROUP BY c.customer_key
+) AS sums
+GROUP BY order_sum
+ORDER BY order_sum NULLS FIRST;
+order_sum	customer_distribution
+NULL	2
+10	1
+
+SELECT c_count, count(*) AS grouped_key_distribution
+FROM (
+    SELECT c.customer_key, count(o.order_key) AS c_count
+    FROM nullable_singleton_customer AS c
+    LEFT JOIN singleton_orders AS o
+      ON c.customer_key = o.customer_key
+    GROUP BY c.customer_key
+) AS counts
+GROUP BY c_count
+ORDER BY c_count;
+c_count	grouped_key_distribution
+0	1
+2	1
+
+SELECT c_count, count(*) AS grouped_key_distribution
+FROM (
+    SELECT c.customer_key, count(o.order_key) AS c_count
+    FROM prefix_nullable_singleton_customer AS c
+    LEFT JOIN singleton_orders AS o
+      ON c.customer_key = o.customer_key
+    WHERE substring(c.phone FROM 1 FOR 2) IN ('13')
+    GROUP BY c.customer_key
+) AS counts
+GROUP BY c_count
+ORDER BY c_count;
+c_count	grouped_key_distribution
+0	1
+2	1
+
+DROP TABLE IF EXISTS nullable_singleton_customer;
+DROP TABLE
+
+DROP TABLE IF EXISTS singleton_orders_large;
+DROP TABLE
+
+DROP TABLE IF EXISTS singleton_orders;
+DROP TABLE
+
+DROP TABLE IF EXISTS singleton_customer;
+DROP TABLE

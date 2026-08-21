@@ -582,7 +582,7 @@ impl DeltaWriter {
         for &col_idx in &write_column_indices {
             let ty = &all_logical_types[col_idx];
             let mut nulls = vec![0u8; row_count.div_ceil(8)];
-            let mut data: Vec<u8> = Vec::with_capacity(row_count * ty.physical_size());
+            let mut data: Vec<u8> = Vec::with_capacity(row_count * ty.type_size());
 
             for (out_row, (_key, (chunk_idx, row_idx))) in ordered_rows.iter().enumerate() {
                 let chunk = chunks
@@ -1223,7 +1223,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(dv.cardinality(), 4);
-        assert!(dv.is_deleted(0));
+        assert!(dv.is_deleted(crate::rowset::SegmentRowId::from_raw(0)));
 
         drop(tmp);
     }

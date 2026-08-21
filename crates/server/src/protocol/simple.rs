@@ -9,7 +9,7 @@ use paro_common::error::{ParoError, Result};
 use paro_common::types::LogicalType;
 use paro_function::copy::CopyOptions;
 use paro_session::{
-    CopyProtocolSink, CopyProtocolSource, ProtocolResultSink, ResultSink, SessionExecutionControl,
+    CopyProtocolSink, CopyProtocolSource, ProtocolResultSink, ResultSink, StatementCancellation,
     StatementCompletion,
 };
 use std::collections::VecDeque;
@@ -25,7 +25,6 @@ use super::result::PgWireResultSink;
 
 pub struct ProtocolSink<'a> {
     result_sink: PgWireResultSink<'a>,
-    execution_control: Arc<SessionExecutionControl>,
     drain_token: CancellationToken,
     force_close_token: CancellationToken,
     pending_frontend_messages: Arc<Mutex<VecDeque<pgwire::messages::PgWireFrontendMessage>>>,
@@ -35,14 +34,12 @@ pub struct ProtocolSink<'a> {
 impl<'a> ProtocolSink<'a> {
     pub fn new(
         socket: &'a mut Framed<TcpStream, PgCodec>,
-        execution_control: Arc<SessionExecutionControl>,
         drain_token: CancellationToken,
         force_close_token: CancellationToken,
         pending_frontend_messages: Arc<Mutex<VecDeque<pgwire::messages::PgWireFrontendMessage>>>,
     ) -> Self {
         Self {
             result_sink: PgWireResultSink::new(socket),
-            execution_control,
             drain_token,
             force_close_token,
             pending_frontend_messages,
@@ -102,17 +99,26 @@ impl ResultSink for ProtocolSink<'_> {
 impl ProtocolResultSink for ProtocolSink<'_> {
     fn create_copy_out_sink(
         &mut self,
+        cancellation: &StatementCancellation,
         options: &CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
         self.ensure_transport_available()?;
-        create_copy_out_sink(self.result_sink.socket_mut(), options)
+        create_copy_out_sink(
+            self.result_sink.socket_mut(),
+            cancellation,
+            self.force_close_token.clone(),
+            options,
+        )
     }
 
-    fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+    fn create_copy_in_source(
+        &mut self,
+        cancellation: &StatementCancellation,
+    ) -> Result<Box<dyn CopyProtocolSource + '_>> {
         self.ensure_transport_available()?;
         create_copy_in_source(
             self.result_sink.socket_mut(),
-            Arc::clone(&self.execution_control),
+            cancellation,
             self.drain_token.clone(),
             self.force_close_token.clone(),
             Arc::clone(&self.pending_frontend_messages),

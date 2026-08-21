@@ -5,13 +5,9 @@
 
 use std::sync::Arc;
 
-use paro_common::allocator::{Allocator, MemoryTag};
-use paro_common::error::Result;
-use paro_common::memory::{MemoryAccountingClass, MemoryOwner};
+use paro_common::allocator::Allocator;
+use paro_common::error::{self as paro_error, Result};
 
-use crate::memory_runtime::{
-    LocalMemoryGrant, OperatorMemoryAccount, DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
-};
 use crate::pipeline::graph::SinkSharing;
 use crate::pipeline::handles::BreakerHandleCatalog;
 use crate::pipeline::program::PipelineProgram;
@@ -19,7 +15,7 @@ use crate::pipeline::program::PipelineProgram;
 use super::breaker::{BreakerHandleRegistry, SharedSinkCoordinator};
 use super::context::{PipelineInitContext, QueryRuntimeContext};
 use super::parameter::ParameterBindings;
-use super::scratch::{PendingChunkState, PipelineTaskState, TaskMemoryGrants};
+use super::scratch::{PipelineTaskState, TaskMemoryGrants};
 use super::state::{SinkGlobal, SourceGlobal, TransformGlobalSlots};
 
 /// Runtime state created for one execution attempt of one immutable
@@ -92,7 +88,15 @@ impl PipelineRuntime {
             program.source.exec.create_global(&mut ctx)?
         };
 
-        let mut transform_globals = Vec::with_capacity(program.transforms.len());
+        let mut transform_globals = Vec::new();
+        transform_globals
+            .try_reserve_exact(program.transforms.len())
+            .map_err(|error| {
+                paro_error::out_of_memory(format!(
+                    "failed to allocate {} transform global slots: {error}",
+                    program.transforms.len()
+                ))
+            })?;
         for transform in program.transforms.iter() {
             let mut ctx = init_context(
                 query,
@@ -164,24 +168,25 @@ impl PipelineRuntime {
         };
 
         let scratch = self.program.scratch.create_scratch(allocator.clone())?;
-        let account = Arc::new(OperatorMemoryAccount::new(query.memory.clone()));
-        let owner: Arc<dyn MemoryOwner> = account;
-        let memory = TaskMemoryGrants::new(LocalMemoryGrant::new(
-            owner,
-            DEFAULT_LOCAL_INITIAL_GRANT_BYTES,
-            MemoryTag::Allocator,
-            MemoryAccountingClass::NonRevocable,
-            allocator.clone(),
-        )?);
+        let memory = TaskMemoryGrants::query_accounted(query.memory.clone(), allocator.clone())?;
 
-        Ok(PipelineTaskState {
-            source,
-            transforms,
-            sink,
-            memory,
-            scratch,
-            pending: PendingChunkState::Empty,
-        })
+        Ok(PipelineTaskState::new_data(
+            source, transforms, sink, memory, scratch,
+        ))
+    }
+
+    /// Create global-completion state without data-path operator locals or vector scratch.
+    pub(crate) fn create_finish_task_state(
+        &self,
+        query: &QueryRuntimeContext,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<PipelineTaskState> {
+        PipelineTaskState::new_finish(query.memory.clone(), allocator)
+    }
+
+    /// Prove that an empty source can bypass all data-path local state.
+    pub(crate) fn can_complete_empty_without_data_task(&self) -> bool {
+        self.program.transforms.is_empty() && self.program.sink.exec.empty_local_merge_is_identity()
     }
 
     fn init_context<'a>(
@@ -280,6 +285,19 @@ mod tests {
             .create_task_state(&query, paro_common::test_utils::test_allocator())
             .expect("task state");
         assert!(task.pending.is_empty());
-        assert_eq!(task.scratch.transform_chunks.len(), 0);
+        assert_eq!(
+            task.data()
+                .expect("data-path task state")
+                .scratch
+                .transform_chunks
+                .len(),
+            0
+        );
+
+        let finish = runtime
+            .create_finish_task_state(&query, paro_common::test_utils::test_allocator())
+            .expect("finish task state");
+        assert!(finish.is_finish_only());
+        assert!(finish.pending.is_empty());
     }
 }

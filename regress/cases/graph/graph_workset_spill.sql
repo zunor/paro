@@ -7,7 +7,7 @@
 -- 2. force_external correctness for shortest path single-source / bound target
 -- 3. emit_path_info path reconstruction via path_length/vertices/edges
 -- 4. large result streaming through HaveMoreOutput
--- 5. force_external error when temp_directory is unset
+-- 5. force_external uses the database-owned default temp directory after RESET
 
 -- ============================================================
 -- Part 1: Small graph for force_external + path reconstruction
@@ -72,7 +72,6 @@ SET force_external = DEFAULT;
 SET temp_directory = DEFAULT;
 
 SET force_external = true;
--- @statement error SQLSTATE=53200
 SELECT * FROM GRAPH_TABLE(gw_graph
     MATCH (a:Node WHERE a.name = 'A')-[e:Follows]->{1,4}(b:Node)
     COLUMNS (b.name AS dst)

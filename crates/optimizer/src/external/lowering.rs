@@ -120,7 +120,10 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn lower_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
-        let plan = plan.try_map_children(|child| self.lower_plan(child))?;
+        plan.try_map_post_order(|plan| self.lower_current_plan(plan))
+    }
+
+    fn lower_current_plan(&mut self, plan: LogicalPlan) -> Result<LogicalPlan> {
         let LogicalPlan {
             id,
             stats,
@@ -234,7 +237,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
         aggregate.groups = expressions;
         aggregate.aggregates = aggregates;
         aggregate.child = Box::new(child);
-        aggregate.recompute_returned_types();
+        aggregate.recompute_returned_types_after_row_preserving_relocation();
         Ok(aggregate)
     }
 
@@ -656,11 +659,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn ensure_no_unlowered_external_routines(&self, plan: &LogicalPlan) -> Result<()> {
-        self.ensure_operator_is_lowered(&plan.operator)?;
-        for child in plan.children() {
-            self.ensure_no_unlowered_external_routines(child)?;
-        }
-        Ok(())
+        plan.try_visit_pre_order(|plan| self.ensure_operator_is_lowered(&plan.operator))
     }
 
     fn ensure_operator_is_lowered(&self, operator: &LogicalOperator) -> Result<()> {

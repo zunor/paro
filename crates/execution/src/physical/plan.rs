@@ -38,6 +38,10 @@ impl PhysicalPlanNodeArena {
         self.nodes.get(id.index())
     }
 
+    pub(crate) fn get_mut(&mut self, id: PhysicalPlanNodeId) -> Option<&mut PhysicalPlanNode> {
+        self.nodes.get_mut(id.index())
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = &PhysicalPlanNode> {
         self.nodes.iter()
     }
@@ -82,6 +86,26 @@ impl PhysicalPlan {
 
     pub fn child_ids<'a>(&'a self, children: &'a PlanChildren) -> &'a [PhysicalPlanNodeId] {
         children.as_slice(&self.children)
+    }
+
+    /// Return a structural one-row guarantee, independent of optimizer
+    /// cardinality estimates. Consumers may use this as a semantic proof.
+    pub fn guarantees_exactly_one_row(&self, id: PhysicalPlanNodeId) -> bool {
+        let node = self.node(id);
+        match &node.kind {
+            PhysicalNodeKind::Aggregate(spec) => {
+                spec.grouping_key_count == 0
+                    && spec.grouping_sets.len() <= 1
+                    && spec.having_filter.is_empty()
+            }
+            PhysicalNodeKind::Project(_) | PhysicalNodeKind::Sort(_) => {
+                let [child] = self.child_ids(&node.children) else {
+                    return false;
+                };
+                self.guarantees_exactly_one_row(*child)
+            }
+            _ => false,
+        }
     }
 
     pub fn format_tree(&self) -> String {
@@ -220,7 +244,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             if let Some(predicate) = &spec.predicate {
                 push_string_property(&mut properties, "Pushed Predicate", predicate.to_string());
             }
-            if spec.late_materialize {
+            if spec.planned_materialization().is_late() {
                 push_string_property(&mut properties, "Late Materialize", "auto".to_string());
             }
             if !spec.residual_predicates.is_empty() {
@@ -305,7 +329,15 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         }
         PhysicalNodeKind::HashJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
-            push_join_conditions(&mut properties, &spec.conditions);
+            if spec.build_time_integer_index.is_some() {
+                push_string_property(
+                    &mut properties,
+                    "Build Index",
+                    "integer_build_time".to_string(),
+                );
+            }
+            push_join_conditions(&mut properties, &spec.key_conditions);
+            push_join_conditions(&mut properties, &spec.build_residual_conditions);
         }
         PhysicalNodeKind::NestedLoopJoin(spec) => {
             push_string_property(&mut properties, "Join Type", spec.join_type.to_string());
@@ -375,8 +407,29 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 push_string_property(&mut properties, "Filter", "<pushed down>".to_string());
             }
         }
+        PhysicalNodeKind::RowFetch(spec) => {
+            let output_names = spec
+                .projection
+                .as_ref()
+                .map_or(spec.raw_output_names.as_ref(), |projection| {
+                    projection.output_names.as_ref()
+                });
+            push_list_property(&mut properties, "Output", output_names);
+            push_string_property(&mut properties, "Sources", spec.mappings.len().to_string());
+        }
         PhysicalNodeKind::Aggregate(spec) => {
             push_aggregate_properties(&mut properties, spec);
+            if !spec.output_names.is_empty() {
+                push_list_property(&mut properties, "Output", &spec.output_names);
+            }
+        }
+        PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+            push_aggregate_properties(&mut properties, &spec.aggregate);
+            push_string_property(
+                &mut properties,
+                "Retained Detail Columns",
+                spec.detail_columns.len().to_string(),
+            );
             if !spec.output_names.is_empty() {
                 push_list_property(&mut properties, "Output", &spec.output_names);
             }
@@ -433,9 +486,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         _ => {}
     }
 
-    if let Some(output_schema) = format_output_schema(node) {
-        push_string_property(&mut properties, "Output Schema", output_schema);
-    }
+    push_string_property(&mut properties, "Output Schema", format_output_schema(node));
 
     properties
 }
@@ -461,6 +512,23 @@ fn push_aggregate_properties(properties: &mut Vec<ExplainProperty>, spec: &Aggre
                 .map(|expr| format_aggregate_expr(expr, spec))
                 .collect::<Vec<_>>()
                 .join(", "),
+        );
+    }
+    if let Some(reduction) = &spec.post_reduction {
+        push_string_property(
+            properties,
+            "Post Reduction",
+            reduction
+                .reducers
+                .iter()
+                .map(format_expr)
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        push_string_property(
+            properties,
+            "Post Predicate",
+            format_expr(&reduction.predicate),
         );
     }
     if !spec.grouping_sets.is_empty() {
@@ -693,19 +761,17 @@ fn format_hops(min_hops: u64, max_hops: u64) -> String {
     }
 }
 
-fn format_output_schema(node: &PhysicalPlanNode) -> Option<String> {
+fn format_output_schema(node: &PhysicalPlanNode) -> String {
     if node.output.column_count() == 0 {
-        return None;
+        return "(none)".to_string();
     }
-    Some(
-        node.output
-            .names
-            .iter()
-            .zip(node.output.types.iter())
-            .map(|(name, ty)| format!("{name} {ty}"))
-            .collect::<Vec<_>>()
-            .join(", "),
-    )
+    node.output
+        .names
+        .iter()
+        .zip(node.output.types.iter())
+        .map(|(name, ty)| format!("{name} {ty}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn format_join_condition(condition: &JoinCondition) -> String {

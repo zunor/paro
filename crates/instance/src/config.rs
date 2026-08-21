@@ -10,6 +10,7 @@ use crate::lifecycle::startup_report::StartupPolicy;
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::ThreadAffinityMode;
 use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_storage::compaction::compaction_manager::CompactionAdmissionPolicy;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -136,6 +137,24 @@ impl Default for CheckpointConfigOptions {
     }
 }
 
+/// Instance-level compaction resource and foreground-admission policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CompactionConfigOptions {
+    pub max_concurrency: usize,
+    pub admission: CompactionAdmissionPolicy,
+}
+
+impl Default for CompactionConfigOptions {
+    fn default() -> Self {
+        Self {
+            // Reserve foreground capacity until maintenance becomes a
+            // cooperatively sliced scheduler workload.
+            max_concurrency: 1,
+            admission: CompactionAdmissionPolicy::default(),
+        }
+    }
+}
+
 /// Immutable boot-time configuration shared by the whole instance.
 #[derive(Debug)]
 pub struct BootConfig {
@@ -153,6 +172,7 @@ pub struct BootConfig {
     pub initial_maximum_threads: Option<usize>,
     pub pin_threads: ThreadAffinityMode,
     pub checkpoint: CheckpointConfigOptions,
+    pub compaction: CompactionConfigOptions,
     pub initial_temporary_directory: String,
     pub initial_use_temporary_directory: bool,
     pub initial_max_temp_directory_size: Option<usize>,
@@ -194,6 +214,7 @@ impl BootConfig {
             initial_maximum_threads: config.options.maximum_threads,
             pin_threads: config.options.pin_threads,
             checkpoint: config.options.checkpoint,
+            compaction: config.options.compaction,
             initial_temporary_directory: config.options.temporary_directory.clone(),
             initial_use_temporary_directory: config.options.use_temporary_directory,
             initial_max_temp_directory_size: config.options.max_temp_directory_size,
@@ -213,6 +234,8 @@ pub struct InstanceConfigOptions {
     pub access_mode: AccessMode,
     /// Checkpoint runtime coordination policy.
     pub checkpoint: CheckpointConfigOptions,
+    /// Background compaction scheduling and debt relief policy.
+    pub compaction: CompactionConfigOptions,
     /// Maximum memory used by the database system (in bytes).
     pub maximum_memory: usize,
     /// Maximum threads used by the database system.
@@ -262,6 +285,7 @@ impl Default for InstanceConfigOptions {
             instance_root: String::new(),
             access_mode: AccessMode::ReadWrite,
             checkpoint: CheckpointConfigOptions::default(),
+            compaction: CompactionConfigOptions::default(),
             maximum_memory: 1024 * 1024 * 1024, // 1GB
             // None means "use system default" which is resolved in effective_max_threads()
             maximum_threads: None,
@@ -505,6 +529,7 @@ impl From<&paro_common::config::ClusterConfig> for InstanceConfig {
             instance_root: String::new(),
             access_mode: config.access_mode.into(),
             checkpoint: CheckpointConfigOptions::default(),
+            compaction: CompactionConfigOptions::default(),
             maximum_memory: config.max_memory,
             maximum_threads: config.num_threads,
             pin_threads: match config.pin_threads {

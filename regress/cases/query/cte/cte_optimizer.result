@@ -6,11 +6,9 @@ ORDER_BY  (rows=1)
   Sort Key: #0 ASC NULLS LAST
   ->  PROJECTION  (rows=1)
     Output: v
-    ->  PROJECTION  (rows=1)
-      Output: expr_1
-      ->  FILTER  (rows=1)
-        Filter: #0 > 1
-        ->  VALUES  (rows=3)
+    ->  FILTER  (rows=1)
+      Filter: #0 > 1
+      ->  VALUES  (rows=3)
 
 EXPLAIN
 WITH nums(v) AS MATERIALIZED (VALUES (1), (2), (3))
@@ -44,13 +42,13 @@ PROJECTION  (rows=1)
   ->  AGGREGATE  (rows=1)
     Aggregates: sum(+(#0, #1))
     Output: aggr_0
-    ->  CROSS_PRODUCT  (rows=1000000)
-      ->  PROJECTION
+    ->  CROSS_PRODUCT  (rows=9)
+      ->  PROJECTION  (rows=3)
         Output: expr_1
-        ->  VALUES
-      ->  PROJECTION
+        ->  VALUES  (rows=3)
+      ->  PROJECTION  (rows=3)
         Output: expr_1
-        ->  VALUES
+        ->  VALUES  (rows=3)
 
 WITH nums(v) AS NOT MATERIALIZED (VALUES (1), (2), (3))
 SELECT SUM(a.v + b.v) AS total

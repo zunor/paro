@@ -3,6 +3,7 @@
 
 pub(crate) mod build;
 pub(crate) mod emit;
+pub(crate) mod finalize;
 
 pub use build::PerfectHashAggregateSinkExec;
 pub use emit::PerfectHashAggregateEmitSourceExec;

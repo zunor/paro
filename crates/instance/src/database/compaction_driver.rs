@@ -9,25 +9,38 @@ use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::logging::targets;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
-use paro_storage::compaction::compaction_manager::{CompactionManager, CompactionObservability};
+use paro_storage::compaction::compaction_manager::{
+    CompactionAdmissionPolicy, CompactionManager, CompactionObservability,
+};
 use paro_storage::table::table_handle::TableHandle;
 use paro_storage::tablet::TabletRef;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-const DEFAULT_COMPACTION_MAX_CONCURRENCY: usize = 2;
 const COMPACTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub struct CompactionDriver {
     manager: RwLock<Option<Arc<CompactionManager>>>,
     scheduler: RwLock<Option<Arc<TaskScheduler>>>,
     buffer_pool: Arc<BufferPool>,
+    max_concurrency: usize,
+    admission_policy: CompactionAdmissionPolicy,
 }
 
 pub struct CompactionSuspendGuard {
     manager: Arc<CompactionManager>,
     reason: &'static str,
+}
+
+pub struct ForegroundMaintenanceGuard {
+    manager: Arc<CompactionManager>,
+}
+
+impl Drop for ForegroundMaintenanceGuard {
+    fn drop(&mut self) {
+        self.manager.finish_foreground_statement();
+    }
 }
 
 impl Drop for CompactionSuspendGuard {
@@ -37,11 +50,17 @@ impl Drop for CompactionSuspendGuard {
 }
 
 impl CompactionDriver {
-    pub fn new(buffer_pool: Arc<BufferPool>) -> Self {
+    pub fn new(
+        buffer_pool: Arc<BufferPool>,
+        max_concurrency: usize,
+        admission_policy: CompactionAdmissionPolicy,
+    ) -> Self {
         Self {
             manager: RwLock::new(None),
             scheduler: RwLock::new(None),
             buffer_pool,
+            max_concurrency: max_concurrency.max(1),
+            admission_policy,
         }
     }
 
@@ -71,15 +90,21 @@ impl CompactionDriver {
 
         let scheduler = self.scheduler.read().clone();
         let manager = match scheduler {
-            Some(scheduler) => Arc::new(CompactionManager::new_with_buffer_pool_and_scheduler(
-                DEFAULT_COMPACTION_MAX_CONCURRENCY,
-                self.buffer_pool.clone(),
-                scheduler,
-            )),
-            None => Arc::new(CompactionManager::new_with_buffer_pool(
-                DEFAULT_COMPACTION_MAX_CONCURRENCY,
-                self.buffer_pool.clone(),
-            )),
+            Some(scheduler) => Arc::new(
+                CompactionManager::new_with_buffer_pool_scheduler_and_admission_policy(
+                    self.max_concurrency,
+                    self.buffer_pool.clone(),
+                    scheduler,
+                    self.admission_policy,
+                ),
+            ),
+            None => Arc::new(
+                CompactionManager::new_with_buffer_pool_and_admission_policy(
+                    self.max_concurrency,
+                    self.buffer_pool.clone(),
+                    self.admission_policy,
+                ),
+            ),
         };
         manager.clone().start();
 
@@ -108,6 +133,15 @@ impl CompactionDriver {
             );
         }
         Some(CompactionSuspendGuard { manager, reason })
+    }
+
+    /// Defer new maintenance admission while a foreground statement is active.
+    /// Accepted work is never canceled; the manager provides bounded
+    /// starvation relief during sustained foreground traffic.
+    pub fn enter_foreground(&self) -> Option<ForegroundMaintenanceGuard> {
+        let manager = self.manager.read().as_ref()?.clone();
+        manager.begin_foreground_statement();
+        Some(ForegroundMaintenanceGuard { manager })
     }
 
     pub fn shutdown(&self) {

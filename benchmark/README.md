@@ -125,10 +125,28 @@ PARO_BENCH_CARGO_PROFILE=release PARO_BENCH_DATA_DIR_MODE=fresh \
   make -C benchmark bless GATE=operator-runtime BLESS_RUNS=3
 ```
 
+The TPC-H workload requires a server with at least 2GiB of physical buffer-pool
+memory. Start it with `parod --max-memory 2GiB ...`; the harness checks this
+before setup so a larger query grant cannot silently overcommit a smaller
+physical pool.
+
 Run the operator runtime SQL gate:
 
 ```bash
 make -C benchmark check GATE=operator-runtime INCLUDE_SOURCE=operator-runtime-sql
+```
+
+Create or refresh the complete TPC-H SF1 baseline from three isolated runs:
+
+```bash
+PARO_BENCH_CARGO_PROFILE=release PARO_BENCH_DATA_DIR_MODE=fresh \
+  make -C benchmark bless GATE=tpch BLESS_RUNS=3
+```
+
+Run the checked-in TPC-H correctness and performance gate:
+
+```bash
+make -C benchmark check GATE=tpch INCLUDE_SOURCE=tpch-sql
 ```
 
 Run the operator runtime Divan dispatch gate:

@@ -8,6 +8,14 @@ use paro_planner::binder::Binder;
 use paro_planner::plan::LogicalPlan;
 
 use crate::aggregate::common::CommonAggregateOptimizer;
+use crate::aggregate::dimension_deferral;
+use crate::aggregate::input_materialization;
+use crate::aggregate::join_preaggregation;
+use crate::aggregate::join_subsumption;
+use crate::aggregate::late_payload;
+use crate::aggregate::non_null_inputs;
+use crate::aggregate::post_reduction;
+use crate::aggregate::singleton_groups;
 use crate::aggregate::statistics_exec::AggregateStatisticsExecutor;
 use crate::column::lifetime::ColumnLifetimeAnalyzer;
 use crate::column::remove_unused::RemoveUnusedColumns;
@@ -25,6 +33,7 @@ use crate::graph::start_selection::GraphStartSelection;
 use crate::join::build_probe_side::BuildProbeSideOptimizer;
 use crate::join::elimination::JoinElimination;
 use crate::join::filter_pushdown::JoinFilterPushdown;
+use crate::join::mixed_predicates::JoinPredicateNormalizer;
 use crate::join_order::optimizer::JoinOrderOptimizer;
 use crate::limit::pushdown::LimitPushdown;
 use crate::limit::topn::TopNOptimizer;
@@ -32,7 +41,7 @@ use crate::optimizer_type::OptimizerType;
 use crate::rewriter::Rewriter;
 use crate::rules::arithmetic::ArithmeticSimplificationRule;
 use crate::rules::comparison::ComparisonSimplificationRule;
-use crate::rules::conjunction::ConjunctionSimplificationRule;
+use crate::rules::conjunction::{CommonConjunctionFactorRule, ConjunctionSimplificationRule};
 use crate::rules::constant_folding::ConstantFoldingRule;
 use crate::rules::move_constants::MoveConstantsRule;
 use crate::search::optimizer::SearchOptimizer;
@@ -41,6 +50,8 @@ use crate::statistics::propagator::StatisticsPropagator;
 use crate::statistics::segment_pruner::SegmentPruner;
 use crate::subquery::delim_join_elimination::DelimJoinElimination;
 use crate::subquery::empty_result::EmptyResultPullup;
+use crate::subquery::partition_aggregate::CorrelatedPartitionAggregate;
+use crate::subquery::scalar_aggregate_window;
 
 pub struct GraphStartSelectionPass;
 
@@ -103,6 +114,7 @@ impl Rewriter for ExpressionRewriterPass {
         rewriter.add_rule(Box::new(ArithmeticSimplificationRule::new()));
         rewriter.add_rule(Box::new(ComparisonSimplificationRule::new()));
         rewriter.add_rule(Box::new(ConjunctionSimplificationRule::new()));
+        rewriter.add_rule(Box::new(CommonConjunctionFactorRule::new()));
         rewriter.add_rule(Box::new(MoveConstantsRule::new()));
         rewriter.rewrite_plan(&mut plan);
         Ok(plan)
@@ -123,6 +135,18 @@ impl Rewriter for CommonAggregatePass {
     ) -> Result<LogicalPlan> {
         CommonAggregateOptimizer::new().optimize(&mut plan);
         Ok(plan)
+    }
+}
+
+pub struct AggregateNonNullInputPass;
+
+impl Rewriter for AggregateNonNullInputPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateNonNullInput
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(non_null_inputs::optimize_plan(plan, &ctx.column_stats))
     }
 }
 
@@ -218,6 +242,30 @@ impl Rewriter for EmptyResultPullupPass {
     }
 }
 
+pub struct CorrelatedPartitionAggregatePass;
+
+impl Rewriter for CorrelatedPartitionAggregatePass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::CorrelatedPartitionAggregate
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        CorrelatedPartitionAggregate::new(ctx.bind_context.clone()).optimize_plan(plan)
+    }
+}
+
+pub struct ScalarAggregateWindowPass;
+
+impl Rewriter for ScalarAggregateWindowPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::ScalarAggregateWindow
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        scalar_aggregate_window::optimize_plan(plan, &ctx.bind_context)
+    }
+}
+
 pub struct JoinEliminationPass;
 
 impl Rewriter for JoinEliminationPass {
@@ -251,7 +299,97 @@ impl Rewriter for JoinOrderPass {
     }
 }
 
+pub struct AggregateJoinSubsumptionPass;
+
+impl Rewriter for AggregateJoinSubsumptionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateJoinSubsumption
+    }
+
+    fn rewrite(
+        &mut self,
+        plan: LogicalPlan,
+        _ctx: &mut OptimizationContext,
+    ) -> Result<LogicalPlan> {
+        Ok(join_subsumption::optimize_plan(plan))
+    }
+}
+
+pub struct AggregateJoinPreaggregationPass;
+
+impl Rewriter for AggregateJoinPreaggregationPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateJoinPreaggregation
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(join_preaggregation::optimize_plan(
+            plan,
+            &ctx.bind_context,
+            &ctx.column_stats,
+        ))
+    }
+}
+
+pub struct AggregateDimensionDeferralPass;
+
+impl Rewriter for AggregateDimensionDeferralPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateDimensionDeferral
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        let (plan, changed) =
+            dimension_deferral::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
+        if changed {
+            ctx.invalidations.mark_aggregate_schema();
+        }
+        Ok(plan)
+    }
+}
+
+pub struct AggregateInputMaterializationPass;
+
+impl Rewriter for AggregateInputMaterializationPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateInputMaterialization
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        let (plan, changed) = input_materialization::optimize_plan(plan, &ctx.bind_context)?;
+        if changed {
+            ctx.invalidations.mark_aggregate_schema();
+        }
+        Ok(plan)
+    }
+}
+
+pub struct AggregateSingletonGroupsPass;
+
+impl Rewriter for AggregateSingletonGroupsPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregateSingletonGroups
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(singleton_groups::optimize_plan(plan, &ctx.column_stats))
+    }
+}
+
 pub struct StatisticsGatheringPass;
+
+/// Reuse a grouped aggregate to derive an alpha-equivalent scalar reduction.
+pub struct AggregatePostReductionPass;
+
+impl Rewriter for AggregatePostReductionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::AggregatePostReduction
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        Ok(post_reduction::optimize_plan(plan, &ctx.bind_context))
+    }
+}
 
 impl Rewriter for StatisticsGatheringPass {
     fn optimizer_type(&self) -> OptimizerType {
@@ -288,11 +426,57 @@ impl Rewriter for UnusedColumnsPass {
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
         let mut plan = plan;
         RemoveUnusedColumns::optimize(&mut plan, &self.binder, ctx.session.as_ref(), true);
+        // Get compaction reuses a table index with new column ordinals. A
+        // keyed statistic cannot be remapped in place without risking a
+        // collision with a different former ordinal, so pruning explicitly
+        // invalidates the whole binding domain. Every downstream statistics
+        // consumer must sit behind an observable StatisticsGathering pass.
+        ctx.column_stats.clear();
         Ok(plan)
     }
 }
 
 pub struct ColumnLifetimePass;
+
+pub struct LatePayloadFetchPass;
+
+impl Rewriter for LatePayloadFetchPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::LateMaterialization
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        let (plan, changed) =
+            late_payload::optimize_plan(plan, &ctx.bind_context, &ctx.cost_model)?;
+        if changed {
+            ctx.invalidations.mark_late_materialization();
+        }
+        Ok(plan)
+    }
+}
+
+/// Produces a derived scan binding for an exact ASCII prefix that is already
+/// proven by the directly fused scan predicate. This is deliberately not a
+/// late-materialization pass: no stored value changes identity and no row
+/// fetch is introduced.
+pub struct MatchedPrefixScanProjectionPass;
+
+impl Rewriter for MatchedPrefixScanProjectionPass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::MatchedPrefixScanProjection
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        if !ctx.session.settings.rowset_scan_pushdown() {
+            return Ok(plan);
+        }
+        let (plan, changed) = late_payload::optimize_matched_prefix_plan(plan)?;
+        if changed {
+            ctx.invalidations.mark_scan_projection();
+        }
+        Ok(plan)
+    }
+}
 
 impl Rewriter for ColumnLifetimePass {
     fn optimizer_type(&self) -> OptimizerType {
@@ -329,6 +513,18 @@ impl Rewriter for JoinFilterPushdownPass {
 
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
         Ok(JoinFilterPushdown::new(ctx.session.clone()).optimize_plan(plan))
+    }
+}
+
+pub struct MixedJoinPredicatePass;
+
+impl Rewriter for MixedJoinPredicatePass {
+    fn optimizer_type(&self) -> OptimizerType {
+        OptimizerType::MixedJoinPredicate
+    }
+
+    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
+        JoinPredicateNormalizer::new(&ctx.bind_context).optimize_plan(plan)
     }
 }
 
@@ -383,8 +579,12 @@ impl Rewriter for InClausePass {
         OptimizerType::InClause
     }
 
-    fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
-        InClauseRewriter::new().rewrite(plan, ctx)
+    fn rewrite(
+        &mut self,
+        plan: LogicalPlan,
+        _ctx: &mut OptimizationContext,
+    ) -> Result<LogicalPlan> {
+        InClauseRewriter::new().rewrite(plan)
     }
 }
 

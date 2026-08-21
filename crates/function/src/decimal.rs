@@ -108,6 +108,73 @@ pub(crate) fn rescale_checked<T: DecimalInteger>(
     round_divide_checked(value, pow10_checked(from_scale - to_scale)?)
 }
 
+/// Apply the exact DECIMAL-to-DECIMAL value conversion shared by scalar casts
+/// and aggregate finalized-state projections.
+///
+/// Keeping scale rounding and declared-precision validation here prevents a
+/// state predicate from becoming a subtly different implementation of the
+/// bound SQL cast that it replaces.
+pub(crate) fn cast_i128_decimal(
+    value: i128,
+    from_scale: u8,
+    target_precision: u8,
+    target_scale: u8,
+) -> Result<i128> {
+    PreparedI128DecimalCast::new(from_scale, target_precision, target_scale)?.cast(value)
+}
+
+/// Bound scalar DECIMAL conversion with every type-derived constant computed
+/// once. Aggregate-state predicates and vector casts share this kernel so the
+/// optimized row loop cannot drift from SQL CAST semantics.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct PreparedI128DecimalCast {
+    scale: PreparedI128DecimalScale,
+    precision: I128DecimalPrecision,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum PreparedI128DecimalScale {
+    Identity,
+    Multiply(i128),
+    Divide(i128),
+}
+
+impl PreparedI128DecimalCast {
+    pub(crate) fn new(source_scale: u8, target_precision: u8, target_scale: u8) -> Result<Self> {
+        let scale = if source_scale == target_scale {
+            PreparedI128DecimalScale::Identity
+        } else if source_scale < target_scale {
+            PreparedI128DecimalScale::Multiply(
+                pow10_i128(target_scale - source_scale)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            )
+        } else {
+            PreparedI128DecimalScale::Divide(
+                pow10_i128(source_scale - target_scale)
+                    .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            )
+        };
+        Ok(Self {
+            scale,
+            precision: I128DecimalPrecision::new(target_precision)?,
+        })
+    }
+
+    #[inline]
+    pub(crate) fn cast(self, value: i128) -> Result<i128> {
+        let value = match self.scale {
+            PreparedI128DecimalScale::Identity => value,
+            PreparedI128DecimalScale::Multiply(factor) => value
+                .checked_mul(factor)
+                .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+            PreparedI128DecimalScale::Divide(divisor) => round_divide_checked(value, divisor)
+                .ok_or_else(|| paro_error::out_of_range("Decimal scale overflow"))?,
+        };
+        self.precision.check(value)?;
+        Ok(value)
+    }
+}
+
 pub(crate) fn round_divide_checked<T: DecimalInteger>(value: T, divisor: T) -> Option<T> {
     let (quotient, remainder) = value.checked_div_rem(divisor)?;
     if remainder == T::ZERO {
@@ -188,20 +255,42 @@ pub(crate) fn check_precision(value: i256, precision: u8) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn check_precision_i128(value: i128, precision: u8) -> Result<()> {
-    if precision == 0 || precision > MAX_DECIMAL_PRECISION {
-        return Err(paro_error::invalid_input(format!(
-            "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
-        )));
+/// Precomputed declared-precision guard for a vectorized i128 DECIMAL kernel.
+///
+/// The bound depends only on the bound result type, not on a row. Keeping it
+/// outside the row loop avoids rebuilding `10^precision` for every value.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct I128DecimalPrecision {
+    precision: u8,
+    upper_exclusive: u128,
+}
+
+impl I128DecimalPrecision {
+    pub(crate) fn new(precision: u8) -> Result<Self> {
+        if precision == 0 || precision > MAX_DECIMAL_PRECISION {
+            return Err(paro_error::invalid_input(format!(
+                "Decimal precision must be between 1 and {MAX_DECIMAL_PRECISION}"
+            )));
+        }
+        let upper_exclusive = pow10_i128(precision)
+            .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?
+            as u128;
+        Ok(Self {
+            precision,
+            upper_exclusive,
+        })
     }
-    let limit = pow10_i128(precision)
-        .ok_or_else(|| paro_error::out_of_range("Decimal precision exceeds i128"))?;
-    if value.unsigned_abs() >= limit as u128 {
-        return Err(paro_error::out_of_range(format!(
-            "Decimal value exceeds precision {precision}"
-        )));
+
+    #[inline]
+    pub(crate) fn check(self, value: i128) -> Result<()> {
+        if value.unsigned_abs() >= self.upper_exclusive {
+            return Err(paro_error::out_of_range(format!(
+                "Decimal value exceeds precision {}",
+                self.precision
+            )));
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 pub(crate) fn to_i128(value: i256, precision: u8) -> Result<i128> {
@@ -279,8 +368,9 @@ mod tests {
         }
 
         assert_eq!(rescale_checked(i128::MAX, 0, 1), None);
-        assert!(check_precision_i128(99_999, 5).is_ok());
-        assert!(check_precision_i128(100_000, 5).is_err());
+        let precision = I128DecimalPrecision::new(5).unwrap();
+        assert!(precision.check(99_999).is_ok());
+        assert!(precision.check(100_000).is_err());
     }
 
     #[test]

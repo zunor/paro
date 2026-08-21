@@ -46,7 +46,7 @@ impl StatementTimeoutDriver for ToggleTimeoutDriver {
         &self,
         statement_token: &CancellationToken,
         cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
-        _timeout_lifetime: &Arc<CancellationToken>,
+        _timeout_lifetime: &CancellationToken,
         _timeout: Duration,
     ) {
         if self.enabled.load(Ordering::SeqCst) {

@@ -37,6 +37,7 @@ mod rle;
 
 pub use binary_dict::{BinaryDictPageBuilder, BinaryDictPageDecoder};
 pub use binary_plain::{BinaryPlainPageBuilder, BinaryPlainPageDecoder};
+pub(crate) use binary_plain::{BinaryPlainPageSlice, BinaryPlainPayloadRowRanges};
 pub use binary_prefix::{BinaryPrefixPageBuilder, BinaryPrefixPageDecoder};
 pub use bitshuffle::{BitShufflePageBuilder, BitShufflePageDecoder, BITSHUFFLE_PAGE_HEADER_SIZE};
 pub use encoding_info::{get_encoding_registry, EncodingInfo, EncodingRegistry, FieldType};

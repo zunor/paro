@@ -859,7 +859,7 @@ mod tests {
         ));
         assert!(matches!(
             view.get_vector_format(1).unwrap().sel(),
-            SelectionRef::Constant { count: 2 }
+            SelectionRef::Constant { count: 2, .. }
         ));
         assert!(matches!(
             view.get_vector_format(2).unwrap().sel(),

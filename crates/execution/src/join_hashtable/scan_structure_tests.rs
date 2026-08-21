@@ -1,0 +1,730 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+use super::*;
+use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
+use paro_common::allocator::{Allocator, DefaultAllocator};
+use paro_common::chunk::Chunk;
+use paro_common::error::{self as paro_error, Result as CommonResult};
+use paro_common::runtime_value::Value;
+use paro_common::types::LogicalType;
+
+use paro_planner::expression::{ConstantExpression, Expression};
+use paro_planner::operator::join::{JoinComparisonType, JoinCondition, JoinType};
+use paro_storage::buffer::BufferPool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug)]
+struct ToggleAllocator {
+    inner: DefaultAllocator,
+    fail: AtomicBool,
+}
+
+impl ToggleAllocator {
+    fn new() -> Self {
+        Self {
+            inner: DefaultAllocator::new(),
+            fail: AtomicBool::new(false),
+        }
+    }
+
+    fn set_fail(&self, fail: bool) {
+        self.fail.store(fail, Ordering::SeqCst);
+    }
+}
+
+impl Allocator for ToggleAllocator {
+    fn allocate(&self, size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate(size)
+    }
+
+    fn allocate_zeroed(&self, size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {size} bytes"
+            )));
+        }
+        self.inner.allocate_zeroed(size)
+    }
+
+    fn free(&self, ptr: *mut u8, size: usize) {
+        self.inner.free(ptr, size);
+    }
+
+    fn reallocate(&self, ptr: *mut u8, old_size: usize, new_size: usize) -> CommonResult<*mut u8> {
+        if self.fail.load(Ordering::SeqCst) {
+            return Err(paro_error::out_of_memory(format!(
+                "injected allocation failure: {new_size} bytes"
+            )));
+        }
+        self.inner.reallocate(ptr, old_size, new_size)
+    }
+
+    fn name(&self) -> &'static str {
+        "ToggleAllocator"
+    }
+}
+
+#[test]
+fn left_only_output_replaces_shared_vectors_before_cardinality_change() {
+    let allocator = Arc::new(ToggleAllocator::new());
+    let left_first = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(&[1, 2, 3], allocator.clone()),
+        )],
+        allocator.clone(),
+    );
+    let left_second = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(&[4, 5], allocator.clone()),
+        )],
+        allocator.clone(),
+    );
+    let mut result = Chunk::try_initialize(&[LogicalType::Integer], 3, allocator.clone()).unwrap();
+    let first_selection = SelectionVector::try_incremental(
+        left_first.size(),
+        paro_common::test_utils::test_allocator(),
+    )
+    .unwrap();
+    let second_selection = SelectionVector::try_incremental(
+        left_second.size(),
+        paro_common::test_utils::test_allocator(),
+    )
+    .unwrap();
+
+    prepare_left_join_output(
+        &left_first,
+        &mut result,
+        left_first.size(),
+        &[0],
+        &first_selection,
+        &[],
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(&result.data[0], &left_first.data[0]));
+
+    // Changing the next batch's cardinality would have to materialize the old
+    // shared vector if the helper touched it before installing the new one.
+    allocator.set_fail(true);
+    prepare_left_join_output(
+        &left_second,
+        &mut result,
+        left_second.size(),
+        &[0],
+        &second_selection,
+        &[],
+    )
+    .expect("left-only batch replacement must not allocate");
+    assert!(Arc::ptr_eq(&result.data[0], &left_second.data[0]));
+    assert_eq!(result.size(), 2);
+}
+
+#[test]
+fn existence_output_rejects_zero_capacity_without_advancing() {
+    let mut output =
+        SelectionVector::try_with_capacity(1, paro_common::test_utils::test_allocator())
+            .expect("selection allocation");
+    let mut candidate_offset = 0;
+
+    let error =
+        collect_existence_output::<true>(&mut output, &[true], &mut candidate_offset, None, 1, 0)
+            .expect_err("zero-capacity output must not be accepted");
+
+    assert!(error.to_string().contains("non-zero output capacity"));
+    assert_eq!(candidate_offset, 0);
+}
+
+fn create_test_buffer_pool() -> Arc<BufferPool> {
+    BufferPool::new_arc(64 * 1024 * 1024)
+}
+
+fn equality_condition() -> JoinCondition {
+    JoinCondition::new(
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(1),
+            LogicalType::Integer,
+        )),
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(1),
+            LogicalType::Integer,
+        )),
+        JoinComparisonType::Equal,
+    )
+}
+
+fn not_distinct_condition() -> JoinCondition {
+    JoinCondition::new(
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(1),
+            LogicalType::Integer,
+        )),
+        Expression::Constant(ConstantExpression::new(
+            Value::Integer(1),
+            LogicalType::Integer,
+        )),
+        JoinComparisonType::NotDistinctFrom,
+    )
+}
+
+fn build_hash_table(
+    join_type: JoinType,
+    build_keys: &[i32],
+    build_payload: &[i32],
+) -> JoinHashTable {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Integer],
+        join_type,
+        JoinHashTableConfig::default(),
+    );
+
+    let keys = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                build_keys,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let payload = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                build_payload,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    ht.build(&keys, &payload).unwrap();
+    ht.finalize().unwrap();
+    ht
+}
+
+fn build_string_hash_table(build_keys: &[i32], build_payload: &[&str]) -> JoinHashTable {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![equality_condition()],
+        vec![LogicalType::Varchar],
+        JoinType::Inner,
+        JoinHashTableConfig::default(),
+    );
+    let keys = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                build_keys,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let payload = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_string_vector_with_allocator(
+                build_payload,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    ht.build(&keys, &payload).unwrap();
+    ht.finalize().unwrap();
+    ht
+}
+
+fn chunk_from_optional_i32(values: &[Option<i32>]) -> Chunk {
+    let mut chunk =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], values.len());
+    for (row_idx, value) in values.iter().enumerate() {
+        let column = chunk.column_mut(0).expect("column must exist");
+        match value {
+            Some(value) => column.set_value(row_idx, &Value::Integer(*value)),
+            None => column.set_value(row_idx, &Value::Null(LogicalType::Integer)),
+        }
+    }
+    chunk.set_cardinality(values.len());
+    chunk
+}
+
+fn build_hash_table_from_optional(
+    join_type: JoinType,
+    condition: JoinCondition,
+    build_keys: &[Option<i32>],
+    build_payload: &[i32],
+) -> JoinHashTable {
+    let ht = JoinHashTable::new(
+        create_test_buffer_pool(),
+        paro_common::test_utils::test_allocator(),
+        vec![condition],
+        vec![LogicalType::Integer],
+        join_type,
+        JoinHashTableConfig::default(),
+    );
+
+    let keys = chunk_from_optional_i32(build_keys);
+    let payload = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                build_payload,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    ht.build(&keys, &payload).unwrap();
+    ht.finalize().unwrap();
+    ht
+}
+
+fn prepare_probe(ht: &JoinHashTable, probe_keys: &[i32]) -> (ScanStructure, Chunk, Chunk) {
+    let keys = Chunk::from_arc_vectors(
+        vec![Arc::new(
+            paro_common::test_utils::test_i32_vector_with_allocator(
+                probe_keys,
+                paro_common::test_utils::test_allocator(),
+            ),
+        )],
+        paro_common::test_utils::test_allocator(),
+    );
+    let left = keys.clone();
+    let mut scan = ht
+        .create_scan_structure()
+        .expect("test scan structure allocation failed");
+    ht.probe(&keys, &mut scan, None, keys.size()).unwrap();
+    (scan, keys, left)
+}
+
+#[test]
+fn test_scan_structure_new() {
+    let ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
+        .expect("test scan structure allocation failed");
+    assert_eq!(ss.count, 0);
+    assert!(ss.is_null);
+    assert!(!ss.finished);
+    assert_eq!(ss.pointer_offset, 16);
+}
+
+#[test]
+fn test_scan_structure_reset() {
+    let mut ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
+        .expect("test scan structure allocation failed");
+    ss.count = 5;
+    ss.finished = true;
+    ss.is_null = false;
+    ss.found_match[0] = true;
+
+    ss.reset();
+
+    assert_eq!(ss.count, 0);
+    assert!(!ss.is_null);
+    assert!(!ss.finished);
+    assert!(!ss.found_match[0]);
+}
+
+#[test]
+fn test_pointers_exhausted() {
+    let mut ss = ScanStructure::try_new(16, paro_common::test_utils::test_allocator())
+        .expect("test scan structure allocation failed");
+    assert!(ss.pointers_exhausted());
+
+    ss.count = 1;
+    assert!(!ss.pointers_exhausted());
+}
+
+#[test]
+fn test_next_left_join_emits_matches_then_unmatched_rows() {
+    let ht = build_hash_table(JoinType::Left, &[1, 2], &[10, 20]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1, 3]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        2,
+    );
+
+    let first = scan
+        .next_left_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(first, 1);
+    assert_eq!(result.data[0].get_value(0).to_string(), "1");
+    assert_eq!(result.data[1].get_value(0).to_string(), "10");
+
+    let second = scan
+        .next_left_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(second, 1);
+    assert_eq!(result.data[0].get_value(0).to_string(), "3");
+    assert!(result.data[1].is_null(0));
+}
+
+#[test]
+fn test_next_semi_anti_and_mark_join() {
+    let ht = build_hash_table(JoinType::Inner, &[1, 2], &[10, 20]);
+
+    let (mut semi_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
+    let mut semi_result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
+    let semi_count = semi_scan
+        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
+        .unwrap();
+    assert_eq!(semi_count, 1);
+    assert_eq!(semi_result.data[0].get_value(0).to_string(), "1");
+
+    let (mut anti_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
+    let mut anti_result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 2);
+    let anti_count = anti_scan
+        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
+        .unwrap();
+    assert_eq!(anti_count, 1);
+    assert_eq!(anti_result.data[0].get_value(0).to_string(), "3");
+
+    let (mut mark_scan, keys, left) = prepare_probe(&ht, &[1, 3]);
+    let mut mark_result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Boolean],
+        2,
+    );
+    let mark_count = mark_scan
+        .next_mark_join(&keys, &left, &mut mark_result, &ht, &[0])
+        .unwrap();
+    assert_eq!(mark_count, 2);
+    assert_eq!(mark_result.data[1].get_value(0).to_string(), "true");
+    assert_eq!(mark_result.data[1].get_value(1).to_string(), "false");
+}
+
+#[test]
+fn existence_joins_drain_probe_batches_larger_than_the_output_vector() {
+    let row_count = VECTOR_SIZE * 2;
+    let keys = (0..row_count as i32).collect::<Vec<_>>();
+    let payload = keys.clone();
+    let mut result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], VECTOR_SIZE);
+
+    let semi_table = build_hash_table(JoinType::Semi, &keys, &payload);
+    let (mut semi_scan, probe_keys, left) = prepare_probe(&semi_table, &keys);
+    for batch in 0..2 {
+        let count = semi_scan
+            .next_semi_join(&probe_keys, &left, &mut result, &semi_table, &[0])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(semi_scan.finished);
+
+    let anti_table = build_hash_table(JoinType::Anti, &[-1], &[-1]);
+    let (mut anti_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
+    for batch in 0..2 {
+        let count = anti_scan
+            .next_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(anti_scan.finished);
+
+    let (mut null_aware_scan, probe_keys, left) = prepare_probe(&anti_table, &keys);
+    for batch in 0..2 {
+        let count = null_aware_scan
+            .next_null_aware_anti_join(&probe_keys, &left, &mut result, &anti_table, &[0])
+            .unwrap();
+        assert_eq!(count, VECTOR_SIZE);
+        assert_eq!(
+            result.data[0].get_value(0),
+            Value::Integer((batch * VECTOR_SIZE) as i32)
+        );
+    }
+    assert!(null_aware_scan.finished);
+}
+
+#[test]
+fn test_not_distinct_from_semi_and_anti_join_respect_null_matches() {
+    let ht = build_hash_table_from_optional(
+        JoinType::Semi,
+        not_distinct_condition(),
+        &[None, Some(2)],
+        &[10, 20],
+    );
+
+    let keys = chunk_from_optional_i32(&[None, Some(1), Some(2)]);
+    let left = keys.clone();
+
+    let mut semi_scan = ht
+        .create_scan_structure()
+        .expect("test scan structure allocation failed");
+    ht.probe(&keys, &mut semi_scan, None, keys.size()).unwrap();
+    let mut semi_result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
+    let semi_count = semi_scan
+        .next_semi_join(&keys, &left, &mut semi_result, &ht, &[0])
+        .unwrap();
+    assert_eq!(semi_count, 2);
+    assert!(semi_result.data[0].is_null(0));
+    assert_eq!(semi_result.data[0].get_value(1).to_string(), "2");
+
+    let mut anti_scan = ht
+        .create_scan_structure()
+        .expect("test scan structure allocation failed");
+    ht.probe(&keys, &mut anti_scan, None, keys.size()).unwrap();
+    let mut anti_result =
+        paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Integer], 3);
+    let anti_count = anti_scan
+        .next_anti_join(&keys, &left, &mut anti_result, &ht, &[0])
+        .unwrap();
+    assert_eq!(anti_count, 1);
+    assert_eq!(anti_result.data[0].get_value(0).to_string(), "1");
+}
+
+#[test]
+fn test_next_single_join_null_fills_unmatched_rows() {
+    let ht = build_hash_table(JoinType::Single, &[1, 2], &[10, 20]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1, 3]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        2,
+    );
+
+    let count = scan
+        .next_single_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(count, 2);
+    assert_eq!(result.data[0].get_value(0).to_string(), "1");
+    assert_eq!(result.data[1].get_value(0).to_string(), "10");
+    assert_eq!(result.data[0].get_value(1).to_string(), "3");
+    assert!(result.data[1].is_null(1));
+}
+
+#[test]
+fn test_next_single_join_errors_on_duplicates() {
+    let ht = build_hash_table(JoinType::Single, &[1, 1], &[10, 11]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        1,
+    );
+
+    let err = scan
+        .next_single_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap_err();
+    assert!(err
+        .to_string()
+        .contains("More than one row returned by a SINGLE join"));
+}
+
+#[test]
+fn test_next_single_join_drains_probe_larger_than_output_vector() {
+    let row_count = VECTOR_SIZE * 2;
+    let keys = (0..row_count as i32).collect::<Vec<_>>();
+    let payload = keys.iter().map(|key| key * 10).collect::<Vec<_>>();
+    let ht = build_hash_table(JoinType::Single, &keys, &payload);
+    let (mut scan, probe_keys, left) = prepare_probe(&ht, &keys);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        VECTOR_SIZE,
+    );
+
+    let first = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(first, VECTOR_SIZE);
+    assert!(!scan.finished);
+    assert_eq!(result.data[0].get_value(0), Value::Integer(0));
+    assert_eq!(
+        result.data[0].get_value(VECTOR_SIZE - 1),
+        Value::Integer((VECTOR_SIZE - 1) as i32)
+    );
+
+    let second = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(second, VECTOR_SIZE);
+    assert!(scan.finished);
+    assert_eq!(
+        result.data[0].get_value(0),
+        Value::Integer(VECTOR_SIZE as i32)
+    );
+    assert_eq!(
+        result.data[1].get_value(VECTOR_SIZE - 1),
+        Value::Integer((row_count as i32 - 1) * 10)
+    );
+}
+
+#[test]
+fn test_next_single_join_uses_capacity_after_output_reset() {
+    let keys = [1, 2, 3, 4];
+    let ht = build_hash_table(JoinType::Single, &keys, &[10, 20, 30, 40]);
+    let (mut scan, probe_keys, left) = prepare_probe(&ht, &keys);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        2,
+    );
+    // A prior operator may advertise a transient capacity larger than the
+    // chunk's reset layout. SINGLE join must size its batch after restoring
+    // that layout.
+    result.set_capacity(4);
+
+    let first = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(first, 2);
+    assert!(!scan.finished);
+
+    let second = scan
+        .next_single_join(&probe_keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(second, 2);
+    assert!(scan.finished);
+    assert_eq!(result.data[1].get_value(1), Value::Integer(40));
+}
+
+#[test]
+fn test_next_right_semi_or_anti_join_marks_build_rows() {
+    let ht = build_hash_table(JoinType::RightSemi, &[1, 2], &[10, 20]);
+    let (mut scan, keys, _left) = prepare_probe(&ht, &[1]);
+
+    let count = scan.next_right_semi_or_anti_join(&keys, &ht).unwrap();
+    assert_eq!(count, 0);
+
+    let mut matched_state = ht.create_full_outer_scan_state();
+    let mut matched = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
+    let matched_count = ht
+        .scan_full_outer(&mut matched_state, true, &mut matched)
+        .unwrap();
+    assert_eq!(matched_count, 1);
+    assert_eq!(matched.data[0].get_value(0).to_string(), "10");
+
+    let mut unmatched_state = ht.create_full_outer_scan_state();
+    let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
+    let unmatched_count = ht
+        .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
+        .unwrap();
+    assert_eq!(unmatched_count, 1);
+    assert_eq!(unmatched.data[0].get_value(0).to_string(), "20");
+}
+
+#[test]
+fn test_next_right_semi_or_anti_join_marks_all_duplicate_build_rows() {
+    let ht = build_hash_table(JoinType::RightSemi, &[3, 3], &[30, 31]);
+    let (mut scan, keys, _left) = prepare_probe(&ht, &[3, 3]);
+
+    let count = scan.next_right_semi_or_anti_join(&keys, &ht).unwrap();
+    assert_eq!(count, 0);
+
+    let mut matched_state = ht.create_full_outer_scan_state();
+    let mut matched = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
+    let matched_count = ht
+        .scan_full_outer(&mut matched_state, true, &mut matched)
+        .unwrap();
+    assert_eq!(matched_count, 2);
+    assert_eq!(matched.data[0].get_value(0).to_string(), "30");
+    assert_eq!(matched.data[0].get_value(1).to_string(), "31");
+
+    let mut unmatched_state = ht.create_full_outer_scan_state();
+    let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
+    let unmatched_count = ht
+        .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
+        .unwrap();
+    assert_eq!(unmatched_count, 0);
+}
+
+#[test]
+fn test_next_inner_join_marks_build_rows_for_right_join_source_scan() {
+    let ht = build_hash_table(JoinType::Right, &[1, 2], &[10, 20]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Integer],
+        1,
+    );
+
+    let count = scan
+        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+    assert_eq!(count, 1);
+    assert_eq!(result.data[0].get_value(0).to_string(), "1");
+    assert_eq!(result.data[1].get_value(0).to_string(), "10");
+    assert!(Arc::ptr_eq(&result.data[0], &left.data[0]));
+
+    let mut unmatched_state = ht.create_full_outer_scan_state();
+    let mut unmatched = Chunk::try_new(paro_common::test_utils::test_allocator())
+        .expect("test chunk allocation failed");
+    let unmatched_count = ht
+        .scan_full_outer(&mut unmatched_state, false, &mut unmatched)
+        .unwrap();
+    assert_eq!(unmatched_count, 1);
+    assert_eq!(unmatched.data[0].get_value(0).to_string(), "20");
+}
+
+#[test]
+fn exact_unique_left_only_inner_join_reuses_index_selection() {
+    let ht = build_hash_table(JoinType::Inner, &[1, 2], &[10, 20]);
+    let (mut scan, _keys, left) = prepare_probe(&ht, &[1, 3, 2]);
+    // The dedicated method is selected only after an exact index probe. Keep
+    // the unit test independent of which integer-index strategy the small
+    // fixture's statistics admit.
+    scan.exact_key_matches = true;
+    scan.has_long_chains = false;
+    // The shared output-layout contract must rebuild both a mismatched type
+    // and insufficient capacity before installing dictionary vectors.
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(&[LogicalType::Varchar], 1);
+
+    let count = scan
+        .next_exact_unique_left_only_inner_join(&left, &mut result, &[0])
+        .unwrap();
+
+    assert_eq!(count, 2);
+    assert_eq!(result.capacity(), VECTOR_SIZE);
+    assert_eq!(result.data[0].logical_type(), &LogicalType::Integer);
+    assert_eq!(result.data[0].get_value(0), Value::Integer(1));
+    assert_eq!(result.data[0].get_value(1), Value::Integer(2));
+    assert!(scan.finished);
+    assert_eq!(scan.count, 0);
+}
+
+#[test]
+fn repeated_build_matches_preserve_varlen_payload_as_dictionary() {
+    let ht = build_string_hash_table(&[1, 2], &["shared-build-value", "other"]);
+    let (mut scan, keys, left) = prepare_probe(&ht, &[1, 1, 1]);
+    let mut result = paro_common::test_utils::test_chunk_with_capacity(
+        &[LogicalType::Integer, LogicalType::Varchar],
+        3,
+    );
+
+    let count = scan
+        .next_inner_join(&keys, &left, &mut result, &ht, &[0])
+        .unwrap();
+
+    assert_eq!(count, 3);
+    assert_eq!(
+        result.data[1].vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+    assert_eq!(
+        result.data[1]
+            .dictionary_info()
+            .expect("build dictionary metadata")
+            .unique_len,
+        1
+    );
+    for row_idx in 0..count {
+        assert_eq!(
+            result.data[1].get_value(row_idx),
+            Value::Varchar("shared-build-value".to_string())
+        );
+    }
+}

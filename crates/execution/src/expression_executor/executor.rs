@@ -3,10 +3,14 @@
 
 //! Compiled expression executor.
 
-use std::cell::RefCell;
+mod fusion;
+
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::fmt;
 use std::sync::Arc;
+
+use smallvec::SmallVec;
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::chunk::Chunk;
@@ -28,6 +32,7 @@ use crate::runtime::{ExpressionEvalInput, ParameterBindings};
 
 use super::comparison::{compile_comparison_dispatch, COMPARISON_EXEC_CTX};
 use super::execution_state::BoundFunctionContext;
+use super::like_pattern::{select_prepared_like, sql_like, PreparedLikePattern};
 use super::predicate::{
     accumulate_selected_rows, build_marked_selection, copy_selection, scan_bool_selection,
     scan_false_bool_selection, scan_null_selection, select_all_rows,
@@ -55,9 +60,26 @@ pub struct CompiledExpressionProgram {
 #[derive(Debug)]
 pub struct CompiledExecutorState {
     states: Vec<CompiledExpressionState>,
-    shared_states: Vec<Option<CompiledExpressionState>>,
+    shared_states: Vec<SharedStateSlot>,
     shared_slots: Vec<SharedExpressionSlot>,
     batch_epoch: u64,
+}
+
+impl CompiledExecutorState {
+    fn release_batch_references(&mut self) {
+        for state in &mut self.states {
+            state.release_batch_references();
+        }
+        for state in &self.shared_states {
+            if let Some(mut state) = SharedStateLease::take(state) {
+                state.state_mut().release_batch_references();
+            }
+        }
+        for slot in &mut self.shared_slots {
+            slot.value = ValueSlot::Empty;
+            slot.signature = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -72,6 +94,31 @@ pub struct VectorKernelInput<'a> {
     pub params: Option<&'a ParameterBindings>,
     pub selection: Option<&'a SelectionVector>,
     pub count: usize,
+}
+
+struct FusedOutputSet {
+    outputs: SmallVec<[bool; 64]>,
+}
+
+impl FusedOutputSet {
+    fn new(output_count: usize) -> Self {
+        let mut outputs = SmallVec::new();
+        outputs.resize(output_count, false);
+        Self { outputs }
+    }
+
+    fn pair_is_available(&self, first: usize, second: usize) -> bool {
+        !self.outputs[first] && !self.outputs[second]
+    }
+
+    fn mark_pair(&mut self, first: usize, second: usize) {
+        self.outputs[first] = true;
+        self.outputs[second] = true;
+    }
+
+    fn contains(&self, output: usize) -> bool {
+        self.outputs[output]
+    }
 }
 
 impl<'a> VectorKernelInput<'a> {
@@ -106,9 +153,59 @@ impl<'a> VectorKernelInput<'a> {
 
 struct SharedEvaluation<'a> {
     nodes: &'a [PhysicalExpression],
-    states: &'a mut [Option<CompiledExpressionState>],
+    states: &'a [SharedStateSlot],
     slots: &'a mut [SharedExpressionSlot],
     epoch: u64,
+}
+
+/// Temporarily owns a shared expression state and restores it on every exit,
+/// including panic unwinding. State cells and scratch slots are disjoint
+/// fields, so nested evaluation can reborrow the latter without a lock, raw
+/// pointer, or unwind fence in the vector hot path.
+struct SharedStateLease<'a> {
+    slot: &'a SharedStateSlot,
+    state: Option<CompiledExpressionState>,
+}
+
+struct SharedStateSlot(Cell<Option<CompiledExpressionState>>);
+
+impl SharedStateSlot {
+    fn new(state: CompiledExpressionState) -> Self {
+        Self(Cell::new(Some(state)))
+    }
+}
+
+impl fmt::Debug for SharedStateSlot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SharedStateSlot(..)")
+    }
+}
+
+impl<'a> SharedStateLease<'a> {
+    fn take(slot: &'a SharedStateSlot) -> Option<Self> {
+        let state = slot.0.take()?;
+        Some(Self {
+            slot,
+            state: Some(state),
+        })
+    }
+
+    fn state_mut(&mut self) -> &mut CompiledExpressionState {
+        self.state
+            .as_mut()
+            .expect("shared state lease always owns its state")
+    }
+}
+
+impl Drop for SharedStateLease<'_> {
+    fn drop(&mut self) {
+        let previous = self.slot.0.replace(Some(
+            self.state
+                .take()
+                .expect("shared state lease always restores its state"),
+        ));
+        debug_assert!(previous.is_none(), "shared state slot restored twice");
+    }
 }
 
 thread_local! {
@@ -117,6 +214,15 @@ thread_local! {
 }
 
 impl SharedEvaluation<'_> {
+    fn signature(&self, sel: Option<&SelectionVector>, count: usize) -> SharedBatchSignature {
+        SharedBatchSignature {
+            epoch: self.epoch,
+            count,
+            selection_identity: selection_identity(sel),
+            selection_hash: selection_hash(sel, count),
+        }
+    }
+
     fn execute_value(
         &mut self,
         expr: &PhysicalSharedExpression,
@@ -131,12 +237,7 @@ impl SharedEvaluation<'_> {
             .get(expr.slot)
             .ok_or_else(|| paro_error::internal("shared expression node out of bounds"))?;
 
-        let signature = SharedBatchSignature {
-            epoch: self.epoch,
-            count,
-            selection_identity: selection_identity(sel),
-            selection_hash: selection_hash(sel, count),
-        };
+        let signature = self.signature(sel, count);
         if self
             .slots
             .get(expr.slot)
@@ -160,6 +261,76 @@ impl SharedEvaluation<'_> {
             .ok_or_else(|| paro_error::internal("shared expression cache slot was not stored"))
     }
 
+    /// Execute a shared expression root directly into its caller-owned output.
+    ///
+    /// Shared child evaluation keeps node-local scratch because several
+    /// parents may borrow it. A root already has a stable batch-lifetime owner:
+    /// the output chunk. Caching a reference to that owner avoids copying the
+    /// complete scratch vector into the output and lets the output allocation
+    /// be reused after the cache is cleared at the next batch boundary.
+    fn execute_into(
+        &mut self,
+        expr: &PhysicalSharedExpression,
+        chunk: &Chunk,
+        sel: Option<&SelectionVector>,
+        count: usize,
+        runtime: &dyn FunctionExecContext,
+        params: Option<&ParameterBindings>,
+        result: &mut Vector,
+    ) -> Result<()> {
+        let signature = self.signature(sel, count);
+        if self
+            .slots
+            .get(expr.slot)
+            .is_some_and(|slot| slot.signature == Some(signature))
+        {
+            return self.slots[expr.slot]
+                .value
+                .evaluated(false)
+                .ok_or_else(|| paro_error::internal("shared expression cache slot was empty"))?
+                .write_into(result);
+        }
+
+        let nodes = self.nodes;
+        let states = self.states;
+        let epoch = self.epoch;
+        let slots = &mut *self.slots;
+        let node = nodes
+            .get(expr.slot)
+            .ok_or_else(|| paro_error::internal("shared expression node out of bounds"))?;
+        let state_slot = states
+            .get(expr.slot)
+            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
+        let mut state = SharedStateLease::take(state_slot)
+            .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
+        let mut nested = SharedEvaluation {
+            nodes,
+            states,
+            slots,
+            epoch,
+        };
+        ExpressionExecutor::execute_into_inner(
+            node,
+            state.state_mut(),
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+            result,
+            &mut nested,
+        )?;
+        drop(state);
+
+        let slot = nested
+            .slots
+            .get_mut(expr.slot)
+            .ok_or_else(|| paro_error::internal("shared expression scratch slot out of bounds"))?;
+        slot.value.set_value(result.reference());
+        slot.signature = Some(signature);
+        Ok(())
+    }
+
     fn execute_uncached(
         &mut self,
         slot: usize,
@@ -170,22 +341,31 @@ impl SharedEvaluation<'_> {
         runtime: &dyn FunctionExecContext,
         params: Option<&ParameterBindings>,
     ) -> Result<EvaluatedValue> {
-        let mut state = self
-            .states
-            .get_mut(slot)
-            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?
-            .take()
+        let nodes = self.nodes;
+        let states = self.states;
+        let epoch = self.epoch;
+        let slots = &mut *self.slots;
+        let state_slot = states
+            .get(slot)
+            .ok_or_else(|| paro_error::internal("shared expression state out of bounds"))?;
+        let mut state = SharedStateLease::take(state_slot)
             .ok_or_else(|| paro_error::internal("recursive shared expression evaluation"))?;
-        let value = catch_unwind(AssertUnwindSafe(|| {
-            ExpressionExecutor::execute_value(
-                node, &mut state, chunk, sel, count, runtime, params, self,
-            )
-        }));
-        self.states[slot] = Some(state);
-        match value {
-            Ok(value) => value,
-            Err(payload) => resume_unwind(payload),
-        }
+        let mut nested = SharedEvaluation {
+            nodes,
+            states,
+            slots,
+            epoch,
+        };
+        ExpressionExecutor::execute_value(
+            node,
+            state.state_mut(),
+            chunk,
+            sel,
+            count,
+            runtime,
+            params,
+            &mut nested,
+        )
     }
 }
 
@@ -290,7 +470,7 @@ impl ExpressionExecutor {
             .map(|root_idx| Self::initialize(physical.unique_root(root_idx)))
             .collect();
         let shared_states = (0..physical.shared_expression_count())
-            .map(|slot| Some(Self::initialize(physical.shared_node(slot))))
+            .map(|slot| SharedStateSlot::new(Self::initialize(physical.shared_node(slot))))
             .collect();
         let shared_slots = physical
             .scratch_layout()
@@ -399,6 +579,7 @@ impl ExpressionExecutor {
                         .map(|_| ValueSlot::default())
                         .collect(),
                     in_list: Self::prepare_in_list(e),
+                    like_pattern: Self::prepare_like_pattern(e),
                     result: ValueSlot::default(),
                     aux: ValueSlot::default(),
                     scratch: ValueSlot::default(),
@@ -456,6 +637,10 @@ impl ExpressionExecutor {
     ) -> Result<()> {
         let physical = &self.program.physical;
         let output_types = physical.root_return_types();
+        // A failed execution also releases its transient references before
+        // returning, so this is only a defensive cleanup for callers that
+        // abandon a partially evaluated batch through unwinding.
+        self.state.release_batch_references();
         Self::prepare_output_chunk(
             result,
             &output_types,
@@ -463,45 +648,83 @@ impl ExpressionExecutor {
             runtime.allocator(MemoryTag::BaseTable),
         )?;
 
-        let CompiledExecutorState {
-            states,
-            shared_states,
-            shared_slots,
-            batch_epoch,
-        } = &mut self.state;
-        *batch_epoch = batch_epoch.wrapping_add(1);
-        let mut shared = SharedEvaluation {
-            nodes: physical.shared_nodes(),
-            states: shared_states,
-            slots: shared_slots,
-            epoch: *batch_epoch,
+        let execution = {
+            let CompiledExecutorState {
+                states,
+                shared_states,
+                shared_slots,
+                batch_epoch,
+            } = &mut self.state;
+            *batch_epoch = batch_epoch.wrapping_add(1);
+            let mut shared = SharedEvaluation {
+                nodes: physical.shared_nodes(),
+                states: shared_states,
+                slots: shared_slots,
+                epoch: *batch_epoch,
+            };
+            (|| {
+                let mut fused_outputs = FusedOutputSet::new(physical.root_count());
+                for chain in physical.decimal_factor_chains() {
+                    if !fused_outputs
+                        .pair_is_available(chain.producer_output, chain.consumer_output)
+                    {
+                        continue;
+                    }
+                    if Self::try_execute_decimal_factor_chain(
+                        chain,
+                        physical,
+                        states,
+                        input,
+                        runtime,
+                        result,
+                        &mut shared,
+                    )? {
+                        fused_outputs.mark_pair(chain.producer_output, chain.consumer_output);
+                    }
+                }
+                for expr_idx in 0..physical.root_count() {
+                    if fused_outputs.contains(expr_idx) {
+                        continue;
+                    }
+                    let first_output = physical.root_first_output(expr_idx);
+                    if first_output < expr_idx {
+                        result.data[expr_idx] = Arc::clone(&result.data[first_output]);
+                        continue;
+                    }
+                    let column = result.column_mut(expr_idx).ok_or_else(|| {
+                        paro_error::internal(format!("Output column {} not found", expr_idx))
+                    })?;
+                    let state_idx = physical.root_state_index(expr_idx);
+                    let expr = physical.root(expr_idx);
+                    if let PhysicalExpression::Shared(expr) = expr {
+                        shared.execute_into(
+                            expr,
+                            input.columns,
+                            input.selection,
+                            input.count,
+                            runtime,
+                            input.params,
+                            column,
+                        )?;
+                    } else {
+                        Self::execute_into_inner(
+                            expr,
+                            &mut states[state_idx],
+                            input.columns,
+                            input.selection,
+                            input.count,
+                            runtime,
+                            input.params,
+                            column,
+                            &mut shared,
+                        )?;
+                    }
+                }
+                result.try_set_cardinality(input.count)
+            })()
         };
-
-        for expr_idx in 0..physical.root_count() {
-            let first_output = self.program.physical.root_first_output(expr_idx);
-            if first_output < expr_idx {
-                result.data[expr_idx] = Arc::clone(&result.data[first_output]);
-                continue;
-            }
-            let column = result.column_mut(expr_idx).ok_or_else(|| {
-                paro_error::internal(format!("Output column {} not found", expr_idx))
-            })?;
-            let state_idx = physical.root_state_index(expr_idx);
-            let expr = physical.root(expr_idx);
-            Self::execute_into_inner(
-                expr,
-                &mut states[state_idx],
-                input.columns,
-                input.selection,
-                input.count,
-                runtime,
-                input.params,
-                column,
-                &mut shared,
-            )?;
-        }
-        result.set_cardinality(input.count);
-        Ok(())
+        self.state.release_batch_references();
+        execution
     }
 
     pub fn execute_kernel_into(
@@ -514,30 +737,34 @@ impl ExpressionExecutor {
         let physical = &self.program.physical;
         let state_idx = physical.root_state_index(expr_idx);
         let expr = physical.root(expr_idx);
-        let CompiledExecutorState {
-            states,
-            shared_states,
-            shared_slots,
-            batch_epoch,
-        } = &mut self.state;
-        *batch_epoch = batch_epoch.wrapping_add(1);
-        let mut shared = SharedEvaluation {
-            nodes: physical.shared_nodes(),
-            states: shared_states,
-            slots: shared_slots,
-            epoch: *batch_epoch,
+        let execution = {
+            let CompiledExecutorState {
+                states,
+                shared_states,
+                shared_slots,
+                batch_epoch,
+            } = &mut self.state;
+            *batch_epoch = batch_epoch.wrapping_add(1);
+            let mut shared = SharedEvaluation {
+                nodes: physical.shared_nodes(),
+                states: shared_states,
+                slots: shared_slots,
+                epoch: *batch_epoch,
+            };
+            Self::execute_into_inner(
+                expr,
+                &mut states[state_idx],
+                input.columns,
+                input.selection,
+                input.count,
+                runtime,
+                input.params,
+                result,
+                &mut shared,
+            )
         };
-        Self::execute_into_inner(
-            expr,
-            &mut states[state_idx],
-            input.columns,
-            input.selection,
-            input.count,
-            runtime,
-            input.params,
-            result,
-            &mut shared,
-        )
+        self.state.release_batch_references();
+        execution
     }
 
     pub fn select_into(
@@ -566,30 +793,34 @@ impl ExpressionExecutor {
         let physical = &self.program.physical;
         let state_idx = physical.root_state_index(expr_idx);
         let expr = physical.root(expr_idx);
-        let CompiledExecutorState {
-            states,
-            shared_states,
-            shared_slots,
-            batch_epoch,
-        } = &mut self.state;
-        *batch_epoch = batch_epoch.wrapping_add(1);
-        let mut shared = SharedEvaluation {
-            nodes: physical.shared_nodes(),
-            states: shared_states,
-            slots: shared_slots,
-            epoch: *batch_epoch,
+        let execution = {
+            let CompiledExecutorState {
+                states,
+                shared_states,
+                shared_slots,
+                batch_epoch,
+            } = &mut self.state;
+            *batch_epoch = batch_epoch.wrapping_add(1);
+            let mut shared = SharedEvaluation {
+                nodes: physical.shared_nodes(),
+                states: shared_states,
+                slots: shared_slots,
+                epoch: *batch_epoch,
+            };
+            Self::select_expression(
+                expr,
+                &mut states[state_idx],
+                input.columns,
+                input.selection,
+                input.count,
+                runtime,
+                input.params,
+                sel,
+                &mut shared,
+            )
         };
-        Self::select_expression(
-            expr,
-            &mut states[state_idx],
-            input.columns,
-            input.selection,
-            input.count,
-            runtime,
-            input.params,
-            sel,
-            &mut shared,
-        )
+        self.state.release_batch_references();
+        execution
     }
 
     pub fn execute_expression(
@@ -786,6 +1017,12 @@ impl ExpressionExecutor {
         slot.prepare_scratch(logical_type, count, allocator)
     }
 
+    /// Prepare the argument container for a function invocation.
+    ///
+    /// Its columns are borrowed references to child results and are replaced
+    /// in full before the function runs. Resetting the previous columns would
+    /// make those shared vectors exclusive (and therefore copy their complete
+    /// buffers) only to drop them immediately afterwards.
     fn prepare_intermediate_chunk<'a>(
         intermediate_types: &[LogicalType],
         intermediate_chunk: &'a mut Option<Chunk>,
@@ -795,24 +1032,22 @@ impl ExpressionExecutor {
         let required_capacity = count.max(1);
         let needs_reinit = intermediate_chunk
             .as_ref()
-            .map(|chunk| {
-                chunk.capacity() < required_capacity || chunk.types() != intermediate_types
-            })
-            .unwrap_or(true);
+            .is_none_or(|chunk| chunk.capacity() < required_capacity);
         if needs_reinit {
-            *intermediate_chunk = Some(Chunk::try_initialize(
-                intermediate_types,
-                required_capacity,
-                allocator,
-            )?);
+            let mut chunk = Chunk::try_new(allocator)?;
+            chunk.set_capacity(required_capacity);
+            chunk.data.reserve(intermediate_types.len());
+            *intermediate_chunk = Some(chunk);
         } else if let Some(chunk) = intermediate_chunk.as_mut() {
-            chunk.try_reset(chunk.allocator().clone())?;
+            chunk.clear_columns();
         }
-        let chunk = intermediate_chunk
+        let intermediate = intermediate_chunk
             .as_mut()
             .expect("intermediate chunk initialized");
-        chunk.set_cardinality(count);
-        Ok(chunk)
+        // Cardinality is independent of physical columns. Zero-argument
+        // functions still receive one logical input row in scalar projections.
+        intermediate.try_set_cardinality(count)?;
+        Ok(intermediate)
     }
 
     fn store_value(slot: &mut ValueSlot, value: &EvaluatedValue) {
@@ -1050,6 +1285,19 @@ impl ExpressionExecutor {
         }
     }
 
+    fn prepare_like_pattern(expr: &PhysicalOperatorExpression) -> Option<PreparedLikePattern> {
+        if !matches!(expr.operator_type, OperatorType::Like | OperatorType::ILike) {
+            return None;
+        }
+        let PhysicalExpression::Constant(pattern) = expr.children.get(1)? else {
+            return None;
+        };
+        let Value::Varchar(pattern) = &pattern.value else {
+            return None;
+        };
+        PreparedLikePattern::try_new(pattern, matches!(expr.operator_type, OperatorType::ILike))
+    }
+
     fn prepare_i32_in_values(values: &[Value]) -> Option<Vec<i32>> {
         let mut typed = values
             .iter()
@@ -1276,6 +1524,29 @@ impl ExpressionExecutor {
                             output_sel,
                         )))
                     }
+                    OperatorType::Like | OperatorType::ILike => {
+                        let Some(pattern) = state.like_pattern.as_ref() else {
+                            return Ok(None);
+                        };
+                        let value = Self::execute_value(
+                            &expr.children[0],
+                            &mut state.child_states[0],
+                            chunk,
+                            input_sel,
+                            count,
+                            runtime,
+                            params,
+                            shared,
+                        )?;
+                        Self::store_value(&mut state.child_results[0], &value);
+                        Ok(Some(select_prepared_like(
+                            value.as_vector(),
+                            pattern,
+                            input_sel,
+                            count,
+                            output_sel,
+                        )?))
+                    }
                     _ => Ok(None),
                 }
             }
@@ -1357,10 +1628,10 @@ impl ExpressionExecutor {
             count,
             allocator.clone(),
         )?;
-        for (child_idx, child_expr) in expr.children.iter().enumerate() {
+        for (child_expr, child_state) in expr.children.iter().zip(child_states.iter_mut()) {
             let child_value = Self::execute_value(
                 child_expr,
-                &mut child_states[child_idx],
+                child_state,
                 chunk,
                 sel,
                 count,
@@ -1368,10 +1639,11 @@ impl ExpressionExecutor {
                 params,
                 shared,
             )?;
-            intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
+            intermediate.try_push_column(Arc::new(child_value.as_vector().reference()), count)?;
         }
+        debug_assert_eq!(intermediate.column_count(), intermediate_types.len());
         Self::ensure_function_local_state(&expr.function, local_state, runtime)?;
-        if let Some(cached_result) = Self::try_dictionary_cached_function(
+        let cached_result = Self::try_dictionary_cached_function(
             expr,
             intermediate,
             count,
@@ -1380,7 +1652,16 @@ impl ExpressionExecutor {
             local_state.as_deref(),
             cached_dictionary_input_id,
             cached_dictionary_output,
-        )? {
+        );
+        let cached_result = match cached_result {
+            Ok(result) => result,
+            Err(error) => {
+                intermediate.clear_columns();
+                return Err(error);
+            }
+        };
+        if let Some(cached_result) = cached_result {
+            intermediate.clear_columns();
             *result = cached_result;
             return Ok(());
         }
@@ -1390,8 +1671,11 @@ impl ExpressionExecutor {
             expr.function.bind_data.as_deref(),
             local_state.as_deref(),
         );
-        expr.function
-            .execute(intermediate, &function_context, result)
+        let execution = expr
+            .function
+            .execute(intermediate, &function_context, result);
+        intermediate.clear_columns();
+        execution
     }
 
     fn execute_function_value(
@@ -1421,10 +1705,10 @@ impl ExpressionExecutor {
             count,
             allocator.clone(),
         )?;
-        for (child_idx, child_expr) in expr.children.iter().enumerate() {
+        for (child_expr, child_state) in expr.children.iter().zip(child_states.iter_mut()) {
             let child_value = Self::execute_value(
                 child_expr,
-                &mut child_states[child_idx],
+                child_state,
                 chunk,
                 sel,
                 count,
@@ -1432,10 +1716,11 @@ impl ExpressionExecutor {
                 params,
                 shared,
             )?;
-            intermediate.data[child_idx] = Arc::new(child_value.as_vector().reference());
+            intermediate.try_push_column(Arc::new(child_value.as_vector().reference()), count)?;
         }
+        debug_assert_eq!(intermediate.column_count(), intermediate_types.len());
         Self::ensure_function_local_state(&expr.function, local_state, runtime)?;
-        if let Some(cached_result) = Self::try_dictionary_cached_function(
+        let cached_result = Self::try_dictionary_cached_function(
             expr,
             intermediate,
             count,
@@ -1444,7 +1729,16 @@ impl ExpressionExecutor {
             local_state.as_deref(),
             cached_dictionary_input_id,
             cached_dictionary_output,
-        )? {
+        );
+        let cached_result = match cached_result {
+            Ok(result) => result,
+            Err(error) => {
+                intermediate.clear_columns();
+                return Err(error);
+            }
+        };
+        if let Some(cached_result) = cached_result {
+            intermediate.clear_columns();
             return Ok(EvaluatedValue::Borrowed(cached_result));
         }
         let result_vector = Self::prepare_slot_result(result, &expr.return_type, count, allocator)?;
@@ -1453,8 +1747,11 @@ impl ExpressionExecutor {
             expr.function.bind_data.as_deref(),
             local_state.as_deref(),
         );
-        expr.function
-            .execute(intermediate, &function_context, result_vector)?;
+        let execution = expr
+            .function
+            .execute(intermediate, &function_context, result_vector);
+        intermediate.clear_columns();
+        execution?;
         Ok(result.evaluated(true).expect("function result initialized"))
     }
 
@@ -2000,6 +2297,58 @@ impl ExpressionExecutor {
                     .expect("is null result initialized"))
             }
             OperatorType::Coalesce => {
+                // The common nullable-column/default form needs neither
+                // short-circuit selections nor evaluation of a constant
+                // child. Copy the column once and patch only its NULL rows.
+                // This is particularly important after outer joins, where a
+                // defaulted aggregate state is often consumed immediately by
+                // another vectorized operator.
+                if let [child_expr, PhysicalExpression::Constant(fallback)] =
+                    expr.children.as_slice()
+                {
+                    if fallback.return_type == expr.return_type
+                        && fallback.value.logical_type().physical_type()
+                            == expr.return_type.physical_type()
+                        && !fallback.value.is_null()
+                        && !matches!(
+                            fallback.value,
+                            Value::List(..) | Value::Struct(..) | Value::Array(..)
+                        )
+                    {
+                        let child = Self::execute_value(
+                            child_expr,
+                            &mut state.child_states[0],
+                            chunk,
+                            sel,
+                            count,
+                            runtime,
+                            params,
+                            shared,
+                        )?;
+                        Self::store_value(&mut state.child_results[0], &child);
+                        let result = Self::prepare_slot_result(
+                            &mut state.result,
+                            &expr.return_type,
+                            count,
+                            runtime.allocator(MemoryTag::BaseTable),
+                        )?;
+                        result.try_copy_range(0, child.as_vector(), 0, count)?;
+                        for row_idx in 0..count {
+                            if child.as_vector().is_null(row_idx) {
+                                if !result.try_set_scalar_value(row_idx, &fallback.value)? {
+                                    return Err(paro_error::internal(
+                                        "scalar COALESCE fast path received a nested fallback",
+                                    ));
+                                }
+                            }
+                        }
+                        return Ok(state
+                            .result
+                            .evaluated(true)
+                            .expect("coalesce result initialized"));
+                    }
+                }
+
                 let result = Self::prepare_slot_result(
                     &mut state.result,
                     &expr.return_type,
@@ -2204,39 +2553,54 @@ impl ExpressionExecutor {
                     params,
                     shared,
                 )?;
-                let pattern = Self::execute_value(
-                    &expr.children[1],
-                    &mut state.child_states[1],
-                    chunk,
-                    sel,
-                    count,
-                    runtime,
-                    params,
-                    shared,
-                )?;
                 Self::store_value(&mut state.child_results[0], &value);
-                Self::store_value(&mut state.child_results[1], &pattern);
 
-                let result = Self::prepare_slot_result(
-                    &mut state.result,
-                    &LogicalType::Boolean,
-                    count,
-                    runtime.allocator(MemoryTag::BaseTable),
-                )?;
                 let case_insensitive = matches!(expr.operator_type, OperatorType::ILike);
-                for row_idx in 0..count {
-                    if value.as_vector().is_null(row_idx) || pattern.as_vector().is_null(row_idx) {
-                        result.set_null(row_idx, true);
-                        continue;
+                if let Some(pattern) = state.like_pattern.as_ref() {
+                    let result = Self::prepare_slot_result(
+                        &mut state.result,
+                        &LogicalType::Boolean,
+                        count,
+                        runtime.allocator(MemoryTag::BaseTable),
+                    )?;
+                    let values = value.as_vector().try_to_utf8_view(count)?;
+                    for row_idx in 0..count {
+                        if !values.is_valid(row_idx) {
+                            result.set_null(row_idx, true);
+                            continue;
+                        }
+                        result.set_bool(row_idx, pattern.matches(values.str(row_idx)));
                     }
-                    let value = value
-                        .as_vector()
-                        .get_string(row_idx)
-                        .ok_or_else(|| paro_error::internal("LIKE left operand was not VARCHAR"))?;
-                    let pattern = pattern.as_vector().get_string(row_idx).ok_or_else(|| {
-                        paro_error::internal("LIKE pattern operand was not VARCHAR")
-                    })?;
-                    result.set_bool(row_idx, sql_like(value, pattern, case_insensitive));
+                } else {
+                    let pattern = Self::execute_value(
+                        &expr.children[1],
+                        &mut state.child_states[1],
+                        chunk,
+                        sel,
+                        count,
+                        runtime,
+                        params,
+                        shared,
+                    )?;
+                    Self::store_value(&mut state.child_results[1], &pattern);
+                    let result = Self::prepare_slot_result(
+                        &mut state.result,
+                        &LogicalType::Boolean,
+                        count,
+                        runtime.allocator(MemoryTag::BaseTable),
+                    )?;
+                    let values = value.as_vector().try_to_utf8_view(count)?;
+                    let patterns = pattern.as_vector().try_to_utf8_view(count)?;
+                    for row_idx in 0..count {
+                        if !values.is_valid(row_idx) || !patterns.is_valid(row_idx) {
+                            result.set_null(row_idx, true);
+                            continue;
+                        }
+                        result.set_bool(
+                            row_idx,
+                            sql_like(values.str(row_idx), patterns.str(row_idx), case_insensitive),
+                        );
+                    }
                 }
 
                 Ok(state
@@ -2597,91 +2961,6 @@ impl ExpressionExecutor {
     }
 }
 
-fn sql_like(value: &str, pattern: &str, case_insensitive: bool) -> bool {
-    // TPC-H strings and patterns are ASCII. Keep that path allocation-free;
-    // the Unicode path below only allocates the two linear character arrays.
-    if value.is_ascii() && pattern.is_ascii() {
-        return sql_like_tokens(
-            value.as_bytes(),
-            pattern.as_bytes(),
-            b'%',
-            b'_',
-            b'\\',
-            |left, right| {
-                if case_insensitive {
-                    left.eq_ignore_ascii_case(&right)
-                } else {
-                    left == right
-                }
-            },
-        );
-    }
-
-    // Unicode case folding can change the number of scalar values, so normalize
-    // both strings before tokenization instead of folding individual characters.
-    let (value, pattern) = if case_insensitive {
-        (value.to_lowercase(), pattern.to_lowercase())
-    } else {
-        (value.to_owned(), pattern.to_owned())
-    };
-    let value = value.chars().collect::<Vec<_>>();
-    let pattern = pattern.chars().collect::<Vec<_>>();
-    sql_like_tokens(&value, &pattern, '%', '_', '\\', |left, right| {
-        left == right
-    })
-}
-
-fn sql_like_tokens<T, F>(value: &[T], pattern: &[T], any: T, one: T, escape: T, equals: F) -> bool
-where
-    T: Copy + PartialEq,
-    F: Fn(T, T) -> bool,
-{
-    let mut value_idx = 0;
-    let mut pattern_idx = 0;
-    let mut wildcard = None;
-    let mut wildcard_value_idx = 0;
-
-    while value_idx < value.len() {
-        if pattern_idx < pattern.len() {
-            let token = pattern[pattern_idx];
-            if token == any {
-                wildcard = Some(pattern_idx);
-                pattern_idx += 1;
-                wildcard_value_idx = value_idx;
-                continue;
-            }
-            if token == one {
-                value_idx += 1;
-                pattern_idx += 1;
-                continue;
-            }
-            if token == escape && pattern_idx + 1 < pattern.len() {
-                if equals(value[value_idx], pattern[pattern_idx + 1]) {
-                    value_idx += 1;
-                    pattern_idx += 2;
-                    continue;
-                }
-            } else if equals(value[value_idx], token) {
-                value_idx += 1;
-                pattern_idx += 1;
-                continue;
-            }
-        }
-
-        let Some(wildcard_idx) = wildcard else {
-            return false;
-        };
-        wildcard_value_idx += 1;
-        value_idx = wildcard_value_idx;
-        pattern_idx = wildcard_idx + 1;
-    }
-
-    while pattern_idx < pattern.len() && pattern[pattern_idx] == any {
-        pattern_idx += 1;
-    }
-    pattern_idx == pattern.len()
-}
-
 #[cfg(test)]
 mod tests {
     use std::any::Any;
@@ -3001,7 +3280,7 @@ mod tests {
         ))
     }
 
-    #[derive(Debug, Clone, PartialEq)]
+    #[derive(Debug, Clone, PartialEq, Hash)]
     struct OffsetBindData {
         offset: i32,
     }
@@ -3016,6 +3295,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .is_some_and(|other| other == self)
+        }
+
+        fn fingerprint(&self) -> u64 {
+            paro_function::scalar::function_data_fingerprint(self)
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -3102,6 +3385,10 @@ mod tests {
                 .as_any()
                 .downcast_ref::<Self>()
                 .is_some_and(|other| Arc::ptr_eq(&self.counter, &other.counter))
+        }
+
+        fn fingerprint(&self) -> u64 {
+            Arc::as_ptr(&self.counter) as usize as u64
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -3974,7 +4261,7 @@ mod tests {
     }
 
     #[test]
-    fn function_intermediate_chunk_allocates_lazily_and_reuses_capacity() {
+    fn function_intermediate_chunk_releases_borrows_and_reuses_capacity() {
         let session = test_session();
         let runtime = test_runtime(session);
         let expr = add_one_expr(0);
@@ -4011,7 +4298,9 @@ mod tests {
             .as_ref()
             .expect("intermediate chunk should be initialized after first execution");
         let first_capacity = first_chunk.capacity();
-        assert_eq!(first_chunk.column_count(), 1);
+        let first_column_capacity = first_chunk.data.capacity();
+        assert_eq!(first_chunk.column_count(), 0);
+        assert!(first_column_capacity >= 1);
 
         let smaller_input = integer_chunk(&[7]);
         executor
@@ -4034,7 +4323,8 @@ mod tests {
             .as_ref()
             .expect("intermediate chunk should stay allocated");
         assert_eq!(reused_chunk.capacity(), first_capacity);
-        assert_eq!(reused_chunk.column_count(), 1);
+        assert_eq!(reused_chunk.data.capacity(), first_column_capacity);
+        assert_eq!(reused_chunk.column_count(), 0);
 
         let larger_input = integer_chunk(&[1, 2, 3, 4, 5]);
         executor
@@ -4056,7 +4346,8 @@ mod tests {
             .as_ref()
             .expect("intermediate chunk should remain allocated");
         assert!(expanded_chunk.capacity() >= larger_input.size());
-        assert_eq!(expanded_chunk.column_count(), 1);
+        assert!(expanded_chunk.data.capacity() >= 1);
+        assert_eq!(expanded_chunk.column_count(), 0);
     }
 
     #[test]
@@ -4107,6 +4398,33 @@ mod tests {
         assert_eq!(first_output_ptr, second_output_ptr);
         assert_eq!(output.get_value(0, 0), Some(Value::Integer(5)));
         assert_eq!(output.get_value(0, 1), Some(Value::Integer(6)));
+    }
+
+    #[test]
+    fn zero_argument_functions_receive_the_input_cardinality_and_runtime_context() {
+        let session = TestStatementContextBuilder::minimal()
+            .with_current_user("alice")
+            .build();
+        let runtime = test_runtime(session);
+        let function = BoundScalarFunction::from(
+            paro_function::scalar::system::get_current_user_functions().functions[0].clone(),
+        );
+        let expression = Expression::Function(FunctionExpression::new(
+            function,
+            Vec::new(),
+            LogicalType::Varchar,
+        ));
+        let mut executor = ExpressionExecutor::new(&expression);
+        let mut input =
+            Chunk::try_new(paro_common::test_utils::test_allocator()).expect("input chunk");
+        input.set_cardinality(1);
+
+        let result = executor
+            .execute_expression(0, &input, None, 1, &runtime)
+            .expect("zero-argument function execution");
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result.get_string(0), Some("alice"));
     }
 
     #[test]
@@ -4205,6 +4523,44 @@ mod tests {
             .execute_all_into(&integer_chunk(&[3]), &runtime, &mut output)
             .expect("next batch should recompute shared scratch");
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn shared_expression_root_owns_and_reuses_its_output_allocation() {
+        let session = test_session();
+        let runtime = test_runtime(session);
+        let (shared_expr, counter) = cached_identity_expr(0);
+        let consumer = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::GreaterThan,
+            shared_expr.clone(),
+            constant_i32(0),
+        ));
+        let mut executor = ExpressionExecutor::with_expressions(&[shared_expr, consumer]);
+        let mut output = Chunk::try_new(paro_common::test_utils::test_allocator())
+            .expect("test chunk allocation failed");
+
+        executor
+            .execute_all_into(&integer_chunk(&[1, 2, 3]), &runtime, &mut output)
+            .expect("first shared root batch should execute");
+        let mut first_allocations = Vec::new();
+        output.data[0].collect_allocation_entries(&mut first_allocations);
+
+        executor
+            .execute_all_into(&integer_chunk(&[4, 5, 6]), &runtime, &mut output)
+            .expect("second shared root batch should execute");
+        executor
+            .execute_all_into(&integer_chunk(&[7, 8, 9]), &runtime, &mut output)
+            .expect("third shared root batch should execute");
+        let mut second_allocations = Vec::new();
+        output.data[0].collect_allocation_entries(&mut second_allocations);
+
+        // Reusable chunks rotate between two reset buffers. Returning to the
+        // first allocation on the third batch proves no retained expression
+        // reference forced that buffer through copy-on-write.
+        assert_eq!(counter.load(Ordering::SeqCst), 3);
+        assert_eq!(first_allocations, second_allocations);
+        assert_eq!(output.get_value(0, 0), Some(Value::Integer(7)));
+        assert_eq!(output.get_value(0, 2), Some(Value::Integer(9)));
     }
 
     #[test]
@@ -4310,6 +4666,34 @@ mod tests {
         assert!(cache.contains_program(std::slice::from_ref(&keep), &version));
         assert!(cache.contains_program(std::slice::from_ref(&insert), &version));
         assert!(!cache.contains_program(std::slice::from_ref(&evict), &version));
+    }
+
+    #[test]
+    fn expression_program_cache_rejects_identities_larger_than_its_node_budget() {
+        let expr = greater_than_i32(0, 10);
+        let version = ExpressionProgramVersion::anonymous();
+        let mut cache =
+            crate::expression_executor::physical::ExpressionProgramCache::with_limits(16, 1);
+
+        let first = cache.get_or_compile(std::slice::from_ref(&expr), version.clone());
+        let second = cache.get_or_compile(std::slice::from_ref(&expr), version);
+
+        assert!(!Arc::ptr_eq(&first, &second));
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.hits(), 0);
+        assert_eq!(cache.misses(), 2);
+    }
+
+    #[test]
+    fn fused_output_set_tracks_wide_projections_without_a_fixed_bit_limit() {
+        let mut outputs = FusedOutputSet::new(130);
+
+        assert!(outputs.pair_is_available(64, 129));
+        outputs.mark_pair(64, 129);
+
+        assert!(outputs.contains(64));
+        assert!(outputs.contains(129));
+        assert!(!outputs.pair_is_available(0, 64));
     }
 
     #[test]

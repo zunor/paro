@@ -8,13 +8,20 @@ use crate::error::{self as paro_error, Result};
 use crate::types::LogicalType;
 use crate::vector::Vector;
 
+mod decode;
+
+pub use decode::SortKeyDecoder;
+
 const NULL_FIRST_BYTE: u8 = 1;
 const NULL_LAST_BYTE: u8 = 2;
 const STRING_DELIMITER: u8 = 0;
 const BLOB_ESCAPE_CHARACTER: u8 = 1;
 const VARIABLE_INLINE_PREFIX_LEN: usize = 16;
-const VARIABLE_SLOT_SIZE: usize = 32;
+const VARIABLE_SLOT_SIZE: usize = VARIABLE_INLINE_PREFIX_LEN + 4 * std::mem::size_of::<u32>();
 const TRANSFORM_BUFFER_LEN: usize = 256;
+
+/// Largest fixed slot required by the current normalized sort-key contract.
+pub const MAX_SORT_KEY_SLOT_SIZE: usize = VARIABLE_SLOT_SIZE;
 
 trait KeyWriter {
     fn push_byte(&mut self, byte: u8);

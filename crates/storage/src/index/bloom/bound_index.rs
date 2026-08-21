@@ -85,15 +85,12 @@ impl BloomFilterIndex {
         self.logical_types.first()
     }
 
-    fn page_ranges_or_default(&self) -> Vec<PageRange> {
+    fn page_ranges(&self) -> Option<&[PageRange]> {
         let num_pages = self.reader.num_filters();
         if self.page_ranges.len() == num_pages {
-            return self.page_ranges.clone();
+            return Some(&self.page_ranges);
         }
-
-        (0..num_pages)
-            .map(|idx| PageRange::new(idx as u32, idx as u32 + 1))
-            .collect()
+        None
     }
 
     fn storage_info_with_ranges(&self) -> IndexStorageInfo {
@@ -122,7 +119,9 @@ impl BloomFilterIndex {
             return PredicateResult::Unknown;
         };
 
-        let ranges = self.page_ranges_or_default();
+        let Some(ranges) = self.page_ranges() else {
+            return PredicateResult::Unknown;
+        };
         let mut valid = Vec::new();
         for (idx, range) in ranges.iter().enumerate() {
             if idx >= self.reader.num_filters() {
@@ -156,7 +155,9 @@ impl BloomFilterIndex {
             }
         }
 
-        let ranges = self.page_ranges_or_default();
+        let Some(ranges) = self.page_ranges() else {
+            return PredicateResult::Unknown;
+        };
         let mut valid = Vec::new();
         for (idx, range) in ranges.iter().enumerate() {
             if idx >= self.reader.num_filters() {
@@ -297,7 +298,7 @@ impl BoundIndex for BloomFilterIndex {
         if self.column_ids.len() != 1 {
             return PredicateResult::Unknown;
         }
-        if predicate.column_id() != self.column_ids[0] {
+        if predicate.index_column_id() != Some(self.column_ids[0]) {
             return PredicateResult::Unknown;
         }
 
@@ -351,5 +352,29 @@ mod tests {
             }
             _ => panic!("expected page ranges"),
         }
+    }
+
+    #[test]
+    fn missing_page_ranges_disable_bloom_pruning() {
+        let mut writer = BloomFilterIndexWriter::new(BloomFilterOptions::default());
+        writer.add_value(b"apple");
+        writer.flush();
+        let index = BloomFilterIndex::from_writer(
+            "bf",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Varchar],
+            &mut writer,
+            Vec::new(),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            index.evaluate_predicate(&Predicate::Eq {
+                column_id: 0,
+                value: Value::Varchar("missing".to_string()),
+            }),
+            PredicateResult::Unknown
+        ));
     }
 }

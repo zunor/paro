@@ -25,10 +25,10 @@ pub mod vector;
 
 // Re-export public types
 pub use expression_state::{ExpressionState, FunctionExecContext};
-pub use function_data::{function_data_equals, FunctionData};
+pub use function_data::{function_data_equals, function_data_fingerprint, FunctionData};
 pub use local_state::FunctionLocalState;
 pub use scalar_function::{
     BoundScalarFunction, DictionaryStrategy, FunctionErrorMode, FunctionNullHandling,
     FunctionSideEffects, FunctionStability, InitLocalStateFn, ScalarBindFn, ScalarBindInput,
-    ScalarDispatch, ScalarFunction, ScalarFunctionFn, ScalarFunctionSet,
+    ScalarDispatch, ScalarFunction, ScalarFunctionFn, ScalarFunctionSet, ScalarPredicateProjection,
 };

@@ -36,15 +36,8 @@ impl<'a> PipelineLowerer<'a> {
                 let (source, mut transforms) = self.collect_linear_roles(join_root)?;
                 let source_handles = source.clone();
                 transforms.extend(consumer_transforms);
-                let pushed = self.push_pipeline(
-                    source,
-                    transforms,
-                    sink,
-                    sink_sharing,
-                    output,
-                    pipelines,
-                    dependencies,
-                )?;
+                let pushed =
+                    self.push_pipeline(source, transforms, sink, sink_sharing, output, pipelines)?;
                 self.add_source_handle_dependencies(&source_handles, pushed.entry, dependencies)?;
                 return Ok(pushed.tail);
             }
@@ -108,7 +101,6 @@ impl<'a> PipelineLowerer<'a> {
                 handle: delim_values,
                 duplicate_keys: spec.duplicate_keys.clone(),
                 cached_outer: Some(cached_outer),
-                required: Default::default(),
             }),
             SinkSharing::Exclusive,
             capture_row_type,

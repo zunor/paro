@@ -59,6 +59,13 @@ impl ParallelDecompressor {
         &self.allocator
     }
 
+    /// Whether two handles describe the same execution resource and policy.
+    /// Segment reuse must not silently retain an allocator from an older
+    /// statement or a different decompression parallelism setting.
+    pub(crate) fn runtime_equivalent(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.allocator, &other.allocator) && self.max_threads == other.max_threads
+    }
+
     /// Decompress a single page body.
     pub fn decompress_one(
         &self,

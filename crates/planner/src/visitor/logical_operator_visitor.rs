@@ -170,6 +170,11 @@ where
                 callback(expr);
             }
         }
+        LogicalOperator::RowFetch(fetch) => {
+            for source in &mut fetch.sources {
+                callback(&mut source.rowid);
+            }
+        }
         LogicalOperator::ExternalProject(project) => {
             for expr in &mut project.expressions {
                 callback(&mut expr.expression);
@@ -202,6 +207,15 @@ where
             }
             for expr in &mut agg.aggregates {
                 callback(expr);
+            }
+            if let Some(reduction) = &mut agg.post_reduction {
+                for reducer in &mut reduction.reducers {
+                    callback(reducer);
+                }
+                for scalar in &mut reduction.scalar_expressions {
+                    callback(scalar);
+                }
+                callback(&mut reduction.predicate);
             }
         }
         LogicalOperator::Insert(_insert) => {

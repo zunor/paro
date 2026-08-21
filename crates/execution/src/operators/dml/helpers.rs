@@ -261,7 +261,7 @@ pub(crate) fn collect_row_ids(
 
 pub(crate) fn primary_key_columns(table: &TableCatalogEntry) -> Option<Vec<usize>> {
     table
-        .constraints
+        .constraints()
         .iter()
         .find(|constraint| constraint.constraint_type == ConstraintType::PrimaryKey)
         .map(|constraint| constraint.columns.clone())

@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::index::bound_index::BoundIndex;
+use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation};
 use crate::index::page_layout::PageLayout;
 use crate::index::predicate::{Predicate, PredicateTree};
 use crate::index::predicate_result::{
@@ -54,35 +54,55 @@ impl IndexEvaluator {
 
     /// Evaluate a predicate tree using available indexes.
     pub fn evaluate(&self, predicate_tree: &PredicateTree) -> PredicateResult {
+        self.evaluate_with_proof(predicate_tree).candidates
+    }
+
+    /// Evaluate candidates and guaranteed-true rows through one tree walk.
+    pub fn evaluate_with_proof(&self, predicate_tree: &PredicateTree) -> IndexPredicateEvaluation {
         match predicate_tree {
             PredicateTree::Leaf(predicate) => self.evaluate_single(predicate),
             PredicateTree::And(children) => {
-                let mut result = PredicateResult::AllMatch;
+                let mut candidates = PredicateResult::AllMatch;
+                let mut guaranteed = PredicateResult::AllMatch;
                 for child in children {
-                    let child_result = self.evaluate(child);
-                    result = match &self.page_layout {
-                        Some(layout) => intersect_with_layout(&result, &child_result, layout),
-                        None => intersect(&result, &child_result),
+                    let child = self.evaluate_with_proof(child);
+                    candidates = match &self.page_layout {
+                        Some(layout) => {
+                            intersect_with_layout(&candidates, &child.candidates, layout)
+                        }
+                        None => intersect(&candidates, &child.candidates),
                     };
-                    if matches!(result, PredicateResult::NoneMatch) {
-                        return result;
+                    if matches!(candidates, PredicateResult::NoneMatch) {
+                        // `guaranteed ⊆ candidates` makes the proof empty too;
+                        // no remaining child can make an AND row eligible.
+                        return IndexPredicateEvaluation::candidates_only(
+                            PredicateResult::NoneMatch,
+                        );
                     }
+                    guaranteed = match &self.page_layout {
+                        Some(layout) => {
+                            intersect_with_layout(&guaranteed, &child.guaranteed, layout)
+                        }
+                        None => intersect(&guaranteed, &child.guaranteed),
+                    };
                 }
-                result
+                IndexPredicateEvaluation::new(candidates, guaranteed)
             }
             PredicateTree::Or(children) => {
-                let mut result = PredicateResult::NoneMatch;
+                let mut candidates = PredicateResult::NoneMatch;
+                let mut guaranteed = PredicateResult::NoneMatch;
                 for child in children {
-                    let child_result = self.evaluate(child);
-                    result = match &self.page_layout {
-                        Some(layout) => union_with_layout(&result, &child_result, layout),
-                        None => union(&result, &child_result),
+                    let child = self.evaluate_with_proof(child);
+                    candidates = match &self.page_layout {
+                        Some(layout) => union_with_layout(&candidates, &child.candidates, layout),
+                        None => union(&candidates, &child.candidates),
                     };
-                    if matches!(result, PredicateResult::AllMatch) {
-                        return result;
-                    }
+                    guaranteed = match &self.page_layout {
+                        Some(layout) => union_with_layout(&guaranteed, &child.guaranteed, layout),
+                        None => union(&guaranteed, &child.guaranteed),
+                    };
                 }
-                result
+                IndexPredicateEvaluation::new(candidates, guaranteed)
             }
         }
     }
@@ -91,19 +111,33 @@ impl IndexEvaluator {
     ///
     /// Indexes are pre-filtered by column_id (stored in the HashMap)
     /// and sorted by priority (ART > Bitmap > Bloom > ZoneMap).
-    fn evaluate_single(&self, predicate: &Predicate) -> PredicateResult {
-        let Some(indexes) = self.indexes.get(&predicate.column_id()) else {
-            return PredicateResult::Unknown;
+    fn evaluate_single(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        let Some(column_id) = predicate.index_column_id() else {
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
+        };
+        let Some(indexes) = self.indexes.get(&column_id) else {
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
 
+        let mut candidates = PredicateResult::Unknown;
+        let mut guaranteed = PredicateResult::NoneMatch;
         for index in indexes {
-            let result = index.evaluate_predicate(predicate);
-            if !matches!(result, PredicateResult::Unknown) {
-                return result;
+            if !matches!(candidates, PredicateResult::Unknown) && !index.provides_predicate_proof()
+            {
+                continue;
             }
+            let result = index.evaluate_predicate_with_proof(predicate);
+            if matches!(candidates, PredicateResult::Unknown)
+                && !matches!(result.candidates, PredicateResult::Unknown)
+            {
+                candidates = result.candidates;
+            }
+            guaranteed = match &self.page_layout {
+                Some(layout) => union_with_layout(&guaranteed, &result.guaranteed, layout),
+                None => union(&guaranteed, &result.guaranteed),
+            };
         }
-
-        PredicateResult::Unknown
+        IndexPredicateEvaluation::new(candidates, guaranteed)
     }
 }
 
@@ -128,6 +162,7 @@ mod tests {
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
     use roaring::RoaringBitmap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockIndex {
         name: String,
@@ -135,6 +170,7 @@ mod tests {
         column_ids: Vec<ColumnId>,
         logical_types: Vec<LogicalType>,
         result: PredicateResult,
+        evaluations: AtomicUsize,
     }
 
     impl MockIndex {
@@ -145,6 +181,7 @@ mod tests {
                 column_ids: vec![0],
                 logical_types: vec![LogicalType::Integer],
                 result,
+                evaluations: AtomicUsize::new(0),
             }
         }
     }
@@ -211,6 +248,7 @@ mod tests {
         }
 
         fn evaluate_predicate(&self, _predicate: &Predicate) -> PredicateResult {
+            self.evaluations.fetch_add(1, Ordering::Relaxed);
             self.result.clone()
         }
     }
@@ -275,5 +313,46 @@ mod tests {
         let tree = PredicateTree::And(vec![pred_left, pred_right]);
         let result = evaluator.evaluate(&tree);
         assert!(matches!(result, PredicateResult::Bitmap(_)));
+    }
+
+    #[test]
+    fn and_stops_after_the_candidate_set_becomes_empty() {
+        let rejecting = Arc::new(MockIndex::new("ART", PredicateResult::NoneMatch));
+        let evaluator = IndexEvaluator::new(vec![rejecting.clone()]);
+        let leaf = |value| {
+            PredicateTree::leaf(Predicate::Eq {
+                column_id: 0,
+                value: paro_common::runtime_value::Value::Integer(value),
+            })
+        };
+
+        let result = evaluator.evaluate_with_proof(&PredicateTree::And(vec![leaf(1), leaf(2)]));
+
+        assert!(matches!(result.candidates, PredicateResult::NoneMatch));
+        assert!(matches!(result.guaranteed, PredicateResult::NoneMatch));
+        assert_eq!(rejecting.evaluations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn candidate_only_indexes_stop_after_the_highest_priority_answer() {
+        let art = Arc::new(MockIndex::new(
+            "ART",
+            PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
+        ));
+        let bloom = Arc::new(MockIndex::new(
+            "BLOOM",
+            PredicateResult::PageRanges(vec![PageRange::new(0, 10)]),
+        ));
+        let evaluator = IndexEvaluator::new(vec![bloom.clone(), art.clone()]);
+        let predicate = PredicateTree::leaf(Predicate::Eq {
+            column_id: 0,
+            value: paro_common::runtime_value::Value::Integer(1),
+        });
+
+        let result = evaluator.evaluate_with_proof(&predicate);
+
+        assert!(matches!(result.candidates, PredicateResult::Bitmap(_)));
+        assert_eq!(art.evaluations.load(Ordering::Relaxed), 1);
+        assert_eq!(bloom.evaluations.load(Ordering::Relaxed), 0);
     }
 }

@@ -14,7 +14,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use crate::index::bound_index::BoundIndex;
+use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation};
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::{
     decode_page_ranges, encode_page_ranges, PageRange, PredicateResult,
@@ -23,7 +23,25 @@ use crate::index::{
     ColumnId, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType, IndexStorageInfo,
 };
 
-use super::ZoneMapIndexReader;
+use super::{ZoneMapEntry, ZoneMapIndexReader};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PagePredicateTruth {
+    AlwaysTrue,
+    MaybeTrue,
+    AlwaysFalse,
+}
+
+enum EncodedPredicate {
+    Eq(Vec<u8>),
+    NotEq(Vec<u8>),
+    Lt { value: Vec<u8>, inclusive: bool },
+    Gt { value: Vec<u8>, inclusive: bool },
+    Range { lower: Vec<u8>, upper: Vec<u8> },
+    In(Vec<Vec<u8>>),
+    IsNull,
+    IsNotNull,
+}
 
 /// Bound ZoneMap index.
 pub struct ZoneMapIndex {
@@ -65,14 +83,8 @@ impl ZoneMapIndex {
         self.logical_types.first()
     }
 
-    fn page_ranges_or_default(&self) -> Vec<PageRange> {
-        let num_pages = self.reader.num_pages();
-        if self.page_ranges.len() == num_pages {
-            return self.page_ranges.clone();
-        }
-        (0..num_pages)
-            .map(|idx| PageRange::new(idx as u32, idx as u32 + 1))
-            .collect()
+    fn page_ranges(&self) -> Option<&[PageRange]> {
+        (self.page_ranges.len() == self.reader.num_pages()).then_some(&self.page_ranges)
     }
 
     fn storage_info_with_ranges(&self) -> IndexStorageInfo {
@@ -92,230 +104,32 @@ impl ZoneMapIndex {
         info
     }
 
-    fn eval_eq(&self, value: &Value) -> PredicateResult {
-        let logical_type = match self.logical_type() {
-            Some(t) => t,
-            None => return PredicateResult::Unknown,
+    fn evaluate_zonemap(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        let (Some(logical_type), Some(ranges)) = (self.logical_type(), self.page_ranges()) else {
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
-        let Ok(bytes) = value_to_bytes(value, logical_type) else {
-            return PredicateResult::Unknown;
+        let Some(predicate) = encode_predicate(predicate, logical_type) else {
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         };
-
-        let cmp = |a: &[u8], b: &[u8]| {
-            compare_bytes(logical_type, a, b).unwrap_or(std::cmp::Ordering::Equal)
-        };
-
-        if !self.reader.segment_may_contain_range(&bytes, &bytes, cmp) {
-            return PredicateResult::NoneMatch;
-        }
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            if self.reader.page_may_contain_value(idx, &bytes, cmp) {
-                valid.push(*range);
-            }
-        }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
-    }
-
-    fn eval_range(&self, lower: &Value, upper: &Value) -> PredicateResult {
-        let logical_type = match self.logical_type() {
-            Some(t) => t,
-            None => return PredicateResult::Unknown,
-        };
-        let Ok(lower_bytes) = value_to_bytes(lower, logical_type) else {
-            return PredicateResult::Unknown;
-        };
-        let Ok(upper_bytes) = value_to_bytes(upper, logical_type) else {
-            return PredicateResult::Unknown;
-        };
-
-        let cmp = |a: &[u8], b: &[u8]| {
-            compare_bytes(logical_type, a, b).unwrap_or(std::cmp::Ordering::Equal)
-        };
-
-        if !self
-            .reader
-            .segment_may_contain_range(&lower_bytes, &upper_bytes, cmp)
-        {
-            return PredicateResult::NoneMatch;
-        }
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            if self
-                .reader
-                .page_may_contain_range(idx, &lower_bytes, &upper_bytes, cmp)
-            {
-                valid.push(*range);
-            }
-        }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
-    }
-
-    fn eval_is_null(&self) -> PredicateResult {
-        if !self.reader.global_has_null {
-            return PredicateResult::NoneMatch;
-        }
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            if self.reader.page_has_null(idx) {
-                valid.push(*range);
-            }
-        }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
-    }
-
-    fn eval_is_not_null(&self) -> PredicateResult {
-        // A page may contain non-null values unless ALL its values are null.
-        // Since ZoneMap only tracks has_null (not all_null), we conservatively
-        // include all pages. Pages with has_null=false definitely have no nulls.
-        // Pages with has_null=true may or may not have all nulls — keep them.
-        PredicateResult::AllMatch
-    }
-
-    fn eval_in(&self, values: &[Value]) -> PredicateResult {
-        let logical_type = match self.logical_type() {
-            Some(t) => t,
-            None => return PredicateResult::Unknown,
-        };
-
-        // Encode all values
-        let mut encoded_values = Vec::with_capacity(values.len());
-        for value in values {
-            match value_to_bytes(value, logical_type) {
-                Ok(bytes) => encoded_values.push(bytes),
-                Err(_) => return PredicateResult::Unknown,
-            }
-        }
-
-        let cmp = |a: &[u8], b: &[u8]| {
-            compare_bytes(logical_type, a, b).unwrap_or(std::cmp::Ordering::Equal)
-        };
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            // A page matches if ANY of the In-list values falls within its [min, max].
-            let page_hit = encoded_values
-                .iter()
-                .any(|bytes| self.reader.page_may_contain_value(idx, bytes, cmp));
-            if page_hit {
-                valid.push(*range);
-            }
-        }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
-    }
-
-    /// Evaluate column < value (inclusive=false) or column <= value (inclusive=true).
-    ///
-    /// A page matches if its min is < value (or <= value for inclusive).
-    /// Equivalently, a page is excluded only if its min > value (or >= for strict).
-    fn eval_comparison_lt(&self, value: &Value, inclusive: bool) -> PredicateResult {
-        let logical_type = match self.logical_type() {
-            Some(t) => t,
-            None => return PredicateResult::Unknown,
-        };
-        let Ok(bytes) = value_to_bytes(value, logical_type) else {
-            return PredicateResult::Unknown;
-        };
-
-        let cmp = |a: &[u8], b: &[u8]| {
-            compare_bytes(logical_type, a, b).unwrap_or(std::cmp::Ordering::Equal)
-        };
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            // Page has values in [page_min, page_max].
-            // Column < value: need page_min < value  (at least one row could be < value)
-            // Column <= value: need page_min <= value
-            if let Some((page_min, _page_max)) = self.reader.page_min_max(idx) {
-                let ord = cmp(page_min, &bytes);
-                let matches = if inclusive {
-                    ord != std::cmp::Ordering::Greater
-                } else {
-                    ord == std::cmp::Ordering::Less
-                };
-                if matches {
-                    valid.push(*range);
+        let mut candidates = Vec::new();
+        let mut guaranteed = Vec::new();
+        for (entry, range) in self.reader.entries().iter().zip(ranges) {
+            let Some(truth) = classify_page(entry, &predicate, logical_type) else {
+                return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
+            };
+            match truth {
+                PagePredicateTruth::AlwaysTrue => {
+                    candidates.push(*range);
+                    guaranteed.push(*range);
                 }
-            } else {
-                // No min/max info, conservatively include
-                valid.push(*range);
+                PagePredicateTruth::MaybeTrue => candidates.push(*range),
+                PagePredicateTruth::AlwaysFalse => {}
             }
         }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
-    }
-
-    /// Evaluate column > value (inclusive=false) or column >= value (inclusive=true).
-    fn eval_comparison_gt(&self, value: &Value, inclusive: bool) -> PredicateResult {
-        let logical_type = match self.logical_type() {
-            Some(t) => t,
-            None => return PredicateResult::Unknown,
-        };
-        let Ok(bytes) = value_to_bytes(value, logical_type) else {
-            return PredicateResult::Unknown;
-        };
-
-        let cmp = |a: &[u8], b: &[u8]| {
-            compare_bytes(logical_type, a, b).unwrap_or(std::cmp::Ordering::Equal)
-        };
-
-        let ranges = self.page_ranges_or_default();
-        let mut valid = Vec::new();
-        for (idx, range) in ranges.iter().enumerate() {
-            // Column > value: need page_max > value
-            // Column >= value: need page_max >= value
-            if let Some((_page_min, page_max)) = self.reader.page_min_max(idx) {
-                let ord = cmp(page_max, &bytes);
-                let matches = if inclusive {
-                    ord != std::cmp::Ordering::Less
-                } else {
-                    ord == std::cmp::Ordering::Greater
-                };
-                if matches {
-                    valid.push(*range);
-                }
-            } else {
-                valid.push(*range);
-            }
-        }
-
-        if valid.is_empty() {
-            PredicateResult::NoneMatch
-        } else {
-            PredicateResult::PageRanges(valid)
-        }
+        IndexPredicateEvaluation::new(
+            ranges_to_result(candidates, ranges.len()),
+            ranges_to_result(guaranteed, ranges.len()),
+        )
     }
 
     /// Load from IndexStorageInfo buffers/options.
@@ -351,6 +165,188 @@ impl ZoneMapIndex {
         )?;
 
         Ok(Arc::new(index))
+    }
+}
+
+fn encode_predicate(predicate: &Predicate, ty: &LogicalType) -> Option<EncodedPredicate> {
+    let encode = |value: &Value| value_to_bytes(value, ty).ok();
+    match predicate {
+        Predicate::Eq { value, .. } => Some(EncodedPredicate::Eq(encode(value)?)),
+        Predicate::NotEq { value, .. } => Some(EncodedPredicate::NotEq(encode(value)?)),
+        Predicate::Lt { value, .. } => Some(EncodedPredicate::Lt {
+            value: encode(value)?,
+            inclusive: false,
+        }),
+        Predicate::Le { value, .. } => Some(EncodedPredicate::Lt {
+            value: encode(value)?,
+            inclusive: true,
+        }),
+        Predicate::Gt { value, .. } => Some(EncodedPredicate::Gt {
+            value: encode(value)?,
+            inclusive: false,
+        }),
+        Predicate::Ge { value, .. } => Some(EncodedPredicate::Gt {
+            value: encode(value)?,
+            inclusive: true,
+        }),
+        Predicate::Range { lower, upper, .. } => Some(EncodedPredicate::Range {
+            lower: encode(lower)?,
+            upper: encode(upper)?,
+        }),
+        Predicate::In { values, .. } => Some(EncodedPredicate::In(
+            values.iter().map(encode).collect::<Option<Vec<_>>>()?,
+        )),
+        Predicate::IsNull { .. } => Some(EncodedPredicate::IsNull),
+        Predicate::IsNotNull { .. } => Some(EncodedPredicate::IsNotNull),
+        Predicate::FixedIn { .. }
+        | Predicate::StringPrefix { .. }
+        | Predicate::StringPrefixIn { .. }
+        | Predicate::StringLike { .. }
+        | Predicate::ColumnComparison { .. } => None,
+    }
+}
+
+fn classify_page(
+    entry: &ZoneMapEntry,
+    predicate: &EncodedPredicate,
+    ty: &LogicalType,
+) -> Option<PagePredicateTruth> {
+    use std::cmp::Ordering;
+
+    let compare = |left: &[u8], right: &[u8]| compare_bytes(ty, left, right).ok();
+    let contains = |value: &[u8]| {
+        Some(
+            compare(value, &entry.min)? != Ordering::Less
+                && compare(value, &entry.max)? != Ordering::Greater,
+        )
+    };
+    let exact_all_valid = entry.bounds_exact && !entry.has_null;
+    match predicate {
+        EncodedPredicate::Eq(value) => {
+            if !contains(value)? {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            if exact_all_valid
+                && compare(&entry.min, value)? == Ordering::Equal
+                && compare(&entry.max, value)? == Ordering::Equal
+            {
+                Some(PagePredicateTruth::AlwaysTrue)
+            } else {
+                Some(PagePredicateTruth::MaybeTrue)
+            }
+        }
+        EncodedPredicate::NotEq(value) => {
+            let constant_page = entry.bounds_exact
+                && compare(&entry.min, value)? == Ordering::Equal
+                && compare(&entry.max, value)? == Ordering::Equal;
+            if constant_page {
+                Some(PagePredicateTruth::AlwaysFalse)
+            } else if exact_all_valid && !contains(value)? {
+                Some(PagePredicateTruth::AlwaysTrue)
+            } else {
+                Some(PagePredicateTruth::MaybeTrue)
+            }
+        }
+        EncodedPredicate::Lt { value, inclusive } => {
+            let minimum_order = compare(&entry.min, value)?;
+            let candidate = if *inclusive {
+                minimum_order != Ordering::Greater
+            } else {
+                minimum_order == Ordering::Less
+            };
+            if !candidate {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            let maximum_order = compare(&entry.max, value)?;
+            let proven = exact_all_valid
+                && if *inclusive {
+                    maximum_order != Ordering::Greater
+                } else {
+                    maximum_order == Ordering::Less
+                };
+            Some(if proven {
+                PagePredicateTruth::AlwaysTrue
+            } else {
+                PagePredicateTruth::MaybeTrue
+            })
+        }
+        EncodedPredicate::Gt { value, inclusive } => {
+            let maximum_order = compare(&entry.max, value)?;
+            let candidate = if *inclusive {
+                maximum_order != Ordering::Less
+            } else {
+                maximum_order == Ordering::Greater
+            };
+            if !candidate {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            let minimum_order = compare(&entry.min, value)?;
+            let proven = exact_all_valid
+                && if *inclusive {
+                    minimum_order != Ordering::Less
+                } else {
+                    minimum_order == Ordering::Greater
+                };
+            Some(if proven {
+                PagePredicateTruth::AlwaysTrue
+            } else {
+                PagePredicateTruth::MaybeTrue
+            })
+        }
+        EncodedPredicate::Range { lower, upper } => {
+            if compare(&entry.max, lower)? == Ordering::Less
+                || compare(&entry.min, upper)? == Ordering::Greater
+            {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            let proven = exact_all_valid
+                && compare(&entry.min, lower)? != Ordering::Less
+                && compare(&entry.max, upper)? != Ordering::Greater;
+            Some(if proven {
+                PagePredicateTruth::AlwaysTrue
+            } else {
+                PagePredicateTruth::MaybeTrue
+            })
+        }
+        EncodedPredicate::In(values) => {
+            let mut page_may_match = false;
+            for value in values {
+                page_may_match |= contains(value)?;
+            }
+            if !page_may_match {
+                return Some(PagePredicateTruth::AlwaysFalse);
+            }
+            let constant = exact_all_valid
+                && compare(&entry.min, &entry.max)? == Ordering::Equal
+                && values
+                    .iter()
+                    .any(|value| compare(&entry.min, value) == Some(Ordering::Equal));
+            Some(if constant {
+                PagePredicateTruth::AlwaysTrue
+            } else {
+                PagePredicateTruth::MaybeTrue
+            })
+        }
+        EncodedPredicate::IsNull => Some(if entry.has_null {
+            PagePredicateTruth::MaybeTrue
+        } else {
+            PagePredicateTruth::AlwaysFalse
+        }),
+        EncodedPredicate::IsNotNull => Some(if entry.has_null {
+            PagePredicateTruth::MaybeTrue
+        } else {
+            PagePredicateTruth::AlwaysTrue
+        }),
+    }
+}
+
+fn ranges_to_result(ranges: Vec<PageRange>, page_count: usize) -> PredicateResult {
+    if ranges.is_empty() {
+        PredicateResult::NoneMatch
+    } else if ranges.len() == page_count {
+        PredicateResult::AllMatch
+    } else {
+        PredicateResult::PageRanges(ranges)
     }
 }
 
@@ -425,38 +421,30 @@ impl BoundIndex for ZoneMapIndex {
     }
 
     fn evaluate_predicate(&self, predicate: &Predicate) -> PredicateResult {
-        if self.column_ids.len() != 1 {
-            return PredicateResult::Unknown;
-        }
-        if predicate.column_id() != self.column_ids[0] {
-            return PredicateResult::Unknown;
-        }
+        self.evaluate_predicate_with_proof(predicate).candidates
+    }
 
-        match predicate {
-            Predicate::Eq { value, .. } => self.eval_eq(value),
-            Predicate::Range { lower, upper, .. } => self.eval_range(lower, upper),
-            Predicate::IsNull { .. } => self.eval_is_null(),
-            Predicate::In { values, .. } => self.eval_in(values),
-            Predicate::IsNotNull { .. } => self.eval_is_not_null(),
-            // Lt/Le/Gt/Ge: delegate to range with open bound
-            Predicate::Lt { value, .. } | Predicate::Le { value, .. } => {
-                // ZoneMap checks if page [min,max] overlaps with (-∞, value].
-                // We check per-page: if page_min <= value (Lt: page_min < value).
-                self.eval_comparison_lt(value, matches!(predicate, Predicate::Le { .. }))
-            }
-            Predicate::Gt { value, .. } | Predicate::Ge { value, .. } => {
-                self.eval_comparison_gt(value, matches!(predicate, Predicate::Ge { .. }))
-            }
-            // NotEq: ZoneMap cannot precisely exclude a single value
-            Predicate::NotEq { .. } => PredicateResult::Unknown,
+    fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        if self.column_ids.len() != 1 || predicate.index_column_id() != Some(self.column_ids[0]) {
+            return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
         }
+        self.evaluate_zonemap(predicate)
+    }
+
+    fn provides_predicate_proof(&self) -> bool {
+        true
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::zonemap::ZoneMapIndexWriter;
+    use crate::index::zonemap::{BoundsPrecision, ZoneMapIndexWriter};
+
+    fn i32_cmp(left: &[u8], right: &[u8]) -> std::cmp::Ordering {
+        i32::from_le_bytes(left.try_into().unwrap())
+            .cmp(&i32::from_le_bytes(right.try_into().unwrap()))
+    }
 
     #[test]
     fn test_zonemap_eval() {
@@ -465,11 +453,13 @@ mod tests {
             Bytes::from_static(&[10, 0, 0, 0]),
             Bytes::from_static(&[20, 0, 0, 0]),
             false,
+            BoundsPrecision::Exact,
         );
         writer.add(
             Bytes::from_static(&[30, 0, 0, 0]),
             Bytes::from_static(&[40, 0, 0, 0]),
             true,
+            BoundsPrecision::Exact,
         );
         let data = writer.finish();
         let ranges = vec![PageRange::new(0, 3), PageRange::new(3, 6)];
@@ -495,5 +485,133 @@ mod tests {
             }
             _ => panic!("expected page ranges"),
         }
+    }
+
+    #[test]
+    fn inclusive_range_covering_all_valid_segment_is_exact_all_match() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add(
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&20_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+        );
+        writer.add(
+            Bytes::copy_from_slice(&30_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&40_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![PageRange::new(0, 3), PageRange::new(3, 6)],
+        )
+        .unwrap();
+
+        assert!(matches!(
+            index.evaluate_predicate(&Predicate::Range {
+                column_id: 0,
+                lower: Value::Integer(10),
+                upper: Value::Integer(40),
+            }),
+            PredicateResult::AllMatch
+        ));
+    }
+
+    #[test]
+    fn candidate_and_proof_sets_come_from_one_page_classification() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add_with_cmp(
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+            i32_cmp,
+        );
+        writer.add_with_cmp(
+            Bytes::copy_from_slice(&15_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&30_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+            i32_cmp,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![PageRange::new(0, 3), PageRange::new(3, 6)],
+        )
+        .unwrap();
+
+        let outcome = index.evaluate_predicate_with_proof(&Predicate::Le {
+            column_id: 0,
+            value: Value::Integer(20),
+        });
+        assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
+        assert_eq!(
+            outcome.guaranteed,
+            PredicateResult::PageRanges(vec![PageRange::new(0, 3)])
+        );
+    }
+
+    #[test]
+    fn missing_page_layout_disables_pruning_and_proof() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add_with_cmp(
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&20_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Exact,
+            i32_cmp,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            Vec::new(),
+        )
+        .unwrap();
+        let outcome = index.evaluate_predicate_with_proof(&Predicate::Eq {
+            column_id: 0,
+            value: Value::Integer(15),
+        });
+        assert!(matches!(outcome.candidates, PredicateResult::Unknown));
+        assert!(matches!(outcome.guaranteed, PredicateResult::NoneMatch));
+    }
+
+    #[test]
+    fn inexact_bounds_never_prove_value_predicates() {
+        let mut writer = ZoneMapIndexWriter::new();
+        writer.add_with_cmp(
+            Bytes::copy_from_slice(&10_i32.to_le_bytes()),
+            Bytes::copy_from_slice(&20_i32.to_le_bytes()),
+            false,
+            BoundsPrecision::Conservative,
+            i32_cmp,
+        );
+        let index = ZoneMapIndex::from_bytes(
+            "zm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            writer.finish(),
+            vec![PageRange::new(0, 3)],
+        )
+        .unwrap();
+        let outcome = index.evaluate_predicate_with_proof(&Predicate::Range {
+            column_id: 0,
+            lower: Value::Integer(10),
+            upper: Value::Integer(20),
+        });
+        assert!(matches!(outcome.candidates, PredicateResult::AllMatch));
+        assert!(matches!(outcome.guaranteed, PredicateResult::NoneMatch));
     }
 }

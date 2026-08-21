@@ -112,8 +112,11 @@ impl SearchOptimizer {
                 filter_selectivity,
                 topn.hnsw_ef_hint,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -148,8 +151,11 @@ impl SearchOptimizer {
                 intent.query_vector.len(),
                 filter_selectivity,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -185,8 +191,11 @@ impl SearchOptimizer {
                 intent.score_mode,
                 filter_selectivity,
             );
-            let request =
-                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?;
+            let Some(request) =
+                build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
+            else {
+                return Ok(None);
+            };
             let candidate = build_search_candidate(
                 search_intent,
                 capability,
@@ -258,7 +267,9 @@ impl SearchOptimizer {
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 continue;
             };
-            let request = build_filter_request(table_id, get, search_intent)?;
+            let Some(request) = build_filter_request(table_id, get, search_intent)? else {
+                continue;
+            };
 
             let mut other_predicates = filter.expressions.clone();
             let match_expression = other_predicates.remove(match_idx);
@@ -304,7 +315,7 @@ fn build_search_scan(
                 pattern.topn.orders[0].ascending,
                 pattern.topn.limit,
             )
-            .with_output_names(pattern.projection.output_names.clone()),
+            .with_output_names(pattern.projection.visible_names.clone()),
         ),
     }
 }
@@ -371,45 +382,50 @@ fn build_topk_request(
     get: &Get,
     limit: usize,
     intent: SearchIntent,
-) -> Result<NormalizedSearchRequest> {
+) -> Result<Option<NormalizedSearchRequest>> {
+    let Some(projections) = projection_spec(get, matches!(intent, SearchIntent::FullText(_)))
+    else {
+        return Ok(None);
+    };
     let request = NormalizedSearchRequest {
         table_id,
         mode: SearchRequestMode::TopK { limit },
         predicate: None,
-        projections: projection_spec(get, matches!(intent, SearchIntent::FullText(_))),
+        projections,
         intents: vec![intent],
         fusion: None,
     };
     request.validate()?;
-    Ok(request)
+    Ok(Some(request))
 }
 
 fn build_filter_request(
     table_id: u64,
     get: &Get,
     intent: SearchIntent,
-) -> Result<NormalizedSearchRequest> {
+) -> Result<Option<NormalizedSearchRequest>> {
+    let Some(projections) = projection_spec(get, false) else {
+        return Ok(None);
+    };
     let request = NormalizedSearchRequest {
         table_id,
         mode: SearchRequestMode::Filter,
         predicate: None,
-        projections: projection_spec(get, false),
+        projections,
         intents: vec![intent],
         fusion: None,
     };
     request.validate()?;
-    Ok(request)
+    Ok(Some(request))
 }
 
-fn projection_spec(get: &Get, include_score: bool) -> ProjectionSpec {
-    ProjectionSpec {
-        columns: get
-            .column_ids
-            .iter()
-            .map(|&column_id| column_id as u32)
-            .collect(),
+fn projection_spec(get: &Get, include_score: bool) -> Option<ProjectionSpec> {
+    Some(ProjectionSpec {
+        columns: (0..get.returned_types.len())
+            .map(|output| get.stored_column(output).map(|column_id| column_id as u32))
+            .collect::<Option<Vec<_>>>()?,
         include_score,
-    }
+    })
 }
 
 fn get_search_storage(
@@ -439,7 +455,8 @@ fn base_rows(get_plan: &LogicalPlan, get: &Get) -> u64 {
         .or_else(|| {
             get.get_table()
                 .and_then(|table| table.get_storage())
-                .map(|storage| storage.total_rows() as u64)
+                .and_then(|storage| storage.total_rows().ok())
+                .map(|rows| rows as u64)
         })
         .unwrap_or(1000)
 }
@@ -554,7 +571,7 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
 }
 
 fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     let column_type = &get.column_types[column_idx];
@@ -562,7 +579,7 @@ fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
     {
         return None;
     }
-    Some(get.column_ids[column_idx] as u32)
+    Some(get.stored_column(column_idx)? as u32)
 }
 
 fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
@@ -700,11 +717,15 @@ fn extract_sparse_intent(expr: &Expression, get: &Get) -> Result<Option<SparseIn
 }
 
 fn resolve_sparse_column(get: &Get, column_idx: usize) -> Option<u32> {
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx] as u32)
+        .then(|| {
+            get.stored_column(column_idx)
+                .map(|column_id| column_id as u32)
+        })
+        .flatten()
 }
 
 fn extract_query_sparse_vector(
@@ -815,14 +836,20 @@ fn extract_internal_fulltext_query(
     let Some((column_id, tsv_config)) = extract_tsvector_source(&func.children[0], get)? else {
         return Ok(None);
     };
-    let Some((query_text, tsq_config, query_kind)) = extract_tsquery_source(&func.children[1])?
+    let Some((query_text, source_config, query_kind)) = extract_tsquery_source(&func.children[1])?
     else {
         return Ok(None);
     };
-    if !tsv_config.eq_ignore_ascii_case(&tsq_config) {
+    if source_config
+        .as_deref()
+        .is_some_and(|config| !tsv_config.eq_ignore_ascii_case(config))
+    {
         return Ok(None);
     }
-    let query_stats = build_fulltext_query_stats(&query_text, &tsq_config, query_kind)?;
+    // TSQUERY values are already normalized and carry no text-search config in
+    // their SQL type. A folded TSQUERY constant is therefore interpreted in
+    // the indexed TSVECTOR's domain and parsed as canonical tsquery syntax.
+    let query_stats = build_fulltext_query_stats(&query_text, &tsv_config, query_kind)?;
     Ok(Some(FullTextIntent {
         column_id: column_id as u32,
         query: query_text,
@@ -871,8 +898,16 @@ fn extract_tsvector_source(expr: &Expression, get: &Get) -> Result<Option<(usize
 
 fn extract_tsquery_source(
     expr: &Expression,
-) -> Result<Option<(String, String, FullTextQueryKind)>> {
+) -> Result<Option<(String, Option<String>, FullTextQueryKind)>> {
     let expr = strip_casts(expr);
+    if let Expression::Constant(constant) = expr {
+        return Ok(match (&constant.return_type, &constant.value) {
+            (LogicalType::TsQuery, Value::Varchar(query)) => {
+                Some((query.clone(), None, FullTextQueryKind::SerializedTsQuery))
+            }
+            _ => None,
+        });
+    }
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
@@ -902,16 +937,20 @@ fn extract_tsquery_source(
         Some(BuiltinIntrinsicId::WebSearchToTsQuery) => FullTextQueryKind::WebSearch,
         _ => return Ok(None),
     };
-    Ok(Some((query_text, config, query_kind)))
+    Ok(Some((query_text, Some(config), query_kind)))
 }
 
 fn resolve_fulltext_column(get: &Get, column_idx: Option<usize>) -> Option<u32> {
     let column_idx = column_idx?;
-    if column_idx >= get.column_ids.len() || column_idx >= get.column_types.len() {
+    if column_idx >= get.column_types.len() {
         return None;
     }
     matches!(get.column_types[column_idx], LogicalType::Varchar)
-        .then_some(get.column_ids[column_idx] as u32)
+        .then(|| {
+            get.stored_column(column_idx)
+                .map(|column_id| column_id as u32)
+        })
+        .flatten()
 }
 
 fn extract_scan_col_idx(expr: &Expression) -> Option<usize> {
@@ -960,7 +999,7 @@ fn rebuild_topn_from_search(search: &SearchScan) -> LogicalOperator {
         child,
         search.projections.clone(),
     )
-    .with_output_names(search.output_names.clone());
+    .with_visible_names(search.output_names.clone());
     let projection = LogicalPlan::synthetic(LogicalOperator::Projection(projection));
     let order = OrderByNode {
         expression: Expression::Reference(ReferenceExpression::new(
@@ -1051,6 +1090,52 @@ mod tests {
     }
 
     #[test]
+    fn internal_fulltext_match_accepts_a_folded_tsquery_constant() {
+        let get = Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
+        let vector = Expression::Function(FunctionExpression::new(
+            scalar_function(
+                "to_tsvector",
+                vec![LogicalType::Varchar, LogicalType::Varchar],
+                LogicalType::TsVector,
+            ),
+            vec![
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("simple".to_string()),
+                    LogicalType::Varchar,
+                )),
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(1, 0),
+                    LogicalType::Varchar,
+                )),
+            ],
+            LogicalType::TsVector,
+        ));
+        let expression = Expression::Function(FunctionExpression::new(
+            scalar_function(
+                "fulltext_match_internal",
+                vec![LogicalType::TsVector, LogicalType::TsQuery],
+                LogicalType::Boolean,
+            ),
+            vec![
+                vector,
+                Expression::Constant(ConstantExpression::new(
+                    Value::Varchar("vector & database".to_string()),
+                    LogicalType::TsQuery,
+                )),
+            ],
+            LogicalType::Boolean,
+        ));
+
+        let intent = extract_fulltext_match_intent(&expression, &get)
+            .unwrap()
+            .unwrap();
+        assert_eq!(intent.query, "vector & database");
+        assert_eq!(intent.query_kind, FullTextQueryKind::SerializedTsQuery);
+        assert_eq!(intent.config, "simple");
+        assert_eq!(intent.query_stats.effective_query_terms(), 2);
+    }
+
+    #[test]
     fn rebuild_topn_from_search_uses_score_projection_index() {
         let search = SearchScan::new(
             Get::new_without_table(1, vec!["v".to_string()], vec![LogicalType::Varchar]),
@@ -1122,5 +1207,13 @@ mod tests {
             Expression::Reference(reference) => assert_eq!(reference.index, 1),
             other => panic!("expected reference, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn derived_scan_output_declines_stored_search_projection() {
+        let mut get =
+            Get::new_without_table(1, vec!["body".to_string()], vec![LogicalType::Varchar]);
+        get.append_matched_utf8_prefix(0, 2, LogicalType::Varchar);
+        assert!(projection_spec(&get, false).is_none());
     }
 }

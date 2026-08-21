@@ -147,12 +147,13 @@ impl<'a> RemoveUnusedColumns<'a> {
 
     /// Clear unused columns from a Get.
     fn remove_columns_from_get(&mut self, get: &mut paro_planner::operator::Get) {
-        let mut new_column_ids = Vec::new();
+        let mut new_column_sources = Vec::new();
         let mut new_column_types = Vec::new();
+        let mut new_returned_types = Vec::new();
         let mut new_names = Vec::new();
         let mut new_col_idx = 0usize;
 
-        for (old_idx, &col_id) in get.column_ids.iter().enumerate() {
+        for old_idx in 0..get.column_sources.len() {
             let binding = ColumnBinding::new(get.table_index, old_idx);
             if self.is_referenced(&binding) || self.everything_referenced {
                 // Column is referenced, keep it
@@ -162,8 +163,9 @@ impl<'a> RemoveUnusedColumns<'a> {
                     self.replacements
                         .push(ReplacementBinding::new(binding, new_binding));
                 }
-                new_column_ids.push(col_id);
+                new_column_sources.push(get.column_sources[old_idx]);
                 new_column_types.push(get.column_types[old_idx].clone());
+                new_returned_types.push(get.returned_types[old_idx].clone());
                 if old_idx < get.names.len() {
                     new_names.push(get.names[old_idx].clone());
                 }
@@ -171,19 +173,45 @@ impl<'a> RemoveUnusedColumns<'a> {
             }
         }
 
-        // Ensure at least one column
-        if new_column_ids.is_empty() && !get.column_ids.is_empty() {
-            new_column_ids.push(get.column_ids[0]);
-            new_column_types.push(get.column_types[0].clone());
-            if !get.names.is_empty() {
-                new_names.push(get.names[0].clone());
+        get.column_sources = new_column_sources;
+        get.column_types = new_column_types;
+        get.returned_types = new_returned_types;
+        get.names = new_names;
+    }
+
+    fn projected_bindings(
+        plan: &LogicalPlan,
+        projection: &paro_planner::operator::ProjectionMap,
+    ) -> Vec<ColumnBinding> {
+        let bindings = plan.get_column_bindings();
+        match projection.as_columns() {
+            None => bindings,
+            Some(indices) => indices
+                .iter()
+                .filter_map(|index| bindings.get(*index).copied())
+                .collect(),
+        }
+    }
+
+    fn remap_bindings(bindings: &mut [ColumnBinding], replacements: &[ReplacementBinding]) {
+        for replacement in replacements {
+            for binding in bindings.iter_mut() {
+                if *binding == replacement.old_binding {
+                    *binding = replacement.new_binding;
+                }
             }
         }
+    }
 
-        get.column_ids = new_column_ids;
-        get.column_types = new_column_types.clone();
-        get.returned_types = new_column_types;
-        get.names = new_names;
+    fn rebuild_projection_map(
+        plan: &LogicalPlan,
+        projected_bindings: &[ColumnBinding],
+    ) -> Vec<usize> {
+        plan.get_column_bindings()
+            .into_iter()
+            .enumerate()
+            .filter_map(|(index, binding)| projected_bindings.contains(&binding).then_some(index))
+            .collect()
     }
 }
 
@@ -211,6 +239,17 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
     fn visit_operator(&mut self, op: &mut LogicalOperator) {
         match op {
             LogicalOperator::Aggregate(agg) => {
+                // Post-reduction values are hidden from the aggregate's public
+                // schema, so their dependencies cannot arrive from a parent
+                // operator. Register the reducer and predicate references
+                // before pruning; the existing replacement map will then keep
+                // their aggregate ordinals synchronized with compacted output.
+                if let Some(reduction) = &mut agg.post_reduction {
+                    for reducer in &mut reduction.reducers {
+                        self.visit_expression(reducer);
+                    }
+                    self.visit_expression(&mut reduction.predicate);
+                }
                 // - Only aggregates are pruned
                 if !self.everything_referenced {
                     // Clear unused aggregate expressions
@@ -273,15 +312,15 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::Projection(proj) => {
-                let layout_sensitive = proj
-                    .output_names
+                let carries_external_arguments = proj
+                    .visible_names
                     .iter()
-                    .any(|name| name.starts_with("__corr_") || name.starts_with("__external_arg_"));
+                    .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
-                if !self.everything_referenced && !layout_sensitive {
+                if !self.everything_referenced && !carries_external_arguments {
                     self.clear_unused_expressions(
                         &mut proj.expressions,
-                        Some(&mut proj.output_names),
+                        Some(&mut proj.visible_names),
                         proj.table_index,
                     );
 
@@ -292,7 +331,7 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                                 value: paro_common::runtime_value::Value::Integer(42),
                                 return_type: paro_common::types::LogicalType::Integer,
                             }));
-                        proj.output_names = vec!["42".to_string()];
+                        proj.visible_names = vec!["42".to_string()];
                     }
 
                     // Update returned types
@@ -319,8 +358,55 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                         .replace_binding(replacement.old_binding, replacement.new_binding);
                 }
             }
+            LogicalOperator::RowFetch(fetch) => {
+                // Fetched catalog namespaces are produced by this boundary, not
+                // by its carrier. Keep only the exact physical catalog ordinals
+                // observed above this node, then pass only carrier references
+                // into the child.
+                if !self.everything_referenced {
+                    fetch.sources.retain_mut(|source| {
+                        source.needed_columns = self
+                            .column_references
+                            .keys()
+                            .filter(|binding| {
+                                binding.table_index == source.materialized_table_index
+                            })
+                            .map(|binding| binding.column_index)
+                            .filter(|column| source.needed_columns.contains(column))
+                            .collect::<std::collections::BTreeSet<_>>()
+                            .into_iter()
+                            .collect::<Vec<_>>()
+                            .into_boxed_slice();
+                        !source.needed_columns.is_empty()
+                    });
+                }
+
+                let child_bindings = fetch.child.get_column_bindings();
+                let mut child_optimizer =
+                    RemoveUnusedColumns::new(self.binder, self.session, self.everything_referenced);
+                if !self.everything_referenced {
+                    for binding in child_bindings {
+                        if let Some(references) = self.column_references.remove(&binding) {
+                            child_optimizer
+                                .column_references
+                                .insert(binding, references);
+                        }
+                    }
+                }
+                for source in &mut fetch.sources {
+                    child_optimizer.visit_expression(&mut source.rowid);
+                }
+                child_optimizer.visit_logical_plan(&mut fetch.child);
+                for replacement in &child_optimizer.replacements {
+                    child_optimizer
+                        .replace_binding(replacement.old_binding, replacement.new_binding);
+                }
+            }
             LogicalOperator::Filter(filter) => {
                 // Filters don't produce new columns, just pass through
+                let projection_was_all = filter.projection_map.is_all();
+                let mut projected_bindings =
+                    Self::projected_bindings(filter.child.as_ref(), &filter.projection_map);
                 let mut child_optimizer =
                     RemoveUnusedColumns::new(self.binder, self.session, self.everything_referenced);
 
@@ -342,6 +428,16 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     child_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);
                 }
+                // A stored projection map is a positional annotation over the
+                // pre-pruning child layout. Rebuild it by binding after child
+                // compaction; leaving the old ordinals in place can silently
+                // select a different column or go out of bounds.
+                if !projection_was_all {
+                    Self::remap_bindings(&mut projected_bindings, &child_optimizer.replacements);
+                    filter.projection_map =
+                        Self::rebuild_projection_map(filter.child.as_ref(), &projected_bindings)
+                            .into();
+                }
                 // No need to propagate replacements up - already updated via raw pointers
             }
             LogicalOperator::Join(join) => {
@@ -353,6 +449,21 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
 
                 // Copy parent's column references
                 child_optimizer.column_references = std::mem::take(&mut self.column_references);
+
+                // Projection maps are positional, while child pruning below
+                // may compact either input. Preserve their binding identity so
+                // the maps can be rebuilt against the final child layouts.
+                let (mut projected_left_bindings, mut projected_right_bindings) = match join {
+                    paro_planner::operator::Join::Comparison(join) => (
+                        Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
+                        Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
+                    ),
+                    paro_planner::operator::Join::Any(join) => (
+                        Self::projected_bindings(join.left.as_ref(), &join.left_projection_map),
+                        Self::projected_bindings(join.right.as_ref(), &join.right_projection_map),
+                    ),
+                    paro_planner::operator::Join::Cross(_) => (Vec::new(), Vec::new()),
+                };
 
                 // For INNER JOIN with equality predicates, we can optimize:
                 // Replace references to RHS with references to LHS to reduce columns extracted from hash table
@@ -441,6 +552,35 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     right_optimizer
                         .replace_binding(replacement.old_binding, replacement.new_binding);
                 }
+                Self::remap_bindings(&mut projected_left_bindings, &left_optimizer.replacements);
+                Self::remap_bindings(&mut projected_right_bindings, &right_optimizer.replacements);
+                match join {
+                    paro_planner::operator::Join::Comparison(join) => {
+                        join.left_projection_map = Self::rebuild_projection_map(
+                            join.left.as_ref(),
+                            &projected_left_bindings,
+                        )
+                        .into();
+                        join.right_projection_map = Self::rebuild_projection_map(
+                            join.right.as_ref(),
+                            &projected_right_bindings,
+                        )
+                        .into();
+                    }
+                    paro_planner::operator::Join::Any(join) => {
+                        join.left_projection_map = Self::rebuild_projection_map(
+                            join.left.as_ref(),
+                            &projected_left_bindings,
+                        )
+                        .into();
+                        join.right_projection_map = Self::rebuild_projection_map(
+                            join.right.as_ref(),
+                            &projected_right_bindings,
+                        )
+                        .into();
+                    }
+                    paro_planner::operator::Join::Cross(_) => {}
+                }
                 // After replacing bindings, we may have duplicate conditions
                 if let paro_planner::operator::Join::Comparison(cj) = join {
                     let mut unique_conditions = Vec::new();
@@ -462,6 +602,13 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                 }
             }
             LogicalOperator::Get(get) => {
+                // Runtime join filters are attached after the ordinary unused
+                // column pass. A later structural rewrite may legitimately run
+                // pruning again, so these expressions must participate in the
+                // same binding-retention and compaction map as scan outputs.
+                for expression in &mut get.runtime_filter_expressions {
+                    self.visit_expression(expression);
+                }
                 // Remove unused columns from table scan
                 self.remove_columns_from_get(get);
             }
@@ -834,11 +981,17 @@ mod tests {
     use super::RemoveUnusedColumns;
     use paro_common::types::LogicalType;
     use paro_context::test_support::TestStatementContextBuilder;
+    use paro_function::aggregate::distributive::count::get_count_star_function;
+    use paro_function::aggregate::distributive::minmax::get_max_function;
     use paro_planner::binder::Binder;
-    use paro_planner::expression::{ColumnRefExpression, Expression};
+    use paro_planner::expression::{
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType, Expression,
+        ReferenceExpression,
+    };
     use paro_planner::operator::{
-        ColumnBinding, ComparisonJoin, ExpressionGet, Get, Join, JoinComparisonType, JoinCondition,
-        JoinType, LogicalOperator, Projection,
+        Aggregate, ColumnBinding, ComparisonJoin, ExpressionGet, Filter, Get, Join,
+        JoinComparisonType, JoinCondition, JoinType, LogicalOperator, PostAggregateReduction,
+        Projection,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -854,6 +1007,99 @@ mod tests {
             panic!("expected column reference");
         };
         column.binding
+    }
+
+    #[test]
+    fn post_reduction_keeps_hidden_source_aggregate_and_tracks_its_new_ordinal() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let values = LogicalPlan::new(
+            ctx,
+            LogicalOperator::ExpressionGet(ExpressionGet::new(
+                10,
+                Vec::new(),
+                vec!["key".into()],
+                vec![LogicalType::Integer],
+            )),
+        );
+        let count = || {
+            Expression::Aggregate(AggregateExpression::new(
+                get_count_star_function(),
+                Vec::new(),
+                LogicalType::BigInt,
+            ))
+        };
+        let (max, _) = get_max_function()
+            .bind(&[LogicalType::BigInt])
+            .expect("bind max(bigint)");
+        let reducer = Expression::Aggregate(AggregateExpression::new(
+            max,
+            vec![Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 1),
+                LogicalType::BigInt,
+            ))],
+            LogicalType::BigInt,
+        ));
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(12, 1),
+                LogicalType::BigInt,
+            )),
+            Expression::ColumnRef(ColumnRefExpression::new(
+                ColumnBinding::new(14, 0),
+                LogicalType::BigInt,
+            )),
+        ));
+        let aggregate = Aggregate::new(
+            11,
+            12,
+            13,
+            values,
+            vec![int_column(10, 0)],
+            Vec::new(),
+            vec![count(), count()],
+            Vec::new(),
+        )
+        .with_post_reduction(PostAggregateReduction {
+            reduction_index: 14,
+            reducers: vec![reducer],
+            scalar_expressions: vec![Expression::Reference(ReferenceExpression::new(
+                0,
+                LogicalType::BigInt,
+            ))],
+            predicate,
+        });
+        let aggregate = LogicalPlan::new(ctx, LogicalOperator::Aggregate(aggregate));
+        // The public projection observes only the group key. Aggregate #1 is
+        // nevertheless required exclusively by the hidden reduction.
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, aggregate, vec![int_column(11, 0)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(project) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Aggregate(aggregate) = &project.child.operator else {
+            panic!("expected aggregate");
+        };
+        assert_eq!(aggregate.aggregates.len(), 1);
+        let reduction = aggregate.post_reduction.as_ref().expect("reduction");
+        let Expression::Aggregate(reducer) = &reduction.reducers[0] else {
+            panic!("expected reducer");
+        };
+        assert_eq!(binding(&reducer.children[0]), ColumnBinding::new(12, 0));
+        let Expression::Comparison(predicate) = &reduction.predicate else {
+            panic!("expected predicate");
+        };
+        assert_eq!(binding(predicate.left.as_ref()), ColumnBinding::new(12, 0));
+        aggregate
+            .verify_post_reduction()
+            .expect("pruned annotation stays valid");
     }
 
     #[test]
@@ -889,7 +1135,7 @@ mod tests {
             )],
         );
         join.duplicate_eliminated_columns = vec![int_column(10, 1)];
-        join.right_projection_map = vec![0];
+        join.right_projection_map = vec![0].into();
         let joined = LogicalPlan::new(ctx, LogicalOperator::Join(Join::Comparison(join)));
         let mut plan = LogicalPlan::new(
             ctx,
@@ -907,11 +1153,192 @@ mod tests {
         let LogicalOperator::Get(get) = &join.left.operator else {
             panic!("expected left get");
         };
-        assert_eq!(get.column_ids, vec![1]);
+        assert_eq!(get.stored_column(0), Some(1));
         assert_eq!(
             binding(&join.duplicate_eliminated_columns[0]),
             ColumnBinding::new(10, 0)
         );
         assert_eq!(binding(&join.conditions[0].left), ColumnBinding::new(10, 0));
+    }
+
+    #[test]
+    fn correlation_projection_prunes_unobserved_subquery_payload() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let scan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec![
+                    "payload_0".into(),
+                    "correlation_key".into(),
+                    "payload_1".into(),
+                ],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                ],
+            )),
+        );
+        let mut correlation_projection = Projection::new(
+            20,
+            scan,
+            vec![int_column(10, 0), int_column(10, 2), int_column(10, 1)],
+        );
+        correlation_projection.visible_names =
+            vec!["payload_0".into(), "payload_1".into(), "__corr_1".into()];
+        let correlation_projection =
+            LogicalPlan::new(ctx, LogicalOperator::Projection(correlation_projection));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                correlation_projection,
+                vec![int_column(20, 2)],
+            )),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(root) = &plan.operator else {
+            panic!("expected root projection");
+        };
+        assert_eq!(binding(&root.expressions[0]), ColumnBinding::new(20, 0));
+        let LogicalOperator::Projection(correlation) = &root.child.operator else {
+            panic!("expected correlation projection");
+        };
+        assert_eq!(correlation.visible_names, vec!["__corr_1"]);
+        assert_eq!(correlation.expressions.len(), 1);
+        let LogicalOperator::Get(scan) = &correlation.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(scan.names, vec!["correlation_key"]);
+    }
+
+    #[test]
+    fn runtime_filter_binding_tracks_pruned_scan_layout() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let mut get = Get::new_without_table(
+            10,
+            vec![
+                "keep".into(),
+                "unused_0".into(),
+                "unused_1".into(),
+                "filter".into(),
+            ],
+            vec![LogicalType::Integer; 4],
+        );
+        get.runtime_filter_expressions.push(int_column(10, 3));
+        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, scan, vec![int_column(10, 0)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Get(get) = &projection.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(get.stored_column(0), Some(0));
+        assert_eq!(get.stored_column(1), Some(3));
+        assert_eq!(
+            binding(&get.runtime_filter_expressions[0]),
+            ColumnBinding::new(10, 1)
+        );
+    }
+
+    #[test]
+    fn pruning_preserves_get_returned_type_independently_of_source_type() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let mut get = Get::new_without_table(
+            10,
+            vec!["unused".into(), "text".into()],
+            vec![LogicalType::Integer, LogicalType::Varchar],
+        );
+        get.column_types[1] = LogicalType::VarcharCollation("C".into());
+        get.returned_types[1] = LogicalType::Varchar;
+        let scan = LogicalPlan::new(ctx, LogicalOperator::Get(get));
+        let text = Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(10, 1),
+            LogicalType::Varchar,
+        ));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, scan, vec![text])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        let LogicalOperator::Get(get) = &projection.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(
+            get.column_types,
+            vec![LogicalType::VarcharCollation("C".into())]
+        );
+        assert_eq!(get.returned_types, vec![LogicalType::Varchar]);
+    }
+
+    #[test]
+    fn pruning_rebuilds_frozen_filter_projection_by_binding() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let scan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec!["key".into(), "dead".into(), "value".into()],
+                vec![
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                    LogicalType::Integer,
+                ],
+            )),
+        );
+        let predicate = Expression::Comparison(ComparisonExpression::new(
+            ComparisonType::Equal,
+            int_column(10, 0),
+            int_column(10, 0),
+        ));
+        let mut filter = Filter::new(scan, vec![predicate]);
+        filter.projection_map = vec![0, 2].into();
+        let filtered = LogicalPlan::new(ctx, LogicalOperator::Filter(filter));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(20, filtered, vec![int_column(10, 2)])),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(projection) = &plan.operator else {
+            panic!("expected projection");
+        };
+        assert_eq!(
+            binding(&projection.expressions[0]),
+            ColumnBinding::new(10, 1)
+        );
+        let LogicalOperator::Filter(filter) = &projection.child.operator else {
+            panic!("expected filter");
+        };
+        assert_eq!(filter.projection_map.as_columns(), Some(&[0, 1][..]));
+        let LogicalOperator::Get(get) = &filter.child.operator else {
+            panic!("expected scan");
+        };
+        assert_eq!(get.stored_column(0), Some(0));
+        assert_eq!(get.stored_column(1), Some(2));
     }
 }

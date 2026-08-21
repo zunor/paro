@@ -13,21 +13,21 @@ FROM (VALUES (1), (2), (3)) AS t(x)
 CROSS JOIN LATERAL py_scale(t.x) AS s
 ORDER BY 1, 2;
 QUERY PLAN
-ORDER_BY  (rows=30)
+ORDER_BY  (rows=300)
   Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
-  ->  PROJECTION  (rows=30)
+  ->  PROJECTION  (rows=300)
     Output: t.x, s.value
-    ->  DELIM_JOIN  (rows=30)
+    ->  DELIM_JOIN  (rows=300)
       ->  PROJECTION  (rows=3)
         Output: x
         ->  VALUES  (rows=3)
       ->  HASH_JOIN
         Join Type: INNER
         Join Condition: #1 IS NOT DISTINCT FROM #0
-        ->  EXTERNAL_TABLE  (rows=100)
-          ->  PROJECTION
+        ->  EXTERNAL_TABLE  (rows=1000)
+          ->  PROJECTION  (rows=1000)
             Output: __external_arg_1, __corr_1
-            ->  CROSS_PRODUCT
+            ->  CROSS_PRODUCT  (rows=1000)
               ->  DUMMY_SCAN
               ->  DELIM_SCAN  (rows=1)
         ->  DELIM_SCAN

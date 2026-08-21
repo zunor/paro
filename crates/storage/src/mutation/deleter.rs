@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::MutationTarget;
 use crate::primary_key::{primary_key_hash, DeleteVector, PrimaryKeySerializer, RowID};
+use crate::rowset::SegmentRowId;
 use crate::table::table_handle::TableHandle;
 use crate::tablet::{KeysType, PhysicalRowRef, TabletReaderParams};
 use crate::transaction::overlay_reader::TxnOverlayReader;
@@ -63,7 +64,7 @@ pub(crate) fn delete(
             segment_row_count.insert(key, rows);
             rows
         };
-        if location.row_offset >= rows_in_segment {
+        if location.row_offset.get() >= rows_in_segment {
             return Err(paro_error::invalid_input(format!(
                 "Row offset {} out of range for rowset {} segment {} (rows={})",
                 location.row_offset, location.rowset_id, location.segment_id, rows_in_segment
@@ -150,13 +151,21 @@ pub(crate) fn delete_all(
             )?;
             if let Some(delete_vector) = existing {
                 for row_id in 0..num_rows {
-                    if !delete_vector.is_deleted(row_id) {
-                        locations.push(PhysicalRowRef::new(rowset_id, segment_id, row_id));
+                    if !delete_vector.is_deleted(SegmentRowId::from_raw(row_id)) {
+                        locations.push(PhysicalRowRef::new(
+                            rowset_id,
+                            segment_id,
+                            SegmentRowId::from_raw(row_id),
+                        ));
                     }
                 }
             } else {
                 for row_id in 0..num_rows {
-                    locations.push(PhysicalRowRef::new(rowset_id, segment_id, row_id));
+                    locations.push(PhysicalRowRef::new(
+                        rowset_id,
+                        segment_id,
+                        SegmentRowId::from_raw(row_id),
+                    ));
                 }
             }
         }

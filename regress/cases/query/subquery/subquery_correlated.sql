@@ -16,6 +16,9 @@ DROP TABLE IF EXISTS subquery_correlated_outer;
 DROP TABLE IF EXISTS subquery_correlated_detail;
 
 -- @setup
+DROP TABLE IF EXISTS subquery_scalar_window_input;
+
+-- @setup
 CREATE TABLE subquery_correlated_outer (
   id INT,
   grp INT,
@@ -29,6 +32,24 @@ CREATE TABLE subquery_correlated_detail (
   seq INT,
   score INT,
   kind TEXT
+);
+
+-- @setup
+CREATE TABLE subquery_scalar_window_input (id INT, balance INT);
+
+-- @setup
+CREATE TABLE subquery_correlated_unique_outer (
+  key_a INT,
+  key_b INT,
+  threshold INT,
+  UNIQUE (key_a, key_b) NOT ENFORCED
+);
+
+-- @setup
+CREATE TABLE subquery_correlated_unique_inner (
+  key_a INT,
+  key_b INT,
+  amount INT
 );
 
 -- @setup
@@ -51,6 +72,24 @@ INSERT INTO subquery_correlated_detail VALUES
   (30, 1, 6, 'base'),
   (30, 2, 1, 'tail'),
   (NULL, 1, 50, 'null_bucket');
+
+-- @setup
+INSERT INTO subquery_scalar_window_input VALUES
+  (1, -5), (2, 10), (3, 20), (4, NULL), (5, 100000);
+
+-- @setup
+INSERT INTO subquery_correlated_unique_outer VALUES
+  (1, 1, 10),
+  (2, 2, 10),
+  (NULL, 1, 10),
+  (NULL, 1, 20);
+
+-- @setup
+INSERT INTO subquery_correlated_unique_inner VALUES
+  (1, 1, 4),
+  (1, 1, 5),
+  (2, 2, 20),
+  (NULL, 1, 100);
 
 -- 1. Correlated scalar with ORDER BY + LIMIT
 -- @query
@@ -126,8 +165,44 @@ SELECT
 FROM subquery_correlated_outer AS o
 ORDER BY o.id;
 
+-- 6. Nullable UNIQUE keys are safe only through null-rejecting equality;
+-- legal duplicate NULL tuples must not manufacture a GROUP BY dependency.
+-- @query
+SELECT o.key_a, o.key_b, o.threshold
+FROM subquery_correlated_unique_outer AS o
+WHERE o.threshold > (
+  SELECT SUM(i.amount)
+  FROM subquery_correlated_unique_inner AS i
+  WHERE i.key_a = o.key_a
+    AND i.key_b = o.key_b
+)
+ORDER BY o.key_a, o.key_b, o.threshold;
+
+-- 7. A subset-filtered scalar aggregate is shared with the detail scan as a
+-- full-partition window. Result semantics cover computed FILTER inputs and
+-- the empty/NULL aggregate domain independently of the plan-shape unit test.
+-- @query
+SELECT c.id, c.balance
+FROM subquery_scalar_window_input AS c
+WHERE c.balance < 100000
+  AND c.balance > (
+    SELECT AVG(s.balance)
+    FROM subquery_scalar_window_input AS s
+    WHERE s.balance < 100000 AND 0 < s.balance
+  )
+ORDER BY c.id;
+
 -- @teardown
 DROP TABLE IF EXISTS subquery_correlated_outer;
 
 -- @teardown
 DROP TABLE IF EXISTS subquery_correlated_detail;
+
+-- @teardown
+DROP TABLE IF EXISTS subquery_scalar_window_input;
+
+-- @teardown
+DROP TABLE IF EXISTS subquery_correlated_unique_outer;
+
+-- @teardown
+DROP TABLE IF EXISTS subquery_correlated_unique_inner;

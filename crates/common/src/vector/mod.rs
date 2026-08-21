@@ -33,10 +33,10 @@ pub struct VectorOperations;
 pub use allocation_set::AllocationSet;
 pub use array_vector::{ArrayVector, VectorArrayBuffer};
 pub(crate) use definition::VectorResetState;
-pub use definition::{DictionaryInfo, DictionarySource, Vector};
+pub use definition::{DictionaryInfo, DictionarySource, Vector, VectorLifetimeOwner};
 pub use selection_vector::{
     reset_selection_materialization_count, selection_materialization_count, SelectionVector,
-    VectorSelection,
+    ValidatedVectorSelection, VectorSelection,
 };
 pub use string_heap::StringHeap;
 pub use validity_mask::{ValidityMask, BITS_PER_VALUE, MAX_ENTRY};
@@ -44,8 +44,8 @@ pub(crate) use vector_buffer::VectorBuffer;
 pub use vector_type::VectorType;
 pub use view::{
     ArrayView, DataRef, DecodedVectorOwned, DecodedVectorRef, DecodedVectorTree, SelectionRef,
-    ValidityRef, VarlenView, VectorView,
+    Utf8View, ValidityRef, VarlenView, VectorView,
 };
 
 /// Default vector size (number of rows per vector).
-pub const VECTOR_SIZE: usize = 2048;
+pub const VECTOR_SIZE: usize = 4096;

@@ -13,6 +13,7 @@ test-support = []
 
 [dependencies]
 thiserror = { workspace = true }
+bytes = { workspace = true }
 
 # Configuration system
 serde = { workspace = true }
@@ -23,6 +24,7 @@ bytesize = { workspace = true }
 humantime-serde = { workspace = true }
 bincode = { workspace = true }
 crc32c = "0.6"
+memchr = "2.7"
 
 # Logging
 tracing = { workspace = true }

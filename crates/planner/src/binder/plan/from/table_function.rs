@@ -34,7 +34,7 @@ impl Binder {
                 LogicalPlan::synthetic(LogicalOperator::DummyScan),
                 routine_ref.bound_arguments.clone(),
             )
-            .with_output_names(
+            .with_visible_names(
                 (0..routine_ref.bound_arguments.len())
                     .map(|idx| format!("__external_arg_{}", idx + 1))
                     .collect(),

@@ -19,6 +19,8 @@ use crate::runtime::state::{
 use crate::runtime::transform::{TransformFinishPoll, TransformFlushPoll, TransformPoll};
 use crate::runtime::ExpressionEvalInput;
 
+use super::topn_memory_context;
+
 #[derive(Debug, Clone)]
 pub struct StreamingTopNTransformExec {
     pub spec: TopNSpec,
@@ -48,11 +50,12 @@ impl StreamingTopNTransformExec {
             .map(|order| order.expression.clone())
             .collect::<Vec<_>>();
         Ok(TransformLocal::StreamingTopN(StreamingTopNTransformLocal {
-            heap: TopNHeap::new(
+            heap: TopNHeap::new_with_memory(
                 self.spec.output_types.to_vec(),
                 &self.spec.orders,
                 self.spec.limit,
                 self.spec.offset,
+                topn_memory_context(ctx.query),
             ),
             order_executor: ExpressionExecutor::with_expressions_for_session(
                 &order_exprs,

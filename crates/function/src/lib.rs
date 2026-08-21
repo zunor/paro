@@ -32,7 +32,7 @@ pub use scalar::{
     function_data_equals, BoundScalarFunction, DictionaryStrategy, ExpressionState, FunctionData,
     FunctionErrorMode, FunctionLocalState, FunctionNullHandling, FunctionSideEffects,
     FunctionStability, InitLocalStateFn, ScalarBindFn, ScalarBindInput, ScalarDispatch,
-    ScalarFunction, ScalarFunctionFn, ScalarFunctionSet,
+    ScalarFunction, ScalarFunctionFn, ScalarFunctionSet, ScalarPredicateProjection,
 };
 
 pub mod aggregate;

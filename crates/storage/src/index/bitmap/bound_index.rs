@@ -411,7 +411,7 @@ impl BoundIndex for BitmapIndex {
         if self.column_ids.len() != 1 {
             return PredicateResult::Unknown;
         }
-        if predicate.column_id() != self.column_ids[0] {
+        if predicate.index_column_id() != Some(self.column_ids[0]) {
             return PredicateResult::Unknown;
         }
 
@@ -426,6 +426,11 @@ impl BoundIndex for BitmapIndex {
             Predicate::Range { lower, upper, .. } => self.evaluate_range(lower, upper),
             Predicate::IsNull { .. } => self.evaluate_is_null(),
             Predicate::IsNotNull { .. } => self.evaluate_is_not_null(),
+            Predicate::FixedIn { .. }
+            | Predicate::StringPrefix { .. }
+            | Predicate::StringPrefixIn { .. }
+            | Predicate::StringLike { .. }
+            | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
     }
 }

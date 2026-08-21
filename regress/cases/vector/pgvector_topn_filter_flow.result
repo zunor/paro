@@ -36,15 +36,15 @@ id
 
 EXPLAIN SELECT id FROM vector_topn_case WHERE category = 'x' ORDER BY emb <+> '[1,0,0]' LIMIT 2;
 QUERY PLAN
-PROJECTION  (rows=1)
+PROJECTION  (rows=2)
   Output: id
-  ->  TOP_N  (rows=1)
+  ->  TOP_N  (rows=2)
     Sort Key: #1 ASC NULLS LAST
     Limit: 2
-    ->  PROJECTION  (rows=1)
+    ->  PROJECTION  (rows=2)
       Output: id, __paro_hidden_1
-      ->  ROWSET_SCAN on public.vector_topn_case  (rows=1)
-        Columns: id, category, emb
+      ->  ROWSET_SCAN on public.vector_topn_case  (rows=2)
+        Columns: id, emb
         Pushed Predicate: col#1 = 'x'
         Late Materialize: auto
 

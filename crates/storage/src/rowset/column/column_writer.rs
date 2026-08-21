@@ -40,15 +40,13 @@ use crate::rowset::encoding::{
 };
 use crate::rowset::page::{
     CompressionType, DataPageFooter, EncodingType, IndexPageFooter, IndexPageType, NullEncoding,
-    PageFooter, PageIO, PagePointer,
+    PageFooter, PageIO, PagePointer, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
 use crate::statistics::{BaseStatistics, ColumnStatistics};
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 use std::io::{Seek, Write};
 use std::sync::Arc;
 
@@ -94,7 +92,7 @@ pub struct ColumnWriterOptions {
     pub min_space_saving: f64,
     /// Encoding type (Default = auto-select)
     pub encoding: EncodingType,
-    /// Format version (1 or 2)
+    /// Data-page format version.
     pub format_version: u32,
     /// Whether to build a bloom filter index
     pub build_bloom_filter: bool,
@@ -126,7 +124,7 @@ impl ColumnWriterOptions {
             compression: CompressionType::Lz4,
             min_space_saving: DEFAULT_MIN_SPACE_SAVING,
             encoding: EncodingType::Default,
-            format_version: 2,
+            format_version: CURRENT_DATA_PAGE_FORMAT_VERSION,
             build_bloom_filter: false,
             build_bitmap_index: false,
             fixed_len: 0,
@@ -529,30 +527,8 @@ fn normalize_stats_logical_type(logical_type: LogicalType) -> LogicalType {
     }
 }
 
-fn is_integral_logical_type(logical_type: &LogicalType) -> bool {
-    matches!(
-        logical_type,
-        LogicalType::TinyInt
-            | LogicalType::SmallInt
-            | LogicalType::Integer
-            | LogicalType::BigInt
-            | LogicalType::HugeInt
-            | LogicalType::UTinyInt
-            | LogicalType::USmallInt
-            | LogicalType::UInteger
-            | LogicalType::UBigInt
-            | LogicalType::UHugeInt
-            | LogicalType::Date
-            | LogicalType::Timestamp
-            | LogicalType::TimestampTz
-            | LogicalType::Time
-    )
-}
-
 fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+    paro_common::hash::hash_bytes(bytes)
 }
 
 fn decode_signed_wide_integer(bytes: &[u8], label: &str) -> Result<i128> {
@@ -619,8 +595,6 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     null_count: u64,
     /// Logical type used for statistics
     stats_logical_type: LogicalType,
-    /// Whether the type is integral (for distinct sampling)
-    distinct_is_integral: bool,
 }
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
@@ -662,7 +636,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 .clone()
                 .unwrap_or_else(|| field_type_to_logical_type(opts.field_type)),
         );
-        let distinct_is_integral = is_integral_logical_type(&stats_logical_type);
         let column_stats =
             ColumnStatistics::new(BaseStatistics::create_empty(stats_logical_type.clone()));
 
@@ -696,7 +669,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             column_stats,
             null_count: 0,
             stats_logical_type,
-            distinct_is_integral,
         })
     }
 
@@ -916,15 +888,25 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 if bytes.len() < 4 {
                     return Err(paro_error::type_mismatch("Date: insufficient bytes"));
                 }
-                let v = i32::from_le_bytes(bytes[..4].try_into().unwrap()) as i64;
-                Value::BigInt(v)
+                Value::Date(i32::from_le_bytes(bytes[..4].try_into().unwrap()))
             }
-            LogicalType::Timestamp | LogicalType::TimestampTz | LogicalType::Time => {
+            LogicalType::Timestamp => {
                 if bytes.len() < 8 {
                     return Err(paro_error::type_mismatch("Timestamp: insufficient bytes"));
                 }
-                let v = i64::from_le_bytes(bytes[..8].try_into().unwrap());
-                Value::BigInt(v)
+                Value::Timestamp(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            LogicalType::TimestampTz => {
+                if bytes.len() < 8 {
+                    return Err(paro_error::type_mismatch("TimestampTz: insufficient bytes"));
+                }
+                Value::TimestampTz(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
+            }
+            LogicalType::Time => {
+                if bytes.len() < 8 {
+                    return Err(paro_error::type_mismatch("Time: insufficient bytes"));
+                }
+                Value::Time(i64::from_le_bytes(bytes[..8].try_into().unwrap()))
             }
             LogicalType::Varchar
             | LogicalType::VarcharCollation(_)
@@ -983,11 +965,8 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         if hashes.is_empty() {
             return;
         }
-        self.column_stats.update_distinct_statistics(
-            &hashes,
-            hashes.len(),
-            self.distinct_is_integral,
-        );
+        self.column_stats
+            .update_distinct_statistics(&hashes, hashes.len());
     }
 
     fn update_statistics_fixed(
@@ -1035,7 +1014,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         // Build null map if needed
         let mut null_data: Option<Bytes> = None;
         let nullmap_size = if let Some(ref mut null_builder) = self.null_builder {
-            if null_builder.count() > 0 {
+            if self.page_has_null && null_builder.count() > 0 {
                 let data = null_builder.finish()?;
                 let size = data.len() as u32;
                 null_data = Some(data);
@@ -1477,12 +1456,22 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 data[offset + 3],
             ]) as usize;
 
-            let value_end = value_start + len;
+            let value_end = value_start.checked_add(len).ok_or_else(|| {
+                paro_error::invalid_input("Variable-length value offset overflow")
+            })?;
             if value_end > data.len() {
                 break;
             }
 
             let value = &data[value_start..value_end];
+            if self.opts.field_type.requires_valid_utf8() {
+                std::str::from_utf8(value).map_err(|_| {
+                    paro_error::invalid_input(format!(
+                        "Invalid UTF-8 for {:?} column {}",
+                        self.opts.field_type, self.opts.column_id
+                    ))
+                })?;
+            }
             let success = match &mut self.page_builder {
                 PageBuilderImpl::BinaryPlain(b) => b.add_slice(value),
                 PageBuilderImpl::BinaryDict(b) => b.add_slice(value),
@@ -1561,6 +1550,24 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    fn first_data_footer(null_flags: Option<&[u8]>) -> DataPageFooter {
+        let opts = ColumnWriterOptions::new(FieldType::Int, 0)
+            .with_nullable(true)
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values: Vec<u8> = (0_i32..8).flat_map(i32::to_le_bytes).collect();
+        writer.append(&values, null_flags, 8).unwrap();
+        let meta = writer.finish().unwrap();
+        let data = writer.get_data();
+        let start = meta.data_page_pointer.offset as usize;
+        let end = start + meta.data_page_pointer.size as usize;
+        let (footer, _, _) = PageIO::parse_page_footer(&data[start..end], true).unwrap();
+        match footer {
+            PageFooter::Data(footer) => footer,
+            _ => panic!("expected data page footer"),
+        }
+    }
+
     #[test]
     fn test_column_writer_options() {
         let opts = ColumnWriterOptions::new(FieldType::Int, 1)
@@ -1627,6 +1634,31 @@ mod tests {
     }
 
     #[test]
+    fn temporal_column_statistics_preserve_logical_value_types() {
+        let opts = ColumnWriterOptions::new(FieldType::Date, 0)
+            .with_nullable(false)
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+        let values = [8_035_i32, 10_591_i32];
+        let bytes = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        writer.append(&bytes, None, values.len() as u32).unwrap();
+        let meta = writer.finish().unwrap();
+
+        assert_eq!(
+            meta.column_stats.statistics().min_value(),
+            Some(Value::Date(8_035))
+        );
+        assert_eq!(
+            meta.column_stats.statistics().max_value(),
+            Some(Value::Date(10_591))
+        );
+    }
+
+    #[test]
     fn test_scalar_column_writer_with_nulls() {
         let opts = ColumnWriterOptions::new(FieldType::Int, 0)
             .with_nullable(true)
@@ -1646,6 +1678,18 @@ mod tests {
 
         let meta = writer.finish().unwrap();
         assert_eq!(meta.num_rows, 10);
+    }
+
+    #[test]
+    fn nullable_page_omits_all_valid_null_map() {
+        let footer = first_data_footer(Some(&[0]));
+        assert_eq!(footer.nullmap_size, 0);
+    }
+
+    #[test]
+    fn nullable_page_preserves_non_empty_null_map() {
+        let footer = first_data_footer(Some(&[0b0000_0100]));
+        assert!(footer.nullmap_size > 0);
     }
 
     #[test]
@@ -1690,5 +1734,19 @@ mod tests {
 
         let meta = writer.finish().unwrap();
         assert_eq!(meta.num_rows, 4);
+    }
+
+    #[test]
+    fn utf8_storage_types_reject_invalid_bytes_before_encoding() {
+        let encoded = [2, 0, 0, 0, 0xff, 0xfe];
+        for field_type in [FieldType::Char, FieldType::Varchar, FieldType::Json] {
+            let opts = ColumnWriterOptions::new(field_type, 7)
+                .with_nullable(false)
+                .with_encoding(EncodingType::Plain);
+            let mut writer = ScalarColumnWriter::new(opts, Cursor::new(Vec::new())).unwrap();
+
+            assert!(writer.append(&encoded, None, 1).is_err());
+            assert_eq!(writer.num_rows(), 0);
+        }
     }
 }

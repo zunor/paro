@@ -28,6 +28,8 @@ env:
   PARO_POLICY_EVOLUTION_GATES: ${{ vars.PARO_POLICY_EVOLUTION_GATES }}
   PARO_POLICY_EVOLUTION_PLATFORMS: ${{ vars.PARO_POLICY_EVOLUTION_PLATFORMS }}
   PARO_POLICY_EVOLUTION_REQUIRED_PLATFORMS: ${{ vars.PARO_POLICY_EVOLUTION_REQUIRED_PLATFORMS }}
+  PARO_PERF_ARCHIVE_DIR: ${{ github.workspace }}/.ci/paro-perf-archive
+  PARO_PERF_ARCHIVE_TOKEN: ${{ secrets.PARO_PERF_ARCHIVE_TOKEN }}
   PARO_BENCH_CARGO_PROFILE: release
   PARO_BENCH_DATA_DIR_MODE: fresh
 
@@ -42,6 +44,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      - name: Checkout performance archive
+        if: vars.PARO_PERF_ARCHIVE_REPOSITORY != ''
+        uses: ./.github/actions/checkout-perf-archive
+        with:
+          repository: ${{ vars.PARO_PERF_ARCHIVE_REPOSITORY }}
+          token: ${{ env.PARO_PERF_ARCHIVE_TOKEN }}
+          path: .ci/paro-perf-archive
       - name: Validate enforced platform coverage
         run: |
           python3 tools/ci/check_policy_evolution.py \

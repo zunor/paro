@@ -115,7 +115,6 @@ impl PhysicalPlanGenerator {
 
         let project_id = self.push_node(
             PhysicalNodeKind::Project(ProjectSpec {
-                table_index: update.table_index as usize,
                 expressions: projection_exprs.into_boxed_slice(),
                 output_names: output_names.clone().into_boxed_slice(),
             }),
@@ -237,7 +236,16 @@ impl PhysicalPlanGenerator {
             score_mode: intent.score_mode,
             mode: SearchRequestMode::Filter,
             predicate,
-            projected_columns: scan.get.column_ids.clone().into_boxed_slice(),
+            projected_columns: (0..scan.get.returned_types.len())
+                .map(|output| {
+                    scan.get.stored_column(output).ok_or_else(|| {
+                        paro_error::internal(
+                            "full-text scan cannot lower a derived output as a stored column",
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+                .into_boxed_slice(),
             emit_score: false,
             output_names: scan.get.names.clone().into_boxed_slice(),
             output_types: scan.get.returned_types.clone().into_boxed_slice(),

@@ -179,11 +179,11 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -196,11 +196,11 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -219,11 +219,11 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #1 GRAPH_EXPAND (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -236,11 +236,11 @@ EXPLAIN ANALYZE SELECT * FROM GRAPH_TABLE(social_network
 ) gt;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=2)
-  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=1)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=1)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=1)
+  SOURCE #0 GRAPH_SCAN (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #1 GRAPH_SHORTEST_PATH (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #2 GRAPH_PROJECT (actual time=<time-range> rows=3 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=3 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=3 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -259,7 +259,10 @@ SELECT * FROM GRAPH_TABLE(social_network
     MATCH (a:Person)-[k:Knows]->{1,3}(b:Person)
     COLUMNS (a.name AS from_name, b.name AS to_name)
 ) gt;
-ERROR: force_external graph scan requires a temporary directory (SQLSTATE=53200)
+gt.from_name	gt.to_name
+Alice	Bob
+Alice	Charlie
+Bob	Charlie
 
 SET force_external = DEFAULT;
 SET

@@ -11,7 +11,8 @@ use paro_common::types::LogicalType;
 use paro_execution::query_executor::compiled::ResultColumnDesc;
 use paro_function::copy::CopyOptions;
 use paro_session::{
-    CopyProtocolSink, CopyProtocolSource, ExtendedQueryResponder, FormatCode, StatementCompletion,
+    CopyProtocolSink, CopyProtocolSource, ExtendedQueryResponder, FormatCode,
+    StatementCancellation, StatementCompletion,
 };
 use pgwire::messages::data::{NoData, ParameterDescription, RowDescription};
 use pgwire::messages::extendedquery::{
@@ -32,7 +33,6 @@ use super::result::{build_error_response, field_description_with_format, send_ch
 
 pub struct PgWireExtendedQueryResponder<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
-    execution_control: Arc<paro_session::SessionExecutionControl>,
     drain_token: CancellationToken,
     force_close_token: CancellationToken,
     pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
@@ -41,14 +41,12 @@ pub struct PgWireExtendedQueryResponder<'a> {
 impl<'a> PgWireExtendedQueryResponder<'a> {
     pub fn new(
         socket: &'a mut Framed<TcpStream, PgCodec>,
-        execution_control: Arc<paro_session::SessionExecutionControl>,
         drain_token: CancellationToken,
         force_close_token: CancellationToken,
         pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
     ) -> Self {
         Self {
             socket,
-            execution_control,
             drain_token,
             force_close_token,
             pending_frontend_messages,
@@ -193,15 +191,24 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     fn create_copy_out_sink(
         &mut self,
+        cancellation: &StatementCancellation,
         options: &CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
-        create_copy_out_sink(self.socket, options)
+        create_copy_out_sink(
+            self.socket,
+            cancellation,
+            self.force_close_token.clone(),
+            options,
+        )
     }
 
-    fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+    fn create_copy_in_source(
+        &mut self,
+        cancellation: &StatementCancellation,
+    ) -> Result<Box<dyn CopyProtocolSource + '_>> {
         create_copy_in_source(
             self.socket,
-            Arc::clone(&self.execution_control),
+            cancellation,
             self.drain_token.clone(),
             self.force_close_token.clone(),
             Arc::clone(&self.pending_frontend_messages),

@@ -8,6 +8,7 @@ pub mod graph;
 pub mod join;
 pub(crate) mod output;
 pub mod result;
+pub mod row_fetch;
 pub mod scan;
 pub mod search;
 pub mod set;

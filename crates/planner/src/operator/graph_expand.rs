@@ -7,6 +7,7 @@
 //! Produced by GraphMatchDecompose for each (edge, vertex) pair in the pattern.
 
 use paro_catalog::entry::EdgeTableInfo;
+use paro_common::types::LogicalType;
 use paro_parser::ast::{PathMode, PathQuantifier};
 
 use crate::expression::Expression;
@@ -22,8 +23,9 @@ pub enum ExpandDirection {
 
 /// GraphExpand expands from source vertices along edges to neighbors.
 ///
-/// Takes input containing source vertex IDs and produces tuples of
-/// `(src_local_id, src_rowid, edge_rowid, dst_local_id, dst_rowid)`.
+/// Preserves the input graph carrier and appends
+/// `(edge_rowid, dst_local_id, dst_rowid)`. A terminal path-producing expand
+/// additionally appends `(path_length, path_vertices, path_edges)`.
 #[derive(Debug)]
 pub struct GraphExpand {
     /// Edge table metadata from the property graph definition.
@@ -46,6 +48,8 @@ pub struct GraphExpand {
     pub edge_table_index: usize,
     /// Table index of the target vertex variable.
     pub target_table_index: usize,
+    /// Binding namespace for the graph chain's physical carrier columns.
+    pub output_table_index: usize,
     /// Target vertex label.
     pub target_label: String,
     /// Source vertex table oid for path materialization.
@@ -68,6 +72,7 @@ impl GraphExpand {
         source_table_index: usize,
         edge_table_index: usize,
         target_table_index: usize,
+        output_table_index: usize,
         target_label: String,
         source_table_oid: u64,
         target_table_oid: u64,
@@ -85,6 +90,7 @@ impl GraphExpand {
             source_table_index,
             edge_table_index,
             target_table_index,
+            output_table_index,
             target_label,
             source_table_oid,
             target_table_oid,
@@ -93,4 +99,36 @@ impl GraphExpand {
             child: Box::new(child),
         }
     }
+
+    /// Physical carrier types produced by this expand.
+    ///
+    /// An expand preserves its child's carrier columns, appends edge rowid and
+    /// target local-id/rowid, and optionally appends the terminal path payload.
+    pub fn output_types(&self) -> Vec<LogicalType> {
+        let mut types = self.child.types();
+        types.extend([
+            LogicalType::UBigInt,
+            LogicalType::UBigInt,
+            LogicalType::UBigInt,
+        ]);
+        if self.has_path_functions {
+            types.extend([
+                LogicalType::BigInt,
+                graph_path_element_list_type(),
+                graph_path_element_list_type(),
+            ]);
+        }
+        types
+    }
+}
+
+/// Logical type of the elements returned by vertices(path) and edges(path).
+///
+/// This lives with the logical graph layout so planning and execution cannot
+/// drift on the path carrier representation.
+pub fn graph_path_element_list_type() -> LogicalType {
+    LogicalType::List(Box::new(LogicalType::Struct(vec![
+        ("table_oid".to_string(), LogicalType::UBigInt),
+        ("rowid".to_string(), LogicalType::UBigInt),
+    ])))
 }

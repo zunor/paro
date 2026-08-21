@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::binder::Binder;
-use crate::expression::{ConstantExpression, WindowExpression};
+use crate::expression::{ConstantExpression, ExpressionIterator, WindowExpression};
 use crate::operator::{Join, LogicalOperator};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -49,6 +49,16 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
                     &mut proj.expressions,
                     &mut proj.child.operator,
                 )?;
+                Ok(found)
+            }
+            LogicalOperator::RowFetch(fetch) => {
+                let mut found = self.plan_one_pass(&mut fetch.child.operator)?;
+                for source in &mut fetch.sources {
+                    found |= self.binder.plan_current_layer_subqueries(
+                        &mut source.rowid,
+                        &mut fetch.child.operator,
+                    )?;
+                }
                 Ok(found)
             }
             LogicalOperator::ExternalProject(project) => {
@@ -273,23 +283,17 @@ impl<'a> RecursiveSubqueryPlanner<'a> {
         expr: &mut WindowExpression,
         root: &mut LogicalOperator,
     ) -> Result<bool> {
-        let mut found = self
-            .binder
-            .plan_current_layer_subqueries_in_list(&mut expr.children, root)?;
-        found |= self
-            .binder
-            .plan_current_layer_subqueries_in_list(&mut expr.partitions, root)?;
-        for order in &mut expr.orders {
-            found |= self
-                .binder
-                .plan_current_layer_subqueries(&mut order.expression, root)?;
-        }
-        if let crate::expression::WindowFrameBound::Offset(offset) = &mut expr.frame.start_bound {
-            found |= self.binder.plan_current_layer_subqueries(offset, root)?;
-        }
-        if let crate::expression::WindowFrameBound::Offset(offset) = &mut expr.frame.end_bound {
-            found |= self.binder.plan_current_layer_subqueries(offset, root)?;
-        }
-        Ok(found)
+        let mut found = false;
+        let mut error = None;
+        ExpressionIterator::enumerate_window_children_mut(expr, |child| {
+            if error.is_some() {
+                return;
+            }
+            match self.binder.plan_current_layer_subqueries(child, root) {
+                Ok(child_found) => found |= child_found,
+                Err(err) => error = Some(err),
+            }
+        });
+        error.map_or(Ok(found), Err)
     }
 }

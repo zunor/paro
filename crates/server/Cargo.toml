@@ -21,6 +21,8 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+itoa = { workspace = true }
+ryu = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }
@@ -28,4 +30,5 @@ bytesize = { workspace = true }
 rand = "0.8"
 
 [dev-dependencies]
+paro-common = { workspace = true, features = ["test-support"] }
 tempfile = "3.8"

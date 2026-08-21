@@ -3,6 +3,8 @@
 
 //! Unified 64-bit RowID for primary-key and row-id based paths.
 
+use crate::rowset::SegmentRowId;
+
 const RSSID_SHIFT: u64 = 32;
 const ROW_OFFSET_MASK: u64 = 0xFFFF_FFFF;
 
@@ -16,8 +18,8 @@ pub struct RowID(u64);
 
 impl RowID {
     #[inline]
-    pub const fn new(rssid: u32, row_offset: u32) -> Self {
-        Self(((rssid as u64) << RSSID_SHIFT) | (row_offset as u64))
+    pub const fn new(rssid: u32, row_offset: SegmentRowId) -> Self {
+        Self(((rssid as u64) << RSSID_SHIFT) | (row_offset.get() as u64))
     }
 
     #[inline]
@@ -26,8 +28,8 @@ impl RowID {
     }
 
     #[inline]
-    pub const fn row_offset(&self) -> u32 {
-        (self.0 & ROW_OFFSET_MASK) as u32
+    pub const fn row_offset(&self) -> SegmentRowId {
+        SegmentRowId::from_raw((self.0 & ROW_OFFSET_MASK) as u32)
     }
 
     #[inline]
@@ -64,7 +66,7 @@ mod tests {
 
     #[test]
     fn row_id_roundtrip() {
-        let row_id = RowID::new(42, 99);
+        let row_id = RowID::new(42, crate::rowset::SegmentRowId::from_raw(99));
         assert_eq!(row_id.rssid(), 42);
         assert_eq!(row_id.row_offset(), 99);
         assert_eq!(RowID::from_raw(row_id.to_raw()), row_id);
@@ -72,7 +74,10 @@ mod tests {
 
     #[test]
     fn row_id_from_into_u64() {
-        let row_id = RowID::new(u32::MAX, u32::MAX - 1);
+        let row_id = RowID::new(
+            u32::MAX,
+            crate::rowset::SegmentRowId::from_raw(u32::MAX - 1),
+        );
         let raw: u64 = row_id.into();
         assert_eq!(RowID::from(raw), row_id);
     }

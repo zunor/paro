@@ -26,7 +26,7 @@ use paro_common::vector::Vector;
 
 use super::{Index, IndexStorageInfo};
 use crate::index::predicate::Predicate;
-use crate::index::predicate_result::PredicateResult;
+use crate::index::predicate_result::{intersect, PredicateResult};
 
 #[cfg(test)]
 use super::IndexConstraintType;
@@ -56,6 +56,38 @@ pub struct IndexAppendInfo {
     pub append_mode: IndexAppendMode,
     /// Indexes to delete from on conflict (for UPSERT)
     pub delete_index_names: Vec<String>,
+}
+
+/// Candidate and proof sets produced by one index predicate evaluation.
+///
+/// Construction intersects the proof with the candidate set, making
+/// `guaranteed ⊆ candidates` structural rather than a convention shared by
+/// independent evaluator implementations.
+#[derive(Debug, Clone)]
+pub struct IndexPredicateEvaluation {
+    pub candidates: PredicateResult,
+    pub guaranteed: PredicateResult,
+}
+
+impl IndexPredicateEvaluation {
+    pub fn new(candidates: PredicateResult, guaranteed: PredicateResult) -> Self {
+        // `Unknown` means universal/no information for a candidate set, but
+        // no information is the empty set for a proof. Normalize before using
+        // the generic candidate intersection algebra.
+        let guaranteed = if matches!(guaranteed, PredicateResult::Unknown) {
+            PredicateResult::NoneMatch
+        } else {
+            intersect(&candidates, &guaranteed)
+        };
+        Self {
+            candidates,
+            guaranteed,
+        }
+    }
+
+    pub fn candidates_only(candidates: PredicateResult) -> Self {
+        Self::new(candidates, PredicateResult::NoneMatch)
+    }
 }
 
 impl IndexAppendInfo {
@@ -127,6 +159,19 @@ pub trait BoundIndex: Index {
     /// Returns PredicateResult::Unknown if the index cannot evaluate the predicate.
     fn evaluate_predicate(&self, _predicate: &Predicate) -> PredicateResult {
         PredicateResult::Unknown
+    }
+
+    /// Evaluate candidate and guaranteed-true rows together. Indexes without
+    /// proof semantics inherit a candidate-only result.
+    fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        IndexPredicateEvaluation::candidates_only(self.evaluate_predicate(predicate))
+    }
+
+    /// Whether this index can establish guaranteed-true rows in addition to
+    /// candidate pruning. Evaluators use this capability to avoid probing
+    /// candidate-only indexes after a higher-priority candidate result wins.
+    fn provides_predicate_proof(&self) -> bool {
+        false
     }
 
     // =========================================================================
@@ -343,5 +388,12 @@ mod tests {
         assert_eq!(base.column_ids, vec![0, 1]);
         assert_eq!(base.delta_index_type, DeltaIndexType::None);
         assert_eq!(base.logical_types.len(), 2);
+    }
+
+    #[test]
+    fn unknown_proof_is_normalized_to_no_proof() {
+        let evaluation =
+            IndexPredicateEvaluation::new(PredicateResult::AllMatch, PredicateResult::Unknown);
+        assert!(matches!(evaluation.guaranteed, PredicateResult::NoneMatch));
     }
 }

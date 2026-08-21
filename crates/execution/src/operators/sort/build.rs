@@ -10,7 +10,7 @@ use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::types::LogicalType;
 
 use crate::explain::types::ExplainRuntimeStats;
-use crate::physical::properties::{MemoryClass, RequiredProperties};
+use crate::physical::properties::MemoryClass;
 use crate::runtime::breaker::{HandleRef, SortHandle, SortPendingRunsReclaimer};
 use crate::runtime::context::{
     OperatorCallContext, OperatorFinishContext, PipelineInitContext, QueryRuntimeContext,
@@ -25,6 +25,8 @@ use crate::sorting::sort_descriptor::{
 };
 use crate::sorting::sorted_run::RunBuilder;
 
+use super::finalize::prepare_parallel_sort_finalize;
+
 // ---------------------------------------------------------------------------
 // Sort build sink
 // ---------------------------------------------------------------------------
@@ -38,7 +40,6 @@ pub struct SortBuildSinkExec {
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
     pub force_external: bool,
-    pub required: RequiredProperties,
 }
 
 impl SortBuildSinkExec {
@@ -193,6 +194,13 @@ impl SortBuildSinkExec {
         };
         let handle = global.handle.clone();
         let num_threads = ctx.query.session.number_of_threads();
+        if let Some(work) = prepare_parallel_sort_finalize(
+            Arc::clone(&handle),
+            num_threads,
+            ctx.query.memory.available_bytes(),
+        )? {
+            return Ok(FinishWork::Parallel(work));
+        }
         let memory_class = if handle.is_external() {
             MemoryClass::External
         } else {
@@ -201,7 +209,7 @@ impl SortBuildSinkExec {
         Ok(FinishWork::Parallel(FinishTaskGroupRunner::group(
             "sort_seal",
             memory_class,
-            move |_ctx| handle.seal(num_threads),
+            move |_ctx| handle.seal_streaming(),
         )))
     }
 
@@ -216,7 +224,7 @@ impl SortBuildSinkExec {
             ));
         };
         if !global.handle.is_sealed() {
-            global.handle.seal(ctx.query.session.number_of_threads())?;
+            global.handle.seal_streaming()?;
         }
         ctx.query
             .memory

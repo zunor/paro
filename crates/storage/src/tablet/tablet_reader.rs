@@ -13,9 +13,12 @@
 //! - Returns Chunks for pipeline execution
 
 use super::schema_adapter::{build_reader_schema_adapters, RowsetSchemaAdapter};
-pub use super::tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
+pub use super::tablet_reader_params::{
+    ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
+};
 use super::tablet_runtime::{TabletReadGuard, TabletRef, TabletSnapshotMaterialization};
 use super::tablet_schema::TabletSchemaRef;
+use crate::codec::vector_decoder::StorageDictionaryDecoderCache;
 use crate::primary_key::DeleteVector;
 use crate::rowset::segment::SegmentIterator;
 use crate::rowset::RowsetSharedPtr;
@@ -58,26 +61,22 @@ impl RowsetCursor {
     fn new(
         rowset: RowsetSharedPtr,
         projection: &[ColumnId],
+        read_prefix_widths: &[Option<usize>],
         params: &TabletReaderParams,
     ) -> Result<Self> {
         // Ensure segments are loaded and protect rowset from deletion during read.
         // Segment-granular rowset scans pass the already-loaded segment handle
         // through TabletReaderParams to avoid rebuilding a cursor over every
         // segment in the rowset for each morsel.
-        if params.segment.is_none() {
-            if let Some(opts) = &params.segment_options {
-                rowset.load_with_options(opts.clone())?;
-            } else {
-                rowset.load()?;
-            }
-        }
-        rowset.acquire();
-
         let segments = if let Some(segment) = &params.segment {
             vec![Arc::clone(segment)]
+        } else if let Some(options) = &params.segment_options {
+            rowset.segments_with_options(options.clone())?
         } else {
+            rowset.load()?;
             rowset.segments()
         };
+        rowset.acquire();
         let mut segment_iters = Vec::with_capacity(segments.len());
         for seg in segments {
             let col_ids: Vec<ColumnId> = if params.projection.is_none() && projection.is_empty() {
@@ -117,14 +116,21 @@ impl RowsetCursor {
                 Vec::new()
             };
 
-            let iter = if use_late_materialize && !predicate_columns.is_empty() {
-                SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
+            let mut iter = if use_late_materialize && !predicate_columns.is_empty() {
+                let matched_prefixes = projection
+                    .iter()
+                    .copied()
+                    .zip(read_prefix_widths.iter().copied())
+                    .filter_map(|(column_id, width)| width.map(|width| (column_id, width)))
+                    .collect::<HashMap<_, _>>();
+                SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize_with_prefixes(
                     &seg,
                     col_ids,
                     predicate_columns,
                     delete_vector,
                     params.predicate_tree.clone(),
                     params.prefetcher.clone(),
+                    matched_prefixes,
                 )?
             } else {
                 SegmentIterator::new_with_delete_vector_predicate_and_prefetcher(
@@ -135,9 +141,12 @@ impl RowsetCursor {
                     params.prefetcher.clone(),
                 )?
             };
-            if iter.num_columns() == 0 && !params.emit_row_id && projection.is_empty() {
-                continue;
-            };
+            if let Some((start, end)) = params.segment_ordinal_range {
+                iter.set_ordinal_range(start, end)?;
+            }
+            // A zero-column iterator is a cardinality source, not an empty
+            // segment. SegmentIterator advances it from segment ordinals so
+            // COUNT(*) can avoid materializing an arbitrary payload column.
             segment_iters.push(iter);
         }
 
@@ -230,6 +239,13 @@ pub struct TabletReader {
     /// Output column mapping (output idx -> read idx)
     pub(super) output_to_read: Vec<usize>,
 
+    /// Output decode transform, parallel to `output_to_read`.
+    pub(super) value_projections: Vec<ColumnValueProjection>,
+
+    /// Raw predicate columns that can be compacted to a proven prefix before
+    /// they leave the segment iterator, parallel to `projection`.
+    read_prefix_widths: Vec<Option<usize>>,
+
     /// Prepare-stage rowset schema adapters keyed by rowset id.
     schema_adapters: HashMap<u64, RowsetSchemaAdapter>,
 
@@ -244,6 +260,10 @@ pub struct TabletReader {
 
     /// Allocator used to materialize output vectors/chunks.
     pub(super) allocator: Arc<dyn Allocator>,
+
+    /// Most recently decoded storage dictionary page per projected column.
+    /// Kept at reader scope because one physical page can feed many chunks.
+    pub(super) storage_dictionary_cache: StorageDictionaryDecoderCache,
 
     /// Snapshot guard pinned for the full reader lifetime.
     snapshot_guard: Option<TabletReadGuard>,
@@ -263,6 +283,8 @@ impl std::fmt::Debug for TabletReader {
             .field("read_types", &self.read_types)
             .field("projection", &self.projection)
             .field("output_to_read", &self.output_to_read)
+            .field("value_projections", &self.value_projections)
+            .field("read_prefix_widths", &self.read_prefix_widths)
             .field("schema_adapters", &self.schema_adapters.len())
             .field("state", &self.state)
             .field("current_cursor", &self.current_cursor)
@@ -292,6 +314,11 @@ impl TabletReader {
         params: TabletReaderParams,
         allocator: Arc<dyn Allocator>,
     ) -> Result<Self> {
+        if params.segment_ordinal_range.is_some() && params.segment.is_none() {
+            return Err(paro_error::invalid_input(
+                "segment ordinal range requires an explicit segment handle",
+            ));
+        }
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("Tablet schema not available"))?;
@@ -314,6 +341,29 @@ impl TabletReader {
         } else {
             ColumnProjection::new(output_columns.clone())
         };
+
+        for (output_index, (&column_index, projection)) in column_projection
+            .output_columns()
+            .iter()
+            .zip(column_projection.value_projections())
+            .enumerate()
+        {
+            let ColumnValueProjection::MatchedUtf8Prefix { byte_width } = projection else {
+                continue;
+            };
+            let column = schema.column(column_index).ok_or_else(|| {
+                paro_error::invalid_input("matched-prefix column index is out of range")
+            })?;
+            if column.logical_type != LogicalType::Varchar
+                || !params.predicate_tree.as_ref().is_some_and(|predicate| {
+                    predicate.proves_ascii_prefix_width(column.id, *byte_width)
+                })
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "matched-prefix output {output_index} lacks its exact VARCHAR predicate witness"
+                )));
+            }
+        }
 
         // Determine output types based on output columns
         let mut output_types = output_columns
@@ -353,6 +403,7 @@ impl TabletReader {
             })
             .collect::<Result<Vec<_>>>()?;
 
+        let read_prefix_widths = column_projection.exclusive_matched_prefix_widths();
         Ok(Self {
             tablet,
             params,
@@ -362,11 +413,14 @@ impl TabletReader {
             read_types,
             projection,
             output_to_read: column_projection.output_to_read().to_vec(),
+            value_projections: column_projection.value_projections().to_vec(),
+            read_prefix_widths,
             schema_adapters: HashMap::new(),
             state: ReaderState::new(),
             current_cursor: None,
             is_prepared: false,
             allocator,
+            storage_dictionary_cache: StorageDictionaryDecoderCache::default(),
             snapshot_guard: None,
             snapshot_materialization: None,
         })
@@ -436,17 +490,31 @@ impl TabletReader {
                 }
 
                 let rowset = self.rowsets[self.state.current_rowset_idx].clone();
-                let cursor = RowsetCursor::new(rowset, &self.projection, &self.params)?;
+                let cursor = RowsetCursor::new(
+                    rowset,
+                    &self.projection,
+                    &self.read_prefix_widths,
+                    &self.params,
+                )?;
                 self.current_cursor = Some(cursor);
             }
 
             // Fetch next batch from current rowset/segment
-            let (rowids, batch_v, batch_rows, segment_finished, rowset_id, segment_id) = {
+            let (
+                rowids,
+                batch_v,
+                batch_rows,
+                physical_rows,
+                selection,
+                segment_finished,
+                rowset_id,
+                segment_id,
+            ) = {
                 let cursor = self.current_cursor.as_mut().unwrap();
                 let rowset_id = cursor.rowset.rowset_id();
 
                 if cursor.is_finished() {
-                    (Vec::new(), Vec::new(), 0, true, rowset_id, 0)
+                    (Vec::new(), Vec::new(), 0, 0, None, true, rowset_id, 0)
                 } else {
                     let iter = cursor.next_iter().expect("segment iterator must exist");
                     let segment_id = iter.segment_id();
@@ -461,6 +529,8 @@ impl TabletReader {
                         segment_batch.rowids,
                         segment_batch.columns,
                         segment_batch.rows,
+                        segment_batch.physical_rows,
+                        segment_batch.selection,
                         finished,
                         rowset_id,
                         segment_id,
@@ -478,7 +548,13 @@ impl TabletReader {
             }
 
             // Infer row count (verifies against expected)
-            let rows = self.infer_row_count(&batch, batch_rows)?;
+            let inferred_physical_rows = self.infer_row_count(&batch, physical_rows)?;
+            if inferred_physical_rows != physical_rows {
+                return Err(paro_error::data_corrupted(
+                    "Segment batch physical row count mismatch",
+                ));
+            }
+            let rows = batch_rows;
 
             if rows == 0 {
                 // Empty batch – advance segment and continue
@@ -492,7 +568,15 @@ impl TabletReader {
                 continue;
             }
 
-            let chunk = self.build_chunk(&batch, rows, &rowids, rowset_id, segment_id)?;
+            let chunk = self.build_chunk_with_owned_selection(
+                &batch,
+                rows,
+                physical_rows,
+                selection,
+                &rowids,
+                rowset_id,
+                segment_id,
+            )?;
 
             self.state.rows_read += rows as u64;
 

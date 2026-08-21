@@ -5,15 +5,18 @@
 
 use std::collections::HashMap;
 use std::mem;
+use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_planner::expression::{
-    ConjunctionExpression, ConjunctionType, ConstantExpression, Expression, ReferenceExpression,
+    ColumnRefExpression, ConjunctionExpression, ConjunctionType, ConstantExpression, Expression,
+    ExpressionIterator, ReferenceExpression, WindowExpression, WindowFrameBound, WindowInvocation,
 };
 use paro_planner::operator::join::{
-    ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
+    AntiJoinMode, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinType,
+    MarkJoinSemantics,
 };
 use paro_planner::operator::{
     Aggregate as LogicalAggregate, CTERef as LogicalCteRef, CopyTo as LogicalCopyTo,
@@ -24,9 +27,9 @@ use paro_planner::operator::{
     GraphScan as LogicalGraphScan, Insert as LogicalInsert, Limit as LogicalLimit,
     LogicalExternalProject, LogicalExternalTable, LogicalOperator,
     MaterializedCTE as LogicalMaterializedCte, Order as LogicalOrder,
-    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte, SearchCandidate,
-    SearchDecision, SearchScan as LogicalSearchScan, SetOpType,
-    SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
+    Projection as LogicalProjection, RecursiveCTE as LogicalRecursiveCte,
+    RowFetch as LogicalRowFetch, SearchCandidate, SearchDecision, SearchScan as LogicalSearchScan,
+    SetOpType, SetOperation as LogicalSetOperation, TableFunctionGet as LogicalTableFunctionGet,
     TopN as LogicalTopN, Update as LogicalUpdate, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
@@ -39,18 +42,23 @@ use super::plan::{PhysicalPlan, PhysicalPlanNodeArena};
 use super::properties::PlanPropertyMap;
 use super::row_type::RowType;
 use super::specs::{
-    AdaptiveSearchSpec, AggregateSpec, ClassicIeJoinSpec, CopyToFileSpec, CreateIndexUtilitySpec,
-    CrossProductSpec, CteScanSpec, DeleteSpec, DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec,
-    DelimScanTarget, DummyScanSpec, EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec,
-    FilterSpec, FullTextSearchSpec, GraphExpandSpec, GraphProjectSpec, GraphRowidMapping,
-    GraphScanSpec, GraphShortestPathSpec, HashJoinSpec, InsertSpec, LimitSpec, MaterializedCteSpec,
-    NestedLoopJoinSpec, PerfectHashAggregatePlan, PhysicalNodeKind, ProjectSpec, RecursiveCteSpec,
-    RowsetScanSpec, SearchSourceSpec, SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec,
-    TableFunctionScanSpec, TopNSpec, UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec,
-    VectorSearchSpec, WindowSpec,
+    AdaptiveSearchSpec, AggregateSpec, BuildTimeIntegerJoinIndexSpec, ClassicIeJoinSpec,
+    CopyToFileSpec, CreateIndexUtilitySpec, CrossProductSpec, CteScanSpec, DeleteSpec,
+    DelimJoinSideSpec, DelimJoinSpec, DelimScanSpec, DelimScanTarget, DummyScanSpec,
+    EmptyResultSpec, ExternalProjectSpec, ExternalTableSpec, FilterSpec, FullTextSearchSpec,
+    GraphExpandSpec, GraphProjectSpec, GraphRowFetchMapping, GraphScanSpec, GraphShortestPathSpec,
+    HashJoinSpec, HashReductionCascadeSpec, HashReductionExtremaChannelSpec,
+    HashReductionGroupedExtremaSpec, HashReductionPredicateSpec, HashReductionSourcePredicateSpec,
+    HashReductionStepSpec, InsertSpec, LimitSpec, MaterializedCteSpec, NestedLoopJoinSpec,
+    PartitionAggregateDomain, PartitionAggregateWindowSpec, PerfectHashAggregatePlan,
+    PhysicalNodeKind, PostAggregateReductionSpec, ProjectSpec, RecursiveCteSpec,
+    RelationalRowFetchMapping, RowFetchProjectionSpec, RowFetchSpec, RowsetColumnProjection,
+    RowsetColumnValueProjection, RowsetScanAccessPolicy, RowsetScanSpec, SearchSourceSpec,
+    SortRangeJoinSpec, SortSpec, SparseVectorSearchSpec, TableFunctionScanSpec, TopNSpec,
+    UnsupportedSpec, UpdateSpec, UtilitySpec, ValuesSpec, VectorSearchSpec, WindowSpec,
 };
 
-mod predicate_builder;
+pub(crate) mod predicate_builder;
 
 mod aggregate;
 mod dml;
@@ -60,6 +68,7 @@ mod helpers;
 mod inequality_join_gate;
 mod join;
 mod misc;
+mod row_fetch;
 mod scan;
 mod set;
 
@@ -70,6 +79,11 @@ use inequality_join_gate::*;
 pub struct PlanBuildContext {
     pub force_external: bool,
     pub rowset_scan_pushdown: bool,
+    /// Query-scoped memory available to physical operators. Zero means the
+    /// planner has no budget information and must use conservative defaults.
+    pub max_memory: usize,
+    pub max_threads: usize,
+    pub scan_access_cost: paro_storage::rowset::scan_cost::ScanAccessCostModel,
 }
 
 impl Default for PlanBuildContext {
@@ -77,6 +91,9 @@ impl Default for PlanBuildContext {
         Self {
             force_external: false,
             rowset_scan_pushdown: true,
+            max_memory: 0,
+            max_threads: 1,
+            scan_access_cost: Default::default(),
         }
     }
 }
@@ -101,12 +118,14 @@ impl PhysicalPlanGenerator {
         self.arena = PhysicalPlanNodeArena::default();
         self.children = PlanChildrenArena::default();
         let root = self.generate_node(logical)?;
-        Ok(PhysicalPlan::new(
+        let mut plan = PhysicalPlan::new(
             root,
             mem::take(&mut self.arena),
             mem::take(&mut self.children),
             PlanPropertyMap::default(),
-        ))
+        );
+        super::rewrite::rewrite_projection_chains(&mut plan);
+        Ok(plan)
     }
 
     fn generate_node(&mut self, logical: &LogicalPlan) -> Result<PhysicalPlanNodeId> {
@@ -115,11 +134,19 @@ impl PhysicalPlanGenerator {
             LogicalOperator::DummyScan => (PhysicalNodeKind::DummyScan(DummyScanSpec), Vec::new()),
             LogicalOperator::ExpressionGet(values) => self.lower_values(values),
             LogicalOperator::EmptyResult(empty) => self.lower_empty_result(empty)?,
-            LogicalOperator::Filter(filter) => self.lower_filter(filter)?,
-            LogicalOperator::Projection(project) if is_graph_chain(project.child.as_ref()) => {
-                self.lower_graph_project(project)?
+            LogicalOperator::Filter(filter) => {
+                self.lower_filter(filter, logical.stats.estimated_cardinality)?
             }
-            LogicalOperator::Projection(project) => self.lower_project(project)?,
+            LogicalOperator::Projection(project) => {
+                if let LogicalOperator::RowFetch(fetch) = &project.child.operator {
+                    self.lower_row_fetch(fetch, Some(project))?
+                } else if is_graph_chain(project.child.as_ref()) {
+                    self.lower_graph_project(project)?
+                } else {
+                    self.lower_project(project)?
+                }
+            }
+            LogicalOperator::RowFetch(fetch) => self.lower_row_fetch(fetch, None)?,
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,
@@ -229,5 +256,11 @@ impl PhysicalPlanGenerator {
     }
 }
 
+#[cfg(test)]
+mod partition_aggregate_tests;
+#[cfg(test)]
+mod post_reduction_tests;
+#[cfg(test)]
+mod row_fetch_tests;
 #[cfg(test)]
 mod tests;

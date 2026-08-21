@@ -24,7 +24,6 @@ impl<'a> PipelineLowerer<'a> {
         let producer_sink = SinkSpec::ExternalTable(ExternalTableSinkSpec {
             handle,
             spec: spec.clone(),
-            required: Default::default(),
         });
         let producer = match self.plan.child_ids(&self.plan.node(root).children) {
             [child] => self.lower_subtree_to_sink(
@@ -45,7 +44,6 @@ impl<'a> PipelineLowerer<'a> {
                     SinkSharing::Exclusive,
                     producer_output,
                     pipelines,
-                    dependencies,
                 )?;
                 pushed.tail
             }
@@ -70,7 +68,6 @@ impl<'a> PipelineLowerer<'a> {
             sink_sharing,
             output,
             pipelines,
-            dependencies,
         )?;
         let consumer = pushed.entry;
         self.handles.add_consumer(handle, consumer)?;

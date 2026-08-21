@@ -5,6 +5,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use paro_common::vector::VECTOR_SIZE;
+
 use super::{RawRowAllocator, RawRowLayout};
 use crate::buffer::BufferHandle;
 
@@ -104,16 +106,26 @@ pub struct RawRowChunkPart {
     pub total_heap_size: usize,
     /// Number of rows in this part
     pub count: u32,
-    /// Base heap pointer for swizzling
-    pub base_heap_ptr: Option<*mut u8>,
-    /// Lock for recomputing heap pointers
-    pub lock: Arc<Mutex<()>>,
+    /// Last pinned base address of this part's heap range.
+    ///
+    /// Row-local varlen pointers are swizzled whenever the buffer pool reloads
+    /// the heap block at another address. Keeping the address as an integer
+    /// avoids giving a stale raw pointer a false lifetime, and sharing the
+    /// state makes cloned part metadata observe the same swizzle generation.
+    pub heap_base_address: Arc<Mutex<Option<usize>>>,
 }
 
-// Safety: The raw pointer is protected by the lock for swizzling,
-// and logic must ensure it's only accessed when the block is pinned.
-unsafe impl Send for RawRowChunkPart {}
-unsafe impl Sync for RawRowChunkPart {}
+/// Stable append-time location of one row inside a raw row collection.
+///
+/// Sealed [`RowStore`](crate::row::RowStore) metadata retains this location so
+/// later gathers can pin the exact chunk part without scanning segments and
+/// chunks again for every projected column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RawRowLocation {
+    pub(crate) segment_index: usize,
+    pub(crate) part_index: usize,
+    pub(crate) row_in_part: usize,
+}
 
 impl RawRowChunkPart {
     /// Create a new chunk part.
@@ -132,8 +144,7 @@ impl RawRowChunkPart {
             heap_block_offset,
             total_heap_size,
             count,
-            base_heap_ptr: None,
-            lock: Arc::new(Mutex::new(())),
+            heap_base_address: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -146,8 +157,7 @@ impl RawRowChunkPart {
             heap_block_offset: INVALID_INDEX,
             total_heap_size: 0,
             count,
-            base_heap_ptr: None,
-            lock: Arc::new(Mutex::new(())),
+            heap_base_address: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -156,7 +166,7 @@ impl RawRowChunkPart {
         self.heap_block_index = INVALID_INDEX;
         self.heap_block_offset = INVALID_INDEX;
         self.total_heap_size = 0;
-        self.base_heap_ptr = None;
+        *self.heap_base_address.lock().unwrap() = None;
     }
 
     /// Check if this part has heap data.
@@ -362,15 +372,13 @@ impl RawRowSegment {
 
     /// Get the last chunk index, or create one if empty or if the last chunk is full.
     ///
-    /// Each chunk must have at most `STANDARD_VECTOR_SIZE` rows so scan state
+    /// Each chunk must have at most `VECTOR_SIZE` rows so scan state
     /// can map positions to chunk boundaries without extra indirection.
     pub fn get_or_create_chunk_index(&mut self) -> usize {
-        const STANDARD_VECTOR_SIZE: usize = 2048;
-
         // Create a new chunk if:
         // 1. No chunks exist, or
-        // 2. The last chunk is full (count >= STANDARD_VECTOR_SIZE)
-        if self.chunks.is_empty() || self.chunks.last().unwrap().count >= STANDARD_VECTOR_SIZE {
+        // 2. The last chunk is full (count >= VECTOR_SIZE)
+        if self.chunks.is_empty() || self.chunks.last().unwrap().count >= VECTOR_SIZE {
             self.chunks.push(RawRowChunk::new());
         }
         self.chunks.len() - 1
@@ -385,7 +393,6 @@ impl RawRowSegment {
     /// # Returns
     /// The index of the added part in chunk_parts.
     pub fn add_part_to_chunk(&mut self, chunk_index: usize, part: RawRowChunkPart) -> usize {
-        const STANDARD_VECTOR_SIZE: usize = 2048;
         let row_width = self.allocator.layout().get_row_width();
         let all_constant = self.allocator.layout().all_constant();
         let part_index = self.chunk_parts.len();
@@ -398,8 +405,8 @@ impl RawRowSegment {
         let chunk = &mut self.chunks[chunk_index];
         chunk.add_part_info(&part, all_constant);
         debug_assert!(
-            chunk.count <= STANDARD_VECTOR_SIZE,
-            "raw row chunk exceeded STANDARD_VECTOR_SIZE: chunk_index={}, count={}, limit={STANDARD_VECTOR_SIZE}",
+            chunk.count <= VECTOR_SIZE,
+            "raw row chunk exceeded VECTOR_SIZE: chunk_index={}, count={}, limit={VECTOR_SIZE}",
             chunk_index,
             chunk.count
         );

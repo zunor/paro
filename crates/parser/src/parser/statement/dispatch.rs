@@ -2217,11 +2217,17 @@ pub fn constraint_def(i: Input) -> IResult<ConstraintDefinition> {
         },
         |(_, _, _, columns, _)| ConstraintType::PrimaryKey(columns),
     );
+    let unique_not_enforced_constraint = map(
+        rule! {
+            UNIQUE ~ ^"(" ~ ^#comma_separated_list1(ident) ~ ^")" ~ ^NOT ~ ^ENFORCED
+        },
+        |(_, _, columns, _, _, _)| ConstraintType::UniqueNotEnforced(columns),
+    );
 
     map(
         rule! {
             (CONSTRAINT ~ #ident)?
-            ~ ( #check_constraint | #primary_key_constraint )
+            ~ ( #check_constraint | #primary_key_constraint | #unique_not_enforced_constraint )
         },
         |(opt_constraint_name, constraint_type)| ConstraintDefinition {
             name: opt_constraint_name.map(|(_, name)| name),

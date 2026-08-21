@@ -8,6 +8,7 @@
 mod column_binding;
 mod operator_type;
 mod plan_operator;
+mod projection_map;
 
 pub mod aggregate;
 pub mod alter;
@@ -42,6 +43,7 @@ pub mod limit;
 pub mod order;
 pub mod projection;
 pub mod refresh_property_graph;
+pub mod row_fetch;
 pub mod search_scan;
 pub mod set_operation;
 pub mod table_function;
@@ -50,7 +52,9 @@ pub mod update;
 pub mod window;
 
 pub use self::plan_operator::LogicalOperator;
-pub use aggregate::Aggregate;
+pub use aggregate::{
+    Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
+};
 pub use alter::Alter;
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;
@@ -74,20 +78,22 @@ pub use expression_get::ExpressionGet;
 pub use external_project::LogicalExternalProject;
 pub use external_table::LogicalExternalTable;
 pub use filter::Filter;
-pub use get::Get;
+pub use get::{binding_preserving_get, Get, GetColumnSource};
 pub use graph_expand::{ExpandDirection, GraphExpand};
 pub use graph_match::GraphMatch;
 pub use graph_scan::GraphScan;
 pub use insert::{Insert, InsertOnConflict, InsertOnConflictAction};
 pub use join::{
-    AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition, JoinSide,
-    JoinType,
+    AntiJoinMode, AnyJoin, ComparisonJoin, CrossProduct, Join, JoinComparisonType, JoinCondition,
+    JoinSide, JoinType, MarkJoinSemantics,
 };
 pub use limit::Limit;
 pub use operator_type::LogicalOperatorType;
 pub use order::Order;
 pub use projection::Projection;
+pub use projection_map::ProjectionMap;
 pub use refresh_property_graph::RefreshPropertyGraph;
+pub use row_fetch::{RowFetch, RowFetchSource};
 pub use search_scan::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
     Confidence, FullTextFilterScan, FullTextQueryKind, FullTextQueryStats, FullTextQueryStatsKind,

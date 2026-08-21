@@ -370,6 +370,10 @@ impl Rowset {
     /// Actual column data is loaded lazily when accessed.
     pub fn load(&self) -> Result<()> {
         let mut loaded = self.segments_loaded.write().unwrap();
+        self.load_segments_locked(&mut loaded)
+    }
+
+    fn load_segments_locked(&self, loaded: &mut bool) -> Result<()> {
         if *loaded {
             return Ok(());
         }
@@ -402,29 +406,36 @@ impl Rowset {
         Ok(())
     }
 
-    /// Load segments with custom options (page cache, etc.).
-    pub fn load_with_options(&self, options: SegmentOptions) -> Result<()> {
+    /// Return segment handles configured with the requested runtime resources.
+    ///
+    /// Loading and cloning the handles share the same configuration lock, so
+    /// a concurrent caller cannot replace the cached Segment instances between
+    /// those operations. Existing readers remain valid through their Arc pins.
+    pub fn segments_with_options(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
+        let mut loaded = self.segments_loaded.write().unwrap();
         {
-            let mut lock = self.segment_options.write().unwrap();
-            *lock = options;
+            let mut current = self.segment_options.write().unwrap();
+            if !current.runtime_equivalent(&options) {
+                *current = options;
+                *loaded = false;
+            }
         }
-        self.load()
+        self.load_segments_locked(&mut loaded)?;
+        Ok(self.segments.read().unwrap().clone())
     }
 
     /// Reload segments (force reload from disk)
     pub fn reload(&self) -> Result<()> {
+        let mut loaded = self.segments_loaded.write().unwrap();
         {
             let segments = self.segments.read().unwrap();
             for segment in segments.iter() {
                 segment.invalidate_delete_vector_cache();
             }
         }
-        {
-            let mut loaded = self.segments_loaded.write().unwrap();
-            *loaded = false;
-        }
+        *loaded = false;
         self.invalidate_statistics();
-        self.load()
+        self.load_segments_locked(&mut loaded)
     }
 
     /// Get segment by ID
@@ -615,10 +626,9 @@ impl Rowset {
     ///
     /// This unloads segments from memory but does not delete files.
     pub fn close(&self) -> Result<()> {
+        let mut loaded = self.segments_loaded.write().unwrap();
         let mut segments = self.segments.write().unwrap();
         segments.clear();
-
-        let mut loaded = self.segments_loaded.write().unwrap();
         *loaded = false;
 
         Ok(())
@@ -963,6 +973,7 @@ impl Default for RowsetBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::buffer::{BufferPool, PageCache};
     use crate::rowset::encoding::FieldType;
     use crate::rowset::rowset_meta::RowsetMetaBuilder;
     use crate::rowset::segment::{
@@ -1186,6 +1197,36 @@ mod tests {
     }
 
     #[test]
+    fn segments_with_runtime_options_reopen_and_reuse_loaded_segments() {
+        let schema = create_test_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let rowset_dir = tmp.path().join("rowset");
+        std::fs::create_dir_all(&rowset_dir).unwrap();
+        create_segment_with_path(&schema, 0, 3, rowset_dir.join("0.dat"));
+
+        let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))
+            .num_rows(3)
+            .num_segments(1)
+            .state(RowsetState::Visible)
+            .build();
+        let rowset = Rowset::create(schema, meta, rowset_dir).unwrap();
+        rowset.load().unwrap();
+        let original = rowset.get_segment(0).unwrap();
+
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let options = SegmentOptions::default()
+            .with_verify_checksum(false)
+            .with_page_cache(cache.clone())
+            .with_cache_decoded(true);
+        let reopened_segments = rowset.segments_with_options(options.clone()).unwrap();
+
+        let reopened = reopened_segments[0].clone();
+        assert!(!Arc::ptr_eq(&original, &reopened));
+        let reused = rowset.segments_with_options(options).unwrap();
+        assert!(Arc::ptr_eq(&reopened, &reused[0]));
+    }
+
+    #[test]
     fn test_rowset_iterator() {
         let schema = create_test_schema();
         let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))
@@ -1237,7 +1278,7 @@ mod tests {
 
         // Write delete vector marking middle row
         let mut dv = DeleteVector::new();
-        dv.mark_deleted(1);
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(1));
         dv.save_to_dir(&rowset_dir, 0).unwrap();
 
         let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))

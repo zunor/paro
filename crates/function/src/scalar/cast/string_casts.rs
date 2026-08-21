@@ -19,7 +19,7 @@ pub fn numeric_to_varchar_cast<T: std::fmt::Display + Copy>(
 ) -> Result<bool> {
     let view = input.try_to_view(count)?;
     let data = view.get_data::<T>();
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
@@ -48,13 +48,12 @@ where
     T: std::str::FromStr + Copy + Default + 'static,
 {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
-            let source = source_value.as_str();
+            let source = view.str(row);
             match source.trim().parse::<T>() {
                 Ok(value) => {
                     unsafe { result.set_flat::<T>(row, value) };
@@ -85,13 +84,12 @@ pub fn varchar_to_uuid_cast(
     ctx: &CastExecCtx<'_>,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
+    let view = input.try_to_utf8_view(count)?;
     result.set_count(count);
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
-            let source = source_value.as_str();
+            let source = view.str(row);
             match parse_uuid_str(source) {
                 Ok(value) => {
                     unsafe { result.set_flat::<u128>(row, value) };
@@ -125,7 +123,7 @@ pub fn uuid_to_varchar_cast(
     let data = view
         .get_data::<u128>()
         .expect("uuid cast requires pointer data");
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
@@ -147,13 +145,12 @@ fn varchar_to_json_like_cast(
     type_name: &str,
 ) -> Result<bool> {
     let mut all_success = true;
-    let view = input.try_to_varlen_view(count)?;
-    let mut writer = VarcharResultWriter::new(result, count);
+    let view = input.try_to_utf8_view(count)?;
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if view.is_valid(row) {
-            let source_value = view.get_inline_string(row);
-            let source = source_value.as_str();
+            let source = view.str(row);
             if serde_json::from_str::<JsonValue>(source).is_ok() {
                 writer.write_str(row, source)?;
             } else if ctx.try_cast {

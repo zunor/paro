@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -9,24 +10,30 @@ use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::memory::{MemoryAccountingContext, MemoryError, MemoryResult};
-use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{SelectionVector, Vector};
 use paro_planner::operator::join::{JoinCondition, JoinType};
 use paro_storage::buffer::{BufferPool, MemoryTag};
-use paro_storage::index::{ColumnId, Predicate, PredicateTree};
+use paro_storage::index::{ColumnId, PredicateTree};
 use paro_storage::row::{
     RadixPartitionedRows, RadixPartitionedRowsBuilder, ReclaimableRowStore, RowLayout, RowStore,
     RowValidityType,
 };
 
+use crate::join_hashtable::table::BuildTimeIntegerIndexBuilder;
 use crate::join_hashtable::{JoinHashTable, JoinHashTableConfig};
 use crate::memory_runtime::{ReclaimStats, Reclaimer, SpillCost};
+use crate::pipeline::graph::PipelineId;
 use crate::runtime::context::OperatorCleanupContext;
 
 use super::cleanup::{CleanupReason, CleanupState, CleanupStatus, RuntimeCleanup};
 use super::registry::BreakerHandleMetadata;
+
+#[path = "join_runtime_filter.rs"]
+mod runtime_filter;
+use runtime_filter::JoinRuntimeFilter;
+pub use runtime_filter::JoinRuntimeFilterBuilder;
 
 pub const HASH_JOIN_SPILL_MIN_RADIX_BITS: usize = 1;
 pub const HASH_JOIN_SPILL_MAX_RADIX_BITS: usize = 12;
@@ -34,6 +41,14 @@ pub const HASH_JOIN_SPILL_MIN_TARGET_PARTITION_BYTES: usize = 1024 * 1024;
 pub const HASH_JOIN_SPILL_TARGET_PARTITION_BYTES: usize = 64 * 1024 * 1024;
 
 static NEXT_HASH_JOIN_LOCAL_BUILD_RECLAIMER_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+enum BuildReclaimState {
+    Disabled = 0,
+    Enabled = 1,
+    Sealed = 2,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct JoinBuildId(pub u32);
@@ -45,12 +60,14 @@ pub struct JoinBuildHandle {
     pub spill: Arc<JoinSpillState>,
     pub completion: CompletionLatch,
     pub stats: JoinBuildStats,
-    table: OnceLock<Arc<JoinHashTable>>,
-    runtime_filter_builder: Mutex<Option<JoinRuntimeFilterSketch>>,
-    runtime_filter_sketch: OnceLock<JoinRuntimeFilterSketch>,
+    table: Mutex<JoinHashTableState>,
+    pending_consumers: Mutex<HashSet<PipelineId>>,
+    runtime_filter_builder: Mutex<Option<JoinRuntimeFilterBuilder>>,
+    runtime_filter: OnceLock<JoinRuntimeFilter>,
+    build_time_integer_builder: Mutex<Option<Arc<BuildTimeIntegerIndexBuilder>>>,
     mode: AtomicU8,
-    reclaim_enabled: AtomicBool,
-    spill_in_progress: AtomicBool,
+    build_reclaim_state: AtomicU8,
+    build_spill_gate: Mutex<()>,
     spill_radix_bits: OnceLock<usize>,
     external: OnceLock<JoinExternalModeConfig>,
     cleanup: CleanupState,
@@ -58,18 +75,21 @@ pub struct JoinBuildHandle {
 
 impl JoinBuildHandle {
     pub fn new(metadata: BreakerHandleMetadata) -> Self {
+        let pending_consumers = metadata.consumers.iter().copied().collect();
         Self {
             join_id: JoinBuildId(metadata.id.index() as u32),
             metadata,
             spill: Arc::new(JoinSpillState::default()),
             completion: CompletionLatch::default(),
             stats: JoinBuildStats::default(),
-            table: OnceLock::new(),
+            table: Mutex::new(JoinHashTableState::Uninitialized),
+            pending_consumers: Mutex::new(pending_consumers),
             runtime_filter_builder: Mutex::new(None),
-            runtime_filter_sketch: OnceLock::new(),
+            runtime_filter: OnceLock::new(),
+            build_time_integer_builder: Mutex::new(None),
             mode: AtomicU8::new(JoinBuildMode::InMemory as u8),
-            reclaim_enabled: AtomicBool::new(false),
-            spill_in_progress: AtomicBool::new(false),
+            build_reclaim_state: AtomicU8::new(BuildReclaimState::Disabled as u8),
+            build_spill_gate: Mutex::new(()),
             spill_radix_bits: OnceLock::new(),
             external: OnceLock::new(),
             cleanup: CleanupState::default(),
@@ -105,6 +125,34 @@ impl JoinBuildHandle {
         Ok(())
     }
 
+    /// Install an optional build-time index builder once. Concurrent pipeline
+    /// initialization may construct more than one candidate, but local states
+    /// subsequently read the single published winner from this handle.
+    pub(crate) fn install_build_time_integer_builder(
+        &self,
+        builder: Arc<BuildTimeIntegerIndexBuilder>,
+    ) {
+        let mut state = self.build_time_integer_builder.lock();
+        if state.is_none() {
+            *state = Some(builder);
+        }
+    }
+
+    pub(crate) fn build_time_integer_builder(&self) -> Option<Arc<BuildTimeIntegerIndexBuilder>> {
+        self.build_time_integer_builder.lock().as_ref().cloned()
+    }
+
+    pub(crate) fn take_build_time_integer_builder(
+        &self,
+    ) -> Result<Option<BuildTimeIntegerIndexBuilder>> {
+        let Some(builder) = self.build_time_integer_builder.lock().take() else {
+            return Ok(None);
+        };
+        Arc::try_unwrap(builder).map(Some).map_err(|_| {
+            paro_error::internal("unique integer join builder retained a local reference")
+        })
+    }
+
     pub fn initialize_table(
         &self,
         buffer_pool: Arc<BufferPool>,
@@ -113,35 +161,97 @@ impl JoinBuildHandle {
         build_types: Vec<LogicalType>,
         join_type: JoinType,
         memory: MemoryAccountingContext,
-    ) -> Arc<JoinHashTable> {
+    ) -> Result<Arc<JoinHashTable>> {
+        let build_output_count = build_types.len();
+        self.initialize_table_with_output_count(
+            buffer_pool,
+            allocator,
+            conditions,
+            build_types,
+            build_output_count,
+            join_type,
+            false,
+            memory,
+        )
+    }
+
+    pub fn initialize_table_with_output_count(
+        &self,
+        buffer_pool: Arc<BufferPool>,
+        allocator: Arc<dyn Allocator>,
+        conditions: Vec<JoinCondition>,
+        build_types: Vec<LogicalType>,
+        build_output_count: usize,
+        join_type: JoinType,
+        build_keys_unique: bool,
+        memory: MemoryAccountingContext,
+    ) -> Result<Arc<JoinHashTable>> {
         let runtime_filter_key_types = conditions
             .iter()
             .map(|condition| condition.right.return_type())
             .collect::<Vec<_>>();
-        self.initialize_runtime_filter_builder(&runtime_filter_key_types);
-        Arc::clone(self.table.get_or_init(|| {
-            Arc::new(JoinHashTable::new_with_memory(
-                buffer_pool,
-                allocator,
-                conditions,
-                build_types,
-                join_type,
-                JoinHashTableConfig::default(),
-                memory,
-            ))
-        }))
+        self.initialize_runtime_filter_builder(
+            &runtime_filter_key_types,
+            memory.with_class(MemoryAccountingClass::Metadata),
+        );
+        let mut state = self.table.lock();
+        match &*state {
+            JoinHashTableState::Live(table) => return Ok(Arc::clone(table)),
+            JoinHashTableState::Released => {
+                return Err(paro_error::internal(
+                    "hash join table cannot be reinitialized after its consumers finished",
+                ));
+            }
+            JoinHashTableState::Uninitialized => {}
+        }
+        let table = Arc::new(JoinHashTable::new_with_memory_and_output_count(
+            buffer_pool,
+            allocator,
+            conditions,
+            build_types,
+            build_output_count,
+            join_type,
+            JoinHashTableConfig {
+                build_keys_unique,
+                ..Default::default()
+            },
+            memory,
+        ));
+        *state = JoinHashTableState::Live(Arc::clone(&table));
+        Ok(table)
     }
 
     #[inline]
     pub fn table(&self) -> Option<Arc<JoinHashTable>> {
-        self.table.get().cloned()
+        match &*self.table.lock() {
+            JoinHashTableState::Live(table) => Some(Arc::clone(table)),
+            JoinHashTableState::Uninitialized | JoinHashTableState::Released => None,
+        }
     }
 
     pub fn require_table(&self) -> Result<Arc<JoinHashTable>> {
-        self.table
-            .get()
-            .cloned()
-            .ok_or_else(|| paro_error::internal("hash join build handle has no hash table"))
+        self.table()
+            .ok_or_else(|| paro_error::internal("hash join build handle has no live hash table"))
+    }
+
+    /// Release the build table when the last pipeline that consumes this
+    /// breaker finishes. The catalog is the single source of truth for
+    /// consumer ownership, so replay and unmatched-output branches naturally
+    /// extend the lifetime without relying on scheduler order. Removing from
+    /// the pending set also makes duplicate completion notifications idempotent.
+    pub fn consumer_finished(&self, pipeline: PipelineId) -> bool {
+        let released = {
+            let mut pending = self.pending_consumers.lock();
+            if !pending.remove(&pipeline) {
+                return false;
+            }
+            pending.is_empty()
+        };
+        if released {
+            let old = std::mem::replace(&mut *self.table.lock(), JoinHashTableState::Released);
+            drop(old);
+        }
+        released
     }
 
     pub fn finalize_in_memory(&self) -> Result<()> {
@@ -152,39 +262,48 @@ impl JoinBuildHandle {
         Ok(())
     }
 
-    pub fn initialize_runtime_filter_builder(&self, key_types: &[LogicalType]) {
+    pub fn initialize_runtime_filter_builder(
+        &self,
+        key_types: &[LogicalType],
+        memory: MemoryAccountingContext,
+    ) {
         let mut builder = self.runtime_filter_builder.lock();
         if builder.is_none() {
-            *builder = Some(JoinRuntimeFilterSketch::empty(key_types));
+            *builder = Some(JoinRuntimeFilterBuilder::empty_with_memory(
+                key_types, memory,
+            ));
         }
     }
 
-    pub fn merge_runtime_filter_sketch(
+    pub fn merge_runtime_filter_builder(
         &self,
-        sketch: Option<JoinRuntimeFilterSketch>,
+        incoming: Option<JoinRuntimeFilterBuilder>,
     ) -> Result<()> {
-        let Some(sketch) = sketch else {
+        let Some(incoming) = incoming else {
             return Ok(());
         };
         let mut builder = self.runtime_filter_builder.lock();
         match builder.as_mut() {
-            Some(existing) => existing.merge(&sketch)?,
-            None => *builder = Some(sketch),
+            Some(existing) => existing.merge(incoming)?,
+            None => *builder = Some(incoming),
         }
         Ok(())
     }
 
     pub fn publish_runtime_filter_from_builder(&self) -> Result<()> {
-        if self.runtime_filter_sketch.get().is_some() {
+        let mut builder = self.runtime_filter_builder.lock();
+        if self.runtime_filter.get().is_some() {
             return Ok(());
         }
-        let sketch = self
-            .runtime_filter_builder
-            .lock()
-            .clone()
-            .unwrap_or_else(|| JoinRuntimeFilterSketch::empty(&[]));
-        // Idempotent publish: concurrent finalize paths may race, and keeping the first sketch is fine.
-        let _ = self.runtime_filter_sketch.set(sketch);
+        let filter = builder
+            .take()
+            .unwrap_or_else(|| JoinRuntimeFilterBuilder::empty(&[]))
+            .freeze();
+        // The builder lock serializes concurrent finalize/reclaim publishers,
+        // so ownership can move into the immutable filter without cloning it.
+        self.runtime_filter.set(filter).map_err(|_| {
+            paro_error::internal("hash join runtime filter was published concurrently")
+        })?;
         Ok(())
     }
 
@@ -193,27 +312,46 @@ impl JoinBuildHandle {
         build_key_index: usize,
         probe_column_id: ColumnId,
     ) -> Option<PredicateTree> {
-        self.runtime_filter_sketch
+        self.runtime_filter
             .get()
             .and_then(|filter| filter.predicate_for_column(build_key_index, probe_column_id))
     }
 
     pub fn runtime_filter_ready(&self) -> bool {
-        self.runtime_filter_sketch.get().is_some()
+        self.runtime_filter.get().is_some()
     }
 
     pub fn enable_build_reclaim(&self) {
         if !self.completion.is_complete() && !self.is_external() {
-            self.reclaim_enabled.store(true, Ordering::Release);
+            let _ = self.build_reclaim_state.compare_exchange(
+                BuildReclaimState::Disabled as u8,
+                BuildReclaimState::Enabled as u8,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
         }
     }
 
     pub fn disable_build_reclaim(&self) {
-        self.reclaim_enabled.store(false, Ordering::Release);
+        let _ =
+            self.build_reclaim_state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    (state != BuildReclaimState::Sealed as u8)
+                        .then_some(BuildReclaimState::Disabled as u8)
+                });
+    }
+
+    /// Permanently closes the build-reclaim window and waits for a reclaimer
+    /// that already entered the spill gate. After this returns, an in-memory
+    /// finalizer may treat the build store as immutable.
+    pub fn seal_build_reclaim(&self) {
+        self.build_reclaim_state
+            .store(BuildReclaimState::Sealed as u8, Ordering::Release);
+        let _spill_guard = self.build_spill_gate.lock();
     }
 
     pub fn build_reclaim_enabled(&self) -> bool {
-        self.reclaim_enabled.load(Ordering::Acquire)
+        self.build_reclaim_state.load(Ordering::Acquire) == BuildReclaimState::Enabled as u8
     }
 
     pub fn has_build_spill(&self) -> bool {
@@ -226,26 +364,44 @@ impl JoinBuildHandle {
             .get_or_init(|| choose_hash_join_radix_bits(build_bytes, query_memory_cap))
     }
 
-    pub fn spill_build_for_reclaim(
+    pub fn reclaim_build(
         &self,
         target_bytes: usize,
         query_memory_cap: usize,
         memory: MemoryAccountingContext,
     ) -> MemoryResult<ReclaimStats> {
-        if target_bytes == 0 || self.completion.is_complete() || self.is_external() {
+        if target_bytes == 0 {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        if self.spill_in_progress.swap(true, Ordering::AcqRel) {
+        let _spill_guard = self.build_spill_gate.lock();
+        if !self.build_reclaim_enabled() || self.completion.is_complete() || self.is_external() {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        struct SpillGuard<'a>(&'a AtomicBool);
-        impl Drop for SpillGuard<'_> {
-            fn drop(&mut self) {
-                self.0.store(false, Ordering::Release);
-            }
-        }
-        let _spill_guard = SpillGuard(&self.spill_in_progress);
+        self.spill_build_locked(target_bytes, query_memory_cap, memory)
+    }
 
+    pub fn spill_build_for_external(
+        &self,
+        target_bytes: usize,
+        query_memory_cap: usize,
+        memory: MemoryAccountingContext,
+    ) -> MemoryResult<ReclaimStats> {
+        if target_bytes == 0 {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        let _spill_guard = self.build_spill_gate.lock();
+        if self.completion.is_complete() || self.is_external() {
+            return Ok(ReclaimStats::empty(target_bytes));
+        }
+        self.spill_build_locked(target_bytes, query_memory_cap, memory)
+    }
+
+    fn spill_build_locked(
+        &self,
+        target_bytes: usize,
+        query_memory_cap: usize,
+        memory: MemoryAccountingContext,
+    ) -> MemoryResult<ReclaimStats> {
         let Some(table) = self.table() else {
             return Ok(ReclaimStats::empty(target_bytes));
         };
@@ -292,6 +448,13 @@ impl JoinBuildHandle {
     pub fn cleanup_status(&self) -> CleanupStatus {
         self.cleanup.status()
     }
+}
+
+#[derive(Debug)]
+enum JoinHashTableState {
+    Uninitialized,
+    Live(Arc<JoinHashTable>),
+    Released,
 }
 
 fn hash_join_reclaim_error(err: paro_common::error::ParoError) -> MemoryError {
@@ -346,11 +509,8 @@ impl Reclaimer for HashJoinBuildSpillReclaimer {
         if !self.handle.build_reclaim_enabled() {
             return Ok(ReclaimStats::empty(target_bytes));
         }
-        self.handle.spill_build_for_reclaim(
-            target_bytes,
-            self.query_memory_cap,
-            self.memory.clone(),
-        )
+        self.handle
+            .reclaim_build(target_bytes, self.query_memory_cap, self.memory.clone())
     }
 
     fn spill_cost(&self) -> SpillCost {
@@ -466,349 +626,6 @@ impl Reclaimer for HashJoinLocalBuildSpillReclaimer {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct JoinRuntimeFilterSketch {
-    pub row_count: u64,
-    pub keys: Box<[JoinRuntimeFilterKeySketch]>,
-}
-
-impl JoinRuntimeFilterSketch {
-    pub fn empty(key_types: &[LogicalType]) -> Self {
-        Self {
-            row_count: 0,
-            keys: key_types
-                .iter()
-                .cloned()
-                .map(JoinRuntimeFilterKeySketch::new)
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
-        }
-    }
-
-    pub fn add_key_chunk(
-        &mut self,
-        keys: &Chunk,
-        selection: &SelectionVector,
-        selected_count: usize,
-    ) -> Result<()> {
-        if keys.column_count() != self.keys.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key count mismatch: sketch={}, chunk={}",
-                self.keys.len(),
-                keys.column_count()
-            )));
-        }
-        if selected_count > selection.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter selected count exceeds selection length: selected={selected_count}, selection={}",
-                selection.len()
-            )));
-        }
-        self.row_count += selected_count as u64;
-        let selected_rows = selection.as_slice();
-        for selected in selected_rows.iter().take(selected_count) {
-            let row_idx = *selected as usize;
-            for (key_idx, key) in self.keys.iter_mut().enumerate() {
-                let vector = keys.column(key_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter key column missing")
-                })?;
-                key.add_vector_value(vector, row_idx)?;
-            }
-        }
-        Ok(())
-    }
-
-    fn merge(&mut self, other: &Self) -> Result<()> {
-        if self.keys.len() != other.keys.len() {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter sketch merge key count mismatch: left={}, right={}",
-                self.keys.len(),
-                other.keys.len()
-            )));
-        }
-        self.row_count += other.row_count;
-        for (left, right) in self.keys.iter_mut().zip(other.keys.iter()) {
-            left.merge(right)?;
-        }
-        Ok(())
-    }
-
-    fn predicate_for_column(
-        &self,
-        build_key_index: usize,
-        probe_column_id: ColumnId,
-    ) -> Option<PredicateTree> {
-        self.keys
-            .get(build_key_index)
-            .and_then(|key| key.predicate_for_column(probe_column_id))
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct JoinRuntimeFilterKeySketch {
-    pub logical_type: LogicalType,
-    pub non_null_count: u64,
-    pub has_null: bool,
-    comparable: bool,
-    pub min: Option<Value>,
-    pub max: Option<Value>,
-}
-
-impl JoinRuntimeFilterKeySketch {
-    fn new(logical_type: LogicalType) -> Self {
-        Self {
-            logical_type,
-            non_null_count: 0,
-            has_null: false,
-            comparable: true,
-            min: None,
-            max: None,
-        }
-    }
-
-    fn add_vector_value(&mut self, vector: &Vector, row_idx: usize) -> Result<()> {
-        if vector.logical_type() != &self.logical_type {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key type mismatch: sketch={}, vector={}",
-                self.logical_type,
-                vector.logical_type()
-            )));
-        }
-        if vector.is_null(row_idx) {
-            self.has_null = true;
-            return Ok(());
-        }
-        self.non_null_count += 1;
-        match &self.logical_type {
-            LogicalType::Boolean => {
-                self.add_value(Value::Boolean(vector.get_bool(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter boolean value missing"),
-                )?))
-            }
-            LogicalType::TinyInt => {
-                self.add_value(Value::TinyInt(vector.get_i8(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter tinyint value missing")
-                })?))
-            }
-            LogicalType::SmallInt => {
-                self.add_value(Value::SmallInt(vector.get_i16(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter smallint value missing"),
-                )?))
-            }
-            LogicalType::Integer => {
-                self.add_value(Value::Integer(vector.get_i32(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter integer value missing"),
-                )?))
-            }
-            LogicalType::BigInt => {
-                self.add_value(Value::BigInt(vector.get_i64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter bigint value missing")
-                })?))
-            }
-            LogicalType::HugeInt => {
-                self.add_value(Value::HugeInt(vector.get_i128(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter hugeint value missing"),
-                )?))
-            }
-            LogicalType::UTinyInt => {
-                self.add_value(Value::UTinyInt(vector.get_u8(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter utinyint value missing"),
-                )?))
-            }
-            LogicalType::USmallInt => {
-                self.add_value(Value::USmallInt(vector.get_u16(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter usmallint value missing"),
-                )?))
-            }
-            LogicalType::UInteger => {
-                self.add_value(Value::UInteger(vector.get_u32(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter uinteger value missing"),
-                )?))
-            }
-            LogicalType::UBigInt => {
-                self.add_value(Value::UBigInt(vector.get_u64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter ubigint value missing"),
-                )?))
-            }
-            LogicalType::UHugeInt => {
-                self.add_value(Value::UHugeInt(vector.get_u128(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter uhugeint value missing"),
-                )?))
-            }
-            LogicalType::Uuid => {
-                self.add_value(Value::Uuid(vector.get_u128(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter uuid value missing")
-                })?))
-            }
-            LogicalType::Float => {
-                self.add_value(Value::Float(vector.get_f32(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter float value missing")
-                })?))
-            }
-            LogicalType::Double => {
-                self.add_value(Value::Double(vector.get_f64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter double value missing")
-                })?))
-            }
-            LogicalType::Decimal { precision, scale } => {
-                let value = if *precision <= 18 {
-                    vector.get_i64(row_idx).ok_or_else(|| {
-                        paro_error::internal("hash join runtime filter decimal value missing")
-                    })? as i128
-                } else {
-                    vector.get_i128(row_idx).ok_or_else(|| {
-                        paro_error::internal("hash join runtime filter decimal value missing")
-                    })?
-                };
-                self.add_value(Value::Decimal(value, *precision, *scale));
-            }
-            LogicalType::Date => {
-                self.add_value(Value::Date(vector.get_i32(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter date value missing")
-                })?))
-            }
-            LogicalType::Timestamp => {
-                self.add_value(Value::Timestamp(vector.get_i64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter timestamp value missing"),
-                )?))
-            }
-            LogicalType::TimestampTz => {
-                self.add_value(Value::TimestampTz(vector.get_i64(row_idx).ok_or_else(
-                    || paro_error::internal("hash join runtime filter timestamptz value missing"),
-                )?))
-            }
-            LogicalType::Time => {
-                self.add_value(Value::Time(vector.get_i64(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter time value missing")
-                })?))
-            }
-            LogicalType::Varchar
-            | LogicalType::VarcharCollation(_)
-            | LogicalType::TsVector
-            | LogicalType::TsQuery
-            | LogicalType::Json
-            | LogicalType::Jsonb => {
-                let value = vector.get_string(row_idx).ok_or_else(|| {
-                    paro_error::internal("hash join runtime filter string value missing")
-                })?;
-                self.add_string_value(value);
-            }
-            _ => {
-                self.comparable = false;
-            }
-        }
-        Ok(())
-    }
-
-    fn add_value(&mut self, value: Value) {
-        Self::update_extreme(&mut self.min, &value, &mut self.comparable, true);
-        if self.comparable {
-            Self::update_extreme(&mut self.max, &value, &mut self.comparable, false);
-        }
-    }
-
-    fn add_string_value(&mut self, value: &str) {
-        Self::update_string_extreme(&mut self.min, value, &mut self.comparable, true);
-        if self.comparable {
-            Self::update_string_extreme(&mut self.max, value, &mut self.comparable, false);
-        }
-    }
-
-    fn merge(&mut self, other: &Self) -> Result<()> {
-        if self.logical_type != other.logical_type {
-            return Err(paro_error::internal(format!(
-                "hash join runtime filter key sketch merge type mismatch: left={}, right={}",
-                self.logical_type, other.logical_type
-            )));
-        }
-        self.has_null |= other.has_null;
-        self.non_null_count += other.non_null_count;
-        if !other.comparable {
-            self.comparable = false;
-            return Ok(());
-        }
-        if let Some(min) = other.min.as_ref() {
-            Self::update_extreme(&mut self.min, min, &mut self.comparable, true);
-        }
-        if self.comparable {
-            if let Some(max) = other.max.as_ref() {
-                Self::update_extreme(&mut self.max, max, &mut self.comparable, false);
-            }
-        }
-        Ok(())
-    }
-
-    fn update_extreme(
-        slot: &mut Option<Value>,
-        value: &Value,
-        comparable: &mut bool,
-        is_min: bool,
-    ) {
-        let Some(current) = slot.as_ref() else {
-            *slot = Some(value.clone());
-            return;
-        };
-        let Some(ordering) = value.partial_cmp(current) else {
-            *comparable = false;
-            return;
-        };
-        let should_replace = if is_min {
-            ordering == std::cmp::Ordering::Less
-        } else {
-            ordering == std::cmp::Ordering::Greater
-        };
-        if should_replace {
-            *slot = Some(value.clone());
-        }
-    }
-
-    fn update_string_extreme(
-        slot: &mut Option<Value>,
-        value: &str,
-        comparable: &mut bool,
-        is_min: bool,
-    ) {
-        let Some(current) = slot.as_ref() else {
-            *slot = Some(Value::Varchar(value.to_owned()));
-            return;
-        };
-        let Value::Varchar(current) = current else {
-            *comparable = false;
-            return;
-        };
-        let should_replace = if is_min {
-            value < current.as_str()
-        } else {
-            value > current.as_str()
-        };
-        if should_replace {
-            *slot = Some(Value::Varchar(value.to_owned()));
-        }
-    }
-
-    fn predicate_for_column(&self, column_id: ColumnId) -> Option<PredicateTree> {
-        if self.non_null_count == 0 || !self.comparable {
-            return None;
-        }
-        let min = self.min.clone()?;
-        let max = self.max.clone()?;
-        min.partial_cmp(&max)?;
-        let predicate = if min == max {
-            Predicate::Eq {
-                column_id,
-                value: min,
-            }
-        } else {
-            Predicate::Range {
-                column_id,
-                lower: min,
-                upper: max,
-            }
-        };
-        Some(PredicateTree::leaf(predicate))
-    }
-}
-
 impl RuntimeCleanup for JoinBuildHandle {
     fn cleanup(&self, ctx: &mut OperatorCleanupContext, reason: CleanupReason) -> Result<()> {
         self.disable_build_reclaim();
@@ -895,6 +712,7 @@ impl JoinBuildSpillBuffer {
         types: Vec<LogicalType>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         Ok(Self {
             builder: RadixPartitionedRowsBuilder::new_with_memory(
                 buffer_pool,
@@ -956,6 +774,7 @@ impl JoinProbeSpillBuffer {
         types: Vec<LogicalType>,
         memory: MemoryAccountingContext,
     ) -> Result<Self> {
+        let memory = memory.with_class(MemoryAccountingClass::Spill);
         Ok(Self {
             builder: RadixPartitionedRowsBuilder::new_with_memory(
                 buffer_pool,
@@ -1397,569 +1216,5 @@ pub struct JoinBuildStats {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::sync::Arc;
-
-    use paro_common::chunk::Chunk;
-    use paro_common::memory::MemoryAccountingClass;
-    use paro_common::runtime_value::Value;
-    use paro_common::test_utils::{
-        test_allocator, test_chunk_from_vectors, test_i32_vector_with_allocator,
-        test_vector_with_capacity,
-    };
-    use paro_common::types::LogicalType;
-    use paro_context::test_support::TestStatementContextBuilder;
-    use paro_planner::expression::{Expression, ReferenceExpression};
-    use paro_planner::operator::join::JoinComparisonType;
-    use paro_storage::buffer::{BufferPool, MemoryTag};
-    use paro_storage::index::{Predicate, PredicateTree};
-    use paro_storage::row::RowValidityType;
-
-    use crate::explain::profiler::OperatorProfiler;
-    use crate::memory_runtime::QueryMemoryPool;
-    use crate::physical::properties::PipelineProperties;
-    use crate::physical::row_type::RowType;
-    use crate::pipeline::handles::{BreakerHandleId, BreakerHandleKind};
-    use crate::runtime::context::{OperatorCleanupContext, QueryRuntimeContext};
-    use crate::runtime::parameter::ParameterBindings;
-    use crate::runtime::scratch::TaskMemoryGrants;
-    use crate::runtime::QueryOutputPort;
-    use crate::thread_context::ThreadContext;
-
-    use super::*;
-
-    fn metadata() -> BreakerHandleMetadata {
-        BreakerHandleMetadata {
-            id: BreakerHandleId::new(0),
-            kind: BreakerHandleKind::HashJoinBuild,
-            row_type: RowType::new(vec!["a".to_string()], vec![LogicalType::Integer]),
-            producer: None,
-            consumers: Box::new([]),
-            properties: PipelineProperties::default(),
-        }
-    }
-
-    fn query_context() -> QueryRuntimeContext {
-        QueryRuntimeContext::new(
-            TestStatementContextBuilder::minimal().build(),
-            Arc::new(ParameterBindings::empty()),
-            Arc::new(QueryMemoryPool::unbounded()),
-            QueryOutputPort::unbounded(),
-        )
-    }
-
-    fn with_cleanup_context<R>(
-        query: &QueryRuntimeContext,
-        f: impl FnOnce(&mut OperatorCleanupContext<'_>) -> R,
-    ) -> R {
-        let thread = ThreadContext::single_threaded();
-        let memory = TaskMemoryGrants::detached(test_allocator());
-        let mut profiler = OperatorProfiler::disabled();
-        let mut ctx = OperatorCleanupContext {
-            query,
-            pipeline: None,
-            operator: None,
-            thread: &thread,
-            memory: memory.call_scope(),
-            cancel: &query.cancellation,
-            profiler: &mut profiler,
-        };
-        f(&mut ctx)
-    }
-
-    fn radix_input() -> Chunk {
-        radix_input_with_rows(&[0, 1 << 63, 0, 1 << 63], &[10, 20, 30, 40])
-    }
-
-    fn radix_input_with_rows(hashes_input: &[u64], payload_input: &[i32]) -> Chunk {
-        assert_eq!(hashes_input.len(), payload_input.len());
-        let count = hashes_input.len();
-        let mut hashes = test_vector_with_capacity(LogicalType::UBigInt, count);
-        for (idx, hash) in hashes_input.iter().copied().enumerate() {
-            hashes.set_u64(idx, hash);
-        }
-        hashes.set_count(count);
-
-        let mut payload = test_vector_with_capacity(LogicalType::Integer, count);
-        for (idx, value) in payload_input.iter().copied().enumerate() {
-            payload.set_i32(idx, value);
-        }
-        payload.set_count(count);
-
-        test_chunk_from_vectors(vec![hashes, payload])
-    }
-
-    fn partitioned_rows() -> RadixPartitionedRows {
-        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
-        let layout = Arc::new(RowLayout::from_types(
-            vec![LogicalType::UBigInt, LogicalType::Integer],
-            RowValidityType::CanHaveNullValues,
-        ));
-        let mut builder =
-            RadixPartitionedRowsBuilder::new(pool, layout, MemoryTag::HashTable, 1, 0)
-                .expect("radix builder");
-        builder.append(&radix_input()).expect("append radix input");
-        builder.seal()
-    }
-
-    #[test]
-    fn join_build_mode_uses_atomic_discriminant_and_once_external_config() {
-        let handle = JoinBuildHandle::new(metadata());
-        assert_eq!(handle.mode(), JoinBuildMode::InMemory);
-        assert!(!handle.is_external());
-        assert!(handle.external_config().is_none());
-
-        handle
-            .set_external_mode(JoinExternalModeConfig {
-                radix_bits: 4,
-                build_partitions: JoinPartitionSet { partition_count: 8 },
-                probe_partitions: ProbeSpillSet { partition_count: 8 },
-            })
-            .expect("external mode should be set once");
-
-        assert_eq!(handle.mode(), JoinBuildMode::External);
-        assert!(handle.is_external());
-        assert_eq!(
-            handle
-                .external_config()
-                .expect("external config")
-                .build_partitions
-                .partition_count,
-            8
-        );
-        assert!(handle
-            .set_external_mode(JoinExternalModeConfig {
-                radix_bits: 5,
-                build_partitions: JoinPartitionSet {
-                    partition_count: 16
-                },
-                probe_partitions: ProbeSpillSet {
-                    partition_count: 16
-                },
-            })
-            .is_err());
-    }
-
-    #[test]
-    fn join_build_finalize_publishes_min_max_runtime_filter() {
-        let allocator = test_allocator();
-        let handle = JoinBuildHandle::new(metadata());
-        let table = handle.initialize_table(
-            Arc::new(BufferPool::new(16 * 1024 * 1024)),
-            allocator.clone(),
-            vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                JoinComparisonType::Equal,
-            )],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::HashTable,
-                MemoryAccountingClass::Revocable,
-            ),
-        );
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[10, 20, 30],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[100, 200, 300],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        table.build(&keys, &payload).expect("build hash table");
-        let selection = SelectionVector::try_incremental(3, allocator.clone()).expect("selection");
-        let mut sketch = JoinRuntimeFilterSketch::empty(&[LogicalType::Integer]);
-        sketch
-            .add_key_chunk(&keys, &selection, 3)
-            .expect("update runtime filter sketch");
-        handle
-            .merge_runtime_filter_sketch(Some(sketch))
-            .expect("merge runtime filter sketch");
-
-        handle.finalize_in_memory().expect("finalize build");
-
-        assert_eq!(
-            handle.runtime_filter_predicate(0, 7).expect("predicate"),
-            PredicateTree::leaf(Predicate::Range {
-                column_id: 7,
-                lower: Value::Integer(10),
-                upper: Value::Integer(30),
-            })
-        );
-    }
-
-    #[test]
-    fn hash_join_build_spill_reclaimer_externalizes_after_finish_enable() {
-        let allocator = test_allocator();
-        let handle = Arc::new(JoinBuildHandle::new(metadata()));
-        let memory = MemoryAccountingContext::detached(
-            paro_common::allocator::MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        );
-        let table = handle.initialize_table(
-            Arc::new(BufferPool::new(16 * 1024 * 1024)),
-            allocator.clone(),
-            vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                JoinComparisonType::Equal,
-            )],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            memory.clone(),
-        );
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[10, 20, 30, 40],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[100, 200, 300, 400],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        table.build(&keys, &payload).expect("build hash table");
-        let reclaimer = HashJoinBuildSpillReclaimer::new(handle.clone(), memory, 16 * 1024 * 1024);
-
-        assert_eq!(reclaimer.reclaimable_bytes(), 0);
-        handle.enable_build_reclaim();
-        let before = table.build_rows_size_in_bytes();
-        assert!(before > 0);
-        assert_eq!(reclaimer.reclaimable_bytes(), before);
-
-        let stats = reclaimer.reclaim_sync(1).expect("reclaim hash join build");
-        assert_eq!(stats.requested_bytes, 1);
-        assert_eq!(stats.reclaimed_bytes, before);
-        assert_eq!(stats.spilled_bytes, before);
-        assert!(handle.is_external());
-        assert!(handle.completion.is_complete());
-        assert!(handle.runtime_filter_ready());
-        assert_eq!(table.build_rows_size_in_bytes(), 0);
-        assert_eq!(handle.spill.partition_counts().0, 2);
-        assert_eq!(reclaimer.reclaimable_bytes(), 0);
-    }
-
-    #[test]
-    fn hash_join_local_build_spill_reclaimer_buffers_unmerged_build_rows() {
-        let allocator = test_allocator();
-        let handle = Arc::new(JoinBuildHandle::new(metadata()));
-        let memory = MemoryAccountingContext::detached(
-            paro_common::allocator::MemoryTag::HashTable,
-            MemoryAccountingClass::Revocable,
-        );
-        handle.initialize_table(
-            Arc::new(BufferPool::new(16 * 1024 * 1024)),
-            allocator.clone(),
-            vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                JoinComparisonType::Equal,
-            )],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            memory.clone(),
-        );
-        let local_table = Arc::new(JoinHashTable::new_with_memory(
-            Arc::new(BufferPool::new(16 * 1024 * 1024)),
-            allocator.clone(),
-            vec![JoinCondition::new(
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
-                JoinComparisonType::Equal,
-            )],
-            vec![LogicalType::Integer],
-            JoinType::Inner,
-            JoinHashTableConfig::default(),
-            memory.clone(),
-        ));
-        let keys = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[10, 20, 30, 40],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        let payload = Chunk::from_arc_vectors(
-            vec![Arc::new(test_i32_vector_with_allocator(
-                &[100, 200, 300, 400],
-                allocator.clone(),
-            ))],
-            allocator.clone(),
-        );
-        local_table
-            .build(&keys, &payload)
-            .expect("build local hash table");
-        let build_spill = Arc::new(Mutex::new(None));
-        let reclaimer = HashJoinLocalBuildSpillReclaimer::new(
-            handle.clone(),
-            HashJoinLocalBuildSpillReclaimer::next_local_id(),
-            local_table.clone(),
-            build_spill.clone(),
-            memory.clone(),
-            16 * 1024 * 1024,
-        );
-
-        let before = local_table.build_rows_size_in_bytes();
-        assert!(before > 0);
-        assert_eq!(reclaimer.reclaimable_bytes(), before);
-        let stats = reclaimer
-            .reclaim_sync(1)
-            .expect("reclaim local hash join build");
-
-        assert_eq!(stats.requested_bytes, 1);
-        assert_eq!(stats.reclaimed_bytes, before);
-        assert!(stats.spilled_bytes > 0);
-        assert_eq!(local_table.build_rows_size_in_bytes(), 0);
-        assert!(!handle.is_external());
-        assert!(!handle.completion.is_complete());
-
-        let buffer = build_spill.lock().take().expect("local build spill buffer");
-        handle
-            .spill
-            .append_build_buffer(buffer)
-            .expect("append local build spill to handle");
-        assert!(handle.has_build_spill());
-        assert_eq!(handle.spill.partition_counts().0, 2);
-
-        handle
-            .spill_build_for_reclaim(usize::MAX, 16 * 1024 * 1024, memory)
-            .expect("finish external hash join from local spill");
-        assert!(handle.is_external());
-        assert!(handle.completion.is_complete());
-        assert_eq!(handle.spill.partition_counts().0, 2);
-    }
-
-    #[test]
-    fn join_spill_cleanup_releases_partitions_and_resets_replay_state() {
-        let spill = JoinSpillState::default();
-        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
-        spill
-            .install_build_partitions(partitioned_rows())
-            .expect("install build partitions");
-        let input = radix_input();
-        let mut probe_buffer = JoinProbeSpillBuffer::new(
-            pool,
-            1,
-            0,
-            input.types(),
-            MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::HashTable,
-                paro_common::memory::MemoryAccountingClass::Revocable,
-            ),
-        )
-        .expect("probe spill buffer");
-        probe_buffer
-            .append(&input)
-            .expect("append probe partition chunk");
-        spill
-            .append_probe_buffer(probe_buffer)
-            .expect("append probe partition buffer");
-        assert_eq!(spill.partition_counts(), (2, 2));
-        let stats = spill.stats();
-        assert_eq!(stats.build_rows, 4);
-        assert_eq!(stats.probe_rows, 4);
-        assert!(stats.build_bytes > 0);
-        assert!(stats.probe_bytes > 0);
-        assert!(stats.max_partition_bytes > 0);
-
-        let first_partition = spill
-            .take_next_replay_partition()
-            .expect("first replay partition")
-            .expect("partition");
-        assert_eq!(first_partition.partition_idx, 0);
-        assert!(spill.is_sealed());
-
-        let query = query_context();
-        with_cleanup_context(&query, |ctx| {
-            spill
-                .cleanup(
-                    ctx,
-                    CleanupReason::Cancelled(paro_context::StatementCancelReason::UserRequest),
-                )
-                .expect("cleanup spill");
-        });
-
-        assert_eq!(spill.partition_counts(), (0, 0));
-        assert!(!spill.is_sealed());
-        assert_eq!(spill.cleanup_status(), CleanupStatus::Cancelled);
-        assert!(spill
-            .take_next_replay_partition()
-            .expect("cleanup should leave replay in an empty state")
-            .is_none());
-    }
-
-    #[test]
-    fn join_spill_replay_partitions_use_reclaiming_row_scanners() {
-        let spill = JoinSpillState::default();
-        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
-        spill
-            .install_build_partitions(partitioned_rows())
-            .expect("install build partitions");
-        let input = radix_input();
-        let mut probe_buffer = JoinProbeSpillBuffer::new(
-            pool,
-            1,
-            0,
-            input.types(),
-            MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::HashTable,
-                paro_common::memory::MemoryAccountingClass::Revocable,
-            ),
-        )
-        .expect("probe spill buffer");
-        probe_buffer
-            .append(&input)
-            .expect("append probe partition chunk");
-        spill
-            .append_probe_buffer(probe_buffer)
-            .expect("append probe partition buffer");
-
-        let partition = spill
-            .take_next_replay_partition()
-            .expect("replay partition")
-            .expect("partition");
-        let mut build_cursor = partition.build_rows.into_reclaiming_scanner();
-        let mut probe_cursor = partition
-            .probe_rows
-            .expect("probe rows")
-            .into_reclaiming_scanner();
-        let expected_build_rows = build_cursor.count() as usize;
-        let expected_probe_rows = probe_cursor.count() as usize;
-        let mut chunk = Chunk::try_new(test_allocator()).expect("scan chunk");
-
-        let mut build_rows = 0usize;
-        loop {
-            let scanned = build_cursor.next_chunk(&mut chunk).expect("scan build");
-            if scanned == 0 {
-                break;
-            }
-            build_rows += scanned;
-        }
-        assert_eq!(build_rows, expected_build_rows);
-        assert!(build_rows > 0);
-
-        let mut probe_rows = 0usize;
-        loop {
-            let scanned = probe_cursor.next_chunk(&mut chunk).expect("scan probe");
-            if scanned == 0 {
-                break;
-            }
-            probe_rows += scanned;
-        }
-        assert_eq!(probe_rows, expected_probe_rows);
-        assert!(probe_rows > 0);
-    }
-
-    #[test]
-    fn join_spill_replay_preserves_build_partition_without_probe_rows() {
-        let spill = JoinSpillState::default();
-        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
-        spill
-            .install_build_partitions(partitioned_rows())
-            .expect("install build partitions");
-        let input = radix_input_with_rows(&[0], &[100]);
-        let mut probe_buffer = JoinProbeSpillBuffer::new(
-            pool,
-            1,
-            0,
-            input.types(),
-            MemoryAccountingContext::detached(
-                paro_common::allocator::MemoryTag::HashTable,
-                paro_common::memory::MemoryAccountingClass::Revocable,
-            ),
-        )
-        .expect("probe spill buffer");
-        probe_buffer
-            .append(&input)
-            .expect("append one-sided probe partition chunk");
-        spill
-            .append_probe_buffer(probe_buffer)
-            .expect("append probe partition buffer");
-
-        let first = spill
-            .take_next_replay_partition()
-            .expect("first replay partition")
-            .expect("first partition");
-        assert_eq!(first.partition_idx, 0);
-        assert!(first.probe_rows.is_some());
-        let second = spill
-            .take_next_replay_partition()
-            .expect("second replay partition")
-            .expect("second partition");
-        assert_eq!(second.partition_idx, 1);
-        assert!(second.build_rows.count() > 0);
-        assert!(second.probe_rows.is_none());
-    }
-
-    #[test]
-    fn join_spill_replay_preserves_build_partitions_when_probe_never_spilled() {
-        let spill = JoinSpillState::default();
-        spill
-            .install_build_partitions(partitioned_rows())
-            .expect("install build partitions");
-
-        let first = spill
-            .take_next_replay_partition()
-            .expect("first replay partition")
-            .expect("first partition");
-        assert_eq!(first.partition_idx, 0);
-        assert!(first.build_rows.count() > 0);
-        assert!(first.probe_rows.is_none());
-    }
-
-    #[test]
-    fn join_probe_spill_buffers_batch_global_appends() {
-        let spill = JoinSpillState::default();
-        let pool = Arc::new(BufferPool::new(16 * 1024 * 1024));
-        let memory = MemoryAccountingContext::detached(
-            paro_common::allocator::MemoryTag::HashTable,
-            paro_common::memory::MemoryAccountingClass::Revocable,
-        );
-        let input = radix_input();
-
-        let mut first =
-            JoinProbeSpillBuffer::new(pool.clone(), 1, 0, input.types(), memory.clone())
-                .expect("first probe spill buffer");
-        first.append(&input).expect("append first probe chunk");
-        let mut second = JoinProbeSpillBuffer::new(pool, 1, 0, input.types(), memory)
-            .expect("second probe spill buffer");
-        second.append(&input).expect("append second probe chunk");
-
-        spill
-            .append_probe_buffer(first)
-            .expect("append first probe buffer");
-        spill
-            .append_probe_buffer(second)
-            .expect("append second probe buffer");
-
-        assert_eq!(spill.partition_counts(), (0, 2));
-        let stats = spill.stats();
-        assert_eq!(stats.probe_rows, 8);
-        assert!(stats.probe_bytes > 0);
-    }
-
-    #[test]
-    fn hash_join_radix_bits_scale_with_build_bytes_and_query_cap() {
-        assert_eq!(choose_hash_join_radix_bits(0, 1024 * 1024), 1);
-        assert_eq!(
-            choose_hash_join_radix_bits(2 * 1024 * 1024, 4 * 1024 * 1024),
-            1
-        );
-        assert!(choose_hash_join_radix_bits(256 * 1024 * 1024, 16 * 1024 * 1024) >= 6);
-        assert_eq!(
-            choose_hash_join_radix_bits(usize::MAX / 2, usize::MAX / 2),
-            HASH_JOIN_SPILL_MAX_RADIX_BITS
-        );
-    }
-}
+#[path = "join_tests.rs"]
+mod tests;

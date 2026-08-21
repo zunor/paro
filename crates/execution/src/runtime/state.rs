@@ -8,6 +8,7 @@
 //! global variables.
 
 use std::any::Any;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, Result};
@@ -20,10 +21,9 @@ pub use super::breaker::{
     MaterializeSinkGlobal, MaterializeSinkLocal, MaterializedSourceGlobal, MaterializedSourceLocal,
 };
 pub use crate::operators::aggregate::state::{
-    HashAggregateBuildSinkLocal, HashAggregateEmitSourceLocal, PerfectHashAggregateEmitSourceLocal,
-    PerfectHashAggregateSinkLocal, StreamingAggregateTransformGlobal,
-    StreamingAggregateTransformLocal, UngroupedAggregateEmitSourceLocal,
-    UngroupedAggregateSinkLocal,
+    HashAggregateBuildSinkLocal, HashAggregateEmitSourceGlobal, HashAggregateEmitSourceLocal,
+    HashAggregateEmitWork, PerfectHashAggregateEmitSourceLocal, PerfectHashAggregateSinkLocal,
+    UngroupedAggregateEmitSourceLocal, UngroupedAggregateSinkLocal,
 };
 pub use crate::operators::dml::state::{
     CopyToSinkGlobal, CopyToSinkLocal, DmlSinkGlobal, EmptyDmlSinkLocal, InsertSinkLocal,
@@ -34,9 +34,9 @@ pub use crate::operators::external::state::{
 };
 pub use crate::operators::graph::state::{
     GraphExpandTransformGlobal, GraphExpandTransformLocal, GraphFilterScanState,
-    GraphProjectMaterializedRuntime, GraphProjectTableFetchPlan, GraphProjectTransformLocal,
-    GraphScanSourceGlobal, GraphScanSourceLocal, GraphShortestPathTransformGlobal,
-    GraphShortestPathTransformLocal,
+    GraphProjectTransformLocal, GraphScanSourceGlobal, GraphScanSourceLocal,
+    GraphShortestPathTransformGlobal, GraphShortestPathTransformLocal, RowFetchMaterializedRuntime,
+    RowFetchTablePlan,
 };
 pub use crate::operators::join::state::{
     ClassicIeJoinSourceLocal, CrossProductProbeTransformLocal, HashJoinBuildSinkLocal,
@@ -46,10 +46,12 @@ pub use crate::operators::join::state::{
     SortRangeProbeOffsets,
 };
 pub use crate::operators::result::state::{ClientResultSinkGlobal, ClientResultSinkLocal};
+pub use crate::operators::row_fetch::{RowFetchTableState, RowFetchTransformLocal};
 pub use crate::operators::scan::state::{
     ChunkSourceGlobal, ChunkSourceLocal, EmptySourceGlobal, EmptySourceLocal,
-    ExpressionSourceGlobal, ExpressionSourceLocal, RowsetSourceGlobal, RowsetSourceLocal,
-    TableFunctionSourceGlobal, TableFunctionSourceLocal, ValuesSourceGlobal, ValuesSourceLocal,
+    ExpressionSourceGlobal, ExpressionSourceLocal, PreparedRowsetPredicate, RowsetScanMorsel,
+    RowsetSourceGlobal, RowsetSourceLocal, TableFunctionSourceGlobal, TableFunctionSourceLocal,
+    ValuesSourceGlobal, ValuesSourceLocal,
 };
 pub use crate::operators::search::state::{SearchSourceGlobal, SearchSourceLocal};
 pub use crate::operators::set::state::{
@@ -71,6 +73,7 @@ pub use crate::operators::window::state::{
     StreamingWindowTransformGlobal, StreamingWindowTransformLocal, WindowBuildSinkLocal,
     WindowEmitSourceLocal,
 };
+pub use crate::operators::window::{PartitionAggregateEmitGlobal, PartitionAggregateEmitLocal};
 
 pub type DynGlobalStateBox = Box<dyn DynGlobalState>;
 pub type DynLocalStateBox = Box<dyn DynLocalState>;
@@ -95,6 +98,32 @@ pub struct BreakerHandleGlobal<T> {
     pub handle: Arc<T>,
 }
 
+#[derive(Debug)]
+pub struct HashJoinUnmatchedSourceGlobal {
+    pub handle: Arc<JoinBuildHandle>,
+    next_block: AtomicUsize,
+}
+
+impl HashJoinUnmatchedSourceGlobal {
+    pub fn new(handle: Arc<JoinBuildHandle>) -> Self {
+        Self {
+            handle,
+            next_block: AtomicUsize::new(0),
+        }
+    }
+
+    pub fn work_count(&self) -> usize {
+        self.handle
+            .table()
+            .map_or(0, |table| table.build_block_count())
+    }
+
+    pub fn claim_block(&self, block_count: usize) -> Option<usize> {
+        let block_idx = self.next_block.fetch_add(1, Ordering::Relaxed);
+        (block_idx < block_count).then_some(block_idx)
+    }
+}
+
 // ─── Enums ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -109,13 +138,14 @@ pub enum SourceGlobal {
     Materialized(Arc<MaterializedSourceGlobal>),
     ClassicIeJoin(Arc<crate::operators::join::sort_range::ClassicIeJoinSourceGlobal>),
     HashJoinSpillReplay(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
-    HashJoinUnmatched(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
-    HashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
+    HashJoinUnmatched(Arc<HashJoinUnmatchedSourceGlobal>),
+    HashAggregateEmit(Arc<HashAggregateEmitSourceGlobal>),
     UngroupedAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
     PerfectHashAggregateEmit(Arc<BreakerHandleGlobal<AggregateHandle>>),
     SortEmit(Arc<BreakerHandleGlobal<SortHandle>>),
     TopNEmit(Arc<BreakerHandleGlobal<TopNHandle>>),
     WindowEmit(Arc<BreakerHandleGlobal<WindowHandle>>),
+    PartitionAggregateWindowEmit(Arc<PartitionAggregateEmitGlobal>),
     SetOperationEmit(Arc<BreakerHandleGlobal<SetOperationHandle>>),
     CteScan(Arc<BreakerHandleGlobal<CteHandle>>),
     DelimScan(Arc<BreakerHandleGlobal<DelimHandle>>),
@@ -203,6 +233,7 @@ impl SourceGlobal {
             Self::SortEmit(_) => "SortEmit",
             Self::TopNEmit(_) => "TopNEmit",
             Self::WindowEmit(_) => "WindowEmit",
+            Self::PartitionAggregateWindowEmit(_) => "PartitionAggregateWindowEmit",
             Self::SetOperationEmit(_) => "SetOperationEmit",
             Self::CteScan(_) => "CteScan",
             Self::DelimScan(_) => "DelimScan",
@@ -235,6 +266,7 @@ pub enum SourceLocal {
     SortEmit(SortEmitSourceLocal),
     TopNEmit(TopNEmitSourceLocal),
     WindowEmit(WindowEmitSourceLocal),
+    PartitionAggregateWindowEmit(PartitionAggregateEmitLocal),
     SetOperationEmit(SetOperationEmitSourceLocal),
     CteScan(CteScanSourceLocal),
     DelimScan(DelimScanSourceLocal),
@@ -282,6 +314,7 @@ impl SourceLocal {
             Self::SortEmit(_) => "SortEmit",
             Self::TopNEmit(_) => "TopNEmit",
             Self::WindowEmit(_) => "WindowEmit",
+            Self::PartitionAggregateWindowEmit(_) => "PartitionAggregateWindowEmit",
             Self::SetOperationEmit(_) => "SetOperationEmit",
             Self::CteScan(_) => "CteScan",
             Self::DelimScan(_) => "DelimScan",
@@ -301,7 +334,6 @@ pub enum TransformGlobal {
     Project(Arc<ProjectTransformGlobal>),
     StreamingLimit(Arc<StreamingLimitTransformGlobal>),
     StreamingTopN(Arc<StreamingTopNTransformGlobal>),
-    StreamingAggregate(Arc<StreamingAggregateTransformGlobal>),
     StreamingWindow(Arc<StreamingWindowTransformGlobal>),
     HashJoinProbe(Arc<BreakerHandleGlobal<JoinBuildHandle>>),
     NestedLoopJoinProbe(Arc<crate::operators::join::nested_loop::runtime::NljProbeGlobal>),
@@ -310,7 +342,6 @@ pub enum TransformGlobal {
     ExternalProject(Arc<ExternalProjectTransformGlobal>),
     GraphExpand(Arc<GraphExpandTransformGlobal>),
     GraphShortestPath(Arc<GraphShortestPathTransformGlobal>),
-    PropertyRepair,
     Dyn(DynGlobalStateBox),
 }
 
@@ -321,7 +352,6 @@ pub enum TransformLocal {
     Project(ProjectTransformLocal),
     StreamingLimit(StreamingLimitTransformLocal),
     StreamingTopN(StreamingTopNTransformLocal),
-    StreamingAggregate(StreamingAggregateTransformLocal),
     StreamingWindow(StreamingWindowTransformLocal),
     HashJoinProbe(HashJoinProbeTransformLocal),
     NestedLoopJoinProbe(NestedLoopJoinProbeTransformLocal),
@@ -329,22 +359,20 @@ pub enum TransformLocal {
     CrossProductProbe(CrossProductProbeTransformLocal),
     ExternalProject(ExternalProjectTransformLocal),
     GraphExpand(GraphExpandTransformLocal),
+    RowFetch(RowFetchTransformLocal),
     GraphProject(GraphProjectTransformLocal),
     GraphShortestPath(GraphShortestPathTransformLocal),
-    PropertyRepair,
     Dyn(DynLocalStateBox),
 }
 
 #[derive(Debug)]
 pub struct TransformGlobalSlots {
-    slots: Box<[TransformGlobal]>,
+    slots: Vec<TransformGlobal>,
 }
 
 impl TransformGlobalSlots {
     pub fn new(slots: Vec<TransformGlobal>) -> Self {
-        Self {
-            slots: slots.into_boxed_slice(),
-        }
+        Self { slots }
     }
 
     #[inline]
@@ -516,15 +544,10 @@ mod tests {
         let slots = TransformGlobalSlots::new(vec![
             TransformGlobal::Empty,
             TransformGlobal::Filter(Arc::new(FilterTransformGlobal)),
-            TransformGlobal::PropertyRepair,
         ]);
 
         assert!(matches!(slots.get(0), Some(TransformGlobal::Empty)));
         assert!(matches!(slots.get(1), Some(TransformGlobal::Filter(_))));
-        assert!(matches!(
-            slots.get(2),
-            Some(TransformGlobal::PropertyRepair)
-        ));
-        assert!(slots.get(3).is_none());
+        assert!(slots.get(2).is_none());
     }
 }

@@ -10,14 +10,6 @@ use paro_common::error::Result;
 use paro_common::types::LogicalType;
 use paro_common::vector::{SelectionVector, Vector};
 
-fn projection_indices(column_count: usize, projection_map: &[usize]) -> Vec<usize> {
-    if projection_map.is_empty() {
-        (0..column_count).collect()
-    } else {
-        projection_map.to_vec()
-    }
-}
-
 fn project_columns(
     input: &Chunk,
     sel: &SelectionVector,
@@ -25,10 +17,7 @@ fn project_columns(
     result: &mut Chunk,
     result_offset: usize,
 ) -> Result<()> {
-    for (out_idx, input_idx) in projection_indices(input.column_count(), projection_map)
-        .into_iter()
-        .enumerate()
-    {
+    for (out_idx, &input_idx) in projection_map.iter().enumerate() {
         result.data[result_offset + out_idx] = Arc::new(Vector::try_dictionary(
             Arc::clone(&input.data[input_idx]),
             sel.clone(),
@@ -68,7 +57,7 @@ pub fn construct_left_outer_result(
     result: &mut Chunk,
 ) -> Result<()> {
     project_columns(left, left_sel, left_projection_map, result, 0)?;
-    let right_offset = projection_indices(left.column_count(), left_projection_map).len();
+    let right_offset = left_projection_map.len();
     for (idx, typ) in right_types.iter().enumerate() {
         result.data[right_offset + idx] = Arc::new(Vector::try_constant_null(
             typ.clone(),
@@ -94,7 +83,7 @@ pub fn construct_mark_join_result(
     }
     project_columns(left, &left_sel, left_projection_map, result, 0)?;
 
-    let marker_offset = projection_indices(left.column_count(), left_projection_map).len();
+    let marker_offset = left_projection_map.len();
     result.data[marker_offset] = Arc::new(Vector::try_new(
         LogicalType::Boolean,
         count.max(1),
@@ -213,7 +202,7 @@ mod tests {
             2,
         );
 
-        construct_mark_join_result(&left, &[], &[Some(true), None], &mut result).unwrap();
+        construct_mark_join_result(&left, &[0], &[Some(true), None], &mut result).unwrap();
 
         assert_eq!(result.size(), 2);
         assert_eq!(result.data[1].get_value(0).to_string(), "true");
@@ -242,7 +231,7 @@ mod tests {
             paro_common::vector::VECTOR_SIZE,
         );
 
-        construct_mark_join_result(&left, &[], &markers, &mut result).unwrap();
+        construct_mark_join_result(&left, &[0], &markers, &mut result).unwrap();
 
         assert_eq!(result.size(), values.len());
         assert_eq!(result.data[1].get_bool(0), Some(true));
@@ -282,7 +271,7 @@ mod tests {
             &paro_common::test_utils::test_selection(vec![0]),
             1,
             &[LogicalType::Boolean],
-            &[],
+            &[0, 1],
             &mut result,
         )
         .unwrap();

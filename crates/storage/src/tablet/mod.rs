@@ -62,16 +62,20 @@ static DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: AtomicUsize =
     AtomicUsize::new(DEFAULT_DELETE_PATCH_INLINE_ROW_REF_THRESHOLD);
 
 // Re-export main types
+pub use crate::rowset::PhysicalRowRef;
 pub use schema_adapter::TabletSchemaAdaptationPlan;
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::{SearchGenerationHeadMeta, TabletMeta};
 pub use tablet_reader::TabletReader;
-pub use tablet_reader_params::{ColumnProjection, TabletReaderBuilder, TabletReaderParams};
+pub use tablet_reader_params::{
+    ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
+};
+pub use tablet_rowid_lookup::TabletRowIdReader;
 pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
-    CheckpointTabletSnapshot, PhysicalRowRef, PrimaryIndexUpdate, RetiredGcBarrier,
-    RetiredPendingGcStatus, RowsetPublishObserver, Tablet, TabletId, TabletIdentity,
-    TabletReadGuard, TabletRef, TabletSnapshotMaterialization, TabletState, Version, VersionGap,
+    CheckpointTabletSnapshot, PrimaryIndexUpdate, RetiredGcBarrier, RetiredPendingGcStatus,
+    RowsetPublishObserver, Tablet, TabletId, TabletIdentity, TabletReadGuard, TabletRef,
+    TabletSnapshotMaterialization, TabletState, Version, VersionGap,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 

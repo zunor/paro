@@ -53,6 +53,7 @@ impl PipelineTaskExecutor {
             return;
         };
         self.active_finish_task = None;
+        self.finish_tasks_completed = 0;
         self.cancel_finish_group(ctx, &group, reason);
     }
 }
@@ -127,13 +128,29 @@ pub(crate) fn finish_context<'a>(
     finish_task: Option<FinishTaskId>,
     task: &'a PipelineTaskState,
 ) -> OperatorFinishContext<'a> {
+    finish_context_with_memory(
+        ctx,
+        pipeline,
+        operator,
+        finish_task,
+        task.memory.call_scope(),
+    )
+}
+
+pub(crate) fn finish_context_with_memory<'a>(
+    ctx: &'a mut PipelineTaskStepContext<'_>,
+    pipeline: crate::pipeline::graph::PipelineId,
+    operator: RuntimeOperatorId,
+    finish_task: Option<FinishTaskId>,
+    memory: crate::memory_runtime::OperatorMemoryScope<'a>,
+) -> OperatorFinishContext<'a> {
     OperatorFinishContext {
         query: ctx.query,
         pipeline,
         operator,
         finish_task,
         thread: ctx.thread,
-        memory: task.memory.call_scope(),
+        memory,
         cancel: &ctx.query.cancellation,
         wake: ctx.wake,
         profiler: &mut *ctx.profiler,

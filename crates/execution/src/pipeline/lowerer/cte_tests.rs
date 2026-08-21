@@ -81,6 +81,35 @@ fn recursive_cte_lowers_to_control_region() {
 }
 
 #[test]
+fn recursive_cte_hoists_loop_invariant_hash_build() {
+    let plan = recursive_cte_with_invariant_hash_build_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    let invariant_build = graph
+        .pipelines
+        .iter()
+        .find(|pipeline| matches!(pipeline.sink, SinkSpec::HashJoinBuild(_)))
+        .expect("invariant hash build pipeline")
+        .id;
+    let ControlRegion::RecursiveCte(region) = &graph.control_regions[0] else {
+        panic!("expected recursive CTE region");
+    };
+    assert!(!region.recursive.contains(&invariant_build));
+    assert!(region.recursive.iter().any(|pipeline| {
+        graph.pipelines[pipeline.index()]
+            .transforms
+            .iter()
+            .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+    }));
+    assert!(graph.dependencies.iter().any(|dependency| {
+        dependency.producer == invariant_build
+            && region.recursive.contains(&dependency.consumer)
+            && matches!(dependency.kind, DependencyKind::BuildBeforeProbe)
+    }));
+}
+
+#[test]
 fn projection_above_recursive_cte_stays_on_emit_pipeline() {
     let plan = projected_recursive_cte_plan();
     let mut lowerer = PipelineLowerer::new(&plan);
@@ -184,6 +213,26 @@ fn left_delim_join_lowers_to_correlated_subquery_region() {
     );
     assert_eq!(region.join, PipelineId::new(3));
     assert!(region.cached_outer.is_some());
+}
+
+#[test]
+fn delim_join_can_feed_hash_probe_through_materialized_boundary() {
+    let plan = hash_join_with_delim_probe_plan();
+    let mut lowerer = PipelineLowerer::new(&plan);
+    let graph = lowerer.lower_to_pipeline_graph(plan.root).unwrap();
+
+    assert_eq!(graph.control_regions.len(), 1);
+    assert!(graph
+        .pipelines
+        .iter()
+        .any(|pipeline| matches!(pipeline.sink, SinkSpec::Materialize(_))));
+    assert!(graph.pipelines.iter().any(|pipeline| {
+        matches!(pipeline.source, SourceSpec::Materialized(_))
+            && pipeline
+                .transforms
+                .iter()
+                .any(|transform| matches!(transform, TransformSpec::HashJoinProbe(_)))
+    }));
 }
 
 #[test]

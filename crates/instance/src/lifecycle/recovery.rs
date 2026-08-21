@@ -67,9 +67,10 @@ impl InstanceRecovery {
             let open_result = match instance.database_service.open_managed_database(
                 &record,
                 DatabaseOpenIntent::OpenExisting,
-                &instance
-                    .runtime
-                    .database_open_context(instance.boot_config.checkpoint),
+                &instance.runtime.database_open_context(
+                    instance.boot_config.checkpoint,
+                    instance.boot_config.compaction,
+                ),
                 instance.lifecycle.startup_policy,
                 true,
             ) {

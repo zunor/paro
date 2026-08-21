@@ -49,6 +49,8 @@ class PolicyEvolutionGuardTests(unittest.TestCase):
             policy_sha = _write_policy(root, gate="operator-runtime", enforcement="soft", version=7)
             _write_baseline(root, gate="operator-runtime", platform="linux-amd64", version=7, sha=policy_sha)
             _write_baseline(root, gate="operator-runtime", platform="macos-arm64", version=7, sha=policy_sha)
+            _write_calibration(root, gate="operator-runtime", platform="linux-amd64", version=7, observations=30)
+            _write_calibration(root, gate="operator-runtime", platform="macos-arm64", version=7, observations=30)
 
             errors = _validate(
                 repo_root=root,
@@ -70,6 +72,7 @@ class PolicyEvolutionGuardTests(unittest.TestCase):
                 sha=policy_sha,
                 build_fingerprint={"rust_toolchain": "unknown", "cargo": "unknown"},
             )
+            _write_calibration(root, gate="operator-runtime", platform="linux-amd64", version=1, observations=30)
 
             errors = _validate(
                 repo_root=root,
@@ -78,6 +81,33 @@ class PolicyEvolutionGuardTests(unittest.TestCase):
             )
 
             self.assertTrue(any("coverage" in error for error in errors), errors)
+
+    def test_non_shadow_policy_requires_archive_observation_threshold(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            policy_sha = _write_policy(root, gate="operator-runtime", enforcement="soft")
+            _write_baseline(
+                root,
+                gate="operator-runtime",
+                platform="linux-amd64",
+                version=1,
+                sha=policy_sha,
+            )
+            _write_calibration(
+                root,
+                gate="operator-runtime",
+                platform="linux-amd64",
+                version=1,
+                observations=29,
+            )
+
+            errors = _validate(
+                repo_root=root,
+                available_platforms={"linux-amd64"},
+                required_platforms={"linux-amd64"},
+            )
+
+            self.assertTrue(any("29/30" in error for error in errors), errors)
 
 
 def _write_policy(root: Path, *, gate: str, enforcement: str, version: int = 1) -> str:
@@ -162,6 +192,48 @@ def _write_baseline(
                 ]
             },
         }),
+        encoding="utf-8",
+    )
+
+
+def _write_calibration(
+    root: Path,
+    *,
+    gate: str,
+    platform: str,
+    version: int,
+    observations: int,
+) -> None:
+    archive = root / ".ci" / "paro-perf-archive"
+    relative = f"calibrations/{gate}/{platform}/policy-v{version}/calibration.json"
+    calibration_path = archive / relative
+    calibration_path.parent.mkdir(parents=True, exist_ok=True)
+    calibration_bytes = json.dumps(
+        {"observations": [{"sources": []} for _ in range(observations)]},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    calibration_path.write_bytes(calibration_bytes)
+
+    manifest_path = archive / f"manifests/{gate}/{platform}/policy-v{version}.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "gate": gate,
+                "platform": platform,
+                "policy_version": version,
+                "results": [],
+                "calibrations": [
+                    {
+                        "path": relative,
+                        "sha256": hashlib.sha256(calibration_bytes).hexdigest(),
+                        "size_bytes": len(calibration_bytes),
+                    }
+                ],
+            }
+        ),
         encoding="utf-8",
     )
 

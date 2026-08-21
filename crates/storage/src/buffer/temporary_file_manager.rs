@@ -437,6 +437,9 @@ pub struct TemporaryFileInfo {
 struct TemporaryBlockInfo {
     index: TemporaryFileIndex,
     tag: MemoryTag,
+    /// Integrity of the original, uncompressed logical block. Temporary row
+    /// stores rely on byte-for-byte preservation of typed vector payloads.
+    checksum_crc32c: u32,
 }
 
 /// Snapshot of spill I/O metrics maintained by [`TemporaryFileManager`].
@@ -1150,6 +1153,7 @@ impl TemporaryFileManager {
         }
 
         let original_size = data.len();
+        let checksum_crc32c = crc32c::crc32c(data);
 
         // Get current time for performance statistics
         let time_before_ns = TemporaryFileCompressionAdaptivity::get_current_time_nanos();
@@ -1222,7 +1226,11 @@ impl TemporaryFileManager {
             let mut used_blocks = self.used_blocks.write().unwrap();
             match used_blocks.entry(block_id) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
-                    entry.insert(TemporaryBlockInfo { index, tag });
+                    entry.insert(TemporaryBlockInfo {
+                        index,
+                        tag,
+                        checksum_crc32c,
+                    });
                     true
                 }
                 std::collections::hash_map::Entry::Occupied(_) => false,
@@ -1298,11 +1306,9 @@ impl TemporaryFileManager {
                 paro_error::internal(format!("block {} not found in temp files", block_id))
             })?
         };
-        let index = block_info.index;
-
-        let buffer_size = index.identifier.size.size();
-        let original_size = index.original_size();
-        self.read_block_into(&index, buffer)?;
+        let buffer_size = block_info.index.identifier.size.size();
+        let original_size = block_info.index.original_size();
+        self.read_block_into(block_info, buffer)?;
 
         self.release_tracked_spill(block_id, block_info)?;
         self.read_bytes
@@ -1321,11 +1327,9 @@ impl TemporaryFileManager {
                 paro_error::internal(format!("block {} not found in temp files", block_id))
             })?
         };
-        let index = block_info.index;
-
-        let buffer_size = index.identifier.size.size();
-        let original_size = index.original_size();
-        self.read_block_into(&index, buffer)?;
+        let buffer_size = block_info.index.identifier.size.size();
+        let original_size = block_info.index.original_size();
+        self.read_block_into(block_info, buffer)?;
 
         self.read_bytes
             .fetch_add(buffer_size as u64, Ordering::AcqRel);
@@ -1351,7 +1355,8 @@ impl TemporaryFileManager {
         Ok(buffer_size)
     }
 
-    fn read_block_into(&self, index: &TemporaryFileIndex, buffer: &mut [u8]) -> Result<()> {
+    fn read_block_into(&self, block: TemporaryBlockInfo, buffer: &mut [u8]) -> Result<()> {
+        let index = &block.index;
         let original_size = index.original_size();
         if buffer.len() < original_size {
             return Err(paro_error::invalid_input(format!(
@@ -1377,6 +1382,13 @@ impl TemporaryFileManager {
             buffer[..original_size].copy_from_slice(&decompressed);
         } else {
             buffer[..original_size].copy_from_slice(&temp_buffer[..original_size]);
+        }
+        let actual_checksum = crc32c::crc32c(&buffer[..original_size]);
+        if actual_checksum != block.checksum_crc32c {
+            return Err(paro_error::data_corrupted(format!(
+                "temporary spill checksum mismatch: expected {}, got {}",
+                block.checksum_crc32c, actual_checksum
+            )));
         }
         Ok(())
     }
@@ -1909,6 +1921,35 @@ mod tests {
         manager.delete_temporary_buffer(block_id).unwrap();
         assert!(!manager.has_temporary_buffer(block_id));
         assert_eq!(manager.get_used_space(), 0);
+        cleanup_temp_dir(&dir);
+    }
+
+    #[test]
+    fn spill_checksum_rejects_bytes_without_losing_cleanup_ownership() {
+        let dir = create_temp_dir();
+        let manager = TemporaryFileManager::new(&dir).unwrap();
+        let block_id = 44;
+        let data = vec![9u8; 4096];
+        let written = manager
+            .write_temporary_buffer(block_id, MemoryTag::OrderBy, &data)
+            .unwrap();
+        manager
+            .used_blocks
+            .write()
+            .unwrap()
+            .get_mut(&block_id)
+            .expect("tracked block")
+            .checksum_crc32c ^= 1;
+
+        let mut output = vec![0u8; data.len()];
+        let error = manager
+            .peek_temporary_buffer(block_id, &mut output)
+            .unwrap_err();
+        assert!(error.to_string().contains("spill checksum mismatch"));
+        assert!(manager.has_temporary_buffer(block_id));
+        assert_eq!(manager.get_used_space(), written as u64);
+
+        manager.delete_temporary_buffer(block_id).unwrap();
         cleanup_temp_dir(&dir);
     }
 

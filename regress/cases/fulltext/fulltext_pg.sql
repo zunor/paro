@@ -52,6 +52,7 @@ FROM ft_docs
 WHERE fulltext_match(content || '', 'vector database') AND category = 'tech';
 
 -- EXPLAIN should show fulltext plan or fallback filter
+-- @normalize explain_search_ids
 EXPLAIN
 SELECT id
 FROM ft_docs

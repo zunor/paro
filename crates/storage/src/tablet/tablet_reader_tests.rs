@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::codec::vector_decoder;
+use crate::index::{Predicate, PredicateTree};
 use crate::primary_key::{DeleteVector, RowID};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageBuilder;
@@ -594,6 +595,49 @@ fn create_segment_with_values(
     )
 }
 
+fn create_segment_with_names(
+    schema: &TabletSchemaRef,
+    names: &[&str],
+    path: &Path,
+) -> SegmentSharedPtr {
+    let opts = SegmentWriterOptions::new(0)
+        .with_short_key_index(false)
+        .with_compression(CompressionType::None);
+    let mut writer = SegmentWriter::create(schema.clone(), path, opts).unwrap();
+    let rows = names.len() as u32;
+    let ids: Vec<u8> = (0..rows)
+        .flat_map(|value| i64::from(value).to_le_bytes())
+        .collect();
+    let mut encoded_names = Vec::new();
+    for name in names {
+        encoded_names.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        encoded_names.extend_from_slice(name.as_bytes());
+    }
+    let values: Vec<u8> = (0..rows)
+        .flat_map(|value| (value as i32).to_le_bytes())
+        .collect();
+    writer
+        .append_chunk(&[
+            ColumnData::new(ids, rows),
+            ColumnData::new(encoded_names, rows),
+            ColumnData::new(values, rows),
+        ])
+        .unwrap();
+    writer.finalize().unwrap();
+    Arc::new(
+        Segment::open(
+            0,
+            path,
+            schema.clone(),
+            SegmentOptions::default().with_verify_checksum(false),
+            0,
+            0,
+            0,
+        )
+        .unwrap(),
+    )
+}
+
 fn create_segment_with_values_column0_only(
     schema: &TabletSchemaRef,
     segment_id: u32,
@@ -630,7 +674,7 @@ fn create_rowset_with_delete_vector(
 
     let mut dv = DeleteVector::new();
     for d in deleted {
-        dv.mark_deleted(*d);
+        dv.mark_deleted(crate::rowset::SegmentRowId::from_raw(*d));
     }
     dv.save_to_dir(&rowset_dir, 0).unwrap();
 
@@ -725,6 +769,71 @@ fn test_tablet_reader_duplicate_projection() {
 }
 
 #[test]
+fn matched_prefix_projection_keeps_stored_sibling_and_emits_compact_value() {
+    let tmp = TempDir::new().unwrap();
+    let schema = create_test_schema();
+    let rowset_dir = tmp.path().join("rowset");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment = create_segment_with_names(
+        &schema,
+        &["13alice", "31bob", "99drop"],
+        &rowset_dir.join("0.dat"),
+    );
+    let meta = RowsetMetaBuilder::with_id(1, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let projection = ColumnProjection::try_with_value_projections(
+        vec![1, 1],
+        vec![
+            ColumnValueProjection::Stored,
+            ColumnValueProjection::MatchedUtf8Prefix { byte_width: 2 },
+        ],
+    )
+    .unwrap();
+    let params = TabletReaderParams::with_version(0)
+        .with_projection(projection)
+        .with_predicates(PredicateTree::leaf(Predicate::StringPrefixIn {
+            column_id: 1,
+            prefixes: vec!["13".to_string(), "31".to_string()],
+        }))
+        .with_late_materialize(vec![1]);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+    let chunk = reader.get_next_chunk().unwrap().expect("matching rows");
+    assert_eq!(chunk.len(), 2);
+    assert_eq!(chunk.column(0).unwrap().get_string(0), Some("13alice"));
+    assert_eq!(chunk.column(0).unwrap().get_string(1), Some("31bob"));
+    assert_eq!(chunk.column(1).unwrap().get_string(0), Some("13"));
+    assert_eq!(chunk.column(1).unwrap().get_string(1), Some("31"));
+}
+
+#[test]
+fn matched_prefix_projection_requires_exact_predicate_witness() {
+    let projection = ColumnProjection::try_with_value_projections(
+        vec![1],
+        vec![ColumnValueProjection::MatchedUtf8Prefix { byte_width: 2 }],
+    )
+    .unwrap();
+    let params = TabletReaderParams::with_version(0).with_projection(projection);
+    let error = TabletReader::new(create_test_tablet(), params)
+        .expect_err("prefix projection without its predicate witness must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("lacks its exact VARCHAR predicate witness"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
 fn test_segment_iterator_skips_sequential_rowids_for_plain_scan() {
     let tmp = TempDir::new().unwrap();
     let schema = create_test_schema();
@@ -737,6 +846,28 @@ fn test_segment_iterator_skips_sequential_rowids_for_plain_scan() {
     assert_eq!(batch.rows, 2);
     assert!(batch.rowids.is_empty());
     assert_eq!(batch.columns.len(), 1);
+}
+
+#[test]
+fn test_segment_iterator_ordinal_range_is_end_exclusive() {
+    let tmp = TempDir::new().unwrap();
+    let schema = create_test_schema();
+    let segment_path = tmp.path().join("ordinal_range.dat");
+    let segment = create_segment_with_values(&schema, 0, &[10, 20, 30, 40, 50], &segment_path);
+
+    let mut iter = SegmentIterator::new_with_delete_vector(&segment, vec![0], None).unwrap();
+    iter.set_ordinal_range(1, 4).unwrap();
+    let batch = iter.next_batch_with_rowid_policy(10, true).unwrap();
+
+    assert_eq!(batch.rows, 3);
+    assert_eq!(batch.rowids, vec![1, 2, 3]);
+    let values = &batch.columns[0].1.data;
+    let decoded = values
+        .chunks_exact(std::mem::size_of::<i64>())
+        .map(|bytes| i64::from_le_bytes(bytes.try_into().unwrap()))
+        .collect::<Vec<_>>();
+    assert_eq!(decoded, vec![20, 30, 40]);
+    assert!(!iter.has_next());
 }
 
 #[test]
@@ -795,6 +926,81 @@ fn test_tablet_reader_emits_row_id_column() {
 }
 
 #[test]
+fn test_rowid_lookup_single_segment_restores_requested_order_without_flattening() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+    let schema = create_test_schema();
+    let rowset_dir = base.join("rowset_lookup_permutation");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment = create_segment_with_values(&schema, 0, &[10, 20, 30], &segment_path);
+    let rowset_id = 17u64;
+    let meta = RowsetMetaBuilder::with_id(rowset_id, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let mut scan = TabletReader::new(
+        tablet.clone(),
+        TabletReaderParams::with_version(0)
+            .with_columns(vec![0])
+            .with_emit_row_id(true),
+    )
+    .unwrap();
+    scan.prepare().unwrap();
+    let scanned = scan.get_next_chunk().unwrap().unwrap();
+    let raw_rowids = (0..scanned.size())
+        .map(|index| scanned.column(1).unwrap().get_i64(index).unwrap() as u64)
+        .collect::<Vec<_>>();
+
+    let requested = [raw_rowids[2], raw_rowids[0], raw_rowids[2], raw_rowids[1]];
+    let fetched = scan.get_by_rowids(&requested, &[2, 0]).unwrap();
+    assert_eq!(fetched.size(), 4);
+    assert_eq!(fetched.column_count(), 2);
+    assert_eq!(fetched.column(0).unwrap().get_i32(0), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(1), Some(0));
+    assert_eq!(fetched.column(0).unwrap().get_i32(2), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(3), Some(1));
+    assert_eq!(fetched.column(1).unwrap().get_i64(0), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(1), Some(10));
+    assert_eq!(fetched.column(1).unwrap().get_i64(2), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(3), Some(20));
+    assert_eq!(
+        fetched.column(0).unwrap().vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+
+    let point_reader = crate::tablet::TabletRowIdReader::new(
+        tablet.clone(),
+        tablet.capture_consistent_rowsets(0).unwrap(),
+        &[2, 0],
+        Arc::new(paro_common::allocator::default_allocator()),
+    )
+    .unwrap();
+    let fetched = point_reader.get_by_rowids(&requested, &[2, 0]).unwrap();
+    assert_eq!(fetched.size(), 4);
+    assert_eq!(fetched.column_count(), 2);
+    assert_eq!(fetched.column(0).unwrap().get_i32(0), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(1), Some(0));
+    assert_eq!(fetched.column(0).unwrap().get_i32(2), Some(2));
+    assert_eq!(fetched.column(0).unwrap().get_i32(3), Some(1));
+    assert_eq!(fetched.column(1).unwrap().get_i64(0), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(1), Some(10));
+    assert_eq!(fetched.column(1).unwrap().get_i64(2), Some(30));
+    assert_eq!(fetched.column(1).unwrap().get_i64(3), Some(20));
+    assert_eq!(
+        fetched.column(0).unwrap().vector_type(),
+        paro_common::vector::VectorType::Dictionary
+    );
+}
+
+#[test]
 fn test_tablet_reader_row_id_only_projection() {
     let tmp = TempDir::new().unwrap();
     let base = tmp.path();
@@ -840,6 +1046,44 @@ fn test_tablet_reader_row_id_only_projection() {
         assert_eq!(location.segment_id, 0);
         assert_eq!(location.row_offset, idx as u32);
     }
+    assert!(reader.get_next_chunk().unwrap().is_none());
+}
+
+#[test]
+fn test_tablet_reader_cardinality_only_projection() {
+    let tmp = TempDir::new().unwrap();
+    let base = tmp.path();
+
+    let schema = create_test_schema();
+    let rowset_dir = base.join("rowset_cardinality_only");
+    std::fs::create_dir_all(&rowset_dir).unwrap();
+    let segment_path = rowset_dir.join("0.dat");
+    let segment = create_segment_with_values(&schema, 0, &[1, 2, 3], &segment_path);
+
+    let meta = RowsetMetaBuilder::with_id(10, 1, Version::singleton(0))
+        .num_rows(3)
+        .num_segments(1)
+        .state(RowsetState::Visible)
+        .build();
+    let rowset = Arc::new(
+        Rowset::create_with_segments(schema.clone(), meta, &rowset_dir, vec![segment]).unwrap(),
+    );
+
+    let tablet = Arc::new(Tablet::new(1, 100, 1000, schema, base, None).unwrap());
+    tablet.add_rowset(rowset).unwrap();
+
+    let params = TabletReaderParams::with_version(0)
+        .with_projection(ColumnProjection::new(Vec::new()))
+        .with_batch_size(10);
+    let mut reader = TabletReader::new(tablet, params).unwrap();
+    reader.prepare().unwrap();
+
+    let chunk = reader
+        .get_next_chunk()
+        .unwrap()
+        .expect("cardinality-only chunk should exist");
+    assert_eq!(chunk.column_count(), 0);
+    assert_eq!(chunk.len(), 3);
     assert!(reader.get_next_chunk().unwrap().is_none());
 }
 

@@ -20,6 +20,15 @@ FROM (
 GROUP BY category
 ORDER BY category;
 
+-- A zero-key aggregate window retains detail rows while sharing one complete
+-- aggregate state. FILTER belongs to that shared state, not to detail replay.
+SELECT
+    x,
+    sum(x) FILTER (WHERE keep) OVER () AS kept_sum,
+    count(x) FILTER (WHERE keep) OVER () AS kept_count
+FROM (VALUES (1, true), (2, false), (3, true)) AS global_aggregate_input(x, keep)
+ORDER BY x;
+
 -- Equal windows shared by SELECT and QUALIFY should have one window-runtime output.
 EXPLAIN SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)
@@ -153,3 +162,29 @@ SELECT last_value(x) OVER (
 SELECT last_value(x) OVER (
     ORDER BY x ROWS BETWEEN CURRENT ROW AND 1 PRECEDING
 ) FROM (VALUES (1)) AS invalid_frame_input(x);
+
+-- Ordinary window inputs are materialized once when arguments are computed
+-- expressions rather than direct references.
+SELECT
+    category,
+    x,
+    sum(x + 1) OVER (PARTITION BY category) AS computed_sum
+FROM (VALUES ('a', 1), ('a', 2), ('b', 4)) AS computed_window_input(category, x)
+ORDER BY category, x;
+
+-- Equal volatile trees are independent evaluations and must not be CSE'd
+-- while the lowerer materializes direct window inputs.
+SELECT
+    first_value(random()) OVER () = first_value(random()) OVER ()
+        AS volatile_inputs_are_independent
+FROM (VALUES (1)) AS volatile_window_input(x);
+
+-- Frame offsets may themselves be scalar expressions. Their materialized
+-- value is an implementation column and must not leak into window output.
+SELECT
+    x,
+    sum(x) OVER (
+        ORDER BY x ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW
+    ) AS computed_frame_sum
+FROM (VALUES (1), (2), (3), (4)) AS computed_frame_input(x)
+ORDER BY x;

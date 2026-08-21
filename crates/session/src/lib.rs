@@ -35,6 +35,7 @@ pub use dispatch::{
 pub use execution_control::{
     ActiveStatementControl, ConnectionShutdownReason, SessionExecutionControl,
 };
+pub use paro_context::StatementCancellation;
 pub use prepared::binary_codec::{
     decode_binary_param, encode_binary_value, is_binary_recv_supported, is_binary_send_supported,
 };

@@ -9,6 +9,7 @@ use crate::index::hnsw::{PreparedQuery, ScoredPoint, SearchParams};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
+use crate::rowset::SegmentRowId;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
@@ -311,7 +312,7 @@ impl Segment {
         } else if let Some(dv) = delete_vector {
             let mut bitmap = RoaringBitmap::new();
             for i in 0..self.num_rows() as u32 {
-                if !dv.is_deleted(i) {
+                if !dv.is_deleted(SegmentRowId::from_raw(i)) {
                     bitmap.insert(i);
                 }
             }

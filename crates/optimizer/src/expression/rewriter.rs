@@ -352,21 +352,20 @@ mod tests {
         let mut rewriter = ExpressionRewriter::new();
         rewriter.add_rule(Box::new(IncrementSmallConstantRule::new()));
 
-        let mut expr = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: Vec::new(),
-            partitions: Vec::new(),
-            orders: Vec::new(),
-            frame: WindowFrame {
+        let mut expr = Expression::Window(WindowExpression::native(
+            WindowFunction::row_number(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(make_constant(98))),
                 start_is_preceding: true,
                 end_bound: WindowFrameBound::Offset(Box::new(make_constant(99))),
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
 
         rewriter.rewrite_expression(&mut expr, &LogicalOperator::DummyScan);
         let Expression::Window(window) = expr else {

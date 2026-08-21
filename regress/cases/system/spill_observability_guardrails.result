@@ -28,12 +28,12 @@ SET
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
-  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
 PIPELINE 1
-  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -46,12 +46,12 @@ FROM spill_h_agg
 GROUP BY k1, k2;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=50)
-  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=49 spilled=true spilled_bytes=<bytes> repartition_depth=1)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=200000 loops=<loops>)
+  SINK #1 HASH_AGGREGATE_BUILD (actual time=<time-range> rows=200000 loops=<loops> spilled=true spilled_bytes=<bytes> repartition_depth=1)
 PIPELINE 1
-  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=105)
-  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=104)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=200000 loops=104)
+  SOURCE #2 HASH_AGGREGATE_EMIT (actual time=<time-range> rows=200000 loops=<loops>)
+  TRANSFORM #3 PROJECTION (actual time=<time-range> rows=200000 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=200000 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=1
 Execution Time: <time-ms>
@@ -64,12 +64,13 @@ EXPLAIN SELECT * FROM spill_h_join_l l SEMI JOIN spill_h_join_r r ON l.id = r.id
 QUERY PLAN
 PROJECTION  (rows=1000)
   Output: l.id
-  ->  HASH_JOIN  (rows=200)
+  ->  HASH_JOIN  (rows=1000)
     Join Type: SEMI
+    Build Index: integer_build_time
     Join Condition: #0 = #0
-    ->  ROWSET_SCAN on public.spill_h_join_l l
+    ->  ROWSET_SCAN on public.spill_h_join_l l  (rows=1000)
       Columns: id
-    ->  ROWSET_SCAN on public.spill_h_join_r r
+    ->  ROWSET_SCAN on public.spill_h_join_r r  (rows=1000)
       Columns: id
 
 SET temp_directory = DEFAULT;
@@ -79,12 +80,12 @@ SET
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
 QUERY PLAN
 PIPELINE 0
-  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=4)
-  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=3)
-  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=3 peak_memory_bytes=<bytes>)
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> peak_memory_bytes=<bytes>)
 PIPELINE 1
-  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=6)
-  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=5)
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=<loops>)
 PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
 MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
 Execution Time: <time-ms>
@@ -93,8 +94,20 @@ Rows Returned: 10000
 SET force_external = true;
 SET
 
+-- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE SELECT id FROM spill_h_sort ORDER BY id DESC;
-ERROR: force_external sort requires a temporary directory (SQLSTATE=53200)
+QUERY PLAN
+PIPELINE 0
+  SOURCE #0 ROWSET_SCAN (actual time=<time-range> rows=10000 loops=<loops>)
+  TRANSFORM #1 PROJECTION (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #2 SORT_BUILD (actual time=<time-range> rows=10000 loops=<loops> spilled=true peak_memory_bytes=<bytes> spilled_bytes=<bytes>)
+PIPELINE 1
+  SOURCE #3 SORT_EMIT (actual time=<time-range> rows=10000 loops=<loops>)
+  SINK #4 CLIENT_RESULT (actual time=<time-range> rows=10000 loops=<loops>)
+PROFILE schema_version=1 query_id=<id> events=<events> parallelism=<threads> workers=<workers> worker_utilization=<ratio> ready_time_us=<us> wait_time_us=<us> wake_coalesce=<count> backpressure=<count> runtime_filter_installed=0 runtime_filter_no_wait=0
+MEMORY_PROFILE grant_bytes=<bytes> revoked_bytes=<bytes> revocable_bytes=<bytes> spill_bytes=<bytes> spill_latency_us=<us> yield_latency_us=<us> repartition_depth=0
+Execution Time: <time-ms>
+Rows Returned: 10000
 
 SET force_external = DEFAULT;
 SET

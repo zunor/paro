@@ -45,8 +45,14 @@ impl BenchState {
         let long = Arc::new(PrimaryIndex::with_options(16, usize::MAX / 2));
 
         for i in 0..PRELOAD_KEYS {
-            fixed.upsert(make_fixed_key(i), RowID::new(1, i));
-            long.upsert(make_long_key(i), RowID::new(1, i));
+            fixed.upsert(
+                make_fixed_key(i),
+                RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(i)),
+            );
+            long.upsert(
+                make_long_key(i),
+                RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(i)),
+            );
         }
 
         let fixed_lookup = (0..LOOKUP_BATCH)
@@ -130,7 +136,10 @@ impl LookupScaleState {
         let index = PrimaryIndex::with_options(16, usize::MAX / 2);
         for i in 0..key_count {
             let row = i as u32;
-            index.upsert(make_fixed_key(row), RowID::new(1, row));
+            index.upsert(
+                make_fixed_key(row),
+                RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(row)),
+            );
         }
         let lookup_keys = (0..LOOKUP_BATCH)
             .map(|i| make_fixed_key((i % key_count) as u32))
@@ -175,7 +184,10 @@ fn long_key_point_lookups() {
 fn mixed_read_write_fixed_keys() {
     let index = Arc::new(PrimaryIndex::with_options(16, usize::MAX / 2));
     for i in 0..PRELOAD_KEYS {
-        index.upsert(make_fixed_key(i), RowID::new(1, i));
+        index.upsert(
+            make_fixed_key(i),
+            RowID::new(1, paro_storage::rowset::SegmentRowId::from_raw(i)),
+        );
     }
 
     let barrier = Arc::new(Barrier::new(MIXED_THREADS));
@@ -188,7 +200,13 @@ fn mixed_read_write_fixed_keys() {
             for i in 0..MIXED_OPS_PER_THREAD {
                 let key = make_fixed_key((i as u32) % PRELOAD_KEYS);
                 if i % 4 == 0 {
-                    index.upsert(key, RowID::new((tid + 2) as u32, i as u32));
+                    index.upsert(
+                        key,
+                        RowID::new(
+                            (tid + 2) as u32,
+                            paro_storage::rowset::SegmentRowId::from_raw(i as u32),
+                        ),
+                    );
                 } else {
                     divan::black_box(index.get(&key));
                 }
@@ -207,7 +225,13 @@ fn fixed_key_upsert_single_thread(bencher: Bencher) {
     bencher.counter(H4_UPSERT_KEYS).bench_local(|| {
         let index = PrimaryIndex::with_options(16, usize::MAX / 2);
         for (row_offset, key) in keys.iter().enumerate() {
-            index.upsert(key.clone(), RowID::new(1, row_offset as u32));
+            index.upsert(
+                key.clone(),
+                RowID::new(
+                    1,
+                    paro_storage::rowset::SegmentRowId::from_raw(row_offset as u32),
+                ),
+            );
         }
         divan::black_box(index.len());
     });
@@ -235,7 +259,13 @@ fn fixed_key_upsert_multi_thread(bencher: Bencher) {
                 let index = index.clone();
                 handles.push(thread::spawn(move || {
                     for (row_offset, key) in batch.into_iter().enumerate() {
-                        index.upsert(key, RowID::new((tid + 1) as u32, row_offset as u32));
+                        index.upsert(
+                            key,
+                            RowID::new(
+                                (tid + 1) as u32,
+                                paro_storage::rowset::SegmentRowId::from_raw(row_offset as u32),
+                            ),
+                        );
                     }
                 }));
             }

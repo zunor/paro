@@ -292,6 +292,7 @@ impl PipelineExecutionDriver {
         }
         self.finished[pipeline.index()] = true;
         self.finished_count += 1;
+        self.handles.pipeline_finished(pipeline);
         for event in self.gates.mark_finished(pipeline) {
             if !self.finished[event.pipeline.index()] && self.gates.is_ready(event.pipeline) {
                 self.push_ready_pipeline(event.pipeline, 1, query.memory.available_bytes());

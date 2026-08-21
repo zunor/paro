@@ -38,6 +38,7 @@ pub enum BreakerHandleKind {
     HashJoinBuild,
     Aggregate,
     Window,
+    PartitionAggregateWindow,
     SetOperation,
     Cte,
     Delim,
@@ -127,7 +128,25 @@ impl BreakerHandleCatalogBuilder {
             .entries
             .get_mut(id.index())
             .ok_or_else(|| paro_error::internal("unknown breaker handle id"))?;
-        entry.consumers.push(consumer);
+        if !entry.consumers.contains(&consumer) {
+            entry.consumers.push(consumer);
+        }
+        Ok(())
+    }
+
+    /// Roll back a speculative registration before lowering has attached any
+    /// producer or consumer. IDs remain dense, so only the newest entry may be
+    /// removed.
+    pub fn unregister_unbound(&mut self, id: BreakerHandleId) -> Result<()> {
+        let Some(entry) = self.entries.last() else {
+            return Err(paro_error::internal("breaker handle catalog is empty"));
+        };
+        if entry.id != id || entry.producer.is_some() || !entry.consumers.is_empty() {
+            return Err(paro_error::internal(
+                "only the newest unbound breaker handle can be rolled back",
+            ));
+        }
+        self.entries.pop();
         Ok(())
     }
 

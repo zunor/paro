@@ -15,6 +15,8 @@ use super::aggregate_state::AggregateStateLayout;
 const SERIALIZED_STATE_MAGIC: &[u8; 8] = b"PAAGST01";
 const STATE_PART_RAW_BYTES: u8 = 0;
 const STATE_PART_FUNCTION_SERIALIZED: u8 = 1;
+#[cfg(debug_assertions)]
+const DEBUG_STATE_POISON: u8 = 0xA5;
 
 /// Payload chunk + input mapping required by aggregate updates.
 pub struct AggregatePayload<'a> {
@@ -36,14 +38,37 @@ pub fn initialize_states(
     let address_data = address_format.get_data::<*mut u8>();
     for row in 0..count {
         let base = base_address(&address_format, address_data, addresses, row)?;
-        for (agg_idx, object) in objects.iter().enumerate() {
-            let state_ptr = unsafe { base.add(layout.state_offset(agg_idx)) };
-            unsafe {
-                (object.function.initialize)(state_ptr);
-            }
-        }
+        unsafe { initialize_state_at_address(layout, objects, base) };
     }
     Ok(())
+}
+
+/// Initialize every aggregate state stored at one row address.
+///
+/// Debug builds poison the function-owned bytes first. This gives the grouped
+/// and perfect-hash paths the same observable initialization contract and
+/// makes initializers that accidentally depend on zeroed backing storage fail
+/// close to their aggregate tests.
+///
+/// # Safety
+///
+/// `base` must point to writable storage of at least `layout.total_size()`
+/// bytes, aligned according to [`AggregateStateLayout`], and the storage must
+/// not currently contain live aggregate states.
+#[inline]
+pub(crate) unsafe fn initialize_state_at_address(
+    layout: &AggregateStateLayout,
+    objects: &[AggregateObject],
+    base: *mut u8,
+) {
+    for (agg_idx, object) in objects.iter().enumerate() {
+        let state_ptr = unsafe { base.add(layout.state_offset(agg_idx)) };
+        #[cfg(debug_assertions)]
+        unsafe {
+            std::ptr::write_bytes(state_ptr, DEBUG_STATE_POISON, object.function.state_size);
+        }
+        unsafe { (object.function.initialize)(state_ptr) };
+    }
 }
 
 /// Update aggregate states for a batch of row addresses.
@@ -556,6 +581,11 @@ mod tests {
         *(state as *mut i64) = 0;
     }
 
+    #[cfg(debug_assertions)]
+    unsafe fn partial_test_initialize(state: *mut u8) {
+        *state = 0x11;
+    }
+
     unsafe fn test_update(
         inputs: &[&Vector],
         _input_data: &AggregateInputData,
@@ -659,6 +689,27 @@ mod tests {
         agg_idx: usize,
     ) -> i64 {
         unsafe { *((rows[row_idx].as_ptr().add(layout.state_offset(agg_idx))) as *const i64) }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn debug_initialization_poison_precedes_function_initializer() {
+        let mut object = make_sum_object();
+        object.function.initialize = partial_test_initialize;
+        let objects = vec![object];
+        let layout = AggregateStateLayout::new(&objects).expect("layout");
+        let mut storage = vec![0_u64; layout.total_size().div_ceil(size_of::<u64>())];
+        let state_ptr = storage.as_mut_ptr() as *mut u8;
+
+        // SAFETY: `storage` is a fresh, 8-byte-aligned allocation with one
+        // complete aggregate state row and contains no live state.
+        unsafe { initialize_state_at_address(&layout, &objects, state_ptr) };
+
+        let bytes = unsafe {
+            std::slice::from_raw_parts(state_ptr as *const u8, objects[0].function.state_size)
+        };
+        assert_eq!(bytes[0], 0x11);
+        assert_eq!(bytes[1..], [DEBUG_STATE_POISON; 7]);
     }
 
     #[test]

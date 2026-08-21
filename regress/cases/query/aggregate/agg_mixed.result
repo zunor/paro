@@ -118,15 +118,13 @@ ORDER_BY  (rows=2)
     ->  WINDOW  (rows=2)
       ->  PROJECTION  (rows=2)
         Output: category, sum_x
-        ->  PROJECTION  (rows=2)
-          Output: category, sum_x
-          ->  AGGREGATE  (rows=2)
-            Group Key: #0
-            Aggregates: sum(#1)
-            Output: aggr_0, aggr_1
-            ->  PROJECTION  (rows=4)
-              Output: category, x
-              ->  VALUES  (rows=4)
+        ->  AGGREGATE  (rows=2)
+          Group Key: #0
+          Aggregates: sum(#1)
+          Output: aggr_0, aggr_1
+          ->  PROJECTION  (rows=4)
+            Output: category, x
+            ->  VALUES  (rows=4)
 
 DROP TABLE IF EXISTS agg_m_dim;
 DROP TABLE

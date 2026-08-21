@@ -90,6 +90,11 @@ impl InstanceBuilder {
     ) -> paro_common::error::Result<Arc<Instance>> {
         let layout = InstanceLayout::new(path);
         config.options.instance_root = layout.root().to_string_lossy().to_string();
+        if config.options.use_temporary_directory
+            && config.options.temporary_directory.trim().is_empty()
+        {
+            config.options.temporary_directory = layout.temporary_dir().to_string_lossy().into();
+        }
         Self::ensure_data_dir_exists(&layout)?;
         let owner_guard = InstanceOwnerGuard::acquire(&layout)?;
         Self::prepare_buffer_pool(&config)?;

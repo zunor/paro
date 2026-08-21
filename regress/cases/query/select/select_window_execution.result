@@ -23,6 +23,17 @@ A	3	3
 B	7	1
 C	4	2
 
+SELECT
+    x,
+    sum(x) FILTER (WHERE keep) OVER () AS kept_sum,
+    count(x) FILTER (WHERE keep) OVER () AS kept_count
+FROM (VALUES (1, true), (2, false), (3, true)) AS global_aggregate_input(x, keep)
+ORDER BY x;
+x	kept_sum	kept_count
+1	4	2
+2	4	2
+3	4	2
+
 EXPLAIN SELECT x, row_number() OVER (ORDER BY x) AS rn
 FROM (VALUES (3), (1), (2)) AS qualify_input(x)
 QUALIFY row_number() OVER (ORDER BY x) <= 2
@@ -58,13 +69,7 @@ ORDER_BY  (rows=3)
   Sort Key: #0 ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: x
-    ->  PROJECTION  (rows=3)
-      Output: x
-      ->  PROJECTION  (rows=3)
-        Output: x
-        ->  PROJECTION  (rows=3)
-          Output: x
-          ->  VALUES  (rows=3)
+    ->  VALUES  (rows=3)
 
 SELECT
     category,
@@ -210,3 +215,34 @@ SELECT last_value(x) OVER (
     ORDER BY x ROWS BETWEEN CURRENT ROW AND 1 PRECEDING
 ) FROM (VALUES (1)) AS invalid_frame_input(x);
 ERROR: frame starting from current row cannot have preceding rows (SQLSTATE=42P20)
+
+SELECT
+    category,
+    x,
+    sum(x + 1) OVER (PARTITION BY category) AS computed_sum
+FROM (VALUES ('a', 1), ('a', 2), ('b', 4)) AS computed_window_input(category, x)
+ORDER BY category, x;
+category	x	computed_sum
+a	1	5
+a	2	5
+b	4	5
+
+SELECT
+    first_value(random()) OVER () = first_value(random()) OVER ()
+        AS volatile_inputs_are_independent
+FROM (VALUES (1)) AS volatile_window_input(x);
+volatile_inputs_are_independent
+false
+
+SELECT
+    x,
+    sum(x) OVER (
+        ORDER BY x ROWS BETWEEN (1 + 1) PRECEDING AND CURRENT ROW
+    ) AS computed_frame_sum
+FROM (VALUES (1), (2), (3), (4)) AS computed_frame_input(x)
+ORDER BY x;
+x	computed_frame_sum
+1	1
+2	3
+3	6
+4	9

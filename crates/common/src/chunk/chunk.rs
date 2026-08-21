@@ -164,6 +164,32 @@ impl Chunk {
         }
     }
 
+    /// Create a chunk with an explicit row cardinality.
+    ///
+    /// Unlike [`Self::from_arc_vectors`], this constructor represents
+    /// cardinality-only batches with no materialized columns. Every supplied
+    /// vector must describe the same explicit number of rows.
+    pub fn try_from_arc_vectors_with_cardinality(
+        vectors: Vec<Arc<Vector>>,
+        count: usize,
+        allocator: Arc<dyn Allocator>,
+    ) -> Result<Self> {
+        if let Some(vector) = vectors.iter().find(|vector| vector.len() != count) {
+            return Err(paro_error::internal(format!(
+                "chunk column cardinality mismatch: column={}, expected={count}",
+                vector.len()
+            )));
+        }
+        Ok(Self {
+            data: vectors,
+            count,
+            capacity: count.max(VECTOR_SIZE),
+            initial_capacity: count.max(VECTOR_SIZE),
+            reset_state: None,
+            allocator,
+        })
+    }
+
     /// Append a column that already has `expected_count` logical rows set.
     pub fn try_push_column(&mut self, vector: Arc<Vector>, expected_count: usize) -> Result<()> {
         if vector.len() != expected_count {
@@ -242,7 +268,12 @@ impl Chunk {
                 self.capacity
             )));
         }
-        if self.count == count {
+        if self.count == count
+            && self
+                .data
+                .iter()
+                .all(|vector| vector.count_matches_cardinality(count))
+        {
             return Ok(());
         }
 
@@ -264,6 +295,18 @@ impl Chunk {
     #[inline]
     pub fn set_capacity(&mut self, capacity: usize) {
         self.capacity = capacity;
+    }
+
+    /// Remove every column handle while retaining the chunk container's
+    /// allocated column capacity and row capacity.
+    ///
+    /// This is useful for short-lived argument chunks whose columns borrow
+    /// vectors owned elsewhere. Clearing the handles at the end of the call
+    /// releases those borrows without reallocating the `Vec` on the next use.
+    pub fn clear_columns(&mut self) {
+        self.data.clear();
+        self.count = 0;
+        self.reset_state = None;
     }
 
     // ========== Column Access ==========

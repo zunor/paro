@@ -9,6 +9,7 @@ use paro_common::vector::Vector;
 
 use crate::row::codec::scatter_to_positions;
 use crate::row::pin::PinSet;
+use crate::row::raw::{RawPinnedRows, RawRowLocation};
 use crate::row::region::RowLocation;
 use crate::row::{Ordering, RowAddr, RowStore};
 use std::sync::Arc;
@@ -56,18 +57,24 @@ impl GatherPlan {
 pub struct PinnedRows<'a> {
     store: &'a RowStore,
     logical_rows: Vec<RowLocation>,
-    physical_rows: Vec<RowLocation>,
+    pinned_regions: Vec<PinnedRegionRows<'a>>,
     plan: GatherPlan,
     _pin_set: PinSet<'a>,
 }
 
+#[derive(Debug)]
+struct PinnedRegionRows<'a> {
+    physical_start: usize,
+    rows: RawPinnedRows<'a>,
+}
+
 impl<'a> PinnedRows<'a> {
-    pub(crate) fn new(
+    pub(crate) fn try_new(
         store: &'a RowStore,
         rows: Vec<RowLocation>,
         ordering: Ordering,
         pin_set: PinSet<'a>,
-    ) -> Self {
+    ) -> Result<Self> {
         let logical_rows = rows;
         let (physical_rows, plan) = match ordering {
             Ordering::Sequential => (
@@ -97,13 +104,38 @@ impl<'a> PinnedRows<'a> {
             }
         };
 
-        Self {
+        let mut pinned_regions = Vec::new();
+        let mut group_start = 0usize;
+        while group_start < physical_rows.len() {
+            let region_idx = physical_rows[group_start].region_index;
+            let mut group_end = group_start + 1;
+            while group_end < physical_rows.len()
+                && physical_rows[group_end].region_index == region_idx
+            {
+                group_end += 1;
+            }
+            let raw_locations = physical_rows[group_start..group_end]
+                .iter()
+                .map(|row| row.raw)
+                .collect::<Vec<RawRowLocation>>();
+            let rows = store
+                .region(region_idx)
+                .collection()
+                .pin_locations(&raw_locations)?;
+            pinned_regions.push(PinnedRegionRows {
+                physical_start: group_start,
+                rows,
+            });
+            group_start = group_end;
+        }
+
+        Ok(Self {
             store,
             logical_rows,
-            physical_rows,
+            pinned_regions,
             plan,
             _pin_set: pin_set,
-        }
+        })
     }
 
     #[inline]
@@ -250,27 +282,12 @@ impl<'a> PinnedRows<'a> {
         }
 
         let typ = self.store.layout().types()[column_idx].clone();
-        let mut group_start = 0usize;
-        while group_start < self.physical_rows.len() {
-            let region_idx = self.physical_rows[group_start].region_index;
-            let mut group_end = group_start + 1;
-            while group_end < self.physical_rows.len()
-                && self.physical_rows[group_end].region_index == region_idx
-            {
-                group_end += 1;
-            }
-
-            let group_len = group_end - group_start;
-            let local_ordinals: Vec<usize> = self.physical_rows[group_start..group_end]
-                .iter()
-                .map(|row| row.local_ordinal)
-                .collect();
+        for region in &self.pinned_regions {
+            let group_start = region.physical_start;
+            let group_len = region.rows.len();
+            let group_end = group_start + group_len;
             let mut tmp = Vector::try_new(typ.clone(), group_len, output.allocator().clone())?;
-            self.store.region(region_idx).collection().gather_column(
-                &local_ordinals,
-                column_idx,
-                &mut tmp,
-            )?;
+            region.rows.gather_column(column_idx, &mut tmp)?;
 
             let output_positions: Vec<usize> = (group_start..group_end)
                 .map(|physical_idx| {
@@ -287,8 +304,6 @@ impl<'a> PinnedRows<'a> {
                     paro_error::internal(format!("missing codec for row column {}", column_idx))
                 })?;
             scatter_to_positions(codec, output_col_idx, &tmp, output, &output_positions)?;
-
-            group_start = group_end;
         }
 
         Ok(())

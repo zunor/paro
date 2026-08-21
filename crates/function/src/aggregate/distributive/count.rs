@@ -6,13 +6,19 @@
 //!
 
 use crate::aggregate::{
-    AggregateFunction, AggregateFunctionSet, AggregateInputData, AggregateStateInput,
+    AggregateDirectUpdate, AggregateEmptyInput, AggregateFunction, AggregateFunctionSet,
+    AggregateInputData, AggregateSingletonMerge, AggregateStateInput,
 };
 use paro_common::error::Result;
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 struct CountFunction;
+
+fn count_non_null_input(_source: &AggregateFunction) -> Option<AggregateFunction> {
+    Some(get_count_star_function())
+}
 
 impl CountFunction {
     unsafe fn initialize(state: *mut u8) {
@@ -79,6 +85,30 @@ impl CountFunction {
         }
     }
 
+    unsafe fn update_distinct_runs(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &AggregateStateInput,
+        run_starts: &[u32],
+        count: usize,
+    ) {
+        let input = inputs[0];
+        let all_valid = input.validity().all_valid();
+        for (run_idx, &start) in run_starts.iter().enumerate() {
+            let start = start as usize;
+            let end = run_starts
+                .get(run_idx + 1)
+                .map_or(count, |next| *next as usize);
+            let increment = if all_valid {
+                end - start
+            } else {
+                (start..end).filter(|&row| !input.is_null(row)).count()
+            };
+            let state = states.state_ptr(run_idx) as *mut i64;
+            *state += increment as i64;
+        }
+    }
+
     unsafe fn combine(
         source: &Vector,
         target: &Vector,
@@ -114,8 +144,62 @@ impl CountFunction {
     }
 }
 
+struct CountPartialMergeFunction;
+
+impl CountPartialMergeFunction {
+    unsafe fn update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        states: &AggregateStateInput,
+        count: usize,
+    ) {
+        let input = inputs[0];
+        for row_idx in 0..count {
+            if !input.is_null(row_idx) {
+                let state = states.state_ptr(row_idx) as *mut i64;
+                *state += input.get_fixed::<i64>(row_idx);
+            }
+        }
+    }
+
+    unsafe fn simple_update(
+        inputs: &[&Vector],
+        _input_data: &AggregateInputData,
+        state: *mut u8,
+        count: usize,
+    ) {
+        let input = inputs[0];
+        let state = state as *mut i64;
+        for row_idx in 0..count {
+            if !input.is_null(row_idx) {
+                *state += input.get_fixed::<i64>(row_idx);
+            }
+        }
+    }
+}
+
+fn count_partial_merge(_source: &AggregateFunction) -> Option<AggregateFunction> {
+    let function = AggregateFunction::new(
+        "count_partial_merge".to_string(),
+        vec![LogicalType::BigInt],
+        LogicalType::BigInt,
+        std::mem::size_of::<i64>(),
+        CountFunction::initialize,
+        CountPartialMergeFunction::update,
+        CountFunction::combine,
+        CountFunction::finalize,
+        Some(CountPartialMergeFunction::simple_update),
+        None,
+    )
+    .with_empty_input(AggregateEmptyInput::NonNull)
+    .with_partial_merge(count_partial_merge)
+    .with_singleton_merge(AggregateSingletonMerge::InputOr(Value::BigInt(0)));
+    // SAFETY: partial COUNT state is one inline i64 with no external ownership.
+    Some(unsafe { function.with_trivially_copyable_state() })
+}
+
 pub fn get_count_star_function() -> AggregateFunction {
-    AggregateFunction::new(
+    let function = AggregateFunction::new(
         "count_star".to_string(),
         vec![],
         LogicalType::BigInt,
@@ -127,6 +211,11 @@ pub fn get_count_star_function() -> AggregateFunction {
         Some(CountFunction::simple_update_star),
         None,
     )
+    .with_empty_input(AggregateEmptyInput::NonNull);
+    // SAFETY: COUNT state is one inline i64 with no external ownership.
+    unsafe { function.with_trivially_copyable_state() }
+        .with_partial_merge(count_partial_merge)
+        .with_direct_update(AggregateDirectUpdate::CountStar)
 }
 
 pub fn get_count_function() -> AggregateFunctionSet {
@@ -143,7 +232,7 @@ pub fn get_count_function() -> AggregateFunctionSet {
     ];
 
     for t in types {
-        set.add_function(AggregateFunction::new(
+        let function = AggregateFunction::new(
             "count".to_string(),
             vec![t],
             LogicalType::BigInt,
@@ -154,7 +243,13 @@ pub fn get_count_function() -> AggregateFunctionSet {
             CountFunction::finalize,
             Some(CountFunction::simple_update),
             None,
-        ));
+        )
+        .with_empty_input(AggregateEmptyInput::NonNull)
+        .with_non_null_input(count_non_null_input);
+        // SAFETY: COUNT state is one inline i64 with no external ownership.
+        let function = unsafe { function.with_trivially_copyable_state() }
+            .with_partial_merge(count_partial_merge);
+        set.add_function(function.with_distinct_run_update(CountFunction::update_distinct_runs));
     }
 
     set
@@ -266,6 +361,25 @@ mod tests {
             }
 
             assert_eq!(result.get_flat::<i64>(0), 2);
+        }
+    }
+
+    #[test]
+    fn finalized_count_partials_merge_without_widening_and_ignore_nulls() {
+        let (count, _) = get_count_function().bind(&[LogicalType::BigInt]).unwrap();
+        let merge = count.partial_merge_function().unwrap();
+        assert_eq!(merge.return_type, LogicalType::BigInt);
+        let mut arena = test_arena();
+        let mut state = vec![0u8; merge.state_size];
+        let state_ptr = state.as_mut_ptr();
+        let mut input = paro_common::test_utils::test_i64_vector(&[2, 0, 5]);
+        input.set_null(1, true);
+
+        unsafe {
+            (merge.initialize)(state_ptr);
+            let input_data = preserve_input_data(&merge, &mut arena);
+            merge.simple_update.unwrap()(&[&input], &input_data, state_ptr, 3);
+            assert_eq!(*(state_ptr as *const i64), 7);
         }
     }
 }

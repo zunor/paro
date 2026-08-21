@@ -1,12 +1,31 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::expression::{Expression, WindowExpression, WindowFrameBound};
+use crate::expression::{Expression, WindowExpression, WindowFrameBound, WindowInvocation};
 
 pub struct ExpressionIterator;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpressionVisitDecision {
+    Descend,
+    SkipChildren,
+}
+
 impl ExpressionIterator {
-    pub fn enumerate_children(expr: &Expression, mut f: impl FnMut(&Expression)) {
+    /// Visit an expression tree in pre-order with explicit subtree pruning.
+    /// All child enumeration remains centralized here, so adding an expression
+    /// variant cannot silently omit it from downstream analyses.
+    pub fn visit<'a>(
+        expr: &'a Expression,
+        visitor: &mut impl FnMut(&'a Expression) -> ExpressionVisitDecision,
+    ) {
+        if visitor(expr) == ExpressionVisitDecision::SkipChildren {
+            return;
+        }
+        Self::enumerate_children(expr, |child| Self::visit(child, visitor));
+    }
+
+    pub fn enumerate_children<'a>(expr: &'a Expression, mut f: impl FnMut(&'a Expression)) {
         match expr {
             Expression::Aggregate(e) => {
                 for child in &e.children {
@@ -116,9 +135,27 @@ impl ExpressionIterator {
         }
     }
 
-    pub fn enumerate_window_children(window: &WindowExpression, mut f: impl FnMut(&Expression)) {
-        for child in &window.children {
-            f(child);
+    pub fn enumerate_window_children<'a>(
+        window: &'a WindowExpression,
+        mut f: impl FnMut(&'a Expression),
+    ) {
+        match &window.invocation {
+            WindowInvocation::Native { arguments, .. } => {
+                for argument in arguments {
+                    f(argument);
+                }
+            }
+            WindowInvocation::Aggregate(aggregate) => {
+                for child in &aggregate.children {
+                    f(child);
+                }
+                if let Some(filter) = &aggregate.filter {
+                    f(filter);
+                }
+                for order in &aggregate.order_bys {
+                    f(&order.expression);
+                }
+            }
         }
         for partition in &window.partitions {
             f(partition);
@@ -138,8 +175,23 @@ impl ExpressionIterator {
         window: &mut WindowExpression,
         mut f: impl FnMut(&mut Expression),
     ) {
-        for child in &mut window.children {
-            f(child);
+        match &mut window.invocation {
+            WindowInvocation::Native { arguments, .. } => {
+                for argument in arguments {
+                    f(argument);
+                }
+            }
+            WindowInvocation::Aggregate(aggregate) => {
+                for child in &mut aggregate.children {
+                    f(child);
+                }
+                if let Some(filter) = &mut aggregate.filter {
+                    f(filter);
+                }
+                for order in &mut aggregate.order_bys {
+                    f(&mut order.expression);
+                }
+            }
         }
         for partition in &mut window.partitions {
             f(partition);
@@ -160,12 +212,14 @@ impl ExpressionIterator {
 mod tests {
     use super::ExpressionIterator;
     use crate::expression::{
-        ColumnRefExpression, ComparisonExpression, ComparisonType, ConstantExpression, Expression,
-        WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
+        AggregateExpression, ColumnRefExpression, ComparisonExpression, ComparisonType,
+        ConstantExpression, Expression, OrderByExpression, WindowExpression, WindowFrame,
+        WindowFrameBound, WindowFrameType,
     };
     use crate::operator::ColumnBinding;
     use paro_common::runtime_value::Value;
     use paro_common::types::LogicalType;
+    use paro_function::aggregate::distributive::count::get_count_function;
     use paro_function::window::WindowFunction;
 
     fn int_column(idx: usize) -> Expression {
@@ -177,16 +231,16 @@ mod tests {
 
     #[test]
     fn enumerate_children_visits_window_offsets_and_orders() {
-        let expr = Expression::Window(WindowExpression {
-            function: WindowFunction::row_number(),
-            children: vec![int_column(0)],
-            partitions: vec![int_column(1)],
-            orders: vec![crate::expression::OrderByExpression {
+        let expr = Expression::Window(WindowExpression::native(
+            WindowFunction::first_value(LogicalType::Integer),
+            vec![int_column(0)],
+            vec![int_column(1)],
+            vec![crate::expression::OrderByExpression {
                 expression: int_column(2),
                 ascending: true,
                 nulls_first: false,
             }],
-            frame: WindowFrame {
+            WindowFrame {
                 frame_type: WindowFrameType::Rows,
                 start_bound: WindowFrameBound::Offset(Box::new(Expression::Constant(
                     ConstantExpression {
@@ -198,9 +252,8 @@ mod tests {
                 end_bound: WindowFrameBound::Offset(Box::new(int_column(3))),
                 end_is_preceding: false,
             },
-            ignore_nulls: false,
-            return_type: LogicalType::BigInt,
-        });
+            false,
+        ));
 
         let mut count = 0;
         ExpressionIterator::enumerate_children(&expr, |_| {
@@ -233,5 +286,45 @@ mod tests {
             },
             other => panic!("expected comparison, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn enumerate_children_visits_aggregate_window_modifiers() {
+        let (count, _) = get_count_function()
+            .bind(&[LogicalType::Integer])
+            .expect("bind count(integer)");
+        let aggregate = AggregateExpression::new(count, vec![int_column(0)], LogicalType::BigInt)
+            .with_filter(Some(Expression::Constant(ConstantExpression::new(
+                Value::Boolean(true),
+                LogicalType::Boolean,
+            ))))
+            .with_order_bys(vec![OrderByExpression {
+                expression: int_column(1),
+                ascending: true,
+                nulls_first: false,
+            }]);
+        let expression = Expression::Window(WindowExpression::aggregate(
+            aggregate,
+            vec![int_column(2)],
+            vec![OrderByExpression {
+                expression: int_column(3),
+                ascending: true,
+                nulls_first: false,
+            }],
+            WindowFrame {
+                frame_type: WindowFrameType::Rows,
+                start_bound: WindowFrameBound::Offset(Box::new(int_column(4))),
+                start_is_preceding: true,
+                end_bound: WindowFrameBound::Offset(Box::new(int_column(5))),
+                end_is_preceding: false,
+            },
+        ));
+
+        let mut children = Vec::new();
+        ExpressionIterator::enumerate_children(&expression, |child| {
+            children.push(child.return_type());
+        });
+        assert_eq!(children.len(), 7);
+        assert_eq!(children[1], LogicalType::Boolean);
     }
 }

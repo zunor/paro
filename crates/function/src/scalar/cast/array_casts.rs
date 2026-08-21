@@ -252,7 +252,7 @@ pub fn varchar_to_array_cast(
     let child_count = count
         .checked_mul(target_size)
         .ok_or_else(|| paro_error::internal("ARRAY child count overflow"))?;
-    let source_view = source.try_to_varlen_view(count)?;
+    let source_view = source.try_to_utf8_view(count)?;
     let mut parsed_child = Vector::try_new(
         LogicalType::Float,
         child_count.max(1),
@@ -273,10 +273,9 @@ pub fn varchar_to_array_cast(
             continue;
         }
 
-        let s = source_view.get_inline_string(row);
-        let s = s.as_str();
+        let s = source_view.str(row);
 
-        match parse_vector_literal(&s) {
+        match parse_vector_literal(s) {
             Ok(values) => {
                 if values.len() != target_size {
                     let error_msg = format!(
@@ -369,7 +368,7 @@ pub fn array_to_varchar_cast(
 ) -> Result<bool> {
     let array = source.try_to_array_view(count)?;
     let child = ArrayVector::get_entry(source);
-    let mut writer = VarcharResultWriter::new(result, count);
+    let mut writer = VarcharResultWriter::try_new(result, count)?;
 
     for row in 0..count {
         if !array.is_valid(row) {

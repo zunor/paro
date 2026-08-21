@@ -6,17 +6,25 @@ use paro_common::runtime_value::Value;
 use paro_common::test_utils::test_allocator;
 use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
-use paro_function::window::{WindowFunction, WindowFunctionType};
+use paro_function::aggregate::distributive::count::get_count_star_function;
+use paro_function::aggregate::distributive::minmax::get_min_function;
+use paro_function::aggregate::distributive::sum::get_sum_function;
+use paro_function::window::WindowFunction;
 use paro_planner::expression::{
-    ConstantExpression, Expression, OrderByExpression, ReferenceExpression, WindowExpression,
-    WindowFrame, WindowFrameBound, WindowFrameType,
+    AggregateExpression, ColumnRefExpression, ConstantExpression, Expression, OrderByExpression,
+    ReferenceExpression, WindowExpression, WindowFrame, WindowFrameBound, WindowFrameType,
 };
+use paro_planner::operator::ColumnBinding;
 
 use super::build_window_output_chunks;
 use crate::physical::specs::WindowSpec;
 
 fn reference(index: usize, ty: LogicalType) -> Expression {
     Expression::Reference(ReferenceExpression::new(index, ty))
+}
+
+fn column_ref(index: usize, ty: LogicalType) -> Expression {
+    Expression::ColumnRef(ColumnRefExpression::new(ColumnBinding::new(7, index), ty))
 }
 
 fn int_constant(value: i32) -> Expression {
@@ -26,36 +34,52 @@ fn int_constant(value: i32) -> Expression {
     ))
 }
 
-fn null_int_constant() -> Expression {
+fn bigint_constant(value: i64) -> Expression {
     Expression::Constant(ConstantExpression::new(
-        Value::Null(LogicalType::Integer),
-        LogicalType::Integer,
+        Value::BigInt(value),
+        LogicalType::BigInt,
+    ))
+}
+
+fn null_bigint_constant() -> Expression {
+    Expression::Constant(ConstantExpression::new(
+        Value::Null(LogicalType::BigInt),
+        LogicalType::BigInt,
     ))
 }
 
 fn rank_over(partition_idx: usize, order_idx: usize) -> WindowExpression {
-    WindowExpression {
-        function: WindowFunction::rank(),
-        children: Vec::new(),
-        partitions: vec![reference(partition_idx, LogicalType::Integer)],
-        orders: vec![OrderByExpression {
+    WindowExpression::native(
+        WindowFunction::rank(),
+        Vec::new(),
+        vec![reference(partition_idx, LogicalType::Integer)],
+        vec![OrderByExpression {
             expression: reference(order_idx, LogicalType::Integer),
             ascending: true,
             nulls_first: false,
         }],
-        frame: WindowFrame::default(),
-        ignore_nulls: false,
-        return_type: LogicalType::BigInt,
-    }
+        WindowFrame::default(),
+        false,
+    )
 }
 
 fn window_spec(expressions: Vec<WindowExpression>) -> WindowSpec {
-    let mut output_types = vec![LogicalType::Integer, LogicalType::Integer];
+    window_spec_for_types(
+        expressions,
+        vec![LogicalType::Integer, LogicalType::Integer],
+    )
+}
+
+fn window_spec_for_types(
+    expressions: Vec<WindowExpression>,
+    mut output_types: Vec<LogicalType>,
+) -> WindowSpec {
+    let input_width = output_types.len();
     output_types.extend(expressions.iter().map(WindowExpression::return_type));
     WindowSpec {
         window_index: 1,
         expressions: expressions.into_boxed_slice(),
-        input_width: 2,
+        input_width,
         output_names: (0..output_types.len())
             .map(|idx| format!("col{idx}"))
             .collect::<Vec<_>>()
@@ -99,40 +123,56 @@ fn value_order_input_chunk(values: &[Value], orders: &[i32]) -> Chunk {
     chunk
 }
 
+fn offset_value_input_chunk(offsets: &[Value], values: &[i32]) -> Chunk {
+    assert_eq!(offsets.len(), values.len());
+    let mut chunk = Chunk::try_initialize(
+        &[LogicalType::BigInt, LogicalType::Integer],
+        values.len(),
+        test_allocator(),
+    )
+    .expect("input chunk");
+    chunk
+        .try_set_cardinality(values.len())
+        .expect("cardinality");
+    for (row, (offset, value)) in offsets.iter().zip(values).enumerate() {
+        chunk.set_value(0, row, offset).unwrap();
+        chunk.set_value(1, row, &Value::Integer(*value)).unwrap();
+    }
+    chunk
+}
+
 fn value_window(
     function: WindowFunction,
     children: Vec<Expression>,
     frame: WindowFrame,
 ) -> WindowExpression {
-    WindowExpression {
+    WindowExpression::native(
         function,
         children,
-        partitions: Vec::new(),
-        orders: vec![OrderByExpression {
+        Vec::new(),
+        vec![OrderByExpression {
             expression: reference(1, LogicalType::Integer),
             ascending: true,
             nulls_first: false,
         }],
         frame,
-        ignore_nulls: false,
-        return_type: LogicalType::Integer,
-    }
+        false,
+    )
 }
 
 fn ntile_window(bucket_count: Expression) -> WindowExpression {
-    WindowExpression {
-        function: WindowFunction::ntile(),
-        children: vec![bucket_count],
-        partitions: Vec::new(),
-        orders: vec![OrderByExpression {
+    WindowExpression::native(
+        WindowFunction::ntile(),
+        vec![bucket_count],
+        Vec::new(),
+        vec![OrderByExpression {
             expression: reference(1, LogicalType::Integer),
             ascending: true,
             nulls_first: false,
         }],
-        frame: WindowFrame::get_default_frame(&WindowFunction::ntile()),
-        ignore_nulls: false,
-        return_type: LogicalType::BigInt,
-    }
+        WindowFrame::get_default_frame(&WindowFunction::ntile()),
+        false,
+    )
 }
 
 fn rows_frame(
@@ -171,20 +211,19 @@ fn window_breaker_rejects_mixed_partition_order_layouts() {
 
 #[test]
 fn window_breaker_writes_aggregate_window_results_directly() {
-    let spec = window_spec(vec![WindowExpression {
-        function: WindowFunction::new(
-            "sum",
-            WindowFunctionType::Aggregate,
-            vec![LogicalType::Integer],
-            LogicalType::Integer,
-        ),
-        children: vec![reference(0, LogicalType::Integer)],
-        partitions: vec![reference(1, LogicalType::Integer)],
-        orders: Vec::new(),
-        frame: WindowFrame::default(),
-        ignore_nulls: false,
-        return_type: LogicalType::Integer,
-    }]);
+    let (sum, target_types) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("integer SUM binding");
+    assert_eq!(target_types, vec![LogicalType::Integer]);
+    let return_type = sum.return_type.clone();
+    let aggregate =
+        AggregateExpression::new(sum, vec![reference(0, LogicalType::Integer)], return_type);
+    let spec = window_spec(vec![WindowExpression::aggregate(
+        aggregate,
+        vec![reference(1, LogicalType::Integer)],
+        Vec::new(),
+        WindowFrame::default(),
+    )]);
     let mut input = Chunk::try_initialize(
         &[LogicalType::Integer, LogicalType::Integer],
         3,
@@ -204,9 +243,180 @@ fn window_breaker_writes_aggregate_window_results_directly() {
     assert_eq!(output.len(), 1);
     let chunk = &output[0];
     assert_eq!(chunk.size(), 3);
-    assert_eq!(chunk.column(2).unwrap().get_value(0), Value::Integer(30));
-    assert_eq!(chunk.column(2).unwrap().get_value(1), Value::Integer(30));
-    assert_eq!(chunk.column(2).unwrap().get_value(2), Value::Integer(7));
+    assert_eq!(chunk.column(2).unwrap().get_value(0), Value::BigInt(30));
+    assert_eq!(chunk.column(2).unwrap().get_value(1), Value::BigInt(30));
+    assert_eq!(chunk.column(2).unwrap().get_value(2), Value::BigInt(7));
+}
+
+#[test]
+fn window_breaker_executes_zero_argument_aggregate_kernel() {
+    let aggregate =
+        AggregateExpression::new(get_count_star_function(), Vec::new(), LogicalType::BigInt);
+    let spec = window_spec(vec![WindowExpression::aggregate(
+        aggregate,
+        Vec::new(),
+        Vec::new(),
+        WindowFrame::default(),
+    )]);
+
+    let output = build_window_output_chunks(&spec, &[rank_input_chunk(0, 3)], test_allocator())
+        .expect("window output");
+    let result = output[0].column(2).expect("count output");
+    for row in 0..3 {
+        assert_eq!(result.get_value(row), Value::BigInt(3));
+    }
+}
+
+#[test]
+fn window_breaker_uses_bound_decimal_min_kernel() {
+    let decimal = LogicalType::Decimal {
+        precision: 9,
+        scale: 2,
+    };
+    let (minimum, target_types) = get_min_function()
+        .bind(std::slice::from_ref(&decimal))
+        .expect("decimal MIN binding");
+    assert_eq!(target_types, vec![decimal.clone()]);
+    let aggregate = AggregateExpression::new(
+        minimum,
+        vec![reference(0, decimal.clone())],
+        decimal.clone(),
+    );
+    let spec = window_spec_for_types(
+        vec![WindowExpression::aggregate(
+            aggregate,
+            vec![reference(1, LogicalType::Integer)],
+            Vec::new(),
+            WindowFrame::default(),
+        )],
+        vec![decimal.clone(), LogicalType::Integer],
+    );
+    let mut input = Chunk::try_initialize(
+        &[decimal.clone(), LogicalType::Integer],
+        5,
+        test_allocator(),
+    )
+    .expect("input chunk");
+    input.try_set_cardinality(5).expect("cardinality");
+    for (row, (value, partition)) in [
+        (Value::Decimal(125, 9, 2), 1),
+        (Value::Null(decimal.clone()), 1),
+        (Value::Decimal(100, 9, 2), 1),
+        (Value::Decimal(700, 9, 2), 2),
+        (Value::Decimal(700, 9, 2), 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        input.set_value(0, row, &value).unwrap();
+        input.set_value(1, row, &Value::Integer(partition)).unwrap();
+    }
+
+    let output =
+        build_window_output_chunks(&spec, &[input], test_allocator()).expect("window output");
+    let result = output[0].column(2).unwrap();
+    for row in 0..3 {
+        assert_eq!(result.get_value(row), Value::Decimal(100, 9, 2));
+    }
+    for row in 3..5 {
+        assert_eq!(result.get_value(row), Value::Decimal(700, 9, 2));
+    }
+}
+
+#[test]
+fn sorted_window_fallback_recomputes_ordered_aggregate_frames_with_bound_kernel() {
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("integer SUM binding");
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![reference(0, LogicalType::Integer)],
+        LogicalType::BigInt,
+    );
+    let expression = WindowExpression::aggregate(
+        aggregate,
+        Vec::new(),
+        vec![OrderByExpression {
+            expression: reference(1, LogicalType::Integer),
+            ascending: true,
+            nulls_first: false,
+        }],
+        WindowFrame::default(),
+    );
+    let output = build_window_output_chunks(
+        &window_spec(vec![expression]),
+        &[value_order_input_chunk(
+            &[Value::Integer(10), Value::Integer(20), Value::Integer(30)],
+            &[1, 2, 3],
+        )],
+        test_allocator(),
+    )
+    .expect("ordered aggregate window");
+    let result = output[0].column(2).expect("sum output");
+    assert_eq!(result.get_value(0), Value::BigInt(10));
+    assert_eq!(result.get_value(1), Value::BigInt(30));
+    assert_eq!(result.get_value(2), Value::BigInt(60));
+}
+
+#[test]
+fn sorted_window_fallback_applies_aggregate_filter_three_valued_logic() {
+    let (sum, _) = get_sum_function()
+        .bind(&[LogicalType::Integer])
+        .expect("integer SUM binding");
+    let aggregate = AggregateExpression::new(
+        sum,
+        vec![reference(0, LogicalType::Integer)],
+        LogicalType::BigInt,
+    )
+    // Binder output is a ColumnRef until column binding resolution. The
+    // generic window fallback must not mistake it for an aggregate-payload
+    // Reference because FILTER is applied directly to the sorted row domain.
+    .with_filter(Some(column_ref(2, LogicalType::Boolean)));
+    let expression = WindowExpression::aggregate(
+        aggregate,
+        vec![reference(1, LogicalType::Integer)],
+        Vec::new(),
+        WindowFrame::default(),
+    );
+    let mut input = Chunk::try_initialize(
+        &[
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Boolean,
+        ],
+        4,
+        test_allocator(),
+    )
+    .expect("input chunk");
+    input.try_set_cardinality(4).expect("cardinality");
+    for (row, (value, filter)) in [
+        (10, Value::Boolean(true)),
+        (20, Value::Boolean(false)),
+        (30, Value::Null(LogicalType::Boolean)),
+        (40, Value::Boolean(true)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        input.set_value(0, row, &Value::Integer(value)).unwrap();
+        input.set_value(1, row, &Value::Integer(1)).unwrap();
+        input.set_value(2, row, &filter).unwrap();
+    }
+
+    let spec = window_spec_for_types(
+        vec![expression],
+        vec![
+            LogicalType::Integer,
+            LogicalType::Integer,
+            LogicalType::Boolean,
+        ],
+    );
+    let output = build_window_output_chunks(&spec, &[input], test_allocator())
+        .expect("filtered aggregate window");
+    let result = output[0].column(3).expect("sum output");
+    for row in 0..4 {
+        assert_eq!(result.get_value(row), Value::BigInt(50));
+    }
 }
 
 #[test]
@@ -240,19 +450,18 @@ fn window_breaker_writes_rank_across_output_chunks_directly() {
 
 #[test]
 fn window_breaker_rejects_non_direct_sort_expressions() {
-    let spec = window_spec(vec![WindowExpression {
-        function: WindowFunction::rank(),
-        children: Vec::new(),
-        partitions: vec![int_constant(1)],
-        orders: vec![OrderByExpression {
+    let spec = window_spec(vec![WindowExpression::native(
+        WindowFunction::rank(),
+        Vec::new(),
+        vec![int_constant(1)],
+        vec![OrderByExpression {
             expression: Expression::Window(rank_over(0, 1)),
             ascending: true,
             nulls_first: false,
         }],
-        frame: WindowFrame::default(),
-        ignore_nulls: false,
-        return_type: LogicalType::BigInt,
-    }]);
+        WindowFrame::default(),
+        false,
+    )]);
 
     let err = build_window_output_chunks(&spec, &[], test_allocator()).unwrap_err();
     assert!(err
@@ -310,7 +519,7 @@ fn frame_value_functions_read_from_each_current_frame() {
         ),
         value_window(
             WindowFunction::nth_value(LogicalType::Integer),
-            vec![reference(1, LogicalType::Integer), int_constant(2)],
+            vec![reference(1, LogicalType::Integer), bigint_constant(2)],
             rows_frame(
                 WindowFrameBound::CurrentRow,
                 false,
@@ -376,7 +585,7 @@ fn frame_value_functions_apply_ignore_nulls_inside_the_frame() {
     last_ignore.ignore_nulls = true;
     let mut nth_ignore = value_window(
         WindowFunction::nth_value(LogicalType::Integer),
-        vec![reference(0, LogicalType::Integer), int_constant(2)],
+        vec![reference(0, LogicalType::Integer), bigint_constant(2)],
         whole_partition_rows_frame(),
     );
     nth_ignore.ignore_nulls = true;
@@ -407,7 +616,7 @@ fn frame_value_functions_apply_ignore_nulls_inside_the_frame() {
 #[test]
 fn ntile_assigns_remainder_rows_to_leading_buckets() {
     let output = build_window_output_chunks(
-        &window_spec(vec![ntile_window(int_constant(4))]),
+        &window_spec(vec![ntile_window(bigint_constant(4))]),
         &[rank_input_chunk(1, 10)],
         test_allocator(),
     )
@@ -424,8 +633,8 @@ fn ntile_assigns_remainder_rows_to_leading_buckets() {
 fn ntile_handles_more_buckets_than_rows_and_null_counts() {
     let output = build_window_output_chunks(
         &window_spec(vec![
-            ntile_window(int_constant(6)),
-            ntile_window(null_int_constant()),
+            ntile_window(bigint_constant(6)),
+            ntile_window(null_bigint_constant()),
         ]),
         &[rank_input_chunk(1, 4)],
         test_allocator(),
@@ -448,7 +657,7 @@ fn ntile_handles_more_buckets_than_rows_and_null_counts() {
 fn ntile_rejects_non_positive_bucket_counts() {
     for count in [-1, 0] {
         let error = build_window_output_chunks(
-            &window_spec(vec![ntile_window(int_constant(count))]),
+            &window_spec(vec![ntile_window(bigint_constant(i64::from(count)))]),
             &[rank_input_chunk(1, 1)],
             test_allocator(),
         )
@@ -468,18 +677,21 @@ fn lead_evaluates_offsets_for_each_current_row() {
         WindowFunction::lead_with_offset(LogicalType::Integer),
         vec![
             reference(1, LogicalType::Integer),
-            reference(0, LogicalType::Integer),
+            reference(0, LogicalType::BigInt),
         ],
         whole_partition_rows_frame(),
     );
     let output = build_window_output_chunks(
-        &window_spec(vec![expression]),
-        &[value_order_input_chunk(
+        &window_spec_for_types(
+            vec![expression],
+            vec![LogicalType::BigInt, LogicalType::Integer],
+        ),
+        &[offset_value_input_chunk(
             &[
-                Value::Integer(1),
-                Value::Integer(2),
-                Value::Integer(0),
-                Value::Null(LogicalType::Integer),
+                Value::BigInt(1),
+                Value::BigInt(2),
+                Value::BigInt(0),
+                Value::Null(LogicalType::BigInt),
             ],
             &[10, 20, 30, 40],
         )],
@@ -500,7 +712,7 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
         WindowFunction::lead_with_default(LogicalType::Integer),
         vec![
             reference(0, LogicalType::Integer),
-            int_constant(1),
+            bigint_constant(1),
             int_constant(99),
         ],
         whole_partition_rows_frame(),
@@ -510,7 +722,7 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
         WindowFunction::lag_with_default(LogicalType::Integer),
         vec![
             reference(0, LogicalType::Integer),
-            int_constant(1),
+            bigint_constant(1),
             int_constant(99),
         ],
         whole_partition_rows_frame(),
@@ -518,7 +730,7 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
     lag.ignore_nulls = true;
     let mut zero_offset = value_window(
         WindowFunction::lead_with_offset(LogicalType::Integer),
-        vec![reference(0, LogicalType::Integer), int_constant(0)],
+        vec![reference(0, LogicalType::Integer), bigint_constant(0)],
         whole_partition_rows_frame(),
     );
     zero_offset.ignore_nulls = true;
@@ -557,7 +769,13 @@ fn lead_and_lag_apply_ignore_nulls_while_navigating_the_partition() {
 #[test]
 fn rows_frame_offsets_reject_null_and_negative_values() {
     for (offset, expected) in [
-        (null_int_constant(), "window frame offset must not be null"),
+        (
+            Expression::Constant(ConstantExpression::new(
+                Value::Null(LogicalType::Integer),
+                LogicalType::Integer,
+            )),
+            "window frame offset must not be null",
+        ),
         (int_constant(-1), "window frame offset must not be negative"),
     ] {
         let expression = value_window(
@@ -578,71 +796,4 @@ fn rows_frame_offsets_reject_null_and_negative_values() {
         .unwrap_err();
         assert!(error.to_string().contains(expected), "{error}");
     }
-}
-
-#[test]
-fn aggregate_rows_frame_excludes_rows_before_the_partition() {
-    let sum = WindowFunction::new(
-        "sum",
-        WindowFunctionType::Aggregate,
-        vec![LogicalType::Integer],
-        LogicalType::Integer,
-    );
-    let expression = value_window(
-        sum,
-        vec![reference(1, LogicalType::Integer)],
-        rows_frame(
-            WindowFrameBound::Offset(Box::new(int_constant(1))),
-            true,
-            WindowFrameBound::Offset(Box::new(int_constant(1))),
-            true,
-        ),
-    );
-    let output = build_window_output_chunks(
-        &window_spec(vec![expression]),
-        &[rank_input_chunk(1, 4)],
-        test_allocator(),
-    )
-    .expect("window output");
-    let vector = output[0].column(2).unwrap();
-
-    assert_eq!(vector.get_value(0), Value::Null(LogicalType::Integer));
-    assert_eq!(vector.get_value(1), Value::Integer(1));
-    assert_eq!(vector.get_value(2), Value::Integer(2));
-    assert_eq!(vector.get_value(3), Value::Integer(3));
-}
-
-#[test]
-fn aggregate_range_frame_includes_the_current_peer_group() {
-    let sum = WindowFunction::new(
-        "sum",
-        WindowFunctionType::Aggregate,
-        vec![LogicalType::Integer],
-        LogicalType::Integer,
-    );
-    let expression = value_window(
-        sum,
-        vec![reference(1, LogicalType::Integer)],
-        WindowFrame::default(),
-    );
-    let output = build_window_output_chunks(
-        &window_spec(vec![expression]),
-        &[value_order_input_chunk(
-            &[
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-                Value::Integer(0),
-            ],
-            &[1, 1, 2, 3],
-        )],
-        test_allocator(),
-    )
-    .expect("window output");
-    let vector = output[0].column(2).unwrap();
-
-    assert_eq!(vector.get_value(0), Value::Integer(2));
-    assert_eq!(vector.get_value(1), Value::Integer(2));
-    assert_eq!(vector.get_value(2), Value::Integer(4));
-    assert_eq!(vector.get_value(3), Value::Integer(7));
 }

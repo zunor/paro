@@ -6,6 +6,7 @@
 pub mod cardinality;
 pub mod cost_model;
 pub mod enumerator;
+mod equality_graph;
 pub mod optimizer;
 pub mod query_graph;
 pub mod relation;

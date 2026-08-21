@@ -1103,7 +1103,7 @@ fn write_row_refs(path: &Path, locations: &[PhysicalRowRef]) -> Result<()> {
     for location in locations {
         file.write_all(&location.rowset_id.to_le_bytes())
             .and_then(|_| file.write_all(&location.segment_id.to_le_bytes()))
-            .and_then(|_| file.write_all(&location.row_offset.to_le_bytes()))
+            .and_then(|_| file.write_all(&location.row_offset.get().to_le_bytes()))
             .map_err(|err| {
                 paro_error::io_error(format!(
                     "write transaction delete-vector rows {}: {}",
@@ -1158,7 +1158,7 @@ fn load_row_refs(path: &Path) -> Result<Vec<PhysicalRowRef>> {
         locations.push(PhysicalRowRef {
             rowset_id,
             segment_id,
-            row_offset,
+            row_offset: crate::rowset::SegmentRowId::from_raw(row_offset),
         });
     }
     Ok(locations)
