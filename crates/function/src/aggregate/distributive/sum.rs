@@ -319,10 +319,7 @@ fn exact_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunctio
         )),
         _ => None,
     }?;
-    Some(match source.singleton_merge().cloned() {
-        Some(law) => function.with_singleton_merge(law),
-        None => function,
-    })
+    Some(function)
 }
 
 /// Build the closed aggregate used to merge finalized integral and floating

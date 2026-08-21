@@ -393,9 +393,12 @@ impl Optimizer {
             // retained, or replayed above that physical witness boundary.
             PipelineStep::Conditional(ConditionalSegment {
                 condition: PipelineCondition::ScanProjection,
-                passes: vec![Box::new(UnusedColumnsPass {
-                    binder: scan_projection_binder,
-                })],
+                passes: vec![
+                    Box::new(UnusedColumnsPass {
+                        binder: scan_projection_binder,
+                    }),
+                    Box::new(StatisticsGatheringPass),
+                ],
             }),
             // Terminally prove one-row grouping domains after every structural
             // rewrite has settled join orientation, bindings, and exact NULL

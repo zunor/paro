@@ -426,6 +426,12 @@ impl Rewriter for UnusedColumnsPass {
     fn rewrite(&mut self, plan: LogicalPlan, ctx: &mut OptimizationContext) -> Result<LogicalPlan> {
         let mut plan = plan;
         RemoveUnusedColumns::optimize(&mut plan, &self.binder, ctx.session.as_ref(), true);
+        // Get compaction reuses a table index with new column ordinals. A
+        // keyed statistic cannot be remapped in place without risking a
+        // collision with a different former ordinal, so pruning explicitly
+        // invalidates the whole binding domain. Every downstream statistics
+        // consumer must sit behind an observable StatisticsGathering pass.
+        ctx.column_stats.clear();
         Ok(plan)
     }
 }

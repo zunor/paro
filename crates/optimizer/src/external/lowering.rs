@@ -229,11 +229,6 @@ impl<'a> ExternalRoutineLowerer<'a> {
     }
 
     fn lower_aggregate(&mut self, mut aggregate: Aggregate) -> Result<Aggregate> {
-        // External lowering only relocates expression evaluation into an
-        // ExternalProject. It preserves the child's rows and the aggregate's
-        // grouping semantics, so row-domain proofs remain valid even though
-        // recomputing the output schema normally invalidates them.
-        let group_input_multiplicity = aggregate.group_input_multiplicity;
         let group_count = aggregate.groups.len();
         let mut expressions = aggregate.groups;
         expressions.extend(aggregate.aggregates);
@@ -242,8 +237,7 @@ impl<'a> ExternalRoutineLowerer<'a> {
         aggregate.groups = expressions;
         aggregate.aggregates = aggregates;
         aggregate.child = Box::new(child);
-        aggregate.recompute_returned_types();
-        aggregate.group_input_multiplicity = group_input_multiplicity;
+        aggregate.recompute_returned_types_after_row_preserving_relocation();
         Ok(aggregate)
     }
 
@@ -870,7 +864,7 @@ mod tests {
     };
     use paro_planner::operator::{
         Aggregate, ComparisonJoin, ExpressionGet, Filter, GroupInputMultiplicity, Join,
-        JoinCondition, JoinType, LogicalOperator, Order, Projection,
+        JoinCondition, JoinType, LogicalOperator, Order, Projection, SingletonGroupProof,
     };
     use paro_planner::plan::LogicalPlan;
 
@@ -1048,7 +1042,10 @@ mod tests {
             Vec::new(),
             Vec::new(),
         );
-        aggregate.group_input_multiplicity = GroupInputMultiplicity::AtMostOne;
+        aggregate.group_input_multiplicity =
+            GroupInputMultiplicity::AtMostOne(SingletonGroupProof::new([
+                paro_planner::operator::ColumnBinding::new(1, 0),
+            ]));
         let plan = LogicalPlan::new(&bind_context, LogicalOperator::Aggregate(aggregate));
 
         let lowered = lower(plan, &bind_context);
@@ -1056,10 +1053,10 @@ mod tests {
         let LogicalOperator::Aggregate(aggregate) = lowered.plan.operator else {
             panic!("expected aggregate");
         };
-        assert_eq!(
+        assert!(matches!(
             aggregate.group_input_multiplicity,
-            GroupInputMultiplicity::AtMostOne
-        );
+            GroupInputMultiplicity::AtMostOne(_)
+        ));
     }
 
     #[test]

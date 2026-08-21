@@ -7,11 +7,15 @@
 
 pub use crate::binder::ir::GroupingSet;
 use crate::expression::{AggregateType, Expression, ExpressionIterator, ExpressionVisitDecision};
-use crate::operator::ColumnBinding;
+use crate::operator::{
+    binding_preserving_get, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator,
+};
 use crate::plan::LogicalPlan;
+use paro_catalog::entry::ConstraintType;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_storage::statistics::BaseStatistics;
+use std::collections::HashSet;
 
 /// A correctness-proven functional dependency between GROUP BY expressions.
 ///
@@ -30,11 +34,220 @@ pub struct GroupDependency {
 /// `AtMostOne` is a terminal optimizer annotation. Physical lowering may use
 /// it to replace aggregate-state construction with a scalar projection, but
 /// any group-expression rewrite must clear it and re-establish the proof.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SingletonGroupProof {
+    unique_group_key: Box<[ColumnBinding]>,
+}
+
+impl SingletonGroupProof {
+    pub fn new(unique_group_key: impl Into<Box<[ColumnBinding]>>) -> Self {
+        Self {
+            unique_group_key: unique_group_key.into(),
+        }
+    }
+
+    pub fn unique_group_key(&self) -> &[ColumnBinding] {
+        &self.unique_group_key
+    }
+
+    pub fn remap_table_indices(&mut self, mut remap: impl FnMut(&mut usize)) {
+        for binding in &mut self.unique_group_key {
+            remap(&mut binding.table_index);
+        }
+    }
+
+    /// Revalidate every structural obligation that can change after the
+    /// statistics proof was issued. Exact no-NULL evidence is captured by the
+    /// witness; the catalog key, grouping domain, join direction, predicates,
+    /// partial grouping keys, and aggregate laws must still match the current
+    /// tree before physical lowering may erase the hash aggregate.
+    pub fn is_valid_for(&self, aggregate: &Aggregate) -> bool {
+        if self.unique_group_key.is_empty()
+            || aggregate.post_reduction.is_some()
+            || aggregate.aggregates.is_empty()
+            || !aggregate.has_plain_grouping_domain()
+        {
+            return false;
+        }
+        let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
+            return false;
+        };
+        if join.join_type != JoinType::Left
+            || join.conditions.is_empty()
+            || join.mark_index.is_some()
+            || !join.duplicate_eliminated_columns.is_empty()
+            || join.delim_flipped
+            || join
+                .conditions
+                .iter()
+                .any(|condition| condition.comparison != JoinComparisonType::Equal)
+        {
+            return false;
+        }
+        let Some(preserved) = binding_preserving_get(join.left.as_ref()) else {
+            return false;
+        };
+        let LogicalOperator::Aggregate(partial) = &join.right.operator else {
+            return false;
+        };
+        if !partial.has_plain_grouping_domain() || partial.post_reduction.is_some() {
+            return false;
+        }
+
+        let group_bindings = aggregate
+            .groups
+            .iter()
+            .map(|expression| input_binding(expression, aggregate.child.as_ref()))
+            .collect::<Option<HashSet<_>>>();
+        let Some(group_bindings) = group_bindings else {
+            return false;
+        };
+        if !self
+            .unique_group_key
+            .iter()
+            .all(|binding| group_bindings.contains(binding))
+            || !declared_key_matches(preserved, &self.unique_group_key)
+        {
+            return false;
+        }
+
+        let expected_partial_keys = (0..partial.groups.len())
+            .map(|ordinal| ColumnBinding::new(partial.group_index, ordinal))
+            .collect::<HashSet<_>>();
+        let preserved_bindings = join
+            .left
+            .get_column_bindings()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut matched_partial_keys = HashSet::with_capacity(expected_partial_keys.len());
+        for condition in &join.conditions {
+            let (left, right) = (
+                input_binding(&condition.left, join.left.as_ref()),
+                input_binding(&condition.right, join.right.as_ref()),
+            );
+            let partial_key = match (left, right) {
+                (Some(left), Some(right))
+                    if preserved_bindings.contains(&left)
+                        && expected_partial_keys.contains(&right) =>
+                {
+                    Some(right)
+                }
+                (Some(left), Some(right))
+                    if expected_partial_keys.contains(&left)
+                        && preserved_bindings.contains(&right) =>
+                {
+                    Some(left)
+                }
+                _ => None,
+            };
+            let Some(partial_key) = partial_key else {
+                return false;
+            };
+            if !matched_partial_keys.insert(partial_key) {
+                return false;
+            }
+        }
+        if matched_partial_keys != expected_partial_keys {
+            return false;
+        }
+
+        aggregate.aggregates.iter().all(|expression| {
+            let Expression::Aggregate(merge) = expression else {
+                return false;
+            };
+            if merge.aggr_type != AggregateType::NonDistinct
+                || merge.filter.is_some()
+                || !merge.order_bys.is_empty()
+                || merge.children.len() != 1
+                || merge.function.arguments.len() != 1
+                || merge.function.arguments[0] != merge.children[0].return_type()
+                || merge.function.return_type != merge.return_type
+                || !merge
+                    .function
+                    .singleton_merge()
+                    .is_some_and(|law| law.is_valid_for(&merge.return_type))
+            {
+                return false;
+            }
+            let Some(binding) = input_binding(&merge.children[0], aggregate.child.as_ref()) else {
+                return false;
+            };
+            if binding.table_index != partial.aggregate_index {
+                return false;
+            }
+            let Some(Expression::Aggregate(source)) = partial.aggregates.get(binding.column_index)
+            else {
+                return false;
+            };
+            source
+                .function
+                .partial_merge_function()
+                .is_some_and(|expected| expected.execution_semantics_equal(&merge.function))
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum GroupInputMultiplicity {
     #[default]
     Arbitrary,
-    AtMostOne,
+    AtMostOne(SingletonGroupProof),
+}
+
+/// Resolve one passive input expression in either lifecycle domain.
+///
+/// Optimizer proofs are issued while expressions carry logical
+/// [`ColumnBinding`]s. Before physical generation, `ColumnBindingResolver`
+/// replaces those values with positional references local to the expression's
+/// input operator. Revalidation deliberately maps both representations back
+/// to the same binding domain so resolving a plan cannot erase a still-valid
+/// proof, while a changed positional layout still fails closed.
+fn input_binding(expression: &Expression, input: &LogicalPlan) -> Option<ColumnBinding> {
+    let bindings = input.get_column_bindings();
+    let types = input.types();
+    if bindings.len() != types.len() {
+        return None;
+    }
+    match expression {
+        Expression::ColumnRef(column) if column.depth == 0 => bindings
+            .iter()
+            .zip(&types)
+            .any(|(binding, ty)| *binding == column.binding && *ty == column.return_type)
+            .then_some(column.binding),
+        Expression::Reference(reference) => bindings
+            .get(reference.index)
+            .copied()
+            .filter(|_| types.get(reference.index) == Some(&reference.return_type)),
+        _ => None,
+    }
+}
+
+fn declared_key_matches(get: &crate::operator::Get, bindings: &[ColumnBinding]) -> bool {
+    let Some(table) = &get.table else {
+        return false;
+    };
+    let column_ids = bindings
+        .iter()
+        .map(|binding| {
+            (binding.table_index == get.table_index)
+                .then(|| get.stored_column(binding.column_index))
+                .flatten()
+        })
+        .collect::<Option<HashSet<_>>>();
+    let Some(column_ids) = column_ids else {
+        return false;
+    };
+    column_ids.len() == bindings.len()
+        && table.constraints().iter().any(|constraint| {
+            matches!(
+                constraint.constraint_type,
+                ConstraintType::Unique | ConstraintType::PrimaryKey
+            ) && constraint.columns.len() == column_ids.len()
+                && constraint
+                    .columns
+                    .iter()
+                    .all(|column| column_ids.contains(column))
+        })
 }
 
 impl GroupDependency {
@@ -157,6 +370,30 @@ impl Aggregate {
             .chain(self.aggregates.iter().map(|expr| expr.return_type()))
             .chain(self.grouping_functions.iter().map(|_| LogicalType::BigInt))
             .collect();
+    }
+
+    /// Recompute the output schema after relocating expression evaluation
+    /// without changing the aggregate's input rows or grouping semantics.
+    ///
+    /// This deliberately names the proof-preservation obligation instead of
+    /// encouraging callers to save and restore a terminal annotation around
+    /// [`Self::recompute_returned_types`]. Structural verification still
+    /// rechecks the witness before physical lowering can consume it.
+    pub fn recompute_returned_types_after_row_preserving_relocation(&mut self) {
+        let group_input_multiplicity = std::mem::take(&mut self.group_input_multiplicity);
+        self.recompute_returned_types();
+        self.group_input_multiplicity = group_input_multiplicity;
+    }
+
+    pub fn verify_group_input_multiplicity(&self) -> Result<()> {
+        if let GroupInputMultiplicity::AtMostOne(proof) = &self.group_input_multiplicity {
+            if !proof.is_valid_for(self) {
+                return Err(paro_error::internal(
+                    "Aggregate singleton-group proof no longer matches its logical tree",
+                ));
+            }
+        }
+        Ok(())
     }
 
     pub fn get_column_bindings(&self) -> Vec<ColumnBinding> {

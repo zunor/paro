@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use crate::expression::Expression;
-use crate::operator::ColumnBinding;
+use crate::operator::{ColumnBinding, LogicalOperator};
+use crate::plan::LogicalPlan;
 use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -63,6 +64,25 @@ pub struct Get {
     /// this Get's output layout and may be discarded by rewrites that cannot
     /// preserve a hint without changing its scope.
     pub runtime_filter_expressions: Vec<Expression>,
+}
+
+/// Find the base scan below operators that preserve column-binding identity.
+///
+/// These operators may filter or reorder rows, but they neither synthesize a
+/// new binding domain nor duplicate an input row. Proofs about one binding's
+/// value (for example exact non-NULL statistics or a declared unique key) can
+/// therefore be checked at their use site without mistaking a join's
+/// NULL-extended output for the stored column.
+pub fn binding_preserving_get(plan: &LogicalPlan) -> Option<&Get> {
+    match &plan.operator {
+        LogicalOperator::Get(get) => Some(get),
+        LogicalOperator::Filter(filter) => binding_preserving_get(filter.child.as_ref()),
+        LogicalOperator::Order(order) => binding_preserving_get(order.child.as_ref()),
+        LogicalOperator::TopN(topn) => binding_preserving_get(topn.child.as_ref()),
+        LogicalOperator::Limit(limit) => binding_preserving_get(limit.child.as_ref()),
+        LogicalOperator::ExternalProject(project) => binding_preserving_get(project.child.as_ref()),
+        _ => None,
+    }
 }
 
 impl Get {

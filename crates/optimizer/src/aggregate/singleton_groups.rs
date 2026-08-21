@@ -9,15 +9,19 @@
 //! in every outer group. Partial-merge functions may publish an exact scalar
 //! singleton law; physical lowering can then avoid constructing a second hash
 //! table without guessing aggregate semantics from a function name.
+//!
+//! Catalog UNIQUE constraints are declared optimizer guarantees, including
+//! `NOT ENFORCED` declarations. Unlike join elimination, singleton lowering
+//! makes duplicate declared keys observable as extra output groups; data that
+//! violates its declared constraint is outside this optimization's contract.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
-use paro_function::aggregate::AggregateSingletonMerge;
-use paro_planner::expression::{AggregateType, Expression};
+use paro_planner::expression::Expression;
 use paro_planner::operator::{
-    Aggregate, ColumnBinding, GroupInputMultiplicity, Join, JoinComparisonType, JoinType,
-    LogicalOperator,
+    binding_preserving_get, Aggregate, ColumnBinding, GroupInputMultiplicity, Join,
+    LogicalOperator, SingletonGroupProof,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::statistics::ColumnStatistics;
@@ -31,62 +35,29 @@ pub fn optimize_plan(
     plan.map_children(|child| optimize_plan(child, column_stats))
         .map_operator(|operator| match operator {
             LogicalOperator::Aggregate(mut aggregate) => {
-                aggregate.group_input_multiplicity = if proves_at_most_one(&aggregate, column_stats)
-                {
-                    GroupInputMultiplicity::AtMostOne
-                } else {
-                    GroupInputMultiplicity::Arbitrary
-                };
+                aggregate.group_input_multiplicity = prove_at_most_one(&aggregate, column_stats)
+                    .map(GroupInputMultiplicity::AtMostOne)
+                    .unwrap_or(GroupInputMultiplicity::Arbitrary);
                 LogicalOperator::Aggregate(aggregate)
             }
             operator => operator,
         })
 }
 
-fn proves_at_most_one(
+fn prove_at_most_one(
     aggregate: &Aggregate,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
-) -> bool {
-    if aggregate.post_reduction.is_some()
-        || aggregate.aggregates.is_empty()
-        || !aggregate.has_plain_grouping_domain()
-    {
-        return false;
-    }
+) -> Option<SingletonGroupProof> {
     let LogicalOperator::Join(Join::Comparison(join)) = &aggregate.child.operator else {
-        return false;
+        return None;
     };
-    if join.join_type != JoinType::Left
-        || join.conditions.is_empty()
-        || join.mark_index.is_some()
-        || !join.duplicate_eliminated_columns.is_empty()
-        || join.delim_flipped
-        || join
-            .conditions
-            .iter()
-            .any(|condition| condition.comparison != JoinComparisonType::Equal)
-    {
-        return false;
-    }
-    let LogicalOperator::Get(preserved) = &join.left.operator else {
-        return false;
-    };
-    let LogicalOperator::Aggregate(partial) = &join.right.operator else {
-        return false;
-    };
-    if !partial.has_plain_grouping_domain() || partial.post_reduction.is_some() {
-        return false;
-    }
-
+    let preserved = binding_preserving_get(join.left.as_ref())?;
     let group_bindings = aggregate
         .groups
         .iter()
         .map(column_binding)
-        .collect::<Option<HashSet<_>>>();
-    let Some(group_bindings) = group_bindings else {
-        return false;
-    };
-    let unique_group = declared_unique_keys(preserved).into_iter().any(|key| {
+        .collect::<Option<Vec<_>>>()?;
+    let key = declared_unique_keys(preserved).into_iter().find(|key| {
         key.bindings
             .iter()
             .all(|binding| group_bindings.contains(binding))
@@ -95,85 +66,12 @@ fn proves_at_most_one(
                     .get(&binding)
                     .is_some_and(|statistics| !statistics.statistics().can_have_null())
             })
-    });
-    if !unique_group {
-        return false;
-    }
-
-    // Every grouping output of the nullable-side aggregate must participate
-    // in ordinary equality. Otherwise multiple partial rows could match one
-    // preserved key even though the partial itself is grouped.
-    let expected_partial_keys = (0..partial.groups.len())
-        .map(|ordinal| ColumnBinding::new(partial.group_index, ordinal))
-        .collect::<HashSet<_>>();
-    let preserved_bindings = join
-        .left
-        .get_column_bindings()
-        .into_iter()
-        .collect::<HashSet<_>>();
-    let mut matched_partial_keys = HashSet::with_capacity(expected_partial_keys.len());
-    for condition in &join.conditions {
-        let (left, right) = (
-            column_binding(&condition.left),
-            column_binding(&condition.right),
-        );
-        let partial_key = match (left, right) {
-            (Some(left), Some(right))
-                if preserved_bindings.contains(&left) && expected_partial_keys.contains(&right) =>
-            {
-                Some(right)
-            }
-            (Some(left), Some(right))
-                if expected_partial_keys.contains(&left) && preserved_bindings.contains(&right) =>
-            {
-                Some(left)
-            }
-            _ => None,
-        };
-        let Some(partial_key) = partial_key else {
-            return false;
-        };
-        if !matched_partial_keys.insert(partial_key) {
-            return false;
-        }
-    }
-    if matched_partial_keys != expected_partial_keys {
-        return false;
-    }
-
-    let aggregates_valid = aggregate.aggregates.iter().all(|expression| {
-        let Expression::Aggregate(merge) = expression else {
-            return false;
-        };
-        if merge.aggr_type != AggregateType::NonDistinct
-            || merge.filter.is_some()
-            || !merge.order_bys.is_empty()
-            || merge.children.len() != 1
-            || merge.function.singleton_merge().is_none()
-        {
-            return false;
-        }
-        let Some(binding) = column_binding(&merge.children[0]) else {
-            return false;
-        };
-        if binding.table_index != partial.aggregate_index {
-            return false;
-        }
-        let Some(Expression::Aggregate(source)) = partial.aggregates.get(binding.column_index)
-        else {
-            return false;
-        };
-        let semantics = source
-            .function
-            .partial_merge_function()
-            .is_some_and(|expected| expected.execution_semantics_equal(&merge.function));
-        semantics
-            && matches!(
-                merge.function.singleton_merge(),
-                Some(AggregateSingletonMerge::Input | AggregateSingletonMerge::InputOr(_))
-            )
-    });
-    aggregates_valid
+    })?;
+    let proof = SingletonGroupProof::new(key.bindings);
+    if !proof.is_valid_for(aggregate) {
+        return None;
+    };
+    Some(proof)
 }
 
 fn column_binding(expression: &Expression) -> Option<ColumnBinding> {
@@ -190,9 +88,14 @@ mod tests {
         CatalogObjectId, ColumnDefinition, Constraint, CreateTableInfo, TableCatalogEntry,
     };
     use paro_common::types::LogicalType;
-    use paro_function::aggregate::distributive::count::get_count_function;
-    use paro_planner::expression::{AggregateExpression, ColumnRefExpression};
-    use paro_planner::operator::{ComparisonJoin, ExpressionGet, Get, JoinCondition};
+    use paro_function::aggregate::distributive::count::{
+        get_count_function, get_count_star_function,
+    };
+    use paro_planner::binder::ir::GroupingSet;
+    use paro_planner::expression::{AggregateExpression, ColumnRefExpression, ReferenceExpression};
+    use paro_planner::operator::{
+        ComparisonJoin, ExpressionGet, Filter, Get, JoinComparisonType, JoinCondition, JoinType,
+    };
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
     use paro_storage::table::table_factory::TableFactory;
 
@@ -292,6 +195,23 @@ mod tests {
         )
     }
 
+    fn candidate_join_mut(plan: &mut LogicalPlan) -> &mut ComparisonJoin {
+        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+            panic!("aggregate root")
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            panic!("comparison join child")
+        };
+        join
+    }
+
+    fn candidate_aggregate_mut(plan: &mut LogicalPlan) -> &mut Aggregate {
+        let LogicalOperator::Aggregate(aggregate) = &mut plan.operator else {
+            panic!("aggregate root")
+        };
+        aggregate
+    }
+
     #[test]
     fn unique_preserved_key_and_partial_merge_prove_singleton_groups() {
         let (plan, statistics) = candidate();
@@ -299,10 +219,10 @@ mod tests {
         let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
             panic!("aggregate root")
         };
-        assert_eq!(
+        assert!(matches!(
             aggregate.group_input_multiplicity,
-            GroupInputMultiplicity::AtMostOne
-        );
+            GroupInputMultiplicity::AtMostOne(_)
+        ));
     }
 
     #[test]
@@ -312,6 +232,152 @@ mod tests {
             ColumnBinding::new(1, 0),
             ColumnStatistics::create_unknown(LogicalType::BigInt),
         );
+        let optimized = optimize_plan(plan, &statistics);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("aggregate root")
+        };
+        assert_eq!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::Arbitrary
+        );
+    }
+
+    #[test]
+    fn preserved_filter_keeps_the_declared_key_proof() {
+        let (mut plan, statistics) = candidate();
+        let join = candidate_join_mut(&mut plan);
+        let left = std::mem::replace(
+            &mut join.left,
+            Box::new(LogicalPlan::synthetic(LogicalOperator::DummyScan)),
+        );
+        join.left = Box::new(LogicalPlan::synthetic(LogicalOperator::Filter(
+            Filter::new(*left, Vec::new()),
+        )));
+
+        let optimized = optimize_plan(plan, &statistics);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("aggregate root")
+        };
+        assert!(matches!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::AtMostOne(_)
+        ));
+    }
+
+    #[test]
+    fn uncovered_partial_group_key_rejects_singleton_lowering() {
+        let (mut plan, statistics) = candidate();
+        let join = candidate_join_mut(&mut plan);
+        let LogicalOperator::Aggregate(partial) = &mut join.right.operator else {
+            panic!("partial aggregate")
+        };
+        partial.groups.push(column(2, 1));
+        partial.recompute_returned_types();
+
+        let optimized = optimize_plan(plan, &statistics);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("aggregate root")
+        };
+        assert_eq!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::Arbitrary
+        );
+    }
+
+    #[test]
+    fn non_equality_join_rejects_singleton_lowering() {
+        let (mut plan, statistics) = candidate();
+        candidate_join_mut(&mut plan).conditions[0].comparison = JoinComparisonType::GreaterThan;
+
+        let optimized = optimize_plan(plan, &statistics);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("aggregate root")
+        };
+        assert_eq!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::Arbitrary
+        );
+    }
+
+    #[test]
+    fn resolved_input_references_preserve_the_structural_witness() {
+        let (plan, statistics) = candidate();
+        let mut optimized = optimize_plan(plan, &statistics);
+        let aggregate = candidate_aggregate_mut(&mut optimized);
+        let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
+        else {
+            panic!("singleton proof")
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            panic!("comparison join")
+        };
+        let left_bindings = join.left.get_column_bindings();
+        let right_bindings = join.right.get_column_bindings();
+        let left_key = left_bindings
+            .iter()
+            .position(|binding| *binding == ColumnBinding::new(1, 0))
+            .expect("left key");
+        let right_key = right_bindings
+            .iter()
+            .position(|binding| *binding == ColumnBinding::new(3, 0))
+            .expect("right key");
+        join.conditions[0].left =
+            Expression::Reference(ReferenceExpression::new(left_key, LogicalType::BigInt));
+        join.conditions[0].right =
+            Expression::Reference(ReferenceExpression::new(right_key, LogicalType::BigInt));
+
+        let child_bindings = aggregate.child.get_column_bindings();
+        let group_key = child_bindings
+            .iter()
+            .position(|binding| *binding == ColumnBinding::new(1, 0))
+            .expect("group key");
+        let partial_value = child_bindings
+            .iter()
+            .position(|binding| *binding == ColumnBinding::new(4, 0))
+            .expect("partial value");
+        aggregate.groups[0] =
+            Expression::Reference(ReferenceExpression::new(group_key, LogicalType::BigInt));
+        let Expression::Aggregate(merge) = &mut aggregate.aggregates[0] else {
+            panic!("merge aggregate")
+        };
+        merge.children[0] =
+            Expression::Reference(ReferenceExpression::new(partial_value, LogicalType::BigInt));
+
+        assert!(proof.is_valid_for(aggregate));
+    }
+
+    #[test]
+    fn merge_without_singleton_law_rejects_projection_lowering() {
+        let (mut plan, statistics) = candidate();
+        let aggregate = candidate_aggregate_mut(&mut plan);
+        let Expression::Aggregate(merge) = &mut aggregate.aggregates[0] else {
+            panic!("merge aggregate")
+        };
+        merge.function = get_count_star_function();
+        assert!(merge.function.singleton_merge().is_none());
+
+        let optimized = optimize_plan(plan, &statistics);
+        let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
+            panic!("aggregate root")
+        };
+        assert_eq!(
+            aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::Arbitrary
+        );
+    }
+
+    #[test]
+    fn multiple_grouping_domains_reject_singleton_lowering() {
+        let (mut plan, statistics) = candidate();
+        candidate_aggregate_mut(&mut plan).grouping_sets = vec![
+            GroupingSet {
+                expressions: vec![0],
+            },
+            GroupingSet {
+                expressions: Vec::new(),
+            },
+        ];
+
         let optimized = optimize_plan(plan, &statistics);
         let LogicalOperator::Aggregate(aggregate) = optimized.operator else {
             panic!("aggregate root")

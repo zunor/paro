@@ -52,7 +52,9 @@ pub mod update;
 pub mod window;
 
 pub use self::plan_operator::LogicalOperator;
-pub use aggregate::{Aggregate, GroupInputMultiplicity, PostAggregateReduction};
+pub use aggregate::{
+    Aggregate, GroupInputMultiplicity, PostAggregateReduction, SingletonGroupProof,
+};
 pub use alter::Alter;
 pub use column_binding::ColumnBinding;
 pub use copy_to::CopyTo;
@@ -76,7 +78,7 @@ pub use expression_get::ExpressionGet;
 pub use external_project::LogicalExternalProject;
 pub use external_table::LogicalExternalTable;
 pub use filter::Filter;
-pub use get::{Get, GetColumnSource};
+pub use get::{binding_preserving_get, Get, GetColumnSource};
 pub use graph_expand::{ExpandDirection, GraphExpand};
 pub use graph_match::GraphMatch;
 pub use graph_scan::GraphScan;

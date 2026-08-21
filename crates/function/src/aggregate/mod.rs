@@ -417,6 +417,29 @@ pub enum AggregateSingletonMerge {
     InputOr(Value),
 }
 
+impl AggregateSingletonMerge {
+    /// Normalize the optimizer-owned fallback into the aggregate's declared
+    /// return domain. Extension functions may publish a naturally typed
+    /// scalar (for example INTEGER zero for a BIGINT result); lowering must
+    /// cast it once instead of constructing a mismatched ConstantExpression.
+    pub fn normalized_fallback(&self, return_type: &LogicalType) -> Option<Value> {
+        let Self::InputOr(value) = self else {
+            return None;
+        };
+        if value.is_null() {
+            return None;
+        }
+        value
+            .cast(return_type)
+            .ok()
+            .filter(|value| !value.is_null())
+    }
+
+    pub fn is_valid_for(&self, return_type: &LogicalType) -> bool {
+        matches!(self, Self::Input) || self.normalized_fallback(return_type).is_some()
+    }
+}
+
 // ============================================================================
 // AggregateFunction
 // ============================================================================
@@ -656,7 +679,6 @@ impl AggregateFunction {
             && self.empty_input == other.empty_input
             && self.algebra == other.algebra
             && optional_fn_equal!(self.partial_merge, other.partial_merge)
-            && self.singleton_merge == other.singleton_merge
             && optional_fn_equal!(self.input_rollup, other.input_rollup)
             && optional_fn_equal!(self.non_null_input, other.non_null_input)
             && self.state_ownership == other.state_ownership
@@ -1254,5 +1276,28 @@ mod tests {
 
         assert!(!func.has_bind_data());
         assert!(func.get_bind_data::<AvgBindData>().is_none());
+    }
+
+    #[test]
+    fn singleton_law_is_not_part_of_executable_function_identity() {
+        let plain = create_dummy_aggregate("merge", vec![LogicalType::BigInt], LogicalType::BigInt);
+        let annotated = plain
+            .clone()
+            .with_singleton_merge(AggregateSingletonMerge::Input);
+
+        assert!(plain.execution_semantics_equal(&annotated));
+    }
+
+    #[test]
+    fn singleton_fallback_is_normalized_to_the_return_domain() {
+        let law = AggregateSingletonMerge::InputOr(Value::Integer(0));
+        assert_eq!(
+            law.normalized_fallback(&LogicalType::BigInt),
+            Some(Value::BigInt(0))
+        );
+        assert!(
+            !AggregateSingletonMerge::InputOr(Value::Null(LogicalType::BigInt))
+                .is_valid_for(&LogicalType::BigInt)
+        );
     }
 }

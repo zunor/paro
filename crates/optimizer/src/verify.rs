@@ -316,6 +316,7 @@ impl Verifier {
             }
             LogicalOperator::Aggregate(agg) => {
                 agg.verify_post_reduction()?;
+                agg.verify_group_input_multiplicity()?;
                 let expected =
                     agg.groups.len() + agg.aggregates.len() + agg.grouping_functions.len();
                 if agg.returned_types.len() != expected {

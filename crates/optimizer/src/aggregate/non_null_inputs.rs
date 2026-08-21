@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use paro_planner::expression::{AggregateType, Expression};
-use paro_planner::operator::{ColumnBinding, LogicalOperator};
+use paro_planner::operator::{binding_preserving_get, ColumnBinding, LogicalOperator};
 use paro_planner::plan::LogicalPlan;
 use paro_storage::statistics::ColumnStatistics;
 
@@ -51,8 +51,14 @@ fn rewrite_aggregate(
     let Some(replacement) = aggregate.function.non_null_input_function() else {
         return;
     };
-    debug_assert_eq!(replacement.return_type, aggregate.function.return_type);
-    debug_assert_eq!(replacement.empty_input, aggregate.function.empty_input);
+    if replacement.return_type != aggregate.function.return_type
+        || replacement.return_type != aggregate.return_type
+        || replacement.empty_input != aggregate.function.empty_input
+        || !replacement.arguments.is_empty()
+        || replacement.varargs.is_some()
+    {
+        return;
+    }
     aggregate.function = replacement;
     aggregate.children.clear();
 }
@@ -67,28 +73,17 @@ fn binding_is_non_null_at(
     binding: ColumnBinding,
     column_stats: &HashMap<ColumnBinding, Arc<ColumnStatistics>>,
 ) -> bool {
-    match &plan.operator {
-        LogicalOperator::Get(get) => {
-            binding.table_index == get.table_index
-                && get.stored_column(binding.column_index).is_some()
-                && column_stats
-                    .get(&binding)
-                    .is_some_and(|statistics| !statistics.statistics().can_have_null())
-        }
-        LogicalOperator::Filter(filter) => {
-            binding_is_non_null_at(filter.child.as_ref(), binding, column_stats)
-        }
-        LogicalOperator::Order(order) => {
-            binding_is_non_null_at(order.child.as_ref(), binding, column_stats)
-        }
-        LogicalOperator::TopN(topn) => {
-            binding_is_non_null_at(topn.child.as_ref(), binding, column_stats)
-        }
-        LogicalOperator::Limit(limit) => {
-            binding_is_non_null_at(limit.child.as_ref(), binding, column_stats)
-        }
-        _ => false,
+    if !plan.get_column_bindings().contains(&binding) {
+        return false;
     }
+    let Some(get) = binding_preserving_get(plan) else {
+        return false;
+    };
+    binding.table_index == get.table_index
+        && get.stored_column(binding.column_index).is_some()
+        && column_stats
+            .get(&binding)
+            .is_some_and(|statistics| !statistics.statistics().can_have_null())
 }
 
 #[cfg(test)]
@@ -98,7 +93,8 @@ mod tests {
     use paro_function::aggregate::distributive::count::get_count_function;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression};
     use paro_planner::operator::{
-        ComparisonJoin, Get, Join, JoinComparisonType, JoinCondition, JoinType,
+        ComparisonJoin, Filter, Get, Join, JoinComparisonType, JoinCondition, JoinType, Limit,
+        Order, TopN,
     };
     use paro_storage::statistics::BaseStatistics;
 
@@ -198,5 +194,42 @@ mod tests {
         };
         assert_eq!(aggregate.function.name, "count");
         assert_eq!(aggregate.children.len(), 1);
+    }
+
+    #[test]
+    fn binding_preserving_unaries_carry_the_non_null_proof() {
+        let binding = ColumnBinding::new(1, 0);
+        let mut statistics = HashMap::new();
+        statistics.insert(
+            binding,
+            Arc::new(ColumnStatistics::new(BaseStatistics::new(
+                LogicalType::BigInt,
+            ))),
+        );
+        let wrappers = [
+            LogicalPlan::synthetic(LogicalOperator::Filter(Filter::new(
+                scan(binding),
+                Vec::new(),
+            ))),
+            LogicalPlan::synthetic(LogicalOperator::Order(Order::new(
+                scan(binding),
+                Vec::new(),
+            ))),
+            LogicalPlan::synthetic(LogicalOperator::TopN(TopN::new(
+                scan(binding),
+                Vec::new(),
+                10,
+                0,
+            ))),
+            LogicalPlan::synthetic(LogicalOperator::Limit(Limit::new(
+                scan(binding),
+                None,
+                None,
+            ))),
+        ];
+
+        for child in wrappers {
+            assert!(binding_is_non_null_at(&child, binding, &statistics));
+        }
     }
 }

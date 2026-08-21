@@ -479,10 +479,7 @@ fn decimal_sum_input_rollup(source: &AggregateFunction) -> Option<AggregateFunct
     }
     bind_sum(&source.arguments)
         .ok()
-        .map(|(function, _)| match source.singleton_merge().cloned() {
-            Some(law) => function.with_singleton_merge(law),
-            None => function,
-        })
+        .map(|(function, _)| function)
 }
 
 pub(in crate::aggregate) fn prepare_direct_state_predicate(

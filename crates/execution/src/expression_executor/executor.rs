@@ -2306,7 +2306,10 @@ impl ExpressionExecutor {
                 if let [child_expr, PhysicalExpression::Constant(fallback)] =
                     expr.children.as_slice()
                 {
-                    if !fallback.value.is_null()
+                    if fallback.return_type == expr.return_type
+                        && fallback.value.logical_type().physical_type()
+                            == expr.return_type.physical_type()
+                        && !fallback.value.is_null()
                         && !matches!(
                             fallback.value,
                             Value::List(..) | Value::Struct(..) | Value::Array(..)
@@ -2332,9 +2335,11 @@ impl ExpressionExecutor {
                         result.try_copy_range(0, child.as_vector(), 0, count)?;
                         for row_idx in 0..count {
                             if child.as_vector().is_null(row_idx) {
-                                let scalar =
-                                    result.try_set_scalar_value(row_idx, &fallback.value)?;
-                                debug_assert!(scalar, "nested COALESCE fallback was excluded");
+                                if !result.try_set_scalar_value(row_idx, &fallback.value)? {
+                                    return Err(paro_error::internal(
+                                        "scalar COALESCE fast path received a nested fallback",
+                                    ));
+                                }
                             }
                         }
                         return Ok(state

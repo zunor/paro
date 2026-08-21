@@ -423,9 +423,13 @@ impl PhysicalPlanGenerator {
         aggregate: &LogicalAggregate,
         having_filter: Box<[Expression]>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
-        if aggregate.group_input_multiplicity == GroupInputMultiplicity::AtMostOne
-            && having_filter.is_empty()
-        {
+        let singleton_proof = match &aggregate.group_input_multiplicity {
+            GroupInputMultiplicity::AtMostOne(proof) if proof.is_valid_for(aggregate) => {
+                Some(proof)
+            }
+            GroupInputMultiplicity::Arbitrary | GroupInputMultiplicity::AtMostOne(_) => None,
+        };
+        if singleton_proof.is_some() && having_filter.is_empty() {
             let child = self.generate_node(aggregate.child.as_ref())?;
             let expressions = singleton_group_projection(aggregate)?;
             return Ok((
@@ -658,13 +662,18 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
         let input = merge.children[0].clone();
         let projected = match merge.function.singleton_merge() {
             Some(AggregateSingletonMerge::Input) => input,
-            Some(AggregateSingletonMerge::InputOr(value)) => {
+            Some(law @ AggregateSingletonMerge::InputOr(_)) => {
+                let value = law.normalized_fallback(&merge.return_type).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "At-most-one aggregate output {ordinal} has an invalid fallback type"
+                    ))
+                })?;
                 Expression::Operator(OperatorExpression::new(
                     OperatorType::Coalesce,
                     vec![
                         input,
                         Expression::Constant(ConstantExpression::new(
-                            value.clone(),
+                            value,
                             merge.return_type.clone(),
                         )),
                     ],
@@ -683,6 +692,17 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
         return Err(paro_error::internal(
             "At-most-one aggregate projection width does not match its logical output",
         ));
+    }
+    if let Some((ordinal, (expression, expected))) = expressions
+        .iter()
+        .zip(&aggregate.returned_types)
+        .enumerate()
+        .find(|(_, (expression, expected))| expression.return_type() != **expected)
+    {
+        return Err(paro_error::internal(format!(
+            "At-most-one aggregate projection type {ordinal} differs from its logical output: projected={:?}, expected={expected:?}",
+            expression.return_type()
+        )));
     }
     Ok(expressions)
 }
