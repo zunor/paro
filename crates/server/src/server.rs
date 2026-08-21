@@ -574,17 +574,25 @@ mod tests {
     }
 
     async fn read_messages_until_ready(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
+        const MAX_MESSAGES: usize = 4_096;
+        let deadline = Instant::now() + Duration::from_secs(10);
         let mut messages = Vec::new();
-        loop {
-            let message = read_backend_message_timeout(stream, Duration::from_secs(2))
+        for _ in 0..MAX_MESSAGES {
+            let mut message = tokio::time::timeout_at(deadline, read_backend_message(stream))
                 .await
                 .expect("backend message before ReadyForQuery");
             let ready = message.0 == b'Z';
+            // COPY payloads can be arbitrarily large. Tests using this generic
+            // control-message helper only need the tag, so retain no row data.
+            if message.0 == b'd' {
+                message.1.clear();
+            }
             messages.push(message);
             if ready {
                 return messages;
             }
         }
+        panic!("backend emitted more than {MAX_MESSAGES} messages before ReadyForQuery");
     }
 
     async fn read_available_messages(stream: &mut TcpStream) -> Vec<(u8, Vec<u8>)> {
@@ -1566,6 +1574,86 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_to_stdout_batches_rows_into_bounded_frames() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        let messages = run_simple_query_roundtrip(
+            &mut client,
+            "COPY (SELECT * FROM range(0, 10000)) TO STDOUT WITH (FORMAT csv)",
+        )
+        .await;
+        let copy_frames = messages.iter().filter(|(tag, _)| *tag == b'd').count();
+        assert_eq!(copy_frames, 1, "10k compact rows fit in one COPY frame");
+        assert!(messages.iter().any(|(tag, payload)| {
+            *tag == b'C' && command_complete_tag(payload).is_some_and(|tag| tag == "COPY 10000")
+        }));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn statement_timeout_cancels_copy_to_stdout_and_recovers_connection() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+        run_simple_query_roundtrip(&mut client, "SET statement_timeout = 50").await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY (SELECT * FROM range(0, 1000000000)) TO STDOUT WITH (FORMAT csv)"
+                        .to_string(),
+                ),
+            )))
+            .await
+            .expect("write COPY query");
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|(tag, payload)| {
+                    *tag == b'E'
+                        && error_field(payload, b'M').as_deref()
+                            == Some("canceling statement due to statement timeout")
+                })
+                .count(),
+            1
+        );
+        assert!(!messages.iter().any(|(tag, payload)| {
+            *tag == b'C'
+                && command_complete_tag(payload).is_some_and(|tag| tag.starts_with("COPY "))
+        }));
+        assert_eq!(
+            messages
+                .last()
+                .and_then(|(_, payload)| ready_for_query_status(payload)),
+            Some('I')
+        );
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(!probe.iter().any(|(tag, _)| *tag == b'E'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn statement_timeout_cancels_copy_from_stdin_and_recovers_connection() {
         let (server, run_task, addr) = spawn_test_server(4).await;
         let mut client = TcpStream::connect(addr).await.expect("client connection");
@@ -1656,6 +1744,59 @@ mod tests {
             read, 0,
             "force close should terminate the socket without protocol epilogue"
         );
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn force_close_interrupts_backpressured_copy_to_stdout() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY (SELECT * FROM range(0, 1000000000)) TO STDOUT WITH (FORMAT csv)"
+                        .to_string(),
+                ),
+            )))
+            .await
+            .expect("write COPY query");
+        loop {
+            let (tag, _) = read_backend_message(&mut client).await;
+            if tag == b'd' {
+                break;
+            }
+            assert_eq!(tag, b'H');
+        }
+
+        // Stop consuming rows long enough for the server-side socket to apply
+        // backpressure, then verify the lifecycle token interrupts that send.
+        sleep(Duration::from_millis(50)).await;
+        server.broadcast_force_close();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                if client
+                    .read(&mut buffer)
+                    .await
+                    .expect("read after force close")
+                    == 0
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("backpressured COPY TO STDOUT should release the connection promptly");
 
         server
             .shutdown(Duration::from_secs(5))

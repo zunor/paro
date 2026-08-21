@@ -10,7 +10,7 @@ use paro_common::logging::targets;
 use paro_common::runtime_value::Value;
 use paro_common::types::{logical_type_from_pg_oid, LogicalType};
 use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
-use paro_context::{StatementContext, StatementOptions, StatementSource};
+use paro_context::{StatementCancellation, StatementContext, StatementOptions, StatementSource};
 use paro_execution::query_executor::compiled::{
     CompiledStatement, ExecutionRequest, ResultColumnDesc,
 };
@@ -120,6 +120,7 @@ pub trait ExtendedQueryResponder: Send {
 
     fn create_copy_out_sink(
         &mut self,
+        _cancellation: &StatementCancellation,
         _options: &paro_function::copy::CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
         Err(paro_error::not_supported(
@@ -127,7 +128,10 @@ pub trait ExtendedQueryResponder: Send {
         ))
     }
 
-    fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+    fn create_copy_in_source(
+        &mut self,
+        _cancellation: &StatementCancellation,
+    ) -> Result<Box<dyn CopyProtocolSource + '_>> {
         Err(paro_error::not_supported(
             "COPY FROM STDIN is not available in this context",
         ))
@@ -977,26 +981,34 @@ async fn execute_client_copy_portal<R: ExtendedQueryResponder>(
             let options = paro_function::copy::CopyOptions::from_ast(&copy_stmt.options)?;
             let query_stmt = crate::execute::build_copy_to_query_statement(&copy_stmt)?;
             {
-                let mut copy_sink = responder.create_copy_out_sink(&options)?;
+                let cancellation = session
+                    .current_statement_cancellation()
+                    .expect("COPY TO STDOUT requires an active statement scope");
+                let mut copy_sink = responder.create_copy_out_sink(&cancellation, &options)?;
                 session
                     .execute_copy_to_core(
                         query_stmt,
                         Some(&parameter_env),
                         None,
                         StatementSource::ExtendedQuery,
+                        cancellation,
                         &mut *copy_sink,
                     )
                     .await?
             }
         }
         (paro_parser::ast::CopyDirection::From, paro_parser::ast::CopySource::Stdin) => {
-            let mut copy_source = responder.create_copy_in_source()?;
+            let cancellation = session
+                .current_statement_cancellation()
+                .expect("COPY FROM STDIN requires an active statement scope");
+            let mut copy_source = responder.create_copy_in_source(&cancellation)?;
             session
                 .execute_copy_from_core(
                     &copy_stmt,
                     Some(&parameter_env),
                     None,
                     StatementSource::ExtendedQuery,
+                    cancellation,
                     &mut *copy_source,
                 )
                 .await?
@@ -1184,13 +1196,17 @@ mod tests {
 
         fn create_copy_out_sink(
             &mut self,
+            _cancellation: &StatementCancellation,
             _options: &paro_function::copy::CopyOptions,
         ) -> Result<Box<dyn CopyProtocolSink + '_>> {
             self.events.push("copy_out_sink".to_string());
             Ok(Box::new(TestCopyOutSink { responder: self }))
         }
 
-        fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+        fn create_copy_in_source(
+            &mut self,
+            _cancellation: &StatementCancellation,
+        ) -> Result<Box<dyn CopyProtocolSource + '_>> {
             self.events.push("copy_in_source".to_string());
             Ok(Box::new(TestCopyInSource { responder: self }))
         }

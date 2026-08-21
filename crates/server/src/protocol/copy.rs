@@ -14,8 +14,8 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::copy::{CopyFormat, CopyOptions, ForceQuoteOption};
 use paro_session::{
-    ActiveStatementControl, CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink,
-    SessionExecutionControl, StatementCompletion,
+    CopyInSpec, CopyProtocolSink, CopyProtocolSource, ResultSink, StatementCancellation,
+    StatementCompletion,
 };
 use pgwire::messages::copy::{CopyData, CopyDone, CopyInResponse, CopyOutResponse};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -32,6 +32,8 @@ use crate::protocol::result::{
 };
 
 const COPY_TEXT_FORMAT_CODE: i8 = 0;
+const COPY_DATA_TARGET_BYTES: usize = 64 * 1024;
+const COPY_CANCEL_FLUSH_GRACE: std::time::Duration = std::time::Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CopyFrontendMode {
@@ -41,17 +43,24 @@ pub enum CopyFrontendMode {
 
 pub struct PgWireCopyOutSink<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
-    active_statement: Arc<ActiveStatementControl>,
+    cancellation: StatementCancellation,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
     options: CopyOptions,
+    delimiter: String,
+    null_string: String,
     names: Vec<String>,
     force_quote_columns: Vec<bool>,
     col_count: usize,
+    copy_buffer: String,
 }
 
 impl<'a> PgWireCopyOutSink<'a> {
     pub fn new(
         socket: &'a mut Framed<TcpStream, PgCodec>,
-        active_statement: Arc<ActiveStatementControl>,
+        cancellation: StatementCancellation,
+        drain_token: CancellationToken,
+        force_close_token: CancellationToken,
         options: CopyOptions,
     ) -> Result<Self> {
         if matches!(options.format, CopyFormat::Binary) {
@@ -77,26 +86,20 @@ impl<'a> PgWireCopyOutSink<'a> {
 
         Ok(Self {
             socket,
-            active_statement,
+            cancellation,
+            drain_token,
+            force_close_token,
+            delimiter: delimiter.to_string(),
+            null_string: options
+                .null_string()
+                .expect("COPY OUT only supports CSV/TEXT formats")
+                .to_string(),
             options,
             names: Vec::new(),
             force_quote_columns: Vec::new(),
             col_count: 0,
+            copy_buffer: String::with_capacity(COPY_DATA_TARGET_BYTES),
         })
-    }
-
-    fn delimiter(&self) -> String {
-        self.options
-            .delimiter()
-            .expect("COPY OUT only supports CSV/TEXT formats")
-            .to_string()
-    }
-
-    fn null_string(&self) -> String {
-        self.options
-            .null_string()
-            .expect("COPY OUT only supports CSV/TEXT formats")
-            .to_string()
     }
 
     fn quote_char(&self) -> Option<char> {
@@ -107,27 +110,90 @@ impl<'a> PgWireCopyOutSink<'a> {
         self.options.escape()
     }
 
-    async fn send_copy_data_line(&mut self, line: String) -> Result<()> {
-        self.send_backend_message(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
-            line,
-        ))))
-        .await
+    fn abandon_connection(&self, reason: &'static str) -> ParoError {
+        // An interrupted flush leaves a valid prefix in the codec buffer, but
+        // an ErrorResponse cannot overtake it. Closing this connection is the
+        // only progress-preserving outcome when the peer is not reading.
+        self.force_close_token.cancel();
+        paro_error::connection_failure(reason)
     }
 
-    /// Send one complete COPY frame after observing statement cancellation.
+    /// Send one COPY frame under the connection and statement lifetimes.
     ///
-    /// Once `Framed::send` starts, it must run to completion: dropping that
-    /// future while it is flushing can leave an encoded COPY frame pending and
-    /// prevent the subsequent error response from making progress. A client
-    /// that issued a cancel request resumes reading the original connection;
-    /// the in-flight frame can then drain, and the next frame boundary reports
-    /// the cancellation without corrupting the protocol stream.
-    async fn send_backend_message(&mut self, message: PgWireBackendMessage) -> Result<()> {
-        self.active_statement.cancellation().check()?;
-        self.socket
-            .send(message)
-            .await
-            .map_err(|e| paro_error::internal(e.to_string()))
+    /// Cancellation observed before encoding a frame is returned normally so
+    /// the connection loop can send a terminal ErrorResponse. Cancellation
+    /// while a frame is blocked first gets a short flush grace, because a
+    /// normal PostgreSQL cancel client resumes reading the original socket. If
+    /// the peer still applies backpressure, the connection is abandoned: the
+    /// queued frame remains byte-valid, but no terminal response can overtake
+    /// it and a non-reading peer cannot observe that response anyway.
+    async fn send_cancellable_frame(&mut self, message: PgWireBackendMessage) -> Result<()> {
+        if self.force_close_token.is_cancelled() {
+            return Err(self.abandon_connection("connection force-closed during COPY TO STDOUT"));
+        }
+        if self.drain_token.is_cancelled() {
+            return Err(self.abandon_connection("connection drained during COPY TO STDOUT"));
+        }
+        self.cancellation.check()?;
+
+        if let Err(error) = self.socket.feed(message).await {
+            self.force_close_token.cancel();
+            return Err(paro_error::connection_failure(error.to_string()));
+        }
+
+        enum FlushOutcome {
+            Flushed(std::io::Result<()>),
+            ForceClosed,
+            Drained,
+            StatementCancelled,
+        }
+
+        let outcome = tokio::select! {
+            biased;
+            _ = self.force_close_token.cancelled() => FlushOutcome::ForceClosed,
+            _ = self.drain_token.cancelled() => FlushOutcome::Drained,
+            _ = self.cancellation.cancelled() => FlushOutcome::StatementCancelled,
+            result = self.socket.flush() => FlushOutcome::Flushed(result),
+        };
+
+        match outcome {
+            FlushOutcome::Flushed(Ok(())) => Ok(()),
+            FlushOutcome::Flushed(Err(error)) => {
+                self.force_close_token.cancel();
+                Err(paro_error::connection_failure(error.to_string()))
+            }
+            FlushOutcome::ForceClosed => {
+                Err(self.abandon_connection("connection force-closed during COPY TO STDOUT"))
+            }
+            FlushOutcome::Drained => {
+                Err(self.abandon_connection("connection drained during COPY TO STDOUT"))
+            }
+            FlushOutcome::StatementCancelled => {
+                match tokio::time::timeout(COPY_CANCEL_FLUSH_GRACE, self.socket.flush()).await {
+                    Ok(Ok(())) => self.cancellation.check(),
+                    Ok(Err(error)) => {
+                        self.force_close_token.cancel();
+                        Err(paro_error::connection_failure(error.to_string()))
+                    }
+                    Err(_) => Err(self
+                        .abandon_connection("statement cancelled while flushing COPY TO STDOUT")),
+                }
+            }
+        }
+    }
+
+    async fn flush_copy_buffer(&mut self) -> Result<()> {
+        if self.copy_buffer.is_empty() {
+            return Ok(());
+        }
+        let payload = std::mem::replace(
+            &mut self.copy_buffer,
+            String::with_capacity(COPY_DATA_TARGET_BYTES),
+        );
+        self.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(Bytes::from(
+            payload,
+        ))))
+        .await
     }
 
     fn append_csv_field(&self, out: &mut String, field: &str, force_quote: bool) {
@@ -161,11 +227,10 @@ impl<'a> PgWireCopyOutSink<'a> {
             None => return false,
         };
 
-        let delimiter = self.delimiter();
         if field.contains('\n') || field.contains('\r') {
             return true;
         }
-        if field.contains(&delimiter) {
+        if field.contains(&self.delimiter) {
             return true;
         }
 
@@ -173,7 +238,7 @@ impl<'a> PgWireCopyOutSink<'a> {
     }
 
     fn append_text_field(&self, out: &mut String, field: &str) {
-        let delimiter = self.delimiter().chars().next().unwrap_or('\t');
+        let delimiter = self.delimiter.chars().next().unwrap_or('\t');
         for ch in field.chars() {
             match ch {
                 '\\' => out.push_str("\\\\"),
@@ -199,69 +264,56 @@ impl<'a> PgWireCopyOutSink<'a> {
         }
     }
 
-    fn serialize_row(&self, chunk: &Chunk, row: usize) -> String {
-        let mut line = String::new();
-        let delimiter = self.delimiter();
-        let null_string = self.null_string();
-
+    fn append_serialized_row(&self, chunk: &Chunk, row: usize, out: &mut String) {
         for col in 0..self.col_count {
             if col > 0 {
-                line.push_str(&delimiter);
+                out.push_str(&self.delimiter);
             }
 
             let value = chunk.column(col).map(|v| v.get_value(row));
             let is_null = chunk.column(col).map(|v| v.is_null(row)).unwrap_or(true);
-            let field = if is_null {
-                null_string.clone()
-            } else {
-                self.value_to_text(value.as_ref().unwrap())
-            };
 
             if is_null {
-                line.push_str(&field);
+                out.push_str(&self.null_string);
                 continue;
             }
+            let field = self.value_to_text(value.as_ref().unwrap());
 
             match self.options.format {
                 CopyFormat::Csv => {
                     let force_quote = self.force_quote_columns.get(col).copied().unwrap_or(false);
-                    self.append_csv_field(&mut line, &field, force_quote);
+                    self.append_csv_field(out, &field, force_quote);
                 }
                 CopyFormat::Text => {
-                    self.append_text_field(&mut line, &field);
+                    self.append_text_field(out, &field);
                 }
                 CopyFormat::Binary => {
-                    line.push_str(&field);
+                    out.push_str(&field);
                 }
                 CopyFormat::Ndjson => {
-                    line.push_str(&field);
+                    out.push_str(&field);
                 }
             }
         }
 
-        line.push('\n');
-        line
+        out.push('\n');
     }
 
-    fn serialize_header(&self) -> String {
-        let mut line = String::new();
-        let delimiter = self.delimiter();
-
+    fn append_serialized_header(&self, out: &mut String) {
         for (idx, name) in self.names.iter().enumerate() {
             if idx > 0 {
-                line.push_str(&delimiter);
+                out.push_str(&self.delimiter);
             }
 
             match self.options.format {
-                CopyFormat::Csv => self.append_csv_field(&mut line, name, false),
-                CopyFormat::Text => self.append_text_field(&mut line, name),
-                CopyFormat::Binary => line.push_str(name),
-                CopyFormat::Ndjson => line.push_str(name),
+                CopyFormat::Csv => self.append_csv_field(out, name, false),
+                CopyFormat::Text => self.append_text_field(out, name),
+                CopyFormat::Binary => out.push_str(name),
+                CopyFormat::Ndjson => out.push_str(name),
             }
         }
 
-        line.push('\n');
-        line
+        out.push('\n');
     }
 }
 
@@ -286,7 +338,7 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
 
         let _ = types;
 
-        self.send_backend_message(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
+        self.send_cancellable_frame(PgWireBackendMessage::CopyOutResponse(CopyOutResponse::new(
             COPY_TEXT_FORMAT_CODE,
             self.col_count as i16,
             vec![0; self.col_count],
@@ -294,23 +346,31 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
         .await?;
 
         if self.options.header() {
-            let header = self.serialize_header();
-            self.send_copy_data_line(header).await?;
+            let mut buffer = std::mem::take(&mut self.copy_buffer);
+            self.append_serialized_header(&mut buffer);
+            self.copy_buffer = buffer;
         }
 
         Ok(())
     }
 
     async fn push_copy_rows(&mut self, chunk: &Chunk) -> Result<()> {
+        let mut buffer = std::mem::take(&mut self.copy_buffer);
         for row in 0..chunk.size() {
-            let line = self.serialize_row(chunk, row);
-            self.send_copy_data_line(line).await?;
+            self.append_serialized_row(chunk, row, &mut buffer);
+            if buffer.len() >= COPY_DATA_TARGET_BYTES {
+                self.copy_buffer = buffer;
+                self.flush_copy_buffer().await?;
+                buffer = std::mem::take(&mut self.copy_buffer);
+            }
         }
+        self.copy_buffer = buffer;
         Ok(())
     }
 
     async fn finish_copy_out(&mut self) -> Result<()> {
-        self.send_backend_message(PgWireBackendMessage::CopyDone(CopyDone::new()))
+        self.flush_copy_buffer().await?;
+        self.send_cancellable_frame(PgWireBackendMessage::CopyDone(CopyDone::new()))
             .await
     }
 }
@@ -331,6 +391,9 @@ impl<'a> ResultSink for PgWireCopyOutSink<'a> {
     }
 
     async fn error(&mut self, err: &ParoError) -> Result<()> {
+        // Terminal errors must bypass statement cancellation. Otherwise the
+        // cancellation that caused this callback would suppress its own
+        // ErrorResponse and leave a reading client waiting forever.
         self.socket
             .send(PgWireBackendMessage::ErrorResponse(build_error_response(
                 err,
@@ -349,7 +412,7 @@ pub struct PgWireCopyInSink<'a> {
 impl<'a> PgWireCopyInSink<'a> {
     pub fn new(
         socket: &'a mut Framed<TcpStream, PgCodec>,
-        execution_control: Arc<SessionExecutionControl>,
+        cancellation: StatementCancellation,
         drain_token: CancellationToken,
         force_close_token: CancellationToken,
         pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
@@ -358,7 +421,7 @@ impl<'a> PgWireCopyInSink<'a> {
         Self {
             sink: PgWireResultSink::new(socket),
             receiver: CopyFrontendReceiver::new(
-                execution_control,
+                cancellation,
                 drain_token,
                 force_close_token,
                 pending_frontend_messages,
@@ -381,7 +444,7 @@ impl<'a> PgWireCopyInSink<'a> {
 }
 
 struct CopyFrontendReceiver<'a> {
-    execution_control: Arc<SessionExecutionControl>,
+    cancellation: StatementCancellation,
     drain_token: CancellationToken,
     force_close_token: CancellationToken,
     pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
@@ -391,14 +454,14 @@ struct CopyFrontendReceiver<'a> {
 
 impl<'a> CopyFrontendReceiver<'a> {
     fn new(
-        execution_control: Arc<SessionExecutionControl>,
+        cancellation: StatementCancellation,
         drain_token: CancellationToken,
         force_close_token: CancellationToken,
         pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
         mode: CopyFrontendMode,
     ) -> Self {
         Self {
-            execution_control,
+            cancellation,
             drain_token,
             force_close_token,
             pending_frontend_messages,
@@ -407,20 +470,10 @@ impl<'a> CopyFrontendReceiver<'a> {
         }
     }
 
-    fn active_statement(&self) -> Result<std::sync::Arc<paro_session::ActiveStatementControl>> {
-        self.execution_control.active_statement().ok_or_else(|| {
-            paro_error::internal("COPY FROM STDIN requires an active statement scope")
-        })
-    }
-
     async fn next_message(
         &self,
         socket: &mut Framed<TcpStream, PgCodec>,
     ) -> Result<PgWireFrontendMessage> {
-        let active_statement = self.active_statement()?;
-        let cancellation = active_statement.cancellation();
-        let statement_token = active_statement.statement_token();
-
         tokio::select! {
             biased;
             _ = self.force_close_token.cancelled() => {
@@ -433,8 +486,8 @@ impl<'a> CopyFrontendReceiver<'a> {
                     "connection drained during COPY FROM STDIN".to_string(),
                 ))
             }
-            _ = statement_token.cancelled() => {
-                cancellation.check()?;
+            _ = self.cancellation.cancelled() => {
+                self.cancellation.check()?;
                 Err(paro_error::query_canceled())
             }
             message = socket.next() => {
@@ -597,22 +650,23 @@ fn resolve_force_quote_columns(
 
 pub fn create_copy_out_sink<'a>(
     socket: &'a mut Framed<TcpStream, PgCodec>,
-    execution_control: Arc<SessionExecutionControl>,
+    cancellation: &StatementCancellation,
+    drain_token: CancellationToken,
+    force_close_token: CancellationToken,
     options: &CopyOptions,
 ) -> Result<Box<dyn CopyProtocolSink + 'a>> {
-    let active_statement = execution_control
-        .active_statement()
-        .ok_or_else(|| paro_error::internal("COPY TO STDOUT requires an active statement scope"))?;
     Ok(Box::new(PgWireCopyOutSink::new(
         socket,
-        active_statement,
+        cancellation.clone(),
+        drain_token,
+        force_close_token,
         options.clone(),
     )?))
 }
 
 pub fn create_copy_in_source<'a>(
     socket: &'a mut Framed<TcpStream, PgCodec>,
-    execution_control: Arc<SessionExecutionControl>,
+    cancellation: &StatementCancellation,
     drain_token: CancellationToken,
     force_close_token: CancellationToken,
     pending_frontend_messages: Arc<Mutex<VecDeque<PgWireFrontendMessage>>>,
@@ -620,7 +674,7 @@ pub fn create_copy_in_source<'a>(
 ) -> Result<Box<dyn CopyProtocolSource + 'a>> {
     Ok(Box::new(PgWireCopyInSink::new(
         socket,
-        execution_control,
+        cancellation.clone(),
         drain_token,
         force_close_token,
         pending_frontend_messages,
@@ -631,6 +685,29 @@ pub fn create_copy_in_source<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_instance::CopyStdinMetrics;
+    use std::time::Duration;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::TcpListener;
+
+    async fn connected_pg_streams() -> (Framed<TcpStream, PgCodec>, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let client = TcpStream::connect(address);
+        let accept = listener.accept();
+        let (client, accepted) = tokio::join!(client, accept);
+        let (server, _) = accepted.unwrap();
+        (
+            Framed::new(
+                server,
+                PgCodec::new(
+                    crate::connection::PgFrontendMessageLimits::new(1024 * 1024),
+                    Arc::new(CopyStdinMetrics::default()),
+                ),
+            ),
+            client.unwrap(),
+        )
+    }
 
     #[test]
     fn resolves_force_quote_columns_for_csv() {
@@ -646,5 +723,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cols, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn cancellation_before_copy_done_is_reported_without_closing_connection() {
+        let (mut server, mut client) = connected_pg_streams().await;
+        let statement_token = CancellationToken::new();
+        let cancellation = StatementCancellation::new(statement_token.clone(), None);
+        let drain_token = CancellationToken::new();
+        let force_close_token = CancellationToken::new();
+        let mut sink = PgWireCopyOutSink::new(
+            &mut server,
+            cancellation,
+            drain_token,
+            force_close_token.clone(),
+            CopyOptions::default(),
+        )
+        .unwrap();
+
+        statement_token.cancel();
+        let error = sink
+            .finish_copy_out()
+            .await
+            .expect_err("cancellation at the final frame boundary must win over CopyDone");
+        assert!(error.is_query_canceled());
+        assert!(!force_close_token.is_cancelled());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), client.read_u8())
+                .await
+                .is_err(),
+            "the cancelled finish must not put CopyDone on the wire"
+        );
     }
 }

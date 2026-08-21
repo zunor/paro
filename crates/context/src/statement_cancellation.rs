@@ -108,6 +108,11 @@ impl StatementCancellation {
         self.statement_token.is_cancelled()
     }
 
+    /// Wait until this statement, or its owning connection, is cancelled.
+    pub async fn cancelled(&self) {
+        self.statement_token.cancelled().await;
+    }
+
     pub fn connection_cancelled(&self) -> bool {
         self.connection_token.is_cancelled()
     }

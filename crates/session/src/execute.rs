@@ -545,12 +545,16 @@ impl Session {
 
         let result: Result<()> = async {
             let completion = {
-                let mut protocol_sink = sink.create_copy_out_sink(options)?;
+                let cancellation = self
+                    .current_statement_cancellation()
+                    .expect("COPY TO STDOUT requires an active statement scope");
+                let mut protocol_sink = sink.create_copy_out_sink(&cancellation, options)?;
                 self.execute_copy_to_core(
                     query_stmt,
                     None,
                     statement_format.clone(),
                     source,
+                    cancellation,
                     &mut *protocol_sink,
                 )
                 .await?
@@ -588,12 +592,16 @@ impl Session {
 
         let result: Result<()> = async {
             let completion = {
-                let mut protocol_source = sink.create_copy_in_source()?;
+                let cancellation = self
+                    .current_statement_cancellation()
+                    .expect("COPY FROM STDIN requires an active statement scope");
+                let mut protocol_source = sink.create_copy_in_source(&cancellation)?;
                 self.execute_copy_from_core(
                     copy_stmt,
                     None,
                     statement_format.clone(),
                     source,
+                    cancellation,
                     &mut *protocol_source,
                 )
                 .await?
@@ -621,6 +629,7 @@ impl Session {
         parameter_env: Option<&TypedParameterEnv>,
         statement_format: Option<String>,
         source: StatementSource,
+        cancellation: StatementCancellation,
         protocol_sink: &mut dyn CopyProtocolSink,
     ) -> Result<StatementCompletion> {
         let statement_completion = StatementCompletion::Copy { rows: 0 };
@@ -632,8 +641,7 @@ impl Session {
                 source,
                 ..StatementOptions::default()
             },
-            self.current_statement_cancellation()
-                .expect("COPY execution requires an active statement scope"),
+            cancellation,
         );
 
         debug!(
@@ -729,6 +737,7 @@ impl Session {
         parameter_env: Option<&TypedParameterEnv>,
         statement_format: Option<String>,
         source: StatementSource,
+        cancellation: StatementCancellation,
         protocol_source: &mut dyn CopyProtocolSource,
     ) -> Result<StatementCompletion> {
         validate_copy_from_options(copy_stmt)?;
@@ -739,9 +748,6 @@ impl Session {
         };
         protocol_source.begin_copy_in(&spec).await?;
 
-        let cancellation = self
-            .current_statement_cancellation()
-            .expect("COPY FROM STDIN requires an active statement scope");
         let payload = FramedCopySourceBridge::new(
             self.copy_stdin_memory_limit(),
             self.instance.copy_stdin_metrics().clone(),

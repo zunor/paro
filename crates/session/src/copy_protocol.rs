@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use paro_context::StatementCancellation;
 use paro_function::copy::CopyOptions;
 use tokio_util::bytes::Bytes;
 
@@ -35,6 +36,7 @@ pub trait CopyProtocolSource: Send {
 pub trait ProtocolResultSink: ResultSink {
     fn create_copy_out_sink(
         &mut self,
+        _cancellation: &StatementCancellation,
         _options: &CopyOptions,
     ) -> Result<Box<dyn CopyProtocolSink + '_>> {
         Err(paro_error::not_supported(
@@ -42,7 +44,10 @@ pub trait ProtocolResultSink: ResultSink {
         ))
     }
 
-    fn create_copy_in_source(&mut self) -> Result<Box<dyn CopyProtocolSource + '_>> {
+    fn create_copy_in_source(
+        &mut self,
+        _cancellation: &StatementCancellation,
+    ) -> Result<Box<dyn CopyProtocolSource + '_>> {
         Err(paro_error::not_supported(
             "COPY FROM STDIN is not available in this context",
         ))

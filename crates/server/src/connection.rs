@@ -712,16 +712,9 @@ impl Connection {
     ) -> anyhow::Result<()> {
         self.begin_extended_query_pipeline();
 
-        let execution_control = self
-            .session
-            .as_ref()
-            .expect("session must be initialized")
-            .execution_control()
-            .clone();
         let session = self.session.as_mut().expect("session must be initialized");
         let mut responder = PgWireExtendedQueryResponder::new(
             &mut self.socket,
-            execution_control,
             self.drain_token.clone(),
             self.force_close_token.clone(),
             Arc::clone(&self.pending_frontend_messages),
@@ -778,15 +771,8 @@ impl Connection {
         self.extended_query_pipeline_open = false;
         self.enter_skip_until_sync();
 
-        let execution_control = self
-            .session
-            .as_ref()
-            .expect("session must be initialized")
-            .execution_control()
-            .clone();
         let mut responder = PgWireExtendedQueryResponder::new(
             &mut self.socket,
-            execution_control,
             self.drain_token.clone(),
             self.force_close_token.clone(),
             Arc::clone(&self.pending_frontend_messages),
@@ -796,16 +782,9 @@ impl Connection {
     }
 
     async fn execute_protocol_query(&mut self, sql: &str) -> anyhow::Result<()> {
-        let execution_control = self
-            .session
-            .as_ref()
-            .expect("session must be initialized")
-            .execution_control()
-            .clone();
         let session = self.session.as_mut().expect("session must be initialized");
         let mut sink = ProtocolSink::new(
             &mut self.socket,
-            execution_control,
             self.drain_token.clone(),
             self.force_close_token.clone(),
             Arc::clone(&self.pending_frontend_messages),
