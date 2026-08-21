@@ -419,14 +419,26 @@ impl<'a> PgWireCopyOutSink<'a> {
         if self.copy_buffer.is_empty() {
             return Ok(());
         }
-        let payload = std::mem::replace(
-            &mut self.copy_buffer,
-            BytesMut::with_capacity(COPY_DATA_BUFFER_BYTES),
-        );
-        self.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(
-            payload.freeze(),
-        )))
-        .await
+        let payload = std::mem::take(&mut self.copy_buffer).freeze();
+        let reclaim = payload.clone();
+        self.send_cancellable_frame(PgWireBackendMessage::CopyData(CopyData::new(payload)))
+            .await?;
+
+        // PgCodec copies the payload into its write buffer during `feed` and
+        // retains no source reference. Recover the allocation after the frame
+        // flush instead of allocating another 128 KiB staging buffer.
+        self.copy_buffer = match reclaim.try_into_mut() {
+            Ok(mut buffer) => {
+                buffer.clear();
+                buffer
+            }
+            Err(_) => BytesMut::with_capacity(COPY_DATA_BUFFER_BYTES),
+        };
+        if self.copy_buffer.capacity() < COPY_DATA_BUFFER_BYTES {
+            self.copy_buffer
+                .reserve(COPY_DATA_BUFFER_BYTES - self.copy_buffer.capacity());
+        }
+        Ok(())
     }
 }
 
@@ -883,5 +895,26 @@ mod tests {
             force_close_token.is_cancelled(),
             "abandoning COPY must suppress the outer protocol epilogue"
         );
+    }
+
+    #[tokio::test]
+    async fn successful_copy_frame_reclaims_its_staging_allocation() {
+        let (mut server, _client) = connected_pg_streams().await;
+        let cancellation = StatementCancellation::new(CancellationToken::new(), None);
+        let mut sink = PgWireCopyOutSink::new(
+            &mut server,
+            cancellation,
+            CancellationToken::new(),
+            CopyOptions::default(),
+        )
+        .unwrap();
+        sink.copy_buffer
+            .extend_from_slice(&vec![b'x'; COPY_DATA_TARGET_BYTES]);
+        let allocation = sink.copy_buffer.as_ptr();
+
+        sink.flush_copy_buffer().await.unwrap();
+        assert_eq!(sink.copy_buffer.as_ptr(), allocation);
+        assert!(sink.copy_buffer.is_empty());
+        assert!(sink.copy_buffer.capacity() >= COPY_DATA_BUFFER_BYTES);
     }
 }
