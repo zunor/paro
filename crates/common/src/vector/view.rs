@@ -15,7 +15,7 @@ pub enum SelectionRef<'a> {
     Borrowed(&'a SelectionVector),
     Owned(SelectionVector),
     Range { offset: usize, count: usize },
-    Constant { count: usize },
+    Constant { index: usize, count: usize },
     Incremental { count: usize },
 }
 
@@ -26,7 +26,7 @@ impl<'a> SelectionRef<'a> {
             Self::Borrowed(sel) => sel.len(),
             Self::Owned(sel) => sel.len(),
             Self::Range { count, .. } => *count,
-            Self::Constant { count } | Self::Incremental { count } => *count,
+            Self::Constant { count, .. } | Self::Incremental { count } => *count,
         }
     }
 
@@ -41,7 +41,7 @@ impl<'a> SelectionRef<'a> {
             Self::Borrowed(sel) => sel.get(idx),
             Self::Owned(sel) => sel.get(idx),
             Self::Range { offset, .. } => offset + idx,
-            Self::Constant { .. } => 0,
+            Self::Constant { index, .. } => *index,
             Self::Incremental { .. } => idx,
         }
     }
@@ -66,6 +66,17 @@ impl<'a> SelectionRef<'a> {
 
     fn try_compose(self, selection: &'a VectorSelection, count: usize) -> Result<SelectionRef<'a>> {
         match (self, selection) {
+            (base, VectorSelection::Repeated { index, count: len }) => {
+                if count > *len {
+                    return Err(paro_error::internal(format!(
+                        "vector view count exceeds repeated selection: count={count}, selection_count={len}"
+                    )));
+                }
+                Ok(SelectionRef::Constant {
+                    index: base.get(*index),
+                    count,
+                })
+            }
             (SelectionRef::Borrowed(child_sel), VectorSelection::Materialized(sel)) => {
                 Ok(SelectionRef::Owned(child_sel.try_slice(sel, count)?))
             }
@@ -95,7 +106,9 @@ impl<'a> SelectionRef<'a> {
                 result.try_fill_offset_from(offset, sel, count)?;
                 Ok(SelectionRef::Owned(result))
             }
-            (SelectionRef::Constant { count: _ }, _) => Ok(SelectionRef::Constant { count }),
+            (SelectionRef::Constant { index, .. }, _) => {
+                Ok(SelectionRef::Constant { index, count })
+            }
             (SelectionRef::Incremental { count: _ }, VectorSelection::Materialized(sel))
                 if count == sel.len() =>
             {
@@ -524,7 +537,7 @@ impl Vector {
             }),
             VectorType::Constant => Ok(VectorView {
                 logical_type: &self.logical_type,
-                sel: SelectionRef::Constant { count },
+                sel: SelectionRef::Constant { index: 0, count },
                 validity: ValidityRef::Borrowed(&self.validity),
                 data: DataRef::Ptr(self.buffer.data()),
                 physical_count: 1,
@@ -727,7 +740,10 @@ mod tests {
         let vector = crate::test_utils::test_constant(LogicalType::BigInt, 42_i64, 4);
         let view = vector.try_to_view(4).unwrap();
 
-        assert!(matches!(view.sel(), SelectionRef::Constant { count: 4 }));
+        assert!(matches!(
+            view.sel(),
+            SelectionRef::Constant { index: 0, count: 4 }
+        ));
         assert_eq!(view.get_i64(0), 42);
         assert_eq!(view.get_i64(3), 42);
     }
@@ -797,7 +813,7 @@ mod tests {
         let constant_decoded = constant.try_decode_ref(4).unwrap();
         assert!(matches!(
             constant_decoded.sel(),
-            SelectionRef::Constant { count: 4 }
+            SelectionRef::Constant { index: 0, count: 4 }
         ));
 
         let range = flat.slice_ref(1, 2).expect("range slice");

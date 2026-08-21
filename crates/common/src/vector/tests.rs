@@ -1217,6 +1217,20 @@ fn test_try_copy_selection_range_avoids_selection_materialization() {
 }
 
 #[test]
+fn test_broadcast_ref_keeps_repeated_mapping_symbolic() {
+    let source = Arc::new(crate::test_utils::test_i32_vector(&[10, 20, 30, 40]));
+    let broadcast = Vector::try_broadcast_ref(source, 2, 4).unwrap();
+
+    assert!(matches!(
+        broadcast.selection(),
+        VectorSelection::Repeated { index: 2, count: 4 }
+    ));
+    assert_eq!(broadcast.len(), 4);
+    assert_eq!(broadcast.get_i32(0), Some(30));
+    assert_eq!(broadcast.get_i32(3), Some(30));
+}
+
+#[test]
 fn test_try_copy_selection_materialized_rows() {
     let source = crate::test_utils::test_i32_vector(&[10, 20, 30, 40]);
     let selection = crate::test_utils::test_selection(vec![3, 1, 2]);
@@ -1250,7 +1264,7 @@ fn test_try_copy_selection_ref_owned_and_constant_rows() {
 
     let mut repeated = crate::test_utils::test_vector_with_capacity(LogicalType::Integer, 3);
     repeated
-        .try_copy_selection_ref(0, &source, SelectionRef::Constant { count: 3 }, 3)
+        .try_copy_selection_ref(0, &source, SelectionRef::Constant { index: 0, count: 3 }, 3)
         .unwrap();
 
     assert_eq!(repeated.len(), 3);

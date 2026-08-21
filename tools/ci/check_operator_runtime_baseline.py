@@ -329,7 +329,7 @@ def _check_hash_join_reclaimer_guard() -> list[str]:
     state = _read("crates/execution/src/operators/join/state.rs")
     required_breaker = [
         "HashJoinBuildSpillReclaimer",
-        "spill_build_for_reclaim",
+        "reclaim_build",
         "enable_build_reclaim",
         "disable_build_reclaim",
         "SpillCost::Repartition",
@@ -452,8 +452,12 @@ def _check_aggregate_reclaimer_guard() -> list[str]:
 def _check_sort_merge_guard() -> list[str]:
     source = _strip_test_sections(_read("crates/execution/src/sorting/sorted_run_merger.rs"))
     linear_scan_count = source.count("fn select_next_run(")
+    # `materialize_range` creates its cursors once and reuses them across the
+    # complete range. Only constructors in the streaming source path are
+    # per-batch debt.
+    streaming_source = source.split("pub fn get_data(", 1)[1]
     per_batch_cursor_count = (
-        source.count("cursor_on_demand(1)")
+        streaming_source.count("cursor_on_demand(1)")
         + source.count(".map(SortedRun::external_key_cursor)")
         + source.count(".map(SortedRun::external_payload_cursor)")
     )

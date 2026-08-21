@@ -280,12 +280,7 @@ impl NestedLoopJoinProbeTransformExec {
         let Some(select) = dispatch.select else {
             return Ok(None);
         };
-        let right_constant = Vector::try_constant_from_value(
-            right.logical_type().clone(),
-            right.get_value(build_row),
-            input.size(),
-            input.allocator().clone(),
-        )?;
+        let right_constant = Vector::try_broadcast_ref(Arc::clone(right), build_row, input.size())?;
         let mut scratch = ctx.scratch.expr();
         let selection =
             scratch.selection(input.size(), ctx.query.allocator(MemoryTag::BaseTable))?;
@@ -318,11 +313,10 @@ impl NestedLoopJoinProbeTransformExec {
                     build.column_count()
                 ))
             })?;
-            columns.push(Arc::new(Vector::try_constant_from_value(
-                column.logical_type().clone(),
-                column.get_value(build_row),
+            columns.push(Arc::new(Vector::try_broadcast_ref(
+                Arc::clone(column),
+                build_row,
                 selected_count,
-                input.allocator().clone(),
             )?));
         }
         *output = Chunk::try_from_arc_vectors_with_cardinality(

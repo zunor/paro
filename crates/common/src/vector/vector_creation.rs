@@ -466,6 +466,15 @@ impl Vector {
         )
     }
 
+    /// Create a zero-copy broadcast view of one child row.
+    ///
+    /// The repeated mapping is represented symbolically, so broadcasting a
+    /// scalar out of a vector does not allocate a selection buffer or box the
+    /// value through [`crate::runtime_value::Value`].
+    pub fn try_broadcast_ref(child: Arc<Vector>, index: usize, count: usize) -> Result<Self> {
+        Self::try_gather_ref(child, VectorSelection::repeated(index, count))
+    }
+
     /// Create a zero-copy range view over this vector.
     pub fn slice_ref(&self, offset: usize, len: usize) -> Result<Self> {
         if offset.checked_add(len).is_none_or(|end| end > self.len()) {

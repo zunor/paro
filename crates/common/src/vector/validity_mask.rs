@@ -493,6 +493,28 @@ impl ValidityMask {
             VectorSelection::Range { offset, .. } => {
                 self.try_copy_range_from(dst_offset, source, *offset, count)
             }
+            VectorSelection::Repeated {
+                index,
+                count: selection_count,
+            } => {
+                if count > *selection_count || (count != 0 && *index >= source.capacity) {
+                    return Err(paro_error::internal(format!(
+                        "ValidityMask repeated selection is out of bounds: index={index}, count={count}, selection_count={selection_count}, source_capacity={}",
+                        source.capacity
+                    )));
+                }
+                let dst_end = dst_offset.checked_add(count).ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "ValidityMask repeated selection destination overflow: offset={dst_offset}, count={count}"
+                    ))
+                })?;
+                self.try_ensure_capacity(dst_end)?;
+                if source.all_valid() || source.is_valid(*index) {
+                    self.try_set_range_valid(dst_offset, count)
+                } else {
+                    self.try_set_range_invalid(dst_offset, count)
+                }
+            }
             VectorSelection::Materialized(sel) => {
                 if count > sel.len() {
                     return Err(paro_error::internal(format!(

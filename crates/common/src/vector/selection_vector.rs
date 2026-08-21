@@ -343,6 +343,12 @@ pub enum VectorSelection {
         offset: usize,
         count: usize,
     },
+    /// A zero-allocation broadcast mapping: every logical row resolves to one
+    /// physical row in the child vector.
+    Repeated {
+        index: usize,
+        count: usize,
+    },
 }
 
 /// A logical-to-physical mapping proven to fit one exact child cardinality.
@@ -402,11 +408,16 @@ impl VectorSelection {
     }
 
     #[inline]
+    pub fn repeated(index: usize, count: usize) -> Self {
+        Self::Repeated { index, count }
+    }
+
+    #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::None => 0,
             Self::Materialized(sel) => sel.len(),
-            Self::Range { count, .. } => *count,
+            Self::Range { count, .. } | Self::Repeated { count, .. } => *count,
         }
     }
 
@@ -432,6 +443,9 @@ impl VectorSelection {
                 .filter(|end| *end <= child_count)
                 .is_none()
                 .then_some(*offset),
+            Self::Repeated { index, count } => {
+                (*count != 0 && *index >= child_count).then_some(*index)
+            }
         };
         if let Some(index) = invalid {
             return Err(paro_error::out_of_range(format!(
@@ -445,7 +459,7 @@ impl VectorSelection {
     pub fn as_materialized(&self) -> Option<&SelectionVector> {
         match self {
             Self::Materialized(sel) => Some(sel),
-            Self::None | Self::Range { .. } => None,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => None,
         }
     }
 
@@ -455,6 +469,7 @@ impl VectorSelection {
             Self::None => idx,
             Self::Materialized(sel) => sel.get(idx),
             Self::Range { offset, .. } => offset + idx,
+            Self::Repeated { index, .. } => *index,
         }
     }
 
@@ -462,7 +477,7 @@ impl VectorSelection {
     pub fn allocation_identity(&self) -> Option<usize> {
         match self {
             Self::Materialized(sel) => sel.allocation_identity(),
-            Self::None | Self::Range { .. } => None,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => None,
         }
     }
 
@@ -476,7 +491,7 @@ impl VectorSelection {
     pub fn collect_allocation_size(&self, allocations: &mut super::AllocationSet) -> usize {
         match self {
             Self::Materialized(sel) => sel.collect_allocation_size(allocations),
-            Self::None | Self::Range { .. } => 0,
+            Self::None | Self::Range { .. } | Self::Repeated { .. } => 0,
         }
     }
 
@@ -502,12 +517,24 @@ impl VectorSelection {
                 }
                 Ok(selection)
             }
+            Self::Repeated { index, count } => {
+                record_selection_materialization();
+                SelectionVector::try_repeated(*index, *count, allocator)
+            }
         }
     }
 
     pub fn try_compose(&self, selection: VectorSelection) -> Result<VectorSelection> {
         match (self, selection) {
             (Self::None, selection) => Ok(selection),
+            (base, Self::Repeated { index, count }) => Ok(Self::Repeated {
+                index: base.physical_index(index),
+                count,
+            }),
+            (Self::Repeated { index, .. }, selection) => Ok(Self::Repeated {
+                index: *index,
+                count: selection.len(),
+            }),
             (Self::Materialized(child), Self::Materialized(sel)) => {
                 Ok(Self::Materialized(child.try_slice(&sel, sel.len())?))
             }

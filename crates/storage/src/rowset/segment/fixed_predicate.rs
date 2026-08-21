@@ -757,7 +757,7 @@ unsafe fn filter_dense_membership_avx2<T: FixedPhysical>(
         .as_mut_ptr()
         .cast::<BatchRowOrdinal>();
     let mut ordinals = unsafe { _mm256_loadu_si256([0i32, 1, 2, 3, 4, 5, 6, 7].as_ptr().cast()) };
-    let ordinal_step = unsafe { _mm256_set1_epi32(8) };
+    let ordinal_step = _mm256_set1_epi32(8);
     let mut row = 0usize;
     let mut written = 0usize;
     while row + 8 <= rows {
@@ -772,7 +772,7 @@ unsafe fn filter_dense_membership_avx2<T: FixedPhysical>(
             mask |= u32::from(dense_membership_contains(value, base, span, bits)) << lane;
         }
         written += unsafe { compact_ordinals_avx2(mask, ordinals, output, written) };
-        ordinals = unsafe { _mm256_add_epi32(ordinals, ordinal_step) };
+        ordinals = _mm256_add_epi32(ordinals, ordinal_step);
         row += 8;
     }
     while row < rows {
@@ -822,7 +822,6 @@ static AVX2_COMPACTION_TABLE: [[i32; 8]; 256] = avx2_compaction_table();
 /// because this helper always writes one full 8-lane vector and exposes only
 /// the lanes selected by `matched_mask`.
 #[cfg(all(target_arch = "x86_64", target_endian = "little"))]
-#[target_feature(enable = "avx2")]
 #[inline(always)]
 unsafe fn compact_ordinals_avx2(
     matched_mask: u32,
@@ -918,10 +917,10 @@ unsafe fn filter_i64_range_inclusive_avx2(
         .spare_capacity_mut()
         .as_mut_ptr()
         .cast::<BatchRowOrdinal>();
-    let lower_vector = unsafe { _mm256_set1_epi64x(lower) };
-    let upper_vector = unsafe { _mm256_set1_epi64x(upper) };
+    let lower_vector = _mm256_set1_epi64x(lower);
+    let upper_vector = _mm256_set1_epi64x(upper);
     let mut ordinals = unsafe { _mm256_loadu_si256([0i32, 1, 2, 3, 4, 5, 6, 7].as_ptr().cast()) };
-    let ordinal_step = unsafe { _mm256_set1_epi32(4) };
+    let ordinal_step = _mm256_set1_epi32(4);
     let mut row = 0usize;
     let mut written = 0usize;
     while row + 4 <= rows {
@@ -932,16 +931,14 @@ unsafe fn filter_i64_range_inclusive_avx2(
                     .cast::<__m256i>(),
             )
         };
-        let below_lower = unsafe { _mm256_cmpgt_epi64(lower_vector, values) };
-        let above_upper = unsafe { _mm256_cmpgt_epi64(values, upper_vector) };
-        let rejected = unsafe {
-            _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(
-                below_lower,
-                above_upper,
-            ))) as u32
-        };
+        let below_lower = _mm256_cmpgt_epi64(lower_vector, values);
+        let above_upper = _mm256_cmpgt_epi64(values, upper_vector);
+        let rejected = _mm256_movemask_pd(_mm256_castsi256_pd(_mm256_or_si256(
+            below_lower,
+            above_upper,
+        ))) as u32;
         written += unsafe { compact_ordinals_avx2(!rejected & 0x0f, ordinals, output, written) };
-        ordinals = unsafe { _mm256_add_epi32(ordinals, ordinal_step) };
+        ordinals = _mm256_add_epi32(ordinals, ordinal_step);
         row += 4;
     }
     while row < rows {
@@ -1101,10 +1098,10 @@ unsafe fn filter_i32_range_inclusive_avx2(
         .spare_capacity_mut()
         .as_mut_ptr()
         .cast::<BatchRowOrdinal>();
-    let lower_vector = unsafe { _mm256_set1_epi32(lower) };
-    let upper_vector = unsafe { _mm256_set1_epi32(upper) };
+    let lower_vector = _mm256_set1_epi32(lower);
+    let upper_vector = _mm256_set1_epi32(upper);
     let mut ordinals = unsafe { _mm256_loadu_si256([0i32, 1, 2, 3, 4, 5, 6, 7].as_ptr().cast()) };
-    let ordinal_step = unsafe { _mm256_set1_epi32(8) };
+    let ordinal_step = _mm256_set1_epi32(8);
     let mut row = 0usize;
     let mut written = 0usize;
     while row + 8 <= rows {
@@ -1115,16 +1112,14 @@ unsafe fn filter_i32_range_inclusive_avx2(
                     .cast::<__m256i>(),
             )
         };
-        let below_lower = unsafe { _mm256_cmpgt_epi32(lower_vector, values) };
-        let above_upper = unsafe { _mm256_cmpgt_epi32(values, upper_vector) };
-        let rejected = unsafe {
-            _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
-                below_lower,
-                above_upper,
-            ))) as u32
-        };
+        let below_lower = _mm256_cmpgt_epi32(lower_vector, values);
+        let above_upper = _mm256_cmpgt_epi32(values, upper_vector);
+        let rejected = _mm256_movemask_ps(_mm256_castsi256_ps(_mm256_or_si256(
+            below_lower,
+            above_upper,
+        ))) as u32;
         written += unsafe { compact_ordinals_avx2(!rejected & 0xff, ordinals, output, written) };
-        ordinals = unsafe { _mm256_add_epi32(ordinals, ordinal_step) };
+        ordinals = _mm256_add_epi32(ordinals, ordinal_step);
         row += 8;
     }
     while row < rows {

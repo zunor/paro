@@ -59,7 +59,7 @@ impl<'a> CopySourceRows<'a> {
             SelectionRef::Borrowed(selection) => Self::BorrowedMaterialized(selection),
             SelectionRef::Owned(selection) => Self::OwnedMaterialized(selection),
             SelectionRef::Range { offset, .. } => Self::Range { offset },
-            SelectionRef::Constant { .. } => Self::Constant { index: 0 },
+            SelectionRef::Constant { index, .. } => Self::Constant { index },
             SelectionRef::Incremental { .. } => Self::Incremental { start: 0 },
         }
     }
@@ -351,6 +351,20 @@ impl Vector {
                     count,
                 }
             }
+            VectorSelection::Repeated {
+                index,
+                count: selection_count,
+            } => {
+                if count > *selection_count {
+                    return Err(paro_error::internal(format!(
+                        "copy selection count exceeds repeated selection: count={count}, selection_count={selection_count}"
+                    )));
+                }
+                SelectionRef::Constant {
+                    index: *index,
+                    count,
+                }
+            }
             VectorSelection::Materialized(selection) => SelectionRef::Borrowed(selection),
         };
         self.try_copy_selection_ref(dst_offset, source, selection, count)
@@ -551,6 +565,9 @@ impl Vector {
     ) -> Result<CopySourceRows<'a>> {
         match base_selection {
             VectorSelection::None => Ok(rows),
+            VectorSelection::Repeated { index, .. } => {
+                Ok(CopySourceRows::Constant { index: *index })
+            }
             VectorSelection::Range { offset, .. } => match rows {
                 CopySourceRows::Range { offset: row_offset }
                 | CopySourceRows::Incremental { start: row_offset } => Ok(CopySourceRows::Range {

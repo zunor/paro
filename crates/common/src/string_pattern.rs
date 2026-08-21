@@ -23,7 +23,7 @@ enum LikeStrategy {
     Exact(Vec<u8>),
     Prefix(Vec<u8>),
     Suffix(Vec<u8>),
-    Contains(LiteralSearcher),
+    Contains(Box<LiteralSearcher>),
     Ordered {
         segments: Vec<LiteralSearcher>,
         anchored_start: bool,
@@ -170,9 +170,10 @@ impl PreparedLikePattern {
                 (true, true) => LikeStrategy::Exact(literal),
                 (true, false) => LikeStrategy::Prefix(literal),
                 (false, true) => LikeStrategy::Suffix(literal),
-                (false, false) => {
-                    LikeStrategy::Contains(LiteralSearcher::new(literal, case_insensitive))
-                }
+                (false, false) => LikeStrategy::Contains(Box::new(LiteralSearcher::new(
+                    literal,
+                    case_insensitive,
+                ))),
             }
         } else {
             LikeStrategy::Ordered {

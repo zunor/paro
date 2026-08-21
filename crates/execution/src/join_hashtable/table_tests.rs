@@ -1,3 +1,6 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
 use super::*;
 use paro_common::allocator::MemoryTag;
 use paro_common::memory::{MemoryDomain, MemoryOwner};
