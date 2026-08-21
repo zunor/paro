@@ -21,7 +21,10 @@ use crate::scalar::{
     function_data_fingerprint, BoundScalarFunction, ExpressionState, FunctionData, ScalarBindInput,
     ScalarFunction, ScalarFunctionSet,
 };
-use direct_decimal::{execute_direct_decimal_factor_rows, execute_direct_decimal_rows};
+use direct_decimal::{
+    execute_direct_decimal_factor_product_rows, execute_direct_decimal_factor_rows,
+    execute_direct_decimal_rows,
+};
 pub use direct_decimal::{try_execute_decimal_factor_chain, DecimalFactorChainPlan};
 use ethnum::i256;
 use paro_common::chunk::Chunk;
@@ -273,6 +276,32 @@ struct DecimalFactorFusionBindData {
     constant: i128,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct DecimalFactorProductFusionBindData {
+    factor: DecimalFactorFusionBindData,
+    product: BoundDecimalFusionOp,
+    outer: BoundDecimalFusionOp,
+    factor_side: DecimalOperandSide,
+}
+
+impl FunctionData for DecimalFactorProductFusionBindData {
+    fn clone_box(&self) -> Box<dyn FunctionData> {
+        Box::new(*self)
+    }
+
+    fn equals(&self, other: &dyn FunctionData) -> bool {
+        other.as_any().downcast_ref::<Self>() == Some(self)
+    }
+
+    fn fingerprint(&self) -> u64 {
+        function_data_fingerprint(self)
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
 impl FunctionData for DecimalFactorFusionBindData {
     fn clone_box(&self) -> Box<dyn FunctionData> {
         Box::new(*self)
@@ -403,6 +432,62 @@ pub fn try_decimal_factor_fusion(
             nested_side,
             constant_side,
             constant,
+        }),
+    )
+}
+
+/// Build one four-input DECIMAL kernel for an addition/subtraction between a
+/// constant-factor product and an ordinary product.
+///
+/// A canonical example is `price * (1 - discount) - cost * quantity`. Every
+/// bound arithmetic node remains in the witness, so scale conversion,
+/// precision checks, overflow behavior, and wide exact fallback are identical
+/// to evaluating the original expression tree.
+pub fn try_decimal_factor_product_fusion(
+    outer: &BoundScalarFunction,
+    factor: &BoundScalarFunction,
+    product: &BoundScalarFunction,
+    product_left_type: &LogicalType,
+    product_right_type: &LogicalType,
+    factor_side: DecimalOperandSide,
+) -> Option<BoundScalarFunction> {
+    let factor_plan = factor
+        .bind_data
+        .as_deref()?
+        .as_any()
+        .downcast_ref::<DecimalFactorFusionBindData>()
+        .copied()?;
+    let product_plan =
+        BoundDecimalFusionOp::try_from_bound(product, product_left_type, product_right_type)?;
+    if product_plan.op != DecimalArithmeticOp::Mul {
+        return None;
+    }
+    let (outer_left, outer_right) = match factor_side {
+        DecimalOperandSide::Left => (&factor.return_type, &product.return_type),
+        DecimalOperandSide::Right => (&product.return_type, &factor.return_type),
+    };
+    let outer_plan = BoundDecimalFusionOp::try_from_bound(outer, outer_left, outer_right)?;
+    if !matches!(
+        outer_plan.op,
+        DecimalArithmeticOp::Add | DecimalArithmeticOp::Sub
+    ) {
+        return None;
+    }
+    let mut arguments = factor.arguments.clone();
+    arguments.push(product_left_type.clone());
+    arguments.push(product_right_type.clone());
+    Some(
+        BoundScalarFunction::from(ScalarFunction::new(
+            "decimal_factor_product_fusion".to_string(),
+            arguments,
+            outer.return_type.clone(),
+            execute_decimal_factor_product_arithmetic,
+        ))
+        .with_bind_data(DecimalFactorProductFusionBindData {
+            factor: factor_plan,
+            product: product_plan,
+            outer: outer_plan,
+            factor_side,
         }),
     )
 }
@@ -645,6 +730,102 @@ fn execute_decimal_factor_arithmetic(
                 result.set_flat::<i128>(row, value);
             }
         }
+    }
+    Ok(())
+}
+
+fn execute_decimal_factor_product_arithmetic(
+    chunk: &Chunk,
+    state: &dyn ExpressionState,
+    result: &mut Vector,
+) -> Result<()> {
+    let plan = state
+        .bind_data()
+        .and_then(|data| {
+            data.as_any()
+                .downcast_ref::<DecimalFactorProductFusionBindData>()
+        })
+        .copied()
+        .ok_or_else(|| {
+            paro_error::internal("decimal factor-product fusion bind data is missing")
+        })?;
+    let [factor_outer, factor_inner, product_left, product_right] = chunk.data.as_slice() else {
+        return Err(paro_error::internal(
+            "decimal factor-product fusion requires four variable inputs",
+        ));
+    };
+    let LogicalType::Decimal { precision, .. } = result.logical_type().clone() else {
+        return Err(paro_error::internal(
+            "decimal factor-product fusion result is not DECIMAL",
+        ));
+    };
+    result.set_count(chunk.size());
+    let factor_outer = DecimalInputView::try_new(factor_outer, chunk.size())?;
+    let factor_inner = DecimalInputView::try_new(factor_inner, chunk.size())?;
+    let product_left = DecimalInputView::try_new(product_left, chunk.size())?;
+    let product_right = DecimalInputView::try_new(product_right, chunk.size())?;
+    let output = DecimalOutput::try_new(result)?;
+    if execute_direct_decimal_factor_product_rows(
+        &factor_outer,
+        &factor_inner,
+        &product_left,
+        &product_right,
+        output,
+        plan,
+        chunk.size(),
+    )? {
+        return Ok(());
+    }
+    for row in 0..chunk.size() {
+        if !factor_outer.is_valid(row)
+            || !factor_inner.is_valid(row)
+            || !product_left.is_valid(row)
+            || !product_right.is_valid(row)
+        {
+            result.try_set_null(row, true)?;
+            continue;
+        }
+        let factor_outer_value = factor_outer.value_at(row)?;
+        let factor_inner_value = factor_inner.value_at(row)?;
+        let product_left_value = product_left.value_at(row)?;
+        let product_right_value = product_right.value_at(row)?;
+        let fast = || -> Option<i128> {
+            let (factor, factor_failed) = plan.factor.evaluate_i64(
+                i64::try_from(factor_outer_value).ok()?,
+                i64::try_from(factor_inner_value).ok()?,
+            );
+            let (product, product_failed) = plan.product.evaluate_i64(
+                i64::try_from(product_left_value).ok()?,
+                i64::try_from(product_right_value).ok()?,
+            );
+            let (left, right) = match plan.factor_side {
+                DecimalOperandSide::Left => (factor, product),
+                DecimalOperandSide::Right => (product, factor),
+            };
+            let (value, outer_failed) = plan.outer.evaluate_i64(left, right);
+            (!(factor_failed || product_failed || outer_failed)).then_some(i128::from(value))
+        };
+        let value = match fast() {
+            Some(value) => value,
+            None => {
+                let factor = plan
+                    .factor
+                    .evaluate_exact(factor_outer_value, factor_inner_value)?;
+                let product = plan
+                    .product
+                    .evaluate_exact(product_left_value, product_right_value)?;
+                match plan.factor_side {
+                    DecimalOperandSide::Left => plan.outer.evaluate_exact(factor, product)?,
+                    DecimalOperandSide::Right => plan.outer.evaluate_exact(product, factor)?,
+                }
+            }
+        };
+        if precision <= 18 && i64::try_from(value).is_err() {
+            return Err(decimal_overflow(plan.outer.op));
+        }
+        // SAFETY: each bound stage enforces its declared precision and the
+        // output vector was sized to the input chunk above.
+        unsafe { output.write(row, value) };
     }
     Ok(())
 }

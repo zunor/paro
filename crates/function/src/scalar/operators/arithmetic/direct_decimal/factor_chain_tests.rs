@@ -9,9 +9,9 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
 use super::super::{
-    register_arithmetic_functions, try_decimal_factor_fusion, try_execute_decimal_factor_chain,
-    BoundScalarFunction, DecimalFactorChainPlan, DecimalOperandSide, ExpressionState, FunctionData,
-    ScalarBindInput, ScalarFunctionSet,
+    register_arithmetic_functions, try_decimal_factor_fusion, try_decimal_factor_product_fusion,
+    try_execute_decimal_factor_chain, BoundScalarFunction, DecimalFactorChainPlan,
+    DecimalOperandSide, ExpressionState, FunctionData, ScalarBindInput, ScalarFunctionSet,
 };
 
 struct BindState {
@@ -57,6 +57,16 @@ fn execute_fused_factor(function: &BoundScalarFunction, outer: Vector, inner: Ve
         bind_data: function.bind_data.as_ref().unwrap().clone(),
     };
     let chunk = paro_common::test_utils::test_chunk_from_vectors(vec![outer, inner]);
+    let mut result = paro_common::test_utils::test_vector(function.return_type.clone());
+    function.execute(&chunk, &state, &mut result).unwrap();
+    result
+}
+
+fn execute_fused_factor_product(function: &BoundScalarFunction, inputs: Vec<Vector>) -> Vector {
+    let state = BindState {
+        bind_data: function.bind_data.as_ref().unwrap().clone(),
+    };
+    let chunk = paro_common::test_utils::test_chunk_from_vectors(inputs);
     let mut result = paro_common::test_utils::test_vector(function.return_type.clone());
     function.execute(&chunk, &state, &mut result).unwrap();
     result
@@ -166,6 +176,80 @@ fn declines_decimal_constants_whose_value_scale_disagrees_with_declared_type() {
         DecimalOperandSide::Left,
     )
     .is_none());
+}
+
+#[test]
+fn factor_product_kernel_matches_profit_expression_and_null_semantics() {
+    let money_type = LogicalType::Decimal {
+        precision: 15,
+        scale: 2,
+    };
+    let rate_type = LogicalType::Decimal {
+        precision: 4,
+        scale: 2,
+    };
+    let factor_inner = bind_decimal_operator("-", &[LogicalType::Integer, rate_type.clone()]);
+    let factor_outer =
+        bind_decimal_operator("*", &[money_type.clone(), factor_inner.return_type.clone()]);
+    let factor = try_decimal_factor_fusion(
+        &factor_outer,
+        &factor_inner,
+        &Value::Integer(1),
+        &money_type,
+        &rate_type,
+        &LogicalType::Integer,
+        DecimalOperandSide::Right,
+        DecimalOperandSide::Left,
+    )
+    .expect("discounted revenue should fuse");
+    let product = bind_decimal_operator("*", &[money_type.clone(), money_type.clone()]);
+    let outer = bind_decimal_operator(
+        "-",
+        &[factor.return_type.clone(), product.return_type.clone()],
+    );
+    let fused = try_decimal_factor_product_fusion(
+        &outer,
+        &factor,
+        &product,
+        &money_type,
+        &money_type,
+        DecimalOperandSide::Left,
+    )
+    .expect("profit difference-of-products should fuse");
+
+    let mut prices = paro_common::test_utils::test_vector(money_type.clone());
+    prices.set_count(2);
+    prices.set_i64(0, 10_000);
+    prices.set_i64(1, 20_000);
+    let mut discounts = paro_common::test_utils::test_vector(rate_type);
+    discounts.set_count(2);
+    discounts.set_i64(0, 5);
+    discounts.set_i64(1, 10);
+    let mut costs = paro_common::test_utils::test_vector(money_type.clone());
+    costs.set_count(2);
+    costs.set_i64(0, 2_000);
+    costs.set_i64(1, 5_000);
+    let mut quantities = paro_common::test_utils::test_vector(money_type);
+    quantities.set_count(2);
+    quantities.set_i64(0, 300);
+    quantities.set_i64(1, 200);
+
+    let result = execute_fused_factor_product(
+        &fused,
+        vec![
+            prices.reference(),
+            discounts.reference(),
+            costs.reference(),
+            quantities.reference(),
+        ],
+    );
+    assert_eq!(unsafe { result.get_fixed::<i128>(0) }, 350_000);
+    assert_eq!(unsafe { result.get_fixed::<i128>(1) }, 800_000);
+
+    discounts.set_null(1, true);
+    let result = execute_fused_factor_product(&fused, vec![prices, discounts, costs, quantities]);
+    assert_eq!(unsafe { result.get_fixed::<i128>(0) }, 350_000);
+    assert!(result.is_null(1));
 }
 
 #[test]

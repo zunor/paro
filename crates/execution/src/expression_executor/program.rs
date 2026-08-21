@@ -15,7 +15,9 @@ use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_context::StatementContext;
 use paro_function::scalar::cast::BoundCastInfo;
-use paro_function::scalar::operators::arithmetic::{try_decimal_factor_fusion, DecimalOperandSide};
+use paro_function::scalar::operators::arithmetic::{
+    try_decimal_factor_fusion, try_decimal_factor_product_fusion, DecimalOperandSide,
+};
 use paro_function::scalar::{BoundScalarFunction, FunctionSideEffects, FunctionStability};
 use paro_planner::expression::{
     ComparisonType, ConjunctionType, Expression, ExpressionIterator, ExpressionVisitDecision,
@@ -721,6 +723,9 @@ impl<'a> ProgramCompiler<'a> {
     fn compile_expression_inner(&mut self, expr: &'a Expression) -> CompiledExpr {
         match expr {
             Expression::Function(expr) => {
+                if let Some(fused) = self.try_compile_decimal_factor_product_fusion(expr) {
+                    return fused;
+                }
                 if let Some(fused) = self.try_compile_decimal_factor_fusion(expr) {
                     return fused;
                 }
@@ -866,6 +871,89 @@ impl<'a> ProgramCompiler<'a> {
         &mut self,
         expr: &'a paro_planner::expression::FunctionExpression,
     ) -> Option<CompiledExpr> {
+        let (function, inputs) = self.try_bind_decimal_factor_fusion(expr)?;
+        let children = inputs.map(|input| self.compile_expression(input));
+        let cse_safe = children.iter().all(|child| child.cse_safe);
+        Some(CompiledExpr {
+            expr: PhysicalExpression::Function(PhysicalFunctionExpression {
+                function,
+                children: children.into_iter().map(|child| child.expr).collect(),
+                return_type: expr.return_type.clone(),
+            }),
+            cse_safe,
+        })
+    }
+
+    fn try_compile_decimal_factor_product_fusion(
+        &mut self,
+        expr: &'a paro_planner::expression::FunctionExpression,
+    ) -> Option<CompiledExpr> {
+        if expr.children.len() != 2
+            || expr.function.stability != FunctionStability::Consistent
+            || expr.function.side_effects != FunctionSideEffects::NoSideEffects
+        {
+            return None;
+        }
+        for factor_side in [DecimalOperandSide::Left, DecimalOperandSide::Right] {
+            let factor_idx = usize::from(factor_side == DecimalOperandSide::Right);
+            let product_idx = usize::from(factor_side == DecimalOperandSide::Left);
+            let Expression::Function(factor_expression) = &expr.children[factor_idx] else {
+                continue;
+            };
+            let Expression::Function(product_expression) = &expr.children[product_idx] else {
+                continue;
+            };
+            if product_expression.children.len() != 2
+                || product_expression.function.stability != FunctionStability::Consistent
+                || product_expression.function.side_effects != FunctionSideEffects::NoSideEffects
+                || self
+                    .shared_slots_by_identity
+                    .contains(self.fingerprints.identity(&expr.children[factor_idx]))
+                || self
+                    .shared_slots_by_identity
+                    .contains(self.fingerprints.identity(&expr.children[product_idx]))
+            {
+                continue;
+            }
+            let Some((factor_function, factor_inputs)) =
+                self.try_bind_decimal_factor_fusion(factor_expression)
+            else {
+                continue;
+            };
+            let Some(function) = try_decimal_factor_product_fusion(
+                &expr.function,
+                &factor_function,
+                &product_expression.function,
+                &product_expression.children[0].return_type(),
+                &product_expression.children[1].return_type(),
+                factor_side,
+            ) else {
+                continue;
+            };
+            let inputs = [
+                factor_inputs[0],
+                factor_inputs[1],
+                &product_expression.children[0],
+                &product_expression.children[1],
+            ];
+            let children = inputs.map(|input| self.compile_expression(input));
+            let cse_safe = children.iter().all(|child| child.cse_safe);
+            return Some(CompiledExpr {
+                expr: PhysicalExpression::Function(PhysicalFunctionExpression {
+                    function,
+                    children: children.into_iter().map(|child| child.expr).collect(),
+                    return_type: expr.return_type.clone(),
+                }),
+                cse_safe,
+            });
+        }
+        None
+    }
+
+    fn try_bind_decimal_factor_fusion(
+        &self,
+        expr: &'a paro_planner::expression::FunctionExpression,
+    ) -> Option<(BoundScalarFunction, [&'a Expression; 2])> {
         if expr.children.len() != 2
             || expr.function.stability != FunctionStability::Consistent
             || expr.function.side_effects != FunctionSideEffects::NoSideEffects
@@ -905,19 +993,13 @@ impl<'a> ProgramCompiler<'a> {
                 ) else {
                     continue;
                 };
-                let children = [
-                    self.compile_expression(&expr.children[outer_variable_idx]),
-                    self.compile_expression(&nested.children[inner_variable_idx]),
-                ];
-                let cse_safe = children.iter().all(|child| child.cse_safe);
-                return Some(CompiledExpr {
-                    expr: PhysicalExpression::Function(PhysicalFunctionExpression {
-                        function,
-                        children: children.into_iter().map(|child| child.expr).collect(),
-                        return_type: expr.return_type.clone(),
-                    }),
-                    cse_safe,
-                });
+                return Some((
+                    function,
+                    [
+                        &expr.children[outer_variable_idx],
+                        &nested.children[inner_variable_idx],
+                    ],
+                ));
             }
         }
         None
@@ -1254,5 +1336,54 @@ mod tests {
         assert_eq!(chain.consumer_output, 1);
         assert_eq!(chain.shared_slot, 0);
         assert_eq!(chain.consumer_shared_side, DecimalOperandSide::Left);
+    }
+
+    #[test]
+    fn decimal_factor_product_expression_compiles_to_one_four_input_kernel() {
+        let money = LogicalType::Decimal {
+            precision: 15,
+            scale: 2,
+        };
+        let rate = LogicalType::Decimal {
+            precision: 4,
+            scale: 2,
+        };
+        let discount = bind_decimal("-", &[LogicalType::Integer, rate.clone()]);
+        let discount_expr = Expression::Function(FunctionExpression::new(
+            discount.clone(),
+            vec![integer_one(), reference(1, rate)],
+            discount.return_type.clone(),
+        ));
+        let revenue = bind_decimal("*", &[money.clone(), discount.return_type.clone()]);
+        let revenue_expr = Expression::Function(FunctionExpression::new(
+            revenue.clone(),
+            vec![reference(0, money.clone()), discount_expr],
+            revenue.return_type.clone(),
+        ));
+        let cost = bind_decimal("*", &[money.clone(), money.clone()]);
+        let cost_expr = Expression::Function(FunctionExpression::new(
+            cost.clone(),
+            vec![reference(2, money.clone()), reference(3, money)],
+            cost.return_type.clone(),
+        ));
+        let profit = bind_decimal(
+            "-",
+            &[revenue.return_type.clone(), cost.return_type.clone()],
+        );
+        let profit_expr = Expression::Function(FunctionExpression::new(
+            profit.clone(),
+            vec![revenue_expr, cost_expr],
+            profit.return_type.clone(),
+        ));
+
+        let program = PhysicalExpressionProgram::compile(
+            &[profit_expr],
+            ExpressionProgramVersion::anonymous(),
+        );
+        let PhysicalExpression::Function(root) = program.root(0) else {
+            panic!("profit expression should compile to a function kernel")
+        };
+        assert_eq!(root.function.name, "decimal_factor_product_fusion");
+        assert_eq!(root.children.len(), 4);
     }
 }

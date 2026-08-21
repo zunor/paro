@@ -777,6 +777,151 @@ pub(super) fn execute_direct_decimal_factor_rows(
     }
 }
 
+pub(super) fn execute_direct_decimal_factor_product_rows(
+    factor_outer: &DecimalInputView<'_>,
+    factor_inner: &DecimalInputView<'_>,
+    product_left: &DecimalInputView<'_>,
+    product_right: &DecimalInputView<'_>,
+    output: DecimalOutput,
+    plan: DecimalFactorProductFusionBindData,
+    count: usize,
+) -> Result<bool> {
+    if PreparedCommonFactor::try_new(plan.factor).is_none() {
+        return Ok(false);
+    }
+    macro_rules! execute_four {
+        ($factor_outer:expr, $factor_inner:expr, $product_left:expr, $product_right:expr) => {{
+            match output {
+                DecimalOutput::I64(output) => execute_decimal_factor_product_loop(
+                    $factor_outer,
+                    $factor_inner,
+                    $product_left,
+                    $product_right,
+                    DirectI64Writer(output),
+                    plan,
+                    count,
+                )?,
+                DecimalOutput::I128(output) => execute_decimal_factor_product_loop(
+                    $factor_outer,
+                    $factor_inner,
+                    $product_left,
+                    $product_right,
+                    DirectI128Writer(output),
+                    plan,
+                    count,
+                )?,
+            }
+            return Ok(true);
+        }};
+    }
+
+    match (
+        &factor_outer.access,
+        &factor_inner.access,
+        &product_left.access,
+        &product_right.access,
+    ) {
+        (
+            DecimalInputAccess::DirectI64(factor_outer),
+            DecimalInputAccess::DirectI64(factor_inner),
+            DecimalInputAccess::DirectI64(product_left),
+            DecimalInputAccess::DirectI64(product_right),
+        ) => execute_four!(
+            DirectI64Reader(*factor_outer),
+            DirectI64Reader(*factor_inner),
+            DirectI64Reader(*product_left),
+            DirectI64Reader(*product_right)
+        ),
+        (
+            DecimalInputAccess::SelectedI64(factor_outer),
+            DecimalInputAccess::SelectedI64(factor_inner),
+            DecimalInputAccess::SelectedI64(product_left),
+            DecimalInputAccess::SelectedI64(product_right),
+        ) => {
+            let (Some(factor_outer), Some(factor_inner), Some(product_left), Some(product_right)) = (
+                DirectMaterializedI64Reader::try_new(factor_outer),
+                DirectMaterializedI64Reader::try_new(factor_inner),
+                DirectMaterializedI64Reader::try_new(product_left),
+                DirectMaterializedI64Reader::try_new(product_right),
+            ) else {
+                return Ok(false);
+            };
+            execute_four!(factor_outer, factor_inner, product_left, product_right)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_decimal_factor_product_loop<A, B, C, D, W>(
+    factor_outer: A,
+    factor_inner: B,
+    product_left: C,
+    product_right: D,
+    output: W,
+    plan: DecimalFactorProductFusionBindData,
+    count: usize,
+) -> Result<()>
+where
+    A: DirectFusionDecimalReader,
+    B: DirectFusionDecimalReader,
+    C: DirectFusionDecimalReader,
+    D: DirectFusionDecimalReader,
+    W: DirectDecimalWriter,
+{
+    let Some(factor) = PreparedCommonFactor::try_new(plan.factor) else {
+        return Err(paro_error::internal(
+            "factor-product direct kernel lost its validated factor plan",
+        ));
+    };
+    let mut invalid = false;
+    for row in 0..count {
+        let (factor_outer_value, factor_outer_wide) = unsafe { factor_outer.read_narrow(row) };
+        let (factor_inner_value, factor_inner_wide) = unsafe { factor_inner.read_narrow(row) };
+        let (product_left_value, product_left_wide) = unsafe { product_left.read_narrow(row) };
+        let (product_right_value, product_right_wide) = unsafe { product_right.read_narrow(row) };
+        let (factor_value, factor_failed) = factor.evaluate(factor_outer_value, factor_inner_value);
+        let (product_value, product_failed) = plan
+            .product
+            .evaluate_i64(product_left_value, product_right_value);
+        let (left, right) = match plan.factor_side {
+            DecimalOperandSide::Left => (factor_value, product_value),
+            DecimalOperandSide::Right => (product_value, factor_value),
+        };
+        let (value, outer_failed) = plan.outer.evaluate_i64(left, right);
+        invalid |= factor_outer_wide
+            | factor_inner_wide
+            | product_left_wide
+            | product_right_wide
+            | factor_failed
+            | product_failed
+            | outer_failed;
+        unsafe { output.write(row, i128::from(value)) };
+    }
+    if !invalid {
+        return Ok(());
+    }
+
+    for row in 0..count {
+        let factor = plan
+            .factor
+            .evaluate_exact(unsafe { factor_outer.read(row) }, unsafe {
+                factor_inner.read(row)
+            })?;
+        let product = plan
+            .product
+            .evaluate_exact(unsafe { product_left.read(row) }, unsafe {
+                product_right.read(row)
+            })?;
+        let value = match plan.factor_side {
+            DecimalOperandSide::Left => plan.outer.evaluate_exact(factor, product)?,
+            DecimalOperandSide::Right => plan.outer.evaluate_exact(product, factor)?,
+        };
+        unsafe { output.write(row, value) };
+    }
+    Ok(())
+}
+
 fn execute_decimal_factor_pair<O, I, W>(
     outer: O,
     inner: I,
