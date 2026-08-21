@@ -175,7 +175,7 @@ mod tests {
                 &self,
                 _statement_token: &CancellationToken,
                 _cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
-                _timeout_lifetime: &Arc<CancellationToken>,
+                _timeout_lifetime: &CancellationToken,
                 _timeout: Duration,
             ) {
                 self.arms.fetch_add(1, Ordering::SeqCst);

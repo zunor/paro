@@ -15,7 +15,7 @@ impl StatementTimeoutDriver for TokioStatementTimeoutDriver {
         &self,
         statement_token: &CancellationToken,
         cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
-        timeout_lifetime: &Arc<CancellationToken>,
+        timeout_lifetime: &CancellationToken,
         timeout: Duration,
     ) {
         let statement_token = statement_token.clone();

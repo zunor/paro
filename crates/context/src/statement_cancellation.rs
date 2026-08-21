@@ -12,7 +12,7 @@ pub trait StatementTimeoutDriver: Send + Sync {
         &self,
         _statement_token: &CancellationToken,
         _cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
-        _timeout_lifetime: &Arc<CancellationToken>,
+        _timeout_lifetime: &CancellationToken,
         _timeout: Duration,
     ) {
     }
@@ -29,6 +29,24 @@ pub enum StatementCancelReason {
     StatementTimeout,
 }
 
+struct TimeoutLifetime {
+    token: CancellationToken,
+}
+
+impl TimeoutLifetime {
+    fn new() -> Self {
+        Self {
+            token: CancellationToken::new(),
+        }
+    }
+}
+
+impl Drop for TimeoutLifetime {
+    fn drop(&mut self) {
+        self.token.cancel();
+    }
+}
+
 #[derive(Clone)]
 pub struct StatementCancellation {
     connection_token: CancellationToken,
@@ -36,7 +54,7 @@ pub struct StatementCancellation {
     statement_timeout: Option<Duration>,
     cancel_reason: Arc<OnceLock<StatementCancelReason>>,
     timeout_driver: Arc<dyn StatementTimeoutDriver>,
-    timeout_lifetime: Arc<CancellationToken>,
+    _timeout_lifetime: Arc<TimeoutLifetime>,
 }
 
 impl std::fmt::Debug for StatementCancellation {
@@ -79,9 +97,14 @@ impl StatementCancellation {
         cancel_reason: Arc<OnceLock<StatementCancelReason>>,
         timeout_driver: Arc<dyn StatementTimeoutDriver>,
     ) -> Self {
-        let timeout_lifetime = Arc::new(CancellationToken::new());
+        let timeout_lifetime = Arc::new(TimeoutLifetime::new());
         if let Some(timeout) = statement_timeout {
-            timeout_driver.arm(&statement_token, &cancel_reason, &timeout_lifetime, timeout);
+            timeout_driver.arm(
+                &statement_token,
+                &cancel_reason,
+                &timeout_lifetime.token,
+                timeout,
+            );
         }
         Self {
             connection_token,
@@ -89,7 +112,7 @@ impl StatementCancellation {
             statement_timeout,
             cancel_reason,
             timeout_driver,
-            timeout_lifetime,
+            _timeout_lifetime: timeout_lifetime,
         }
     }
 
@@ -138,18 +161,11 @@ impl StatementCancellation {
     }
 }
 
-impl Drop for StatementCancellation {
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.timeout_lifetime) == 1 {
-            self.timeout_lifetime.cancel();
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[derive(Default)]
     struct RecordingTimeoutDriver {
@@ -161,11 +177,52 @@ mod tests {
             &self,
             _statement_token: &CancellationToken,
             _cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
-            _timeout_lifetime: &Arc<CancellationToken>,
+            _timeout_lifetime: &CancellationToken,
             _timeout: Duration,
         ) {
             self.arms.fetch_add(1, Ordering::SeqCst);
         }
+    }
+
+    #[derive(Default)]
+    struct CapturingTimeoutDriver {
+        timeout_lifetime: Mutex<Option<CancellationToken>>,
+    }
+
+    impl StatementTimeoutDriver for CapturingTimeoutDriver {
+        fn arm(
+            &self,
+            _statement_token: &CancellationToken,
+            _cancel_reason: &Arc<OnceLock<StatementCancelReason>>,
+            timeout_lifetime: &CancellationToken,
+            _timeout: Duration,
+        ) {
+            *self.timeout_lifetime.lock().unwrap() = Some(timeout_lifetime.clone());
+        }
+    }
+
+    #[test]
+    fn timeout_lifetime_ends_exactly_when_the_last_cancellation_clone_drops() {
+        let driver = Arc::new(CapturingTimeoutDriver::default());
+        let cancellation = StatementCancellation::with_timeout_driver(
+            CancellationToken::new(),
+            Some(Duration::from_secs(1)),
+            driver.clone(),
+        );
+        let second = cancellation.clone();
+        let third = cancellation.clone();
+        let timeout_lifetime = driver
+            .timeout_lifetime
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("timeout driver should capture its lifetime");
+
+        drop(cancellation);
+        drop(second);
+        assert!(!timeout_lifetime.is_cancelled());
+        drop(third);
+        assert!(timeout_lifetime.is_cancelled());
     }
 
     #[test]
