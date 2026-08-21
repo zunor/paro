@@ -551,7 +551,7 @@ fn try_filter_seed_i64_batch(
                 filter_i64_range_inclusive_avx2(batch.data.as_ptr(), lower, upper, rows, selection)
             };
         }
-        return false;
+        false
     }
 
     #[cfg(not(any(
@@ -1011,7 +1011,7 @@ fn try_filter_seed_i32_batch(
                 filter_i32_range_inclusive_avx2(batch.data.as_ptr(), lower, upper, rows, selection)
             };
         }
-        return false;
+        false
     }
 
     #[cfg(not(any(
