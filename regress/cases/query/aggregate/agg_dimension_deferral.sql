@@ -6,12 +6,17 @@
 -- one payload so the final merge aggregate is correctness-bearing.
 -- @setup
 DROP TABLE IF EXISTS agg_defer_fact;
+DROP TABLE IF EXISTS agg_defer_plan_dimension;
 DROP TABLE IF EXISTS agg_defer_dimension;
 CREATE TABLE agg_defer_dimension (
     key_a BIGINT,
     key_b BIGINT,
     payload VARCHAR,
     PRIMARY KEY (key_a, key_b)
+);
+CREATE TABLE agg_defer_plan_dimension (
+    key_a BIGINT PRIMARY KEY,
+    payload VARCHAR
 );
 CREATE TABLE agg_defer_fact (
     key_a BIGINT,
@@ -24,6 +29,8 @@ INSERT INTO agg_defer_dimension VALUES
     (2, 2, 'same'),
     (3, 3, NULL),
     (4, 4, 'other');
+INSERT INTO agg_defer_plan_dimension
+SELECT key_a, payload FROM agg_defer_dimension;
 INSERT INTO agg_defer_fact
 SELECT 1, 1, 10, true FROM generate_series(1, 2000) AS generated(i);
 INSERT INTO agg_defer_fact
@@ -36,6 +43,18 @@ INSERT INTO agg_defer_fact
 SELECT NULL, NULL, 100, true FROM generate_series(1, 2000) AS generated(i);
 INSERT INTO agg_defer_fact
 SELECT 9, 9, 200, true FROM generate_series(1, 2000) AS generated(i);
+
+-- Plan-shape coverage keeps the cost gate honest: the wide dimension payload
+-- must be attached between a compact partial aggregate and the final merge.
+EXPLAIN SELECT
+    d.payload,
+    count(*) AS row_count,
+    sum(f.amount) AS total_amount,
+    sum(f.amount) FILTER (WHERE f.keep) AS kept_amount
+FROM agg_defer_fact AS f
+JOIN agg_defer_plan_dimension AS d
+  ON f.key_a = d.key_a
+GROUP BY d.payload;
 
 SELECT
     d.payload,
@@ -64,4 +83,5 @@ ORDER BY d.payload NULLS LAST, f.keep;
 
 -- @teardown
 DROP TABLE IF EXISTS agg_defer_fact;
+DROP TABLE IF EXISTS agg_defer_plan_dimension;
 DROP TABLE IF EXISTS agg_defer_dimension;

@@ -57,6 +57,7 @@ enum ExpressionDomain {
 
 struct DimensionDeferral {
     projection_depth: usize,
+    dimension: PreparedDimension,
     partial_groups: Vec<Expression>,
     outer_groups: Vec<DeferredOuterGroup>,
     partial_aggregates: Vec<Expression>,
@@ -93,21 +94,24 @@ fn rewrite_node(
     bind_context: &BindContext,
     cost_model: &CostModel,
 ) -> Result<(LogicalPlan, bool)> {
-    let Some(witness) = recognize(&plan, cost_model) else {
-        return Ok((plan, false));
-    };
-    let Some(dimension) = prepare_dimension_copy(&plan, witness.projection_depth, bind_context)
-    else {
+    let Some(witness) = recognize_and_prepare(&plan, bind_context, cost_model) else {
         return Ok((plan, false));
     };
     let input = match DimensionRewriteInput::from_plan(plan, witness.projection_depth) {
         Ok(input) => input,
         Err(plan) => return Ok((*plan, false)),
     };
-    Ok((apply(input, witness, dimension, bind_context), true))
+    Ok((apply(input, witness, bind_context), true))
 }
 
-fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDeferral> {
+/// Prove the rewrite and prepare its independently-bound dimension copy only
+/// after the cost gate accepts it. The resulting witness owns every resource
+/// needed by the total mutation phase below.
+fn recognize_and_prepare(
+    plan: &LogicalPlan,
+    bind_context: &BindContext,
+    cost_model: &CostModel,
+) -> Option<DimensionDeferral> {
     let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
         return None;
     };
@@ -327,8 +331,22 @@ fn recognize(plan: &LogicalPlan, cost_model: &CostModel) -> Option<DimensionDefe
         return None;
     }
 
+    let old_bindings = join.right.get_column_bindings();
+    let copied_dimension = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
+    let new_bindings = copied_dimension.get_column_bindings();
+    debug_assert_eq!(old_bindings.len(), new_bindings.len());
+    let binding_map = old_bindings
+        .into_iter()
+        .zip(new_bindings)
+        .collect::<HashMap<_, _>>();
+    debug_assert!(binding_map.iter().all(|(old, new)| old != new));
+
     Some(DimensionDeferral {
         projection_depth: projections.len(),
+        dimension: PreparedDimension {
+            plan: copied_dimension,
+            binding_map,
+        },
         partial_groups,
         outer_groups,
         partial_aggregates,
@@ -429,47 +447,9 @@ fn take_join_below_projections(
     }
 }
 
-fn prepare_dimension_copy(
-    plan: &LogicalPlan,
-    projection_depth: usize,
-    bind_context: &BindContext,
-) -> Option<PreparedDimension> {
-    let LogicalOperator::Aggregate(aggregate) = &plan.operator else {
-        return None;
-    };
-    let mut child = aggregate.child.as_ref();
-    for _ in 0..projection_depth {
-        let LogicalOperator::Projection(projection) = &child.operator else {
-            return None;
-        };
-        child = projection.child.as_ref();
-    }
-    let LogicalOperator::Join(Join::Comparison(join)) = &child.operator else {
-        return None;
-    };
-    let old_bindings = join.right.get_column_bindings();
-    let copied = deep_copy_plan(join.right.as_ref(), bind_context.shared().as_ref());
-    let new_bindings = copied.get_column_bindings();
-    if old_bindings.len() != new_bindings.len() {
-        return None;
-    }
-    let binding_map = old_bindings
-        .into_iter()
-        .zip(new_bindings)
-        .collect::<HashMap<_, _>>();
-    if binding_map.iter().any(|(old, new)| old == new) {
-        return None;
-    }
-    Some(PreparedDimension {
-        plan: copied,
-        binding_map,
-    })
-}
-
 fn apply(
     input: DimensionRewriteInput,
     witness: DimensionDeferral,
-    dimension: PreparedDimension,
     bind_context: &BindContext,
 ) -> LogicalPlan {
     let DimensionRewriteInput {
@@ -480,6 +460,15 @@ fn apply(
         join_stats,
         mut join,
     } = input;
+    let DimensionDeferral {
+        projection_depth: _,
+        dimension,
+        partial_groups,
+        outer_groups,
+        partial_aggregates,
+        merge_functions,
+        fact_conditions,
+    } = witness;
     let partial_group_index = bind_context.generate_table_index();
     let partial_aggregate_index = bind_context.generate_table_index();
     let partial_groupings_index = bind_context.generate_table_index();
@@ -488,6 +477,35 @@ fn apply(
         condition.left = remap_bindings(condition.left.clone(), &dimension.binding_map);
         condition.right = remap_bindings(condition.right.clone(), &dimension.binding_map);
     }
+    debug_assert_eq!(final_conditions.len(), fact_conditions.len());
+    for (condition, rewrite) in final_conditions.iter_mut().zip(&fact_conditions) {
+        let fact_expression = if rewrite.fact_on_left {
+            &mut condition.left
+        } else {
+            &mut condition.right
+        };
+        debug_assert!(partial_groups
+            .get(rewrite.key_ordinal)
+            .is_some_and(|group| fact_expression.equals(group)));
+        *fact_expression = Expression::ColumnRef(ColumnRefExpression::new(
+            ColumnBinding::new(partial_group_index, rewrite.key_ordinal),
+            fact_expression.return_type(),
+        ));
+    }
+    let outer_groups = outer_groups
+        .into_iter()
+        .map(|group| match group {
+            DeferredOuterGroup::Dimension(expression) => {
+                remap_bindings(*expression, &dimension.binding_map)
+            }
+            DeferredOuterGroup::Partial { ordinal } => {
+                Expression::ColumnRef(ColumnRefExpression::new(
+                    ColumnBinding::new(partial_group_index, ordinal),
+                    partial_groups[ordinal].return_type(),
+                ))
+            }
+        })
+        .collect();
     // Preserve the original inner join below the partial aggregate so fact
     // expressions retain their SQL error/evaluation domain. The declared key
     // proves that filtering join cannot multiply facts; its descriptive
@@ -496,7 +514,7 @@ fn apply(
     join.right_projection_map = ProjectionMap::none();
     let filtered_fact = LogicalPlan {
         id: join_id,
-        stats: join_stats.clone(),
+        stats: join_stats,
         operator: LogicalOperator::Join(Join::Comparison(join)),
     };
     let partial = LogicalPlan::new(
@@ -506,48 +524,16 @@ fn apply(
             partial_aggregate_index,
             partial_groupings_index,
             filtered_fact,
-            witness.partial_groups.clone(),
+            partial_groups,
             vec![],
-            witness.partial_aggregates,
+            partial_aggregates,
             vec![],
         )),
     );
-    let mut final_join =
+    let final_join =
         ComparisonJoin::new(JoinType::Inner, partial, dimension.plan, final_conditions);
 
-    for (condition, rewrite) in final_join
-        .conditions
-        .iter_mut()
-        .zip(&witness.fact_conditions)
-    {
-        let fact_expression = if rewrite.fact_on_left {
-            &mut condition.left
-        } else {
-            &mut condition.right
-        };
-        *fact_expression = Expression::ColumnRef(ColumnRefExpression::new(
-            ColumnBinding::new(partial_group_index, rewrite.key_ordinal),
-            fact_expression.return_type(),
-        ));
-    }
-
-    let outer_groups = witness
-        .outer_groups
-        .into_iter()
-        .map(|group| match group {
-            DeferredOuterGroup::Dimension(expression) => {
-                remap_bindings(*expression, &dimension.binding_map)
-            }
-            DeferredOuterGroup::Partial { ordinal } => {
-                Expression::ColumnRef(ColumnRefExpression::new(
-                    ColumnBinding::new(partial_group_index, ordinal),
-                    witness.partial_groups[ordinal].return_type(),
-                ))
-            }
-        })
-        .collect();
-    let outer_aggregates = witness
-        .merge_functions
+    let outer_aggregates = merge_functions
         .into_iter()
         .enumerate()
         .map(|(aggregate_index, merge)| {
@@ -677,14 +663,7 @@ pub(super) fn carrier_work_upper_bound(plan: &LogicalPlan) -> u64 {
             .estimated_cardinality
             .map_or(0, |estimate| estimate.expected);
     }
-    let children = plan.children();
-    if children.is_empty() {
-        return plan
-            .stats
-            .estimated_cardinality
-            .map_or(0, |estimate| estimate.expected);
-    }
-    children
+    plan.children()
         .into_iter()
         .map(carrier_work_upper_bound)
         .max()
