@@ -125,16 +125,17 @@ impl JoinBuildHandle {
         Ok(())
     }
 
-    pub(crate) fn share_build_time_integer_builder(
+    /// Install an optional build-time index builder once. Concurrent pipeline
+    /// initialization may construct more than one candidate, but local states
+    /// subsequently read the single published winner from this handle.
+    pub(crate) fn install_build_time_integer_builder(
         &self,
         builder: Arc<BuildTimeIntegerIndexBuilder>,
-    ) -> Arc<BuildTimeIntegerIndexBuilder> {
+    ) {
         let mut state = self.build_time_integer_builder.lock();
-        if let Some(existing) = state.as_ref() {
-            return Arc::clone(existing);
+        if state.is_none() {
+            *state = Some(builder);
         }
-        *state = Some(Arc::clone(&builder));
-        builder
     }
 
     pub(crate) fn build_time_integer_builder(&self) -> Option<Arc<BuildTimeIntegerIndexBuilder>> {

@@ -58,6 +58,10 @@ fn materialize_inputs(
 ) -> bool {
     let mut changed = false;
     let mut rejected = Vec::<Expression>::new();
+    // Every success replaces at least one candidate occurrence with a passive
+    // ColumnRef, while `rejected` prevents retrying unchanged failures. A
+    // successful binding rewrite can change the remaining candidates' lowest
+    // complete domain, so only then is the rejection set deliberately reset.
     loop {
         let candidate = aggregates.iter().find_map(|expression| {
             let Expression::Aggregate(aggregate) = expression else {
@@ -256,14 +260,15 @@ fn include_materialized_binding(
         .get_column_bindings()
         .iter()
         .position(|candidate| *candidate == binding);
-    debug_assert!(output_ordinal.is_some());
-    // `binding` is the append-only output constructed by `wrap_projection`;
-    // every recursive frame above has already preserved it. The release
-    // fallback is intentionally All rather than a stale positional map.
+    debug_assert!(
+        output_ordinal.is_some(),
+        "materialized aggregate binding must remain in every child domain"
+    );
+    // The binding is the append-only output constructed by `wrap_projection`;
+    // every recursive frame above has already preserved it. Do not silently
+    // widen a positional contract if that construction invariant drifts.
     if let Some(output_ordinal) = output_ordinal {
         projection.include(output_ordinal);
-    } else {
-        *projection = paro_planner::operator::ProjectionMap::all();
     }
 }
 

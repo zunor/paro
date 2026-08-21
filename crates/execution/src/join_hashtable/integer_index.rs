@@ -17,7 +17,7 @@ use paro_common::hash::{combine_hash, hash_i64, hash_u128, hash_u64, HASH_SEED, 
 use paro_common::memory::{GrantBuffer, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use paro_common::vector::{Vector, VectorView};
+use paro_common::vector::{DataRef, Vector, VectorView};
 use paro_storage::row::codec::unsafe_api;
 use paro_storage::row::RowLayout;
 
@@ -96,15 +96,20 @@ impl IntegerKeyKind {
     /// Staying in the physical domain avoids constructing a tagged [`Value`]
     /// for every retained row merely to recover the same integer ordinal.
     fn vector_ordinal(self, view: &VectorView<'_>, row_idx: usize) -> Option<u128> {
+        debug_assert_eq!(
+            Self::from_logical_type(view.logical_type()),
+            Some(self),
+            "integer index key kind must match its prepared vector"
+        );
         if !view.is_valid(row_idx) {
             return None;
         }
+        let DataRef::Ptr(data) = view.data() else {
+            return self.sequence_ordinal(view, row_idx);
+        };
         macro_rules! read {
             ($ty:ty) => {{
-                let Some(data) = view.get_data::<$ty>() else {
-                    return self.sequence_ordinal(view, row_idx);
-                };
-                unsafe { *data.add(view.physical_index(row_idx)) }
+                unsafe { *(data as *const $ty).add(view.physical_index(row_idx)) }
             }};
         }
         Some(match self {
@@ -124,19 +129,11 @@ impl IntegerKeyKind {
     }
 
     fn sequence_ordinal(self, view: &VectorView<'_>, row_idx: usize) -> Option<u128> {
-        matches!(
-            self,
-            Self::TinyInt
-                | Self::SmallInt
-                | Self::Integer
-                | Self::BigInt
-                | Self::HugeInt
-                | Self::Date
-                | Self::Timestamp
-                | Self::TimestampTz
-                | Self::Time
-        )
-        .then(|| signed_ordinal(view.get_i64(row_idx) as i128))
+        debug_assert!(matches!(view.data(), DataRef::SequenceI64 { .. }));
+        // Sequence vectors have one canonical representation and logical type:
+        // i64-backed BIGINT. Keep this boundary explicit so a future pointer
+        // representation cannot fall through into an i64 reinterpretation.
+        (self == Self::BigInt).then(|| signed_ordinal(view.get_i64(row_idx) as i128))
     }
 
     /// Read a key directly from its serialized build row.
@@ -1644,6 +1641,15 @@ mod tests {
                 .and_then(|offset| usize::try_from(offset).ok()),
             Some(u32::MAX as usize)
         );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "integer index key kind must match its prepared vector")]
+    fn vector_ordinal_rejects_a_mismatched_physical_key_domain() {
+        let vector = paro_common::test_utils::test_i64_vector(&[7]);
+        let view = vector.try_to_view(1).expect("bigint view");
+        let _ = IntegerKeyKind::Integer.vector_ordinal(&view, 0);
     }
 
     #[test]

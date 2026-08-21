@@ -1,0 +1,33 @@
+DROP TABLE IF EXISTS agg_input_materialization_keys;
+DROP TABLE
+
+CREATE TABLE agg_input_materialization_fact (
+    key INTEGER,
+    left_value DECIMAL(38, 20),
+    right_value DECIMAL(38, 20)
+);
+CREATE TABLE
+
+CREATE TABLE agg_input_materialization_keys (key INTEGER);
+CREATE TABLE
+
+INSERT INTO agg_input_materialization_fact VALUES
+    (1,
+     CAST('0.1' AS DECIMAL(38, 20)),
+     CAST('0.1' AS DECIMAL(38, 20))),
+    (2,
+     CAST('1' AS DECIMAL(38, 20)),
+     CAST('1' AS DECIMAL(38, 20)));
+INSERT 0 2
+
+INSERT INTO agg_input_materialization_keys VALUES (1);
+INSERT 0 1
+
+SELECT sum(f.left_value * f.right_value) AS safe_product
+FROM agg_input_materialization_fact AS f
+JOIN agg_input_materialization_keys AS k ON f.key = k.key;
+safe_product
+0.01000000000000000000000000000000000000
+
+DROP TABLE IF EXISTS agg_input_materialization_keys;
+DROP TABLE

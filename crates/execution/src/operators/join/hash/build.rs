@@ -82,7 +82,7 @@ impl HashJoinBuildSinkExec {
                     Err(error) => return Err(error),
                 };
                 if let Some(builder) = builder {
-                    handle.share_build_time_integer_builder(Arc::new(builder));
+                    handle.install_build_time_integer_builder(Arc::new(builder));
                 }
             }
         }
