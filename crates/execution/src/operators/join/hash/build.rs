@@ -72,6 +72,7 @@ impl HashJoinBuildSinkExec {
                     &index.minimum,
                     &index.maximum,
                     index.estimated_rows,
+                    self.build_keys_unique,
                     ctx.query.allocator(MemoryTag::HashTable),
                     &hash_join_memory_context(ctx.query)
                         .with_class(paro_common::memory::MemoryAccountingClass::NonRevocable),

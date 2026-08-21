@@ -492,6 +492,7 @@ enum ConcurrentBuildTimeIntegerIndexStrategy {
 /// pass at finish without decoding the serialized build store again.
 pub(crate) struct ConcurrentBuildTimeIntegerIndexBuilder {
     strategy: ConcurrentBuildTimeIntegerIndexStrategy,
+    build_keys_unique: bool,
     has_long_chains: AtomicBool,
     invalidated: AtomicBool,
 }
@@ -533,6 +534,7 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         minimum: &Value,
         maximum: &Value,
         build_count: usize,
+        build_keys_unique: bool,
         allocator: Arc<dyn Allocator>,
         memory: &MemoryAccountingContext,
     ) -> Result<Option<Self>> {
@@ -568,6 +570,7 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         };
         Ok(Some(Self {
             strategy,
+            build_keys_unique,
             has_long_chains: AtomicBool::new(false),
             invalidated: AtomicBool::new(false),
         }))
@@ -609,7 +612,6 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         key: &VectorView<'_>,
         source_row: usize,
         row_ptr: usize,
-        unique: bool,
         mut link: impl FnMut(usize, usize),
     ) -> Result<()> {
         if self.invalidated.load(Ordering::Relaxed) {
@@ -623,7 +625,11 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         match &self.strategy {
             ConcurrentBuildTimeIntegerIndexStrategy::Direct(builder) => {
                 let ordinal = builder.domain.kind.vector_ordinal(key, source_row);
-                let previous = match builder.insert_planned_ordinal(ordinal, row_ptr, unique)? {
+                let previous = match builder.insert_planned_ordinal(
+                    ordinal,
+                    row_ptr,
+                    self.build_keys_unique,
+                )? {
                     PlannedIntegerInsert::Inserted(previous) => previous,
                     PlannedIntegerInsert::DomainChanged => {
                         self.invalidated.store(true, Ordering::Release);
@@ -642,7 +648,12 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                     .ok_or_else(|| paro_error::internal("ranked join batch has no row range"))?
                     + batch_row;
                 let ordinal = builder.domain.kind.vector_ordinal(key, source_row);
-                match builder.record_planned_ordinal(row_slot, ordinal, row_ptr, unique) {
+                match builder.record_planned_ordinal(
+                    row_slot,
+                    ordinal,
+                    row_ptr,
+                    self.build_keys_unique,
+                ) {
                     Ok(true) => Ok(()),
                     Ok(false) => {
                         self.invalidated.store(true, Ordering::Release);
@@ -686,7 +697,7 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                 (builder.finish_build_time(), false)
             }
             ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) => {
-                match builder.finish(&mut link) {
+                match builder.finish(self.build_keys_unique, &mut link) {
                     Ok(result) => result,
                     // Rank and pointer arrays are allocated only after the actual
                     // distinct count is known. If that bounded allocation loses a
@@ -818,19 +829,18 @@ impl ConcurrentRankedIntegerIndexBuilder {
                     row_ptr,
                 },
             );
-            let word = self
-                .bits
-                .as_ptr()
-                .cast::<AtomicU64>()
-                .add(domain_index as usize / u64::BITS as usize);
-            let previous = (&*word).fetch_or(
-                1_u64 << (domain_index as usize % u64::BITS as usize),
-                Ordering::Relaxed,
-            );
-            if unique && previous & (1_u64 << (domain_index as usize % u64::BITS as usize)) != 0 {
-                return Err(paro_error::internal(
-                    "declared-unique integer join key produced duplicate build rows",
-                ));
+            if unique {
+                let word = self
+                    .bits
+                    .as_ptr()
+                    .cast::<AtomicU64>()
+                    .add(domain_index as usize / u64::BITS as usize);
+                let bit = 1_u64 << (domain_index as usize % u64::BITS as usize);
+                if (&*word).fetch_or(bit, Ordering::Relaxed) & bit != 0 {
+                    return Err(paro_error::internal(
+                        "declared-unique integer join key produced duplicate build rows",
+                    ));
+                }
             }
         }
         Ok(true)
@@ -889,7 +899,11 @@ impl ConcurrentRankedIntegerIndexBuilder {
         Ok(unsafe { slab_ptr.add(record_index) })
     }
 
-    fn finish(self, link: &mut impl FnMut(usize, usize)) -> Result<(ExactIntegerJoinIndex, bool)> {
+    fn finish(
+        self,
+        build_keys_unique: bool,
+        link: &mut impl FnMut(usize, usize),
+    ) -> Result<(ExactIntegerJoinIndex, bool)> {
         let reserved_rows = self.next_row_slot.load(Ordering::Acquire);
         let recorded_rows = self.completed_rows.load(Ordering::Acquire);
         if recorded_rows != reserved_rows {
@@ -901,6 +915,25 @@ impl ConcurrentRankedIntegerIndexBuilder {
             return Err(paro_error::internal(
                 "build-time ranked row count exceeds planned maximum",
             ));
+        }
+        if !build_keys_unique {
+            // Producers only publish immutable row records. Once their release
+            // count is complete, one cache-linear pass can form occupancy
+            // without a shared atomic read-modify-write for every build row.
+            // Declared-unique keys keep the eager atomic path because the
+            // duplicate check itself is a runtime proof obligation.
+            for row_slot in 0..recorded_rows {
+                let record = unsafe { &*self.published_record_slot(row_slot)? };
+                let domain_index = record.domain_index as usize;
+                unsafe {
+                    let word = self
+                        .bits
+                        .as_ptr()
+                        .cast::<u64>()
+                        .add(domain_index / u64::BITS as usize);
+                    *word |= 1_u64 << (domain_index % u64::BITS as usize);
+                }
+            }
         }
         let word_count = self.domain.len.div_ceil(u64::BITS as usize);
         let rank_bytes = word_count
@@ -1813,6 +1846,7 @@ mod tests {
             &Value::Integer(0),
             &Value::Integer(199_999),
             5_000,
+            false,
             allocator.clone(),
             &memory(),
         )
@@ -1838,7 +1872,6 @@ mod tests {
                     &first_view,
                     row,
                     row + 1,
-                    true,
                     |_, _| unreachable!("keys are unique"),
                 )
                 .unwrap();
@@ -1856,7 +1889,6 @@ mod tests {
                 &second_view,
                 0,
                 4_097,
-                true,
                 |_, _| unreachable!("keys are unique"),
             )
             .unwrap();

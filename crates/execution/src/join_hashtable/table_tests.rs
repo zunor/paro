@@ -330,6 +330,7 @@ fn integer_index_is_filled_during_parallel_build_and_only_published_at_finish() 
             &Value::Integer(1),
             &Value::Integer(4),
             4,
+            true,
             paro_common::test_utils::test_allocator(),
             &memory,
         )
@@ -411,6 +412,7 @@ fn stale_build_time_integer_domain_falls_back_to_retained_rows() {
             &Value::Integer(1),
             &Value::Integer(2),
             2,
+            true,
             paro_common::test_utils::test_allocator(),
             &memory,
         )
@@ -477,6 +479,7 @@ fn ranked_build_time_index_links_duplicates_across_parallel_local_tables() {
             &Value::Integer(0),
             &Value::Integer(1_000),
             4,
+            false,
             paro_common::test_utils::test_allocator(),
             &memory,
         )

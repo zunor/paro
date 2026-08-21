@@ -1045,7 +1045,6 @@ impl JoinHashTable {
                         key,
                         source_row_idx,
                         row_ptr,
-                        self.config.build_keys_unique,
                         |row_ptr, previous| {
                             self.build_row_layout
                                 .set_next(row_ptr as *mut u8, previous as *const u8);
