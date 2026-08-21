@@ -1,8 +1,11 @@
 -- Copyright 2024-2026 Zunor
 -- SPDX-License-Identifier: Apache-2.0
 
--- End-to-end coverage for a Q13-shaped left join reduction. The declared key
--- and exact no-NULL data admit singleton lowering; the second query uses a
+-- End-to-end coverage for a Q13-shaped left join reduction. The declared
+-- nullable UNIQUE key and exact no-NULL data admit singleton lowering; the
+-- EXPLAIN no longer shows a merge AGGREGATE because projection-chain folding
+-- merges the singleton Project into the visible c_count projection. The
+-- second query uses a
 -- nullable UNIQUE key with duplicate NULLs and must retain ordinary GROUP BY
 -- multiplicity.
 -- @setup
@@ -14,7 +17,7 @@ DROP TABLE IF EXISTS prefix_nullable_singleton_customer;
 
 CREATE TABLE singleton_customer (
     customer_key BIGINT,
-    PRIMARY KEY (customer_key)
+    UNIQUE (customer_key) NOT ENFORCED
 );
 CREATE TABLE singleton_orders (
     order_key BIGINT,

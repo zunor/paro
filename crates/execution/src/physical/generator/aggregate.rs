@@ -423,13 +423,11 @@ impl PhysicalPlanGenerator {
         aggregate: &LogicalAggregate,
         having_filter: Box<[Expression]>,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
-        let singleton_proof = match &aggregate.group_input_multiplicity {
-            GroupInputMultiplicity::AtMostOne(proof) if proof.is_valid_for(aggregate) => {
-                Some(proof)
-            }
-            GroupInputMultiplicity::Arbitrary | GroupInputMultiplicity::AtMostOne(_) => None,
-        };
-        if singleton_proof.is_some() && having_filter.is_empty() {
+        let singleton_lowerable = matches!(
+            &aggregate.group_input_multiplicity,
+            GroupInputMultiplicity::AtMostOne(proof) if proof.is_valid_for(aggregate)
+        );
+        if singleton_lowerable && having_filter.is_empty() {
             let child = self.generate_node(aggregate.child.as_ref())?;
             let expressions = singleton_group_projection(aggregate)?;
             return Ok((
@@ -663,7 +661,7 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
         let projected = match merge.function.singleton_merge() {
             Some(AggregateSingletonMerge::Input) => input,
             Some(law @ AggregateSingletonMerge::InputOr(_)) => {
-                let value = law.normalized_fallback(&merge.return_type).ok_or_else(|| {
+                let value = law.validated_fallback(&merge.return_type).ok_or_else(|| {
                     paro_error::internal(format!(
                         "At-most-one aggregate output {ordinal} has an invalid fallback type"
                     ))
@@ -673,7 +671,7 @@ fn singleton_group_projection(aggregate: &LogicalAggregate) -> Result<Vec<Expres
                     vec![
                         input,
                         Expression::Constant(ConstantExpression::new(
-                            value,
+                            value.clone(),
                             merge.return_type.clone(),
                         )),
                     ],

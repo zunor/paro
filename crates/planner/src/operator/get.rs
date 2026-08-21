@@ -68,11 +68,12 @@ pub struct Get {
 
 /// Find the base scan below operators that preserve column-binding identity.
 ///
-/// These operators may filter or reorder rows, but they neither synthesize a
-/// new binding domain nor duplicate an input row. Proofs about one binding's
-/// value (for example exact non-NULL statistics or a declared unique key) can
-/// therefore be checked at their use site without mistaking a join's
-/// NULL-extended output for the stored column.
+/// These operators may filter or reorder rows, and `ExternalProject` may add
+/// its own output domain, but every child binding keeps its identity and row
+/// multiplicity. Proofs about one preserved binding's value (for example exact
+/// non-NULL statistics or a declared unique key) can therefore be checked at
+/// their use site without mistaking a join's NULL-extended output for the
+/// stored column.
 pub fn binding_preserving_get(plan: &LogicalPlan) -> Option<&Get> {
     match &plan.operator {
         LogicalOperator::Get(get) => Some(get),

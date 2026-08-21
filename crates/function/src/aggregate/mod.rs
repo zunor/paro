@@ -413,30 +413,28 @@ pub enum AggregateEmptyInput {
 pub enum AggregateSingletonMerge {
     /// Preserve the finalized partial value, including NULL.
     Input,
-    /// Preserve a present partial and substitute the constant for NULL.
+    /// Preserve a present partial and substitute an exactly result-typed
+    /// constant for NULL.
     InputOr(Value),
 }
 
 impl AggregateSingletonMerge {
-    /// Normalize the optimizer-owned fallback into the aggregate's declared
-    /// return domain. Extension functions may publish a naturally typed
-    /// scalar (for example INTEGER zero for a BIGINT result); lowering must
-    /// cast it once instead of constructing a mismatched ConstantExpression.
-    pub fn normalized_fallback(&self, return_type: &LogicalType) -> Option<Value> {
+    /// Return the fallback only when the declaration already inhabits the
+    /// aggregate's exact result domain.
+    ///
+    /// This is optimizer proof metadata, not a SQL cast site. Accepting a
+    /// coercible value could silently change the declared singleton law (for
+    /// example numeric zero into VARCHAR `"0"`), so extension functions must
+    /// publish the correctly typed value explicitly.
+    pub fn validated_fallback(&self, return_type: &LogicalType) -> Option<&Value> {
         let Self::InputOr(value) = self else {
             return None;
         };
-        if value.is_null() {
-            return None;
-        }
-        value
-            .cast(return_type)
-            .ok()
-            .filter(|value| !value.is_null())
+        (!value.is_null() && value.logical_type() == *return_type).then_some(value)
     }
 
     pub fn is_valid_for(&self, return_type: &LogicalType) -> bool {
-        matches!(self, Self::Input) || self.normalized_fallback(return_type).is_some()
+        matches!(self, Self::Input) || self.validated_fallback(return_type).is_some()
     }
 }
 
@@ -1289,11 +1287,15 @@ mod tests {
     }
 
     #[test]
-    fn singleton_fallback_is_normalized_to_the_return_domain() {
-        let law = AggregateSingletonMerge::InputOr(Value::Integer(0));
+    fn singleton_fallback_must_already_match_the_return_domain() {
+        let integer = AggregateSingletonMerge::InputOr(Value::Integer(0));
+        assert!(integer.validated_fallback(&LogicalType::BigInt).is_none());
+        let varchar = AggregateSingletonMerge::InputOr(Value::BigInt(0));
+        assert!(varchar.validated_fallback(&LogicalType::Varchar).is_none());
+        let bigint = AggregateSingletonMerge::InputOr(Value::BigInt(0));
         assert_eq!(
-            law.normalized_fallback(&LogicalType::BigInt),
-            Some(Value::BigInt(0))
+            bigint.validated_fallback(&LogicalType::BigInt),
+            Some(&Value::BigInt(0))
         );
         assert!(
             !AggregateSingletonMerge::InputOr(Value::Null(LogicalType::BigInt))

@@ -33,6 +33,8 @@ use paro_storage::statistics::{NumericStats, StringStats};
 use super::*;
 use crate::physical::specs::GroupKeyEncoding;
 
+#[path = "tests/aggregate_singleton.rs"]
+mod aggregate_singleton;
 #[path = "tests/window_arguments.rs"]
 mod window_arguments;
 

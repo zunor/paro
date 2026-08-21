@@ -11,7 +11,7 @@ use crate::operator::{
     binding_preserving_get, ColumnBinding, Join, JoinComparisonType, JoinType, LogicalOperator,
 };
 use crate::plan::LogicalPlan;
-use paro_catalog::entry::ConstraintType;
+use paro_catalog::entry::{CatalogEntry, CatalogObjectId, ConstraintType};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_storage::statistics::BaseStatistics;
@@ -36,24 +36,31 @@ pub struct GroupDependency {
 /// any group-expression rewrite must clear it and re-establish the proof.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingletonGroupProof {
-    unique_group_key: Box<[ColumnBinding]>,
+    preserved_table: CatalogObjectId,
+    null_free_key_columns: Box<[usize]>,
 }
 
 impl SingletonGroupProof {
-    pub fn new(unique_group_key: impl Into<Box<[ColumnBinding]>>) -> Self {
-        Self {
-            unique_group_key: unique_group_key.into(),
+    /// Capture a declared key after the caller proves every nullable UNIQUE
+    /// column non-NULL at the aggregate's use site.
+    ///
+    /// The witness deliberately stores catalog identity rather than logical
+    /// bindings. Table indices and Get output ordinals are optimizer-local and
+    /// may be regenerated or compacted; the table object and stored column ids
+    /// remain stable across those rewrites.
+    pub fn from_null_free_declared_key(
+        get: &crate::operator::Get,
+        bindings: &[ColumnBinding],
+    ) -> Option<Self> {
+        let table = get.table.as_ref()?;
+        let column_ids = stored_column_ids(get, bindings)?;
+        if column_ids.is_empty() || !declared_key_matches(get, &column_ids) {
+            return None;
         }
-    }
-
-    pub fn unique_group_key(&self) -> &[ColumnBinding] {
-        &self.unique_group_key
-    }
-
-    pub fn remap_table_indices(&mut self, mut remap: impl FnMut(&mut usize)) {
-        for binding in &mut self.unique_group_key {
-            remap(&mut binding.table_index);
-        }
+        Some(Self {
+            preserved_table: table.object_id(),
+            null_free_key_columns: column_ids.into_boxed_slice(),
+        })
     }
 
     /// Revalidate every structural obligation that can change after the
@@ -62,7 +69,7 @@ impl SingletonGroupProof {
     /// partial grouping keys, and aggregate laws must still match the current
     /// tree before physical lowering may erase the hash aggregate.
     pub fn is_valid_for(&self, aggregate: &Aggregate) -> bool {
-        if self.unique_group_key.is_empty()
+        if self.null_free_key_columns.is_empty()
             || aggregate.post_reduction.is_some()
             || aggregate.aggregates.is_empty()
             || !aggregate.has_plain_grouping_domain()
@@ -87,6 +94,12 @@ impl SingletonGroupProof {
         let Some(preserved) = binding_preserving_get(join.left.as_ref()) else {
             return false;
         };
+        let Some(preserved_table) = preserved.table.as_ref() else {
+            return false;
+        };
+        if preserved_table.object_id() != self.preserved_table {
+            return false;
+        }
         let LogicalOperator::Aggregate(partial) = &join.right.operator else {
             return false;
         };
@@ -94,19 +107,39 @@ impl SingletonGroupProof {
             return false;
         }
 
+        let Some(child_layout) = InputLayout::new(aggregate.child.as_ref()) else {
+            return false;
+        };
+        let Some(left_layout) = InputLayout::new(join.left.as_ref()) else {
+            return false;
+        };
+        let Some(right_layout) = InputLayout::new(join.right.as_ref()) else {
+            return false;
+        };
         let group_bindings = aggregate
             .groups
             .iter()
-            .map(|expression| input_binding(expression, aggregate.child.as_ref()))
+            .map(|expression| child_layout.binding(expression))
             .collect::<Option<HashSet<_>>>();
         let Some(group_bindings) = group_bindings else {
             return false;
         };
-        if !self
-            .unique_group_key
+        let proof_bindings = self
+            .null_free_key_columns
+            .iter()
+            .map(|column_id| {
+                (0..preserved.column_sources.len())
+                    .find(|ordinal| preserved.stored_column(*ordinal) == Some(*column_id))
+                    .map(|ordinal| ColumnBinding::new(preserved.table_index, ordinal))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(proof_bindings) = proof_bindings else {
+            return false;
+        };
+        if !proof_bindings
             .iter()
             .all(|binding| group_bindings.contains(binding))
-            || !declared_key_matches(preserved, &self.unique_group_key)
+            || !declared_key_matches(preserved, &self.null_free_key_columns)
         {
             return false;
         }
@@ -114,30 +147,14 @@ impl SingletonGroupProof {
         let expected_partial_keys = (0..partial.groups.len())
             .map(|ordinal| ColumnBinding::new(partial.group_index, ordinal))
             .collect::<HashSet<_>>();
-        let preserved_bindings = join
-            .left
-            .get_column_bindings()
-            .into_iter()
-            .collect::<HashSet<_>>();
         let mut matched_partial_keys = HashSet::with_capacity(expected_partial_keys.len());
         for condition in &join.conditions {
             let (left, right) = (
-                input_binding(&condition.left, join.left.as_ref()),
-                input_binding(&condition.right, join.right.as_ref()),
+                left_layout.binding(&condition.left),
+                right_layout.binding(&condition.right),
             );
             let partial_key = match (left, right) {
-                (Some(left), Some(right))
-                    if preserved_bindings.contains(&left)
-                        && expected_partial_keys.contains(&right) =>
-                {
-                    Some(right)
-                }
-                (Some(left), Some(right))
-                    if expected_partial_keys.contains(&left)
-                        && preserved_bindings.contains(&right) =>
-                {
-                    Some(left)
-                }
+                (Some(_), Some(right)) if expected_partial_keys.contains(&right) => Some(right),
                 _ => None,
             };
             let Some(partial_key) = partial_key else {
@@ -169,7 +186,7 @@ impl SingletonGroupProof {
             {
                 return false;
             }
-            let Some(binding) = input_binding(&merge.children[0], aggregate.child.as_ref()) else {
+            let Some(binding) = child_layout.binding(&merge.children[0]) else {
                 return false;
             };
             if binding.table_index != partial.aggregate_index {
@@ -194,7 +211,7 @@ pub enum GroupInputMultiplicity {
     AtMostOne(SingletonGroupProof),
 }
 
-/// Resolve one passive input expression in either lifecycle domain.
+/// One cached input layout for resolving expressions in either lifecycle domain.
 ///
 /// Optimizer proofs are issued while expressions carry logical
 /// [`ColumnBinding`]s. Before physical generation, `ColumnBindingResolver`
@@ -202,30 +219,37 @@ pub enum GroupInputMultiplicity {
 /// input operator. Revalidation deliberately maps both representations back
 /// to the same binding domain so resolving a plan cannot erase a still-valid
 /// proof, while a changed positional layout still fails closed.
-fn input_binding(expression: &Expression, input: &LogicalPlan) -> Option<ColumnBinding> {
-    let bindings = input.get_column_bindings();
-    let types = input.types();
-    if bindings.len() != types.len() {
-        return None;
+struct InputLayout {
+    bindings: Vec<ColumnBinding>,
+    types: Vec<LogicalType>,
+}
+
+impl InputLayout {
+    fn new(input: &LogicalPlan) -> Option<Self> {
+        let bindings = input.get_column_bindings();
+        let types = input.types();
+        (bindings.len() == types.len()).then_some(Self { bindings, types })
     }
-    match expression {
-        Expression::ColumnRef(column) if column.depth == 0 => bindings
-            .iter()
-            .zip(&types)
-            .any(|(binding, ty)| *binding == column.binding && *ty == column.return_type)
-            .then_some(column.binding),
-        Expression::Reference(reference) => bindings
-            .get(reference.index)
-            .copied()
-            .filter(|_| types.get(reference.index) == Some(&reference.return_type)),
-        _ => None,
+
+    fn binding(&self, expression: &Expression) -> Option<ColumnBinding> {
+        match expression {
+            Expression::ColumnRef(column) if column.depth == 0 => self
+                .bindings
+                .iter()
+                .zip(&self.types)
+                .any(|(binding, ty)| *binding == column.binding && *ty == column.return_type)
+                .then_some(column.binding),
+            Expression::Reference(reference) => self
+                .bindings
+                .get(reference.index)
+                .copied()
+                .filter(|_| self.types.get(reference.index) == Some(&reference.return_type)),
+            _ => None,
+        }
     }
 }
 
-fn declared_key_matches(get: &crate::operator::Get, bindings: &[ColumnBinding]) -> bool {
-    let Some(table) = &get.table else {
-        return false;
-    };
+fn stored_column_ids(get: &crate::operator::Get, bindings: &[ColumnBinding]) -> Option<Vec<usize>> {
     let column_ids = bindings
         .iter()
         .map(|binding| {
@@ -233,21 +257,26 @@ fn declared_key_matches(get: &crate::operator::Get, bindings: &[ColumnBinding]) 
                 .then(|| get.stored_column(binding.column_index))
                 .flatten()
         })
-        .collect::<Option<HashSet<_>>>();
-    let Some(column_ids) = column_ids else {
+        .collect::<Option<Vec<_>>>()?;
+    let distinct = column_ids.iter().copied().collect::<HashSet<_>>();
+    (distinct.len() == column_ids.len()).then_some(column_ids)
+}
+
+fn declared_key_matches(get: &crate::operator::Get, column_ids: &[usize]) -> bool {
+    let Some(table) = &get.table else {
         return false;
     };
-    column_ids.len() == bindings.len()
-        && table.constraints().iter().any(|constraint| {
-            matches!(
-                constraint.constraint_type,
-                ConstraintType::Unique | ConstraintType::PrimaryKey
-            ) && constraint.columns.len() == column_ids.len()
-                && constraint
-                    .columns
-                    .iter()
-                    .all(|column| column_ids.contains(column))
-        })
+    let column_ids = column_ids.iter().copied().collect::<HashSet<_>>();
+    table.constraints().iter().any(|constraint| {
+        matches!(
+            constraint.constraint_type,
+            ConstraintType::Unique | ConstraintType::PrimaryKey
+        ) && constraint.columns.len() == column_ids.len()
+            && constraint
+                .columns
+                .iter()
+                .all(|column| column_ids.contains(column))
+    })
 }
 
 impl GroupDependency {
@@ -358,9 +387,10 @@ impl Aggregate {
 
     pub fn recompute_returned_types(&mut self) {
         self.group_stats.resize(self.groups.len(), None);
-        // Callers use this method after changing group expressions. Any prior
-        // proof is positional and therefore stale until statistics propagation
-        // derives it again over the settled logical tree.
+        // Callers use this method after changing group expressions. Even
+        // though the witness keeps stable catalog identity, its structural
+        // obligations (group coverage, join shape, and merge laws) are stale
+        // until the optimizer proves them again over the settled logical tree.
         self.group_dependencies.clear();
         self.group_input_multiplicity = GroupInputMultiplicity::Arbitrary;
         self.returned_types = self

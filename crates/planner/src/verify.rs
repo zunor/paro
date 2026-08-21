@@ -69,7 +69,6 @@ fn verify_operator(op: &LogicalOperator) -> Result<()> {
         }
         LogicalOperator::Aggregate(agg) => {
             agg.verify_post_reduction()?;
-            agg.verify_group_input_multiplicity()?;
             for expr in &agg.groups {
                 verify_expression(expr)?;
             }

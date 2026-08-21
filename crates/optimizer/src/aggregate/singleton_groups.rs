@@ -67,7 +67,7 @@ fn prove_at_most_one(
                     .is_some_and(|statistics| !statistics.statistics().can_have_null())
             })
     })?;
-    let proof = SingletonGroupProof::new(key.bindings);
+    let proof = SingletonGroupProof::from_null_free_declared_key(preserved, &key.bindings)?;
     if !proof.is_valid_for(aggregate) {
         return None;
     };
@@ -94,7 +94,8 @@ mod tests {
     use paro_planner::binder::ir::GroupingSet;
     use paro_planner::expression::{AggregateExpression, ColumnRefExpression, ReferenceExpression};
     use paro_planner::operator::{
-        ComparisonJoin, ExpressionGet, Filter, Get, JoinComparisonType, JoinCondition, JoinType,
+        ComparisonJoin, ExpressionGet, Filter, Get, GetColumnSource, JoinComparisonType,
+        JoinCondition, JoinType,
     };
     use paro_storage::statistics::{BaseStatistics, ColumnStatistics};
     use paro_storage::table::table_factory::TableFactory;
@@ -343,6 +344,88 @@ mod tests {
         merge.children[0] =
             Expression::Reference(ReferenceExpression::new(partial_value, LogicalType::BigInt));
 
+        assert!(proof.is_valid_for(aggregate));
+    }
+
+    #[test]
+    fn stale_structural_witness_fails_closed_after_join_mutation() {
+        let (plan, statistics) = candidate();
+        let mut optimized = optimize_plan(plan, &statistics);
+        let aggregate = candidate_aggregate_mut(&mut optimized);
+        let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
+        else {
+            panic!("singleton proof")
+        };
+
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            panic!("comparison join")
+        };
+        join.join_type = JoinType::Inner;
+
+        assert!(!proof.is_valid_for(aggregate));
+        assert!(aggregate.verify_group_input_multiplicity().is_err());
+        paro_planner::verify::verify_physical_planner_invariants(&optimized.operator)
+            .expect("a stale optimization hint must not make compilation fail");
+    }
+
+    #[test]
+    fn catalog_column_identity_survives_get_ordinal_reuse() {
+        let (plan, statistics) = candidate();
+        let mut optimized = optimize_plan(plan, &statistics);
+        let aggregate = candidate_aggregate_mut(&mut optimized);
+        let GroupInputMultiplicity::AtMostOne(proof) = aggregate.group_input_multiplicity.clone()
+        else {
+            panic!("singleton proof")
+        };
+        let LogicalOperator::Join(Join::Comparison(join)) = &mut aggregate.child.operator else {
+            panic!("comparison join")
+        };
+        let LogicalOperator::Get(get) = &mut join.left.operator else {
+            panic!("preserved Get")
+        };
+
+        // Simulate a later Get compaction reusing output ordinal 0 for a
+        // different nullable UNIQUE catalog column on the same table object.
+        // A binding-based witness would silently migrate to column 1; the
+        // catalog-column witness must continue looking for proven column 0.
+        let types = vec![LogicalType::BigInt, LogicalType::BigInt];
+        let storage = Arc::new(TableFactory::default().create_table(&types).unwrap());
+        let info = CreateTableInfo::new(
+            "paro".to_string(),
+            "public".to_string(),
+            "preserved".to_string(),
+            vec![
+                ColumnDefinition::new("key".to_string(), LogicalType::BigInt),
+                ColumnDefinition::new("email".to_string(), LogicalType::BigInt),
+            ],
+        )
+        .with_constraints(vec![
+            Constraint::unique(vec![0]),
+            Constraint::unique(vec![1]),
+        ]);
+        get.table = Some(Arc::new(
+            TableCatalogEntry::from_info(info, storage, CatalogObjectId::from_raw(91_001), 0)
+                .unwrap(),
+        ));
+        get.names = vec!["email".to_string()];
+        get.returned_types = vec![LogicalType::BigInt];
+        get.column_types = vec![LogicalType::BigInt];
+        get.column_sources = vec![GetColumnSource::Stored { column_id: 1 }];
+
+        assert!(!proof.is_valid_for(aggregate));
+    }
+
+    #[test]
+    fn row_preserving_expression_relocation_retains_a_valid_witness() {
+        let (plan, statistics) = candidate();
+        let mut optimized = optimize_plan(plan, &statistics);
+        let aggregate = candidate_aggregate_mut(&mut optimized);
+
+        aggregate.recompute_returned_types_after_row_preserving_relocation();
+
+        let GroupInputMultiplicity::AtMostOne(proof) = &aggregate.group_input_multiplicity else {
+            panic!("singleton proof")
+        };
         assert!(proof.is_valid_for(aggregate));
     }
 

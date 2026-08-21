@@ -12,7 +12,7 @@ DROP TABLE
 
 CREATE TABLE singleton_customer (
     customer_key BIGINT,
-    PRIMARY KEY (customer_key)
+    UNIQUE (customer_key) NOT ENFORCED
 );
 CREATE TABLE
 

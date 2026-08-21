@@ -340,14 +340,6 @@ impl LogicalPlanDeepCopy {
                 if let Some(reduction) = &mut post_reduction {
                     self.remap_table_index(bind_shared, &mut reduction.reduction_index);
                 }
-                let mut group_input_multiplicity = a.group_input_multiplicity.clone();
-                if let crate::operator::GroupInputMultiplicity::AtMostOne(proof) =
-                    &mut group_input_multiplicity
-                {
-                    proof.remap_table_indices(|table_index| {
-                        self.remap_table_index(bind_shared, table_index)
-                    });
-                }
                 LogicalOperator::Aggregate(AggNode {
                     group_index,
                     aggregate_index,
@@ -359,7 +351,7 @@ impl LogicalPlanDeepCopy {
                     post_reduction,
                     group_stats: a.group_stats.clone(),
                     group_dependencies: a.group_dependencies.clone(),
-                    group_input_multiplicity,
+                    group_input_multiplicity: a.group_input_multiplicity.clone(),
                     returned_types: a.returned_types.clone(),
                     grouping_functions: a.grouping_functions.clone(),
                 })
