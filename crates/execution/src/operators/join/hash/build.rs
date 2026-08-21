@@ -60,14 +60,14 @@ pub struct HashJoinBuildSinkExec {
 impl HashJoinBuildSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         let handle = ctx.handles.get(self.handle)?;
-        let build_time_integer_builder = (!self.force_external)
-            .then_some(self.build_time_integer_index.as_ref())
-            .flatten()
-            .map(|index| {
+        if !self.force_external && handle.build_time_integer_builder().is_none() {
+            if let Some(index) = &self.build_time_integer_index {
                 let [condition] = self.key_conditions.as_ref() else {
-                    return Ok(None);
+                    return Err(paro_error::internal(
+                        "build-time integer index requires one hash key",
+                    ));
                 };
-                match crate::join_hashtable::table::BuildTimeIntegerIndexBuilder::try_new_from_values(
+                let builder = match crate::join_hashtable::table::BuildTimeIntegerIndexBuilder::try_new_from_values(
                     &condition.right.return_type(),
                     &index.minimum,
                     &index.maximum,
@@ -76,16 +76,14 @@ impl HashJoinBuildSinkExec {
                     &hash_join_memory_context(ctx.query)
                         .with_class(paro_common::memory::MemoryAccountingClass::NonRevocable),
                 ) {
-                    Ok(builder) => Ok(builder),
-                    Err(error) if error.error_class() == ErrorClass::Resource => Ok(None),
-                    Err(error) => Err(error),
+                    Ok(builder) => builder,
+                    Err(error) if error.error_class() == ErrorClass::Resource => None,
+                    Err(error) => return Err(error),
+                };
+                if let Some(builder) = builder {
+                    handle.share_build_time_integer_builder(Arc::new(builder));
                 }
-            })
-            .transpose()?
-            .flatten()
-            .map(Arc::new);
-        if let Some(builder) = &build_time_integer_builder {
-            handle.install_build_time_integer_builder(Arc::clone(builder))?;
+            }
         }
         let table = handle.initialize_table_with_output_count(
             ctx.query.session.buffer_pool().clone(),

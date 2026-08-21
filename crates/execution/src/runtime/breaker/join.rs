@@ -125,18 +125,16 @@ impl JoinBuildHandle {
         Ok(())
     }
 
-    pub(crate) fn install_build_time_integer_builder(
+    pub(crate) fn share_build_time_integer_builder(
         &self,
         builder: Arc<BuildTimeIntegerIndexBuilder>,
-    ) -> Result<()> {
+    ) -> Arc<BuildTimeIntegerIndexBuilder> {
         let mut state = self.build_time_integer_builder.lock();
-        if state.is_some() {
-            return Err(paro_error::internal(
-                "unique integer join builder was already installed",
-            ));
+        if let Some(existing) = state.as_ref() {
+            return Arc::clone(existing);
         }
-        *state = Some(builder);
-        Ok(())
+        *state = Some(Arc::clone(&builder));
+        builder
     }
 
     pub(crate) fn build_time_integer_builder(&self) -> Option<Arc<BuildTimeIntegerIndexBuilder>> {

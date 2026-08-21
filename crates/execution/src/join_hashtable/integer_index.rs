@@ -7,11 +7,12 @@
 //! plus rank metadata, keeping the probe path exact without paying one pointer
 //! per absent key.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use parking_lot::Mutex;
 use paro_common::allocator::Allocator;
-use paro_common::error::{self as paro_error, Result};
+use paro_common::error::{self as paro_error, ErrorClass, Result};
 use paro_common::hash::{combine_hash, hash_i64, hash_u128, hash_u64, HASH_SEED, NULL_HASH};
 use paro_common::memory::{GrantBuffer, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
@@ -26,6 +27,7 @@ const MAX_SLOTS_PER_BUILD_ROW: usize = 256;
 const MAX_DIRECT_JOIN_SLOTS: usize = 2_097_152;
 const MAX_DIRECT_SLOTS_PER_BUILD_ROW: usize = 24;
 const MAX_RANKED_INDEX_PEAK_BYTES: usize = 32 * 1024 * 1024;
+const RANKED_BUILD_RECORDS_PER_SLAB: usize = 4_096;
 
 const SIGNED_ORDINAL_MASK: u128 = 1_u128 << 127;
 
@@ -86,6 +88,55 @@ impl IntegerKeyKind {
             (Self::Time, Value::Time(value)) => Some(signed_ordinal(*value as i128)),
             _ => None,
         }
+    }
+
+    /// Read an integer key directly from a prepared vector view.
+    ///
+    /// Build sinks already validated the key's logical type and NULL policy.
+    /// Staying in the physical domain avoids constructing a tagged [`Value`]
+    /// for every retained row merely to recover the same integer ordinal.
+    fn vector_ordinal(self, view: &VectorView<'_>, row_idx: usize) -> Option<u128> {
+        if !view.is_valid(row_idx) {
+            return None;
+        }
+        macro_rules! read {
+            ($ty:ty) => {{
+                let Some(data) = view.get_data::<$ty>() else {
+                    return self.sequence_ordinal(view, row_idx);
+                };
+                unsafe { *data.add(view.physical_index(row_idx)) }
+            }};
+        }
+        Some(match self {
+            Self::TinyInt => signed_ordinal(read!(i8) as i128),
+            Self::SmallInt => signed_ordinal(read!(i16) as i128),
+            Self::Integer | Self::Date => signed_ordinal(read!(i32) as i128),
+            Self::BigInt | Self::Timestamp | Self::TimestampTz | Self::Time => {
+                signed_ordinal(read!(i64) as i128)
+            }
+            Self::HugeInt => signed_ordinal(read!(i128)),
+            Self::UTinyInt => u128::from(read!(u8)),
+            Self::USmallInt => u128::from(read!(u16)),
+            Self::UInteger => u128::from(read!(u32)),
+            Self::UBigInt => u128::from(read!(u64)),
+            Self::UHugeInt => read!(u128),
+        })
+    }
+
+    fn sequence_ordinal(self, view: &VectorView<'_>, row_idx: usize) -> Option<u128> {
+        matches!(
+            self,
+            Self::TinyInt
+                | Self::SmallInt
+                | Self::Integer
+                | Self::BigInt
+                | Self::HugeInt
+                | Self::Date
+                | Self::Timestamp
+                | Self::TimestampTz
+                | Self::Time
+        )
+        .then(|| signed_ordinal(view.get_i64(row_idx) as i128))
     }
 
     /// Read a key directly from its serialized build row.
@@ -344,9 +395,9 @@ impl ConcurrentDirectIntegerIndexBuilder {
         Ok(())
     }
 
-    fn insert_planned_value(
+    fn insert_planned_ordinal(
         &self,
-        value: &Value,
+        ordinal: Option<u128>,
         row_ptr: usize,
         unique: bool,
     ) -> Result<PlannedIntegerInsert> {
@@ -355,7 +406,7 @@ impl ConcurrentDirectIntegerIndexBuilder {
                 "integer join index cannot store a null build-row pointer",
             ));
         }
-        let Some(ordinal) = self.domain.kind.value_ordinal(value) else {
+        let Some(ordinal) = ordinal else {
             return Ok(PlannedIntegerInsert::DomainChanged);
         };
         let Some(index) = self.domain.index_for_ordinal(ordinal) else {
@@ -445,6 +496,19 @@ pub(crate) struct ConcurrentBuildTimeIntegerIndexBuilder {
     invalidated: AtomicBool,
 }
 
+/// One contiguous publication range reserved by a build input batch.
+///
+/// Ranked indexes need stable record ordinals, but reserving and publishing
+/// every row through shared atomics makes those counters the build hot spot.
+/// A batch owns this range exclusively; individual rows still publish their
+/// occupancy bit atomically because different batches may contain the same
+/// join key.
+#[derive(Debug)]
+pub(crate) struct BuildTimeIntegerBatchReservation {
+    ranked_row_start: Option<usize>,
+    row_count: usize,
+}
+
 impl std::fmt::Debug for ConcurrentBuildTimeIntegerIndexBuilder {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let strategy = match &self.strategy {
@@ -509,9 +573,41 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         }))
     }
 
-    pub(crate) fn insert_value_with_link(
+    pub(crate) fn reserve_batch(
         &self,
-        value: &Value,
+        row_count: usize,
+    ) -> Option<BuildTimeIntegerBatchReservation> {
+        if self.invalidated.load(Ordering::Relaxed) {
+            return None;
+        }
+        let ranked_row_start = match &self.strategy {
+            ConcurrentBuildTimeIntegerIndexStrategy::Direct(_) => None,
+            ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) => {
+                let start = builder
+                    .next_row_slot
+                    .fetch_add(row_count, Ordering::Relaxed);
+                if start
+                    .checked_add(row_count)
+                    .is_none_or(|end| end > builder.maximum_rows)
+                {
+                    self.invalidated.store(true, Ordering::Release);
+                    return None;
+                }
+                Some(start)
+            }
+        };
+        Some(BuildTimeIntegerBatchReservation {
+            ranked_row_start,
+            row_count,
+        })
+    }
+
+    pub(crate) fn insert_reserved_vector_row_with_link(
+        &self,
+        reservation: &BuildTimeIntegerBatchReservation,
+        batch_row: usize,
+        key: &VectorView<'_>,
+        source_row: usize,
         row_ptr: usize,
         unique: bool,
         mut link: impl FnMut(usize, usize),
@@ -519,9 +615,15 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
         if self.invalidated.load(Ordering::Relaxed) {
             return Ok(());
         }
+        if batch_row >= reservation.row_count {
+            return Err(paro_error::internal(
+                "integer join batch row exceeds its reservation",
+            ));
+        }
         match &self.strategy {
             ConcurrentBuildTimeIntegerIndexStrategy::Direct(builder) => {
-                let previous = match builder.insert_planned_value(value, row_ptr, unique)? {
+                let ordinal = builder.domain.kind.vector_ordinal(key, source_row);
+                let previous = match builder.insert_planned_ordinal(ordinal, row_ptr, unique)? {
                     PlannedIntegerInsert::Inserted(previous) => previous,
                     PlannedIntegerInsert::DomainChanged => {
                         self.invalidated.store(true, Ordering::Release);
@@ -535,13 +637,40 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                 Ok(())
             }
             ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) => {
-                if builder.record_planned_value(value, row_ptr, unique)? {
-                    Ok(())
-                } else {
-                    self.invalidated.store(true, Ordering::Release);
-                    Ok(())
+                let row_slot = reservation
+                    .ranked_row_start
+                    .ok_or_else(|| paro_error::internal("ranked join batch has no row range"))?
+                    + batch_row;
+                let ordinal = builder.domain.kind.vector_ordinal(key, source_row);
+                match builder.record_planned_ordinal(row_slot, ordinal, row_ptr, unique) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        self.invalidated.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                    // This index is an optional execution artifact. Keep the
+                    // retained build rows authoritative when a lazily
+                    // allocated record slab cannot obtain memory.
+                    Err(error) if error.error_class() == ErrorClass::Resource => {
+                        self.invalidated.store(true, Ordering::Release);
+                        Ok(())
+                    }
+                    Err(error) => Err(error),
                 }
             }
+        }
+    }
+
+    /// Publish all records written through one reservation with a single
+    /// release operation. Finish acquires this counter before reading slabs.
+    pub(crate) fn publish_batch(&self, reservation: BuildTimeIntegerBatchReservation) {
+        if reservation.ranked_row_start.is_some() {
+            let ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) = &self.strategy else {
+                unreachable!("ranked reservation must belong to a ranked builder");
+            };
+            builder
+                .completed_rows
+                .fetch_add(reservation.row_count, Ordering::Release);
         }
     }
 
@@ -557,7 +686,15 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
                 (builder.finish_build_time(), false)
             }
             ConcurrentBuildTimeIntegerIndexStrategy::Ranked(builder) => {
-                builder.finish(&mut link)?
+                match builder.finish(&mut link) {
+                    Ok(result) => result,
+                    // Rank and pointer arrays are allocated only after the actual
+                    // distinct count is known. If that bounded allocation loses a
+                    // memory race, publish no speculative index and let the hash
+                    // table finalize from its retained rows.
+                    Err(error) if error.error_class() == ErrorClass::Resource => return Ok(None),
+                    Err(error) => return Err(error),
+                }
             }
         };
         Ok(Some((
@@ -567,11 +704,18 @@ impl ConcurrentBuildTimeIntegerIndexBuilder {
     }
 }
 
+#[repr(C)]
+struct RankedBuildRecord {
+    domain_index: u32,
+    _padding: u32,
+    row_ptr: usize,
+}
+
 struct ConcurrentRankedIntegerIndexBuilder {
     domain: IntegerIndexDomain,
     bits: GrantBuffer,
-    row_domain_indices: GrantBuffer,
-    row_pointers: GrantBuffer,
+    record_slab_ptrs: Box<[AtomicPtr<RankedBuildRecord>]>,
+    record_slab_allocations: Mutex<Vec<GrantBuffer>>,
     maximum_rows: usize,
     next_row_slot: AtomicUsize,
     completed_rows: AtomicUsize,
@@ -604,24 +748,23 @@ impl ConcurrentRankedIntegerIndexBuilder {
         let bit_bytes = word_count
             .checked_mul(std::mem::size_of::<AtomicU64>())
             .ok_or_else(|| paro_error::internal("ranked join bitset size overflow"))?;
-        let row_index_bytes = maximum_rows
-            .checked_mul(std::mem::size_of::<u32>())
-            .ok_or_else(|| paro_error::internal("ranked join row-index size overflow"))?;
-        let row_pointer_bytes = maximum_rows
-            .checked_mul(std::mem::size_of::<usize>())
-            .ok_or_else(|| paro_error::internal("ranked join row-pointer size overflow"))?;
         let rank_bytes = word_count
             .checked_mul(std::mem::size_of::<u32>())
             .ok_or_else(|| paro_error::internal("ranked join rank size overflow"))?;
-        let peak_bytes = bit_bytes
-            .checked_add(row_index_bytes)
-            .and_then(|bytes| bytes.checked_add(row_pointer_bytes))
-            .and_then(|bytes| bytes.checked_add(rank_bytes))
-            .and_then(|bytes| {
-                bytes.checked_add(maximum_rows.saturating_mul(std::mem::size_of::<usize>()))
-            })
+        let slab_count = maximum_rows.div_ceil(RANKED_BUILD_RECORDS_PER_SLAB);
+        let slab_pointer_bytes = slab_count
+            .checked_mul(std::mem::size_of::<AtomicPtr<RankedBuildRecord>>())
+            .ok_or_else(|| paro_error::internal("ranked join slab directory size overflow"))?;
+        // Only fixed domain metadata is admitted eagerly. Build records are
+        // allocated in 4K-row slabs and the final pointer array is sized from
+        // the observed distinct count. A storage-level row upper bound can
+        // therefore guard correctness without reserving one record per
+        // filtered-out source row.
+        let fixed_bytes = bit_bytes
+            .checked_add(rank_bytes)
+            .and_then(|bytes| bytes.checked_add(slab_pointer_bytes))
             .ok_or_else(|| paro_error::internal("ranked join index size overflow"))?;
-        if peak_bytes > MAX_RANKED_INDEX_PEAK_BYTES {
+        if fixed_bytes > MAX_RANKED_INDEX_PEAK_BYTES {
             return Ok(None);
         }
         Ok(Some(Self {
@@ -631,8 +774,11 @@ impl ConcurrentRankedIntegerIndexBuilder {
                 len,
             },
             bits: memory.allocate_zeroed_buffer(Arc::clone(&allocator), bit_bytes)?,
-            row_domain_indices: memory.allocate_buffer(Arc::clone(&allocator), row_index_bytes)?,
-            row_pointers: memory.allocate_buffer(Arc::clone(&allocator), row_pointer_bytes)?,
+            record_slab_ptrs: (0..slab_count)
+                .map(|_| AtomicPtr::new(std::ptr::null_mut()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            record_slab_allocations: Mutex::new(Vec::new()),
             maximum_rows,
             next_row_slot: AtomicUsize::new(0),
             completed_rows: AtomicUsize::new(0),
@@ -641,13 +787,19 @@ impl ConcurrentRankedIntegerIndexBuilder {
         }))
     }
 
-    fn record_planned_value(&self, value: &Value, row_ptr: usize, unique: bool) -> Result<bool> {
+    fn record_planned_ordinal(
+        &self,
+        row_slot: usize,
+        ordinal: Option<u128>,
+        row_ptr: usize,
+        unique: bool,
+    ) -> Result<bool> {
         if row_ptr == 0 {
             return Err(paro_error::internal(
                 "ranked join index cannot store a null build-row pointer",
             ));
         }
-        let Some(ordinal) = self.domain.kind.value_ordinal(value) else {
+        let Some(ordinal) = ordinal else {
             return Ok(false);
         };
         let Some(domain_index) = self.domain.index_for_ordinal(ordinal) else {
@@ -655,18 +807,16 @@ impl ConcurrentRankedIntegerIndexBuilder {
         };
         let domain_index = u32::try_from(domain_index)
             .map_err(|_| paro_error::internal("ranked join domain index exceeds u32"))?;
-        let row_slot = self.next_row_slot.fetch_add(1, Ordering::Relaxed);
-        if row_slot >= self.maximum_rows {
-            return Ok(false);
-        }
+        debug_assert!(row_slot < self.maximum_rows);
+        let record = self.record_slot(row_slot)?;
         unsafe {
             std::ptr::write(
-                self.row_domain_indices.as_ptr().cast::<u32>().add(row_slot),
-                domain_index,
-            );
-            std::ptr::write(
-                self.row_pointers.as_ptr().cast::<usize>().add(row_slot),
-                row_ptr,
+                record,
+                RankedBuildRecord {
+                    domain_index,
+                    _padding: 0,
+                    row_ptr,
+                },
             );
             let word = self
                 .bits
@@ -683,11 +833,60 @@ impl ConcurrentRankedIntegerIndexBuilder {
                 ));
             }
         }
-        // Publish initialization only after both per-row slots and the
-        // occupancy bit are visible. Finish acquires this counter, so the
-        // builder's safety does not depend on an undocumented scheduler join.
-        self.completed_rows.fetch_add(1, Ordering::Release);
         Ok(true)
+    }
+
+    fn record_slot(&self, row_slot: usize) -> Result<*mut RankedBuildRecord> {
+        let slab_index = row_slot / RANKED_BUILD_RECORDS_PER_SLAB;
+        let record_index = row_slot % RANKED_BUILD_RECORDS_PER_SLAB;
+        let slab = self.record_slab_ptrs.get(slab_index).ok_or_else(|| {
+            paro_error::internal("ranked join build record exceeds its slab directory")
+        })?;
+        let mut slab_ptr = slab.load(Ordering::Acquire);
+        if slab_ptr.is_null() {
+            let slab_bytes = RANKED_BUILD_RECORDS_PER_SLAB
+                .checked_mul(std::mem::size_of::<RankedBuildRecord>())
+                .ok_or_else(|| paro_error::internal("ranked join record slab size overflow"))?;
+            let allocation = match self
+                .memory
+                .allocate_buffer(Arc::clone(&self.allocator), slab_bytes)
+            {
+                Ok(allocation) => allocation,
+                Err(error) => {
+                    // Another worker may have installed the slab while this
+                    // allocation was contending for its grant.
+                    slab_ptr = slab.load(Ordering::Acquire);
+                    if slab_ptr.is_null() {
+                        return Err(error.into());
+                    }
+                    return Ok(unsafe { slab_ptr.add(record_index) });
+                }
+            };
+            let allocated_ptr = allocation.as_ptr().cast::<RankedBuildRecord>();
+            debug_assert!(
+                (allocated_ptr as usize).is_multiple_of(std::mem::align_of::<RankedBuildRecord>())
+            );
+            match slab.compare_exchange(
+                std::ptr::null_mut(),
+                allocated_ptr,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    // The local allocation remains alive until ownership has
+                    // moved into the builder. Finish only runs after producer
+                    // tasks have returned, so publishing before this push
+                    // cannot expose an unowned slab to teardown.
+                    self.record_slab_allocations.lock().push(allocation);
+                    slab_ptr = allocated_ptr;
+                }
+                Err(installed) => {
+                    slab_ptr = installed;
+                    drop(allocation);
+                }
+            }
+        }
+        Ok(unsafe { slab_ptr.add(record_index) })
     }
 
     fn finish(self, link: &mut impl FnMut(usize, usize)) -> Result<(ExactIntegerJoinIndex, bool)> {
@@ -725,24 +924,15 @@ impl ConcurrentRankedIntegerIndexBuilder {
             .ok_or_else(|| paro_error::internal("ranked join pointer size overflow"))?;
         let pointers = self
             .memory
-            .allocate_zeroed_buffer(self.allocator, pointer_bytes)?;
+            .allocate_zeroed_buffer(Arc::clone(&self.allocator), pointer_bytes)?;
         let rank_values = unsafe { grant_slice::<u32>(&ranks, word_count) };
         let mut has_long_chains = false;
         for row_slot in 0..recorded_rows {
-            let domain_index = unsafe {
-                std::ptr::read(self.row_domain_indices.as_ptr().cast::<u32>().add(row_slot))
-                    as usize
-            };
+            let record = unsafe { &*self.published_record_slot(row_slot)? };
+            let domain_index = record.domain_index as usize;
             let pointer_slot = ranked_slot(words, rank_values, domain_index);
-            let pointer_slot_u32 = u32::try_from(pointer_slot)
-                .map_err(|_| paro_error::internal("ranked join pointer slot exceeds u32"))?;
-            let row_ptr =
-                unsafe { std::ptr::read(self.row_pointers.as_ptr().cast::<usize>().add(row_slot)) };
+            let row_ptr = record.row_ptr;
             unsafe {
-                std::ptr::write(
-                    self.row_domain_indices.as_ptr().cast::<u32>().add(row_slot),
-                    pointer_slot_u32,
-                );
                 let target = pointers.as_ptr().cast::<usize>().add(pointer_slot);
                 let previous = std::ptr::replace(target, row_ptr);
                 if previous != 0 {
@@ -770,6 +960,22 @@ impl ConcurrentRankedIntegerIndexBuilder {
             },
             has_long_chains,
         ))
+    }
+
+    fn published_record_slot(&self, row_slot: usize) -> Result<*const RankedBuildRecord> {
+        let slab_index = row_slot / RANKED_BUILD_RECORDS_PER_SLAB;
+        let record_index = row_slot % RANKED_BUILD_RECORDS_PER_SLAB;
+        let slab_ptr = self
+            .record_slab_ptrs
+            .get(slab_index)
+            .ok_or_else(|| paro_error::internal("ranked join record slab index is out of bounds"))?
+            .load(Ordering::Acquire);
+        if slab_ptr.is_null() {
+            return Err(paro_error::internal(
+                "ranked join published row is missing its record slab",
+            ));
+        }
+        Ok(unsafe { slab_ptr.add(record_index) })
     }
 }
 
@@ -1372,9 +1578,11 @@ mod tests {
     use paro_common::allocator::MemoryTag;
     use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
     use paro_common::runtime_value::Value;
+    use paro_common::types::LogicalType;
     use paro_storage::row::RowLayout;
 
     use super::{
+        ConcurrentBuildTimeIntegerIndexBuilder, ConcurrentBuildTimeIntegerIndexStrategy,
         ConcurrentDirectIntegerIndexBuilder, IntegerKeyKind, StagedRankedIntegerIndexBuilder,
     };
 
@@ -1595,6 +1803,77 @@ mod tests {
         scatter.insert_at(0, 200).unwrap();
         scatter.insert_at(1, 300).unwrap();
         scatter.finish().unwrap();
+    }
+
+    #[test]
+    fn build_time_ranked_records_allocate_and_publish_by_batch() {
+        let allocator = paro_common::test_utils::test_allocator();
+        let builder = ConcurrentBuildTimeIntegerIndexBuilder::try_new_from_values(
+            &LogicalType::Integer,
+            &Value::Integer(0),
+            &Value::Integer(199_999),
+            5_000,
+            allocator.clone(),
+            &memory(),
+        )
+        .unwrap()
+        .expect("sparse bounded domain uses a ranked index");
+        let ConcurrentBuildTimeIntegerIndexStrategy::Ranked(ranked) = &builder.strategy else {
+            panic!("test domain must decline the direct representation");
+        };
+        assert!(ranked.record_slab_allocations.lock().is_empty());
+
+        let first_values = (0..4_096).collect::<Vec<i32>>();
+        let first = paro_common::test_utils::test_i32_vector_with_allocator(
+            &first_values,
+            allocator.clone(),
+        );
+        let first_view = first.try_to_view(first_values.len()).unwrap();
+        let reservation = builder.reserve_batch(first_values.len()).unwrap();
+        for row in 0..first_values.len() {
+            builder
+                .insert_reserved_vector_row_with_link(
+                    &reservation,
+                    row,
+                    &first_view,
+                    row,
+                    row + 1,
+                    true,
+                    |_, _| unreachable!("keys are unique"),
+                )
+                .unwrap();
+        }
+        builder.publish_batch(reservation);
+        assert_eq!(ranked.record_slab_allocations.lock().len(), 1);
+
+        let second = paro_common::test_utils::test_i32_vector_with_allocator(&[4_096], allocator);
+        let second_view = second.try_to_view(1).unwrap();
+        let reservation = builder.reserve_batch(1).unwrap();
+        builder
+            .insert_reserved_vector_row_with_link(
+                &reservation,
+                0,
+                &second_view,
+                0,
+                4_097,
+                true,
+                |_, _| unreachable!("keys are unique"),
+            )
+            .unwrap();
+        builder.publish_batch(reservation);
+        assert_eq!(ranked.record_slab_allocations.lock().len(), 2);
+
+        let (index, has_long_chains) = builder.finish(|_, _| unreachable!()).unwrap().unwrap();
+        assert!(!has_long_chains);
+        let probe = paro_common::test_utils::test_i32_vector(&[0, 4_095, 4_096, 8_000]);
+        let mut pointers = [0; 4];
+        let mut matched = [0; 4];
+        let count = index
+            .lookup_vector_rows(&probe, 4, &[0, 1, 2, 3], &mut pointers, &mut matched)
+            .unwrap();
+        assert_eq!(count, 3);
+        assert_eq!(&matched[..count], &[0, 1, 2]);
+        assert_eq!(&pointers[..3], &[1, 4_096, 4_097]);
     }
 
     #[test]

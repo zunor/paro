@@ -1014,11 +1014,17 @@ impl JoinHashTable {
 
         let mut store = self.build_store.lock().unwrap();
         let build_time_integer_builder = self.config.build_time_integer_builder.as_ref();
+        let build_time_integer_reservation =
+            build_time_integer_builder.and_then(|builder| builder.reserve_batch(appended_count));
         let direct_key = build_time_integer_builder
             .map(|_| {
                 keys.column(0)
                     .ok_or_else(|| paro_error::internal("hash join build has no direct-index key"))
             })
+            .transpose()?;
+        let direct_key_view = direct_key
+            .as_ref()
+            .map(|key| key.try_to_view(keys.size()))
             .transpose()?;
         let appended_count = store.append_key_payload_chunk_with(
             keys,
@@ -1027,12 +1033,17 @@ impl JoinHashTable {
             appended_count,
             (!defer_hashes).then_some(hashes.as_slice()),
             false,
-            |_, source_row_idx, row_ptr| {
-                if let (Some(builder), Some(key)) =
-                    (build_time_integer_builder, direct_key.as_ref())
-                {
-                    builder.insert_value_with_link(
-                        &key.get_value(source_row_idx),
+            |output_idx, source_row_idx, row_ptr| {
+                if let (Some(builder), Some(reservation), Some(key)) = (
+                    build_time_integer_builder,
+                    build_time_integer_reservation.as_ref(),
+                    direct_key_view.as_ref(),
+                ) {
+                    builder.insert_reserved_vector_row_with_link(
+                        reservation,
+                        output_idx,
+                        key,
+                        source_row_idx,
                         row_ptr,
                         self.config.build_keys_unique,
                         |row_ptr, previous| {
@@ -1044,6 +1055,11 @@ impl JoinHashTable {
                 Ok(())
             },
         )?;
+        if let (Some(builder), Some(reservation)) =
+            (build_time_integer_builder, build_time_integer_reservation)
+        {
+            builder.publish_batch(reservation);
+        }
         if defer_hashes {
             // Publish the deferred state while holding the same store lock that
             // made the zero hash fields visible to spill/finalize readers.

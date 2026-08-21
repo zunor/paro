@@ -12,8 +12,8 @@ use paro_planner::binder::context::BindContext;
 use paro_planner::expression::{
     ComparisonExpression, ComparisonType, ConstantExpression, Expression, ReferenceExpression,
 };
-use paro_planner::operator::join::{JoinComparisonType, JoinCondition};
-use paro_planner::operator::{Filter, Get, LogicalOperator, Projection};
+use paro_planner::operator::join::{ComparisonJoin, JoinComparisonType, JoinCondition, JoinType};
+use paro_planner::operator::{Filter, Get, Join, LogicalOperator, Projection};
 use paro_planner::plan::LogicalPlan;
 
 use super::{
@@ -103,6 +103,27 @@ fn unique_build_proof_resolves_physical_references_through_carriers() {
         &projection,
         &conditions
     ));
+}
+
+#[test]
+fn integer_build_hint_traces_projected_outputs_through_inner_join_carriers() {
+    let ctx = BindContext::new();
+    let mut left = declared_unique_get(&ctx);
+    let LogicalOperator::Get(left_get) = &mut left.operator else {
+        unreachable!("test source is a get")
+    };
+    left_get.table_index = 6;
+    let right = declared_unique_get(&ctx);
+    let mut carrier = ComparisonJoin::new(JoinType::Inner, left, right, Vec::new());
+    carrier.left_projection_map = vec![0].into();
+    carrier.right_projection_map = vec![1].into();
+    let carrier = LogicalPlan::new(&ctx, LogicalOperator::Join(Join::Comparison(carrier)));
+
+    let key = Expression::Reference(ReferenceExpression::new(1, LogicalType::BigInt));
+    let (get, column_id) = resolve_base_get_column(&carrier, &key)
+        .expect("inner join output must retain its base-column lineage");
+    assert_eq!(get.table_index, 7);
+    assert_eq!(column_id, 1);
 }
 
 #[test]

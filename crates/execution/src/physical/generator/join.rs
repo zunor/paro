@@ -1364,6 +1364,21 @@ fn resolve_base_get_output(
         }
         LogicalOperator::Limit(limit) => resolve_base_get_output(&limit.child, output_index),
         LogicalOperator::TopN(topn) => resolve_base_get_output(&topn.child, output_index),
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.join_type == JoinType::Inner
+                && join.duplicate_eliminated_columns.is_empty()
+                && !join.delim_flipped =>
+        {
+            let left_projection = join.left_projection_map.to_indices(join.left.types().len());
+            if let Some(&child_index) = left_projection.get(output_index) {
+                return resolve_base_get_output(&join.left, child_index);
+            }
+            let right_output = output_index.checked_sub(left_projection.len())?;
+            let right_projection = join
+                .right_projection_map
+                .to_indices(join.right.types().len());
+            resolve_base_get_output(&join.right, *right_projection.get(right_output)?)
+        }
         _ => None,
     }
 }
@@ -1393,6 +1408,21 @@ fn resolve_bound_get_column(
         }
         LogicalOperator::TopN(topn) => {
             resolve_bound_get_column(&topn.child, table_index, column_index)
+        }
+        LogicalOperator::Join(Join::Comparison(join))
+            if join.join_type == JoinType::Inner
+                && join.duplicate_eliminated_columns.is_empty()
+                && !join.delim_flipped =>
+        {
+            let left = resolve_bound_get_column(&join.left, table_index, column_index);
+            let right = resolve_bound_get_column(&join.right, table_index, column_index);
+            match (left, right) {
+                (Some(column), None) | (None, Some(column)) => Some(column),
+                // A binding namespace must identify exactly one source in a
+                // transparent carrier. Decline rather than guessing if an
+                // invalid plan aliases a table index across both children.
+                _ => None,
+            }
         }
         _ => None,
     }

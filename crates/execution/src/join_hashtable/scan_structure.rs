@@ -715,6 +715,10 @@ impl ScanStructure {
         hash_table: &JoinHashTable,
         left_projection_map: &[usize],
     ) -> Result<usize> {
+        if self.exact_key_matches && hash_table.join_type == paro_planner::operator::JoinType::Inner
+        {
+            return self.next_exact_inner_join(left, result, hash_table, left_projection_map);
+        }
         self.next_inner_join_impl(
             keys,
             left,
@@ -728,6 +732,57 @@ impl ScanStructure {
                 Ok(match_count)
             },
         )
+    }
+
+    /// Drain an exact-index INNER probe without the generic candidate state machine.
+    ///
+    /// Exact integer indexes publish only rows whose complete equality key was
+    /// already matched. With no residual predicate on this entry point, copying
+    /// candidates through `chain_match_sel`, `scratch_sel`, and the pending
+    /// buffers cannot reject a row. Drain one complete chain level directly
+    /// into the authoritative output selections instead. A following chain
+    /// level that would overflow the output vector remains untouched for the
+    /// next call, preserving the ordinary `OutputMore` contract.
+    fn next_exact_inner_join(
+        &mut self,
+        left: &paro_common::chunk::Chunk,
+        result: &mut paro_common::chunk::Chunk,
+        hash_table: &JoinHashTable,
+        left_projection_map: &[usize],
+    ) -> Result<usize> {
+        debug_assert!(self.exact_key_matches);
+        debug_assert_eq!(
+            hash_table.join_type,
+            paro_planner::operator::JoinType::Inner
+        );
+        if self.finished {
+            result.try_set_cardinality(0)?;
+            return Ok(0);
+        }
+
+        let mut output_count = 0usize;
+        while self.count > 0 {
+            if output_count > 0 && output_count + self.count > VECTOR_SIZE {
+                break;
+            }
+            for active_idx in 0..self.count {
+                let probe_idx = self.sel_vector.get(active_idx);
+                let row_ptr = self.pointers[probe_idx];
+                debug_assert_ne!(row_ptr, 0);
+                self.lhs_sel.set(output_count + active_idx, probe_idx);
+                self.rhs_pointers[output_count + active_idx] = row_ptr;
+            }
+            output_count += self.count;
+            self.advance_pointers();
+        }
+
+        if output_count == 0 {
+            result.try_set_cardinality(0)?;
+        } else {
+            self.gather_result(left, result, output_count, hash_table, left_projection_map)?;
+        }
+        self.finished = self.count == 0;
+        Ok(output_count)
     }
 
     /// Emit a payload-free inner join directly from an exact unique-key probe.
@@ -1190,10 +1245,17 @@ impl ScanStructure {
 
         // 2. Gather projected RHS columns
         let right_result_offset = left_projection_map.len();
-        let unique_rhs_count = self.prepare_rhs_dictionary(count)?;
+        let unique_rhs_count = self.count_adjacent_unique_rhs(count);
+        let needs_dictionary = hash_table
+            .build_output_types()
+            .iter()
+            .any(|build_type| dictionary_gather_is_smaller(build_type, count, unique_rhs_count));
+        if needs_dictionary {
+            self.prepare_rhs_dictionary(count)?;
+        }
         for (build_idx, build_type) in hash_table.build_output_types().iter().enumerate() {
             let output_idx = right_result_offset + build_idx;
-            let use_dictionary = unique_rhs_count < count
+            let use_dictionary = needs_dictionary
                 && dictionary_gather_is_smaller(build_type, count, unique_rhs_count);
             let row_ptrs = if use_dictionary {
                 &self.rhs_unique_pointers[..unique_rhs_count]
@@ -1217,7 +1279,19 @@ impl ScanStructure {
         Ok(())
     }
 
-    fn prepare_rhs_dictionary(&mut self, count: usize) -> Result<usize> {
+    fn count_adjacent_unique_rhs(&self, count: usize) -> usize {
+        let mut previous = None;
+        let mut unique_count = 0usize;
+        for &pointer in &self.rhs_pointers[..count] {
+            if previous != Some(pointer) {
+                previous = Some(pointer);
+                unique_count += 1;
+            }
+        }
+        unique_count
+    }
+
+    fn prepare_rhs_dictionary(&mut self, count: usize) -> Result<()> {
         self.rhs_unique_pointers.clear();
         self.rhs_dictionary_sel.try_make_exclusive()?;
         self.rhs_dictionary_sel.set_len(count);
@@ -1232,7 +1306,7 @@ impl ScanStructure {
             }
             self.rhs_dictionary_sel.set(row_idx, dictionary_idx);
         }
-        Ok(self.rhs_unique_pointers.len())
+        Ok(())
     }
 }
 
