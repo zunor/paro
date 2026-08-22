@@ -34,7 +34,6 @@ use super::segment::{
     ColumnData, HnswColumnBuildOptions, Segment, SegmentInlineIndexKind, SegmentInlineIndexPage,
     SegmentWriter, SegmentWriterOptions,
 };
-use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::metrics::{storage_metrics, SearchInlineBuildMetricKey};
 use crate::search::{
     AdmissionDecision, AdmissionGrant, FlushSearchMode, HnswInlineBuildEstimate,
@@ -413,48 +412,9 @@ fn hnsw_column_build_options(
             "HNSW definition requires exactly one vector column",
         ));
     };
-    let read_usize = |key: &str, default: usize| {
-        definition
-            .provider_config
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .and_then(|value| usize::try_from(value).ok())
-            .unwrap_or(default)
-    };
-    let defaults = HnswConfig::default();
-    let config = HnswConfig::new(
-        read_usize("m", defaults.m),
-        read_usize("ef_construct", defaults.ef_construct),
-    )
-    .with_plain_scan_threshold(read_usize(
-        "plain_scan_threshold",
-        defaults.plain_scan_threshold,
-    ))
-    .with_filtered_plain_scan_threshold(read_usize(
-        "filtered_plain_scan_threshold",
-        defaults.filtered_plain_scan_threshold,
-    ));
-    let distance = definition
-        .provider_config
-        .get("distance")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-        .map(DistanceMetric::from_u8)
-        .unwrap_or_else(|| {
-            match definition
-                .provider_config
-                .get("distance")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("euclidean")
-                .to_ascii_lowercase()
-                .as_str()
-            {
-                "cosine" | "cos" => DistanceMetric::Cosine,
-                "dot" | "dot_product" | "inner_product" | "ip" => DistanceMetric::DotProduct,
-                "manhattan" | "l1" => DistanceMetric::Manhattan,
-                _ => DistanceMetric::Euclidean,
-            }
-        });
+    let provider = definition.hnsw_provider_config()?;
+    let config = provider.index_config();
+    let distance = provider.distance;
     Ok((*column_id, HnswColumnBuildOptions { config, distance }))
 }
 
@@ -489,11 +449,13 @@ fn hnsw_inline_build_estimate(
     entry: &SearchInlineBuilderEntry,
     max_rows_per_segment: u64,
     column_schema: &[crate::tablet::TabletColumn],
-) -> Option<HnswInlineBuildEstimate> {
+) -> Result<Option<HnswInlineBuildEstimate>> {
     if entry.definition.kind != SearchIndexKind::Hnsw {
-        return None;
+        return Ok(None);
     }
-    let column_id = *entry.definition.column_ids.first()?;
+    let column_id = *entry.definition.column_ids.first().ok_or_else(|| {
+        paro_error::invalid_input("HNSW definition requires exactly one vector column")
+    })?;
     let dimension = column_schema
         .iter()
         .find(|column| column.id == column_id)
@@ -501,7 +463,11 @@ fn hnsw_inline_build_estimate(
             LogicalType::Array(_, dimension) => u32::try_from(*dimension).ok(),
             _ => None,
         })
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            paro_error::invalid_input(format!(
+                "HNSW definition column {column_id} is not a VECTOR(N) column"
+            ))
+        })?;
     HnswInlineBuildEstimate::from_definition(
         &entry.definition,
         max_rows_per_segment.max(1),
@@ -938,20 +904,22 @@ impl RowsetWriter {
 
         let requests = entries
             .iter()
-            .map(|entry| InlineAdmissionRequest {
-                table_id: entry.definition.table_id,
-                definition_id: entry.definition.definition_id,
-                provider: entry.definition.kind,
-                flush_mode: entry.flush_mode(),
-                estimated_cost: estimate_inline_build_cost(entry, row_count_estimate),
-                row_count: row_count_estimate.max(1),
-                hnsw_inline: hnsw_inline_build_estimate(
-                    entry,
-                    row_count_estimate,
-                    self.context.schema.columns(),
-                ),
+            .map(|entry| -> Result<InlineAdmissionRequest> {
+                Ok(InlineAdmissionRequest {
+                    table_id: entry.definition.table_id,
+                    definition_id: entry.definition.definition_id,
+                    provider: entry.definition.kind,
+                    flush_mode: entry.flush_mode(),
+                    estimated_cost: estimate_inline_build_cost(entry, row_count_estimate),
+                    row_count: row_count_estimate.max(1),
+                    hnsw_inline: hnsw_inline_build_estimate(
+                        entry,
+                        row_count_estimate,
+                        self.context.schema.columns(),
+                    )?,
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         for attempt in 0..REQUIRED_INLINE_ADMISSION_MAX_ATTEMPTS {
             let decisions = admission.request_inline_batch(&requests)?;
             if decisions.len() != entries.len() {
@@ -1973,8 +1941,15 @@ mod tests {
             column_ids: vec![1],
             expression: None,
             provider_config: json!({
+                "version": 1,
+                "dimension": 2,
+                "distance": "euclidean",
                 "m": 8,
                 "ef_construct": 64,
+                "ef_search": 64,
+                "plain_scan_threshold": 10_000,
+                "filtered_plain_scan_threshold": 0,
+                "build_seed": 1,
                 "inline_threshold": {
                     "max_vector_count": max_vector_count,
                     "max_graph_memory_bytes": 64 * 1024 * 1024u64,

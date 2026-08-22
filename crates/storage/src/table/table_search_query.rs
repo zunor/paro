@@ -6,6 +6,7 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::GlobalFullTextStats;
 use crate::index::hnsw::types::SearchParams;
+use crate::index::hnsw::DistanceMetric;
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::search::capability::{CapabilityToken, SearchCapability, SearchIndexKind};
@@ -16,7 +17,7 @@ use crate::search::providers::fulltext::search::{FullTextFilterProvider, FullTex
 use crate::search::providers::hnsw::search::VectorSearchProvider;
 use crate::search::providers::sparse::search::SparseSearchProvider;
 use crate::search::row_fetch::materialize_candidate_batch;
-use crate::search::{SearchReadSnapshot, TableReadLease};
+use crate::search::{SearchReadOptions, SearchReadSnapshot, TableReadLease};
 use crate::transaction::overlay_reader::TxnOverlayReader;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -43,6 +44,7 @@ impl TableHandle {
         &self,
         capability: &SearchCapability,
         visible_version: i64,
+        read_options: &SearchReadOptions,
     ) -> Result<SearchReadSnapshot> {
         let token = capability.capability_token();
         match self.open_search_snapshot_with_token_result(
@@ -50,6 +52,7 @@ impl TableHandle {
             &token,
             visible_version,
             None,
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => Ok(snapshot),
             OpenSearchCursorResult::CapabilityTokenStale => Err(paro_error::internal(format!(
@@ -68,9 +71,10 @@ impl TableHandle {
         capability: &SearchCapability,
         visible_version: i64,
         overlay: Option<&TxnOverlayReader>,
+        read_options: &SearchReadOptions,
     ) -> Result<SearchReadSnapshot> {
         if overlay.is_none() {
-            return self.open_search_snapshot(capability, visible_version);
+            return self.open_search_snapshot(capability, visible_version, read_options);
         }
 
         let token = capability.capability_token();
@@ -79,6 +83,7 @@ impl TableHandle {
             &token,
             visible_version,
             overlay,
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => Ok(snapshot),
             OpenSearchCursorResult::CapabilityTokenStale => Err(paro_error::internal(format!(
@@ -98,6 +103,7 @@ impl TableHandle {
         token: &CapabilityToken,
         visible_version: i64,
         overlay: Option<&TxnOverlayReader>,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenSearchCursorResult<SearchReadSnapshot>> {
         let generation = match self.open_search_generation_snapshot_with_token(token)? {
             OpenSearchCursorResult::Opened(generation) => generation,
@@ -115,13 +121,19 @@ impl TableHandle {
             .map(TxnOverlayReader::all_rowsets)
             .unwrap_or_default();
         let (table_snapshot, table_lease) = if overlay_rowsets.is_empty() {
-            TableReadLease::open(&self.tablet(), self.table_id(), visible_version)?
+            TableReadLease::open(
+                &self.tablet(),
+                self.table_id(),
+                visible_version,
+                read_options,
+            )?
         } else {
             TableReadLease::open_with_overlay_rowsets(
                 &self.tablet(),
                 self.table_id(),
                 visible_version,
                 overlay_rowsets,
+                read_options,
             )?
         };
         let snapshot = SearchReadSnapshot::new(
@@ -140,20 +152,23 @@ impl TableHandle {
         &self,
         column_id: usize,
         query: &[f32],
+        distance: DistanceMetric,
         k: usize,
         params: SearchParams,
         predicate: Option<PredicateTree>,
         visible_version: i64,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
-            .vector_capability(column_id as u32)
+            .vector_capability(column_id as u32, distance)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "vector"))?;
-        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version, read_options)?;
         VectorSearchProvider::new(
             self.tablet(),
             self.types(),
             column_id,
             query,
+            distance,
             k,
             params,
             predicate,
@@ -165,25 +180,29 @@ impl TableHandle {
         &self,
         column_id: usize,
         query: &[f32],
+        distance: DistanceMetric,
         k: usize,
         params: SearchParams,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
-            .vector_capability(column_id as u32)
+            .vector_capability(column_id as u32, distance)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "vector"))?;
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = self.open_search_snapshot_with_overlay(
             &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )?;
         VectorSearchProvider::new(
             self.tablet(),
             self.types(),
             column_id,
             query,
+            distance,
             k,
             params,
             predicate,
@@ -196,10 +215,12 @@ impl TableHandle {
         token: &CapabilityToken,
         column_id: usize,
         query: &[f32],
+        distance: DistanceMetric,
         k: usize,
         params: SearchParams,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = match self.open_search_snapshot_with_token_result(
@@ -207,6 +228,7 @@ impl TableHandle {
             token,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => snapshot,
             OpenSearchCursorResult::CapabilityTokenStale => {
@@ -221,6 +243,7 @@ impl TableHandle {
             self.types(),
             column_id,
             query,
+            distance,
             k,
             params,
             predicate,
@@ -236,11 +259,12 @@ impl TableHandle {
         k: usize,
         predicate: Option<PredicateTree>,
         visible_version: i64,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .sparse_capability(column_id as u32)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "sparse"))?;
-        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version, read_options)?;
         SparseSearchProvider::new(self.tablet(), column_id, query, k, predicate).open(snapshot)
     }
 
@@ -252,6 +276,7 @@ impl TableHandle {
         k: usize,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = match self.open_search_snapshot_with_token_result(
@@ -259,6 +284,7 @@ impl TableHandle {
             token,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => snapshot,
             OpenSearchCursorResult::CapabilityTokenStale => {
@@ -280,6 +306,7 @@ impl TableHandle {
         k: usize,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .sparse_capability(column_id as u32)
@@ -289,6 +316,7 @@ impl TableHandle {
             &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )?;
         SparseSearchProvider::new(self.tablet(), column_id, query, k, predicate).open(snapshot)
     }
@@ -300,11 +328,12 @@ impl TableHandle {
         config: &str,
         predicate: Option<PredicateTree>,
         visible_version: i64,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .fulltext_capability(column_id as u32, config)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
-        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version, read_options)?;
         FullTextFilterProvider::new(self.tablet(), column_id, query, config, predicate)
             .open(snapshot)
     }
@@ -317,6 +346,7 @@ impl TableHandle {
         config: &str,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = match self.open_search_snapshot_with_token_result(
@@ -324,6 +354,7 @@ impl TableHandle {
             token,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => snapshot,
             OpenSearchCursorResult::CapabilityTokenStale => {
@@ -345,6 +376,7 @@ impl TableHandle {
         config: &str,
         predicate: Option<PredicateTree>,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .fulltext_capability(column_id as u32, config)
@@ -354,6 +386,7 @@ impl TableHandle {
             &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )?;
         FullTextFilterProvider::new(self.tablet(), column_id, query, config, predicate)
             .open(snapshot)
@@ -369,13 +402,14 @@ impl TableHandle {
         global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         visible_version: i64,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .fulltext_capability(column_id as u32, config)
             .ok_or_else(|| paro_error::object_not_found("Search capability", "fulltext"))?;
         let global_stats =
             global_stats.or_else(|| capability.generation_stats.fulltext_global_stats());
-        let snapshot = self.open_search_snapshot(&capability, visible_version)?;
+        let snapshot = self.open_search_snapshot(&capability, visible_version, read_options)?;
         FullTextTopKProvider::new(
             self.tablet(),
             column_id,
@@ -400,6 +434,7 @@ impl TableHandle {
         global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenSearchCursorResult<OpenedSearchCursor>> {
         let overlay = TxnOverlayReader::for_tablet(&self.tablet(), view)?;
         let snapshot = match self.open_search_snapshot_with_token_result(
@@ -407,6 +442,7 @@ impl TableHandle {
             token,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )? {
             OpenSearchCursorResult::Opened(snapshot) => snapshot,
             OpenSearchCursorResult::CapabilityTokenStale => {
@@ -442,6 +478,7 @@ impl TableHandle {
         global_stats: Option<GlobalFullTextStats>,
         score_mode: FullTextScoreMode,
         view: &TransactionView,
+        read_options: &SearchReadOptions,
     ) -> Result<OpenedSearchCursor> {
         let capability = self
             .fulltext_capability(column_id as u32, config)
@@ -453,6 +490,7 @@ impl TableHandle {
             &capability,
             view.visible_version_i64(),
             overlay.as_ref(),
+            read_options,
         )?;
         FullTextTopKProvider::new(
             self.tablet(),
@@ -473,6 +511,7 @@ impl TableHandle {
         batch: CandidateBatch,
         projected_columns: &[usize],
         emit_score: bool,
+        allocator: Arc<dyn paro_common::allocator::Allocator>,
     ) -> Result<Chunk> {
         materialize_candidate_batch(
             &self.tablet(),
@@ -481,6 +520,7 @@ impl TableHandle {
             batch,
             projected_columns,
             emit_score,
+            allocator,
         )
     }
 }

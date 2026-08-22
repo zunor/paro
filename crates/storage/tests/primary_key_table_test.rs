@@ -261,6 +261,14 @@ fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
     let hnsw = segment.hnsw_index(1).expect("HNSW index should exist");
     assert_eq!(hnsw.graph.links.num_points(), rowset.num_rows() as usize);
 
+    let stored = segment
+        .read_by_rowids(&[1], &[0])
+        .expect("read original vector value");
+    let bytes = &stored[0].1.data;
+    assert_eq!(bytes.len(), 2 * std::mem::size_of::<f32>());
+    assert_eq!(f32::from_le_bytes(bytes[0..4].try_into().unwrap()), 100.0);
+    assert_eq!(f32::from_le_bytes(bytes[4..8].try_into().unwrap()), 0.0);
+
     // Cosine query [1,1]: best match should be row idx=1 ([1,1]),
     // not row idx=0 ([100,0]) which would win under plain dot product.
     let params = SearchParams {

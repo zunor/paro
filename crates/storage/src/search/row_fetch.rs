@@ -13,7 +13,7 @@ use crate::rowset::encoding::BinaryPlainPageDecoder;
 use crate::rowset::RowsetId;
 use crate::search::{CandidateBatch, PhysicalRowRef, SearchReadSnapshot};
 use crate::tablet::TabletRef;
-use paro_common::allocator::{default_allocator, Allocator};
+use paro_common::allocator::Allocator;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, codes, Result};
 use paro_common::types::LogicalType;
@@ -780,9 +780,9 @@ pub(crate) fn materialize_candidate_batch(
     batch: CandidateBatch,
     projected_columns: &[usize],
     emit_score: bool,
+    allocator: Arc<dyn Allocator>,
 ) -> Result<Chunk> {
     let row_count = batch.rows.len();
-    let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
     let mode = RowFetchMode::materialize(row_count);
     let mut output_vectors = if let Some((vectors, stats)) = try_materialize_single_segment_columns(
         column_types,
@@ -840,7 +840,7 @@ pub(crate) fn materialize_candidate_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::SearchParams;
+    use crate::index::hnsw::{DistanceMetric, SearchParams};
     use crate::rowset::encoding::BinaryPlainPageBuilder;
     use crate::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
     use crate::table::table_factory::TableFactory;
@@ -848,6 +848,7 @@ mod tests {
         test_chunk_from_vectors, test_embedding_vector, test_i64_vector, test_string_vector,
     };
     use bytes::Bytes;
+    use paro_common::allocator::default_allocator;
 
     #[test]
     fn project_varlen_batch_decodes_length_prefixed_rows_once() {
@@ -987,6 +988,7 @@ mod tests {
             .open_vector_search_cursor(
                 0,
                 &[10.0, 0.0],
+                DistanceMetric::Euclidean,
                 3,
                 SearchParams {
                     ef: Some(64),
@@ -994,6 +996,7 @@ mod tests {
                 },
                 None,
                 table.max_version(),
+                &crate::search::SearchReadOptions::default(),
             )
             .expect("open vector cursor");
         let mut cursor = opened.cursor;
@@ -1088,6 +1091,7 @@ mod tests {
             .open_vector_search_cursor(
                 0,
                 &[10.0, 0.0],
+                DistanceMetric::Euclidean,
                 3,
                 SearchParams {
                     ef: Some(64),
@@ -1095,6 +1099,7 @@ mod tests {
                 },
                 None,
                 table.max_version(),
+                &crate::search::SearchReadOptions::default(),
             )
             .expect("open vector cursor");
         let snapshot = opened.snapshot;

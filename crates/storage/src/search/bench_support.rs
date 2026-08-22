@@ -417,6 +417,7 @@ impl RowFetchBenchFixture {
         let opened = table.open_vector_search_cursor(
             0,
             &[0.0, 0.0],
+            crate::index::hnsw::DistanceMetric::Euclidean,
             config.candidate_count,
             SearchParams {
                 ef: Some(128),
@@ -424,6 +425,7 @@ impl RowFetchBenchFixture {
             },
             None,
             table.max_version(),
+            &crate::search::SearchReadOptions::default(),
         )?;
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;

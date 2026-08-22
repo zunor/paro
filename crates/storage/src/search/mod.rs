@@ -16,6 +16,7 @@ pub mod capability;
 pub mod cursor;
 pub(crate) mod definition;
 pub(crate) mod generation;
+pub mod hnsw_config;
 pub mod inline_sink;
 pub(crate) mod lifecycle;
 pub mod maintenance;
@@ -42,9 +43,13 @@ pub use capability::{
 pub use cursor::{
     CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,
     OpenSearchCursorResult, OpenedSearchCursor, PhysicalRowRef, SearchBatchState, SearchCursor,
-    SearchProvider, SearchReadSnapshot, SearchRowHandle, TableReadLease, TableReadSnapshot,
+    SearchProvider, SearchReadOptions, SearchReadSnapshot, SearchRowHandle, TableReadLease,
+    TableReadSnapshot,
 };
 pub use generation::coverage::SearchGenerationCoverage;
+pub use hnsw_config::{
+    HnswInlineConfig, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED, HNSW_PROVIDER_CONFIG_VERSION,
+};
 pub use inline_sink::{
     AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason, BuildBudget,
     CostEstimate, FlushSearchMode, FullTextStatsDelta, HnswInlineBuildEstimate,

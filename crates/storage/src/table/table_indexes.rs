@@ -140,9 +140,12 @@ impl TableHandle {
         Ok(report)
     }
 
-    pub fn vector_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
-        self.search_registry
-            .capability(SearchIndexKind::Hnsw, column_id, None)
+    pub fn vector_capability(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<SearchCapability> {
+        self.search_registry.hnsw_capability(column_id, distance)
     }
 
     pub fn sparse_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
@@ -160,7 +163,7 @@ impl TableHandle {
 
     pub fn search_capability(&self, intent: &SearchIntent) -> Option<SearchCapability> {
         match intent {
-            SearchIntent::Hnsw(intent) => self.vector_capability(intent.column_id),
+            SearchIntent::Hnsw(intent) => self.vector_capability(intent.column_id, intent.distance),
             SearchIntent::Sparse(intent) => self.sparse_capability(intent.column_id),
             SearchIntent::FullText(FullTextIntent {
                 column_id, config, ..

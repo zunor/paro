@@ -132,6 +132,21 @@ impl EntryPoints {
     where
         F: Fn(PointOffset) -> bool,
     {
+        self.get_random_entry_point_with(checker, |seen| rng.gen_range(0..seen) == 0)
+    }
+
+    /// Get a random matching entry point using a caller-owned reservoir
+    /// replacement decision. Construction uses this form so its persisted seed
+    /// is independent of the `rand` crate's distribution implementation.
+    pub(crate) fn get_random_entry_point_with<F, G>(
+        &self,
+        checker: F,
+        mut replace: G,
+    ) -> Option<EntryPoint>
+    where
+        F: Fn(PointOffset) -> bool,
+        G: FnMut(usize) -> bool,
+    {
         let mut selected = None;
         let mut seen = 0usize;
 
@@ -145,7 +160,7 @@ impl EntryPoints {
             }
 
             seen += 1;
-            if rng.gen_range(0..seen) == 0 {
+            if replace(seen) {
                 selected = Some(*entry);
             }
         }

@@ -7,6 +7,7 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_common::types::LogicalType;
 use paro_planner::operator::SearchDecision;
 use paro_storage::index::hnsw::types::SearchParams;
+use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::PredicateTree;
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::{
@@ -20,6 +21,7 @@ pub struct VectorSearchSpec {
     pub capability_token: CapabilityToken,
     pub column_id: usize,
     pub query: DenseVectorQuery,
+    pub distance: DistanceMetric,
     pub k: usize,
     pub params: SearchParams,
     pub predicate: Option<PredicateTree>,

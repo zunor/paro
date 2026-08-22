@@ -16,7 +16,6 @@ use crate::index::hnsw::vector_storage::VectorStorage;
 use crate::index::hnsw::visited_pool::VisitedPool;
 use bitvec::prelude::BitVec;
 use parking_lot::{Mutex, RwLock};
-use rand::{thread_rng, Rng};
 use std::cmp::max;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
@@ -102,6 +101,51 @@ pub struct GraphLayersBuilder {
     /// Whether to collect per-build distance profile metrics.
     distance_profile_enabled: bool,
     distance_profile: DistanceProfile,
+    /// Stable construction RNG. The algorithm is owned by Paro so identical
+    /// input/configuration remains reproducible across rand crate upgrades.
+    build_rng: Mutex<DeterministicBuildRng>,
+}
+
+/// SplitMix64 construction RNG, version 1.
+///
+/// Do not change this algorithm in place. A future algorithm requires a new
+/// provider-config version so persisted seeds retain their meaning.
+#[derive(Debug)]
+struct DeterministicBuildRng {
+    state: u64,
+}
+
+impl DeterministicBuildRng {
+    const fn new(seed: u64) -> Self {
+        Self { state: seed }
+    }
+    fn next_u64(&mut self) -> u64 {
+        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut value = self.state;
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^ (value >> 31)
+    }
+
+    /// Stable uniform sample in the open interval (0, 1).
+    fn next_open_unit_f64(&mut self) -> f64 {
+        const MANTISSA_VALUES: u64 = 1_u64 << 53;
+        let mantissa = self.next_u64() >> 11;
+        (mantissa as f64 + 1.0) / (MANTISSA_VALUES as f64 + 1.0)
+    }
+
+    /// Stable unbiased integer sample in `[0, upper)`.
+    fn uniform_below(&mut self, upper: usize) -> usize {
+        debug_assert!(upper > 0);
+        let upper = upper as u64;
+        let reject_below = upper.wrapping_neg() % upper;
+        loop {
+            let value = self.next_u64();
+            if value >= reject_below {
+                return (value % upper) as usize;
+            }
+        }
+    }
 }
 
 impl GraphLayersBuilder {
@@ -132,6 +176,7 @@ impl GraphLayersBuilder {
             random_entry_point: config.build_random_entry_point,
             distance_profile_enabled: false,
             distance_profile: DistanceProfile::default(),
+            build_rng: Mutex::new(DeterministicBuildRng::new(config.build_seed)),
         }
     }
 
@@ -154,11 +199,8 @@ impl GraphLayersBuilder {
 
     /// Generate a random level for a new point using geometric distribution.
     pub fn get_random_layer(&self) -> usize {
-        let mut rng = thread_rng();
-        let r: f64 = rng.gen_range(0.0..1.0);
-        if r <= 0.0 {
-            return 31; // Max level
-        }
+        let mut rng = self.build_rng.lock();
+        let r = rng.next_open_unit_f64();
         let level = (-r.ln() * self.level_factor) as usize;
         level.min(31) // Cap at reasonable max level
     }
@@ -259,9 +301,9 @@ impl GraphLayersBuilder {
         };
 
         let entry_point = if self.random_entry_point {
-            let mut rng = thread_rng();
+            let mut rng = self.build_rng.lock();
             entry_points
-                .get_random_entry_point(&mut rng, |_| true)
+                .get_random_entry_point_with(|_| true, |seen| rng.uniform_below(seen) == 0)
                 .expect("entry points must be non-empty")
         } else {
             entry_points

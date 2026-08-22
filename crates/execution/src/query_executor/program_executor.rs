@@ -119,9 +119,10 @@ fn start_program_with_output(
     let output = match program {
         StatementProgram::Pipeline { graph, .. }
             if fetch_driven
-                && session.limits.parallel_scheduler
-                && graph.control_regions.is_empty()
-                && session.number_of_threads() > 1 =>
+                && PipelineScheduler::should_use_parallel_scheduler_for_session(
+                    graph,
+                    session.as_ref(),
+                ) =>
         {
             QueryOutputPort::with_blocking_writes(&streaming_output)
         }

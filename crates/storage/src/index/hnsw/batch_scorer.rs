@@ -110,7 +110,8 @@ mod tests {
         let query = vec![4.0, 4.0];
         let top_k = 3;
 
-        let scorer = VectorScorer::new(&query, storage.as_ref(), DistanceMetric::DotProduct);
+        let prepared = DistanceMetric::DotProduct.prepare(&query);
+        let scorer = VectorScorer::new(&prepared, storage.as_ref());
         let actual = BatchScorer::new(vec![scorer], top_k).scan(0..storage.num_vectors() as u32);
         let expected = brute_force_results(
             &query,
@@ -134,9 +135,13 @@ mod tests {
         ));
         let queries = [vec![1.0, 1.0], vec![3.5, 3.5], vec![7.0, 7.0]];
         let top_k = 4;
-        let scorers = queries
+        let prepared_queries = queries
             .iter()
-            .map(|query| VectorScorer::new(query, storage.as_ref(), DistanceMetric::Euclidean))
+            .map(|query| DistanceMetric::Euclidean.prepare(query))
+            .collect::<Vec<_>>();
+        let scorers = prepared_queries
+            .iter()
+            .map(|query| VectorScorer::new(query, storage.as_ref()))
             .collect::<Vec<_>>();
 
         let actual =

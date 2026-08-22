@@ -85,6 +85,7 @@ impl Segment {
         top_k: usize,
         params: &SearchParams,
         predicate_tree: Option<&PredicateTree>,
+        mode: HnswSearchMode,
     ) -> Result<Vec<Vec<ScoredPoint>>> {
         self.vector_search_batch_with_epoch(
             column_id,
@@ -93,6 +94,7 @@ impl Segment {
             params,
             self.rowset_gen,
             predicate_tree,
+            mode,
         )
     }
 
@@ -105,6 +107,7 @@ impl Segment {
         params: &SearchParams,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
+        mode: HnswSearchMode,
     ) -> Result<Vec<Vec<ScoredPoint>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -119,7 +122,7 @@ impl Segment {
                 return Ok(vec![Vec::new(); queries.len()]);
             }
         }
-        index.search_many_prepared(queries, top_k, params, filter_bitmap.as_ref())
+        index.search_many_prepared(queries, top_k, params, filter_bitmap.as_ref(), mode)
     }
 
     /// Perform a sparse vector search on this segment.

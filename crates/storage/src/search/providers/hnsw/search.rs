@@ -39,6 +39,7 @@ pub(crate) struct VectorSearchProvider {
     column_types: Vec<LogicalType>,
     column_id: usize,
     query: Vec<f32>,
+    distance: DistanceMetric,
     k: usize,
     params: SearchParams,
     predicate: Option<PredicateTree>,
@@ -51,6 +52,7 @@ impl VectorSearchProvider {
         column_types: &[LogicalType],
         column_id: usize,
         query: &[f32],
+        distance: DistanceMetric,
         k: usize,
         params: SearchParams,
         predicate: Option<PredicateTree>,
@@ -60,6 +62,7 @@ impl VectorSearchProvider {
             column_types: column_types.to_vec(),
             column_id,
             query: query.to_vec(),
+            distance,
             k,
             params,
             predicate,
@@ -87,7 +90,23 @@ impl VectorSearchProvider {
                 top_k: self.k,
             },
         )?;
-        let distance = resolve_distance_metric(&snapshot.generation.provider_config);
+        let provider_config = snapshot
+            .generation
+            .hnsw_provider_config
+            .clone()
+            .ok_or_else(|| {
+                paro_error::data_corrupted(
+                    "HNSW generation is missing its validated provider contract",
+                )
+            })?;
+        if provider_config.distance != self.distance {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW distance mismatch: query uses {}, index uses {}",
+                self.distance.durable_name(),
+                provider_config.distance.durable_name()
+            )));
+        }
+        let distance = self.distance;
         let prepared_query = distance.prepare(&self.query);
         let cursor = VectorSearchCursor {
             sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
@@ -101,6 +120,7 @@ impl VectorSearchProvider {
             storage_col_id: self.column_id as u32,
             vector_dim,
             distance,
+            provider_config,
             params: self.params,
             predicate: self.predicate,
             telemetry: self.telemetry,
@@ -143,6 +163,7 @@ struct VectorSearchCursor {
     storage_col_id: u32,
     vector_dim: usize,
     distance: DistanceMetric,
+    provider_config: Arc<crate::search::HnswProviderConfig>,
     params: SearchParams,
     predicate: Option<PredicateTree>,
     telemetry: Arc<dyn SearchTelemetryCollector>,
@@ -211,13 +232,7 @@ impl VectorSearchCursor {
     }
 
     fn query_wide_search_mode(&self) -> HnswSearchMode {
-        let threshold = self
-            .snapshot
-            .generation
-            .provider_config
-            .get("plain_scan_threshold")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(10_000);
+        let threshold = self.provider_config.plain_scan_threshold as u64;
         let visible_rows = self
             .snapshot
             .table_lease
@@ -235,11 +250,8 @@ impl VectorSearchCursor {
         search_mode: HnswSearchMode,
     ) -> Result<(Vec<RankedRow>, bool)> {
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        if visible_segment
-            .segment
-            .hnsw_index(self.storage_col_id)
-            .is_some()
-        {
+        if let Some(index) = visible_segment.segment.hnsw_index(self.storage_col_id) {
+            validate_hnsw_index_contract(index.as_ref(), self.provider_config.as_ref())?;
             return visible_segment
                 .segment
                 .vector_search_with_epoch_mode(
@@ -289,6 +301,7 @@ impl VectorSearchCursor {
             self.storage_col_id,
             self.vector_dim,
         )? {
+            validate_hnsw_index_contract(&index, self.provider_config.as_ref())?;
             let filter_bitmap = visible_segment
                 .segment
                 .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
@@ -360,12 +373,29 @@ impl VectorSearchCursor {
                     crate::rowset::SegmentRowId::from_raw(row_id),
                 ),
                 self.distance
-                    .similarity(self.prepared_query.as_slice(), &decoded),
+                    .similarity_prepared(self.prepared_query.as_slice(), &decoded),
             ));
         }
 
         Ok((collector.into_sorted_rows(), true))
     }
+}
+
+fn validate_hnsw_index_contract(
+    index: &HnswIndex,
+    provider: &crate::search::HnswProviderConfig,
+) -> Result<()> {
+    let expected = provider.index_config();
+    if index.distance != provider.distance || index.config != expected {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW artifact contract mismatch: artifact_distance={}, definition_distance={}, artifact_config={:?}, definition_config={:?}",
+            index.distance.durable_name(),
+            provider.distance.durable_name(),
+            index.config,
+            expected
+        )));
+    }
+    Ok(())
 }
 
 fn open_sidecar_hnsw_index(
@@ -471,7 +501,10 @@ impl SearchCursor for VectorSearchCursor {
             VectorCursorState::Ready { rows, offset } => {
                 let row_limit = batch.row_limit.max(1);
                 let end = (*offset + row_limit).min(rows.len());
-                let candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                let mut candidate_batch = ranked_rows_to_batch(rows[*offset..end].to_vec());
+                for score in &mut candidate_batch.scores {
+                    *score = self.distance.postprocess(*score);
+                }
                 *offset = end;
                 if *offset >= rows.len() {
                     self.state = VectorCursorState::Exhausted;
@@ -501,28 +534,6 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
         )));
     }
     Ok(())
-}
-
-fn resolve_distance_metric(provider_config: &serde_json::Value) -> DistanceMetric {
-    if let Some(value) = provider_config
-        .get("distance")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-    {
-        return DistanceMetric::from_u8(value);
-    }
-    match provider_config
-        .get("distance")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("euclidean")
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "cosine" | "cos" => DistanceMetric::Cosine,
-        "dot" | "dot_product" | "inner_product" | "ip" => DistanceMetric::DotProduct,
-        "manhattan" | "l1" => DistanceMetric::Manhattan,
-        _ => DistanceMetric::Euclidean,
-    }
 }
 
 fn choose_query_wide_search_mode(

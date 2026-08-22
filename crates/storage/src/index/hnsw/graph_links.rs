@@ -189,25 +189,15 @@ impl GraphLinks {
             return;
         };
         let bytes = self.data.as_bytes();
-        let Some(start_byte) = start
-            .checked_mul(POINT_BYTES)
-            .and_then(|offset| self.level0_links_offset.checked_add(offset))
-        else {
-            return;
-        };
-        let Some(end_byte) = end
-            .checked_mul(POINT_BYTES)
-            .and_then(|offset| self.level0_links_offset.checked_add(offset))
-        else {
-            return;
-        };
-        let Some(link_bytes) = bytes.get(start_byte..end_byte) else {
-            return;
-        };
-        for raw in link_bytes.chunks_exact(POINT_BYTES) {
-            f(u32::from_le_bytes(
-                raw.try_into().expect("level-0 link width is fixed"),
-            ));
+        let start_byte = self.level0_links_offset + start * POINT_BYTES;
+        let count = end - start;
+        // parse_layout validated every CSR range against the serialized link
+        // payload. read_unaligned supports both Vec<u8> and mmap backing without
+        // requiring a decoded/realigned copy.
+        let links = unsafe { bytes.as_ptr().add(start_byte).cast::<PointOffset>() };
+        for index in 0..count {
+            let raw = unsafe { std::ptr::read_unaligned(links.add(index)) };
+            f(PointOffset::from_le(raw));
         }
     }
 
@@ -266,19 +256,13 @@ impl GraphLinks {
             return None;
         }
         let bytes = self.data.as_bytes();
-        let start = Self::read_u64_at(
-            bytes,
-            self.level0_offsets_offset
-                .checked_add(point.checked_mul(U64_BYTES)?)?,
-        )
-        .and_then(|value| usize::try_from(value).ok())?;
-        let end = Self::read_u64_at(
-            bytes,
-            self.level0_offsets_offset
-                .checked_add((point + 1).checked_mul(U64_BYTES)?)?,
-        )
-        .and_then(|value| usize::try_from(value).ok())?;
-        (start <= end && end <= self.level0_link_count).then_some((start, end))
+        let start = Self::read_validated_u64(bytes, self.level0_offsets_offset + point * U64_BYTES)
+            as usize;
+        let end =
+            Self::read_validated_u64(bytes, self.level0_offsets_offset + (point + 1) * U64_BYTES)
+                as usize;
+        debug_assert!(start <= end && end <= self.level0_link_count);
+        Some((start, end))
     }
 
     #[inline]
@@ -288,22 +272,13 @@ impl GraphLinks {
             return None;
         }
         let bytes = self.data.as_bytes();
-        let start = Self::read_u64_at(
-            bytes,
-            self.upper_offsets_offset
-                .checked_add(point.checked_mul(U64_BYTES)?)?,
-        )
-        .and_then(|value| usize::try_from(value).ok())?;
-        let end = Self::read_u64_at(
-            bytes,
-            self.upper_offsets_offset
-                .checked_add((point + 1).checked_mul(U64_BYTES)?)?,
-        )
-        .and_then(|value| usize::try_from(value).ok())?;
-        if start > end || end > self.upper_payload_len {
-            return None;
-        }
-        bytes.get(self.upper_payload_offset + start..self.upper_payload_offset + end)
+        let start =
+            Self::read_validated_u64(bytes, self.upper_offsets_offset + point * U64_BYTES) as usize;
+        let end =
+            Self::read_validated_u64(bytes, self.upper_offsets_offset + (point + 1) * U64_BYTES)
+                as usize;
+        debug_assert!(start <= end && end <= self.upper_payload_len);
+        Some(&bytes[self.upper_payload_offset + start..self.upper_payload_offset + end])
     }
 
     pub fn num_levels(&self, point_id: PointOffset) -> usize {
@@ -396,6 +371,13 @@ impl GraphLinks {
         Some(u64::from_le_bytes(raw.try_into().ok()?))
     }
 
+    #[inline(always)]
+    fn read_validated_u64(bytes: &[u8], start: usize) -> u64 {
+        debug_assert!(start + U64_BYTES <= bytes.len());
+        let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(start).cast::<u64>()) };
+        u64::from_le(raw)
+    }
+
     fn read_u32(bytes: &[u8], start: usize, field: &str) -> Result<u32> {
         Self::read_u32_at(bytes, start)
             .ok_or_else(|| paro_error::data_corrupted(format!("GraphLinks missing field: {field}")))
@@ -409,6 +391,128 @@ impl GraphLinks {
     fn checked_usize(value: u64, field: &str) -> Result<usize> {
         usize::try_from(value)
             .map_err(|_| paro_error::data_corrupted(format!("GraphLinks {field} overflow")))
+    }
+
+    fn validate_offset_table(
+        bytes: &[u8],
+        table_offset: usize,
+        point_count: usize,
+        payload_len: usize,
+        label: &str,
+    ) -> Result<()> {
+        let mut previous = 0u64;
+        for point in 0..=point_count {
+            let byte_offset = table_offset + point * U64_BYTES;
+            let current = Self::read_u64(bytes, byte_offset, label)?;
+            if current < previous || current > payload_len as u64 {
+                return Err(paro_error::data_corrupted(format!(
+                    "GraphLinks {label} is not monotonic/in bounds at point {point}: previous={previous}, current={current}, limit={payload_len}"
+                )));
+            }
+            previous = current;
+        }
+        if previous != payload_len as u64 {
+            return Err(paro_error::data_corrupted(format!(
+                "GraphLinks {label} final offset mismatch: {previous} != {payload_len}"
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_upper_payloads(
+        bytes: &[u8],
+        point_count: usize,
+        upper_offsets_offset: usize,
+        upper_payload_offset: usize,
+    ) -> Result<()> {
+        for point in 0..point_count {
+            let start = Self::read_u64(
+                bytes,
+                upper_offsets_offset + point * U64_BYTES,
+                "upper offset",
+            )? as usize;
+            let end = Self::read_u64(
+                bytes,
+                upper_offsets_offset + (point + 1) * U64_BYTES,
+                "upper offset",
+            )? as usize;
+            let payload = &bytes[upper_payload_offset + start..upper_payload_offset + end];
+            let mut cursor = 0usize;
+            let num_levels = Self::decode_varint_checked(payload, &mut cursor)
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "GraphLinks invalid upper level count for point {point}"
+                    ))
+                })?;
+            if num_levels == 0 {
+                return Err(paro_error::data_corrupted(format!(
+                    "GraphLinks point {point} has no level-0 adjacency"
+                )));
+            }
+            for level in 1..num_levels {
+                let count = Self::decode_varint_checked(payload, &mut cursor)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted(format!(
+                            "GraphLinks invalid upper link count for point {point} level {level}"
+                        ))
+                    })?;
+                let mut previous = 0u32;
+                for link_index in 0..count {
+                    let delta = Self::decode_varint_checked(payload, &mut cursor)
+                        .and_then(|value| u32::try_from(value).ok())
+                        .ok_or_else(|| {
+                            paro_error::data_corrupted(format!(
+                                "GraphLinks invalid upper link for point {point} level {level}"
+                            ))
+                        })?;
+                    previous = if link_index == 0 {
+                        delta
+                    } else {
+                        previous.checked_add(delta).ok_or_else(|| {
+                            paro_error::data_corrupted(format!(
+                                "GraphLinks upper link delta overflow for point {point} level {level}"
+                            ))
+                        })?
+                    };
+                    if previous as usize >= point_count {
+                        return Err(paro_error::data_corrupted(format!(
+                            "GraphLinks upper link target {} out of bounds for point {point} level {level}",
+                            previous
+                        )));
+                    }
+                }
+            }
+            if cursor != payload.len() {
+                return Err(paro_error::data_corrupted(format!(
+                    "GraphLinks upper payload has trailing bytes for point {point}: consumed={cursor}, len={}",
+                    payload.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_level0_links(
+        bytes: &[u8],
+        point_count: usize,
+        link_count: usize,
+        links_offset: usize,
+    ) -> Result<()> {
+        for link_index in 0..link_count {
+            let link = Self::read_u32(
+                bytes,
+                links_offset + link_index * POINT_BYTES,
+                "level-0 link",
+            )?;
+            if link as usize >= point_count {
+                return Err(paro_error::data_corrupted(format!(
+                    "GraphLinks level-0 link target {link} out of bounds at link {link_index}"
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn parse_layout(bytes: &[u8]) -> Result<ParsedLayout> {
@@ -509,6 +613,27 @@ impl GraphLinks {
                 "GraphLinks upper payload boundary mismatch",
             ));
         }
+        Self::validate_offset_table(
+            bytes,
+            level0_offsets_offset,
+            point_count,
+            level0_link_count,
+            "level-0 offset",
+        )?;
+        Self::validate_offset_table(
+            bytes,
+            upper_offsets_offset,
+            point_count,
+            upper_payload_len,
+            "upper offset",
+        )?;
+        Self::validate_level0_links(bytes, point_count, level0_link_count, level0_links_offset)?;
+        Self::validate_upper_payloads(
+            bytes,
+            point_count,
+            upper_offsets_offset,
+            upper_payload_offset,
+        )?;
 
         Ok(ParsedLayout {
             serialized_len_bytes,
@@ -681,5 +806,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn middle_level0_offset_corruption_is_rejected_at_open() {
+        let links = GraphLinks::new_from_edges(sample_edges());
+        let mut bytes = Vec::new();
+        links.serialize(&mut bytes).unwrap();
+        let layout = GraphLinks::parse_layout(&bytes).unwrap();
+        let corrupt = (layout.level0_link_count as u64 + 1).to_le_bytes();
+        let offset = layout.level0_offsets_offset + U64_BYTES;
+        bytes[offset..offset + U64_BYTES].copy_from_slice(&corrupt);
+
+        let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("level-0 offset"));
+    }
+
+    #[test]
+    fn truncated_upper_varint_is_rejected_at_open() {
+        let links = GraphLinks::new_from_edges(sample_edges());
+        let mut bytes = Vec::new();
+        links.serialize(&mut bytes).unwrap();
+        let layout = GraphLinks::parse_layout(&bytes).unwrap();
+        let point0_end = GraphLinks::read_u64(
+            &bytes,
+            layout.upper_offsets_offset + U64_BYTES,
+            "point 0 upper end",
+        )
+        .unwrap() as usize;
+        bytes[layout.upper_payload_offset + point0_end - 1] = 0x80;
+
+        let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("invalid upper link"));
+    }
+
+    #[test]
+    fn out_of_bounds_level0_link_is_rejected_at_open() {
+        let links = GraphLinks::new_from_edges(sample_edges());
+        let mut bytes = Vec::new();
+        links.serialize(&mut bytes).unwrap();
+        let layout = GraphLinks::parse_layout(&bytes).unwrap();
+        bytes[layout.level0_links_offset..layout.level0_links_offset + POINT_BYTES]
+            .copy_from_slice(&(layout.point_count as u32).to_le_bytes());
+
+        let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        assert!(error.to_string().contains("level-0 link target"));
     }
 }

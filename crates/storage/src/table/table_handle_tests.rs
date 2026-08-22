@@ -12,7 +12,7 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::{FullTextIndex, FullTextIndexConfig};
 use crate::index::fulltext::tokenizer::TokenizerKind;
-use crate::index::hnsw::SearchParams;
+use crate::index::hnsw::{DistanceMetric, SearchParams};
 use crate::index::{BoundIndex, Predicate, PredicateResult, PredicateTree};
 use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
 use crate::metrics::storage_metrics;
@@ -30,6 +30,7 @@ use crate::tablet::tablet_reader::TabletReaderParams;
 use crate::tablet::{KeysType, TabletColumn, TabletSchema};
 use crate::test_utils::*;
 use crate::transaction::txn::Transaction;
+use paro_common::allocator::default_allocator;
 use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -358,6 +359,7 @@ fn drain_search_cursor(
                 batch,
                 projected_columns,
                 emit_score,
+                Arc::new(default_allocator()),
             )?),
             SearchBatchState::Exhausted => return Ok(chunks),
         }
@@ -377,10 +379,12 @@ fn run_vector_cursor_with_slots(
     let opened = table.open_vector_search_cursor(
         column_id,
         query,
+        DistanceMetric::Euclidean,
         k,
         params,
         predicate.cloned(),
         table.max_version(),
+        &crate::search::SearchReadOptions::default(),
     )?;
     drain_search_cursor(
         table,
@@ -410,8 +414,14 @@ fn sparse_search(
     k: usize,
     projected_columns: &[usize],
 ) -> paro_common::error::Result<Vec<Chunk>> {
-    let opened =
-        table.open_sparse_vector_search_cursor(column_id, query, k, None, table.max_version())?;
+    let opened = table.open_sparse_vector_search_cursor(
+        column_id,
+        query,
+        k,
+        None,
+        table.max_version(),
+        &crate::search::SearchReadOptions::default(),
+    )?;
     drain_search_cursor(table, opened, projected_columns, false, k.clamp(1, 1024), 4)
 }
 
@@ -507,6 +517,7 @@ impl SearchCursorTestExt for TableHandle {
             &config,
             predicate.cloned(),
             self.max_version(),
+            &crate::search::SearchReadOptions::default(),
         )?;
         drain_search_cursor(self, opened, projected_columns, false, 1024, 4)
     }
@@ -1399,7 +1410,9 @@ fn hnsw_capability_exposes_generation_level_provider_stats() {
         ))
         .unwrap();
 
-    let capability = table.vector_capability(1).expect("hnsw capability");
+    let capability = table
+        .vector_capability(1, DistanceMetric::Euclidean)
+        .expect("hnsw capability");
     let SearchProviderStats::Hnsw(provider_stats) = capability
         .generation_stats
         .provider_stats
@@ -1657,7 +1670,16 @@ fn vector_search_for_view_filters_overlay_deleted_rows() {
     let view = transaction_view_for_command(&txn, 1);
 
     let opened = table
-        .open_vector_search_cursor_for_view(1, &[10.0, 0.0], 3, params, None, &view)
+        .open_vector_search_cursor_for_view(
+            1,
+            &[10.0, 0.0],
+            DistanceMetric::Euclidean,
+            3,
+            params,
+            None,
+            &view,
+            &crate::search::SearchReadOptions::default(),
+        )
         .expect("open vector search cursor for txn view");
     let chunks = drain_search_cursor(&table, opened, &[0], false, 3, 1)
         .expect("drain txn view search cursor");
@@ -2457,7 +2479,11 @@ fn search_snapshot_pins_derived_delta_when_generation_lags_read_ts() {
     assert_eq!(capability.definition_id, definition_id);
 
     let snapshot = table
-        .open_search_snapshot(&capability, target_version)
+        .open_search_snapshot(
+            &capability,
+            target_version,
+            &crate::search::SearchReadOptions::default(),
+        )
         .expect("open lagging search snapshot");
     let lease_info = snapshot
         .derived_lag_lease_info()
@@ -3059,6 +3085,7 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
+            &crate::search::SearchReadOptions::default(),
         )
         .unwrap_err();
     assert!(
@@ -3128,6 +3155,7 @@ fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
+            &crate::search::SearchReadOptions::default(),
         )
         .unwrap();
     let chunks = drain_search_cursor(&table, opened, &[0], true, 2, 4).unwrap();
@@ -3159,7 +3187,11 @@ fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
         .fulltext_capability(1, "simple")
         .expect("fulltext capability");
     let snapshot = table
-        .open_search_snapshot(&capability, table.max_version())
+        .open_search_snapshot(
+            &capability,
+            table.max_version(),
+            &crate::search::SearchReadOptions::default(),
+        )
         .expect("search snapshot");
     let table_id = table.table_id();
     let reason = "missing_generation_stats";

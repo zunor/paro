@@ -465,21 +465,6 @@ impl HnswInlineThreshold {
             && dimension <= self.max_dimension
     }
 
-    pub fn from_provider_config_value(provider_config: &Value) -> Self {
-        let threshold = provider_config
-            .get("inline_threshold")
-            .unwrap_or(provider_config);
-        Self {
-            max_vector_count: read_u64_config(threshold, "max_vector_count")
-                .unwrap_or(Self::DEFAULT.max_vector_count),
-            max_graph_memory_bytes: read_u64_config(threshold, "max_graph_memory_bytes")
-                .unwrap_or(Self::DEFAULT.max_graph_memory_bytes),
-            max_dimension: read_u64_config(threshold, "max_dimension")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or(Self::DEFAULT.max_dimension),
-        }
-    }
-
     pub fn estimate_graph_memory_bytes(vector_count: u64, dimension: u32, m: u32) -> u64 {
         let m = u64::from(m.max(1));
         let link_bytes = std::mem::size_of::<u32>() as u64;
@@ -511,32 +496,32 @@ impl HnswInlineBuildEstimate {
         definition: &SearchIndexDefinition,
         vector_count: u64,
         dimension: u32,
-    ) -> Option<Self> {
+    ) -> Result<Option<Self>> {
         if definition.kind != SearchIndexKind::Hnsw {
-            return None;
+            return Ok(None);
         }
-        let threshold =
-            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
-        let dimension = if dimension == 0 {
-            read_u64_config(&definition.provider_config, "dimension")
-                .and_then(|value| u32::try_from(value).ok())
-                .unwrap_or_default()
-        } else {
-            dimension
+        let config = definition.hnsw_provider_config()?;
+        if dimension != config.dimension {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW inline dimension mismatch: definition={}, segment={dimension}",
+                config.dimension
+            )));
+        }
+        let threshold = HnswInlineThreshold {
+            max_vector_count: config.inline_threshold.max_vector_count,
+            max_graph_memory_bytes: config.inline_threshold.max_graph_memory_bytes,
+            max_dimension: config.inline_threshold.max_dimension,
         };
-        let m = read_u64_config(&definition.provider_config, "m")
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(16);
-        Some(Self {
+        Ok(Some(Self {
             vector_count,
             dimension,
             estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
                 vector_count,
                 dimension,
-                m,
+                config.m as u32,
             ),
             threshold,
-        })
+        }))
     }
 
     pub const fn allows_inline(self) -> bool {
@@ -571,12 +556,6 @@ pub struct SidecarArtifactLocation {
     pub offset: u64,
     pub len: u64,
     pub checksum: u64,
-}
-
-fn read_u64_config(config: &Value, key: &str) -> Option<u64> {
-    config
-        .get(key)
-        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
 }
 
 #[cfg(test)]
@@ -646,8 +625,15 @@ mod tests {
             column_ids: vec![3],
             expression: None,
             provider_config: json!({
+                "version": 1,
+                "dimension": 4,
+                "distance": "euclidean",
                 "m": 8,
                 "ef_construct": 64,
+                "ef_search": 64,
+                "plain_scan_threshold": 10_000,
+                "filtered_plain_scan_threshold": 0,
+                "build_seed": 1,
                 "inline_threshold": {
                     "max_vector_count": 128,
                     "max_graph_memory_bytes": 64,
@@ -658,14 +644,19 @@ mod tests {
             config_fingerprint: 99,
         };
 
-        let threshold =
-            HnswInlineThreshold::from_provider_config_value(&definition.provider_config);
+        let provider = definition.hnsw_provider_config().unwrap();
+        let threshold = HnswInlineThreshold {
+            max_vector_count: provider.inline_threshold.max_vector_count,
+            max_graph_memory_bytes: provider.inline_threshold.max_graph_memory_bytes,
+            max_dimension: provider.inline_threshold.max_dimension,
+        };
         assert_eq!(threshold.max_vector_count, 128);
         assert_eq!(threshold.max_graph_memory_bytes, 64);
         assert_eq!(threshold.max_dimension, 4);
 
-        let estimate =
-            HnswInlineBuildEstimate::from_definition(&definition, 16, 4).expect("hnsw estimate");
+        let estimate = HnswInlineBuildEstimate::from_definition(&definition, 16, 4)
+            .expect("valid hnsw config")
+            .expect("hnsw estimate");
         assert_eq!(estimate.threshold, threshold);
         assert!(!estimate.allows_inline());
 

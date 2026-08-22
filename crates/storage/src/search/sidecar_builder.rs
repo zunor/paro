@@ -22,8 +22,8 @@ use super::providers::sparse::inline::SparseInlineArtifactBuilder;
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::TailMutationKind;
-use crate::index::hnsw::{HnswConfig, HnswIndex};
-use crate::index::{DistanceMetric, MmapVectorStorage};
+use crate::index::hnsw::HnswIndex;
+use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
@@ -312,15 +312,15 @@ fn build_hnsw_segment_sidecar_artifact(
         column_meta.num_rows * dim as u64 * std::mem::size_of::<f32>() as u64,
         dim,
     )?);
-    let config = hnsw_config_for_definition(
-        definition,
-        schema_column.hnsw_m,
-        schema_column.hnsw_ef_construct,
-    );
-    let distance = hnsw_distance_for_definition(
-        definition,
-        DistanceMetric::from_u8(schema_column.hnsw_distance),
-    );
+    let provider = definition.hnsw_provider_config()?;
+    if provider.dimension as usize != dim {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW sidecar dimension mismatch: definition={}, segment={dim}",
+            provider.dimension
+        )));
+    }
+    let config = provider.index_config();
+    let distance = provider.distance;
     let index = HnswIndex::build(vector_storage, config, distance);
     let bytes = index.serialize()?;
     let checksum = seahash::hash(&bytes);
@@ -352,64 +352,6 @@ fn hnsw_vector_dimension(logical_type: &LogicalType, column_id: u32) -> Result<u
             "HNSW sidecar build requires Array(Float, N), got {:?} for column {}",
             other, column_id
         ))),
-    }
-}
-
-fn hnsw_config_for_definition(
-    definition: &super::capability::SearchIndexDefinition,
-    fallback_m: usize,
-    fallback_ef_construct: usize,
-) -> HnswConfig {
-    let config = HnswConfig::new(
-        hnsw_config_usize(definition, "m").unwrap_or(fallback_m),
-        hnsw_config_usize(definition, "ef_construct").unwrap_or(fallback_ef_construct),
-    );
-    let config = hnsw_config_usize(definition, "plain_scan_threshold")
-        .map_or(config, |threshold| {
-            config.with_plain_scan_threshold(threshold)
-        });
-    hnsw_config_usize(definition, "filtered_plain_scan_threshold").map_or(config, |threshold| {
-        config.with_filtered_plain_scan_threshold(threshold)
-    })
-}
-
-fn hnsw_config_usize(
-    definition: &super::capability::SearchIndexDefinition,
-    key: &str,
-) -> Option<usize> {
-    definition
-        .provider_config
-        .get(key)
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| usize::try_from(value).ok())
-}
-
-fn hnsw_distance_for_definition(
-    definition: &super::capability::SearchIndexDefinition,
-    fallback: DistanceMetric,
-) -> DistanceMetric {
-    if let Some(value) = definition
-        .provider_config
-        .get("distance")
-        .and_then(serde_json::Value::as_u64)
-        .and_then(|value| u8::try_from(value).ok())
-    {
-        return DistanceMetric::from_u8(value);
-    }
-    definition
-        .provider_config
-        .get("distance")
-        .and_then(serde_json::Value::as_str)
-        .map(hnsw_distance_metric_from_name)
-        .unwrap_or(fallback)
-}
-
-fn hnsw_distance_metric_from_name(name: &str) -> DistanceMetric {
-    match name.to_ascii_lowercase().as_str() {
-        "cosine" | "cos" => DistanceMetric::Cosine,
-        "dot" | "dot_product" | "inner_product" | "ip" => DistanceMetric::DotProduct,
-        "manhattan" | "l1" => DistanceMetric::Manhattan,
-        _ => DistanceMetric::Euclidean,
     }
 }
 

@@ -411,9 +411,13 @@ mod tests {
             ])]))
             .expect("append rows");
 
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), table.max_version())
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            table.max_version(),
+            &crate::search::SearchReadOptions::default(),
+        )
+        .expect("open table lease");
         let visible_segment = table_lease
             .visible_segments()
             .first()
@@ -462,6 +466,7 @@ mod tests {
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
@@ -517,9 +522,13 @@ mod tests {
             ])]))
             .expect("append rows");
 
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), table.max_version())
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            table.max_version(),
+            &crate::search::SearchReadOptions::default(),
+        )
+        .expect("open table lease");
         let generation = GenerationReadSnapshot {
             definition_id: 9,
             generation_id: 1,
@@ -535,6 +544,7 @@ mod tests {
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: Vec::new(),
             }),

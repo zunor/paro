@@ -67,9 +67,25 @@ impl<'a> PipelineScheduler<'a> {
         graph: &PipelineGraph,
         query: &QueryRuntimeContext,
     ) -> bool {
-        query.session.limits.parallel_scheduler
+        Self::should_use_parallel_scheduler_for_session(graph, query.session.as_ref())
+    }
+
+    /// Parallel scheduling is useful only when the graph exposes independent
+    /// work. A single pipeline whose merged operator contract is single-task
+    /// cannot consume another worker; moving it to a background OS thread only
+    /// adds a handoff and an output wakeup to every fetch.
+    pub fn should_use_parallel_scheduler_for_session(
+        graph: &PipelineGraph,
+        session: &paro_context::StatementContext,
+    ) -> bool {
+        session.limits.parallel_scheduler
             && graph.control_regions.is_empty()
-            && query.session.number_of_threads() > 1
+            && session.number_of_threads() > 1
+            && (graph.pipelines.len() > 1
+                || graph
+                    .pipelines
+                    .iter()
+                    .any(|pipeline| pipeline.properties.capabilities.parallelism.max > 1))
     }
 
     fn new(

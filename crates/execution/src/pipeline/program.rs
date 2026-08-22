@@ -775,9 +775,11 @@ fn source_chunk_layout(source: &SourceSpec, row_type: &RowType) -> ChunkLayout {
         | SourceSpec::RecursiveTableScan(_)
         | SourceSpec::TopNEmit(_)
         | SourceSpec::WindowEmit(_)
-        | SourceSpec::SetOperationEmit(_) => {
-            ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE)
-        }
+        | SourceSpec::SetOperationEmit(_)
+        | SourceSpec::VectorSearch(_)
+        | SourceSpec::SparseVectorSearch(_)
+        | SourceSpec::FullTextSearch(_)
+        | SourceSpec::AdaptiveSearch(_) => ChunkLayout::view(row_type.types.to_vec(), VECTOR_SIZE),
         _ => chunk_layout(row_type),
     }
 }

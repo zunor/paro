@@ -13,6 +13,7 @@ pub type PointOffset = u32;
 
 /// Score type for distance/similarity values.
 pub type ScoreType = f32;
+pub const DEFAULT_HNSW_BUILD_SEED: u64 = 0x5041_524f_484e_5357;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -160,8 +161,9 @@ pub struct HnswConfig {
     pub plain_scan_threshold: usize,
     /// Maximum filtered candidate count below which a filtered plain scan is preferred.
     pub filtered_plain_scan_threshold: usize,
+    /// Seed for the versioned deterministic construction RNG.
+    pub build_seed: u64,
     /// Whether to randomize entry point selection during index build.
-    #[serde(default)]
     pub build_random_entry_point: bool,
 }
 
@@ -174,6 +176,7 @@ impl Default for HnswConfig {
             ef: 100,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
+            build_seed: DEFAULT_HNSW_BUILD_SEED,
             build_random_entry_point: false,
         }
     }
@@ -189,6 +192,7 @@ impl HnswConfig {
             ef: ef_construct,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
+            build_seed: DEFAULT_HNSW_BUILD_SEED,
             build_random_entry_point: false,
         }
     }
@@ -208,6 +212,11 @@ impl HnswConfig {
     /// Create a config with custom ef.
     pub fn with_ef(mut self, ef: usize) -> Self {
         self.ef = ef;
+        self
+    }
+
+    pub fn with_build_seed(mut self, seed: u64) -> Self {
+        self.build_seed = seed;
         self
     }
 

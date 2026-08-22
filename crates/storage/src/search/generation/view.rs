@@ -7,6 +7,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use crate::index::fulltext::tokenizer::TokenizerKind;
+use crate::index::hnsw::DistanceMetric;
 use crate::metrics::storage_metrics;
 use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
@@ -37,6 +38,9 @@ pub(crate) fn indexed_through_ts(visible_version: i64) -> u64 {
 #[derive(Debug, Clone)]
 pub(crate) struct SearchDefinitionState {
     pub(crate) definition: SearchIndexDefinition,
+    /// Provider contract decoded once at the registry boundary. Query and
+    /// maintenance paths consume this immutable value, never the JSON image.
+    pub(crate) hnsw_provider_config: Option<Arc<super::super::HnswProviderConfig>>,
     pub(crate) origin: SearchDefinitionOrigin,
     pub(crate) generation: Option<SearchGeneration>,
     pub(crate) capability: Option<SearchCapability>,
@@ -46,16 +50,25 @@ pub(crate) struct SearchDefinitionState {
 }
 
 impl SearchDefinitionState {
-    pub(crate) fn new(definition: SearchIndexDefinition, origin: SearchDefinitionOrigin) -> Self {
-        Self {
+    pub(crate) fn new(
+        definition: SearchIndexDefinition,
+        origin: SearchDefinitionOrigin,
+    ) -> Result<Self> {
+        let hnsw_provider_config = if definition.kind == SearchIndexKind::Hnsw {
+            Some(Arc::new(definition.hnsw_provider_config()?))
+        } else {
+            None
+        };
+        Ok(Self {
             definition,
+            hnsw_provider_config,
             origin,
             generation: None,
             capability: None,
             manifest: None,
             next_generation_id: 1,
             next_build_epoch: 1,
-        }
+        })
     }
 
     pub(crate) fn with_manifest(mut self, manifest: LoadedManifest) -> Self {
@@ -168,6 +181,22 @@ impl SearchView {
             } else {
                 None
             }
+        })
+    }
+
+    pub(crate) fn hnsw_capability(
+        &self,
+        column_id: ColumnId,
+        distance: DistanceMetric,
+    ) -> Option<SearchCapability> {
+        self.definitions.values().find_map(|state| {
+            let capability = state.capability.as_ref()?;
+            if capability.kind != SearchIndexKind::Hnsw
+                || !state.definition.column_ids.contains(&column_id)
+            {
+                return None;
+            }
+            (state.hnsw_provider_config.as_ref()?.distance == distance).then(|| capability.clone())
         })
     }
 
@@ -298,15 +327,17 @@ pub(crate) fn coverage_for_definition(
 pub(crate) fn generation_read_snapshot(
     definition_id: u64,
     state: &SearchDefinitionState,
-) -> Option<GenerationReadSnapshot> {
-    let generation = state.generation.as_ref()?;
+) -> Result<Option<GenerationReadSnapshot>> {
+    let Some(generation) = state.generation.as_ref() else {
+        return Ok(None);
+    };
     let artifacts = state
         .manifest
         .as_ref()
         .map(|manifest| manifest.artifacts.clone())
         .unwrap_or_else(|| Arc::new(GenerationArtifactSet::default()));
 
-    Some(GenerationReadSnapshot {
+    Ok(Some(GenerationReadSnapshot {
         definition_id,
         generation_id: generation.generation_id,
         build_epoch: generation.build_epoch,
@@ -320,8 +351,9 @@ pub(crate) fn generation_read_snapshot(
             .map(|manifest| manifest.root.maintenance_state.clone())
             .unwrap_or_default(),
         provider_config: Arc::new(state.definition.provider_config.clone()),
+        hnsw_provider_config: state.hnsw_provider_config.clone(),
         artifacts,
-    })
+    }))
 }
 
 pub(crate) fn tail_summary_for_manifest(manifest: &LoadedManifest) -> SearchTailSummary {

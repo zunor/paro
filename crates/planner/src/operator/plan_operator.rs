@@ -1614,6 +1614,7 @@ mod tests {
                 intents: vec![SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
                     query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                    distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
                     ef: None,
                 })],
                 fusion: None,
@@ -1623,6 +1624,7 @@ mod tests {
                     intent: SearchIntent::Hnsw(HnswIntent {
                         column_id: 1,
                         query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                        distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
                         ef: None,
                     }),
                     token: paro_storage::search::CapabilityToken {

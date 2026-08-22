@@ -1,0 +1,176 @@
+// Copyright 2024-2026 Zunor
+// SPDX-License-Identifier: Apache-2.0
+
+//! Versioned physical contract for an HNSW search definition.
+//!
+//! Catalog persistence remains JSON, but it is decoded into this type at the
+//! definition boundary. Provider code must not read individual JSON fields or
+//! invent fallback values.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+pub use crate::index::hnsw::types::DEFAULT_HNSW_BUILD_SEED;
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use paro_common::error::{self as paro_error, Result};
+
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswInlineConfig {
+    pub max_vector_count: u64,
+    pub max_graph_memory_bytes: u64,
+    pub max_dimension: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswProviderConfig {
+    pub version: u32,
+    pub dimension: u32,
+    pub distance: DistanceMetric,
+    /// Fixed-width durable fields. Runtime `usize` values are derived only
+    /// after validation so catalog bytes have platform-independent meaning.
+    pub m: u32,
+    pub ef_construct: u32,
+    pub ef_search: u32,
+    pub plain_scan_threshold: u32,
+    pub filtered_plain_scan_threshold: u32,
+    pub build_seed: u64,
+    pub inline_threshold: HnswInlineConfig,
+}
+
+impl HnswProviderConfig {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        dimension: u32,
+        distance: DistanceMetric,
+        m: u32,
+        ef_construct: u32,
+        ef_search: u32,
+        plain_scan_threshold: u32,
+        filtered_plain_scan_threshold: u32,
+        build_seed: u64,
+        inline_threshold: HnswInlineConfig,
+    ) -> Result<Self> {
+        let config = Self {
+            version: HNSW_PROVIDER_CONFIG_VERSION,
+            dimension,
+            distance,
+            m,
+            ef_construct,
+            ef_search,
+            plain_scan_threshold,
+            filtered_plain_scan_threshold,
+            build_seed,
+            inline_threshold,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn from_value(value: &Value) -> Result<Self> {
+        let config: Self = serde_json::from_value(value.clone()).map_err(|err| {
+            paro_error::invalid_input(format!("invalid HNSW provider_config: {err}"))
+        })?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn to_value(&self) -> Result<Value> {
+        serde_json::to_value(self).map_err(|err| {
+            paro_error::serialization_error(format!("serialize HNSW provider_config: {err}"))
+        })
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.version != HNSW_PROVIDER_CONFIG_VERSION {
+            return Err(paro_error::invalid_input(format!(
+                "unsupported HNSW provider_config version {}, expected {}",
+                self.version, HNSW_PROVIDER_CONFIG_VERSION
+            )));
+        }
+        if self.dimension == 0 {
+            return Err(paro_error::invalid_input(
+                "HNSW provider_config dimension must be greater than zero",
+            ));
+        }
+        if !(2..=1_024).contains(&self.m) {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW m must be between 2 and 1024, got {}",
+                self.m
+            )));
+        }
+        if self.ef_construct < self.m || self.ef_construct > 1_000_000 {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW ef_construct must be between m ({}) and 1000000, got {}",
+                self.m, self.ef_construct
+            )));
+        }
+        if self.ef_search == 0 || self.ef_search > 1_000_000 {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW ef_search must be between 1 and 1000000, got {}",
+                self.ef_search
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn index_config(&self) -> HnswConfig {
+        HnswConfig::new(self.m as usize, self.ef_construct as usize)
+            .with_ef(self.ef_search as usize)
+            .with_plain_scan_threshold(self.plain_scan_threshold as usize)
+            .with_filtered_plain_scan_threshold(self.filtered_plain_scan_threshold as usize)
+            .with_build_seed(self.build_seed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn valid_config() -> HnswProviderConfig {
+        HnswProviderConfig::new(
+            100,
+            DistanceMetric::Euclidean,
+            24,
+            100,
+            100,
+            10_000,
+            0,
+            DEFAULT_HNSW_BUILD_SEED,
+            HnswInlineConfig {
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn roundtrip_is_strict_and_typed() {
+        let config = valid_config();
+        let value = config.to_value().unwrap();
+        assert_eq!(HnswProviderConfig::from_value(&value).unwrap(), config);
+
+        let mut unknown = value;
+        unknown["typo"] = json!(1);
+        assert!(HnswProviderConfig::from_value(&unknown)
+            .unwrap_err()
+            .to_string()
+            .contains("unknown field"));
+    }
+
+    #[test]
+    fn missing_distance_is_rejected() {
+        let mut value = valid_config().to_value().unwrap();
+        value.as_object_mut().unwrap().remove("distance");
+        assert!(HnswProviderConfig::from_value(&value)
+            .unwrap_err()
+            .to_string()
+            .contains("missing field `distance`"));
+    }
+}

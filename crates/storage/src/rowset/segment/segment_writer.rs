@@ -373,6 +373,9 @@ impl SegmentWriter {
             })?;
 
             let field_type = Self::logical_type_to_field_type(&col.logical_type);
+            // HNSW construction is an explicit, admission-controlled writer
+            // contract. Never infer it again from the tablet schema here: an
+            // absent entry means the inline build was rejected or deferred.
             let hnsw = self.options.hnsw_indexes.get(&col.id).copied();
             let is_hnsw_col = hnsw.is_some();
             let mut col_opts = ColumnWriterOptions::new(field_type, col.id)
@@ -384,7 +387,6 @@ impl SegmentWriter {
                 .with_bitmap_index(self.options.bitmap_index_columns.contains(&col.id))
                 .with_hnsw(
                     self.options.build_hnsw_indexes && is_hnsw_col,
-                    is_hnsw_col,
                     hnsw.map(|options| options.config),
                     hnsw.map(|options| options.distance),
                 )

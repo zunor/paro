@@ -85,9 +85,9 @@ pub struct HnswMaintenanceRequest {
 impl HnswMaintenanceRequest {
     pub fn new(
         definition: &SearchIndexDefinition,
+        provider: &super::HnswProviderConfig,
         generation_id: u64,
         tail_window: Vec<TailPendingEntry>,
-        dimension: u32,
         freshness_priority: MaintenancePriority,
     ) -> Option<Self> {
         if definition.kind != SearchIndexKind::Hnsw || tail_window.is_empty() {
@@ -95,12 +95,6 @@ impl HnswMaintenanceRequest {
         }
         let rowset_refs = hnsw_rowset_refs(&tail_window);
         let vector_count = rowset_refs.iter().map(|rowset| rowset.row_count).sum();
-        let m = definition
-            .provider_config
-            .get("m")
-            .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
-            .and_then(|value| u32::try_from(value).ok())
-            .unwrap_or(16);
         Some(Self {
             definition_id: definition.definition_id,
             generation_id,
@@ -108,10 +102,10 @@ impl HnswMaintenanceRequest {
             rowset_refs,
             estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
                 vector_count,
-                dimension,
-                m,
+                provider.dimension,
+                provider.m,
             ),
-            dimension,
+            dimension: provider.dimension,
             freshness_priority,
         })
     }
@@ -972,6 +966,24 @@ mod tests {
 
     #[test]
     fn hnsw_maintenance_request_groups_tail_rowset_refs() {
+        let provider_config = crate::search::HnswProviderConfig::new(
+            16,
+            crate::index::hnsw::DistanceMetric::Euclidean,
+            8,
+            64,
+            100,
+            10_000,
+            0,
+            crate::search::DEFAULT_HNSW_BUILD_SEED,
+            crate::search::HnswInlineConfig {
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        )
+        .unwrap()
+        .to_value()
+        .unwrap();
         let definition = SearchIndexDefinition {
             definition_id: 9,
             table_id: 42,
@@ -979,11 +991,7 @@ mod tests {
             kind: SearchIndexKind::Hnsw,
             column_ids: vec![1],
             expression: None,
-            provider_config: serde_json::json!({
-                "m": 8,
-                "ef_construct": 64,
-                "dimension": 16,
-            }),
+            provider_config,
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
             config_fingerprint: 77,
         };
@@ -1019,9 +1027,9 @@ mod tests {
 
         let request = HnswMaintenanceRequest::new(
             &definition,
+            &definition.hnsw_provider_config().unwrap(),
             17,
             tail_window.clone(),
-            16,
             MaintenancePriority::Elevated,
         )
         .expect("hnsw request");

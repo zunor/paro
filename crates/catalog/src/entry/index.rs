@@ -743,39 +743,41 @@ impl IndexCatalogEntry {
             None
         };
 
-        let coverage = if (cursor.position() as usize) < bytes.len() {
-            cursor.read_exact(&mut byte_buf)?;
-            if byte_buf[0] == 1 {
-                let mut version_buf = [0u8; 8];
-                cursor.read_exact(&mut version_buf)?;
-                let visible_version = i64::from_le_bytes(version_buf);
-                cursor.read_exact(&mut len_buf)?;
-                let visible_segment_count = u32::from_le_bytes(len_buf);
-                cursor.read_exact(&mut len_buf)?;
-                let indexed_segment_count = u32::from_le_bytes(len_buf);
-                Some(IndexCoverage {
-                    visible_version,
-                    visible_segment_count,
-                    indexed_segment_count,
-                })
-            } else {
-                None
-            }
-        } else {
+        cursor.read_exact(&mut byte_buf)?;
+        let coverage = if byte_buf[0] == 1 {
+            let mut version_buf = [0u8; 8];
+            cursor.read_exact(&mut version_buf)?;
+            let visible_version = i64::from_le_bytes(version_buf);
+            cursor.read_exact(&mut len_buf)?;
+            let visible_segment_count = u32::from_le_bytes(len_buf);
+            cursor.read_exact(&mut len_buf)?;
+            let indexed_segment_count = u32::from_le_bytes(len_buf);
+            Some(IndexCoverage {
+                visible_version,
+                visible_segment_count,
+                indexed_segment_count,
+            })
+        } else if byte_buf[0] == 0 {
             None
+        } else {
+            return Err(paro_error::serialization_error(format!(
+                "Invalid index coverage tag: {}",
+                byte_buf[0]
+            )));
         };
 
-        let provider_config = if (cursor.position() as usize) < bytes.len() {
-            cursor.read_exact(&mut len_buf)?;
-            let config_len = u32::from_le_bytes(len_buf) as usize;
-            let mut config_bytes = vec![0u8; config_len];
-            cursor.read_exact(&mut config_bytes)?;
-            serde_json::from_slice(&config_bytes).map_err(|err| {
-                paro_error::serialization_error(format!("Invalid index provider config: {err}"))
-            })?
-        } else {
-            Value::Object(Default::default())
-        };
+        cursor.read_exact(&mut len_buf)?;
+        let config_len = u32::from_le_bytes(len_buf) as usize;
+        let mut config_bytes = vec![0u8; config_len];
+        cursor.read_exact(&mut config_bytes)?;
+        let provider_config = serde_json::from_slice(&config_bytes).map_err(|err| {
+            paro_error::serialization_error(format!("Invalid index provider config: {err}"))
+        })?;
+        if cursor.position() as usize != bytes.len() {
+            return Err(paro_error::serialization_error(
+                "Trailing bytes in index catalog entry",
+            ));
+        }
 
         let mut deps = DependencyList::new();
         deps.add_dependency(
@@ -1071,9 +1073,15 @@ mod tests {
         )
         .with_index_type(IndexType::HNSW)
         .with_provider_config(serde_json::json!({
+            "version": 1,
+            "dimension": 100,
+            "distance": "cosine",
             "m": 24,
             "ef_construct": 100,
+            "ef_search": 80,
             "plain_scan_threshold": 10_000,
+            "filtered_plain_scan_threshold": 0,
+            "build_seed": 42,
             "inline_threshold": {
                 "max_vector_count": 90_000,
                 "max_graph_memory_bytes": 268_435_456_u64,
@@ -1098,6 +1106,10 @@ mod tests {
         assert_eq!(restored.provider_config, entry.provider_config);
         assert_eq!(restored.build_state(), IndexBuildState::Failed);
         assert_eq!(restored.failure_reason(), Some("needs rebuild".to_string()));
+
+        let mut with_trailing_bytes = bytes;
+        with_trailing_bytes.extend_from_slice(&[0xde, 0xad]);
+        assert!(IndexCatalogEntry::deserialize(&with_trailing_bytes, "main".to_string()).is_err());
     }
 
     #[test]

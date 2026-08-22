@@ -8,6 +8,7 @@ use crate::index::fulltext::query_parser::{
 pub use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::tokenizer::{tokenizer_from_config, TokenizerKind};
 use crate::index::fulltext::ts_serde::parse_serialized_tsquery;
+use crate::index::hnsw::DistanceMetric;
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::tablet::ColumnId;
@@ -54,6 +55,9 @@ impl DenseVectorQuery {
 pub struct HnswIntent {
     pub column_id: ColumnId,
     pub query: DenseVectorQuery,
+    /// SQL distance function that defines both index compatibility and score
+    /// materialization semantics.
+    pub distance: DistanceMetric,
     pub ef: Option<usize>,
 }
 

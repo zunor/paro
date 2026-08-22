@@ -13,6 +13,7 @@ use paro_common::chunk::Chunk;
 use paro_common::test_utils::{test_allocator, test_embeddings_vector, test_string_vector};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::metrics::storage_metrics;
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::bench_support::manifest_fragment_bytes;
@@ -265,7 +266,7 @@ fn prepare_definition_and_chunk(
         }
         SearchIndexKind::Hnsw => {
             let capability = table
-                .vector_capability(0)
+                .vector_capability(0, DistanceMetric::Euclidean)
                 .expect("array(float) column should seed HNSW definition");
             Ok((
                 capability.definition_id,
@@ -295,12 +296,24 @@ fn search_definition(
     let mut provider_config = match provider {
         SearchIndexKind::FullText => serde_json::json!({"config": tokenizer.unwrap_or("simple")}),
         SearchIndexKind::Sparse => serde_json::json!({"physical_encoding": "binary-v1"}),
-        SearchIndexKind::Hnsw => serde_json::json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-            "dimension": dimension.unwrap_or(HNSW_DIMENSION as u64),
-        }),
+        SearchIndexKind::Hnsw => paro_storage::search::HnswProviderConfig::new(
+            dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+            paro_storage::index::hnsw::DistanceMetric::Euclidean,
+            16,
+            64,
+            64,
+            10_000,
+            0,
+            paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
+            paro_storage::search::HnswInlineConfig {
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        )
+        .expect("valid benchmark HNSW config")
+        .to_value()
+        .expect("serialize benchmark HNSW config"),
     };
     if provider == SearchIndexKind::FullText {
         provider_config["tokenizer"] = serde_json::json!(tokenizer.unwrap_or("simple"));

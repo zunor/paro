@@ -286,6 +286,14 @@ impl SearchIndexRegistry {
         })
     }
 
+    pub(crate) fn hnsw_capability(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<SearchCapability> {
+        self.resolve_capability_with_required_wait(|view| view.hnsw_capability(column_id, distance))
+    }
+
     fn resolve_capability_with_required_wait(
         &self,
         finder: impl Fn(&SearchView) -> Option<SearchCapability>,
@@ -365,7 +373,7 @@ impl SearchIndexRegistry {
         let Some(state) = current.definitions.get(&definition_id) else {
             return Ok(None);
         };
-        Ok(generation_read_snapshot(definition_id, state))
+        generation_read_snapshot(definition_id, state)
     }
 
     pub(crate) fn open_generation_snapshot_with_token(
@@ -391,7 +399,7 @@ impl SearchIndexRegistry {
         {
             return Ok(OpenSearchCursorResult::NotQueryable);
         }
-        generation_read_snapshot(token.definition_id, state)
+        generation_read_snapshot(token.definition_id, state)?
             .map(OpenSearchCursorResult::Opened)
             .ok_or_else(|| {
                 paro_error::internal(format!(
@@ -649,11 +657,7 @@ impl SearchIndexRegistry {
                 &gc_context,
                 delta_window_bytes,
             );
-            let provider_request = provider_maintenance_request_for_definition(
-                &state.definition,
-                manifest,
-                &self.tablet,
-            );
+            let provider_request = provider_maintenance_request_for_definition(&state, manifest)?;
             let request = self.maintenance_scheduler.admission_request(
                 &state.definition,
                 manifest,
@@ -1058,7 +1062,7 @@ impl SearchIndexRegistry {
             std::iter::once(definition.definition_id).chain(duplicate_seed_ids.iter().copied()),
         )?;
 
-        let mut state = SearchDefinitionState::new(definition.clone(), origin);
+        let mut state = SearchDefinitionState::new(definition.clone(), origin)?;
         if let Some(loaded) = self.load_manifest_for_definition(definition.definition_id)? {
             if loaded.root.config_fingerprint == definition.config_fingerprint {
                 state = state.with_manifest(loaded);
@@ -2232,7 +2236,7 @@ impl SearchIndexRegistry {
         let seed_definition_id = seed.definition_id;
         Ok(Some((
             seed_definition_id,
-            SearchDefinitionState::new(seed, SearchDefinitionOrigin::schema_seed(column_id)),
+            SearchDefinitionState::new(seed, SearchDefinitionOrigin::schema_seed(column_id))?,
         )))
     }
 
@@ -2279,7 +2283,7 @@ fn manifest_path_bytes(paths: &[PathBuf]) -> u64 {
 mod tests {
     use super::*;
     use crate::index::fulltext::text_index::FullTextIndex;
-    use crate::index::hnsw::SearchParams;
+    use crate::index::hnsw::{DistanceMetric, SearchParams};
     use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
     use crate::rowset::{ColumnData, RowsetWriter, RowsetWriterContext, SparseVector};
     use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
@@ -2302,6 +2306,7 @@ mod tests {
     use crate::table::table_handle::{TableColumnSpec, TableHandle};
     use crate::tablet::{KeysType, Tablet, TabletColumn, TabletSchema, Version};
     use crate::test_utils::*;
+    use paro_common::allocator::default_allocator;
     use paro_common::chunk::Chunk;
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
@@ -2406,6 +2411,7 @@ mod tests {
                     batch,
                     projected_columns,
                     emit_score,
+                    Arc::new(default_allocator()),
                 )?),
                 SearchBatchState::Exhausted => return Ok(chunks),
             }
@@ -2585,13 +2591,34 @@ mod tests {
         }
     }
 
+    fn test_hnsw_provider_config(
+        dimension: u32,
+        m: usize,
+        ef_construct: usize,
+        inline_max_vector_count: u64,
+    ) -> serde_json::Value {
+        crate::search::HnswProviderConfig::new(
+            dimension,
+            DistanceMetric::Euclidean,
+            m as u32,
+            ef_construct as u32,
+            ef_construct as u32,
+            10_000,
+            0,
+            1,
+            crate::search::HnswInlineConfig {
+                max_vector_count: inline_max_vector_count,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 1_536,
+            },
+        )
+        .unwrap()
+        .to_value()
+        .unwrap()
+    }
+
     fn hnsw_test_definition(definition_id: u64) -> SearchIndexDefinition {
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 100,
-            "distance": "l2",
-            "dimension": 128,
-        });
+        let provider_config = test_hnsw_provider_config(128, 16, 100, 4_096);
         SearchIndexDefinition {
             definition_id,
             table_id: 1,
@@ -2674,7 +2701,8 @@ mod tests {
                         SearchDefinitionState::new(
                             fulltext_test_definition(definition_id),
                             SearchDefinitionOrigin::catalog(definition_id),
-                        ),
+                        )
+                        .unwrap(),
                     );
                 }
                 Ok((true, ()))
@@ -2721,7 +2749,8 @@ mod tests {
         let table = create_table_without_default_indexes(root.path(), &[LogicalType::Varchar]);
         let registry = table.search_registry();
         let definition = fulltext_test_definition(101);
-        let state = SearchDefinitionState::new(definition, SearchDefinitionOrigin::catalog(101));
+        let state =
+            SearchDefinitionState::new(definition, SearchDefinitionOrigin::catalog(101)).unwrap();
         registry
             .mutate_view(|view| {
                 view.definitions.insert(101, state);
@@ -2785,8 +2814,11 @@ mod tests {
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition_id),
         )
+        .unwrap()
         .with_manifest(manifest);
-        let snapshot = generation_read_snapshot(definition_id, &state).unwrap();
+        let snapshot = generation_read_snapshot(definition_id, &state)
+            .unwrap()
+            .unwrap();
         let lease = super::super::cursor::GenerationReadLease::from_snapshot(&snapshot);
         let manifest = state.manifest.as_ref().unwrap();
         assert!(Arc::ptr_eq(&snapshot.artifacts, &manifest.artifacts));
@@ -2992,14 +3024,16 @@ mod tests {
             SearchDefinitionState::new(
                 fulltext_definition.clone(),
                 SearchDefinitionOrigin::catalog(fulltext_definition.definition_id),
-            ),
+            )
+            .unwrap(),
         );
         view.definitions.insert(
             sparse_definition.definition_id,
             SearchDefinitionState::new(
                 sparse_definition.clone(),
                 SearchDefinitionOrigin::catalog(sparse_definition.definition_id),
-            ),
+            )
+            .unwrap(),
         );
 
         let admission: Arc<dyn SearchAdmission> = Arc::new(InlineSearchAdmission::default());
@@ -3056,14 +3090,16 @@ mod tests {
             SearchDefinitionState::new(
                 opportunistic.clone(),
                 SearchDefinitionOrigin::catalog(opportunistic.definition_id),
-            ),
+            )
+            .unwrap(),
         );
         view.definitions.insert(
             required.definition_id,
             SearchDefinitionState::new(
                 required.clone(),
                 SearchDefinitionOrigin::catalog(required.definition_id),
-            ),
+            )
+            .unwrap(),
         );
 
         let context = view.write_context(None).unwrap();
@@ -3083,7 +3119,9 @@ mod tests {
         );
 
         assert!(table.search_registry().definition_count() >= 1);
-        assert!(table.vector_capability(0).is_some());
+        assert!(table
+            .vector_capability(0, DistanceMetric::Euclidean)
+            .is_some());
     }
 
     #[test]
@@ -3103,11 +3141,7 @@ mod tests {
             assert_eq!(seed_state.origin, SearchDefinitionOrigin::schema_seed(0));
         }
 
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-        });
+        let provider_config = test_hnsw_provider_config(4, 16, 64, 4_096);
         let definition = SearchIndexDefinition {
             definition_id: 77,
             table_id: table.tablet_id(),
@@ -3193,7 +3227,7 @@ mod tests {
         drop(table);
         let reopened = reopen_table_with_root(root.path(), &[], &descriptor);
         let recovered_capability = reopened
-            .vector_capability(1)
+            .vector_capability(1, DistanceMetric::Euclidean)
             .expect("recovered schema seed capability");
         assert_eq!(recovered_capability.definition_id, seed_definition_id);
         assert!(recovered_capability.coverage.is_complete());
@@ -3207,11 +3241,7 @@ mod tests {
             assert_eq!(seed_state.origin, SearchDefinitionOrigin::schema_seed(1));
         }
 
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-        });
+        let provider_config = test_hnsw_provider_config(4, 16, 64, 4_096);
         let explicit = SearchIndexDefinition {
             definition_id: 78,
             table_id: reopened.tablet_id(),
@@ -3264,12 +3294,15 @@ mod tests {
             .get(&seed_definition_id)
             .expect("schema seed restored after second reopen");
         assert_eq!(seed_state.origin, SearchDefinitionOrigin::schema_seed(1));
-        assert!(reopened_again.vector_capability(1).is_some());
+        assert!(reopened_again
+            .vector_capability(1, DistanceMetric::Euclidean)
+            .is_some());
 
         let opened = reopened_again
             .open_vector_search_cursor(
                 1,
                 &[1.0, 0.0, 0.0, 0.0],
+                DistanceMetric::Euclidean,
                 1,
                 SearchParams {
                     ef: Some(16),
@@ -3278,6 +3311,7 @@ mod tests {
                 },
                 None,
                 reopened_again.max_version(),
+                &crate::search::SearchReadOptions::default(),
             )
             .expect("query restored schema seed generation");
         let chunks = drain_search_cursor(&reopened_again, opened, &[0], false, 1)
@@ -3716,7 +3750,14 @@ mod tests {
 
         let query = FullTextIndex::new_default().parse_query("graph").unwrap();
         let opened = table
-            .open_fulltext_filter_cursor(0, &query, "simple", None, table.max_version())
+            .open_fulltext_filter_cursor(
+                0,
+                &query,
+                "simple",
+                None,
+                table.max_version(),
+                &crate::search::SearchReadOptions::default(),
+            )
             .unwrap();
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;
@@ -3737,7 +3778,13 @@ mod tests {
                 SearchBatchState::Ready(batch) if batch.is_empty() => continue,
                 SearchBatchState::Ready(batch) => chunks.push(
                     table
-                        .materialize_search_batch(&snapshot, batch, &[0], false)
+                        .materialize_search_batch(
+                            &snapshot,
+                            batch,
+                            &[0],
+                            false,
+                            Arc::new(default_allocator()),
+                        )
                         .unwrap(),
                 ),
                 SearchBatchState::Exhausted => break,
@@ -3998,7 +4045,14 @@ mod tests {
 
         let query = FullTextIndex::new_default().parse_query("graph").unwrap();
         let opened = table
-            .open_fulltext_filter_cursor(0, &query, "simple", None, table.max_version())
+            .open_fulltext_filter_cursor(
+                0,
+                &query,
+                "simple",
+                None,
+                table.max_version(),
+                &crate::search::SearchReadOptions::default(),
+            )
             .expect("query catch-up sidecar fulltext artifact");
         let chunks =
             drain_search_cursor(&table, opened, &[0], false, 1).expect("materialize sidecar query");
@@ -4703,7 +4757,14 @@ mod tests {
 
         let query = FullTextIndex::new_default().parse_query("vector").unwrap();
         let opened = table
-            .open_fulltext_filter_cursor(0, &query, "simple", None, table.max_version())
+            .open_fulltext_filter_cursor(
+                0,
+                &query,
+                "simple",
+                None,
+                table.max_version(),
+                &crate::search::SearchReadOptions::default(),
+            )
             .unwrap();
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;
@@ -4724,7 +4785,13 @@ mod tests {
                 SearchBatchState::Ready(batch) if batch.is_empty() => continue,
                 SearchBatchState::Ready(batch) => {
                     row_count += table
-                        .materialize_search_batch(&snapshot, batch, &[0], false)
+                        .materialize_search_batch(
+                            &snapshot,
+                            batch,
+                            &[0],
+                            false,
+                            Arc::new(default_allocator()),
+                        )
                         .unwrap()
                         .size();
                 }
@@ -5026,13 +5093,7 @@ mod tests {
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
         );
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-            "dimension": 1,
-            "inline_threshold": { "max_vector_count": 0 },
-        });
+        let provider_config = test_hnsw_provider_config(1, 16, 64, 0);
         let definition = SearchIndexDefinition {
             definition_id: 88,
             table_id: table.tablet_id(),
@@ -5111,13 +5172,7 @@ mod tests {
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
         );
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-            "dimension": 4,
-            "inline_threshold": { "max_vector_count": 0 },
-        });
+        let provider_config = test_hnsw_provider_config(4, 16, 64, 0);
         let definition = SearchIndexDefinition {
             definition_id: 90,
             table_id: table.tablet_id(),
@@ -5174,13 +5229,7 @@ mod tests {
             &[LogicalType::Array(Box::new(LogicalType::Float), 2)],
         );
         table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
-        let provider_config = json!({
-            "m": 8,
-            "ef_construct": 32,
-            "distance": "l2",
-            "dimension": 2,
-            "inline_threshold": { "max_vector_count": 0 },
-        });
+        let provider_config = test_hnsw_provider_config(2, 8, 32, 0);
         let definition = SearchIndexDefinition {
             definition_id: 94,
             table_id: table.tablet_id(),
@@ -5281,10 +5330,12 @@ mod tests {
             .open_vector_search_cursor(
                 0,
                 &[1.0, 0.0],
+                DistanceMetric::Euclidean,
                 2,
                 SearchParams::default(),
                 None,
                 table.max_version(),
+                &crate::search::SearchReadOptions::default(),
             )
             .unwrap();
         let mut cursor = opened.cursor;
@@ -5320,13 +5371,7 @@ mod tests {
             )]))
             .unwrap();
 
-        let provider_config = json!({
-            "m": 16,
-            "ef_construct": 64,
-            "distance": "l2",
-            "dimension": 1,
-            "inline_threshold": { "max_vector_count": 0 },
-        });
+        let provider_config = test_hnsw_provider_config(1, 16, 64, 0);
         let definition = SearchIndexDefinition {
             definition_id: 89,
             table_id: table.tablet_id(),

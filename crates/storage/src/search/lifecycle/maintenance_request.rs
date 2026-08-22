@@ -3,60 +3,30 @@
 
 //! Provider-specific maintenance request derivation.
 
-use serde_json::Value;
+use paro_common::error as paro_error;
+use paro_common::error::Result;
 
-use paro_common::types::LogicalType;
-
-use crate::tablet::TabletRef;
-
-use crate::search::capability::{SearchIndexDefinition, SearchIndexKind};
+use crate::search::capability::SearchIndexKind;
+use crate::search::generation::view::SearchDefinitionState;
 use crate::search::maintenance::{HnswMaintenanceRequest, ProviderMaintenanceRequest};
 use crate::search::manifest::LoadedManifest;
 
 pub(crate) fn provider_maintenance_request_for_definition(
-    definition: &SearchIndexDefinition,
+    state: &SearchDefinitionState,
     manifest: &LoadedManifest,
-    tablet: &TabletRef,
-) -> Option<ProviderMaintenanceRequest> {
-    if definition.kind != SearchIndexKind::Hnsw {
-        return None;
+) -> Result<Option<ProviderMaintenanceRequest>> {
+    if state.definition.kind != SearchIndexKind::Hnsw {
+        return Ok(None);
     }
-    let dimension = hnsw_definition_dimension(definition, manifest, tablet);
-    HnswMaintenanceRequest::new(
-        definition,
+    let provider = state.hnsw_provider_config.as_deref().ok_or_else(|| {
+        paro_error::data_corrupted("HNSW registry state is missing its provider contract")
+    })?;
+    Ok(HnswMaintenanceRequest::new(
+        &state.definition,
+        provider,
         manifest.root.generation_id,
         manifest.tail_pending_entries.clone(),
-        dimension,
         manifest.root.maintenance_state.recovery.priority,
     )
-    .map(ProviderMaintenanceRequest::Hnsw)
-}
-
-fn hnsw_definition_dimension(
-    definition: &SearchIndexDefinition,
-    manifest: &LoadedManifest,
-    tablet: &TabletRef,
-) -> u32 {
-    definition
-        .provider_config
-        .get("dimension")
-        .and_then(Value::as_u64)
-        .and_then(|dimension| u32::try_from(dimension).ok())
-        .or_else(|| {
-            manifest
-                .root
-                .generation_stats
-                .hnsw_provider_stats()
-                .map(|stats| stats.dimension)
-        })
-        .or_else(|| {
-            let column_id = *definition.column_ids.first()?;
-            let schema = tablet.schema()?;
-            let column = schema.column_by_id(column_id)?;
-            match &column.logical_type {
-                LogicalType::Array(_, dimension) => u32::try_from(*dimension).ok(),
-                _ => None,
-            }
-        })
-        .unwrap_or_default()
+    .map(ProviderMaintenanceRequest::Hnsw))
 }

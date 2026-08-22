@@ -4,8 +4,10 @@
 use std::borrow::Cow;
 use std::sync::Arc;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::MemoryAccountingClass;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_function::scalar::cast::array_casts::parse_vector_literal;
@@ -17,7 +19,7 @@ use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer}
 use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
 use paro_storage::search::{
     CapabilityToken, DenseVectorQuery, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig,
-    SearchRequestMode,
+    SearchReadOptions, SearchRequestMode,
 };
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
@@ -79,6 +81,7 @@ fn create_search_driver(
     ctx: &mut PipelineInitContext,
     spec: SearchSourceSpecRef<'_>,
 ) -> Result<SearchOperatorDriver> {
+    let read_options = SearchReadOptions::with_page_cache(ctx.query.session.page_cache().clone());
     let (table, opened, row_limit_hint, heap_budget_items, projected_columns, emit_score) =
         match spec {
             SearchSourceSpecRef::Vector(spec) => {
@@ -93,15 +96,17 @@ fn create_search_driver(
                             token,
                             spec.column_id,
                             query_vector.as_ref(),
+                            spec.distance,
                             spec.k,
                             spec.params,
                             spec.predicate.clone(),
                             &ctx.query.transaction,
+                            &read_options,
                         )
                     },
                     || {
                         table
-                            .vector_capability(spec.column_id as u32)
+                            .vector_capability(spec.column_id as u32, spec.distance)
                             .map(|capability| capability.capability_token())
                     },
                 )?;
@@ -128,6 +133,7 @@ fn create_search_driver(
                             spec.k,
                             spec.predicate.clone(),
                             &ctx.query.transaction,
+                            &read_options,
                         )
                     },
                     || {
@@ -161,6 +167,7 @@ fn create_search_driver(
                                 &spec.config,
                                 spec.predicate.clone(),
                                 &ctx.query.transaction,
+                                &read_options,
                             )
                         },
                         || {
@@ -183,6 +190,7 @@ fn create_search_driver(
                                 None,
                                 spec.score_mode,
                                 &ctx.query.transaction,
+                                &read_options,
                             )
                         },
                         || {
@@ -387,7 +395,10 @@ pub(crate) fn poll_search_next(
         .driver
         .as_mut()
         .ok_or_else(|| paro_error::internal("search source local driver missing"))?;
-    match driver.next_chunk(ctx.cancel)? {
+    let allocator = ctx
+        .memory
+        .accounted_allocator_for(MemoryTag::BaseTable, MemoryAccountingClass::NonRevocable);
+    match driver.next_chunk(ctx.cancel, allocator)? {
         Some(next) => {
             *output = next;
             Ok(SourcePoll::Output)

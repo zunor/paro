@@ -4,6 +4,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::buffer::PageCache;
+use crate::rowset::SegmentOptions;
 use crate::rowset::{RowsetId, RowsetSharedPtr, SegmentSharedPtr};
 use crate::tablet::{TabletReadGuard, TabletRef};
 use crate::transaction::overlay_reader::OverlayDeleteVectorMap;
@@ -26,6 +28,37 @@ pub struct TableReadSnapshot {
     pub table_id: TableId,
     pub tablet_id: u64,
     pub visible_version: i64,
+}
+
+/// Runtime resources used while opening a search read snapshot.
+///
+/// Search candidates and their late-materialized projection must resolve
+/// through the same governed storage cache as ordinary scans. Keeping this
+/// contract explicit prevents a search provider from silently reopening
+/// segments with ungoverned/default readers.
+#[derive(Debug, Clone, Default)]
+pub struct SearchReadOptions {
+    page_cache: Option<Arc<PageCache>>,
+    cache_decoded: bool,
+}
+
+impl SearchReadOptions {
+    /// Use the instance page cache for physical and codec-decoded pages.
+    /// Decoded admission is globally budgeted and evicted by `PageCache`.
+    pub fn with_page_cache(page_cache: Arc<PageCache>) -> Self {
+        Self {
+            page_cache: Some(page_cache),
+            cache_decoded: true,
+        }
+    }
+
+    fn segment_options(&self) -> SegmentOptions {
+        let mut options = SegmentOptions::default().with_cache_decoded(self.cache_decoded);
+        if let Some(page_cache) = &self.page_cache {
+            options = options.with_page_cache(page_cache.clone());
+        }
+        options
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -58,6 +91,7 @@ impl TableReadLease {
         tablet: &TabletRef,
         table_id: TableId,
         visible_version: i64,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
         let rowsets = tablet.capture_consistent_rowsets(visible_version)?;
@@ -68,6 +102,7 @@ impl TableReadLease {
             guard,
             rowsets,
             Vec::new(),
+            options,
         )
     }
 
@@ -76,6 +111,7 @@ impl TableReadLease {
         table_id: TableId,
         visible_version: i64,
         overlay_rowsets: Vec<RowsetSharedPtr>,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let guard = Arc::new(TabletReadGuard::pin(tablet, visible_version)?);
         let mut rowsets = tablet.capture_consistent_rowsets(visible_version)?;
@@ -93,6 +129,7 @@ impl TableReadLease {
             guard,
             rowsets,
             overlay_rowset_ids,
+            options,
         )
     }
 
@@ -103,13 +140,14 @@ impl TableReadLease {
         guard: Arc<TabletReadGuard>,
         rowsets: Vec<RowsetSharedPtr>,
         overlay_rowset_ids: Vec<RowsetId>,
+        options: &SearchReadOptions,
     ) -> Result<(TableReadSnapshot, Arc<Self>)> {
         let mut visible_segments = Vec::new();
         let mut segment_index = HashMap::new();
+        let segment_options = options.segment_options();
         for rowset in rowsets {
-            rowset.load()?;
             let rowset_id = rowset.rowset_id();
-            for segment in rowset.segments() {
+            for segment in rowset.segments_with_options(segment_options.clone())? {
                 let segment_id = segment.segment_id();
                 let entry = VisibleSegment {
                     rowset: rowset.clone(),
@@ -255,6 +293,8 @@ pub struct GenerationReadSnapshot {
     /// Immutable provider configuration used to make query-wide execution
     /// decisions at the same generation boundary as the artifacts.
     pub provider_config: Arc<serde_json::Value>,
+    /// Prevalidated HNSW contract. Present iff the generation provider is HNSW.
+    pub hnsw_provider_config: Option<Arc<super::HnswProviderConfig>>,
     pub artifacts: Arc<GenerationArtifactSet>,
 }
 
@@ -427,6 +467,60 @@ pub trait SearchCursor: Send {
     ) -> Result<SearchBatchState>;
 }
 
+#[cfg(test)]
+mod read_options_tests {
+    use super::*;
+    use crate::buffer::BufferPool;
+    use crate::table::table_factory::TableFactory;
+    use crate::test_utils::{test_chunk_from_vectors, test_i32_vector};
+    use paro_common::types::LogicalType;
+
+    #[test]
+    fn search_read_options_retain_sparse_projection_in_governed_cache() {
+        let table = TableFactory::default()
+            .create_table(&[LogicalType::Integer])
+            .expect("create table");
+        let values = (0..4096).collect::<Vec<i32>>();
+        table
+            .append(&test_chunk_from_vectors(vec![test_i32_vector(&values)]))
+            .expect("append rows");
+
+        let pool = BufferPool::new_arc(4 * 1024 * 1024);
+        let cache = Arc::new(PageCache::new(pool.clone()));
+        let options = SearchReadOptions::with_page_cache(cache.clone());
+        let (_, lease) = TableReadLease::open(
+            &table.tablet(),
+            table.table_id(),
+            table.max_version(),
+            &options,
+        )
+        .expect("open search read lease");
+        let segment = lease
+            .visible_segments()
+            .first()
+            .expect("visible segment")
+            .segment
+            .clone();
+
+        // The first sparse access establishes probation; the second promotes
+        // the decoded BitShuffle page into the globally governed cache.
+        segment
+            .read_by_rowids(&[0], &[3, 97])
+            .expect("first sparse projection");
+        assert_eq!(cache.stats().decoded_entries, 0);
+        segment
+            .read_by_rowids(&[0], &[3, 97])
+            .expect("repeated sparse projection");
+        let stats = cache.stats();
+        assert!(stats.decoded_entries > 0);
+        assert!(stats.decoded_bytes > 0);
+        assert!(
+            pool.get_tag_usage(paro_common::allocator::MemoryTag::DecodedPageCache) > 0,
+            "decoded page must be charged to the buffer pool"
+        );
+    }
+}
+
 pub trait SearchProvider: Send + Sync {
     fn open_cursor(
         &self,
@@ -441,7 +535,7 @@ mod tests {
 
     use super::{
         CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,
-        PhysicalRowRef, SearchReadSnapshot, TableReadLease,
+        PhysicalRowRef, SearchReadOptions, SearchReadSnapshot, TableReadLease,
     };
     use crate::search::capability::{CoverageState, SearchIndexKind};
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats};
@@ -492,9 +586,13 @@ mod tests {
             .create_table(&[LogicalType::Integer])
             .expect("create table");
         let visible_version = table.max_version();
-        let (table_snapshot, table_lease) =
-            TableReadLease::open(&table.tablet(), table.tablet_id(), visible_version)
-                .expect("open table lease");
+        let (table_snapshot, table_lease) = TableReadLease::open(
+            &table.tablet(),
+            table.tablet_id(),
+            visible_version,
+            &SearchReadOptions::default(),
+        )
+        .expect("open table lease");
         let generation = GenerationReadSnapshot {
             definition_id: 5,
             generation_id: 6,
@@ -505,6 +603,7 @@ mod tests {
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             provider_config: Arc::new(serde_json::Value::Null),
+            hnsw_provider_config: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);

@@ -102,8 +102,6 @@ pub struct ColumnWriterOptions {
     pub fixed_len: usize,
     /// Whether to build an HNSW index (for Vector type)
     pub build_hnsw: bool,
-    /// Whether vector values should be normalized for HNSW distance semantics.
-    pub normalize_vector_for_hnsw: bool,
     /// HNSW configuration
     pub hnsw_config: Option<HnswConfig>,
     /// Distance metric for HNSW
@@ -129,7 +127,6 @@ impl ColumnWriterOptions {
             build_bitmap_index: false,
             fixed_len: 0,
             build_hnsw: false,
-            normalize_vector_for_hnsw: false,
             hnsw_config: None,
             hnsw_distance: None,
             hnsw_stop_check: None,
@@ -179,12 +176,10 @@ impl ColumnWriterOptions {
     pub fn with_hnsw(
         mut self,
         build: bool,
-        normalize: bool,
         config: Option<HnswConfig>,
         distance: Option<DistanceMetric>,
     ) -> Self {
         self.build_hnsw = build;
-        self.normalize_vector_for_hnsw = normalize;
         self.hnsw_config = config;
         self.hnsw_distance = distance;
         self
@@ -726,22 +721,6 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
 }
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
-    fn normalize_vector_bytes(data: &[u8], count: usize, dim: usize) -> Vec<u8> {
-        let bytes_per_vec = dim * std::mem::size_of::<f32>();
-        let mut out = Vec::with_capacity(count * bytes_per_vec);
-        for i in 0..count {
-            let start = i * bytes_per_vec;
-            let vec_bytes = &data[start..start + bytes_per_vec];
-            let vec_f32 =
-                unsafe { std::slice::from_raw_parts(vec_bytes.as_ptr() as *const f32, dim) };
-            let normalized = DistanceMetric::Cosine.preprocess(vec_f32.to_vec());
-            for v in normalized {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        out
-    }
-
     /// Add fixed-width values to the page builder.
     fn add_fixed_values(&mut self, data: &[u8], count: u32) -> u32 {
         let fixed_width = fixed_type_size(&self.opts);
@@ -1201,17 +1180,6 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
         }
 
         let type_size = fixed_type_size(&self.opts);
-        let normalize_vectors = self.opts.field_type == FieldType::Vector
-            && self.opts.normalize_vector_for_hnsw
-            && matches!(
-                self.opts.hnsw_distance.unwrap_or(DistanceMetric::Cosine),
-                DistanceMetric::Cosine
-            );
-        let vector_dim = if normalize_vectors {
-            self.opts.fixed_len / std::mem::size_of::<f32>()
-        } else {
-            0
-        };
         let mut offset = 0usize;
         let mut row_offset = 0usize;
         let mut remaining = count;
@@ -1231,28 +1199,13 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 let max_values = (available_bytes / bytes_per_value) as u32;
                 let to_add = std::cmp::min(remaining, max_values);
 
-                let mut normalized_buf: Option<Vec<u8>> = None;
-                let input_slice = if normalize_vectors && to_add > 0 {
-                    let total_len = to_add as usize * bytes_per_value;
-                    let raw_slice = &data[offset..offset + total_len];
-                    normalized_buf = Some(Self::normalize_vector_bytes(
-                        raw_slice,
-                        to_add as usize,
-                        vector_dim,
-                    ));
-                    normalized_buf.as_ref().unwrap().as_slice()
-                } else {
-                    &data[offset..]
-                };
-
-                let added = self.add_fixed_values(input_slice, to_add);
+                // Base column pages, statistics, and predicate indexes retain
+                // the SQL value exactly as supplied. Metric preprocessing is
+                // an HNSW artifact concern and must never rewrite table data.
+                let added = self.add_fixed_values(&data[offset..], to_add);
                 let data_slice_len = added as usize * bytes_per_value;
                 if data_slice_len > 0 && offset + data_slice_len <= data.len() {
-                    let slice = if let Some(buf) = &normalized_buf {
-                        &buf[..data_slice_len]
-                    } else {
-                        &data[offset..offset + data_slice_len]
-                    };
+                    let slice = &data[offset..offset + data_slice_len];
                     self.update_secondary_indexes_fixed(
                         slice,
                         null_flags,
@@ -1505,8 +1458,12 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             return Ok(None);
         }
 
-        let config = self.opts.hnsw_config.unwrap_or_default();
-        let distance = self.opts.hnsw_distance.unwrap_or(DistanceMetric::Cosine);
+        let config = self.opts.hnsw_config.ok_or_else(|| {
+            paro_error::internal("HNSW vector storage is missing its build configuration")
+        })?;
+        let distance = self.opts.hnsw_distance.ok_or_else(|| {
+            paro_error::internal("HNSW vector storage is missing its distance contract")
+        })?;
         let mut hnsw_builder = HnswBuilder::new();
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);

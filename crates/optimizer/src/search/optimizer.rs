@@ -95,9 +95,12 @@ impl SearchOptimizer {
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
         let sequential = build_sequential_capability(table_id, filtered.expected);
 
-        if let Some(intent) =
-            extract_vector_intent(pattern.order_expr, pattern.get, topn.hnsw_ef_hint)?
-        {
+        if let Some(intent) = extract_vector_intent(
+            pattern.order_expr,
+            pattern.get,
+            topn.hnsw_ef_hint,
+            pattern.topn.orders[0].ascending,
+        )? {
             let search_intent = SearchIntent::Hnsw(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
@@ -532,22 +535,32 @@ fn extract_vector_intent(
     expr: &Expression,
     get: &Get,
     ef: Option<usize>,
+    ascending: bool,
 ) -> Result<Option<HnswIntent>> {
+    if !ascending {
+        return Ok(None);
+    }
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
         _ => return Ok(None),
     };
-    if !matches!(
-        func.builtin_intrinsic(),
-        Some(
-            BuiltinIntrinsicId::L2Distance
-                | BuiltinIntrinsicId::L1Distance
-                | BuiltinIntrinsicId::CosineDistance
-                | BuiltinIntrinsicId::NegativeInnerProduct
-        )
-    ) || func.children.len() != 2
-    {
+    let distance = match func.builtin_intrinsic() {
+        Some(BuiltinIntrinsicId::L2Distance) => {
+            paro_storage::index::hnsw::DistanceMetric::Euclidean
+        }
+        Some(BuiltinIntrinsicId::L1Distance) => {
+            paro_storage::index::hnsw::DistanceMetric::Manhattan
+        }
+        Some(BuiltinIntrinsicId::CosineDistance) => {
+            paro_storage::index::hnsw::DistanceMetric::Cosine
+        }
+        Some(BuiltinIntrinsicId::NegativeInnerProduct) => {
+            paro_storage::index::hnsw::DistanceMetric::DotProduct
+        }
+        _ => return Ok(None),
+    };
+    if func.children.len() != 2 {
         return Ok(None);
     }
 
@@ -558,6 +571,7 @@ fn extract_vector_intent(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
                     query: query_vector,
+                    distance,
                     ef,
                 }),
             );
@@ -569,6 +583,7 @@ fn extract_vector_intent(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
                     query: query_vector,
+                    distance,
                     ef,
                 }),
             );
@@ -1077,6 +1092,7 @@ mod tests {
                 intent: SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
                     query: DenseVectorQuery::Literal(vec![1.0, 2.0]),
+                    distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
                     ef: None,
                 }),
                 token: paro_storage::search::CapabilityToken {

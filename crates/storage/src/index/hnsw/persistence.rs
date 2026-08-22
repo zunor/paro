@@ -258,11 +258,7 @@ impl HnswIndex {
         let post_filter_count = filter_bitmap.map(|bm| bm.len()).unwrap_or(pre_filter_count);
 
         let prepared_query = self.distance.prepare(query);
-        let mut scorer = VectorScorer::new(
-            prepared_query.as_slice(),
-            self.vector_storage.as_ref(),
-            self.distance,
-        );
+        let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref());
         let results = if self.should_use_plain_scan(filter_bitmap, mode) {
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
@@ -295,6 +291,7 @@ impl HnswIndex {
         top_k: usize,
         params: &SearchParams,
         filter_bitmap: Option<&RoaringBitmap>,
+        mode: HnswSearchMode,
     ) -> Result<Vec<Vec<ScoredPoint>>> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -308,16 +305,10 @@ impl HnswIndex {
         let start = Instant::now();
         let mut scorers: Vec<_> = queries
             .iter()
-            .map(|query| {
-                VectorScorer::new(
-                    query.as_slice(),
-                    self.vector_storage.as_ref(),
-                    self.distance,
-                )
-            })
+            .map(|query| VectorScorer::new(query, self.vector_storage.as_ref()))
             .collect();
 
-        let results = if self.should_use_plain_scan(filter_bitmap, HnswSearchMode::Auto) {
+        let results = if self.should_use_plain_scan(filter_bitmap, mode) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
             match filter_bitmap {
@@ -761,6 +752,23 @@ mod tests {
     }
 
     #[test]
+    fn build_is_byte_deterministic_for_same_seed() {
+        let vectors = make_sift_like_vectors(0xabc, 256, 16, 12);
+        let config = HnswConfig::new(12, 72)
+            .with_plain_scan_threshold(0)
+            .with_build_seed(0x1234_5678_9abc_def0)
+            .with_build_random_entry_point(true);
+        let first = HnswIndex::build(make_storage(&vectors), config, DistanceMetric::Euclidean)
+            .serialize()
+            .unwrap();
+        let second = HnswIndex::build(make_storage(&vectors), config, DistanceMetric::Euclidean)
+            .serialize()
+            .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
     fn test_hnsw_search() {
         let storage = make_storage(&[vec![0.0], vec![1.0]]);
         let config = HnswConfig::new(8, 50)
@@ -810,7 +818,13 @@ mod tests {
         let top_k = 12;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, Some(&filter))
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                Some(&filter),
+                HnswSearchMode::Graph,
+            )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
 
@@ -840,7 +854,13 @@ mod tests {
         let top_k = 10;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, None)
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                None,
+                HnswSearchMode::Exact,
+            )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
 
@@ -875,7 +895,13 @@ mod tests {
         let top_k = 10;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, Some(&filter))
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                Some(&filter),
+                HnswSearchMode::Exact,
+            )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
 
@@ -909,7 +935,13 @@ mod tests {
         let top_k = 8;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, None)
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                None,
+                HnswSearchMode::Graph,
+            )
             .unwrap();
         let single = index.search_one(&query, top_k, &params, None).unwrap();
 
@@ -978,7 +1010,13 @@ mod tests {
         let top_k = 10;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, Some(&filter))
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                Some(&filter),
+                HnswSearchMode::Graph,
+            )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
 
@@ -1073,7 +1111,7 @@ mod tests {
             DistanceMetric::DotProduct.prepare(&[3.0]),
         ];
         let _ = index
-            .search_many_prepared(&queries, 2, &params, None)
+            .search_many_prepared(&queries, 2, &params, None, HnswSearchMode::Exact)
             .unwrap();
 
         let single = index.search_telemetry();
@@ -1099,6 +1137,7 @@ mod tests {
                 1,
                 &SearchParams::default(),
                 None,
+                HnswSearchMode::Exact,
             )
             .unwrap_err();
 
@@ -1123,6 +1162,7 @@ mod tests {
                 1,
                 &SearchParams::default(),
                 None,
+                HnswSearchMode::Exact,
             )
             .unwrap_err();
 
@@ -1182,7 +1222,13 @@ mod tests {
         let top_k = 6;
 
         let batch = index
-            .search_many_prepared(&prepared_queries, top_k, &params, Some(&filter))
+            .search_many_prepared(
+                &prepared_queries,
+                top_k,
+                &params,
+                Some(&filter),
+                HnswSearchMode::Exact,
+            )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
 

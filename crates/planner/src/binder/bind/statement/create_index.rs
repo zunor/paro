@@ -14,9 +14,11 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, CreateIndexStmt, Expr, IndexKind};
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
-use paro_storage::index::hnsw::HnswConfig;
+use paro_storage::index::hnsw::{DistanceMetric, HnswConfig};
 use paro_storage::index::IndexConstraintType;
-use paro_storage::search::HnswInlineThreshold;
+use paro_storage::search::{
+    HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
+};
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -282,6 +284,9 @@ fn hnsw_provider_config(
     const HNSW_KEYS: &[&str] = &[
         "m",
         "ef_construct",
+        "ef_search",
+        "distance",
+        "build_seed",
         "plain_scan_threshold",
         "filtered_plain_scan_threshold",
         "inline_max_vector_count",
@@ -312,6 +317,19 @@ fn hnsw_provider_config(
             "HNSW index option ef_construct must be between m ({m}) and 1000000, got {ef_construct}"
         )));
     }
+    let ef_search = parse_u64_index_option(options, "ef_search", defaults.ef as u64)?;
+    if ef_search == 0 || ef_search > 1_000_000 {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option ef_search must be between 1 and 1000000, got {ef_search}"
+        )));
+    }
+    let distance_name = options.get("distance").map(String::as_str).unwrap_or("l2");
+    let distance = DistanceMetric::parse_sql_name(distance_name).ok_or_else(|| {
+        paro_error::invalid_input(format!(
+            "HNSW index option distance must be one of l2, cosine, ip, or l1, got '{distance_name}'"
+        ))
+    })?;
+    let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
 
     let plain_scan_threshold = parse_u64_index_option(
         options,
@@ -345,19 +363,27 @@ fn hnsw_provider_config(
         )));
     }
 
-    Ok(json!({
-        "m": m,
-        "ef_construct": ef_construct,
-        "distance": 0,
-        "dimension": *dimension,
-        "plain_scan_threshold": plain_scan_threshold,
-        "filtered_plain_scan_threshold": filtered_plain_scan_threshold,
-        "inline_threshold": {
-            "max_vector_count": inline_max_vector_count,
-            "max_graph_memory_bytes": inline_max_graph_memory_bytes,
-            "max_dimension": inline_max_dimension,
-        }
-    }))
+    let dimension = u32::try_from(*dimension).map_err(|_| {
+        paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
+    })?;
+    HnswProviderConfig::new(
+        dimension,
+        distance,
+        u32::try_from(m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        u32::try_from(ef_construct).map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
+        u32::try_from(ef_search).map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        u32::try_from(plain_scan_threshold)
+            .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
+        u32::try_from(filtered_plain_scan_threshold)
+            .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
+        build_seed,
+        HnswInlineConfig {
+            max_vector_count: inline_max_vector_count,
+            max_graph_memory_bytes: inline_max_graph_memory_bytes,
+            max_dimension: inline_max_dimension as u32,
+        },
+    )?
+    .to_value()
 }
 
 fn provider_config_for_index(
@@ -741,7 +767,8 @@ mod tests {
             &mut binder,
             parse_create_index_stmt(
                 "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
-                 m = 32 ef_construct = 160 plain_scan_threshold = 20000 \
+                 m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
+                 build_seed = 42 plain_scan_threshold = 20000 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
                  inline_max_dimension = 256",
@@ -755,6 +782,10 @@ mod tests {
         assert_eq!(bound.info.index_type, IndexType::HNSW);
         assert_eq!(bound.info.provider_config["m"], 32);
         assert_eq!(bound.info.provider_config["ef_construct"], 160);
+        assert_eq!(bound.info.provider_config["ef_search"], 96);
+        assert_eq!(bound.info.provider_config["distance"], "cosine");
+        assert_eq!(bound.info.provider_config["build_seed"], 42);
+        assert_eq!(bound.info.provider_config["version"], 1);
         assert_eq!(bound.info.provider_config["dimension"], 100);
         assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
         assert_eq!(
@@ -785,6 +816,17 @@ mod tests {
         )
         .expect_err("ef_construct below m should fail");
         assert!(invalid.to_string().contains("must be between m (32)"));
+
+        let invalid_distance = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_distance ON items (embedding) distance = hamming",
+            ),
+        )
+        .expect_err("unsupported HNSW distance should fail");
+        assert!(invalid_distance
+            .to_string()
+            .contains("must be one of l2, cosine, ip, or l1"));
     }
 
     #[test]

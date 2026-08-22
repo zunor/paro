@@ -1,10 +1,12 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use serde_json::json;
-
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use crate::search::{
+    HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
+};
 use crate::tablet::{ColumnId, TabletColumn, TabletSchema};
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
 use super::super::capability::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind};
@@ -16,15 +18,44 @@ pub(crate) fn schema_seed_definition(
     column: &TabletColumn,
 ) -> Result<SearchIndexDefinition> {
     let dimension = match &column.logical_type {
-        LogicalType::Array(_, dimension) => *dimension as u64,
-        _ => 0,
+        LogicalType::Array(inner, dimension) if matches!(inner.as_ref(), LogicalType::Float) => {
+            u32::try_from(*dimension)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension"))?
+        }
+        other => {
+            return Err(paro_error::not_supported(format!(
+                "schema HNSW column requires VECTOR(N), got {other:?}"
+            )))
+        }
     };
-    let provider_config = json!({
-        "m": column.hnsw_m,
-        "ef_construct": column.hnsw_ef_construct,
-        "distance": column.hnsw_distance,
-        "dimension": dimension,
-    });
+    let distance = DistanceMetric::from_u8(column.hnsw_distance).ok_or_else(|| {
+        paro_error::invalid_input(format!(
+            "invalid HNSW distance tag {} on column {}",
+            column.hnsw_distance, column.id
+        ))
+    })?;
+    let defaults = HnswConfig::default();
+    let inline = HnswInlineThreshold::DEFAULT;
+    let provider_config = HnswProviderConfig::new(
+        dimension,
+        distance,
+        u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        u32::try_from(column.hnsw_ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
+        u32::try_from(column.hnsw_ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        u32::try_from(defaults.plain_scan_threshold)
+            .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
+        u32::try_from(defaults.filtered_plain_scan_threshold)
+            .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
+        DEFAULT_HNSW_BUILD_SEED,
+        HnswInlineConfig {
+            max_vector_count: inline.max_vector_count,
+            max_graph_memory_bytes: inline.max_graph_memory_bytes,
+            max_dimension: inline.max_dimension,
+        },
+    )?
+    .to_value()?;
     Ok(SearchIndexDefinition {
         definition_id: SCHEMA_SEED_BIT | column.id as u64,
         table_id,

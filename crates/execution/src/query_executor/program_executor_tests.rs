@@ -187,6 +187,70 @@ fn start_program_drives_root_output_on_fetch() {
 }
 
 #[test]
+fn single_task_pipeline_stays_fetch_driven_when_parallel_scheduler_is_enabled() {
+    let output_type = LogicalType::Integer;
+    let row_type = RowType::new(vec!["v".to_string()], vec![output_type.clone()]);
+    let chunk_spec = ChunkScanSpec {
+        chunks: Arc::from(vec![i32_chunk(&[1])].into_boxed_slice()),
+        output_names: vec!["v".to_string()].into_boxed_slice(),
+        output_types: vec![output_type.clone()].into_boxed_slice(),
+    };
+    let mut properties = PipelineProperties::default();
+    properties.capabilities.parallelism = Parallelism::single();
+    let graph = Arc::new(PipelineGraph {
+        pipelines: vec![PipelineSpec {
+            id: PipelineId::new(0),
+            source: SourceSpec::Chunk(chunk_spec.clone()),
+            transforms: Vec::new(),
+            sink: SinkSpec::ClientResult(ClientResultSpec::default()),
+            sink_sharing: SinkSharing::Exclusive,
+            properties,
+            output: row_type.clone(),
+        }],
+        dependencies: Vec::new(),
+        handles: BreakerHandleCatalogBuilder::default().finish(),
+        control_regions: Vec::new(),
+        root: PipelineRoot::Pipeline(PipelineId::new(0)),
+    });
+    let programs = PipelineProgramBuilder::default()
+        .build_program_set(graph.as_ref())
+        .expect("pipeline programs");
+    let statement = StatementProgram::Pipeline {
+        plan: Arc::new(single_node_plan(
+            PhysicalNodeKind::ChunkScan(chunk_spec),
+            row_type,
+        )),
+        graph,
+        programs,
+    };
+    let session = TestStatementContextBuilder::minimal()
+        .with_limits(RuntimeLimits {
+            max_threads: 4,
+            max_memory: 64 * 1024 * 1024,
+            use_temporary_directory: false,
+            temporary_directory: String::new(),
+            max_temp_directory_size: None,
+            force_external: false,
+            rowset_scan_pushdown: true,
+            parallel_scheduler: true,
+        })
+        .build();
+    session.scheduler().set_threads(4).expect("worker threads");
+
+    let execution = start_program(
+        session,
+        &statement,
+        Arc::new(ParameterBindings::empty()),
+        Arc::new(QueryMemoryPool::unbounded()),
+        paro_common::test_utils::test_allocator(),
+    )
+    .expect("start single-task program");
+
+    assert!(execution.driver.is_some());
+    assert!(execution.background.is_none());
+}
+
+#[test]
 fn fetch_driven_materialized_dag_keeps_root_output_bounded() {
     let allocator = paro_common::test_utils::test_allocator();
     let chunk_count = 8usize;

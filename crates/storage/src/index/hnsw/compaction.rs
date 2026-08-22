@@ -62,7 +62,12 @@ impl HnswIndexRebuilder {
                         column_id: c.id,
                         dim,
                         config: HnswConfig::new(c.hnsw_m, c.hnsw_ef_construct),
-                        distance: DistanceMetric::from_u8(c.hnsw_distance),
+                        distance: DistanceMetric::from_u8(c.hnsw_distance).ok_or_else(|| {
+                            paro_error::data_corrupted(format!(
+                                "invalid HNSW distance tag {} on column {}",
+                                c.hnsw_distance, c.id
+                            ))
+                        })?,
                     })
                 }
                 _ => Err(paro_error::not_supported(format!(

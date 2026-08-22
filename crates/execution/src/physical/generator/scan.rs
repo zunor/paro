@@ -526,6 +526,7 @@ fn search_source_spec_for_candidate(
             capability_token: candidate.token.clone(),
             column_id: intent.column_id as usize,
             query: intent.query.clone(),
+            distance: intent.distance,
             k: scan.limit,
             params: paro_storage::index::hnsw::types::SearchParams {
                 ef: intent.ef,

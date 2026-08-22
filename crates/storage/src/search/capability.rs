@@ -35,6 +35,20 @@ pub struct SearchIndexDefinition {
     pub config_fingerprint: ConfigFingerprint,
 }
 
+impl SearchIndexDefinition {
+    /// Decode the durable HNSW provider contract. HNSW consumers use this
+    /// method instead of inspecting JSON fields or supplying local defaults.
+    pub fn hnsw_provider_config(&self) -> paro_common::error::Result<super::HnswProviderConfig> {
+        if self.kind != SearchIndexKind::Hnsw {
+            return Err(paro_common::error::invalid_input(format!(
+                "search definition '{}' is not HNSW",
+                self.name
+            )));
+        }
+        super::HnswProviderConfig::from_value(&self.provider_config)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchDefinitionOrigin {
     CatalogIndex { index_id: u64 },

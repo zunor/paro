@@ -6,26 +6,20 @@
 //! Distance scoring helpers shared by graph search and plain/full-scan paths.
 
 use super::types::{PointOffset, ScoreType, ScoredPoint};
-use super::{DistanceMetric, VectorStorage};
+use super::{PreparedQuery, VectorStorage};
 
 /// Vector scorer responsible for calculating distances during search and build.
 pub struct VectorScorer<'a> {
-    pub query: &'a [f32],
-    pub vector_storage: &'a dyn VectorStorage,
-    pub distance: DistanceMetric,
+    query: &'a PreparedQuery,
+    pub(crate) vector_storage: &'a dyn VectorStorage,
     scores_buffer: Vec<ScoreType>,
 }
 
 impl<'a> VectorScorer<'a> {
-    pub fn new(
-        query: &'a [f32],
-        vector_storage: &'a dyn VectorStorage,
-        distance: DistanceMetric,
-    ) -> Self {
+    pub fn new(query: &'a PreparedQuery, vector_storage: &'a dyn VectorStorage) -> Self {
         Self {
             query,
             vector_storage,
-            distance,
             scores_buffer: Vec::new(),
         }
     }
@@ -37,7 +31,9 @@ impl<'a> VectorScorer<'a> {
 
     /// Score a vector that has already been fetched from storage.
     pub fn score_cached_vector(&self, vector: &[f32]) -> ScoreType {
-        self.distance.similarity(self.query, vector)
+        self.query
+            .metric()
+            .similarity_prepared(self.query.as_slice(), vector)
     }
 
     /// Score a batch of points into a caller-provided buffer.

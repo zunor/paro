@@ -30,11 +30,13 @@
 //! ```
 
 use paro_common::distance;
+use serde::{Deserialize, Serialize};
 
 use super::types::{PreparedQuery, ScoreType};
 
 /// Distance metric type for vector comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum DistanceMetric {
     /// Cosine similarity (dot product of normalized vectors).
     /// Range: [-1, 1], higher is more similar.
@@ -51,13 +53,34 @@ pub enum DistanceMetric {
 }
 
 impl DistanceMetric {
-    /// Convert u8 byte to DistanceMetric
-    pub fn from_u8(val: u8) -> Self {
+    /// Decode the stable tablet-schema distance tag.
+    pub const fn from_u8(val: u8) -> Option<Self> {
         match val {
-            1 => DistanceMetric::Cosine,
-            2 => DistanceMetric::DotProduct,
-            3 => DistanceMetric::Manhattan,
-            _ => DistanceMetric::Euclidean,
+            0 => Some(DistanceMetric::Euclidean),
+            1 => Some(DistanceMetric::Cosine),
+            2 => Some(DistanceMetric::DotProduct),
+            3 => Some(DistanceMetric::Manhattan),
+            _ => None,
+        }
+    }
+
+    /// Parse a SQL index option and normalize aliases to the durable name.
+    pub fn parse_sql_name(name: &str) -> Option<Self> {
+        match name.to_ascii_lowercase().as_str() {
+            "l2" | "euclidean" => Some(Self::Euclidean),
+            "cos" | "cosine" => Some(Self::Cosine),
+            "dot" | "dot_product" | "inner_product" | "ip" => Some(Self::DotProduct),
+            "l1" | "manhattan" => Some(Self::Manhattan),
+            _ => None,
+        }
+    }
+
+    pub const fn durable_name(self) -> &'static str {
+        match self {
+            Self::Euclidean => "euclidean",
+            Self::Cosine => "cosine",
+            Self::DotProduct => "dot_product",
+            Self::Manhattan => "manhattan",
         }
     }
 
@@ -71,7 +94,8 @@ impl DistanceMetric {
     pub fn similarity(&self, v1: &[f32], v2: &[f32]) -> ScoreType {
         debug_assert_eq!(v1.len(), v2.len(), "Vector dimensions must match");
         match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => distance::dot_product(v1, v2),
+            DistanceMetric::Cosine => 1.0 - distance::cosine_distance(v1, v2),
+            DistanceMetric::DotProduct => distance::dot_product(v1, v2),
             DistanceMetric::Euclidean => -distance::l2_squared(v1, v2),
             DistanceMetric::Manhattan => -distance::l1_distance(v1, v2),
         }
@@ -93,32 +117,35 @@ impl DistanceMetric {
         PreparedQuery::new(self.preprocess(raw_query.to_vec()), *self)
     }
 
-    /// Convert internal score to user-facing distance.
+    /// Score a vector against a query produced by [`Self::prepare`]. Cosine
+    /// queries are already unit length, so only the stored vector norm remains
+    /// in the hot loop. Stored table values themselves stay byte-for-byte
+    /// unchanged by index construction.
+    pub fn similarity_prepared(&self, prepared_query: &[f32], vector: &[f32]) -> ScoreType {
+        debug_assert_eq!(
+            prepared_query.len(),
+            vector.len(),
+            "Vector dimensions must match"
+        );
+        if !matches!(self, Self::Cosine) {
+            return self.similarity(prepared_query, vector);
+        }
+        let vector_norm_squared = distance::dot_product(vector, vector);
+        if vector_norm_squared < f32::EPSILON {
+            return 0.0;
+        }
+        distance::dot_product(prepared_query, vector) / vector_norm_squared.sqrt()
+    }
+
+    /// Convert the internal larger-is-better score to the corresponding SQL
+    /// distance function result. All currently optimized SQL vector operators
+    /// order this value ascending.
     pub fn postprocess(&self, score: ScoreType) -> ScoreType {
         match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => score,
+            DistanceMetric::Cosine => 1.0 - score,
+            DistanceMetric::DotProduct => -score,
             DistanceMetric::Euclidean => score.abs().sqrt(),
             DistanceMetric::Manhattan => score.abs(),
-        }
-    }
-
-    /// Returns true if larger scores indicate more similar vectors.
-    pub fn is_larger_better(&self) -> bool {
-        match self {
-            DistanceMetric::Cosine | DistanceMetric::DotProduct => true,
-            DistanceMetric::Euclidean | DistanceMetric::Manhattan => false,
-        }
-    }
-
-    /// Check if a score satisfies a threshold condition.
-    ///
-    /// For LargerBetter metrics: score > threshold.
-    /// For SmallerBetter metrics: score < threshold.
-    pub fn check_threshold(&self, score: ScoreType, threshold: ScoreType) -> bool {
-        if self.is_larger_better() {
-            score > threshold
-        } else {
-            score < threshold
         }
     }
 }
@@ -224,35 +251,30 @@ mod tests {
         // DotProduct
         let score = DistanceMetric::DotProduct.similarity(&v1, &v2);
         assert!(approx_eq(score, 0.0));
+        assert!(approx_eq(DistanceMetric::DotProduct.postprocess(3.5), -3.5));
+        assert!(approx_eq(DistanceMetric::Cosine.postprocess(0.75), 0.25));
     }
 
     #[test]
     fn test_cosine_similarity() {
         let metric = DistanceMetric::Cosine;
-        // Preprocess (normalize) before similarity
-        let v1 = metric.preprocess(vec![3.0, 4.0]);
-        let v2 = metric.preprocess(vec![4.0, 3.0]);
+        let v1 = vec![3.0, 4.0];
+        let v2 = vec![4.0, 3.0];
         let score = metric.similarity(&v1, &v2);
         // cos(angle) = (3*4 + 4*3) / (5 * 5) = 24/25 = 0.96
         assert!(approx_eq(score, 0.96));
-    }
 
-    #[test]
-    fn test_is_larger_better() {
-        assert!(DistanceMetric::Cosine.is_larger_better());
-        assert!(DistanceMetric::DotProduct.is_larger_better());
-        assert!(!DistanceMetric::Euclidean.is_larger_better());
-        assert!(!DistanceMetric::Manhattan.is_larger_better());
-    }
-
-    #[test]
-    fn test_check_threshold() {
-        // For Cosine (larger better): 0.8 > 0.5 = true
-        assert!(DistanceMetric::Cosine.check_threshold(0.8, 0.5));
-        assert!(!DistanceMetric::Cosine.check_threshold(0.3, 0.5));
-
-        // For Euclidean (smaller better): -0.3 < -0.5 is false
-        assert!(!DistanceMetric::Euclidean.check_threshold(-0.3, -0.5));
+        // Query preparation must preserve the same score against an unmodified
+        // persisted vector. Index construction must not normalize SQL values.
+        let prepared = metric.prepare(&v1);
+        assert!(approx_eq(
+            metric.similarity_prepared(prepared.as_slice(), &v2),
+            0.96
+        ));
+        assert!(approx_eq(
+            metric.similarity_prepared(prepared.as_slice(), &[0.0, 0.0]),
+            0.0
+        ));
     }
 
     // ========================================================================

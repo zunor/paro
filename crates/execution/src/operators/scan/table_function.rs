@@ -758,6 +758,7 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                             "max_level": stats.max_level,
                                             "m": stats.m,
                                             "ef_construction": stats.ef_construction,
+                                            "provider_config": &idx.provider_config,
                                             "failure_reason": idx.failure_reason(),
                                             "coverage": idx.coverage().map(|coverage| {
                                                 json!({
@@ -772,6 +773,7 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                         json!({
                                             "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
                                             "column_names": column_names,
+                                            "provider_config": &idx.provider_config,
                                             "failure_reason": idx.failure_reason(),
                                             "coverage": idx.coverage().map(|coverage| {
                                                 json!({

@@ -629,6 +629,30 @@ mod tests {
             .and_then(|end| String::from_utf8(payload[..end].to_vec()).ok())
     }
 
+    fn first_text_data_row_value(payload: &[u8]) -> Option<String> {
+        if i16::from_be_bytes(payload.get(0..2)?.try_into().ok()?) != 1 {
+            return None;
+        }
+        let length = i32::from_be_bytes(payload.get(2..6)?.try_into().ok()?);
+        let length = usize::try_from(length).ok()?;
+        String::from_utf8(payload.get(6..6 + length)?.to_vec()).ok()
+    }
+
+    fn binary_float4_array(values: &[f32]) -> Bytes {
+        const FLOAT4_OID: u32 = 700;
+        let mut bytes = Vec::with_capacity(20 + values.len() * 8);
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&FLOAT4_OID.to_be_bytes());
+        bytes.extend_from_slice(&(values.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        Bytes::from(bytes)
+    }
+
     fn parameter_status(payload: &[u8]) -> Option<(String, String)> {
         let mut index = 0;
         let name_end = payload[index..]
@@ -1063,6 +1087,89 @@ mod tests {
             .expect("write recovery Sync");
         let recovered = read_messages_until_ready(&mut client).await;
         assert_eq!(recovered.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_vector_parameter_executes_prepared_hnsw_topk() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        let ddl = run_simple_query_roundtrip(
+            &mut client,
+            "CREATE TABLE binary_vector_t (id INT PRIMARY KEY, emb VECTOR(3)); \
+             CREATE VECTOR INDEX binary_vector_idx ON binary_vector_t (emb) \
+                 distance = l2 m = 8 ef_construct = 32 ef_search = 24 build_seed = 7",
+        )
+        .await;
+        let setup = run_simple_query_roundtrip(
+            &mut client,
+            "INSERT INTO binary_vector_t VALUES \
+             (1, '[1,1,1]'), (2, '[2,2,2]'), (3, '[1,1,2]')",
+        )
+        .await;
+        let setup_errors = ddl
+            .iter()
+            .chain(setup.iter())
+            .filter_map(|(tag, payload)| {
+                (*tag == b'E').then(|| error_field(payload, b'M')).flatten()
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            setup_errors.is_empty(),
+            "vector setup should succeed: {setup_errors:?}"
+        );
+
+        for message in [
+            PgWireFrontendMessage::Parse(Parse::new(
+                Some("binary_vector_topk".to_string()),
+                "SELECT id FROM binary_vector_t \
+                 ORDER BY emb <-> $1::VECTOR(3) LIMIT 2"
+                    .to_string(),
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Bind(Bind::new(
+                Some("binary_vector_portal".to_string()),
+                Some("binary_vector_topk".to_string()),
+                vec![1],
+                vec![Some(binary_float4_array(&[1.0, 1.0, 1.0]))],
+                Vec::new(),
+            )),
+            PgWireFrontendMessage::Execute(Execute::new(
+                Some("binary_vector_portal".to_string()),
+                0,
+            )),
+            PgWireFrontendMessage::Sync(Sync::new()),
+        ] {
+            client
+                .write_all(&encode_frontend_message(message))
+                .await
+                .expect("write prepared vector message");
+        }
+
+        let messages = read_messages_until_ready(&mut client).await;
+        assert!(
+            !messages.iter().any(|(tag, _)| *tag == b'E'),
+            "prepared binary vector query should succeed"
+        );
+        let ids = messages
+            .iter()
+            .filter_map(|(tag, payload)| {
+                (*tag == b'D')
+                    .then(|| first_text_data_row_value(payload))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["1", "3"]);
 
         server
             .shutdown(Duration::from_secs(5))

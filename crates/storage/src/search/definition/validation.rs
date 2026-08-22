@@ -50,31 +50,11 @@ fn validate_hnsw_definition(definition: &SearchIndexDefinition, tablet: &TabletR
             column.logical_type, column_id
         )));
     }
-    if let Some(configured_dimension) = definition
-        .provider_config
-        .get("dimension")
-        .and_then(Value::as_u64)
-    {
-        if configured_dimension != *dimension as u64 {
-            return Err(paro_error::invalid_input(format!(
-                "HNSW configured dimension {} does not match column {} dimension {}",
-                configured_dimension, column_id, dimension
-            )));
-        }
-    }
-    let m = definition
-        .provider_config
-        .get("m")
-        .and_then(Value::as_u64)
-        .unwrap_or(24);
-    let ef_construct = definition
-        .provider_config
-        .get("ef_construct")
-        .and_then(Value::as_u64)
-        .unwrap_or(100);
-    if !(2..=1_024).contains(&m) || ef_construct < m || ef_construct > 1_000_000 {
+    let config = definition.hnsw_provider_config()?;
+    if config.dimension != *dimension as u32 {
         return Err(paro_error::invalid_input(format!(
-            "invalid HNSW build config: m={m}, ef_construct={ef_construct}"
+            "HNSW configured dimension {} does not match column {} dimension {}",
+            config.dimension, column_id, dimension
         )));
     }
     Ok(())
