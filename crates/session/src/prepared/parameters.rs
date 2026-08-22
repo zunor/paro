@@ -4,6 +4,7 @@
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::scalar::cast::array_casts::parse_vector_literal;
 use paro_function::scalar::cast::date_casts::{
     parse_date_text, parse_interval_text, parse_time_text, parse_timestamp_text,
     parse_timestamptz_text,
@@ -18,8 +19,8 @@ pub(crate) fn placeholder_count(stmt: &Statement) -> usize {
     let mut count = 0usize;
     let mut visitor = StatementVisitor::new(
         |expr| {
-            if matches!(expr, Expr::Placeholder { .. }) {
-                count = count.saturating_add(1);
+            if let Expr::Parameter { index, .. } = expr {
+                count = count.max(index.saturating_add(1));
             }
         },
         |_| {},
@@ -43,25 +44,22 @@ pub(crate) fn bind_value_arguments(
 
 pub(crate) fn bind_expr_arguments(stmt: &Statement, exprs: &[Expr]) -> Result<Statement> {
     let mut stmt = stmt.clone();
-    let mut next = 0usize;
-    let mut placeholders = 0usize;
+    let parameter_count = placeholder_count(&stmt);
     let mut first_error = None;
 
     let mut replacer = StatementReplacer::new(
         |expr| {
-            if !matches!(expr, Expr::Placeholder { .. }) {
+            let Expr::Parameter { index, .. } = expr else {
                 return;
-            }
+            };
 
-            placeholders = placeholders.saturating_add(1);
-            match exprs.get(next) {
+            match exprs.get(*index) {
                 Some(replacement) => {
                     *expr = replacement.clone();
-                    next = next.saturating_add(1);
                 }
                 None if first_error.is_none() => {
                     first_error = Some(paro_error::syntax(format!(
-                        "expected {placeholders} parameters, got {}",
+                        "expected {parameter_count} parameters, got {}",
                         exprs.len()
                     )));
                 }
@@ -75,9 +73,9 @@ pub(crate) fn bind_expr_arguments(stmt: &Statement, exprs: &[Expr]) -> Result<St
     if let Some(err) = first_error {
         return Err(err);
     }
-    if next != exprs.len() {
+    if parameter_count != exprs.len() {
         return Err(paro_error::syntax(format!(
-            "expected {placeholders} parameters, got {}",
+            "expected {parameter_count} parameters, got {}",
             exprs.len()
         )));
     }
@@ -331,6 +329,19 @@ fn cast_parameter_value(value: &Value, logical_type: &LogicalType) -> Result<Val
         (Value::Varchar(text), LogicalType::Blob) => parse_bytea_text(text).map(Value::Blob),
         (Value::Varchar(text), LogicalType::List(child)) => {
             parse_array_value(text, child.as_ref(), None)
+        }
+        (Value::Varchar(text), LogicalType::Array(child, size))
+            if matches!(child.as_ref(), LogicalType::Float) =>
+        {
+            let values = parse_vector_literal(text)?;
+            if values.len() != *size {
+                return Err(paro_error::invalid_value(format!("VECTOR({size})"), text));
+            }
+            Ok(Value::Array(
+                values.into_iter().map(Value::Float).collect(),
+                LogicalType::Float,
+                *size,
+            ))
         }
         (Value::Varchar(text), LogicalType::Array(child, size)) => {
             parse_array_value(text, child.as_ref(), Some(*size))
@@ -853,6 +864,23 @@ fn format_uuid(value: u128) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn postgres_parameter_indexes_support_reuse_and_out_of_order_references() {
+        let stmt = paro_parser::parse_one("SELECT $2, $1, $2").unwrap().stmt;
+        assert_eq!(placeholder_count(&stmt), 2);
+
+        let bound = bind_value_arguments(
+            &stmt,
+            &[Value::Integer(10), Value::Integer(20)],
+            &[Some(LogicalType::Integer), Some(LogicalType::Integer)],
+        )
+        .unwrap();
+        assert_eq!(
+            bound.to_string(),
+            "SELECT CAST(20 AS Int32), CAST(10 AS Int32), CAST(20 AS Int32)"
+        );
+    }
 
     #[test]
     fn numeric_oid_text_parameters_infer_decimal_precision_and_scale() {

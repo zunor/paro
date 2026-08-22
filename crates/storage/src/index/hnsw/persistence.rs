@@ -61,7 +61,7 @@ impl HnswIndex {
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Self {
-        Self::build_with_controls(storage, config, distance, true, None)
+        Self::build_with_controls(storage, config, distance, false, None)
             .expect("HnswIndex::build without stop-check should not fail")
     }
 
@@ -72,10 +72,13 @@ impl HnswIndex {
         use_parallel: bool,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
-        const WARM_START_POINTS: usize = 256;
+        const WARM_START_POINTS: usize = 1_024;
+        const PARALLEL_WAVE_POINTS: usize = 1_024;
 
         let num_vectors = storage.num_vectors();
-        let mut builder = GraphLayersBuilder::new(num_vectors, &config);
+        // Diverse neighbor selection is required for clustered vector sets;
+        // nearest-only truncation forms disconnected local components.
+        let mut builder = GraphLayersBuilder::new_parallel(num_vectors, &config, true);
 
         // Pre-allocate levels for all points.
         for i in 0..num_vectors {
@@ -105,21 +108,27 @@ impl HnswIndex {
             let builder_ref = &builder;
             let storage_ref = storage.as_ref();
             let cancelled = AtomicBool::new(false);
-            (warm_start_end..num_vectors).into_par_iter().for_each(|i| {
+            for wave_start in (warm_start_end..num_vectors).step_by(PARALLEL_WAVE_POINTS) {
+                let wave_end = (wave_start + PARALLEL_WAVE_POINTS).min(num_vectors);
+                (wave_start..wave_end).into_par_iter().for_each(|i| {
+                    if cancelled.load(Ordering::Acquire) {
+                        return;
+                    }
+                    if stop_check.is_some_and(|check| check.should_stop()) {
+                        cancelled.store(true, Ordering::Release);
+                        return;
+                    }
+                    builder_ref.link_new_point(
+                        i as u32,
+                        storage_ref.get_vector(i as u32),
+                        storage_ref,
+                        distance,
+                    );
+                });
                 if cancelled.load(Ordering::Acquire) {
-                    return;
+                    break;
                 }
-                if stop_check.is_some_and(|check| check.should_stop()) {
-                    cancelled.store(true, Ordering::Release);
-                    return;
-                }
-                builder_ref.link_new_point(
-                    i as u32,
-                    storage_ref.get_vector(i as u32),
-                    storage_ref,
-                    distance,
-                );
-            });
+            }
             if cancelled.load(Ordering::Acquire) {
                 return Err(error::query_canceled());
             }

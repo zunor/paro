@@ -25,14 +25,15 @@ ColumnRef {
 
 
 ---------- Input ----------
-?
+$1
 ---------- Output ---------
-?
+$1
 ---------- AST ------------
-Placeholder {
+Parameter {
     span: Some(
-        0..1,
+        0..2,
     ),
+    index: 0,
 }
 
 
@@ -6708,24 +6709,26 @@ Cast {
 
 
 ---------- Input ----------
-(?, ?)
+($1, $2)
 ---------- Output ---------
-(?, ?)
+($1, $2)
 ---------- AST ------------
 Tuple {
     span: Some(
-        0..6,
+        0..8,
     ),
     exprs: [
-        Placeholder {
+        Parameter {
             span: Some(
-                1..2,
+                1..3,
             ),
+            index: 0,
         },
-        Placeholder {
+        Parameter {
             span: Some(
-                4..5,
+                5..7,
             ),
+            index: 1,
         },
     ],
 }

@@ -467,7 +467,7 @@ mod tests {
     use paro_storage::meta::{FileMetadataStore, MetadataStore};
     use pgwire::messages::cancel::CancelRequest;
     use pgwire::messages::copy::{CopyData, CopyDone};
-    use pgwire::messages::extendedquery::{Bind, Execute, Parse, Sync};
+    use pgwire::messages::extendedquery::{Bind, Execute, Flush, Parse, Sync};
     use pgwire::messages::simplequery::Query;
     use pgwire::messages::startup::SecretKey;
     use pgwire::messages::PgWireFrontendMessage;
@@ -1059,6 +1059,7 @@ mod tests {
                 Vec::new(),
             )),
             PgWireFrontendMessage::Execute(Execute::new(Some("select_portal".to_string()), 0)),
+            PgWireFrontendMessage::Flush(Flush::new()),
         ] {
             client
                 .write_all(&encode_frontend_message(message))

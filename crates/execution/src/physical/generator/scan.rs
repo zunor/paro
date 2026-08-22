@@ -525,9 +525,12 @@ fn search_source_spec_for_candidate(
             table,
             capability_token: candidate.token.clone(),
             column_id: intent.column_id as usize,
-            query_vector: intent.query_vector.clone(),
+            query: intent.query.clone(),
             k: scan.limit,
-            params: paro_storage::index::hnsw::types::SearchParams::default(),
+            params: paro_storage::index::hnsw::types::SearchParams {
+                ef: intent.ef,
+                ..Default::default()
+            },
             predicate,
             projected_columns,
             emit_score,

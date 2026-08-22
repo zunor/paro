@@ -53,6 +53,10 @@ pub struct GraphLinks {
     data_len_bytes: usize,
     /// Start byte offset for each point in the compressed payload.
     offsets: Vec<usize>,
+    /// Decoded CSR for level 0, the only level used by the best-first search
+    /// loop. Upper levels stay compressed because they are touched sparsely.
+    level0_offsets: Vec<usize>,
+    level0_links: Vec<PointOffset>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -113,12 +117,16 @@ impl GraphLinks {
         let (offsets, links) = Self::encode_edges(edges);
         let data_len_bytes = links.len();
 
-        Self {
+        let mut result = Self {
             data: GraphLinksData::Ram(links),
             data_offset_bytes: 0,
             data_len_bytes,
             offsets,
-        }
+            level0_offsets: Vec::new(),
+            level0_links: Vec::new(),
+        };
+        result.populate_level0_cache();
+        result
     }
 
     fn encode_edges(edges: Vec<Vec<Vec<PointOffset>>>) -> (Vec<usize>, Vec<u8>) {
@@ -150,11 +158,47 @@ impl GraphLinks {
     }
 
     /// Iterate over links of a point at a specific level.
-    pub fn for_each_link<F>(&self, point_id: PointOffset, level: usize, f: F)
+    pub fn for_each_link<F>(&self, point_id: PointOffset, level: usize, mut f: F)
     where
         F: FnMut(PointOffset),
     {
+        if level == 0 && self.for_each_cached_level0_link(point_id, &mut f) {
+            return;
+        }
         self.for_each_compressed_link(point_id, level, f);
+    }
+
+    fn for_each_cached_level0_link<F>(&self, point_id: PointOffset, f: &mut F) -> bool
+    where
+        F: FnMut(PointOffset),
+    {
+        let point = point_id as usize;
+        let Some((&start, &end)) = self
+            .level0_offsets
+            .get(point)
+            .zip(self.level0_offsets.get(point + 1))
+        else {
+            return false;
+        };
+        let Some(links) = self.level0_links.get(start..end) else {
+            return false;
+        };
+        for &neighbor in links {
+            f(neighbor);
+        }
+        true
+    }
+
+    fn populate_level0_cache(&mut self) {
+        let mut offsets = Vec::with_capacity(self.offsets.len().saturating_add(1));
+        let mut links = Vec::new();
+        offsets.push(0);
+        for point_id in 0..self.offsets.len() as PointOffset {
+            self.for_each_compressed_link(point_id, 0, |neighbor| links.push(neighbor));
+            offsets.push(links.len());
+        }
+        self.level0_offsets = offsets;
+        self.level0_links = links;
     }
 
     /// Number of levels for a given point.
@@ -605,12 +649,16 @@ impl GraphLinks {
         let payload =
             serialized[layout.payload_offset..layout.payload_offset + layout.payload_len].to_vec();
 
-        Ok(Self {
+        let mut result = Self {
             data: GraphLinksData::Ram(payload),
             data_offset_bytes: 0,
             data_len_bytes: layout.payload_len,
             offsets: layout.offsets,
-        })
+            level0_offsets: Vec::new(),
+            level0_links: Vec::new(),
+        };
+        result.populate_level0_cache();
+        Ok(result)
     }
 
     /// Load graph links from a file.
@@ -626,12 +674,16 @@ impl GraphLinks {
         let bytes = &mmap[..];
         let layout = Self::parse_layout(bytes)?;
 
-        Ok(Self {
+        let mut result = Self {
             data: GraphLinksData::Mmap(mmap),
             data_offset_bytes: layout.payload_offset,
             data_len_bytes: layout.payload_len,
             offsets: layout.offsets,
-        })
+            level0_offsets: Vec::new(),
+            level0_links: Vec::new(),
+        };
+        result.populate_level0_cache();
+        Ok(result)
     }
 
     pub fn num_points(&self) -> usize {

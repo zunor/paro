@@ -12,6 +12,7 @@ use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::typed_parameters::ParameterSlot;
 
 use super::stats::TableId;
 
@@ -27,10 +28,33 @@ pub struct ProjectionSpec {
     pub include_score: bool,
 }
 
+/// Dense query vector source retained in an immutable search plan.
+///
+/// Runtime parameters keep values out of compiled plan images while carrying
+/// the fixed vector dimension required to validate each execution.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DenseVectorQuery {
+    Literal(Vec<f32>),
+    RuntimeParameter {
+        slot: ParameterSlot,
+        dimension: usize,
+    },
+}
+
+impl DenseVectorQuery {
+    pub fn dimension(&self) -> usize {
+        match self {
+            Self::Literal(values) => values.len(),
+            Self::RuntimeParameter { dimension, .. } => *dimension,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HnswIntent {
     pub column_id: ColumnId,
-    pub query_vector: Vec<f32>,
+    pub query: DenseVectorQuery,
+    pub ef: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

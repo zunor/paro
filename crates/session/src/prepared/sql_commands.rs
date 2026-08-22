@@ -143,8 +143,8 @@ async fn execute_prepare<S: ProtocolResultSink>(
 
     let entry = PreparedStatementEntry {
         name: stmt.name.name,
-        source_sql: raw_stmt.to_string(),
-        raw_stmt,
+        source_sql: raw_stmt.to_string().into(),
+        raw_stmt: Arc::new(raw_stmt),
         parameter_types,
         result_schema,
         generic_plan,
@@ -339,8 +339,8 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
     let portal = PortalEntry {
         name: stmt.name.name,
         statement_ref: PortalStatementRef::None,
-        source_sql: stmt.query.to_string(),
-        raw_stmt: (*stmt.query).clone(),
+        source_sql: stmt.query.to_string().into(),
+        raw_stmt: Arc::new((*stmt.query).clone()),
         holdability: if stmt.hold {
             CursorHoldability::WithHold
         } else {
@@ -547,7 +547,13 @@ fn select_execute_plan(
         })
         .cloned()
         .map_or_else(
-            || build_generic_plan(ctx, entry.raw_stmt.clone(), &resolved_parameter_types),
+            || {
+                build_generic_plan(
+                    ctx,
+                    entry.raw_stmt.as_ref().clone(),
+                    &resolved_parameter_types,
+                )
+            },
             Ok,
         )?;
 

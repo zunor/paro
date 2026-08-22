@@ -137,10 +137,6 @@ pub(crate) async fn send_chunk_rows(
     socket
         .write_buffer_mut()
         .unsplit(encode_chunk_rows(chunk, schema, format_codes)?.into_inner());
-    socket
-        .flush()
-        .await
-        .map_err(|e| paro_common::error::internal(e.to_string()))?;
     Ok(())
 }
 

@@ -129,16 +129,18 @@ impl HnswBuilder {
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Result<HnswIndex> {
+        // The shared budget limits concurrent index-build jobs. Intra-graph
+        // insertion stays serial because heuristic neighbor selection depends
+        // on a fully published preceding topology.
         let permit = self
             .concurrency_budget
             .as_ref()
             .and_then(|budget| budget.try_acquire());
-        let use_parallel = self.concurrency_budget.is_none() || permit.is_some();
         let result = HnswIndex::build_with_controls(
             storage,
             config,
             distance,
-            use_parallel,
+            false,
             self.stop_check.as_ref(),
         );
         drop(permit);

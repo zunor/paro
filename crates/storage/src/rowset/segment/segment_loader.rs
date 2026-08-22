@@ -129,6 +129,7 @@ impl Segment {
             meta,
             statistics,
             column_readers: RwLock::new(HashMap::new()),
+            search_projection_cache: RwLock::new(HashMap::new()),
             shared_file: Mutex::new(Some(Arc::new(file))),
             short_key_index_decoder: RwLock::new(None),
             indexes: SegmentIndexes {
@@ -197,6 +198,7 @@ impl Segment {
             footer,
             meta,
             column_readers: RwLock::new(HashMap::new()),
+            search_projection_cache: RwLock::new(HashMap::new()),
             shared_file: Mutex::new(None),
             short_key_index_decoder: RwLock::new(None),
             indexes: SegmentIndexes::default(),

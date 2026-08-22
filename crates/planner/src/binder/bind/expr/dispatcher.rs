@@ -211,7 +211,7 @@ impl<'a> ExpressionBinder<'a> {
         match expr {
             Expr::Literal { value, .. } => bind::bind_literal(value),
 
-            Expr::Placeholder { span } => self.binder.bind_protocol_parameter(span),
+            Expr::Parameter { index, .. } => self.binder.bind_protocol_parameter(index),
 
             Expr::ColumnRef { column, .. } => {
                 let error = &mut ParoError::default();

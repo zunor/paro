@@ -737,14 +737,34 @@ impl Session {
 
     pub fn refresh_session_metadata(&mut self) {
         let settings = collect_setting_rows(self);
+        let prepared_statements = self.collect_prepared_statement_metadata();
+        let cursors = self.collect_cursor_metadata();
 
-        let mut prepared_statements = self
+        self.session_metadata.replace(SessionMetadataRows {
+            settings,
+            prepared_statements,
+            cursors,
+        });
+    }
+
+    pub(crate) fn refresh_prepared_statement_metadata(&self) {
+        self.session_metadata
+            .replace_prepared_statements(self.collect_prepared_statement_metadata());
+    }
+
+    pub(crate) fn refresh_cursor_metadata(&self) {
+        self.session_metadata
+            .replace_cursors(self.collect_cursor_metadata());
+    }
+
+    fn collect_prepared_statement_metadata(&self) -> Vec<PreparedStatementSummary> {
+        let mut rows = self
             .state
             .prepared
             .statements()
             .map(|entry| PreparedStatementSummary {
                 name: entry.name.clone(),
-                statement: entry.source_sql.clone(),
+                statement: entry.source_sql.to_string(),
                 parameter_types: parameter_types_to_pg_array(&entry.parameter_types),
                 from_sql: matches!(
                     entry.source,
@@ -755,9 +775,12 @@ impl Session {
                 custom_plans: 0,
             })
             .collect::<Vec<_>>();
-        prepared_statements.sort_by(|a, b| a.name.cmp(&b.name));
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
+    }
 
-        let mut cursors = self
+    fn collect_cursor_metadata(&self) -> Vec<CursorSummary> {
+        let mut rows = self
             .state
             .prepared
             .portals()
@@ -766,7 +789,7 @@ impl Session {
                 let owner = retention.and_then(|retention| retention.owner());
                 CursorSummary {
                     name: entry.name.clone(),
-                    statement: entry.source_sql.clone(),
+                    statement: entry.source_sql.to_string(),
                     is_holdable: matches!(
                         entry.holdability,
                         crate::prepared::portal::CursorHoldability::WithHold
@@ -793,13 +816,8 @@ impl Session {
                 }
             })
             .collect::<Vec<_>>();
-        cursors.sort_by(|a, b| a.name.cmp(&b.name));
-
-        self.session_metadata.replace(SessionMetadataRows {
-            settings,
-            prepared_statements,
-            cursors,
-        });
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        rows
     }
 
     pub(crate) fn clear_protocol_unnamed_objects(&mut self) {

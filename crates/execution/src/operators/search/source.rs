@@ -1,11 +1,14 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::borrow::Cow;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use paro_function::scalar::cast::array_casts::parse_vector_literal;
 use paro_storage::index::fulltext::query_parser::{
     parse_phraseto_tsquery, parse_plainto_tsquery, parse_query, parse_to_tsquery,
     parse_websearch_to_tsquery, ParsedQuery,
@@ -13,7 +16,8 @@ use paro_storage::index::fulltext::query_parser::{
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
 use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
 use paro_storage::search::{
-    CapabilityToken, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig, SearchRequestMode,
+    CapabilityToken, DenseVectorQuery, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig,
+    SearchRequestMode,
 };
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
@@ -80,6 +84,7 @@ fn create_search_driver(
             SearchSourceSpecRef::Vector(spec) => {
                 let table = search_storage_table(&spec.table, "vector search")?;
                 record_search_table_read(ctx, &table);
+                let query_vector = resolve_dense_query(&spec.query, ctx.query.params.as_ref())?;
                 let opened = open_planned_search_cursor(
                     &spec.capability_token,
                     "vector search",
@@ -87,7 +92,7 @@ fn create_search_driver(
                         table.open_vector_search_cursor_with_token_for_view(
                             token,
                             spec.column_id,
-                            &spec.query_vector,
+                            query_vector.as_ref(),
                             spec.k,
                             spec.params,
                             spec.predicate.clone(),
@@ -222,7 +227,52 @@ fn create_search_driver(
     ))
 }
 
-fn search_storage_table(
+pub(crate) fn resolve_dense_query<'a>(
+    query: &'a DenseVectorQuery,
+    params: &crate::runtime::ParameterBindings,
+) -> Result<Cow<'a, [f32]>> {
+    let DenseVectorQuery::RuntimeParameter { slot, dimension } = query else {
+        let DenseVectorQuery::Literal(values) = query else {
+            unreachable!("dense vector query variants are exhaustive")
+        };
+        return Ok(Cow::Borrowed(values));
+    };
+
+    let value = params.value_for_slot(slot)?;
+    let values = match value {
+        Value::Varchar(text) => parse_vector_literal(text)?,
+        Value::Array(elements, _, _) | Value::List(elements, _) => elements
+            .iter()
+            .map(|element| match element {
+                Value::Float(value) => Ok(*value),
+                Value::Double(value) => Ok(*value as f32),
+                Value::TinyInt(value) => Ok(*value as f32),
+                Value::SmallInt(value) => Ok(*value as f32),
+                Value::Integer(value) => Ok(*value as f32),
+                Value::BigInt(value) => Ok(*value as f32),
+                other => Err(paro_error::type_mismatch(format!(
+                    "dense vector parameter contains {}, expected numeric values",
+                    other.logical_type()
+                ))),
+            })
+            .collect::<Result<Vec<_>>>()?,
+        other => {
+            return Err(paro_error::type_mismatch(format!(
+                "dense vector parameter must be VARCHAR or FLOAT array, got {}",
+                other.logical_type()
+            )))
+        }
+    };
+    if values.len() != *dimension {
+        return Err(paro_error::invalid_value(
+            format!("VECTOR({dimension})"),
+            format!("{} dimensions", values.len()),
+        ));
+    }
+    Ok(Cow::Owned(values))
+}
+
+pub(crate) fn search_storage_table(
     table: &Arc<paro_catalog::entry::TableCatalogEntry>,
     label: &str,
 ) -> Result<Arc<TableHandle>> {
@@ -291,7 +341,7 @@ fn parse_fulltext_query_with_tokenizer(
     }
 }
 
-fn open_planned_search_cursor<T>(
+pub(crate) fn open_planned_search_cursor<T>(
     planned_token: &CapabilityToken,
     context: &str,
     mut open_with_token: impl FnMut(&CapabilityToken) -> Result<OpenSearchCursorResult<T>>,

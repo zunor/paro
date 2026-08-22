@@ -19,6 +19,18 @@ impl SharedSessionMetadataState {
             *guard = rows;
         }
     }
+
+    pub fn replace_prepared_statements(&self, rows: Vec<PreparedStatementSummary>) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.prepared_statements = rows;
+        }
+    }
+
+    pub fn replace_cursors(&self, rows: Vec<CursorSummary>) {
+        if let Ok(mut guard) = self.inner.write() {
+            guard.cursors = rows;
+        }
+    }
 }
 
 impl SessionMetadataProvider for SharedSessionMetadataState {

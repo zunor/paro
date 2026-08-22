@@ -116,7 +116,7 @@ impl TabletColumn {
             scale: 0,
             aggregation_type: None,
             index_hnsw: false,
-            hnsw_m: 16,
+            hnsw_m: 24,
             hnsw_ef_construct: 100,
             hnsw_distance: 0,
         }

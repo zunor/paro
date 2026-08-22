@@ -3,6 +3,7 @@
 
 use std::any::Any;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 use paro_common::error::{self as paro_error, ParoError};
 use paro_session::{
@@ -26,8 +27,8 @@ async fn test_reset_session_state_preserves_active_statement_scope() {
         .state
         .add_prepared_statement(PreparedStatementEntry {
             name: "stmt1".to_string(),
-            source_sql: "SELECT 1".to_string(),
-            raw_stmt: parse_single("SELECT 1"),
+            source_sql: Arc::from("SELECT 1"),
+            raw_stmt: Arc::new(parse_single("SELECT 1")),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
             generic_plan: None,

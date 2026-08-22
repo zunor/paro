@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
-use crate::codec::{cell_decoder::decode_cell_into_vector, physical_layout};
+use crate::codec::{cell_decoder::decode_cell_into_vector, physical_layout, vector_decoder};
 use crate::metrics::{storage_metrics, SearchRowFetchMetricKey};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
@@ -602,6 +602,16 @@ pub(crate) fn materialize_candidate_batch(
 ) -> Result<Chunk> {
     let row_count = batch.rows.len();
     let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+    if let Some(chunk) = try_materialize_single_segment_batch(
+        column_types,
+        snapshot,
+        &batch,
+        projected_columns,
+        emit_score,
+        allocator.clone(),
+    )? {
+        return Ok(chunk);
+    }
     let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
     let projected_batch = SearchRowFetcher::new(snapshot, column_types).fetch_batch(
         &batch.rows,
@@ -641,6 +651,111 @@ pub(crate) fn materialize_candidate_batch(
     }
 
     Ok(Chunk::from_vectors(output_vectors, allocator))
+}
+
+fn try_materialize_single_segment_batch(
+    column_types: &[LogicalType],
+    snapshot: &SearchReadSnapshot,
+    batch: &CandidateBatch,
+    projected_columns: &[usize],
+    emit_score: bool,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Option<Chunk>> {
+    let Some(first_row) = batch.rows.first().copied() else {
+        return Ok(None);
+    };
+    if batch
+        .rows
+        .iter()
+        .any(|row| row.segment_key() != first_row.segment_key())
+    {
+        return Ok(None);
+    }
+
+    let segment = snapshot.table_lease.resolve_segment(first_row)?;
+    let column_ids = projected_columns
+        .iter()
+        .map(|&column_idx| {
+            column_types
+                .get(column_idx)
+                .ok_or_else(|| paro_error::internal("Invalid projected column index"))?;
+            u32::try_from(column_idx)
+                .map_err(|_| paro_error::out_of_range("projected column index exceeds u32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let row_offsets = batch
+        .rows
+        .iter()
+        .map(|row| row.row_offset.get())
+        .collect::<Vec<_>>();
+    let cached_columns = projected_columns
+        .iter()
+        .map(|&column_idx| {
+            segment.cached_search_projection(column_idx as u32, &column_types[column_idx])
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if cached_columns.iter().all(Option::is_some) {
+        let mut output_vectors =
+            Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
+        for cached in cached_columns.into_iter().flatten() {
+            let mut output = Vector::try_new(
+                cached.logical_type().clone(),
+                batch.rows.len(),
+                allocator.clone(),
+            )?;
+            for (output_row, &row_offset) in row_offsets.iter().enumerate() {
+                output.try_copy_at(output_row, cached.as_ref(), row_offset as usize)?;
+            }
+            output.set_count(batch.rows.len());
+            output_vectors.push(output);
+        }
+        append_score_vector(batch, emit_score, allocator.clone(), &mut output_vectors)?;
+        return Ok(Some(Chunk::from_vectors(output_vectors, allocator)));
+    }
+
+    let encoded = segment.read_by_rowids(&column_ids, &row_offsets)?;
+    let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
+    for (&column_idx, (column_id, column_batch)) in projected_columns.iter().zip(encoded) {
+        if column_id != column_idx as u32 {
+            return Err(paro_error::internal(
+                "single-segment row fetch returned columns out of order",
+            ));
+        }
+        output_vectors.push(vector_decoder::decode_column_batch(
+            &column_types[column_idx],
+            &column_batch,
+            batch.rows.len(),
+            allocator.clone(),
+            None,
+        )?);
+    }
+
+    append_score_vector(batch, emit_score, allocator.clone(), &mut output_vectors)?;
+
+    Ok(Some(Chunk::from_vectors(output_vectors, allocator)))
+}
+
+fn append_score_vector(
+    batch: &CandidateBatch,
+    emit_score: bool,
+    allocator: Arc<dyn Allocator>,
+    output_vectors: &mut Vec<Vector>,
+) -> Result<()> {
+    if !emit_score {
+        return Ok(());
+    }
+    if !batch.scores.is_empty() && batch.scores.len() != batch.rows.len() {
+        return Err(paro_error::internal(
+            "Score vector length mismatch during search materialization",
+        ));
+    }
+    let scores = if batch.scores.is_empty() {
+        vec![0.0_f32; batch.rows.len()]
+    } else {
+        batch.scores.clone()
+    };
+    output_vectors.push(Vector::try_from_f32(&scores, allocator)?);
+    Ok(())
 }
 
 #[cfg(test)]

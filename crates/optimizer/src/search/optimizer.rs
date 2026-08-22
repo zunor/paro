@@ -14,7 +14,7 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::search::{
-    FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
+    DenseVectorQuery, FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
     SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,
     SequentialCapability, SparseIntent,
 };
@@ -95,7 +95,9 @@ impl SearchOptimizer {
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
         let sequential = build_sequential_capability(table_id, filtered.expected);
 
-        if let Some(intent) = extract_vector_intent(pattern.order_expr, pattern.get)? {
+        if let Some(intent) =
+            extract_vector_intent(pattern.order_expr, pattern.get, topn.hnsw_ef_hint)?
+        {
             let search_intent = SearchIntent::Hnsw(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
@@ -526,7 +528,11 @@ fn find_filters_and_get_plan(mut plan: &LogicalPlan) -> Option<(Vec<Expression>,
     }
 }
 
-fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswIntent>> {
+fn extract_vector_intent(
+    expr: &Expression,
+    get: &Get,
+    ef: Option<usize>,
+) -> Result<Option<HnswIntent>> {
     let expr = strip_casts(expr);
     let func = match expr {
         Expression::Function(function) => function,
@@ -551,7 +557,8 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
-                    query_vector,
+                    query: query_vector,
+                    ef,
                 }),
             );
         }
@@ -561,7 +568,8 @@ fn extract_vector_intent(expr: &Expression, get: &Get) -> Result<Option<HnswInte
             return Ok(
                 resolve_vector_column(get, column_idx).map(|column_id| HnswIntent {
                     column_id,
-                    query_vector,
+                    query: query_vector,
+                    ef,
                 }),
             );
         }
@@ -582,9 +590,11 @@ fn resolve_vector_column(get: &Get, column_idx: usize) -> Option<u32> {
     Some(get.stored_column(column_idx)? as u32)
 }
 
-fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
+fn extract_query_vector(expr: &Expression) -> Result<Option<DenseVectorQuery>> {
     match expr {
-        Expression::Constant(constant) => value_to_vec(&constant.value),
+        Expression::Constant(constant) => {
+            Ok(value_to_vec(&constant.value)?.map(DenseVectorQuery::Literal))
+        }
         Expression::Operator(operator)
             if matches!(operator.operator_type, OperatorType::ArrayConstructor) =>
         {
@@ -598,16 +608,39 @@ fn extract_query_vector(expr: &Expression) -> Result<Option<Vec<f32>>> {
                 };
                 values.push(value);
             }
-            Ok(Some(values))
+            Ok(Some(DenseVectorQuery::Literal(values)))
         }
         Expression::Cast(cast) => {
+            if let Expression::Parameter(parameter) = cast.child.as_ref() {
+                if let LogicalType::Array(child, dimension) = &cast.target_type {
+                    if matches!(child.as_ref(), LogicalType::Float) {
+                        return Ok(Some(DenseVectorQuery::RuntimeParameter {
+                            slot: parameter.slot.clone(),
+                            dimension: *dimension,
+                        }));
+                    }
+                }
+            }
             if let Expression::Constant(constant) = cast.child.as_ref() {
                 if let Value::Varchar(value) = &constant.value {
-                    return Ok(Some(parse_vector_literal(value)?));
+                    return Ok(Some(DenseVectorQuery::Literal(parse_vector_literal(
+                        value,
+                    )?)));
                 }
             }
             extract_query_vector(cast.child.as_ref())
         }
+        Expression::Parameter(parameter) => match &parameter.slot.ty {
+            LogicalType::Array(child, dimension)
+                if matches!(child.as_ref(), LogicalType::Float) =>
+            {
+                Ok(Some(DenseVectorQuery::RuntimeParameter {
+                    slot: parameter.slot.clone(),
+                    dimension: *dimension,
+                }))
+            }
+            _ => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -1043,7 +1076,8 @@ mod tests {
             SearchCandidate {
                 intent: SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
-                    query_vector: vec![1.0, 2.0],
+                    query: DenseVectorQuery::Literal(vec![1.0, 2.0]),
+                    ef: None,
                 }),
                 token: paro_storage::search::CapabilityToken {
                     definition_id: 1,

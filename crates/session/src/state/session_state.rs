@@ -161,6 +161,10 @@ impl SessionState {
         self.prepared.remove_portal(name)
     }
 
+    pub fn restore_portal(&mut self, entry: PortalEntry) {
+        self.prepared.restore_portal(entry);
+    }
+
     pub fn clear_portals(&mut self) {
         self.prepared.clear_portals();
     }
@@ -179,6 +183,10 @@ impl SessionState {
 
     pub fn remove_unnamed_portal(&mut self) -> Option<PortalEntry> {
         self.prepared.remove_unnamed_portal()
+    }
+
+    pub fn restore_unnamed_portal(&mut self, entry: PortalEntry) {
+        self.prepared.restore_unnamed_portal(entry);
     }
 
     pub fn clear_protocol_unnamed_objects(&mut self) -> bool {
@@ -286,8 +294,8 @@ mod tests {
     fn make_prepared_entry(name: &str, sql: &str) -> PreparedStatementEntry {
         PreparedStatementEntry {
             name: name.to_string(),
-            source_sql: sql.to_string(),
-            raw_stmt: parse_single(sql),
+            source_sql: Arc::from(sql),
+            raw_stmt: Arc::new(parse_single(sql)),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
             generic_plan: None,
@@ -300,8 +308,8 @@ mod tests {
         PortalEntry {
             name: name.to_string(),
             statement_ref: crate::prepared::store::PortalStatementRef::None,
-            source_sql: "SELECT 1".to_string(),
-            raw_stmt: parse_single("SELECT 1"),
+            source_sql: Arc::from("SELECT 1"),
+            raw_stmt: Arc::new(parse_single("SELECT 1")),
             holdability: CursorHoldability::WithoutHold,
             scroll_mode: ScrollMode::NoScroll,
             result_formats: vec![FormatCode::Text],

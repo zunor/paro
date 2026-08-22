@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::completion::StatementCompletion;
 use crate::dispatch::UtilityCommand;
@@ -38,8 +39,8 @@ pub struct PortalStoreMark {
 #[derive(Debug, Clone)]
 pub struct PreparedStatementEntry {
     pub name: String,
-    pub source_sql: String,
-    pub raw_stmt: Statement,
+    pub source_sql: Arc<str>,
+    pub raw_stmt: Arc<Statement>,
     pub parameter_types: Vec<Option<LogicalType>>,
     pub result_schema: Vec<ResultColumnDesc>,
     pub generic_plan: Option<CompiledStatement>,
@@ -63,8 +64,8 @@ pub enum PortalKind {
 pub struct PortalEntry {
     pub name: String,
     pub statement_ref: PortalStatementRef,
-    pub source_sql: String,
-    pub raw_stmt: Statement,
+    pub source_sql: Arc<str>,
+    pub raw_stmt: Arc<Statement>,
     pub holdability: CursorHoldability,
     pub scroll_mode: ScrollMode,
     pub result_formats: Vec<FormatCode>,
@@ -176,6 +177,10 @@ impl PreparedState {
         self.named_portals.remove(name)
     }
 
+    pub fn restore_portal(&mut self, entry: PortalEntry) {
+        self.named_portals.insert(entry.name.clone(), entry);
+    }
+
     pub fn clear_portals(&mut self) {
         self.named_portals.clear();
         self.unnamed_portal = None;
@@ -198,6 +203,10 @@ impl PreparedState {
 
     pub fn remove_unnamed_portal(&mut self) -> Option<PortalEntry> {
         self.unnamed_portal.take()
+    }
+
+    pub fn restore_unnamed_portal(&mut self, entry: PortalEntry) {
+        self.unnamed_portal = Some(entry);
     }
 
     pub fn portals(&self) -> impl Iterator<Item = &PortalEntry> {
@@ -298,8 +307,8 @@ mod tests {
     fn make_statement(name: &str) -> PreparedStatementEntry {
         PreparedStatementEntry {
             name: name.to_string(),
-            source_sql: "SELECT 1".to_string(),
-            raw_stmt: parse_single("SELECT 1"),
+            source_sql: Arc::from("SELECT 1"),
+            raw_stmt: Arc::new(parse_single("SELECT 1")),
             parameter_types: Vec::new(),
             result_schema: Vec::new(),
             generic_plan: None,
@@ -316,8 +325,8 @@ mod tests {
         PortalEntry {
             name: name.to_string(),
             statement_ref: PortalStatementRef::None,
-            source_sql: "SELECT 1".to_string(),
-            raw_stmt: parse_single("SELECT 1"),
+            source_sql: Arc::from("SELECT 1"),
+            raw_stmt: Arc::new(parse_single("SELECT 1")),
             holdability,
             scroll_mode: ScrollMode::Scroll,
             result_formats: vec![FormatCode::Text],
@@ -343,7 +352,7 @@ mod tests {
             .set_unnamed_statement(make_statement("s2"))
             .expect("previous unnamed statement should be returned");
 
-        assert_eq!(replaced.source_sql, "SELECT 1");
+        assert_eq!(replaced.source_sql.as_ref(), "SELECT 1");
         assert!(state.unnamed_statement().is_some());
         assert_eq!(state.unnamed_statement().unwrap().name, "");
         assert!(state.statements().next().is_none());

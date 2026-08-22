@@ -449,8 +449,8 @@ pub struct HnswInlineThreshold {
 
 impl HnswInlineThreshold {
     pub const DEFAULT: Self = Self {
-        max_vector_count: 4_096,
-        max_graph_memory_bytes: 64 * 1024 * 1024,
+        max_vector_count: 1_000_000,
+        max_graph_memory_bytes: 256 * 1024 * 1024,
         max_dimension: 1_536,
     };
 
@@ -546,6 +546,21 @@ impl HnswInlineBuildEstimate {
             self.dimension,
         )
     }
+
+    /// Largest safe segment envelope for this vector shape.
+    ///
+    /// HNSW query quality and latency depend on graph locality, so the writer
+    /// should not inherit the executor's 4K chunk size as a graph boundary.
+    /// Derive a segment limit from both the configured vector-count ceiling
+    /// and the graph-memory ceiling instead.
+    pub fn max_segment_vector_count(self) -> u64 {
+        let bytes_per_vector = self
+            .estimated_graph_memory_bytes
+            .saturating_add(self.vector_count.saturating_sub(1))
+            / self.vector_count.max(1);
+        let memory_bound = self.threshold.max_graph_memory_bytes / bytes_per_vector.max(1);
+        self.threshold.max_vector_count.min(memory_bound).max(1)
+    }
 }
 
 pub type SidecarArtifactFileId = ArtifactFileId;
@@ -615,10 +630,10 @@ mod tests {
     #[test]
     fn hnsw_inline_threshold_uses_all_three_dimensions() {
         let threshold = HnswInlineThreshold::DEFAULT;
-        assert!(threshold.allows(4_096, 64 * 1024 * 1024, 1_536));
-        assert!(!threshold.allows(4_097, 64 * 1024 * 1024, 1_536));
-        assert!(!threshold.allows(4_096, 64 * 1024 * 1024 + 1, 1_536));
-        assert!(!threshold.allows(4_096, 64 * 1024 * 1024, 1_537));
+        assert!(threshold.allows(1_000_000, 256 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(1_000_001, 256 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(1_000_000, 256 * 1024 * 1024 + 1, 1_536));
+        assert!(!threshold.allows(1_000_000, 256 * 1024 * 1024, 1_537));
     }
 
     #[test]
@@ -663,6 +678,7 @@ mod tests {
             ..estimate
         };
         assert!(roomy.allows_inline());
+        assert_eq!(roomy.max_segment_vector_count(), 16);
     }
 
     #[test]

@@ -352,7 +352,7 @@ fn split_hnsw_segment_admissions<'a>(
     for mut admitted_sink in admitted {
         if admitted_sink.entry.definition.kind == SearchIndexKind::Hnsw {
             if let Some(estimate) = admitted_sink.hnsw_inline {
-                let limit = u64::from(estimate.threshold.max_vector_count.max(1));
+                let limit = estimate.max_segment_vector_count();
                 hnsw_inline_row_limit = Some(
                     hnsw_inline_row_limit
                         .map(|existing| existing.min(limit))

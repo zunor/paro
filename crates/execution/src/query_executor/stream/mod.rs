@@ -23,6 +23,7 @@ use crate::runtime::{CleanupReason, QueryOutputPort, QueryRuntimeContext};
 
 enum ResultOutput {
     Closed,
+    Direct(Option<Chunk>),
     Completed(QueryOutputPort),
     FetchDriven {
         query: QueryRuntimeContext,
@@ -70,6 +71,25 @@ impl std::fmt::Debug for ResultHandler {
 }
 
 impl ResultHandler {
+    pub fn from_direct_chunk(
+        names: Vec<String>,
+        types: Vec<LogicalType>,
+        chunk: Chunk,
+        allocator: Arc<dyn Allocator>,
+        cancellation: StatementCancellation,
+    ) -> Result<Self> {
+        Ok(Self {
+            names,
+            output_chunk: Self::new_output_chunk(&types, allocator.clone())?,
+            types,
+            allocator,
+            output: ResultOutput::Direct(Some(chunk)),
+            cancellation,
+            query_memory_pool: None,
+            closed: false,
+        })
+    }
+
     /// Create an empty ResultHandler (for DDL/DML that return no rows).
     pub fn empty(allocator: Arc<dyn Allocator>) -> Result<Self> {
         Ok(Self {
@@ -141,6 +161,7 @@ impl ResultHandler {
         }
 
         match &self.output {
+            ResultOutput::Direct(_) => self.fetch_direct_output(),
             ResultOutput::Completed(_) => self.fetch_completed_output(),
             ResultOutput::FetchDriven { .. } => self.fetch_typed_streaming_output(),
             ResultOutput::Background { .. } => self.fetch_background_output(),
@@ -151,6 +172,28 @@ impl ResultHandler {
                 ))
             }
         }
+    }
+
+    fn fetch_direct_output(&mut self) -> Result<Option<&Chunk>> {
+        if self.cancellation.is_cancelled() {
+            self.mark_closed();
+            self.cancellation.check()?;
+            return Ok(None);
+        }
+        let next = match &mut self.output {
+            ResultOutput::Direct(chunk) => chunk.take(),
+            _ => {
+                return Err(paro_common::error::internal(
+                    "direct output path selected without a direct chunk",
+                ))
+            }
+        };
+        if let Some(chunk) = next {
+            self.output_chunk = chunk;
+            return Ok(Some(&self.output_chunk));
+        }
+        self.mark_closed();
+        Ok(None)
     }
 
     /// Check if the handler is still open.

@@ -143,13 +143,13 @@ mod tests {
 
     #[test]
     fn statement_visitor_walks_exprs_without_mutating_statement() {
-        let stmt = crate::parse_one("SELECT ?, ?, x FROM t").unwrap().stmt;
+        let stmt = crate::parse_one("SELECT $1, $2, x FROM t").unwrap().stmt;
         let mut placeholders = 0usize;
         let mut identifiers = 0usize;
 
         let mut visitor = StatementVisitor::new(
             |expr| {
-                if matches!(expr, Expr::Placeholder { .. }) {
+                if matches!(expr, Expr::Parameter { .. }) {
                     placeholders += 1;
                 }
             },
@@ -161,6 +161,6 @@ mod tests {
 
         assert_eq!(placeholders, 2);
         assert!(identifiers >= 2);
-        assert_eq!(stmt.to_string(), "SELECT ?, ?, x FROM t");
+        assert_eq!(stmt.to_string(), "SELECT $1, $2, x FROM t");
     }
 }

@@ -9,7 +9,7 @@ const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
 pub fn is_binary_recv_supported(ty: &LogicalType) -> bool {
-    matches!(
+    if matches!(
         ty,
         LogicalType::Boolean
             | LogicalType::TinyInt
@@ -28,7 +28,16 @@ pub fn is_binary_recv_supported(ty: &LogicalType) -> bool {
             | LogicalType::Date
             | LogicalType::Timestamp
             | LogicalType::TimestampTz
-    )
+    ) {
+        return true;
+    }
+
+    match ty {
+        LogicalType::List(child) | LogicalType::Array(child, _) => {
+            is_binary_array_element_recv_supported(child)
+        }
+        _ => false,
+    }
 }
 
 pub fn is_binary_send_supported(ty: &LogicalType) -> bool {
@@ -149,6 +158,14 @@ pub fn decode_binary_param(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
             let pg_micros = i64::from_be_bytes(bytes.try_into().expect("checked length"));
             Ok(Value::TimestampTz(decode_pg_timestamp(pg_micros)?))
         }
+        LogicalType::List(child) => {
+            let values = decode_binary_array(bytes, child, None)?;
+            Ok(Value::List(values, child.as_ref().clone()))
+        }
+        LogicalType::Array(child, size) => {
+            let values = decode_binary_array(bytes, child, Some(*size))?;
+            Ok(Value::Array(values, child.as_ref().clone(), *size))
+        }
         _ => Err(paro_error::not_implemented(format!(
             "binary parameter format not supported for type {ty}",
         ))),
@@ -244,6 +261,144 @@ fn require_len(bytes: &[u8], expected: usize, ty: &LogicalType) -> Result<()> {
     Ok(())
 }
 
+fn is_binary_array_element_recv_supported(ty: &LogicalType) -> bool {
+    matches!(
+        ty,
+        LogicalType::Boolean
+            | LogicalType::TinyInt
+            | LogicalType::UTinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::USmallInt
+            | LogicalType::BigInt
+            | LogicalType::UInteger
+            | LogicalType::Float
+            | LogicalType::Double
+            | LogicalType::Varchar
+            | LogicalType::Json
+            | LogicalType::Blob
+            | LogicalType::Uuid
+            | LogicalType::Date
+            | LogicalType::Timestamp
+            | LogicalType::TimestampTz
+    )
+}
+
+fn decode_binary_array(
+    bytes: &[u8],
+    child_type: &LogicalType,
+    fixed_size: Option<usize>,
+) -> Result<Vec<Value>> {
+    let mut input = BinaryInput::new(bytes);
+    let dimensions = input.read_i32("array dimension count")?;
+    let _has_null = input.read_i32("array null flag")?;
+    let element_oid = input.read_u32("array element OID")?;
+    let expected_oid = child_type.pg_descriptor().oid;
+    if element_oid != expected_oid {
+        return Err(paro_error::protocol_violation(format!(
+            "binary array element OID {element_oid} does not match {child_type} OID {expected_oid}",
+        )));
+    }
+
+    let length = match dimensions {
+        0 => 0,
+        1 => {
+            let length = input.read_i32("array length")?;
+            let _lower_bound = input.read_i32("array lower bound")?;
+            usize::try_from(length).map_err(|_| {
+                paro_error::protocol_violation(format!("invalid binary array length {length}"))
+            })?
+        }
+        other => {
+            return Err(paro_error::not_implemented(format!(
+                "binary arrays with {other} dimensions are not supported",
+            )))
+        }
+    };
+    if let Some(expected) = fixed_size {
+        if length != expected {
+            return Err(paro_error::invalid_value(
+                format!("ARRAY({expected})"),
+                format!("binary array with {length} elements"),
+            ));
+        }
+    }
+
+    let mut values = Vec::with_capacity(length);
+    for _ in 0..length {
+        let element_len = input.read_i32("array element length")?;
+        if element_len == -1 {
+            values.push(Value::Null(child_type.clone()));
+            continue;
+        }
+        let element_len = usize::try_from(element_len).map_err(|_| {
+            paro_error::protocol_violation(format!(
+                "invalid binary array element length {element_len}",
+            ))
+        })?;
+        values.push(decode_binary_param(
+            input.read_bytes(element_len, "array element")?,
+            child_type,
+        )?);
+    }
+    if !input.is_empty() {
+        return Err(paro_error::protocol_violation(format!(
+            "binary array has {} trailing bytes",
+            input.remaining(),
+        )));
+    }
+    Ok(values)
+}
+
+struct BinaryInput<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> BinaryInput<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn read_i32(&mut self, field: &str) -> Result<i32> {
+        Ok(i32::from_be_bytes(
+            self.read_bytes(4, field)?
+                .try_into()
+                .expect("checked length"),
+        ))
+    }
+
+    fn read_u32(&mut self, field: &str) -> Result<u32> {
+        Ok(u32::from_be_bytes(
+            self.read_bytes(4, field)?
+                .try_into()
+                .expect("checked length"),
+        ))
+    }
+
+    fn read_bytes(&mut self, length: usize, field: &str) -> Result<&'a [u8]> {
+        let end = self.offset.checked_add(length).ok_or_else(|| {
+            paro_error::protocol_violation(format!("binary {field} length overflow"))
+        })?;
+        let value = self.bytes.get(self.offset..end).ok_or_else(|| {
+            paro_error::protocol_violation(format!(
+                "binary {field} is truncated at byte {}",
+                self.offset,
+            ))
+        })?;
+        self.offset = end;
+        Ok(value)
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len() - self.offset
+    }
+
+    fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+}
+
 fn decode_pg_timestamp(pg_micros: i64) -> Result<i64> {
     if matches!(pg_micros, i64::MAX | i64::MIN) {
         return Ok(pg_micros);
@@ -289,6 +444,47 @@ mod tests {
         assert_eq!(
             encode_binary_value(&Value::UInteger(9), &LogicalType::UInteger).unwrap(),
             i64::from(9_u32).to_be_bytes().to_vec()
+        );
+    }
+
+    #[test]
+    fn binary_float_array_decodes_postgres_wire_format() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&LogicalType::Float.pg_descriptor().oid.to_be_bytes());
+        bytes.extend_from_slice(&3_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in [1.25_f32, -2.5, 3.75] {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        assert_eq!(
+            decode_binary_param(&bytes, &LogicalType::List(Box::new(LogicalType::Float))).unwrap(),
+            Value::List(
+                vec![Value::Float(1.25), Value::Float(-2.5), Value::Float(3.75)],
+                LogicalType::Float,
+            )
+        );
+    }
+
+    #[test]
+    fn binary_fixed_array_rejects_dimension_mismatch() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&LogicalType::Float.pg_descriptor().oid.to_be_bytes());
+        bytes.extend_from_slice(&2_i32.to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in [1.0_f32, 2.0] {
+            bytes.extend_from_slice(&4_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+
+        assert!(
+            decode_binary_param(&bytes, &LogicalType::Array(Box::new(LogicalType::Float), 3),)
+                .is_err()
         );
     }
 }

@@ -301,6 +301,13 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
             push_search_token_properties(&mut properties, &spec.capability_token);
             push_string_property(&mut properties, "Column", spec.column_id.to_string());
             push_string_property(&mut properties, "Limit", spec.k.to_string());
+            push_string_property(
+                &mut properties,
+                "Search Ef",
+                spec.params
+                    .ef
+                    .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+            );
         }
         PhysicalNodeKind::SparseVectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);

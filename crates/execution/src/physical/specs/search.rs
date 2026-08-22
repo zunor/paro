@@ -10,7 +10,7 @@ use paro_storage::index::hnsw::types::SearchParams;
 use paro_storage::index::PredicateTree;
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::{
-    CapabilityToken, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
+    CapabilityToken, DenseVectorQuery, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
     NormalizedSearchRequest, SearchRequestMode,
 };
 
@@ -19,7 +19,7 @@ pub struct VectorSearchSpec {
     pub table: Arc<TableCatalogEntry>,
     pub capability_token: CapabilityToken,
     pub column_id: usize,
-    pub query_vector: Vec<f32>,
+    pub query: DenseVectorQuery,
     pub k: usize,
     pub params: SearchParams,
     pub predicate: Option<PredicateTree>,

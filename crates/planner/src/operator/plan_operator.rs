@@ -1018,8 +1018,8 @@ mod tests {
     use paro_function::window::WindowFunction;
     use paro_parser::ast::CopySource;
     use paro_storage::search::{
-        HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind, SearchIntent,
-        SearchRequestMode,
+        DenseVectorQuery, HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIndexKind,
+        SearchIntent, SearchRequestMode,
     };
     use paro_storage::table::table_factory::TableFactory;
     use paro_storage::table::table_handle::TableHandle;
@@ -1613,7 +1613,8 @@ mod tests {
                 },
                 intents: vec![SearchIntent::Hnsw(HnswIntent {
                     column_id: 1,
-                    query_vector: vec![0.1, 0.2],
+                    query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                    ef: None,
                 })],
                 fusion: None,
             },
@@ -1621,7 +1622,8 @@ mod tests {
                 candidate: SearchCandidate {
                     intent: SearchIntent::Hnsw(HnswIntent {
                         column_id: 1,
-                        query_vector: vec![0.1, 0.2],
+                        query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
+                        ef: None,
                     }),
                     token: paro_storage::search::CapabilityToken {
                         definition_id: 1,

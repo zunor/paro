@@ -58,7 +58,7 @@ impl<'a> PgWireExtendedQueryResponder<'a> {
 impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
     async fn send_parse_complete(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
+            .feed(PgWireBackendMessage::ParseComplete(ParseComplete::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
@@ -66,7 +66,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_bind_complete(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::BindComplete(BindComplete::new()))
+            .feed(PgWireBackendMessage::BindComplete(BindComplete::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
@@ -81,7 +81,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
             .map(|ty| ty.as_ref().map(|ty| ty.pg_descriptor().oid).unwrap_or(0))
             .collect::<Vec<_>>();
         self.socket
-            .send(PgWireBackendMessage::ParameterDescription(
+            .feed(PgWireBackendMessage::ParameterDescription(
                 ParameterDescription::new(type_oids),
             ))
             .await
@@ -111,7 +111,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
             .collect::<Vec<_>>();
 
         self.socket
-            .send(PgWireBackendMessage::RowDescription(RowDescription::new(
+            .feed(PgWireBackendMessage::RowDescription(RowDescription::new(
                 fields,
             )))
             .await
@@ -130,7 +130,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_command_complete(&mut self, completion: &StatementCompletion) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::CommandComplete(
+            .feed(PgWireBackendMessage::CommandComplete(
                 pgwire::messages::response::CommandComplete::new(completion.to_command_complete()),
             ))
             .await
@@ -140,7 +140,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_close_complete(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
+            .feed(PgWireBackendMessage::CloseComplete(CloseComplete::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
@@ -148,7 +148,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_no_data(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::NoData(NoData::new()))
+            .feed(PgWireBackendMessage::NoData(NoData::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
@@ -156,7 +156,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_empty_query_response(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::EmptyQueryResponse(
+            .feed(PgWireBackendMessage::EmptyQueryResponse(
                 EmptyQueryResponse::new(),
             ))
             .await
@@ -166,7 +166,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_portal_suspended(&mut self) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
+            .feed(PgWireBackendMessage::PortalSuspended(PortalSuspended::new()))
             .await
             .map_err(|e| paro_common::error::internal(e.to_string()))?;
         Ok(())
@@ -174,7 +174,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_error(&mut self, err: &ParoError) -> Result<()> {
         self.socket
-            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
+            .feed(PgWireBackendMessage::ErrorResponse(build_error_response(
                 err,
             )))
             .await

@@ -25,6 +25,7 @@ use crate::tablet::{ColumnId, TabletSchemaRef};
 use arc_swap::ArcSwapOption;
 use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::vector::Vector;
 use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
@@ -164,6 +165,8 @@ pub struct Segment {
     pub(super) meta: SegmentMeta,
     pub(super) statistics: Option<SegmentStatistics>,
     pub(super) column_readers: RwLock<HashMap<ColumnId, Arc<SharedColumnReader<PositionedFile>>>>,
+    /// Bounded decoded columns used as covering payload for repeated search Top-K output.
+    pub(super) search_projection_cache: RwLock<HashMap<ColumnId, Arc<Vector>>>,
     /// One immutable file handle per loaded segment. Column iterators own only
     /// a logical cursor and use positioned reads, so independent scan morsels
     /// neither reopen the file nor share a mutable OS seek position.
@@ -262,6 +265,70 @@ impl std::fmt::Debug for Segment {
 }
 
 impl Segment {
+    const SEARCH_PROJECTION_CACHE_COLUMN_BYTES: usize = 8 * 1024 * 1024;
+    const SEARCH_PROJECTION_CACHE_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+
+    pub(crate) fn cached_search_projection(
+        &self,
+        column_id: ColumnId,
+        logical_type: &paro_common::types::LogicalType,
+    ) -> Result<Option<Arc<Vector>>> {
+        let Some(row_width) = fixed_row_width(logical_type).ok() else {
+            return Ok(None);
+        };
+        let row_count = usize::try_from(self.meta.num_rows)
+            .map_err(|_| paro_error::out_of_range("segment row count exceeds usize"))?;
+        if row_count.saturating_mul(row_width) > Self::SEARCH_PROJECTION_CACHE_COLUMN_BYTES {
+            return Ok(None);
+        }
+        if let Some(vector) = self
+            .search_projection_cache
+            .read()
+            .unwrap()
+            .get(&column_id)
+            .cloned()
+        {
+            return Ok(Some(vector));
+        }
+
+        let mut iterator = self.new_column_iterator(column_id)?;
+        let (decoded_rows, batch) = iterator.next_batch(row_count)?;
+        if decoded_rows != row_count {
+            return Err(paro_error::data_corrupted(format!(
+                "search projection cache read {} rows, expected {}",
+                decoded_rows, row_count
+            )));
+        }
+        let allocator: Arc<dyn paro_common::allocator::Allocator> =
+            Arc::new(paro_common::allocator::default_allocator());
+        let vector = Arc::new(crate::codec::vector_decoder::decode_column_batch(
+            logical_type,
+            &batch,
+            row_count,
+            allocator,
+            None,
+        )?);
+        let mut cache = self.search_projection_cache.write().unwrap();
+        if let Some(existing) = cache.get(&column_id) {
+            return Ok(Some(Arc::clone(existing)));
+        }
+        let cached_bytes = cache
+            .values()
+            .map(|cached| {
+                fixed_row_width(cached.logical_type())
+                    .unwrap_or(0)
+                    .saturating_mul(cached.len())
+            })
+            .sum::<usize>();
+        if cached_bytes.saturating_add(row_count.saturating_mul(row_width))
+            > Self::SEARCH_PROJECTION_CACHE_TOTAL_BYTES
+        {
+            return Ok(None);
+        }
+        cache.insert(column_id, Arc::clone(&vector));
+        Ok(Some(vector))
+    }
+
     fn shared_file_reader(&self) -> Result<PositionedFile> {
         let mut shared = self.shared_file.lock().map_err(|_| {
             paro_error::internal(format!(

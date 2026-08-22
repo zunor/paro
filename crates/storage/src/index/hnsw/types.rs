@@ -146,6 +146,10 @@ pub struct HnswConfig {
     /// Default ef for search (can be overridden per query).
     pub ef: usize,
     /// Maximum segment size below which an unfiltered plain scan is preferred.
+    ///
+    /// Unfiltered Top-K defaults to graph search even for small physical
+    /// segments. Applying this threshold independently to every segment turns
+    /// a segmented table into an accidental full-table scan.
     pub plain_scan_threshold: usize,
     /// Maximum filtered candidate count below which a filtered plain scan is preferred.
     pub filtered_plain_scan_threshold: usize,
@@ -157,11 +161,11 @@ pub struct HnswConfig {
 impl Default for HnswConfig {
     fn default() -> Self {
         HnswConfig {
-            m: 16,
-            m0: 32, // 2 * m
+            m: 24,
+            m0: 48, // 2 * m
             ef_construct: 100,
             ef: 100,
-            plain_scan_threshold: 10_000,
+            plain_scan_threshold: 0,
             filtered_plain_scan_threshold: 0,
             build_random_entry_point: false,
         }
@@ -176,7 +180,7 @@ impl HnswConfig {
             m0: m * 2,
             ef_construct,
             ef: ef_construct,
-            plain_scan_threshold: 10_000,
+            plain_scan_threshold: 0,
             filtered_plain_scan_threshold: 0,
             build_random_entry_point: false,
         }
@@ -262,11 +266,11 @@ mod tests {
     #[test]
     fn test_hnsw_config_default() {
         let config = HnswConfig::default();
-        assert_eq!(config.m, 16);
-        assert_eq!(config.m0, 32);
+        assert_eq!(config.m, 24);
+        assert_eq!(config.m0, 48);
         assert_eq!(config.ef_construct, 100);
         assert_eq!(config.ef, 100);
-        assert_eq!(config.plain_scan_threshold, 10_000);
+        assert_eq!(config.plain_scan_threshold, 0);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
         assert!(!config.build_random_entry_point);
     }
@@ -278,7 +282,7 @@ mod tests {
         assert_eq!(config.m0, 16);
         assert_eq!(config.ef_construct, 200);
         assert_eq!(config.ef, 200);
-        assert_eq!(config.plain_scan_threshold, 10_000);
+        assert_eq!(config.plain_scan_threshold, 0);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
         assert!(!config.build_random_entry_point);
     }
