@@ -333,12 +333,13 @@ fn search_definition(
         column_ids: vec![column_id],
         expression: expression.clone(),
         freshness_policy: SearchFreshnessPolicy::default_for_kind(provider),
-        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+        config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
             provider,
             &[column_id],
             expression.as_deref(),
             &provider_config,
-        ),
+        )
+        .expect("benchmark provider config is valid"),
         provider_config,
     }
 }

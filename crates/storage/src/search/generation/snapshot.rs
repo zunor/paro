@@ -183,7 +183,7 @@ fn segment_artifact(
 
     let pointer = match definition.kind {
         SearchIndexKind::Hnsw => {
-            if segment.hnsw_index(column_id).is_none() {
+            if !segment.has_hnsw_artifact(column_id) {
                 return Ok(None);
             }
             segment
@@ -334,7 +334,7 @@ fn search_artifact_metadata(
             .map(|stats| SearchProviderStats::Sparse(stats.into())),
         SearchIndexKind::Hnsw => segment
             .hnsw_index_statistics(column_id)
-            .map(|stats| SearchProviderStats::Hnsw(stats.into())),
+            .map(|stats| SearchProviderStats::Hnsw((&stats).into())),
     };
     (bytes_on_disk, provider_stats)
 }

@@ -997,7 +997,7 @@ fn populate_paro_storage_info(
                     max_value: base_stats
                         .and_then(|stats| stats.max_value())
                         .map(|value| value.to_string()),
-                    has_hnsw_index: segment.hnsw_index(meta.column_id).is_some()
+                    has_hnsw_index: segment.has_hnsw_artifact(meta.column_id)
                         || storage.has_queryable_search_artifact(
                             SearchIndexKind::Hnsw,
                             rowset_id,

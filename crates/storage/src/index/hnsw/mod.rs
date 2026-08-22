@@ -41,7 +41,7 @@ pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;
 pub use hnsw_builder::{HnswBuildStopCheck, HnswBuilder};
 pub use links_container::{ItemsBuffer, LinksContainer};
-pub use persistence::HnswIndex;
+pub use persistence::{hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex};
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;

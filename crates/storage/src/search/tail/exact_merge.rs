@@ -307,7 +307,7 @@ fn segment_has_provider_artifact(
     column_id: u32,
 ) -> bool {
     match kind {
-        SearchIndexKind::Hnsw => segment.segment.hnsw_index(column_id).is_some(),
+        SearchIndexKind::Hnsw => segment.segment.has_hnsw_artifact(column_id),
         SearchIndexKind::Sparse => segment.segment.sparse_index(column_id).is_some(),
         SearchIndexKind::FullText => segment.segment.fulltext_index(column_id).is_some(),
     }

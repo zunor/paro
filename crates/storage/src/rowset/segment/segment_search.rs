@@ -73,7 +73,7 @@ impl Segment {
         mode: HnswSearchMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
-            .hnsw_index(column_id)
+            .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
         let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
         if let Some(bm) = filter_bitmap.as_ref() {
@@ -131,7 +131,7 @@ impl Segment {
         }
 
         let index = self
-            .hnsw_index(column_id)
+            .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
         let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
         if let Some(bm) = filter_bitmap.as_ref() {

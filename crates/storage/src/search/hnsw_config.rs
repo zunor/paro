@@ -10,9 +10,16 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub use crate::index::hnsw::types::DEFAULT_HNSW_BUILD_SEED;
-use crate::index::hnsw::{DistanceMetric, HnswBuildContract, HnswConfig, HnswSearchPolicy};
+pub use crate::index::hnsw::types::{
+    DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
+    DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
+};
+use crate::index::hnsw::{DistanceMetric, HnswBuildContract, HnswSearchPolicy};
 use paro_common::error::{self as paro_error, Result};
+
+use super::provider_config::{
+    decode_provider_config, encode_provider_config, StrictProviderConfig,
+};
 
 pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 1;
 
@@ -49,17 +56,11 @@ impl HnswProviderConfig {
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
-        let config: Self = serde_json::from_value(value.clone()).map_err(|err| {
-            paro_error::invalid_input(format!("invalid HNSW provider_config: {err}"))
-        })?;
-        config.validate()?;
-        Ok(config)
+        decode_provider_config(value)
     }
 
     pub fn to_value(&self) -> Result<Value> {
-        serde_json::to_value(self).map_err(|err| {
-            paro_error::serialization_error(format!("serialize HNSW provider_config: {err}"))
-        })
+        encode_provider_config(self)
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -120,14 +121,18 @@ impl HnswProviderConfig {
         Ok(())
     }
 
-    /// Transient builder input. Search fields are never copied into this value.
-    pub fn build_config(&self) -> HnswConfig {
-        HnswConfig::new(self.m as usize, self.ef_construct as usize)
-            .with_build_seed(self.build_seed)
-    }
-
     pub fn build_contract(&self) -> HnswBuildContract {
-        self.build_config().build_contract(self.distance)
+        // Provider validation has already constrained every durable-width
+        // field; construct the physical contract without routing through the
+        // legacy usize-based low-level configuration.
+        HnswBuildContract {
+            version: crate::index::hnsw::types::HNSW_BUILD_CONTRACT_VERSION,
+            m: self.m,
+            m0: self.m * 2,
+            ef_construct: self.ef_construct,
+            distance: self.distance,
+            build_seed: self.build_seed,
+        }
     }
 
     pub const fn search_policy(&self) -> HnswSearchPolicy {
@@ -136,6 +141,19 @@ impl HnswProviderConfig {
             plain_scan_threshold: self.plain_scan_threshold as usize,
             filtered_plain_scan_threshold: self.filtered_plain_scan_threshold as usize,
         }
+    }
+}
+
+impl StrictProviderConfig for HnswProviderConfig {
+    const PROVIDER_NAME: &'static str = "HNSW";
+    const VERSION: u32 = HNSW_PROVIDER_CONFIG_VERSION;
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+
+    fn validate_semantics(&self) -> Result<()> {
+        self.validate()
     }
 }
 

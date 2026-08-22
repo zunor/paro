@@ -402,6 +402,10 @@ impl SidecarCachedArtifact {
         self.mapped.bytes()
     }
 
+    pub(crate) fn mmap_range(&self) -> (Arc<Mmap>, usize, usize) {
+        self.mapped.mmap_range()
+    }
+
     pub fn is_mmap_backed(&self) -> bool {
         true
     }
@@ -421,6 +425,10 @@ pub struct SidecarMappedArtifact {
 impl SidecarMappedArtifact {
     pub fn bytes(&self) -> &[u8] {
         &self.package[self.offset..self.offset + self.len]
+    }
+
+    fn mmap_range(&self) -> (Arc<Mmap>, usize, usize) {
+        (Arc::clone(&self.package), self.offset, self.len)
     }
 
     pub fn artifact_len(&self) -> usize {

@@ -9,16 +9,20 @@ use super::entry_points::EntryPoints;
 use super::graph::GraphLayers;
 use super::graph_links::GraphLinks;
 use super::search_context::FixedLengthPriorityQueue;
-use super::vector_storage::{IndexedVectorStorage, VectorStorage};
+use super::vector_storage::{CosineInverseNorms, IndexedVectorStorage, VectorStorage};
 use super::visited_pool::VisitedPool;
+#[cfg(test)]
+use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswConfig, HnswSearchMode, HnswSearchPolicy, PreparedQuery, ScoredPoint, SearchAlgorithm,
+    HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm,
     SearchParams, VectorScorer,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
 };
+use bytes::Bytes;
+use memmap2::{Mmap, MmapOptions};
 use paro_common::error;
 use paro_common::error::Result;
 use roaring::RoaringBitmap;
@@ -28,7 +32,97 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 1;
+const HNSW_ARTIFACT_VERSION: u32 = 2;
+const HNSW_ARTIFACT_HEADER_LEN: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswArtifactCompatibility {
+    Current,
+    UnsupportedVersion(u32),
+}
+
+impl HnswArtifactCompatibility {
+    pub fn rebuild_reason(self) -> Option<String> {
+        match self {
+            Self::Current => None,
+            Self::UnsupportedVersion(version) => Some(format!(
+                "HNSW artifact version {version} is not queryable (runtime expects {HNSW_ARTIFACT_VERSION}); rebuild the vector index"
+            )),
+        }
+    }
+}
+
+pub fn hnsw_artifact_compatibility(data: &[u8]) -> Result<HnswArtifactCompatibility> {
+    if data.len() < HNSW_ARTIFACT_MAGIC.len() {
+        return Err(error::data_corrupted(
+            "HNSW artifact is truncated before its magic",
+        ));
+    }
+    if data[..4] != HNSW_ARTIFACT_MAGIC {
+        return Err(error::data_corrupted("invalid HNSW artifact magic"));
+    }
+    if data.len() < 8 {
+        return Err(error::data_corrupted(
+            "HNSW artifact is truncated after its magic",
+        ));
+    }
+    let version = u32::from_le_bytes(data[4..8].try_into().expect("u32 width"));
+    Ok(if version == HNSW_ARTIFACT_VERSION {
+        HnswArtifactCompatibility::Current
+    } else {
+        HnswArtifactCompatibility::UnsupportedVersion(version)
+    })
+}
+
+const fn distance_tag(distance: DistanceMetric) -> u8 {
+    match distance {
+        DistanceMetric::Euclidean => 0,
+        DistanceMetric::Cosine => 1,
+        DistanceMetric::DotProduct => 2,
+        DistanceMetric::Manhattan => 3,
+    }
+}
+
+fn append_entry_points(data: &mut Vec<u8>, entries: &[super::EntryPoint]) -> Result<()> {
+    for entry in entries {
+        data.extend_from_slice(&entry.point_id.to_le_bytes());
+        let level = u32::try_from(entry.level)
+            .map_err(|_| error::out_of_range("HNSW entry-point level exceeds u32"))?;
+        data.extend_from_slice(&level.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn read_entry_points(
+    data: &[u8],
+    offset: &mut usize,
+    count: usize,
+) -> Result<Vec<super::EntryPoint>> {
+    let encoded_len = count
+        .checked_mul(2 * std::mem::size_of::<u32>())
+        .ok_or_else(|| error::data_corrupted("HNSW entry-point table length overflow"))?;
+    if data.len().saturating_sub(*offset) < encoded_len {
+        return Err(error::data_corrupted(format!(
+            "HNSW entry-point table is truncated: count={count}, remaining={}",
+            data.len().saturating_sub(*offset)
+        )));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let point_id = u32::from_le_bytes(
+            take_artifact_bytes(data, offset, 4, "entry point id")?
+                .try_into()
+                .expect("u32 width"),
+        );
+        let level = u32::from_le_bytes(
+            take_artifact_bytes(data, offset, 4, "entry point level")?
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
+        entries.push(super::EntryPoint { point_id, level });
+    }
+    Ok(entries)
+}
 
 fn take_artifact_bytes<'a>(
     data: &'a [u8],
@@ -49,6 +143,60 @@ fn take_artifact_bytes<'a>(
     Ok(bytes)
 }
 
+enum HnswArtifactBacking {
+    Bytes(Bytes),
+    Mmap {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl HnswArtifactBacking {
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Bytes(bytes) => bytes,
+            Self::Mmap { mmap, offset, len } => &mmap[*offset..*offset + *len],
+        }
+    }
+
+    fn inverse_norms(&self, offset: usize, len: usize) -> Result<CosineInverseNorms> {
+        match self {
+            Self::Bytes(bytes) => CosineInverseNorms::from_bytes(bytes.slice(offset..offset + len)),
+            Self::Mmap {
+                mmap,
+                offset: artifact_offset,
+                ..
+            } => CosineInverseNorms::from_mmap_range(
+                Arc::clone(mmap),
+                artifact_offset.checked_add(offset).ok_or_else(|| {
+                    error::data_corrupted("HNSW cosine norm artifact offset overflow")
+                })?,
+                len,
+            ),
+        }
+    }
+
+    fn graph_links(&self, offset: usize) -> Result<GraphLinks> {
+        match self {
+            Self::Bytes(bytes) => GraphLinks::deserialize_bytes(bytes.slice(offset..)),
+            Self::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len,
+            } => GraphLinks::deserialize_mmap_range(
+                Arc::clone(mmap),
+                artifact_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| error::data_corrupted("HNSW graph artifact offset overflow"))?,
+                len.checked_sub(offset).ok_or_else(|| {
+                    error::data_corrupted("HNSW graph artifact offset exceeds artifact length")
+                })?,
+            ),
+        }
+    }
+}
+
 /// A high-level HNSW index structure that combines graph and storage.
 pub struct HnswIndex {
     pub build_contract: HnswBuildContract,
@@ -59,55 +207,86 @@ pub struct HnswIndex {
 }
 
 impl HnswIndex {
+    pub fn try_new(
+        build_contract: HnswBuildContract,
+        graph: GraphLayers,
+        vector_storage: Arc<dyn VectorStorage>,
+    ) -> Result<Self> {
+        build_contract.validate()?;
+        let distance = build_contract.distance;
+        let vector_storage = IndexedVectorStorage::prepare(vector_storage, distance);
+        let index = Self {
+            build_contract,
+            graph,
+            vector_storage,
+            single_telemetry: Mutex::new(SearchTelemetry::default()),
+            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
+        };
+        index.validate_entry_points()?;
+        Ok(index)
+    }
+
+    #[cfg(test)]
     pub fn new(
         config: HnswConfig,
         graph: GraphLayers,
         vector_storage: Arc<dyn VectorStorage>,
         distance: DistanceMetric,
     ) -> Self {
-        let vector_storage = IndexedVectorStorage::prepare(vector_storage, distance);
-        let build_contract = config.build_contract(distance);
-        build_contract
-            .validate()
-            .expect("HnswIndex::new requires a valid build contract");
-        Self {
-            build_contract,
+        Self::try_new(
+            config
+                .try_build_contract(distance)
+                .expect("test HNSW configuration is valid"),
             graph,
             vector_storage,
-            single_telemetry: Mutex::new(SearchTelemetry::default()),
-            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
-        }
+        )
+        .expect("test HNSW configuration is valid")
     }
 
     /// Build a new HNSW index from scratch.
+    pub fn try_build(
+        storage: Arc<dyn VectorStorage>,
+        build_contract: HnswBuildContract,
+    ) -> Result<Self> {
+        Self::build_with_controls(storage, build_contract, None)
+    }
+
+    #[cfg(test)]
     pub fn build(
         storage: Arc<dyn VectorStorage>,
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Self {
-        Self::build_with_controls(storage, config, distance, None)
-            .expect("HnswIndex::build without stop-check should not fail")
+        Self::try_build(
+            storage,
+            config
+                .try_build_contract(distance)
+                .expect("test HNSW configuration is valid"),
+        )
+        .expect("test HNSW configuration is valid")
     }
 
     pub(crate) fn build_with_controls(
         storage: Arc<dyn VectorStorage>,
-        config: HnswConfig,
-        distance: DistanceMetric,
+        build_contract: HnswBuildContract,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
+        build_contract.validate()?;
+        let distance = build_contract.distance;
         let storage = IndexedVectorStorage::prepare(storage, distance);
         let num_vectors = storage.num_vectors();
         // Diverse neighbor selection is required for clustered vector sets;
         // nearest-only truncation forms disconnected local components.
-        let mut builder = GraphLayersBuilder::new_with_heuristic(num_vectors, &config, true);
+        let mut builder = GraphLayersBuilder::new_from_contract(num_vectors, &build_contract, true);
 
         // Pre-allocate levels for all points.
         for i in 0..num_vectors {
             if i % 1024 == 0 && stop_check.is_some_and(|check| check.should_stop()) {
                 return Err(error::query_canceled());
             }
-            let level = builder.get_random_layer();
-            builder.set_levels(i as u32, level);
+            let point_id = i as PointOffset;
+            let level = builder.random_layer_for_point(point_id);
+            builder.set_levels(point_id, level);
         }
 
         // Heuristic insertion mutates existing neighbors. Keeping a single
@@ -122,12 +301,20 @@ impl HnswIndex {
         }
 
         let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
-        Ok(Self::new(config, graph, storage, distance))
+        let graph = GraphLayers::new(
+            links,
+            entry_points,
+            VisitedPool::new(),
+            (&build_contract).into(),
+        );
+        Self::try_new(build_contract, graph, storage)
     }
 
     /// Save HNSW index to a directory.
     pub fn save(&self, directory: &Path) -> Result<()> {
+        // Publishing is the one place where a full O(E) semantic validation
+        // is mandatory. Opens remain O(N) and lazy.
+        self.verify_integrity()?;
         if !directory.exists() {
             fs::create_dir_all(directory).map_err(error::io)?;
         }
@@ -152,7 +339,7 @@ impl HnswIndex {
         if let Some(norms) = self.vector_storage.cosine_inverse_norms() {
             let norms_path = directory.join("cosine_inverse_norms.bin");
             let mut bytes = Vec::with_capacity(norms.len() * std::mem::size_of::<f32>());
-            for norm in norms {
+            for norm in norms.iter() {
                 bytes.extend_from_slice(&norm.to_le_bytes());
             }
             fs::write(norms_path, bytes).map_err(error::io)?;
@@ -184,17 +371,13 @@ impl HnswIndex {
 
         let vector_storage = if distance == DistanceMetric::Cosine {
             let norms_path = directory.join("cosine_inverse_norms.bin");
-            let bytes = fs::read(norms_path).map_err(error::io)?;
-            if bytes.len() % std::mem::size_of::<f32>() != 0 {
-                return Err(error::data_corrupted(
-                    "HNSW cosine inverse norm artifact is truncated",
-                ));
-            }
-            let norms: Arc<[f32]> = bytes
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk width")))
-                .collect::<Vec<_>>()
-                .into();
+            let file = fs::File::open(norms_path).map_err(error::io)?;
+            let norms = if file.metadata().map_err(error::io)?.len() == 0 {
+                CosineInverseNorms::Owned(Arc::from([]))
+            } else {
+                let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).map_err(error::io)? });
+                CosineInverseNorms::from_mmap(mmap)?
+            };
             IndexedVectorStorage::from_persisted_cosine_norms(vector_storage, norms)?
         } else {
             vector_storage
@@ -206,39 +389,58 @@ impl HnswIndex {
             (&build_contract).into(),
         );
 
-        Ok(Self {
+        let index = Self {
             build_contract,
             graph,
             vector_storage,
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
-        })
+        };
+        index.validate_entry_points()?;
+        Ok(index)
     }
 
     /// Serialize HNSW index to a byte vector for embedding in segments.
     pub fn serialize(&self) -> Result<Vec<u8>> {
+        // Inline and sidecar generations are published from this envelope.
+        // Run the expensive semantic verifier here, while the freshly built
+        // graph is hot, instead of imposing O(E) work on every open.
+        self.verify_integrity()?;
         let mut data = Vec::new();
 
         data.extend_from_slice(&HNSW_ARTIFACT_MAGIC);
         data.extend_from_slice(&HNSW_ARTIFACT_VERSION.to_le_bytes());
+        data.extend_from_slice(&(HNSW_ARTIFACT_HEADER_LEN as u32).to_le_bytes());
+        data.extend_from_slice(&self.build_contract.version.to_le_bytes());
+        data.extend_from_slice(&self.build_contract.m.to_le_bytes());
+        data.extend_from_slice(&self.build_contract.m0.to_le_bytes());
+        data.extend_from_slice(&self.build_contract.ef_construct.to_le_bytes());
+        data.push(distance_tag(self.build_contract.distance));
+        data.extend_from_slice(&[0; 3]);
+        data.extend_from_slice(&self.build_contract.build_seed.to_le_bytes());
+        let norm_count = self
+            .vector_storage
+            .cosine_inverse_norms()
+            .map_or(0, CosineInverseNorms::len);
+        let norms = self.vector_storage.cosine_inverse_norms();
+        data.extend_from_slice(&(norm_count as u64).to_le_bytes());
+        let primary_count = u32::try_from(self.graph.entry_points.entry_points.len())
+            .map_err(|_| error::out_of_range("too many HNSW primary entry points"))?;
+        let extra_count = u32::try_from(self.graph.entry_points.extra_entry_points.len())
+            .map_err(|_| error::out_of_range("too many HNSW extra entry points"))?;
+        data.extend_from_slice(&primary_count.to_le_bytes());
+        data.extend_from_slice(&extra_count.to_le_bytes());
+        data.extend_from_slice(&0u64.to_le_bytes());
+        debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
 
-        // Serialize immutable graph construction contract as JSON.
-        let config_json = serde_json::to_vec(&self.build_contract)
-            .map_err(|e| error::serialization_error(e.to_string()))?;
-        data.extend_from_slice(&(config_json.len() as u32).to_le_bytes());
-        data.extend_from_slice(&config_json);
-
-        let norms = self.vector_storage.cosine_inverse_norms().unwrap_or(&[]);
-        data.extend_from_slice(&(norms.len() as u64).to_le_bytes());
-        for norm in norms {
-            data.extend_from_slice(&norm.to_le_bytes());
+        if let Some(norms) = norms {
+            for norm in norms.iter() {
+                data.extend_from_slice(&norm.to_le_bytes());
+            }
         }
 
-        // Serialize entry points as JSON.
-        let entry_points_json = serde_json::to_vec(&self.graph.entry_points)
-            .map_err(|e| error::serialization_error(e.to_string()))?;
-        data.extend_from_slice(&(entry_points_json.len() as u32).to_le_bytes());
-        data.extend_from_slice(&entry_points_json);
+        append_entry_points(&mut data, &self.graph.entry_points.entry_points)?;
+        append_entry_points(&mut data, &self.graph.entry_points.extra_entry_points)?;
 
         // Serialize graph links in binary form.
         self.graph.links.serialize(&mut data)?;
@@ -252,38 +454,98 @@ impl HnswIndex {
 
     /// Deserialize HNSW index from a byte buffer.
     pub fn deserialize(data: &[u8], vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
-        let mut offset = 0;
+        Self::deserialize_bytes(Bytes::copy_from_slice(data), vector_storage)
+    }
 
-        let magic = take_artifact_bytes(data, &mut offset, HNSW_ARTIFACT_MAGIC.len(), "magic")?;
-        if magic != HNSW_ARTIFACT_MAGIC {
+    /// Deserialize an inline artifact while retaining its owned byte backing.
+    /// Graph links and cosine norms become immutable slices of that backing,
+    /// so open does not allocate memory proportional to the graph size.
+    pub fn deserialize_bytes(data: Bytes, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
+        Self::deserialize_backing(HnswArtifactBacking::Bytes(data), vector_storage)
+    }
+
+    /// Deserialize a sidecar artifact directly over its package mmap.
+    pub fn deserialize_mmap_range(
+        mmap: Arc<Mmap>,
+        artifact_offset: usize,
+        artifact_len: usize,
+        vector_storage: Arc<dyn VectorStorage>,
+    ) -> Result<Self> {
+        let end = artifact_offset
+            .checked_add(artifact_len)
+            .ok_or_else(|| error::data_corrupted("HNSW artifact mmap range overflow"))?;
+        if end > mmap.len() {
             return Err(error::data_corrupted(
-                "legacy or invalid HNSW artifact envelope",
+                "HNSW artifact mmap range exceeds package length",
             ));
         }
-        let version = u32::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 4, "artifact version")?
-                .try_into()
-                .expect("u32 width"),
-        );
-        if version != HNSW_ARTIFACT_VERSION {
-            return Err(error::data_corrupted(format!(
-                "unsupported HNSW artifact version {version}, expected {HNSW_ARTIFACT_VERSION}"
-            )));
+        Self::deserialize_backing(
+            HnswArtifactBacking::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            },
+            vector_storage,
+        )
+    }
+
+    fn deserialize_backing(
+        backing: HnswArtifactBacking,
+        vector_storage: Arc<dyn VectorStorage>,
+    ) -> Result<Self> {
+        let data = backing.as_bytes();
+        match hnsw_artifact_compatibility(data)? {
+            HnswArtifactCompatibility::Current => {}
+            compatibility => {
+                return Err(error::artifact_not_ready(
+                    compatibility
+                        .rebuild_reason()
+                        .expect("non-current compatibility has a reason"),
+                ))
+            }
         }
 
-        // Deserialize immutable graph construction contract.
-        let config_len = u32::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 4, "build contract length")?
+        let mut offset = 8;
+        let header_len = u32::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 4, "header length")?
                 .try_into()
                 .expect("u32 width"),
         ) as usize;
-        let build_contract: HnswBuildContract = serde_json::from_slice(take_artifact_bytes(
-            data,
-            &mut offset,
-            config_len,
-            "build contract",
-        )?)
-        .map_err(|e| error::serialization_error(e.to_string()))?;
+        if header_len != HNSW_ARTIFACT_HEADER_LEN {
+            return Err(error::data_corrupted(format!(
+                "invalid HNSW artifact header length {header_len}, expected {HNSW_ARTIFACT_HEADER_LEN}"
+            )));
+        }
+        let read_u32 = |data: &[u8], offset: &mut usize, field| -> Result<u32> {
+            Ok(u32::from_le_bytes(
+                take_artifact_bytes(data, offset, 4, field)?
+                    .try_into()
+                    .expect("u32 width"),
+            ))
+        };
+        let build_contract = HnswBuildContract {
+            version: read_u32(data, &mut offset, "build contract version")?,
+            m: read_u32(data, &mut offset, "m")?,
+            m0: read_u32(data, &mut offset, "m0")?,
+            ef_construct: read_u32(data, &mut offset, "ef_construct")?,
+            distance: {
+                let tag = take_artifact_bytes(data, &mut offset, 1, "distance")?[0];
+                DistanceMetric::from_u8(tag).ok_or_else(|| {
+                    error::data_corrupted(format!("unknown HNSW distance tag {tag}"))
+                })?
+            },
+            build_seed: {
+                let padding = take_artifact_bytes(data, &mut offset, 3, "distance padding")?;
+                if padding != [0, 0, 0] {
+                    return Err(error::data_corrupted("HNSW distance padding must be zero"));
+                }
+                u64::from_le_bytes(
+                    take_artifact_bytes(data, &mut offset, 8, "build seed")?
+                        .try_into()
+                        .expect("u64 width"),
+                )
+            },
+        };
         build_contract.validate()?;
         let distance = build_contract.distance;
 
@@ -293,15 +555,25 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW inverse norm count exceeds usize"))?;
+        let primary_count = read_u32(data, &mut offset, "primary entry point count")? as usize;
+        let extra_count = read_u32(data, &mut offset, "extra entry point count")? as usize;
+        if u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "reserved")?
+                .try_into()
+                .expect("u64 width"),
+        ) != 0
+        {
+            return Err(error::data_corrupted(
+                "HNSW artifact reserved header field must be zero",
+            ));
+        }
+        debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
         let norm_bytes = norm_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
-        let inverse_norms: Arc<[f32]> =
-            take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk width")))
-                .collect::<Vec<_>>()
-                .into();
+        let norm_start = offset;
+        take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?;
+        let inverse_norms = backing.inverse_norms(norm_start, norm_bytes)?;
         let vector_storage = match distance {
             DistanceMetric::Cosine => {
                 IndexedVectorStorage::from_persisted_cosine_norms(vector_storage, inverse_norms)?
@@ -314,22 +586,13 @@ impl HnswIndex {
             }
         };
 
-        // Deserialize entry points.
-        let entry_points_len = u32::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 4, "entry point length")?
-                .try_into()
-                .expect("u32 width"),
-        ) as usize;
-        let entry_points: EntryPoints = serde_json::from_slice(take_artifact_bytes(
-            data,
-            &mut offset,
-            entry_points_len,
-            "entry points",
-        )?)
-        .map_err(|e| error::serialization_error(e.to_string()))?;
+        let entry_points = EntryPoints {
+            entry_points: read_entry_points(data, &mut offset, primary_count)?,
+            extra_entry_points: read_entry_points(data, &mut offset, extra_count)?,
+        };
 
         // Deserialize graph links.
-        let links = GraphLinks::deserialize(&data[offset..])?;
+        let links = backing.graph_links(offset)?;
 
         let graph = GraphLayers::new(
             links,
@@ -338,13 +601,15 @@ impl HnswIndex {
             (&build_contract).into(),
         );
 
-        Ok(Self {
+        let index = Self {
             build_contract,
             graph,
             vector_storage,
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
-        })
+        };
+        index.validate_entry_points()?;
+        Ok(index)
     }
 
     /// Perform a vector search under the caller's active query policy.
@@ -366,7 +631,7 @@ impl HnswIndex {
         let post_filter_count = filter_bitmap.map(|bm| bm.len()).unwrap_or(pre_filter_count);
 
         let prepared_query = self.build_contract.distance.prepare(query);
-        let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref());
+        let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
         let results = if self.should_use_plain_scan(filter_bitmap, policy, mode) {
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
@@ -433,7 +698,7 @@ impl HnswIndex {
         let mut scorers: Vec<_> = queries
             .iter()
             .map(|query| VectorScorer::new(query, self.vector_storage.as_ref()))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         let results = if self.should_use_plain_scan(filter_bitmap, policy, mode) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
@@ -497,6 +762,7 @@ impl HnswIndex {
     /// validates the O(N) layout and checksum boundary.
     pub fn verify_integrity(&self) -> Result<()> {
         self.build_contract.validate()?;
+        self.validate_entry_points()?;
         match (
             self.build_contract.distance,
             self.vector_storage.cosine_inverse_norms(),
@@ -506,7 +772,6 @@ impl HnswIndex {
             {
                 if let Some((point, value)) = norms
                     .iter()
-                    .copied()
                     .enumerate()
                     .find(|(_, value)| !value.is_finite() || *value < 0.0)
                 {
@@ -528,6 +793,31 @@ impl HnswIndex {
             (_, None) => {}
         }
         self.graph.links.verify_integrity()
+    }
+
+    fn validate_entry_points(&self) -> Result<()> {
+        for entry in self
+            .graph
+            .entry_points
+            .entry_points
+            .iter()
+            .chain(self.graph.entry_points.extra_entry_points.iter())
+        {
+            if entry.point_id as usize >= self.vector_storage.num_vectors() {
+                return Err(error::data_corrupted(format!(
+                    "HNSW entry point {} is outside vector cardinality {}",
+                    entry.point_id,
+                    self.vector_storage.num_vectors()
+                )));
+            }
+            if entry.level >= self.graph.links.num_levels(entry.point_id) {
+                return Err(error::data_corrupted(format!(
+                    "HNSW entry point {} level {} exceeds its graph levels",
+                    entry.point_id, entry.level
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn choose_algorithm(
@@ -638,7 +928,7 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{AcornParams, InMemoryVectorStorage, PointOffset};
+    use crate::index::hnsw::{AcornParams, HnswM, InMemoryVectorStorage, PointOffset};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use roaring::RoaringBitmap;
@@ -1214,7 +1504,7 @@ mod tests {
             .err()
             .expect("legacy envelope must fail")
             .to_string()
-            .contains("artifact envelope"));
+            .contains("artifact magic"));
 
         let mut unknown = bytes;
         unknown[4..8].copy_from_slice(&(HNSW_ARTIFACT_VERSION + 1).to_le_bytes());
@@ -1222,7 +1512,7 @@ mod tests {
             .err()
             .expect("unknown envelope version must fail")
             .to_string()
-            .contains("unsupported HNSW artifact version"));
+            .contains("rebuild the vector index"));
     }
 
     #[test]
@@ -1236,21 +1526,63 @@ mod tests {
             .vector_storage
             .cosine_inverse_norms()
             .expect("cosine index preprocessing");
-        assert!((norms[0] - 0.2).abs() < 1e-6);
-        assert_eq!(norms[1], 0.0);
-        assert_eq!(norms[2], 1.0);
+        assert!((norms.value(0) - 0.2).abs() < 1e-6);
+        assert_eq!(norms.value(1), 0.0);
+        assert_eq!(norms.value(2), 1.0);
 
         let bytes = index.serialize().unwrap();
         let restored = HnswIndex::deserialize(&bytes, make_storage(&vectors)).unwrap();
+        assert!(restored.graph.links.is_bytes_backed());
+        assert!(restored
+            .vector_storage
+            .cosine_inverse_norms()
+            .unwrap()
+            .is_bytes_backed());
         assert_eq!(
-            restored.vector_storage.cosine_inverse_norms().unwrap(),
-            norms
+            restored
+                .vector_storage
+                .cosine_inverse_norms()
+                .unwrap()
+                .iter()
+                .collect::<Vec<_>>(),
+            norms.iter().collect::<Vec<_>>()
         );
         let result = restored
             .search_one(&[1.0, 0.0], 3, &SearchParams::default(), None)
             .unwrap();
         assert_eq!(result[0].idx, 2);
         assert_eq!(result[2].idx, 1);
+    }
+
+    #[test]
+    fn sidecar_mmap_range_keeps_graph_and_norms_zero_copy() {
+        let vectors = vec![vec![3.0, 4.0], vec![1.0, 0.0], vec![0.0, 1.0]];
+        let storage: Arc<dyn VectorStorage> = make_storage(&vectors);
+        let index = HnswIndex::build(
+            Arc::clone(&storage),
+            HnswConfig::new(8, 32),
+            DistanceMetric::Cosine,
+        );
+        let artifact = index.serialize().unwrap();
+        let prefix_len = 19;
+        let mut package = vec![0xA5; prefix_len];
+        package.extend_from_slice(&artifact);
+        package.extend_from_slice(&[0x5A; 11]);
+
+        let temp_dir = TempDir::new().unwrap();
+        let package_path = temp_dir.path().join("sidecar.pkg");
+        fs::write(&package_path, package).unwrap();
+        let file = fs::File::open(package_path).unwrap();
+        let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
+        let restored =
+            HnswIndex::deserialize_mmap_range(mmap, prefix_len, artifact.len(), storage).unwrap();
+
+        assert!(restored.graph.links.is_mmap_backed());
+        assert!(restored
+            .vector_storage
+            .cosine_inverse_norms()
+            .expect("cosine norms")
+            .is_mmap_backed());
     }
 
     #[test]
@@ -1267,6 +1599,40 @@ mod tests {
         );
         assert!(dot_index.vector_storage.cosine_inverse_norms().is_none());
         dot_index.verify_integrity().unwrap();
+    }
+
+    #[test]
+    fn serialize_rejects_semantically_invalid_graph_before_publish() {
+        let links = GraphLinks::new_from_edges(vec![vec![vec![1]], vec![vec![0]]]);
+        let mut encoded = Vec::new();
+        links.serialize(&mut encoded).unwrap();
+        let first_link_offset = 64 + (2 + 1) * std::mem::size_of::<u64>();
+        encoded[first_link_offset..first_link_offset + 4].copy_from_slice(&99_u32.to_le_bytes());
+        let invalid_links = GraphLinks::deserialize(encoded.as_slice()).unwrap();
+        let graph = GraphLayers::new(
+            invalid_links,
+            EntryPoints {
+                entry_points: vec![super::super::EntryPoint {
+                    point_id: 0,
+                    level: 0,
+                }],
+                extra_entry_points: Vec::new(),
+            },
+            VisitedPool::new(),
+            HnswM::new(8),
+        );
+        let index = HnswIndex::new(
+            HnswConfig::new(8, 32),
+            graph,
+            make_storage(&[vec![0.0], vec![1.0]]),
+            DistanceMetric::Euclidean,
+        );
+
+        assert!(index
+            .serialize()
+            .unwrap_err()
+            .to_string()
+            .contains("out of bounds"));
     }
 
     #[test]
@@ -1416,11 +1782,11 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_directory_load_uses_mmap_graph_links() {
+    fn test_hnsw_directory_load_uses_mmap_graph_and_norms() {
         let vectors: Vec<Vec<f32>> = (0..32).map(|i| vec![i as f32, (i % 7) as f32]).collect();
         let storage = make_storage(&vectors);
         let config = HnswConfig::new(8, 50).with_plain_scan_threshold(0);
-        let index = HnswIndex::build(storage.clone(), config, DistanceMetric::DotProduct);
+        let index = HnswIndex::build(storage.clone(), config, DistanceMetric::Cosine);
 
         let temp_dir = TempDir::new().unwrap();
         index.save(temp_dir.path()).unwrap();
@@ -1428,6 +1794,11 @@ mod tests {
         let loaded =
             HnswIndex::load(temp_dir.path(), storage.clone()).expect("load index from directory");
         assert!(loaded.graph.links.is_mmap_backed());
+        assert!(loaded
+            .vector_storage
+            .cosine_inverse_norms()
+            .expect("cosine norms")
+            .is_mmap_backed());
 
         let params = SearchParams {
             ef: Some(32),

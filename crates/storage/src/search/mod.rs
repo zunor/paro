@@ -49,7 +49,9 @@ pub use cursor::{
 };
 pub use generation::coverage::SearchGenerationCoverage;
 pub use hnsw_config::{
-    HnswInlineConfig, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED, HNSW_PROVIDER_CONFIG_VERSION,
+    HnswInlineConfig, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT,
+    DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_M,
+    DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, HNSW_PROVIDER_CONFIG_VERSION,
 };
 pub use inline_sink::{
     AdmissionDecision, AdmissionGrant, AdmissionRejectReason, AdmissionWaitReason, BuildBudget,

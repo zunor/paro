@@ -43,6 +43,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+const MAX_RETAINED_SEGMENT_READ_VIEWS: usize = 8;
+
 /// Rowset state machine for lifecycle management
 ///
 /// State transitions:
@@ -53,6 +55,12 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug)]
 struct RowsetStateMachine {
     state: RwLock<RowsetState>,
+}
+
+#[derive(Debug)]
+struct SegmentReadView {
+    options: SegmentOptions,
+    segments: Vec<SegmentSharedPtr>,
 }
 
 impl RowsetStateMachine {
@@ -136,6 +144,10 @@ pub struct Rowset {
     /// Whether segments are loaded into memory
     segments_loaded: RwLock<bool>,
 
+    /// Stable, coexisting read runtimes keyed by their governed resources.
+    /// A query never replaces another runtime or rebuilds its column readers.
+    segment_read_views: RwLock<Vec<SegmentReadView>>,
+
     /// Cached rowset statistics (lazy)
     statistics_cache: RwLock<Option<RowsetStatistics>>,
 }
@@ -169,6 +181,7 @@ impl Rowset {
             state_machine: RowsetStateMachine::new(initial_state),
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(false),
+            segment_read_views: RwLock::new(Vec::new()),
             statistics_cache: RwLock::new(None),
         })
     }
@@ -197,6 +210,7 @@ impl Rowset {
             state_machine: RowsetStateMachine::new(initial_state),
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(true),
+            segment_read_views: RwLock::new(Vec::new()),
             statistics_cache: RwLock::new(None),
         })
     }
@@ -385,6 +399,7 @@ impl Rowset {
 
         let mut segments = self.segments.write().unwrap();
         segments.clear();
+        self.segment_read_views.write().unwrap().clear();
 
         for seg_id in 0..num_segments {
             let segment_path = self.segment_path(seg_id);
@@ -407,22 +422,53 @@ impl Rowset {
     /// Open an immutable segment view configured with the requested runtime
     /// resources.
     ///
-    /// The rowset owns one structural view. Non-default views share its
-    /// immutable footer, indexes and file descriptor, but own their PageReader
-    /// and column-reader caches. They belong to the caller (normally a read
-    /// lease) and are deliberately not retained by the rowset.
+    /// The rowset owns one structural view and retains one stable read view per
+    /// runtime-equivalent resource set. Governed and maintenance readers can
+    /// coexist; neither invalidates the other, and repeated queries reuse the
+    /// same PageReader and column-reader cache.
     pub fn open_segment_view(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
         self.load()?;
+        let base_segments = self.segments.read().unwrap().clone();
         if options.runtime_equivalent(&SegmentOptions::default()) {
-            return Ok(self.segments.read().unwrap().clone());
+            return Ok(base_segments);
         }
-        Ok(self
-            .segments
+        if let Some(view) = self
+            .segment_read_views
             .read()
             .unwrap()
             .iter()
+            .find(|view| view.options.runtime_equivalent(&options))
+        {
+            return Ok(view.segments.clone());
+        }
+
+        let mut views = self.segment_read_views.write().unwrap();
+        if let Some(view) = views
+            .iter()
+            .find(|view| view.options.runtime_equivalent(&options))
+        {
+            return Ok(view.segments.clone());
+        }
+        let segments: Vec<SegmentSharedPtr> = base_segments
+            .iter()
             .map(|segment| Arc::new(segment.runtime_view(options.clone())))
-            .collect())
+            .collect();
+        if views.len() >= MAX_RETAINED_SEGMENT_READ_VIEWS {
+            if let Some(inactive) = views.iter().position(|view| {
+                view.segments
+                    .iter()
+                    .all(|segment| Arc::strong_count(segment) == 1)
+            }) {
+                views.remove(inactive);
+            }
+        }
+        if views.len() < MAX_RETAINED_SEGMENT_READ_VIEWS {
+            views.push(SegmentReadView {
+                options,
+                segments: segments.clone(),
+            });
+        }
+        Ok(segments)
     }
 
     /// Reload segments (force reload from disk)
@@ -435,6 +481,7 @@ impl Rowset {
             }
         }
         *loaded = false;
+        self.segment_read_views.write().unwrap().clear();
         self.invalidate_statistics();
         self.load_segments_locked(&mut loaded)
     }
@@ -494,12 +541,16 @@ impl Rowset {
             ));
         }
 
-        let mut segments = self.segments.write().unwrap();
-        segments.push(segment);
+        let segment_count = {
+            let mut segments = self.segments.write().unwrap();
+            segments.push(segment);
+            segments.len()
+        };
+        self.segment_read_views.write().unwrap().clear();
 
         // Update metadata
         let mut meta = self.rowset_meta.write().unwrap();
-        meta.set_num_segments(segments.len() as u32);
+        meta.set_num_segments(segment_count as u32);
 
         self.invalidate_statistics();
 
@@ -1199,7 +1250,7 @@ mod tests {
     }
 
     #[test]
-    fn nondefault_segment_views_are_owned_by_the_read_lease() {
+    fn runtime_equivalent_segment_views_are_stable_and_coexist() {
         let schema = create_test_schema();
         let tmp = tempfile::tempdir().unwrap();
         let rowset_dir = tmp.path().join("rowset");
@@ -1229,7 +1280,7 @@ mod tests {
         assert!(original.uses_page_cache(None));
         assert!(reopened.uses_page_cache(Some(&cache)));
         let independently_opened = rowset.open_segment_view(first_options).unwrap();
-        assert!(!Arc::ptr_eq(&reopened, &independently_opened[0]));
+        assert!(Arc::ptr_eq(&reopened, &independently_opened[0]));
 
         let second_cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
         let second_options = SegmentOptions::default()
@@ -1242,8 +1293,8 @@ mod tests {
         drop(reopened);
         drop(reopened_segments);
         assert!(
-            reopened_weak.upgrade().is_none(),
-            "the rowset must not retain a query-owned segment view"
+            reopened_weak.upgrade().is_some(),
+            "the rowset retains each governed runtime so readers and caches survive across queries"
         );
     }
 

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{DistanceMetric, HnswConfig, HnswIndex, VectorStorage};
+use super::{HnswBuildContract, HnswIndex, VectorStorage};
 use paro_common::error::Result;
 use std::fmt;
 use std::sync::Arc;
@@ -57,17 +57,16 @@ impl HnswBuilder {
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
-        config: HnswConfig,
-        distance: DistanceMetric,
+        build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
-        HnswIndex::build_with_controls(storage, config, distance, self.stop_check.as_ref())
+        HnswIndex::build_with_controls(storage, build_contract, self.stop_check.as_ref())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::InMemoryVectorStorage;
+    use crate::index::hnsw::{DistanceMetric, HnswConfig, InMemoryVectorStorage};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
@@ -89,8 +88,7 @@ mod tests {
         let builder = HnswBuilder::new().with_stop_check(stop_check);
         let result = builder.build(
             Arc::new(InMemoryVectorStorage::new(flat, dim)),
-            HnswConfig::new(8, 50),
-            DistanceMetric::Euclidean,
+            HnswConfig::new(8, 50).build_contract(DistanceMetric::Euclidean),
         );
         let err = match result {
             Ok(_) => panic!("expected HNSW build to be cancelled by stop-check"),

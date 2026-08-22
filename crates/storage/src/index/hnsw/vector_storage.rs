@@ -7,11 +7,128 @@
 
 use super::types::PointOffset;
 use super::DistanceMetric;
+use bytes::Bytes;
 use memmap2::Mmap;
 use paro_common::error::Result;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
+
+/// Immutable per-point cosine preprocessing owned by an HNSW artifact.
+///
+/// Persisted norms deliberately retain their byte backing instead of being
+/// decoded into an O(N) heap allocation when an index is opened. Values are
+/// little-endian on disk, so byte-backed access is alignment-independent.
+#[derive(Debug, Clone)]
+pub enum CosineInverseNorms {
+    Owned(Arc<[f32]>),
+    Bytes(Bytes),
+    Mmap {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl CosineInverseNorms {
+    pub fn from_bytes(bytes: Bytes) -> Result<Self> {
+        Self::validate_byte_len(bytes.len())?;
+        Ok(Self::Bytes(bytes))
+    }
+
+    pub fn from_mmap(mmap: Arc<Mmap>) -> Result<Self> {
+        let len = mmap.len();
+        Self::from_mmap_range(mmap, 0, len)
+    }
+
+    pub fn from_mmap_range(mmap: Arc<Mmap>, offset: usize, len: usize) -> Result<Self> {
+        Self::validate_byte_len(len)?;
+        let end = offset.checked_add(len).ok_or_else(|| {
+            paro_common::error::data_corrupted("HNSW cosine norm mmap range overflow")
+        })?;
+        if end > mmap.len() {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW cosine norm mmap range exceeds package length",
+            ));
+        }
+        Ok(Self::Mmap { mmap, offset, len })
+    }
+
+    fn validate_byte_len(len: usize) -> Result<()> {
+        if len % std::mem::size_of::<f32>() != 0 {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW cosine inverse norm artifact is truncated",
+            ));
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Owned(values) => values.len(),
+            Self::Bytes(bytes) => bytes.len() / std::mem::size_of::<f32>(),
+            Self::Mmap { len, .. } => *len / std::mem::size_of::<f32>(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn is_bytes_backed(&self) -> bool {
+        matches!(self, Self::Bytes(_))
+    }
+
+    pub fn is_mmap_backed(&self) -> bool {
+        matches!(self, Self::Mmap { .. })
+    }
+
+    #[inline]
+    pub fn get(&self, idx: PointOffset) -> Option<f32> {
+        let idx = idx as usize;
+        match self {
+            Self::Owned(values) => values.get(idx).copied(),
+            Self::Bytes(bytes) => Self::read_le(bytes, idx),
+            Self::Mmap { mmap, offset, len } => Self::read_le(&mmap[*offset..*offset + *len], idx),
+        }
+    }
+
+    /// Read a value after the artifact/open boundary has established that the
+    /// norm cardinality matches the vector cardinality.
+    #[inline]
+    pub fn value(&self, idx: PointOffset) -> f32 {
+        let idx = idx as usize;
+        match self {
+            Self::Owned(values) => values[idx],
+            Self::Bytes(bytes) => Self::read_validated(bytes, idx),
+            Self::Mmap { mmap, offset, len } => {
+                Self::read_validated(&mmap[*offset..*offset + *len], idx)
+            }
+        }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = f32> + '_ {
+        (0..self.len()).map(|idx| self.value(idx as PointOffset))
+    }
+
+    #[inline]
+    fn read_validated(bytes: &[u8], idx: usize) -> f32 {
+        let start = idx * std::mem::size_of::<f32>();
+        f32::from_le_bytes([
+            bytes[start],
+            bytes[start + 1],
+            bytes[start + 2],
+            bytes[start + 3],
+        ])
+    }
+
+    fn read_le(bytes: &[u8], idx: usize) -> Option<f32> {
+        let start = idx.checked_mul(std::mem::size_of::<f32>())?;
+        let raw = bytes.get(start..start + std::mem::size_of::<f32>())?;
+        Some(f32::from_le_bytes(raw.try_into().ok()?))
+    }
+}
 
 /// Trait for vector storage used by HNSW.
 pub trait VectorStorage: Send + Sync {
@@ -23,15 +140,8 @@ pub trait VectorStorage: Send + Sync {
     fn vector_dim(&self) -> usize;
     /// Per-point cosine preprocessing owned by the HNSW artifact. Base table
     /// storage returns `None`; indexed storage returns an immutable array.
-    fn cosine_inverse_norms(&self) -> Option<&[f32]> {
+    fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
         None
-    }
-
-    #[inline]
-    fn cosine_inverse_norm(&self, idx: PointOffset) -> Option<f32> {
-        self.cosine_inverse_norms()
-            .and_then(|norms| norms.get(idx as usize))
-            .copied()
     }
 }
 
@@ -39,7 +149,7 @@ pub trait VectorStorage: Send + Sync {
 /// changes the bytes returned by `get_vector`.
 pub struct IndexedVectorStorage {
     base: Arc<dyn VectorStorage>,
-    cosine_inverse_norms: Option<Arc<[f32]>>,
+    cosine_inverse_norms: Option<CosineInverseNorms>,
 }
 
 impl IndexedVectorStorage {
@@ -65,7 +175,7 @@ impl IndexedVectorStorage {
         {
             return base;
         }
-        let inverse_norms = (0..base.num_vectors())
+        let inverse_norms: Arc<[f32]> = (0..base.num_vectors())
             .map(|idx| {
                 let vector = base.get_vector(idx as PointOffset);
                 paro_common::distance::inverse_norm(vector)
@@ -74,13 +184,13 @@ impl IndexedVectorStorage {
             .into();
         Arc::new(Self {
             base,
-            cosine_inverse_norms: Some(inverse_norms),
+            cosine_inverse_norms: Some(CosineInverseNorms::Owned(inverse_norms)),
         })
     }
 
     pub fn from_persisted_cosine_norms(
         base: Arc<dyn VectorStorage>,
-        inverse_norms: Arc<[f32]>,
+        inverse_norms: CosineInverseNorms,
     ) -> Result<Arc<dyn VectorStorage>> {
         if inverse_norms.len() != base.num_vectors() {
             return Err(paro_common::error::data_corrupted(format!(
@@ -109,8 +219,8 @@ impl VectorStorage for IndexedVectorStorage {
         self.base.vector_dim()
     }
 
-    fn cosine_inverse_norms(&self) -> Option<&[f32]> {
-        self.cosine_inverse_norms.as_deref()
+    fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
+        self.cosine_inverse_norms.as_ref()
     }
 }
 

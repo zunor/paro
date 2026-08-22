@@ -6,7 +6,8 @@ use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildContract, HnswIndex, HnswSearchMode, HnswSearchPolicy, PreparedQuery,
+    hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
+    HnswIndex, HnswSearchMode, HnswSearchPolicy, PreparedQuery,
 };
 use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
@@ -206,10 +207,13 @@ impl VectorSearchCursor {
             self.telemetry.as_ref(),
             |segment| {
                 let (rows, degraded) = self.search_segment(segment, search_mode)?;
+                let degraded_reason = degraded
+                    .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
+                    .flatten();
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
                     degraded,
-                    output: (rows, degraded),
+                    output: (rows, degraded, degraded_reason),
                 })
             },
         )?;
@@ -217,9 +221,15 @@ impl VectorSearchCursor {
         let mut collector = TopKCollector::new(self.k);
         let mut candidates_produced = 0usize;
         let mut degraded_segments = 0usize;
-        for (rows, degraded) in per_segment {
+        let mut degraded_score_reasons = Vec::new();
+        for (rows, degraded, degraded_reason) in per_segment {
             candidates_produced += rows.len();
             degraded_segments += usize::from(degraded);
+            if let Some(reason) = degraded_reason {
+                if !degraded_score_reasons.contains(&reason) {
+                    degraded_score_reasons.push(reason);
+                }
+            }
             collector.extend(rows);
         }
         let peak_heap_items = collector.len();
@@ -231,7 +241,7 @@ impl VectorSearchCursor {
             rows_returned: ranked_rows.len(),
             peak_heap_items,
             degraded_segments,
-            degraded_score_reasons: Vec::new(),
+            degraded_score_reasons,
             elapsed: started_at.elapsed(),
         });
         Ok(ranked_rows)
@@ -256,7 +266,10 @@ impl VectorSearchCursor {
         search_mode: HnswSearchMode,
     ) -> Result<(Vec<RankedRow>, bool)> {
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        if let Some(index) = visible_segment.segment.hnsw_index(self.storage_col_id) {
+        if let Some(index) = visible_segment
+            .segment
+            .open_hnsw_index(self.storage_col_id)?
+        {
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
@@ -381,7 +394,7 @@ impl VectorSearchCursor {
                     crate::rowset::SegmentRowId::from_raw(row_id),
                 ),
                 self.distance
-                    .similarity_prepared(self.prepared_query.as_slice(), &decoded),
+                    .similarity_unindexed(self.prepared_query.as_slice(), &decoded),
             ));
         }
 
@@ -439,7 +452,14 @@ fn open_sidecar_hnsw_index(
         provider: SearchIndexKind::Hnsw,
         codec: SIDECAR_PACKAGE_CODEC,
     })?;
-    HnswIndex::deserialize(cached.bytes(), vector_storage).map(Some)
+    if !matches!(
+        hnsw_artifact_compatibility(cached.bytes())?,
+        HnswArtifactCompatibility::Current
+    ) {
+        return Ok(None);
+    }
+    let (mmap, offset, len) = cached.mmap_range();
+    HnswIndex::deserialize_mmap_range(mmap, offset, len, vector_storage).map(Some)
 }
 
 fn hnsw_ranked_rows_from_points(

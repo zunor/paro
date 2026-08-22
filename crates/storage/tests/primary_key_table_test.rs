@@ -258,7 +258,10 @@ fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
     rowset.reload().unwrap();
 
     let segment = rowset.get_segment(0).expect("compaction output segment");
-    let hnsw = segment.hnsw_index(1).expect("HNSW index should exist");
+    let hnsw = segment
+        .open_hnsw_index(1)
+        .expect("HNSW artifact should open")
+        .expect("HNSW index should exist");
     assert_eq!(hnsw.graph.links.num_points(), rowset.num_rows() as usize);
 
     let stored = segment

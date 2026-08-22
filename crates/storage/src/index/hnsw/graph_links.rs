@@ -9,6 +9,7 @@
 //! allocate a decoded graph copy when opened.
 
 use super::types::PointOffset;
+use bytes::Bytes;
 use memmap2::Mmap;
 use paro_common::error as paro_error;
 use paro_common::error::Result;
@@ -26,14 +27,22 @@ const POINT_BYTES: usize = std::mem::size_of::<PointOffset>();
 #[derive(Debug)]
 pub enum GraphLinksData {
     Ram(Vec<u8>),
+    Bytes(Bytes),
     Mmap(Arc<Mmap>),
+    MmapSlice {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
 }
 
 impl GraphLinksData {
     fn as_bytes(&self) -> &[u8] {
         match self {
             Self::Ram(data) => data,
+            Self::Bytes(data) => data,
             Self::Mmap(mmap) => mmap,
+            Self::MmapSlice { mmap, offset, len } => &mmap[*offset..*offset + *len],
         }
     }
 }
@@ -657,6 +666,13 @@ impl GraphLinks {
         Ok(Self::from_data(GraphLinksData::Ram(serialized), layout))
     }
 
+    /// Open graph links over an owned byte view without copying the graph.
+    pub fn deserialize_bytes(serialized: Bytes) -> Result<Self> {
+        let layout = Self::parse_layout(&serialized)?;
+        let serialized = serialized.slice(..layout.serialized_len_bytes);
+        Ok(Self::from_data(GraphLinksData::Bytes(serialized), layout))
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         Self::deserialize(File::open(path)?)
     }
@@ -666,6 +682,25 @@ impl GraphLinks {
         let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
         let layout = Self::parse_layout(&mmap)?;
         Ok(Self::from_data(GraphLinksData::Mmap(mmap), layout))
+    }
+
+    /// Open graph links over a validated range of a shared mmap package.
+    pub fn deserialize_mmap_range(mmap: Arc<Mmap>, offset: usize, len: usize) -> Result<Self> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| paro_common::error::data_corrupted("HNSW mmap range overflow"))?;
+        let serialized = mmap.get(offset..end).ok_or_else(|| {
+            paro_common::error::data_corrupted("HNSW mmap range exceeds package length")
+        })?;
+        let layout = Self::parse_layout(serialized)?;
+        Ok(Self::from_data(
+            GraphLinksData::MmapSlice {
+                mmap,
+                offset,
+                len: layout.serialized_len_bytes,
+            },
+            layout,
+        ))
     }
 
     /// Perform an explicit O(E) integrity scan of every graph link and upper
@@ -695,7 +730,14 @@ impl GraphLinks {
     }
 
     pub fn is_mmap_backed(&self) -> bool {
-        matches!(self.data, GraphLinksData::Mmap(_))
+        matches!(
+            self.data,
+            GraphLinksData::Mmap(_) | GraphLinksData::MmapSlice { .. }
+        )
+    }
+
+    pub fn is_bytes_backed(&self) -> bool {
+        matches!(self.data, GraphLinksData::Bytes(_))
     }
 
     pub fn serialized_size_bytes(&self) -> u64 {

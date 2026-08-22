@@ -3,6 +3,7 @@
 
 //! Strict, versioned physical contracts shared by non-HNSW search providers.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -10,6 +11,46 @@ use paro_common::error::{self as paro_error, Result};
 
 pub const FULLTEXT_PROVIDER_CONFIG_VERSION: u32 = 1;
 pub const SPARSE_PROVIDER_CONFIG_VERSION: u32 = 1;
+
+/// Shared strict boundary for durable provider configuration. New providers
+/// must opt into version checking and semantic validation here instead of
+/// growing another ad-hoc JSON fallback.
+pub(crate) trait StrictProviderConfig: Serialize + DeserializeOwned + Sized {
+    const PROVIDER_NAME: &'static str;
+    const VERSION: u32;
+
+    fn version(&self) -> u32;
+    fn validate_semantics(&self) -> Result<()>;
+}
+
+pub(crate) fn decode_provider_config<T: StrictProviderConfig>(value: &Value) -> Result<T> {
+    let config: T = serde_json::from_value(value.clone()).map_err(|err| {
+        paro_error::invalid_input(format!(
+            "invalid {} provider_config: {err}",
+            T::PROVIDER_NAME
+        ))
+    })?;
+    if config.version() != T::VERSION {
+        return Err(paro_error::invalid_input(format!(
+            "unsupported {} provider_config version {}, expected {}",
+            T::PROVIDER_NAME,
+            config.version(),
+            T::VERSION
+        )));
+    }
+    config.validate_semantics()?;
+    Ok(config)
+}
+
+pub(crate) fn encode_provider_config<T: StrictProviderConfig>(config: &T) -> Result<Value> {
+    config.validate_semantics()?;
+    serde_json::to_value(config).map_err(|err| {
+        paro_error::serialization_error(format!(
+            "serialize {} provider_config: {err}",
+            T::PROVIDER_NAME
+        ))
+    })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,23 +61,24 @@ pub struct FullTextProviderConfig {
 
 impl FullTextProviderConfig {
     pub fn from_value(value: &Value) -> Result<Self> {
-        let config: Self = serde_json::from_value(value.clone()).map_err(|err| {
-            paro_error::invalid_input(format!("invalid FullText provider_config: {err}"))
-        })?;
-        if config.version != FULLTEXT_PROVIDER_CONFIG_VERSION {
-            return Err(paro_error::invalid_input(format!(
-                "unsupported FullText provider_config version {}, expected {}",
-                config.version, FULLTEXT_PROVIDER_CONFIG_VERSION
-            )));
-        }
-        crate::index::fulltext::tokenizer::TokenizerKind::from_config(&config.config)?;
-        Ok(config)
+        decode_provider_config(value)
     }
 
     pub fn to_value(&self) -> Result<Value> {
-        serde_json::to_value(self).map_err(|err| {
-            paro_error::serialization_error(format!("serialize FullText provider_config: {err}"))
-        })
+        encode_provider_config(self)
+    }
+}
+
+impl StrictProviderConfig for FullTextProviderConfig {
+    const PROVIDER_NAME: &'static str = "FullText";
+    const VERSION: u32 = FULLTEXT_PROVIDER_CONFIG_VERSION;
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+
+    fn validate_semantics(&self) -> Result<()> {
+        crate::index::fulltext::tokenizer::TokenizerKind::from_config(&self.config).map(|_| ())
     }
 }
 
@@ -55,22 +97,24 @@ pub enum SparsePhysicalEncoding {
 
 impl SparseProviderConfig {
     pub fn from_value(value: &Value) -> Result<Self> {
-        let config: Self = serde_json::from_value(value.clone()).map_err(|err| {
-            paro_error::invalid_input(format!("invalid Sparse provider_config: {err}"))
-        })?;
-        if config.version != SPARSE_PROVIDER_CONFIG_VERSION {
-            return Err(paro_error::invalid_input(format!(
-                "unsupported Sparse provider_config version {}, expected {}",
-                config.version, SPARSE_PROVIDER_CONFIG_VERSION
-            )));
-        }
-        Ok(config)
+        decode_provider_config(value)
     }
 
     pub fn to_value(&self) -> Result<Value> {
-        serde_json::to_value(self).map_err(|err| {
-            paro_error::serialization_error(format!("serialize Sparse provider_config: {err}"))
-        })
+        encode_provider_config(self)
+    }
+}
+
+impl StrictProviderConfig for SparseProviderConfig {
+    const PROVIDER_NAME: &'static str = "Sparse";
+    const VERSION: u32 = SPARSE_PROVIDER_CONFIG_VERSION;
+
+    fn version(&self) -> u32 {
+        self.version
+    }
+
+    fn validate_semantics(&self) -> Result<()> {
+        Ok(())
     }
 }
 

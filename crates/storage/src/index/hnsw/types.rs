@@ -5,6 +5,8 @@
 //!
 //! Core types for the HNSW (Hierarchical Navigable Small World) index.
 
+#[cfg(test)]
+use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -14,6 +16,11 @@ pub type PointOffset = u32;
 /// Score type for distance/similarity values.
 pub type ScoreType = f32;
 pub const DEFAULT_HNSW_BUILD_SEED: u64 = 0x5041_524f_484e_5357;
+pub const DEFAULT_HNSW_M: u32 = 24;
+pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
+pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
+pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
+pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 0;
 pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 1;
 
 /// A scored point — a point with its similarity/distance score.
@@ -192,16 +199,16 @@ pub struct HnswSearchPolicy {
 impl Default for HnswSearchPolicy {
     fn default() -> Self {
         Self {
-            ef_search: 100,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
+            ef_search: DEFAULT_HNSW_EF_SEARCH as usize,
+            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
+            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
         }
     }
 }
 
-/// Transient configuration used by low-level build and test APIs. Persisted
-/// artifacts store only [`HnswBuildContract`], and production search receives
-/// an explicit [`HnswSearchPolicy`] from the active definition.
+/// Unit-test adapter for concise graph fixtures. Production build entrypoints
+/// accept [`HnswBuildContract`] directly and cannot mix build/search settings.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
     /// Number of edges per node in the index graph (layers > 0).
@@ -212,31 +219,29 @@ pub struct HnswConfig {
     /// Number of neighbours to consider during index building.
     /// Larger = more accurate search, more time to build.
     pub ef_construct: usize,
-    /// Default ef for search (can be overridden per query).
     pub ef: usize,
-    /// Maximum visible-table row count below which an unfiltered exact scan is
-    /// preferred. Providers must evaluate it once per query, globally.
     pub plain_scan_threshold: usize,
-    /// Maximum filtered candidate count below which a filtered plain scan is preferred.
     pub filtered_plain_scan_threshold: usize,
     /// Seed for the versioned deterministic construction RNG.
     pub build_seed: u64,
 }
 
+#[cfg(test)]
 impl Default for HnswConfig {
     fn default() -> Self {
         HnswConfig {
-            m: 24,
-            m0: 48, // 2 * m
-            ef_construct: 100,
-            ef: 100,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
+            m: DEFAULT_HNSW_M as usize,
+            m0: (DEFAULT_HNSW_M * 2) as usize,
+            ef_construct: DEFAULT_HNSW_EF_CONSTRUCT as usize,
+            ef: DEFAULT_HNSW_EF_SEARCH as usize,
+            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
+            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
         }
     }
 }
 
+#[cfg(test)]
 impl HnswConfig {
     /// Create a new config with the given m and ef_construct.
     pub fn new(m: usize, ef_construct: usize) -> Self {
@@ -245,8 +250,8 @@ impl HnswConfig {
             m0: m * 2,
             ef_construct,
             ef: ef_construct,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
+            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
+            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
         }
     }
@@ -274,16 +279,26 @@ impl HnswConfig {
         self
     }
 
-    pub fn build_contract(self, distance: super::DistanceMetric) -> HnswBuildContract {
-        HnswBuildContract {
+    pub fn try_build_contract(self, distance: super::DistanceMetric) -> Result<HnswBuildContract> {
+        let contract = HnswBuildContract {
             version: HNSW_BUILD_CONTRACT_VERSION,
-            m: u32::try_from(self.m).expect("HNSW m exceeds durable contract width"),
-            m0: u32::try_from(self.m0).expect("HNSW m0 exceeds durable contract width"),
-            ef_construct: u32::try_from(self.ef_construct)
-                .expect("HNSW ef_construct exceeds durable contract width"),
+            m: u32::try_from(self.m)
+                .map_err(|_| paro_error::out_of_range("HNSW m exceeds durable u32 width"))?,
+            m0: u32::try_from(self.m0)
+                .map_err(|_| paro_error::out_of_range("HNSW m0 exceeds durable u32 width"))?,
+            ef_construct: u32::try_from(self.ef_construct).map_err(|_| {
+                paro_error::out_of_range("HNSW ef_construct exceeds durable u32 width")
+            })?,
             distance,
             build_seed: self.build_seed,
-        }
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn build_contract(self, distance: super::DistanceMetric) -> HnswBuildContract {
+        self.try_build_contract(distance)
+            .expect("test HNSW configuration is valid")
     }
 
     pub const fn search_policy(self) -> HnswSearchPolicy {
@@ -321,6 +336,7 @@ impl HnswM {
     }
 }
 
+#[cfg(test)]
 impl From<&HnswConfig> for HnswM {
     fn from(config: &HnswConfig) -> Self {
         HnswM {

@@ -30,8 +30,7 @@
 
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildStopCheck, HnswBuilder, HnswConfig, InMemoryVectorStorage,
-    VectorStorage,
+    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, InMemoryVectorStorage, VectorStorage,
 };
 use crate::index::{BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions};
 use crate::rowset::encoding::{
@@ -42,7 +41,7 @@ use crate::rowset::page::{
     CompressionType, DataPageFooter, EncodingType, IndexPageFooter, IndexPageType, NullEncoding,
     PageFooter, PageIO, PagePointer, CURRENT_DATA_PAGE_FORMAT_VERSION,
 };
-use crate::statistics::{BaseStatistics, ColumnStatistics};
+use crate::statistics::{BaseStatistics, ColumnStatistics, HnswIndexStatistics};
 use bytes::{BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
@@ -102,10 +101,8 @@ pub struct ColumnWriterOptions {
     pub fixed_len: usize,
     /// Whether to build an HNSW index (for Vector type)
     pub build_hnsw: bool,
-    /// HNSW configuration
-    pub hnsw_config: Option<HnswConfig>,
-    /// Distance metric for HNSW
-    pub hnsw_distance: Option<DistanceMetric>,
+    /// Immutable HNSW physical build contract.
+    pub hnsw_build_contract: Option<HnswBuildContract>,
     /// Optional cooperative stop-check for HNSW build.
     pub hnsw_stop_check: Option<HnswBuildStopCheck>,
 }
@@ -127,8 +124,7 @@ impl ColumnWriterOptions {
             build_bitmap_index: false,
             fixed_len: 0,
             build_hnsw: false,
-            hnsw_config: None,
-            hnsw_distance: None,
+            hnsw_build_contract: None,
             hnsw_stop_check: None,
         }
     }
@@ -173,15 +169,9 @@ impl ColumnWriterOptions {
         self
     }
 
-    pub fn with_hnsw(
-        mut self,
-        build: bool,
-        config: Option<HnswConfig>,
-        distance: Option<DistanceMetric>,
-    ) -> Self {
+    pub fn with_hnsw(mut self, build: bool, build_contract: Option<HnswBuildContract>) -> Self {
         self.build_hnsw = build;
-        self.hnsw_config = config;
-        self.hnsw_distance = distance;
+        self.hnsw_build_contract = build_contract;
         self
     }
 
@@ -358,6 +348,8 @@ pub struct ColumnWriterMeta {
     pub bitmap_index_pointer: Option<PagePointer>,
     /// HNSW index pointer (optional)
     pub hnsw_index_pointer: Option<PagePointer>,
+    /// HNSW summary persisted in the segment footer.
+    pub hnsw_index_statistics: Option<HnswIndexStatistics>,
     /// Total data size in bytes
     pub data_size: u64,
     /// Total index size in bytes
@@ -1282,7 +1274,9 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
         let zonemap_index_pointer = self.write_zone_map()?;
         let bloom_filter_pointer = self.write_bloom_filter_index()?;
         let bitmap_index_pointer = self.write_bitmap_index()?;
-        let hnsw_index_pointer = self.write_hnsw_index()?;
+        let hnsw = self.write_hnsw_index()?;
+        let hnsw_index_pointer = hnsw.as_ref().map(|(pointer, _)| *pointer);
+        let hnsw_index_statistics = hnsw.map(|(_, statistics)| statistics);
 
         let dict_size = self.dict_page_pointer.map(|p| p.size as u64).unwrap_or(0);
         let mut index_size =
@@ -1324,6 +1318,7 @@ impl<W: DataWriter + 'static> ScalarColumnWriter<W> {
                 .map(|p| PagePointer::new(meta_base_offset + p.offset, p.size)),
             hnsw_index_pointer: hnsw_index_pointer
                 .map(|p| PagePointer::new(meta_base_offset + p.offset, p.size)),
+            hnsw_index_statistics,
             data_size: self.data_size,
             index_size,
             total_mem_footprint,
@@ -1449,7 +1444,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
     }
 
     /// Write HNSW index to file (optional).
-    fn write_hnsw_index(&mut self) -> Result<Option<PagePointer>> {
+    fn write_hnsw_index(&mut self) -> Result<Option<(PagePointer, HnswIndexStatistics)>> {
         let Some(storage) = self.hnsw_storage.take() else {
             return Ok(None);
         };
@@ -1458,18 +1453,16 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             return Ok(None);
         }
 
-        let config = self.opts.hnsw_config.ok_or_else(|| {
-            paro_error::internal("HNSW vector storage is missing its build configuration")
-        })?;
-        let distance = self.opts.hnsw_distance.ok_or_else(|| {
-            paro_error::internal("HNSW vector storage is missing its distance contract")
+        let build_contract = self.opts.hnsw_build_contract.ok_or_else(|| {
+            paro_error::internal("HNSW vector storage is missing its build contract")
         })?;
         let mut hnsw_builder = HnswBuilder::new();
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);
         }
-        let index = hnsw_builder.build(Arc::new(storage), config, distance)?;
+        let index = hnsw_builder.build(Arc::new(storage), build_contract)?;
 
+        let statistics = HnswIndexStatistics::collect(&index);
         let index_data = index.serialize()?;
         let footer = PageFooter::Index(IndexPageFooter {
             num_entries: index.graph.links.num_points() as u32,
@@ -1485,7 +1478,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             &footer,
         )?;
 
-        Ok(Some(ptr))
+        Ok(Some((ptr, statistics)))
     }
 
     /// Consume the writer and return the underlying writer.

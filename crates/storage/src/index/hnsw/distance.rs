@@ -122,7 +122,7 @@ impl DistanceMetric {
     /// queries are already unit length, so only the stored vector norm remains
     /// in the hot loop. Stored table values themselves stay byte-for-byte
     /// unchanged by index construction.
-    pub fn similarity_prepared(&self, prepared_query: &[f32], vector: &[f32]) -> ScoreType {
+    pub fn similarity_unindexed(&self, prepared_query: &[f32], vector: &[f32]) -> ScoreType {
         debug_assert_eq!(
             prepared_query.len(),
             vector.len(),
@@ -138,17 +138,14 @@ impl DistanceMetric {
     /// `inverse_norm` once per point, eliminating a second vector pass and
     /// square root from every graph visit.
     #[inline]
-    pub fn similarity_prepared_indexed(
+    pub fn similarity_prepared_with_norm(
         &self,
         prepared_query: &[f32],
         vector: &[f32],
-        cosine_inverse_norm: Option<f32>,
+        cosine_inverse_norm: f32,
     ) -> ScoreType {
         match self {
-            Self::Cosine => {
-                distance::dot_product(prepared_query, vector)
-                    * cosine_inverse_norm.expect("cosine HNSW artifact is missing inverse norms")
-            }
+            Self::Cosine => distance::dot_product(prepared_query, vector) * cosine_inverse_norm,
             _ => self.similarity(prepared_query, vector),
         }
     }
@@ -160,14 +157,12 @@ impl DistanceMetric {
         &self,
         v1: &[f32],
         v2: &[f32],
-        cosine_inverse_norm_1: Option<f32>,
-        cosine_inverse_norm_2: Option<f32>,
+        cosine_inverse_norm_1: f32,
+        cosine_inverse_norm_2: f32,
     ) -> ScoreType {
         match self {
             Self::Cosine => {
-                distance::dot_product(v1, v2)
-                    * cosine_inverse_norm_1.expect("cosine HNSW artifact is missing inverse norms")
-                    * cosine_inverse_norm_2.expect("cosine HNSW artifact is missing inverse norms")
+                distance::dot_product(v1, v2) * cosine_inverse_norm_1 * cosine_inverse_norm_2
             }
             _ => self.similarity(v1, v2),
         }
@@ -304,11 +299,11 @@ mod tests {
         // persisted vector. Index construction must not normalize SQL values.
         let prepared = metric.prepare(&v1);
         assert!(approx_eq(
-            metric.similarity_prepared(prepared.as_slice(), &v2),
+            metric.similarity_unindexed(prepared.as_slice(), &v2),
             0.96
         ));
         assert!(approx_eq(
-            metric.similarity_prepared(prepared.as_slice(), &[0.0, 0.0]),
+            metric.similarity_unindexed(prepared.as_slice(), &[0.0, 0.0]),
             0.0
         ));
     }

@@ -58,12 +58,12 @@ pub(crate) fn search_definition_from_entry(
         column_ids: column_ids.clone(),
         expression: expression.clone(),
         freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
-        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+        config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
             kind,
             &column_ids,
             expression.as_deref(),
             &provider_config,
-        ),
+        )?,
         provider_config,
     }))
 }

@@ -376,12 +376,12 @@ impl SearchCapability {
 }
 
 impl SearchIndexDefinition {
-    pub fn compute_config_fingerprint(
+    pub fn try_compute_config_fingerprint(
         kind: SearchIndexKind,
         column_ids: &[ColumnId],
         expression: Option<&str>,
         provider_config: &Value,
-    ) -> u64 {
+    ) -> paro_common::error::Result<u64> {
         let mut payload = Vec::new();
         payload.extend_from_slice(format!("{kind:?}|").as_bytes());
         for column_id in column_ids {
@@ -393,20 +393,58 @@ impl SearchIndexDefinition {
             payload.extend_from_slice(expression.as_bytes());
         }
         payload.push(b'|');
-        if kind == SearchIndexKind::Hnsw {
-            if let Ok(config) = super::HnswProviderConfig::from_value(provider_config) {
+        match kind {
+            SearchIndexKind::Hnsw => {
+                let config = super::HnswProviderConfig::from_value(provider_config)?;
                 payload.extend_from_slice(config.dimension.to_string().as_bytes());
                 payload.push(b'|');
                 payload.extend_from_slice(
                     serde_json::to_string(&config.build_contract())
-                        .expect("HNSW build contract is serializable")
+                        .map_err(|error| {
+                            paro_common::error::serialization_error(format!(
+                                "serialize HNSW build contract fingerprint: {error}"
+                            ))
+                        })?
                         .as_bytes(),
                 );
-                return seahash::hash(&payload);
+            }
+            SearchIndexKind::FullText => {
+                let config = super::FullTextProviderConfig::from_value(provider_config)?;
+                payload.extend_from_slice(
+                    serde_json::to_string(&config)
+                        .map_err(|error| {
+                            paro_common::error::serialization_error(format!(
+                                "serialize FullText provider fingerprint: {error}"
+                            ))
+                        })?
+                        .as_bytes(),
+                );
+            }
+            SearchIndexKind::Sparse => {
+                let config = super::SparseProviderConfig::from_value(provider_config)?;
+                payload.extend_from_slice(
+                    serde_json::to_string(&config)
+                        .map_err(|error| {
+                            paro_common::error::serialization_error(format!(
+                                "serialize Sparse provider fingerprint: {error}"
+                            ))
+                        })?
+                        .as_bytes(),
+                );
             }
         }
-        payload.extend_from_slice(provider_config.to_string().as_bytes());
-        seahash::hash(&payload)
+        Ok(seahash::hash(&payload))
+    }
+
+    #[cfg(test)]
+    pub fn compute_config_fingerprint(
+        kind: SearchIndexKind,
+        column_ids: &[ColumnId],
+        expression: Option<&str>,
+        provider_config: &Value,
+    ) -> u64 {
+        Self::try_compute_config_fingerprint(kind, column_ids, expression, provider_config)
+            .expect("test provider configuration is valid")
     }
 }
 
@@ -622,5 +660,34 @@ mod tests {
         rebuilt.m = 24;
         rebuilt.ef_construct = 120;
         assert_ne!(fingerprint(&base), fingerprint(&rebuilt));
+    }
+
+    #[test]
+    fn production_fingerprint_rejects_invalid_provider_config() {
+        let invalid = serde_json::json!({
+            "version": 1,
+            "dimension": 16,
+            "distance": "cosine",
+            "m": 16,
+            "ef_construct": 96,
+            "ef_search": 64,
+            "plain_scan_threshold": 10000,
+            "filtered_plain_scan_threshold": 0,
+            "build_seed": 7,
+            "inline_threshold": {
+                "enabled": false,
+                "max_vector_count": 0,
+                "max_graph_memory_bytes": 0,
+                "max_dimension": 0
+            },
+            "unknown": true
+        });
+        assert!(SearchIndexDefinition::try_compute_config_fingerprint(
+            SearchIndexKind::Hnsw,
+            &[0],
+            None,
+            &invalid,
+        )
+        .is_err());
     }
 }

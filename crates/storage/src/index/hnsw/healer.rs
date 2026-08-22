@@ -26,12 +26,19 @@ fn score_indexed(
     left: PointOffset,
     right: PointOffset,
 ) -> f32 {
-    distance.similarity_indexed(
-        storage.get_vector(left),
-        storage.get_vector(right),
-        storage.cosine_inverse_norm(left),
-        storage.cosine_inverse_norm(right),
-    )
+    if distance == DistanceMetric::Cosine {
+        let norms = storage
+            .cosine_inverse_norms()
+            .unwrap_or_else(|| unreachable!("cosine healer storage is prepared once"));
+        distance.similarity_indexed(
+            storage.get_vector(left),
+            storage.get_vector(right),
+            norms.value(left),
+            norms.value(right),
+        )
+    } else {
+        distance.similarity(storage.get_vector(left), storage.get_vector(right))
+    }
 }
 
 /// Repairs an old graph and migrates surviving points into a new builder.

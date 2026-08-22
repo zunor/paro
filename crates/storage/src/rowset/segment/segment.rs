@@ -321,7 +321,7 @@ impl Segment {
         }
     }
 
-    fn shared_file_reader(&self) -> Result<PositionedFile> {
+    pub(super) fn shared_file_reader(&self) -> Result<PositionedFile> {
         let mut shared = self.shared_file.lock().map_err(|_| {
             paro_error::internal(format!(
                 "segment {} shared file lock is poisoned",

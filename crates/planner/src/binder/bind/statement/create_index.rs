@@ -14,10 +14,12 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, CreateIndexStmt, Expr, IndexKind};
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
-use paro_storage::index::hnsw::{DistanceMetric, HnswConfig};
+use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
+    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD,
+    DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -319,22 +321,25 @@ fn hnsw_provider_config(
         )));
     }
 
-    let defaults = HnswConfig::default();
     let inline_defaults = HnswInlineThreshold::DEFAULT;
-    let m = parse_u64_index_option(options, "m", defaults.m as u64)?;
+    let m = parse_u64_index_option(options, "m", u64::from(DEFAULT_HNSW_M))?;
     if !(2..=1_024).contains(&m) {
         return Err(paro_error::invalid_input(format!(
             "HNSW index option m must be between 2 and 1024, got {m}"
         )));
     }
-    let ef_construct =
-        parse_u64_index_option(options, "ef_construct", defaults.ef_construct as u64)?;
+    let ef_construct = parse_u64_index_option(
+        options,
+        "ef_construct",
+        u64::from(DEFAULT_HNSW_EF_CONSTRUCT),
+    )?;
     if ef_construct < m || ef_construct > 1_000_000 {
         return Err(paro_error::invalid_input(format!(
             "HNSW index option ef_construct must be between m ({m}) and 1000000, got {ef_construct}"
         )));
     }
-    let ef_search = parse_u64_index_option(options, "ef_search", defaults.ef as u64)?;
+    let ef_search =
+        parse_u64_index_option(options, "ef_search", u64::from(DEFAULT_HNSW_EF_SEARCH))?;
     if ef_search == 0 || ef_search > 1_000_000 {
         return Err(paro_error::invalid_input(format!(
             "HNSW index option ef_search must be between 1 and 1000000, got {ef_search}"
@@ -351,12 +356,12 @@ fn hnsw_provider_config(
     let plain_scan_threshold = parse_u64_index_option(
         options,
         "plain_scan_threshold",
-        defaults.plain_scan_threshold as u64,
+        u64::from(DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD),
     )?;
     let filtered_plain_scan_threshold = parse_u64_index_option(
         options,
         "filtered_plain_scan_threshold",
-        defaults.filtered_plain_scan_threshold as u64,
+        u64::from(DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD),
     )?;
     let inline_enabled = parse_bool_index_option(options, "inline_enabled", true)?;
     if !inline_enabled

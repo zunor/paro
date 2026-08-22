@@ -5,9 +5,12 @@ use crate::compaction::execution::index_rebuild::{
     CompactionGenerationContext, CompactionIndexRebuilder,
 };
 use crate::compaction::plan::types::CompactionPlan;
+#[cfg(test)]
+use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
-    DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswConfig, HnswIndex,
-    IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
+    DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswBuildContract,
+    HnswIndex, IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
+    HNSW_BUILD_CONTRACT_VERSION,
 };
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{
@@ -16,6 +19,7 @@ use crate::rowset::page::{
 };
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
+use crate::statistics::HnswIndexStatistics;
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
@@ -28,8 +32,7 @@ use std::sync::Arc;
 struct HnswIndexedColumn {
     column_id: u32,
     dim: usize,
-    config: HnswConfig,
-    distance: DistanceMetric,
+    build_contract: HnswBuildContract,
 }
 
 // Reuse the old graph only when most output points still map back to it.
@@ -58,16 +61,41 @@ impl HnswIndexRebuilder {
             .filter(|c| c.index_hnsw)
             .map(|c| match c.logical_type {
                 LogicalType::Array(ref inner, dim) if matches!(**inner, LogicalType::Float) => {
-                    Ok(HnswIndexedColumn {
-                        column_id: c.id,
-                        dim,
-                        config: HnswConfig::new(c.hnsw_m, c.hnsw_ef_construct),
+                    let m = u32::try_from(c.hnsw_m).map_err(|_| {
+                        paro_error::data_corrupted(format!(
+                            "HNSW m {} on column {} exceeds durable u32 width",
+                            c.hnsw_m, c.id
+                        ))
+                    })?;
+                    let ef_construct = u32::try_from(c.hnsw_ef_construct).map_err(|_| {
+                        paro_error::data_corrupted(format!(
+                            "HNSW ef_construct {} on column {} exceeds durable u32 width",
+                            c.hnsw_ef_construct, c.id
+                        ))
+                    })?;
+                    let build_contract = HnswBuildContract {
+                        version: HNSW_BUILD_CONTRACT_VERSION,
+                        m,
+                        m0: m.checked_mul(2).ok_or_else(|| {
+                            paro_error::data_corrupted(format!(
+                                "HNSW m {} on column {} overflows m0",
+                                c.hnsw_m, c.id
+                            ))
+                        })?,
+                        ef_construct,
                         distance: DistanceMetric::from_u8(c.hnsw_distance).ok_or_else(|| {
                             paro_error::data_corrupted(format!(
                                 "invalid HNSW distance tag {} on column {}",
                                 c.hnsw_distance, c.id
                             ))
                         })?,
+                        build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
+                    };
+                    build_contract.validate()?;
+                    Ok(HnswIndexedColumn {
+                        column_id: c.id,
+                        dim,
+                        build_contract,
                     })
                 }
                 _ => Err(paro_error::not_supported(format!(
@@ -86,10 +114,10 @@ impl HnswIndexRebuilder {
         for rowset in input_rowsets {
             rowset.load()?;
             for segment in rowset.segments() {
-                let Some(index) = segment.hnsw_index(indexed_col.column_id) else {
+                let Some(index) = segment.open_hnsw_index(indexed_col.column_id)? else {
                     continue;
                 };
-                if index.build_contract != indexed_col.config.build_contract(indexed_col.distance) {
+                if index.build_contract != indexed_col.build_contract {
                     continue;
                 }
                 if index.vector_storage.vector_dim() != indexed_col.dim {
@@ -170,6 +198,7 @@ impl HnswIndexRebuilder {
                 .map(|p| p.size as u64)
                 .unwrap_or_default();
             target.hnsw_index_pointer = Some(ptr);
+            target.hnsw_index_statistics = Some(HnswIndexStatistics::collect(&rebuilt_index));
             target.total_mem_footprint = target
                 .total_mem_footprint
                 .saturating_sub(previous_size)
@@ -198,11 +227,7 @@ impl HnswIndexRebuilder {
             return Ok(index);
         }
 
-        Ok(HnswIndex::build(
-            output_storage,
-            indexed_col.config,
-            indexed_col.distance,
-        ))
+        HnswIndex::try_build(output_storage, indexed_col.build_contract)
     }
 
     fn build_index_with_healer(
@@ -210,7 +235,8 @@ impl HnswIndexRebuilder {
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
     ) -> Result<Option<HnswIndex>> {
-        let output_storage = IndexedVectorStorage::prepare(output_storage, indexed_col.distance);
+        let output_storage =
+            IndexedVectorStorage::prepare(output_storage, indexed_col.build_contract.distance);
         let Some((best_old_index, signature_overlap)) =
             Self::select_best_old_index(output_storage.as_ref(), old_candidates)
         else {
@@ -229,9 +255,10 @@ impl HnswIndexRebuilder {
             return Ok(None);
         }
 
-        let mut builder = GraphLayersBuilder::new_with_heuristic(
+        let build_contract = indexed_col.build_contract;
+        let mut builder = GraphLayersBuilder::new_from_contract(
             output_storage.num_vectors(),
-            &indexed_col.config,
+            &build_contract,
             true,
         );
 
@@ -239,16 +266,19 @@ impl HnswIndexRebuilder {
             let point_id = new_id as PointOffset;
             let level = old_id_opt
                 .map(|old_id| best_old_index.graph.links.point_level(old_id))
-                .unwrap_or_else(|| builder.get_random_layer());
+                .unwrap_or_else(|| builder.random_layer_for_point(point_id));
             builder.set_levels(point_id, level);
         }
 
         let mut healer = GraphLayersHealer::new(
             &best_old_index.graph,
             &old_to_new,
-            indexed_col.config.ef_construct,
+            indexed_col.build_contract.ef_construct as usize,
         );
-        healer.heal(best_old_index.vector_storage.as_ref(), indexed_col.distance);
+        healer.heal(
+            best_old_index.vector_storage.as_ref(),
+            indexed_col.build_contract.distance,
+        );
         healer.save_into_builder(&builder);
 
         for (new_id, old_id_opt) in new_to_old.iter().enumerate() {
@@ -256,7 +286,11 @@ impl HnswIndexRebuilder {
                 continue;
             }
             let point_id = new_id as PointOffset;
-            builder.link_new_point(point_id, output_storage.as_ref(), indexed_col.distance);
+            builder.link_new_point(
+                point_id,
+                output_storage.as_ref(),
+                indexed_col.build_contract.distance,
+            );
         }
 
         let (links, entry_points) = builder.into_graph_data();
@@ -264,14 +298,13 @@ impl HnswIndexRebuilder {
             links,
             entry_points,
             VisitedPool::new(),
-            (&indexed_col.config).into(),
+            (&build_contract).into(),
         );
-        Ok(Some(HnswIndex::new(
-            indexed_col.config,
+        Ok(Some(HnswIndex::try_new(
+            build_contract,
             graph,
             output_storage,
-            indexed_col.distance,
-        )))
+        )?))
     }
 
     fn select_best_old_index(
@@ -460,13 +493,15 @@ impl HnswIndexRebuilder {
                     continue;
                 }
 
-                let index = persisted.hnsw_index(indexed_col.column_id).ok_or_else(|| {
-                    paro_error::data_corrupted(format!(
-                        "Missing HNSW index after compaction: segment={} column={}",
-                        persisted.segment_id(),
-                        indexed_col.column_id
-                    ))
-                })?;
+                let index = persisted
+                    .open_hnsw_index(indexed_col.column_id)?
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted(format!(
+                            "Missing HNSW index after compaction: segment={} column={}",
+                            persisted.segment_id(),
+                            indexed_col.column_id
+                        ))
+                    })?;
 
                 let points = index.graph.links.num_points();
                 if points != segment_rows {
@@ -580,8 +615,7 @@ mod tests {
         let indexed_col = HnswIndexedColumn {
             column_id: 1,
             dim: 4,
-            config,
-            distance,
+            build_contract: config.try_build_contract(distance).unwrap(),
         };
 
         let old_vectors = storage(&[
@@ -721,8 +755,7 @@ mod tests {
         let indexed_col = HnswIndexedColumn {
             column_id: 1,
             dim,
-            config,
-            distance,
+            build_contract: config.try_build_contract(distance).unwrap(),
         };
         let mut old_indexes_by_col = HashMap::new();
         old_indexes_by_col.insert(1, vec![old_index]);

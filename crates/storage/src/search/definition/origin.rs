@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use crate::index::hnsw::{DistanceMetric, HnswSearchPolicy};
 use crate::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
 };
@@ -34,7 +34,7 @@ pub(crate) fn schema_seed_definition(
             column.hnsw_distance, column.id
         ))
     })?;
-    let defaults = HnswConfig::default();
+    let defaults = HnswSearchPolicy::default();
     let inline = HnswInlineThreshold::DEFAULT;
     let provider_config = HnswProviderConfig {
         version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
@@ -67,12 +67,12 @@ pub(crate) fn schema_seed_definition(
         column_ids: vec![column.id],
         expression: None,
         freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Hnsw),
-        config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+        config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
             SearchIndexKind::Hnsw,
             &[column.id],
             None,
             &provider_config,
-        ),
+        )?,
         provider_config,
     })
 }

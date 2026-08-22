@@ -10,7 +10,9 @@ use paro_storage::compaction::compaction_task::{CompactionTask, HorizontalCompac
 use paro_storage::compaction::execution::statistics_merge::merge_rowset_statistics;
 use paro_storage::compaction::plan::CompactionPlanner;
 use paro_storage::index::fulltext::text_index::FullTextIndex;
-use paro_storage::index::hnsw::{DistanceMetric, HnswConfig};
+use paro_storage::index::hnsw::{
+    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED, HNSW_BUILD_CONTRACT_VERSION,
+};
 use paro_storage::primary_key::DeleteVector;
 use paro_storage::rowset::{
     ColumnData, Segment, SegmentOptions, SegmentWriter, SegmentWriterOptions,
@@ -178,7 +180,17 @@ fn test_index_statistics() {
 
     let opts = SegmentWriterOptions::new(0)
         .with_short_key_index(false)
-        .with_hnsw_index(1, HnswConfig::new(8, 50), DistanceMetric::Cosine);
+        .with_hnsw_build_contract(
+            1,
+            HnswBuildContract {
+                version: HNSW_BUILD_CONTRACT_VERSION,
+                m: 8,
+                m0: 16,
+                ef_construct: 50,
+                distance: DistanceMetric::Cosine,
+                build_seed: DEFAULT_HNSW_BUILD_SEED,
+            },
+        );
     let mut writer = SegmentWriter::create(schema.clone(), &segment_path, opts).unwrap();
 
     let ids = [0_i64, 1, 2, 3];

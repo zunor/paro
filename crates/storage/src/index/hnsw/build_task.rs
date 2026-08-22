@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{DistanceMetric, HnswBuildStopCheck, HnswBuilder, HnswConfig, MmapVectorStorage};
+use super::{HnswBuildContract, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage};
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{
     BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
@@ -9,6 +9,7 @@ use crate::rowset::page::{
 };
 use crate::rowset::segment::{SegmentFooter, SegmentSharedPtr};
 use crate::rowset::RowsetSharedPtr;
+use crate::statistics::HnswIndexStatistics;
 use crate::tablet::ColumnId;
 use parking_lot::Mutex;
 use paro_common::error::{self as paro_error, ParoError, Result};
@@ -27,16 +28,14 @@ use std::sync::Arc;
 #[derive(Debug, Clone)]
 pub struct HnswColumnBuildConfig {
     pub column_id: ColumnId,
-    pub config: HnswConfig,
-    pub distance: DistanceMetric,
+    pub build_contract: HnswBuildContract,
 }
 
 impl HnswColumnBuildConfig {
-    pub fn new(column_id: ColumnId, config: HnswConfig, distance: DistanceMetric) -> Self {
+    pub fn new(column_id: ColumnId, build_contract: HnswBuildContract) -> Self {
         Self {
             column_id,
-            config,
-            distance,
+            build_contract,
         }
     }
 }
@@ -58,8 +57,7 @@ pub struct HnswBuildSummary {
 struct SegmentColumnJob {
     column_id: ColumnId,
     dim: usize,
-    config: HnswConfig,
-    distance: DistanceMetric,
+    build_contract: HnswBuildContract,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +79,7 @@ struct PendingHnswPage {
     compression: CompressionType,
     num_entries: u32,
     index_data: Vec<u8>,
+    statistics: HnswIndexStatistics,
 }
 
 struct SharedBuildState {
@@ -267,6 +266,7 @@ impl HnswBuildTask {
                         ))
                     })?;
                 target.hnsw_index_pointer = Some(ptr);
+                target.hnsw_index_statistics = Some(page.statistics);
                 target.total_mem_footprint =
                     target.total_mem_footprint.saturating_add(ptr.size as u64);
                 built_columns += 1;
@@ -372,13 +372,15 @@ fn build_hnsw_page_data(
         col_meta.num_rows * job.dim as u64 * std::mem::size_of::<f32>() as u64,
         job.dim,
     )?);
-    let index = hnsw_builder.build(vector_storage, job.config, job.distance)?;
+    let index = hnsw_builder.build(vector_storage, job.build_contract)?;
+    let statistics = HnswIndexStatistics::collect(&index);
     let index_data = index.serialize()?;
     Ok(Some(PendingHnswPage {
         column_id: job.column_id,
         compression: col_meta.compression,
         num_entries: index.graph.links.num_points() as u32,
         index_data,
+        statistics,
     }))
 }
 
@@ -449,8 +451,7 @@ fn collect_segment_job(
         target_columns.push(SegmentColumnJob {
             column_id: config.column_id,
             dim,
-            config: config.config,
-            distance: config.distance,
+            build_contract: config.build_contract,
         });
     }
 
@@ -547,7 +548,9 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{HnswIndex, InMemoryVectorStorage, SearchParams};
+    use crate::index::hnsw::{
+        DistanceMetric, HnswConfig, HnswIndex, InMemoryVectorStorage, SearchParams,
+    };
     use crate::rowset::segment::{
         ColumnData, Segment, SegmentOptions, SegmentWriter, SegmentWriterOptions,
     };
@@ -631,8 +634,9 @@ mod tests {
             &[rowset.clone()],
             &[HnswColumnBuildConfig::new(
                 1,
-                HnswConfig::new(8, 50),
-                DistanceMetric::Euclidean,
+                HnswConfig::new(8, 50)
+                    .try_build_contract(DistanceMetric::Euclidean)
+                    .unwrap(),
             )],
             scheduler,
         )
@@ -767,8 +771,9 @@ mod tests {
             &[rowset.clone()],
             &[HnswColumnBuildConfig::new(
                 1,
-                HnswConfig::new(8, 50),
-                DistanceMetric::Euclidean,
+                HnswConfig::new(8, 50)
+                    .try_build_contract(DistanceMetric::Euclidean)
+                    .unwrap(),
             )],
             scheduler,
             Some(stop_check),

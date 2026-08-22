@@ -413,9 +413,12 @@ fn hnsw_column_build_options(
         ));
     };
     let provider = definition.hnsw_provider_config()?;
-    let config = provider.build_config();
-    let distance = provider.distance;
-    Ok((*column_id, HnswColumnBuildOptions { config, distance }))
+    Ok((
+        *column_id,
+        HnswColumnBuildOptions {
+            build_contract: provider.build_contract(),
+        },
+    ))
 }
 
 fn estimate_inline_build_cost(
@@ -774,7 +777,7 @@ impl RowsetWriter {
 
         options = options.with_build_hnsw_indexes(self.context.build_hnsw_indexes);
         for (column_id, hnsw) in hnsw_indexes {
-            options = options.with_hnsw_index(column_id, hnsw.config, hnsw.distance);
+            options = options.with_hnsw_build_contract(column_id, hnsw.build_contract);
         }
 
         let mut writer = SegmentWriter::create(self.context.schema.clone(), segment_path, options)?;

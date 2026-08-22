@@ -11,7 +11,9 @@ use crate::index::hnsw::entry_points::EntryPoints;
 use crate::index::hnsw::graph_links::GraphLinks;
 use crate::index::hnsw::links_container::{ItemsBuffer, LinksContainer};
 use crate::index::hnsw::search_context::SearchContext;
-use crate::index::hnsw::types::{HnswConfig, HnswM, PointOffset, ScoreType, ScoredPoint};
+#[cfg(test)]
+use crate::index::hnsw::types::HnswConfig;
+use crate::index::hnsw::types::{HnswBuildContract, HnswM, PointOffset, ScoreType, ScoredPoint};
 use crate::index::hnsw::vector_storage::VectorStorage;
 use crate::index::hnsw::visited_pool::VisitedPool;
 use bitvec::prelude::BitVec;
@@ -99,47 +101,58 @@ pub struct GraphLayersBuilder {
     /// Whether to collect per-build distance profile metrics.
     distance_profile_enabled: bool,
     distance_profile: DistanceProfile,
-    /// Stable construction RNG. The algorithm is owned by Paro so identical
-    /// input/configuration remains reproducible across rand crate upgrades.
-    build_rng: Mutex<DeterministicBuildRng>,
+    /// Stable construction seed. Levels are derived from `(seed, point_id)`
+    /// without shared mutable state, so future parallel proposal generation
+    /// cannot make topology depend on scheduling order.
+    build_seed: u64,
 }
 
 /// SplitMix64 construction RNG, version 1.
 ///
 /// Do not change this algorithm in place. A future algorithm requires a new
 /// provider-config version so persisted seeds retain their meaning.
-#[derive(Debug)]
-struct DeterministicBuildRng {
-    state: u64,
-}
+struct DeterministicBuildRng;
 
 impl DeterministicBuildRng {
-    const fn new(seed: u64) -> Self {
-        Self { state: seed }
-    }
-    fn next_u64(&mut self) -> u64 {
-        self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-        let mut value = self.state;
+    fn point_u64(seed: u64, point_id: PointOffset) -> u64 {
+        // This is exactly the point-id-indexed form of the previous serial
+        // SplitMix64 stream: point 0 observes the first draw, point 1 the
+        // second, and so on. It preserves topology while removing draw order.
+        let stream_position = u64::from(point_id).wrapping_add(1);
+        let mut value = seed.wrapping_add(0x9e37_79b9_7f4a_7c15_u64.wrapping_mul(stream_position));
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
         value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         value ^ (value >> 31)
     }
 
     /// Stable uniform sample in the open interval (0, 1).
-    fn next_open_unit_f64(&mut self) -> f64 {
+    fn point_open_unit_f64(seed: u64, point_id: PointOffset) -> f64 {
         const MANTISSA_VALUES: u64 = 1_u64 << 53;
-        let mantissa = self.next_u64() >> 11;
+        let mantissa = Self::point_u64(seed, point_id) >> 11;
         (mantissa as f64 + 1.0) / (MANTISSA_VALUES as f64 + 1.0)
     }
 }
 
 impl GraphLayersBuilder {
+    #[cfg(test)]
     pub fn new(num_points: usize, config: &HnswConfig) -> Self {
         Self::new_with_heuristic(num_points, config, false)
     }
 
+    #[cfg(test)]
     pub fn new_with_heuristic(num_points: usize, config: &HnswConfig, use_heuristic: bool) -> Self {
-        let hnsw_m = HnswM::from(config);
+        let contract = config
+            .try_build_contract(DistanceMetric::Euclidean)
+            .expect("test HNSW configuration is valid");
+        Self::new_from_contract(num_points, &contract, use_heuristic)
+    }
+
+    pub fn new_from_contract(
+        num_points: usize,
+        contract: &HnswBuildContract,
+        use_heuristic: bool,
+    ) -> Self {
+        let hnsw_m = HnswM::from(contract);
         let level_factor = 1.0 / (max(hnsw_m.m, 2) as f64).ln();
 
         let mut links_layers = Vec::with_capacity(num_points);
@@ -152,7 +165,7 @@ impl GraphLayersBuilder {
             entry_points: Mutex::new(EntryPoints::new()),
             visited_pool: VisitedPool::new(),
             hnsw_m,
-            ef_construct: config.ef_construct,
+            ef_construct: contract.ef_construct as usize,
             level_factor,
             ready_list: BitVec::repeat(false, num_points),
             max_level: AtomicUsize::new(0),
@@ -160,7 +173,7 @@ impl GraphLayersBuilder {
             distance_cache_slots: 0,
             distance_profile_enabled: false,
             distance_profile: DistanceProfile::default(),
-            build_rng: Mutex::new(DeterministicBuildRng::new(config.build_seed)),
+            build_seed: contract.build_seed,
         }
     }
 
@@ -182,9 +195,8 @@ impl GraphLayersBuilder {
     }
 
     /// Generate a random level for a new point using geometric distribution.
-    pub fn get_random_layer(&self) -> usize {
-        let mut rng = self.build_rng.lock();
-        let r = rng.next_open_unit_f64();
+    pub fn random_layer_for_point(&self, point_id: PointOffset) -> usize {
+        let r = DeterministicBuildRng::point_open_unit_f64(self.build_seed, point_id);
         let level = (-r.ln() * self.level_factor) as usize;
         level.min(31) // Cap at reasonable max level
     }
@@ -503,12 +515,19 @@ impl GraphLayersBuilder {
         left: PointOffset,
         right: PointOffset,
     ) -> ScoreType {
-        distance.similarity_indexed(
-            storage.get_vector(left),
-            storage.get_vector(right),
-            storage.cosine_inverse_norm(left),
-            storage.cosine_inverse_norm(right),
-        )
+        if distance == DistanceMetric::Cosine {
+            let norms = storage
+                .cosine_inverse_norms()
+                .unwrap_or_else(|| unreachable!("cosine build storage is prepared once"));
+            distance.similarity_indexed(
+                storage.get_vector(left),
+                storage.get_vector(right),
+                norms.value(left),
+                norms.value(right),
+            )
+        } else {
+            distance.similarity(storage.get_vector(left), storage.get_vector(right))
+        }
     }
 
     /// Helper to iterate over links of a point at a specific level during build.
@@ -545,5 +564,35 @@ impl GraphLayersBuilder {
         let entry_points = self.entry_points.into_inner();
 
         (graph_links, entry_points)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn level_sampling_depends_on_point_identity_not_call_order() {
+        let contract = HnswConfig::new(16, 96)
+            .with_build_seed(0x1234_5678)
+            .build_contract(DistanceMetric::Euclidean);
+        let forward = GraphLayersBuilder::new_from_contract(128, &contract, true);
+        let forward_levels = (0..128_u32)
+            .map(|point| forward.random_layer_for_point(point))
+            .collect::<Vec<_>>();
+        let reverse = GraphLayersBuilder::new_from_contract(128, &contract, true);
+        let mut reverse_levels = (0..128_u32)
+            .rev()
+            .map(|point| (point, reverse.random_layer_for_point(point)))
+            .collect::<Vec<_>>();
+        reverse_levels.sort_unstable_by_key(|(point, _)| *point);
+
+        assert_eq!(
+            forward_levels,
+            reverse_levels
+                .into_iter()
+                .map(|(_, level)| level)
+                .collect::<Vec<_>>()
+        );
     }
 }

@@ -359,12 +359,12 @@ impl IndexBackfillPublishTask {
         let provider_config = definition.provider_config.clone();
         let column_ids = definition.column_ids.clone();
         let definition = SearchIndexDefinition {
-            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+            config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
                 kind,
                 &column_ids,
                 expression.as_deref(),
                 &provider_config,
-            ),
+            )?,
             ..definition
         };
         storage.register_search_definition(definition)

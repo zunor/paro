@@ -6,22 +6,68 @@
 //! Distance scoring helpers shared by graph search and plain/full-scan paths.
 
 use super::types::{PointOffset, ScoreType, ScoredPoint};
-use super::{PreparedQuery, VectorStorage};
+use super::vector_storage::CosineInverseNorms;
+use super::{DistanceMetric, PreparedQuery, VectorStorage};
+
+enum ScoringKernel<'a> {
+    Cosine(&'a CosineInverseNorms),
+    Other(DistanceMetric),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::hnsw::InMemoryVectorStorage;
+
+    #[test]
+    fn cosine_kernel_requires_norms_at_construction_boundary() {
+        let storage = InMemoryVectorStorage::new(vec![1.0, 0.0], 2);
+        let query = DistanceMetric::Cosine.prepare(&[1.0, 0.0]);
+        assert!(VectorScorer::new(&query, &storage)
+            .err()
+            .expect("cosine scorer without norms must fail")
+            .to_string()
+            .contains("missing per-point inverse norms"));
+    }
+}
 
 /// Vector scorer responsible for calculating distances during search and build.
 pub struct VectorScorer<'a> {
     query: &'a PreparedQuery,
     pub(crate) vector_storage: &'a dyn VectorStorage,
+    kernel: ScoringKernel<'a>,
     scores_buffer: Vec<ScoreType>,
 }
 
 impl<'a> VectorScorer<'a> {
-    pub fn new(query: &'a PreparedQuery, vector_storage: &'a dyn VectorStorage) -> Self {
-        Self {
+    pub fn new(
+        query: &'a PreparedQuery,
+        vector_storage: &'a dyn VectorStorage,
+    ) -> paro_common::error::Result<Self> {
+        let kernel = match query.metric() {
+            DistanceMetric::Cosine => {
+                let norms = vector_storage.cosine_inverse_norms().ok_or_else(|| {
+                    paro_common::error::data_corrupted(
+                        "cosine HNSW artifact is missing per-point inverse norms",
+                    )
+                })?;
+                if norms.len() != vector_storage.num_vectors() {
+                    return Err(paro_common::error::data_corrupted(format!(
+                        "HNSW cosine inverse norm count mismatch: expected {}, got {}",
+                        vector_storage.num_vectors(),
+                        norms.len()
+                    )));
+                }
+                ScoringKernel::Cosine(norms)
+            }
+            metric => ScoringKernel::Other(metric),
+        };
+        Ok(Self {
             query,
             vector_storage,
+            kernel,
             scores_buffer: Vec::new(),
-        }
+        })
     }
 
     /// Score a single point.
@@ -31,11 +77,14 @@ impl<'a> VectorScorer<'a> {
 
     /// Score an indexed point whose vector has already been fetched.
     pub fn score_cached_point(&self, point_id: PointOffset, vector: &[f32]) -> ScoreType {
-        self.query.metric().similarity_prepared_indexed(
-            self.query.as_slice(),
-            vector,
-            self.vector_storage.cosine_inverse_norm(point_id),
-        )
+        match self.kernel {
+            ScoringKernel::Cosine(norms) => self.query.metric().similarity_prepared_with_norm(
+                self.query.as_slice(),
+                vector,
+                norms.value(point_id),
+            ),
+            ScoringKernel::Other(metric) => metric.similarity(self.query.as_slice(), vector),
+        }
     }
 
     /// Score a batch of points into a caller-provided buffer.

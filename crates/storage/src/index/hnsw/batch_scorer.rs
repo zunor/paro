@@ -111,7 +111,7 @@ mod tests {
         let top_k = 3;
 
         let prepared = DistanceMetric::DotProduct.prepare(&query);
-        let scorer = VectorScorer::new(&prepared, storage.as_ref());
+        let scorer = VectorScorer::new(&prepared, storage.as_ref()).unwrap();
         let actual = BatchScorer::new(vec![scorer], top_k).scan(0..storage.num_vectors() as u32);
         let expected = brute_force_results(
             &query,
@@ -141,7 +141,7 @@ mod tests {
             .collect::<Vec<_>>();
         let scorers = prepared_queries
             .iter()
-            .map(|query| VectorScorer::new(query, storage.as_ref()))
+            .map(|query| VectorScorer::new(query, storage.as_ref()).unwrap())
             .collect::<Vec<_>>();
 
         let actual =

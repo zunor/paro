@@ -7,13 +7,39 @@ use crate::index::art::ART;
 use crate::index::fulltext::text_index::FullTextIndex;
 use crate::index::sparse::SparseVectorIndex;
 use crate::index::{BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex};
+use crate::rowset::page::{CompressionType, PagePointer};
 use crate::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, IndexStatistics, IndexType,
     SegmentIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::ColumnId;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
+
+pub(super) enum DeferredHnswState {
+    Unloaded,
+    Ready {
+        index: Arc<HnswIndex>,
+        statistics: HnswIndexStatistics,
+    },
+    Unsupported {
+        reason: String,
+    },
+    Failed(paro_common::error::ParoError),
+}
+
+/// Structural pointer to an inline HNSW artifact. Its page is read and the
+/// index is materialized only when a vector-search capability asks for it.
+/// Unsupported durable versions are a recoverable capability state; current
+/// format corruption remains an error at that capability boundary.
+pub(super) struct DeferredHnswIndex {
+    pub(super) page_pointer: PagePointer,
+    pub(super) compression: CompressionType,
+    pub(super) vector_data_offset: u64,
+    pub(super) vector_data_len: u64,
+    pub(super) dimension: usize,
+    pub(super) state: Mutex<DeferredHnswState>,
+}
 
 #[derive(Default)]
 pub struct SegmentPredicateIndexes {
@@ -67,7 +93,7 @@ impl SegmentPredicateIndexes {
 
 #[derive(Default)]
 pub struct SegmentSearchIndexes {
-    pub(super) hnsw_indexes: HashMap<ColumnId, Arc<HnswIndex>>,
+    pub(super) hnsw_indexes: HashMap<ColumnId, Arc<DeferredHnswIndex>>,
     pub(super) sparse_indexes: HashMap<ColumnId, Arc<SparseVectorIndex>>,
     pub(super) fulltext_indexes: HashMap<ColumnId, Arc<FullTextIndex>>,
     pub(super) runtime_fulltext_indexes: RwLock<HashMap<ColumnId, Arc<FullTextIndex>>>,
@@ -198,14 +224,49 @@ impl SegmentIndexStats {
 }
 
 impl Segment {
-    /// Get HNSW index for a column.
+    /// Whether the segment footer advertises an inline HNSW artifact. This is
+    /// a metadata-only check and never opens the artifact.
+    pub fn has_hnsw_artifact(&self, column_id: ColumnId) -> bool {
+        self.indexes.search.hnsw_indexes.contains_key(&column_id)
+    }
+
+    /// Materialize the HNSW capability on first use.
+    pub fn open_hnsw_index(
+        &self,
+        column_id: ColumnId,
+    ) -> paro_common::error::Result<Option<Arc<HnswIndex>>> {
+        let Some(deferred) = self.indexes.search.hnsw_indexes.get(&column_id) else {
+            return Ok(None);
+        };
+        self.materialize_hnsw_index(deferred)
+    }
+
+    /// Test-only convenience for assertions over freshly written segments.
+    #[cfg(test)]
     pub fn hnsw_index(&self, column_id: ColumnId) -> Option<Arc<HnswIndex>> {
-        self.indexes.search.hnsw_indexes.get(&column_id).cloned()
+        self.open_hnsw_index(column_id).ok().flatten()
     }
 
     /// Get HNSW index statistics for a column.
-    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<&HnswIndexStatistics> {
-        self.index_stats.hnsw_stats.get(&column_id)
+    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
+        if let Some(stats) = self.index_stats.hnsw_stats.get(&column_id) {
+            return Some(stats.clone());
+        }
+        let deferred = self.indexes.search.hnsw_indexes.get(&column_id)?;
+        let state = deferred.state.lock().ok()?;
+        match &*state {
+            DeferredHnswState::Ready { statistics, .. } => Some(statistics.clone()),
+            _ => None,
+        }
+    }
+
+    pub fn hnsw_rebuild_reason(&self, column_id: ColumnId) -> Option<String> {
+        let deferred = self.indexes.search.hnsw_indexes.get(&column_id)?;
+        let state = deferred.state.lock().ok()?;
+        match &*state {
+            DeferredHnswState::Unsupported { reason } => Some(reason.clone()),
+            _ => None,
+        }
     }
 
     /// Get sparse index for a column.

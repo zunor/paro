@@ -32,7 +32,9 @@
 
 use super::segment::{Segment, SegmentOptions};
 use super::segment_format::{ColumnMeta, SegmentFooter};
-use crate::index::hnsw::{DistanceMetric, HnswBuildStopCheck, HnswConfig};
+#[cfg(test)]
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use crate::index::hnsw::{HnswBuildContract, HnswBuildStopCheck};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
 use crate::rowset::encoding::FieldType;
@@ -42,6 +44,7 @@ use crate::rowset::page::{
 };
 use crate::rowset::segment_statistics::{ColumnSegmentStatistics, SegmentStatistics};
 use crate::rowset::RowsetId;
+use crate::statistics::{split_stats_trailer, HnswIndexStatistics};
 use crate::tablet::{ColumnId, TabletColumn, TabletSchemaRef};
 use bytes::{Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
@@ -84,8 +87,7 @@ pub struct SegmentWriterOptions {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswColumnBuildOptions {
-    pub config: HnswConfig,
-    pub distance: DistanceMetric,
+    pub build_contract: HnswBuildContract,
 }
 
 impl Default for SegmentWriterOptions {
@@ -173,15 +175,24 @@ impl SegmentWriterOptions {
     }
 
     /// Add a physical HNSW build contract for one vector column.
-    pub fn with_hnsw_index(
+    pub fn with_hnsw_build_contract(
         mut self,
+        column_id: ColumnId,
+        build_contract: HnswBuildContract,
+    ) -> Self {
+        self.hnsw_indexes
+            .insert(column_id, HnswColumnBuildOptions { build_contract });
+        self
+    }
+
+    #[cfg(test)]
+    pub fn with_hnsw_index(
+        self,
         column_id: ColumnId,
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Self {
-        self.hnsw_indexes
-            .insert(column_id, HnswColumnBuildOptions { config, distance });
-        self
+        self.with_hnsw_build_contract(column_id, config.build_contract(distance))
     }
 
     /// Set cooperative stop-check for HNSW build.
@@ -387,8 +398,7 @@ impl SegmentWriter {
                 .with_bitmap_index(self.options.bitmap_index_columns.contains(&col.id))
                 .with_hnsw(
                     self.options.build_hnsw_indexes && is_hnsw_col,
-                    hnsw.map(|options| options.config),
-                    hnsw.map(|options| options.distance),
+                    hnsw.map(|options| options.build_contract),
                 )
                 .with_hnsw_stop_check(self.options.hnsw_stop_check.clone());
 
@@ -655,6 +665,7 @@ impl SegmentWriter {
                 hnsw_index_pointer: writer_meta
                     .hnsw_index_pointer
                     .map(|p| PagePointer::new(current_offset + p.offset, p.size)),
+                hnsw_index_statistics: writer_meta.hnsw_index_statistics,
                 sparse_index_pointer: None,
                 fulltext_index_pointer: None,
                 field_type,
@@ -813,6 +824,15 @@ impl SegmentWriter {
                 num_entries,
             )?;
             set_inline_index_pointer(meta, page.kind, pointer);
+            if page.kind == SegmentInlineIndexKind::Hnsw {
+                let stats_bytes = split_stats_trailer(page.bytes).0.ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "HNSW inline artifact for column {} has no statistics trailer",
+                        page.column_id
+                    ))
+                })?;
+                meta.hnsw_index_statistics = Some(HnswIndexStatistics::from_bytes(stats_bytes)?);
+            }
         }
         Ok(())
     }

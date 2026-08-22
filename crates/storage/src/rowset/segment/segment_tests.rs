@@ -4,6 +4,7 @@
 use super::segment::PositionedFile;
 use super::*;
 use crate::index::{
+    hnsw::{DistanceMetric, HnswConfig},
     FixedMembership, FixedMembershipBuildPolicy, Predicate, PredicateResult, PredicateTree,
 };
 use crate::rowset::page::CompressionType;
@@ -85,6 +86,89 @@ fn segment_open_and_iterate_roundtrip() {
     assert_eq!(batch[0].0, 0);
     assert_eq!(batch[1].0, 1);
     assert_eq!(batch[0].1.data.len(), 4 * std::mem::size_of::<i32>());
+}
+
+#[test]
+fn stale_hnsw_artifact_does_not_make_base_segment_unreadable() {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let temp_dir = TempDir::new().unwrap();
+    let file_path = temp_dir.path().join("stale-hnsw.seg");
+    let schema = Arc::new(
+        TabletSchema::new(
+            1,
+            vec![
+                TabletColumn::key(0, "id", LogicalType::Integer),
+                TabletColumn::new(
+                    1,
+                    "embedding",
+                    LogicalType::Array(Box::new(LogicalType::Float), 2),
+                )
+                .with_hnsw_index(8, 32, 0),
+            ],
+            KeysType::PrimaryKeys,
+        )
+        .unwrap(),
+    );
+    let options = SegmentWriterOptions::new(0)
+        .with_compression(CompressionType::None)
+        .with_hnsw_index(1, HnswConfig::new(8, 32), DistanceMetric::Euclidean);
+    let mut writer = SegmentWriter::create(schema.clone(), &file_path, options).unwrap();
+    let ids = (0_i32..4).flat_map(i32::to_le_bytes).collect::<Vec<_>>();
+    let vectors = [
+        [0.0_f32, 0.0_f32],
+        [1.0_f32, 1.0_f32],
+        [2.0_f32, 2.0_f32],
+        [3.0_f32, 3.0_f32],
+    ]
+    .into_iter()
+    .flatten()
+    .flat_map(f32::to_le_bytes)
+    .collect::<Vec<_>>();
+    writer
+        .append_chunk(&[ColumnData::new(ids, 4), ColumnData::new(vectors, 4)])
+        .unwrap();
+    let written = writer.finalize().unwrap();
+    let pointer = written
+        .get_column_meta(1)
+        .and_then(|meta| meta.hnsw_index_pointer)
+        .expect("inline HNSW page");
+    drop(written);
+
+    // Re-sign the page after changing only the HNSW envelope version. This
+    // models a valid artifact produced by an older binary rather than disk
+    // corruption (which must remain a hard error at capability open).
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&file_path)
+        .unwrap();
+    file.seek(SeekFrom::Start(pointer.offset)).unwrap();
+    let mut page = vec![0u8; pointer.size as usize];
+    file.read_exact(&mut page).unwrap();
+    page[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    let checksum = crc32c::crc32c(&page[..page.len() - 4]);
+    let checksum_offset = page.len() - 4;
+    page[checksum_offset..].copy_from_slice(&checksum.to_le_bytes());
+    file.seek(SeekFrom::Start(pointer.offset)).unwrap();
+    file.write_all(&page).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+
+    let reopened = Segment::open(0, &file_path, schema, SegmentOptions::default(), 1, 1, 1)
+        .expect("stale search artifact must not fail segment open");
+    let rows = reopened.read_by_rowids(&[0], &[0, 3]).unwrap();
+    assert_eq!(
+        rows[0].1.data.len(),
+        2 * std::mem::size_of::<i32>(),
+        "ordinary base-column reads remain usable"
+    );
+    assert!(reopened.has_hnsw_artifact(1));
+    assert!(reopened.open_hnsw_index(1).unwrap().is_none());
+    assert!(reopened
+        .hnsw_rebuild_reason(1)
+        .expect("stale artifact reason")
+        .contains("rebuild the vector index"));
 }
 
 #[test]
