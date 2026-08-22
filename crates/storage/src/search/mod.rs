@@ -21,6 +21,7 @@ pub mod inline_sink;
 pub(crate) mod lifecycle;
 pub mod maintenance;
 pub mod posting_stream;
+pub mod provider_config;
 pub(crate) mod providers;
 pub mod request;
 pub mod sidecar;
@@ -68,6 +69,10 @@ pub use maintenance::{
 };
 pub use posting_stream::{
     CandidateStreamStep, PostingCandidateStream, PostingPruningHint, SearchScore,
+};
+pub use provider_config::{
+    FullTextProviderConfig, SparsePhysicalEncoding, SparseProviderConfig,
+    FULLTEXT_PROVIDER_CONFIG_VERSION, SPARSE_PROVIDER_CONFIG_VERSION,
 };
 pub use providers::fulltext::inline::FullTextInlineArtifactBuilder;
 pub use providers::sparse::inline::SparseInlineArtifactBuilder;

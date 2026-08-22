@@ -46,6 +46,14 @@ WHERE index_name = 'idx_indexed_items_emb';
 EXPLAIN SELECT id FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
+-- A cosine operator must not consume an L2 artifact. Metric mismatch is a
+-- capability miss and falls back to the exact relational plan.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]' LIMIT 2;
+SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
+
 -- Prepared Top-K must preserve PostgreSQL's reusable $n parameter identity.
 PREPARE vector_topk(VECTOR(3)) AS
     SELECT id FROM indexed_items ORDER BY emb <-> $1 LIMIT 2;

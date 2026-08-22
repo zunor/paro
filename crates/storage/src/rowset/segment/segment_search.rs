@@ -5,7 +5,9 @@ use super::segment::Segment;
 use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
-use crate::index::hnsw::{HnswSearchMode, PreparedQuery, ScoredPoint, SearchParams};
+use crate::index::hnsw::{
+    HnswSearchMode, HnswSearchPolicy, PreparedQuery, ScoredPoint, SearchParams,
+};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
@@ -22,6 +24,7 @@ impl Segment {
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
         self.vector_search_with_epoch(
@@ -29,6 +32,7 @@ impl Segment {
             query,
             top_k,
             params,
+            policy,
             self.rowset_gen,
             predicate_tree,
         )
@@ -41,6 +45,7 @@ impl Segment {
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
@@ -51,6 +56,7 @@ impl Segment {
             params,
             snapshot_epoch,
             predicate_tree,
+            policy,
             HnswSearchMode::Auto,
         )
     }
@@ -63,6 +69,7 @@ impl Segment {
         params: &SearchParams,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
+        policy: &HnswSearchPolicy,
         mode: HnswSearchMode,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
@@ -74,7 +81,14 @@ impl Segment {
                 return Ok(Vec::new());
             }
         }
-        index.search_one_with_mode(query, top_k, params, filter_bitmap.as_ref(), mode)
+        index.search_one_with_policy_mode(
+            query,
+            top_k,
+            params,
+            filter_bitmap.as_ref(),
+            policy,
+            mode,
+        )
     }
 
     /// Perform a batched vector search on this segment.
@@ -84,6 +98,7 @@ impl Segment {
         queries: &[PreparedQuery],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         predicate_tree: Option<&PredicateTree>,
         mode: HnswSearchMode,
     ) -> Result<Vec<Vec<ScoredPoint>>> {
@@ -92,6 +107,7 @@ impl Segment {
             queries,
             top_k,
             params,
+            policy,
             self.rowset_gen,
             predicate_tree,
             mode,
@@ -105,6 +121,7 @@ impl Segment {
         queries: &[PreparedQuery],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
         mode: HnswSearchMode,
@@ -122,7 +139,14 @@ impl Segment {
                 return Ok(vec![Vec::new(); queries.len()]);
             }
         }
-        index.search_many_prepared(queries, top_k, params, filter_bitmap.as_ref(), mode)
+        index.search_many_prepared_with_policy(
+            queries,
+            top_k,
+            params,
+            filter_bitmap.as_ref(),
+            policy,
+            mode,
+        )
     }
 
     /// Perform a sparse vector search on this segment.

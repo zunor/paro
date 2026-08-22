@@ -190,14 +190,14 @@ impl GraphLinks {
         };
         let bytes = self.data.as_bytes();
         let start_byte = self.level0_links_offset + start * POINT_BYTES;
-        let count = end - start;
-        // parse_layout validated every CSR range against the serialized link
-        // payload. read_unaligned supports both Vec<u8> and mmap backing without
-        // requiring a decoded/realigned copy.
-        let links = unsafe { bytes.as_ptr().add(start_byte).cast::<PointOffset>() };
-        for index in 0..count {
-            let raw = unsafe { std::ptr::read_unaligned(links.add(index)) };
-            f(PointOffset::from_le(raw));
+        let end_byte = self.level0_links_offset + end * POINT_BYTES;
+        // Offset-table validation makes this a single checked slice operation;
+        // individual links then decode from exact-width chunks without unsafe
+        // alignment or pointer assumptions for either Vec or mmap backing.
+        for raw in bytes[start_byte..end_byte].chunks_exact(POINT_BYTES) {
+            f(PointOffset::from_le_bytes(
+                raw.try_into().expect("level-0 link chunk width"),
+            ));
         }
     }
 
@@ -256,11 +256,10 @@ impl GraphLinks {
             return None;
         }
         let bytes = self.data.as_bytes();
-        let start = Self::read_validated_u64(bytes, self.level0_offsets_offset + point * U64_BYTES)
+        let start =
+            Self::read_layout_u64(bytes, self.level0_offsets_offset + point * U64_BYTES) as usize;
+        let end = Self::read_layout_u64(bytes, self.level0_offsets_offset + (point + 1) * U64_BYTES)
             as usize;
-        let end =
-            Self::read_validated_u64(bytes, self.level0_offsets_offset + (point + 1) * U64_BYTES)
-                as usize;
         debug_assert!(start <= end && end <= self.level0_link_count);
         Some((start, end))
     }
@@ -273,10 +272,9 @@ impl GraphLinks {
         }
         let bytes = self.data.as_bytes();
         let start =
-            Self::read_validated_u64(bytes, self.upper_offsets_offset + point * U64_BYTES) as usize;
-        let end =
-            Self::read_validated_u64(bytes, self.upper_offsets_offset + (point + 1) * U64_BYTES)
-                as usize;
+            Self::read_layout_u64(bytes, self.upper_offsets_offset + point * U64_BYTES) as usize;
+        let end = Self::read_layout_u64(bytes, self.upper_offsets_offset + (point + 1) * U64_BYTES)
+            as usize;
         debug_assert!(start <= end && end <= self.upper_payload_len);
         Some(&bytes[self.upper_payload_offset + start..self.upper_payload_offset + end])
     }
@@ -372,10 +370,12 @@ impl GraphLinks {
     }
 
     #[inline(always)]
-    fn read_validated_u64(bytes: &[u8], start: usize) -> u64 {
-        debug_assert!(start + U64_BYTES <= bytes.len());
-        let raw = unsafe { std::ptr::read_unaligned(bytes.as_ptr().add(start).cast::<u64>()) };
-        u64::from_le(raw)
+    fn read_layout_u64(bytes: &[u8], start: usize) -> u64 {
+        u64::from_le_bytes(
+            bytes[start..start + U64_BYTES]
+                .try_into()
+                .expect("validated GraphLinks offset width"),
+        )
     }
 
     fn read_u32(bytes: &[u8], start: usize, field: &str) -> Result<u32> {
@@ -627,14 +627,6 @@ impl GraphLinks {
             upper_payload_len,
             "upper offset",
         )?;
-        Self::validate_level0_links(bytes, point_count, level0_link_count, level0_links_offset)?;
-        Self::validate_upper_payloads(
-            bytes,
-            point_count,
-            upper_offsets_offset,
-            upper_payload_offset,
-        )?;
-
         Ok(ParsedLayout {
             serialized_len_bytes,
             point_count,
@@ -674,6 +666,27 @@ impl GraphLinks {
         let mmap = Arc::new(unsafe { memmap2::MmapOptions::new().map(&file)? });
         let layout = Self::parse_layout(&mmap)?;
         Ok(Self::from_data(GraphLinksData::Mmap(mmap), layout))
+    }
+
+    /// Perform an explicit O(E) integrity scan of every graph link and upper
+    /// payload. Normal open validates the O(N) offset tables; segment and
+    /// sidecar readers additionally validate their enclosing checksums.
+    /// Standalone recovery tooling can opt into this deeper semantic scan
+    /// without forcing every mmap open to fault every graph page.
+    pub fn verify_integrity(&self) -> Result<()> {
+        let bytes = self.data.as_bytes();
+        Self::validate_level0_links(
+            bytes,
+            self.point_count,
+            self.level0_link_count,
+            self.level0_links_offset,
+        )?;
+        Self::validate_upper_payloads(
+            bytes,
+            self.point_count,
+            self.upper_offsets_offset,
+            self.upper_payload_offset,
+        )
     }
 
     #[inline]
@@ -823,7 +836,7 @@ mod tests {
     }
 
     #[test]
-    fn truncated_upper_varint_is_rejected_at_open() {
+    fn deep_verification_rejects_truncated_upper_varint() {
         let links = GraphLinks::new_from_edges(sample_edges());
         let mut bytes = Vec::new();
         links.serialize(&mut bytes).unwrap();
@@ -836,12 +849,13 @@ mod tests {
         .unwrap() as usize;
         bytes[layout.upper_payload_offset + point0_end - 1] = 0x80;
 
-        let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        let restored = GraphLinks::deserialize(bytes.as_slice()).unwrap();
+        let error = restored.verify_integrity().unwrap_err();
         assert!(error.to_string().contains("invalid upper link"));
     }
 
     #[test]
-    fn out_of_bounds_level0_link_is_rejected_at_open() {
+    fn deep_verification_rejects_out_of_bounds_level0_link() {
         let links = GraphLinks::new_from_edges(sample_edges());
         let mut bytes = Vec::new();
         links.serialize(&mut bytes).unwrap();
@@ -849,7 +863,8 @@ mod tests {
         bytes[layout.level0_links_offset..layout.level0_links_offset + POINT_BYTES]
             .copy_from_slice(&(layout.point_count as u32).to_le_bytes());
 
-        let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
+        let restored = GraphLinks::deserialize(bytes.as_slice()).unwrap();
+        let error = restored.verify_integrity().unwrap_err();
         assert!(error.to_string().contains("level-0 link target"));
     }
 }

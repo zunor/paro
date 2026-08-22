@@ -3,8 +3,6 @@
 
 //! Search definition validation against tablet schema.
 
-use serde_json::Value;
-
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
@@ -19,7 +17,7 @@ pub(crate) fn validate_definition(
     match definition.kind {
         SearchIndexKind::Sparse => validate_sparse_definition(definition, tablet),
         SearchIndexKind::Hnsw => validate_hnsw_definition(definition, tablet),
-        SearchIndexKind::FullText => Ok(()),
+        SearchIndexKind::FullText => definition.fulltext_provider_config().map(|_| ()),
     }
 }
 
@@ -78,25 +76,15 @@ fn validate_sparse_definition(
             column_id
         ))
     })?;
-    let encoding = definition
-        .provider_config
-        .get("physical_encoding")
-        .and_then(Value::as_str)
-        .unwrap_or("binary-v1");
-    match encoding {
-        "binary-v1" | "typed-binary-v1" => {
+    let config = definition.sparse_provider_config()?;
+    match config.physical_encoding {
+        crate::search::SparsePhysicalEncoding::BinaryV1 => {
             if !matches!(column.logical_type, LogicalType::Blob) {
                 return Err(paro_error::not_supported(format!(
                     "Sparse index requires Blob binary sparse row image column, got {:?} for column {}",
                     column.logical_type, column_id
                 )));
             }
-        }
-        _ => {
-            return Err(paro_error::not_supported(format!(
-                "Sparse index physical_encoding must be binary-v1, got {}",
-                encoding
-            )));
         }
     }
     Ok(())

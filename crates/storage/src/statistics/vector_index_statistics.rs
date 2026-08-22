@@ -40,7 +40,12 @@ impl HnswIndexStatistics {
             + index.graph.entry_points.extra_entry_points.len())
             as u64
             * std::mem::size_of::<crate::index::hnsw::EntryPoint>() as u64;
-        let graph_size_bytes = graph_links_size + entry_points_size;
+        let metric_preprocessing_size = index
+            .vector_storage
+            .cosine_inverse_norms()
+            .map(|norms| norms.len() as u64 * std::mem::size_of::<f32>() as u64)
+            .unwrap_or(0);
+        let graph_size_bytes = graph_links_size + entry_points_size + metric_preprocessing_size;
         let storage_size_bytes =
             num_vectors as u64 * dim as u64 * std::mem::size_of::<f32>() as u64;
 
@@ -48,8 +53,8 @@ impl HnswIndexStatistics {
             num_indexed_vectors: num_vectors,
             dimension: dim,
             max_level: index.graph.entry_points.max_level(),
-            m: index.config.m,
-            ef_construction: index.config.ef_construct,
+            m: index.build_contract.m as usize,
+            ef_construction: index.build_contract.ef_construct as usize,
             graph_size_bytes,
             storage_size_bytes,
             total_graph_links: degree_summary.total_links,

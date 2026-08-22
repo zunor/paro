@@ -7,7 +7,7 @@ use crate::compaction::execution::index_rebuild::{
 use crate::compaction::plan::types::CompactionPlan;
 use crate::index::hnsw::{
     DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswConfig, HnswIndex,
-    MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
+    IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
 };
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{
@@ -89,7 +89,7 @@ impl HnswIndexRebuilder {
                 let Some(index) = segment.hnsw_index(indexed_col.column_id) else {
                     continue;
                 };
-                if index.distance != indexed_col.distance {
+                if index.build_contract != indexed_col.config.build_contract(indexed_col.distance) {
                     continue;
                 }
                 if index.vector_storage.vector_dim() != indexed_col.dim {
@@ -210,6 +210,7 @@ impl HnswIndexRebuilder {
         indexed_col: HnswIndexedColumn,
         old_candidates: &[Arc<HnswIndex>],
     ) -> Result<Option<HnswIndex>> {
+        let output_storage = IndexedVectorStorage::prepare(output_storage, indexed_col.distance);
         let Some((best_old_index, signature_overlap)) =
             Self::select_best_old_index(output_storage.as_ref(), old_candidates)
         else {
@@ -228,7 +229,7 @@ impl HnswIndexRebuilder {
             return Ok(None);
         }
 
-        let mut builder = GraphLayersBuilder::new_parallel(
+        let mut builder = GraphLayersBuilder::new_with_heuristic(
             output_storage.num_vectors(),
             &indexed_col.config,
             true,
@@ -255,12 +256,7 @@ impl HnswIndexRebuilder {
                 continue;
             }
             let point_id = new_id as PointOffset;
-            builder.link_new_point(
-                point_id,
-                output_storage.get_vector(point_id),
-                output_storage.as_ref(),
-                indexed_col.distance,
-            );
+            builder.link_new_point(point_id, output_storage.as_ref(), indexed_col.distance);
         }
 
         let (links, entry_points) = builder.into_graph_data();

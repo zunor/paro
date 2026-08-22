@@ -71,7 +71,7 @@ impl RowsetCursor {
         let segments = if let Some(segment) = &params.segment {
             vec![Arc::clone(segment)]
         } else if let Some(options) = &params.segment_options {
-            rowset.segments_with_options(options.clone())?
+            rowset.open_segment_view(options.clone())?
         } else {
             rowset.load()?;
             rowset.segments()

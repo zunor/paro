@@ -11,7 +11,7 @@ use paro_storage::meta::{FileMetadataStore, MetadataStore, TabletMetaManager};
 use paro_storage::{
     compaction::compaction_task::{CompactionTask, HorizontalCompactionTask},
     compaction::plan::CompactionPlanner,
-    index::hnsw::SearchParams,
+    index::hnsw::{HnswSearchPolicy, SearchParams},
     primary_key::{DeleteVector, PersistentIndex, PrimaryIndex, PrimaryKeySerializer},
     tablet::{
         tablet_schema::{KeysType, TabletColumn, TabletSchema},
@@ -276,7 +276,14 @@ fn compaction_rebuilds_hnsw_index_and_preserves_cosine_semantics() {
         ..Default::default()
     };
     let results = rowset
-        .vector_search(1, &[1.0, 1.0], 2, &params, None)
+        .vector_search(
+            1,
+            &[1.0, 1.0],
+            2,
+            &params,
+            &HnswSearchPolicy::default(),
+            None,
+        )
         .unwrap();
     assert!(!results.is_empty());
     assert_eq!(results[0].idx, 1);

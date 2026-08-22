@@ -47,6 +47,30 @@ impl SearchIndexDefinition {
         }
         super::HnswProviderConfig::from_value(&self.provider_config)
     }
+
+    pub fn fulltext_provider_config(
+        &self,
+    ) -> paro_common::error::Result<super::FullTextProviderConfig> {
+        if self.kind != SearchIndexKind::FullText {
+            return Err(paro_common::error::invalid_input(format!(
+                "search definition '{}' is not FullText",
+                self.name
+            )));
+        }
+        super::FullTextProviderConfig::from_value(&self.provider_config)
+    }
+
+    pub fn sparse_provider_config(
+        &self,
+    ) -> paro_common::error::Result<super::SparseProviderConfig> {
+        if self.kind != SearchIndexKind::Sparse {
+            return Err(paro_common::error::invalid_input(format!(
+                "search definition '{}' is not Sparse",
+                self.name
+            )));
+        }
+        super::SparseProviderConfig::from_value(&self.provider_config)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -369,6 +393,18 @@ impl SearchIndexDefinition {
             payload.extend_from_slice(expression.as_bytes());
         }
         payload.push(b'|');
+        if kind == SearchIndexKind::Hnsw {
+            if let Ok(config) = super::HnswProviderConfig::from_value(provider_config) {
+                payload.extend_from_slice(config.dimension.to_string().as_bytes());
+                payload.push(b'|');
+                payload.extend_from_slice(
+                    serde_json::to_string(&config.build_contract())
+                        .expect("HNSW build contract is serializable")
+                        .as_bytes(),
+                );
+                return seahash::hash(&payload);
+            }
+        }
         payload.extend_from_slice(provider_config.to_string().as_bytes());
         seahash::hash(&payload)
     }
@@ -402,11 +438,13 @@ mod tests {
         SearchGeneration, SearchIndexDefinition, SearchIndexKind, SearchNotQueryableReason,
         SearchTailSummary,
     };
+    use crate::index::hnsw::DistanceMetric;
     use crate::search::artifact::{ArtifactFileId, ArtifactLocation};
     use crate::search::stats::{
         ExecutionModes, FullTextProviderStats, GenerationStats, SearchExecutionMode,
         SearchProviderStats,
     };
+    use crate::search::{HnswInlineConfig, HnswProviderConfig, HNSW_PROVIDER_CONFIG_VERSION};
 
     #[test]
     fn coverage_state_knows_exact_tail_merge_contract() {
@@ -542,5 +580,47 @@ mod tests {
             }
         );
         assert!(!token.is_queryable());
+    }
+
+    #[test]
+    fn hnsw_artifact_fingerprint_excludes_search_and_placement_policy() {
+        let base = HnswProviderConfig {
+            version: HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: 16,
+            distance: DistanceMetric::Cosine,
+            m: 16,
+            ef_construct: 96,
+            ef_search: 64,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: 7,
+            inline_threshold: HnswInlineConfig {
+                enabled: true,
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: 128,
+            },
+        }
+        .validated()
+        .unwrap();
+        let mut policy_tuned = base.clone();
+        policy_tuned.ef_search = 240;
+        policy_tuned.plain_scan_threshold = 20_000;
+        policy_tuned.inline_threshold.max_vector_count = 8_192;
+
+        let fingerprint = |config: &HnswProviderConfig| {
+            SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::Hnsw,
+                &[3],
+                None,
+                &config.to_value().unwrap(),
+            )
+        };
+        assert_eq!(fingerprint(&base), fingerprint(&policy_tuned));
+
+        let mut rebuilt = base.clone();
+        rebuilt.m = 24;
+        rebuilt.ef_construct = 120;
+        assert_ne!(fingerprint(&base), fingerprint(&rebuilt));
     }
 }

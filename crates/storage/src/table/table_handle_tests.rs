@@ -152,7 +152,7 @@ fn register_fulltext_definition_with_freshness(
     freshness_policy: SearchFreshnessPolicy,
 ) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    let provider_config = json!({ "config": config });
+    let provider_config = json!({"version": 1, "config": config });
     let expression = format!("to_tsvector('{}', col_{})", config, column_id);
     let definition = SearchIndexDefinition {
         definition_id,
@@ -179,7 +179,7 @@ fn register_fulltext_definition_with_freshness(
 fn register_sparse_definition(table: &TableHandle, column_id: u32) -> u64 {
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
     let expression = format!("sparse_vector(col_{})", column_id);
-    let provider_config = json!({ "physical_encoding": "binary-v1" });
+    let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
     let definition = SearchIndexDefinition {
         definition_id,
         table_id: table.tablet().table_id(),
@@ -384,7 +384,7 @@ fn run_vector_cursor_with_slots(
         params,
         predicate.cloned(),
         table.max_version(),
-        &crate::search::SearchReadOptions::default(),
+        &crate::search::SearchReadOptions::ungoverned(),
     )?;
     drain_search_cursor(
         table,
@@ -420,7 +420,7 @@ fn sparse_search(
         k,
         None,
         table.max_version(),
-        &crate::search::SearchReadOptions::default(),
+        &crate::search::SearchReadOptions::ungoverned(),
     )?;
     drain_search_cursor(table, opened, projected_columns, false, k.clamp(1, 1024), 4)
 }
@@ -517,7 +517,7 @@ impl SearchCursorTestExt for TableHandle {
             &config,
             predicate.cloned(),
             self.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )?;
         drain_search_cursor(self, opened, projected_columns, false, 1024, 4)
     }
@@ -1678,7 +1678,7 @@ fn vector_search_for_view_filters_overlay_deleted_rows() {
             params,
             None,
             &view,
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("open vector search cursor for txn view");
     let chunks = drain_search_cursor(&table, opened, &[0], false, 3, 1)
@@ -2482,7 +2482,7 @@ fn search_snapshot_pins_derived_delta_when_generation_lags_read_ts() {
         .open_search_snapshot(
             &capability,
             target_version,
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("open lagging search snapshot");
     let lease_info = snapshot
@@ -2755,7 +2755,10 @@ fn sparse_registry_definition_auto_builds_for_inserts() {
 fn sparse_registry_rejects_varchar_sparse_input() {
     let table = create_table(&[LogicalType::Varchar]);
     let definition_id = NEXT_TEST_SEARCH_DEFINITION_ID.fetch_add(1, AtomicOrdering::Relaxed);
-    let provider_config = json!({});
+    let provider_config = json!({
+        "version": 1,
+        "physical_encoding": "binary-v1",
+    });
     let expression = "sparse_vector(col_0)".to_string();
     let definition = SearchIndexDefinition {
         definition_id,
@@ -3085,7 +3088,7 @@ fn fulltext_tail_over_budget_rejects_before_provider_open() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .unwrap_err();
     assert!(
@@ -3155,7 +3158,7 @@ fn fulltext_topk_mixed_artifact_tail_uses_unified_generation_stats() {
             None,
             FullTextScoreMode::Bm25,
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .unwrap();
     let chunks = drain_search_cursor(&table, opened, &[0], true, 2, 4).unwrap();
@@ -3190,7 +3193,7 @@ fn fulltext_topk_missing_generation_stats_records_degraded_metric() {
         .open_search_snapshot(
             &capability,
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("search snapshot");
     let table_id = table.table_id();

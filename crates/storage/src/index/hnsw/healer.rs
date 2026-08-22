@@ -19,6 +19,21 @@ use parking_lot::RwLock;
 type LockedLinkContainer = RwLock<LinksContainer>;
 type LockedLayersContainer = Vec<LockedLinkContainer>;
 
+#[inline]
+fn score_indexed(
+    storage: &dyn VectorStorage,
+    distance: DistanceMetric,
+    left: PointOffset,
+    right: PointOffset,
+) -> f32 {
+    distance.similarity_indexed(
+        storage.get_vector(left),
+        storage.get_vector(right),
+        storage.cosine_inverse_norm(left),
+        storage.cosine_inverse_norm(right),
+    )
+}
+
 /// Repairs an old graph and migrates surviving points into a new builder.
 pub struct GraphLayersHealer<'a> {
     links_layers: Vec<LockedLayersContainer>,
@@ -104,7 +119,6 @@ impl<'a> GraphLayersHealer<'a> {
         let mut visited = self.visited_pool.get(self.links_layers.len());
         let mut nearest = FixedLengthPriorityQueue::<ScoredPoint>::new(self.ef_construct);
 
-        let query = storage.get_vector(offset);
         let mut pending = Vec::new();
         let mut neighbours = Vec::with_capacity(self.hnsw_m.get_m(level).saturating_mul(2));
 
@@ -113,7 +127,7 @@ impl<'a> GraphLayersHealer<'a> {
             let links = self.links_layers[offset as usize][level].read();
             for point in links.iter() {
                 if self.point_deleted(point) {
-                    let score = distance.similarity(query, storage.get_vector(point));
+                    let score = score_indexed(storage, distance, offset, point);
                     pending.push(ScoredPoint { idx: point, score });
                 } else {
                     visited.check_and_update_visited(point);
@@ -142,7 +156,7 @@ impl<'a> GraphLayersHealer<'a> {
                 .for_each(|link| neighbours.push(link));
 
             for idx in neighbours.iter().copied() {
-                let score = distance.similarity(query, storage.get_vector(idx));
+                let score = score_indexed(storage, distance, offset, idx);
                 if self.point_deleted(idx) {
                     pending.push(ScoredPoint { idx, score });
                 } else {
@@ -177,9 +191,7 @@ impl<'a> GraphLayersHealer<'a> {
 
         let shortcuts = self.search_shortcuts_on_level(offset, level, storage, distance);
         let mut container = LinksContainer::with_capacity(level_m);
-        let scorer = |a: PointOffset, b: PointOffset| {
-            distance.similarity(storage.get_vector(a), storage.get_vector(b))
-        };
+        let scorer = |a: PointOffset, b: PointOffset| score_indexed(storage, distance, a, b);
         container.fill_from_sorted_with_heuristic(
             shortcuts.into_iter(),
             level_m.saturating_sub(valid_links.len()),
@@ -267,7 +279,7 @@ mod tests {
     use crate::index::hnsw::persistence::HnswIndex;
     use crate::index::hnsw::types::{HnswConfig, SearchParams};
     use crate::index::hnsw::vector_storage::{InMemoryVectorStorage, VectorStorage};
-    use crate::index::hnsw::VisitedPool;
+    use crate::index::hnsw::{IndexedVectorStorage, VisitedPool};
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
@@ -352,18 +364,13 @@ mod tests {
     ) -> HnswIndex {
         assert_eq!(vectors.len(), levels.len());
 
-        let storage: Arc<dyn VectorStorage> = make_storage(vectors);
-        let mut builder = GraphLayersBuilder::new_parallel(vectors.len(), &config, true);
+        let storage = IndexedVectorStorage::prepare(make_storage(vectors), distance);
+        let mut builder = GraphLayersBuilder::new_with_heuristic(vectors.len(), &config, true);
         for (idx, level) in levels.iter().copied().enumerate() {
             builder.set_levels(idx as u32, level);
         }
         for i in 0..vectors.len() {
-            builder.link_new_point(
-                i as u32,
-                storage.get_vector(i as u32),
-                storage.as_ref(),
-                distance,
-            );
+            builder.link_new_point(i as u32, storage.as_ref(), distance);
         }
         let (links, entry_points) = builder.into_graph_data();
         let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
@@ -510,7 +517,7 @@ mod tests {
                 build_index_with_levels(&survivor_vectors, &survivor_levels, config, distance);
 
             let mut healed_builder =
-                GraphLayersBuilder::new_parallel(survivor_vectors.len(), &config, true);
+                GraphLayersBuilder::new_with_heuristic(survivor_vectors.len(), &config, true);
             for &old_idx in &survivors_old {
                 let new_idx = old_to_new[old_idx as usize].expect("survivor must be remapped");
                 healed_builder.set_levels(new_idx, base_index.graph.links.point_level(old_idx));

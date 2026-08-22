@@ -143,6 +143,18 @@ pub fn dot_product(v1: &[f32], v2: &[f32]) -> f32 {
     scalar::dot_product(v1, v2)
 }
 
+/// Return the multiplicative inverse of a vector norm, or zero for the
+/// engine's canonical near-zero vector domain.
+#[inline]
+pub fn inverse_norm(vector: &[f32]) -> f32 {
+    let squared = dot_product(vector, vector);
+    if squared < f32::EPSILON {
+        0.0
+    } else {
+        squared.sqrt().recip()
+    }
+}
+
 /// Normalize a vector to unit length.
 ///
 /// Automatically selects the best SIMD implementation available.
@@ -185,17 +197,12 @@ pub fn normalize(vector: Vec<f32>) -> Vec<f32> {
 #[inline]
 pub fn cosine_distance(v1: &[f32], v2: &[f32]) -> f32 {
     let dot = dot_product(v1, v2);
-
-    // Compute norms using dot_product with self (benefits from SIMD)
-    let norm1_sq = dot_product(v1, v1);
-    let norm2_sq = dot_product(v2, v2);
-    let norm_product = (norm1_sq * norm2_sq).sqrt();
-
-    if norm_product < f32::EPSILON {
+    let inverse_norm_1 = inverse_norm(v1);
+    let inverse_norm_2 = inverse_norm(v2);
+    if inverse_norm_1 == 0.0 || inverse_norm_2 == 0.0 {
         return 1.0; // If either vector is zero, distance is maximum
     }
-
-    1.0 - (dot / norm_product)
+    1.0 - dot * inverse_norm_1 * inverse_norm_2
 }
 
 #[cfg(test)]

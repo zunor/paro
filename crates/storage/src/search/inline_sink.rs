@@ -512,6 +512,12 @@ impl HnswInlineBuildEstimate {
             max_graph_memory_bytes: config.inline_threshold.max_graph_memory_bytes,
             max_dimension: config.inline_threshold.max_dimension,
         };
+        let metric_preprocessing_bytes =
+            if config.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+            } else {
+                0
+            };
         Ok(Some(Self {
             vector_count,
             dimension,
@@ -519,7 +525,8 @@ impl HnswInlineBuildEstimate {
                 vector_count,
                 dimension,
                 config.m as u32,
-            ),
+            )
+            .saturating_add(metric_preprocessing_bytes),
             threshold,
         }))
     }
@@ -635,6 +642,7 @@ mod tests {
                 "filtered_plain_scan_threshold": 0,
                 "build_seed": 1,
                 "inline_threshold": {
+                    "enabled": true,
                     "max_vector_count": 128,
                     "max_graph_memory_bytes": 64,
                     "max_dimension": 4
@@ -681,7 +689,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![3],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::BoundedLag {
                 max_tail_rows: 64,
                 max_lag_millis: 250,

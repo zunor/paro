@@ -415,7 +415,7 @@ mod tests {
             &table.tablet(),
             table.tablet_id(),
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("open table lease");
         let visible_segment = table_lease
@@ -526,7 +526,7 @@ mod tests {
             &table.tablet(),
             table.tablet_id(),
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("open table lease");
         let generation = GenerationReadSnapshot {

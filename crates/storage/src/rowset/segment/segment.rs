@@ -167,13 +167,13 @@ pub struct Segment {
     /// One immutable file handle per loaded segment. Column iterators own only
     /// a logical cursor and use positioned reads, so independent scan morsels
     /// neither reopen the file nor share a mutable OS seek position.
-    pub(super) shared_file: Mutex<Option<Arc<File>>>,
-    pub(super) short_key_index_decoder: RwLock<Option<Arc<ShortKeyIndexDecoder>>>,
-    pub(super) indexes: SegmentIndexes,
-    pub(super) index_stats: SegmentIndexStats,
+    pub(super) shared_file: Arc<Mutex<Option<Arc<File>>>>,
+    pub(super) short_key_index_decoder: Arc<RwLock<Option<Arc<ShortKeyIndexDecoder>>>>,
+    pub(super) indexes: Arc<SegmentIndexes>,
+    pub(super) index_stats: Arc<SegmentIndexStats>,
     pub(super) options: SegmentOptions,
     pub(super) page_reader: PageReader,
-    pub(super) delete_vector_cache: ArcSwapOption<CachedDeleteVector>,
+    pub(super) delete_vector_cache: Arc<ArcSwapOption<CachedDeleteVector>>,
     #[cfg(test)]
     pub(super) delete_vector_load_requests: AtomicU64,
 }
@@ -262,6 +262,65 @@ impl std::fmt::Debug for Segment {
 }
 
 impl Segment {
+    /// Create a query-owned runtime view over this segment's immutable
+    /// structure. The footer, indexes, mmap-backed vector artifacts and file
+    /// descriptor are shared; page readers and column-reader caches are scoped
+    /// to the supplied runtime resources.
+    pub(crate) fn runtime_view(&self, options: SegmentOptions) -> Self {
+        let page_reader = PageReader::new(
+            crate::rowset::page_reader::PageReaderContext::new(
+                self.tablet_id,
+                self.rowset_id,
+                self.rowset_gen,
+                self.segment_id,
+            ),
+            options.page_cache.clone(),
+            crate::rowset::page_reader::PageReaderOptions {
+                cache_decompressed: options.cache_decompressed,
+                cache_decoded: options.cache_decoded,
+                parallel_decompressor: options.parallel_decompressor.clone(),
+            },
+        );
+        Self {
+            tablet_id: self.tablet_id,
+            rowset_id: self.rowset_id,
+            rowset_gen: self.rowset_gen,
+            segment_id: self.segment_id,
+            file_path: self.file_path.clone(),
+            schema: self.schema.clone(),
+            footer: self.footer.clone(),
+            meta: self.meta.clone(),
+            statistics: self.statistics.clone(),
+            column_readers: RwLock::new(HashMap::new()),
+            shared_file: Arc::clone(&self.shared_file),
+            short_key_index_decoder: Arc::clone(&self.short_key_index_decoder),
+            indexes: Arc::clone(&self.indexes),
+            index_stats: Arc::clone(&self.index_stats),
+            options,
+            page_reader,
+            delete_vector_cache: Arc::clone(&self.delete_vector_cache),
+            #[cfg(test)]
+            delete_vector_load_requests: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shares_structural_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared_file, &other.shared_file)
+            && Arc::ptr_eq(&self.indexes, &other.indexes)
+            && Arc::ptr_eq(&self.index_stats, &other.index_stats)
+            && Arc::ptr_eq(&self.delete_vector_cache, &other.delete_vector_cache)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn uses_page_cache(&self, cache: Option<&Arc<PageCache>>) -> bool {
+        match (&self.options.page_cache, cache) {
+            (Some(actual), Some(expected)) => Arc::ptr_eq(actual, expected),
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
     fn shared_file_reader(&self) -> Result<PositionedFile> {
         let mut shared = self.shared_file.lock().map_err(|_| {
             paro_error::internal(format!(

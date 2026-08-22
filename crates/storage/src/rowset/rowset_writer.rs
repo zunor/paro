@@ -413,7 +413,7 @@ fn hnsw_column_build_options(
         ));
     };
     let provider = definition.hnsw_provider_config()?;
-    let config = provider.index_config();
+    let config = provider.build_config();
     let distance = provider.distance;
     Ok((*column_id, HnswColumnBuildOptions { config, distance }))
 }
@@ -1787,7 +1787,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 99,
         };
@@ -1811,7 +1811,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 101,
         };
@@ -1837,7 +1837,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 102,
         };
@@ -1848,7 +1848,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy,
             config_fingerprint: 103,
         };
@@ -1883,7 +1883,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 121,
         };
@@ -1894,7 +1894,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy,
             config_fingerprint: 122,
         };
@@ -1951,6 +1951,7 @@ mod tests {
                 "filtered_plain_scan_threshold": 0,
                 "build_seed": 1,
                 "inline_threshold": {
+                    "enabled": true,
                     "max_vector_count": max_vector_count,
                     "max_graph_memory_bytes": 64 * 1024 * 1024u64,
                     "max_dimension": 128
@@ -2944,7 +2945,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 7,
         };
@@ -2993,7 +2994,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 8,
         };

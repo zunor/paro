@@ -129,9 +129,9 @@ impl Segment {
             meta,
             statistics,
             column_readers: RwLock::new(HashMap::new()),
-            shared_file: Mutex::new(Some(Arc::new(file))),
-            short_key_index_decoder: RwLock::new(None),
-            indexes: SegmentIndexes {
+            shared_file: Arc::new(Mutex::new(Some(Arc::new(file)))),
+            short_key_index_decoder: Arc::new(RwLock::new(None)),
+            indexes: Arc::new(SegmentIndexes {
                 predicate: SegmentPredicateIndexes {
                     bloom_filters,
                     bitmap_indexes,
@@ -143,16 +143,16 @@ impl Segment {
                     fulltext_indexes,
                     runtime_fulltext_indexes: RwLock::new(HashMap::new()),
                 },
-            },
-            index_stats: SegmentIndexStats {
+            }),
+            index_stats: Arc::new(SegmentIndexStats {
                 hnsw_stats,
                 sparse_stats,
                 fulltext_stats,
                 runtime_fulltext_stats: RwLock::new(HashMap::new()),
-            },
+            }),
             options,
             page_reader,
-            delete_vector_cache: arc_swap::ArcSwapOption::empty(),
+            delete_vector_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(test)]
             delete_vector_load_requests: std::sync::atomic::AtomicU64::new(0),
         })
@@ -197,13 +197,13 @@ impl Segment {
             footer,
             meta,
             column_readers: RwLock::new(HashMap::new()),
-            shared_file: Mutex::new(None),
-            short_key_index_decoder: RwLock::new(None),
-            indexes: SegmentIndexes::default(),
-            index_stats: SegmentIndexStats::default(),
+            shared_file: Arc::new(Mutex::new(None)),
+            short_key_index_decoder: Arc::new(RwLock::new(None)),
+            indexes: Arc::new(SegmentIndexes::default()),
+            index_stats: Arc::new(SegmentIndexStats::default()),
             options,
             page_reader,
-            delete_vector_cache: arc_swap::ArcSwapOption::empty(),
+            delete_vector_cache: Arc::new(arc_swap::ArcSwapOption::empty()),
             #[cfg(test)]
             delete_vector_load_requests: std::sync::atomic::AtomicU64::new(0),
         }

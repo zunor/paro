@@ -319,7 +319,7 @@ fn build_hnsw_segment_sidecar_artifact(
             provider.dimension
         )));
     }
-    let config = provider.index_config();
+    let config = provider.build_config();
     let distance = provider.distance;
     let index = HnswIndex::build(vector_storage, config, distance);
     let bytes = index.serialize()?;

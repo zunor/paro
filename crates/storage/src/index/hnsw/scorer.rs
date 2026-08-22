@@ -26,14 +26,16 @@ impl<'a> VectorScorer<'a> {
 
     /// Score a single point.
     pub fn score_point(&self, point_id: PointOffset) -> ScoreType {
-        self.score_cached_vector(self.vector_storage.get_vector(point_id))
+        self.score_cached_point(point_id, self.vector_storage.get_vector(point_id))
     }
 
-    /// Score a vector that has already been fetched from storage.
-    pub fn score_cached_vector(&self, vector: &[f32]) -> ScoreType {
-        self.query
-            .metric()
-            .similarity_prepared(self.query.as_slice(), vector)
+    /// Score an indexed point whose vector has already been fetched.
+    pub fn score_cached_point(&self, point_id: PointOffset, vector: &[f32]) -> ScoreType {
+        self.query.metric().similarity_prepared_indexed(
+            self.query.as_slice(),
+            vector,
+            self.vector_storage.cosine_inverse_norm(point_id),
+        )
     }
 
     /// Score a batch of points into a caller-provided buffer.
@@ -43,7 +45,7 @@ impl<'a> VectorScorer<'a> {
             "scores buffer is shorter than point batch",
         );
         for (i, &point_id) in points.iter().enumerate() {
-            scores[i] = self.score_cached_vector(self.vector_storage.get_vector(point_id));
+            scores[i] = self.score_point(point_id);
         }
     }
 
@@ -54,8 +56,7 @@ impl<'a> VectorScorer<'a> {
     ) -> impl Iterator<Item = ScoredPoint> + 'b {
         self.scores_buffer.resize(points.len(), 0.0);
         for (i, &point_id) in points.iter().enumerate() {
-            self.scores_buffer[i] =
-                self.score_cached_vector(self.vector_storage.get_vector(point_id));
+            self.scores_buffer[i] = self.score_point(point_id);
         }
         let scores = &self.scores_buffer;
         points

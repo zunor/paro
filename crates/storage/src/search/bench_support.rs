@@ -425,7 +425,7 @@ impl RowFetchBenchFixture {
             },
             None,
             table.max_version(),
-            &crate::search::SearchReadOptions::default(),
+            &crate::search::SearchReadOptions::ungoverned(),
         )?;
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;

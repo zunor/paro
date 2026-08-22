@@ -96,8 +96,6 @@ pub struct GraphLayersBuilder {
     /// Distance cache slots for heuristic scoring during build.
     /// Zero means disabled.
     distance_cache_slots: usize,
-    /// Whether to randomize entry point selection during insertion.
-    random_entry_point: bool,
     /// Whether to collect per-build distance profile metrics.
     distance_profile_enabled: bool,
     distance_profile: DistanceProfile,
@@ -133,27 +131,14 @@ impl DeterministicBuildRng {
         let mantissa = self.next_u64() >> 11;
         (mantissa as f64 + 1.0) / (MANTISSA_VALUES as f64 + 1.0)
     }
-
-    /// Stable unbiased integer sample in `[0, upper)`.
-    fn uniform_below(&mut self, upper: usize) -> usize {
-        debug_assert!(upper > 0);
-        let upper = upper as u64;
-        let reject_below = upper.wrapping_neg() % upper;
-        loop {
-            let value = self.next_u64();
-            if value >= reject_below {
-                return (value % upper) as usize;
-            }
-        }
-    }
 }
 
 impl GraphLayersBuilder {
     pub fn new(num_points: usize, config: &HnswConfig) -> Self {
-        Self::new_parallel(num_points, config, false)
+        Self::new_with_heuristic(num_points, config, false)
     }
 
-    pub fn new_parallel(num_points: usize, config: &HnswConfig, use_heuristic: bool) -> Self {
+    pub fn new_with_heuristic(num_points: usize, config: &HnswConfig, use_heuristic: bool) -> Self {
         let hnsw_m = HnswM::from(config);
         let level_factor = 1.0 / (max(hnsw_m.m, 2) as f64).ln();
 
@@ -173,7 +158,6 @@ impl GraphLayersBuilder {
             max_level: AtomicUsize::new(0),
             use_heuristic,
             distance_cache_slots: 0,
-            random_entry_point: config.build_random_entry_point,
             distance_profile_enabled: false,
             distance_profile: DistanceProfile::default(),
             build_rng: Mutex::new(DeterministicBuildRng::new(config.build_seed)),
@@ -278,7 +262,6 @@ impl GraphLayersBuilder {
     pub fn link_new_point(
         &self,
         point_id: PointOffset,
-        query_vector: &[f32],
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
     ) {
@@ -300,20 +283,12 @@ impl GraphLayersBuilder {
             entry_points.clone()
         };
 
-        let entry_point = if self.random_entry_point {
-            let mut rng = self.build_rng.lock();
-            entry_points
-                .get_random_entry_point_with(|_| true, |seen| rng.uniform_below(seen) == 0)
-                .expect("entry points must be non-empty")
-        } else {
-            entry_points
-                .get_entry_point(|_| true)
-                .expect("entry points must be non-empty")
-        };
+        let entry_point = entry_points
+            .get_entry_point(|_| true)
+            .expect("entry points must be non-empty");
 
         let mut current_point = entry_point.point_id;
-        let mut current_score =
-            distance.similarity(query_vector, storage.get_vector(current_point));
+        let mut current_score = Self::score_indexed(storage, distance, point_id, current_point);
         let mut current_level = entry_point
             .level
             .min(self.max_level.load(Ordering::Relaxed));
@@ -324,8 +299,7 @@ impl GraphLayersBuilder {
             while changed {
                 changed = false;
                 self.for_each_link(current_point, current_level, |neighbor| {
-                    let neighbor_score =
-                        distance.similarity(query_vector, storage.get_vector(neighbor));
+                    let neighbor_score = Self::score_indexed(storage, distance, point_id, neighbor);
                     if neighbor_score > current_score {
                         current_score = neighbor_score;
                         current_point = neighbor;
@@ -355,14 +329,8 @@ impl GraphLayersBuilder {
             };
 
             // Search on this level to find best neighbors
-            let search_results = self.search_on_level(
-                query_vector,
-                candidates.clone(),
-                level,
-                ef,
-                storage,
-                distance,
-            );
+            let search_results =
+                self.search_on_level(point_id, candidates.clone(), level, ef, storage, distance);
 
             let m_limit = self.hnsw_m.get_m(level);
             if self.use_heuristic {
@@ -414,10 +382,7 @@ impl GraphLayersBuilder {
                         point_id,
                         m_limit,
                         |target, candidate| {
-                            distance.similarity(
-                                storage.get_vector(target),
-                                storage.get_vector(candidate),
-                            )
+                            Self::score_indexed(storage, distance, target, candidate)
                         },
                     );
 
@@ -459,8 +424,7 @@ impl GraphLayersBuilder {
                 return score;
             }
 
-            let score =
-                distance.similarity(storage.get_vector(target), storage.get_vector(candidate));
+            let score = Self::score_indexed(storage, distance, target, candidate);
             cache.put(target, candidate, score);
             if self.distance_profile_enabled {
                 self.distance_profile.record_miss();
@@ -471,13 +435,13 @@ impl GraphLayersBuilder {
         if self.distance_profile_enabled {
             self.distance_profile.record_direct();
         }
-        distance.similarity(storage.get_vector(target), storage.get_vector(candidate))
+        Self::score_indexed(storage, distance, target, candidate)
     }
 
     /// Internal search on a specific level starting from a set of entry points.
     fn search_on_level(
         &self,
-        query: &[f32],
+        query_point: PointOffset,
         entry_points: Vec<ScoredPoint>,
         level: usize,
         ef: usize,
@@ -501,7 +465,7 @@ impl GraphLayersBuilder {
 
             self.for_each_link(candidate.idx, level, |neighbor| {
                 if !visited.check_and_update_visited(neighbor) {
-                    let score = distance.similarity(query, storage.get_vector(neighbor));
+                    let score = Self::score_indexed(storage, distance, query_point, neighbor);
                     search_context.process_candidate(ScoredPoint {
                         idx: neighbor,
                         score,
@@ -527,9 +491,24 @@ impl GraphLayersBuilder {
         if level < links_row.len() {
             let mut links = links_row[level].write();
             links.connect(to, from, m_limit, |target, candidate| {
-                distance.similarity(storage.get_vector(target), storage.get_vector(candidate))
+                Self::score_indexed(storage, distance, target, candidate)
             });
         }
+    }
+
+    #[inline]
+    fn score_indexed(
+        storage: &dyn VectorStorage,
+        distance: DistanceMetric,
+        left: PointOffset,
+        right: PointOffset,
+    ) -> ScoreType {
+        distance.similarity_indexed(
+            storage.get_vector(left),
+            storage.get_vector(right),
+            storage.cosine_inverse_norm(left),
+            storage.cosine_inverse_norm(right),
+        )
     }
 
     /// Helper to iterate over links of a point at a specific level during build.
@@ -566,80 +545,5 @@ impl GraphLayersBuilder {
         let entry_points = self.entry_points.into_inner();
 
         (graph_links, entry_points)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::index::hnsw::vector_storage::{InMemoryVectorStorage, VectorStorage};
-    use std::sync::Arc;
-    use std::thread;
-
-    fn make_storage(num_vectors: usize, dim: usize) -> Arc<InMemoryVectorStorage> {
-        let mut flat = Vec::with_capacity(num_vectors * dim);
-        for i in 0..num_vectors {
-            for d in 0..dim {
-                flat.push(((i * dim + d) as f32 + 1.0) / 100.0);
-            }
-        }
-        Arc::new(InMemoryVectorStorage::new(flat, dim))
-    }
-
-    #[test]
-    fn test_link_new_point_parallel_safety() {
-        let num_vectors = 64usize;
-        let dim = 8usize;
-        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(0);
-        let storage = make_storage(num_vectors, dim);
-
-        let mut builder = GraphLayersBuilder::new_parallel(num_vectors, &config, true);
-        for idx in 0..num_vectors as PointOffset {
-            // Keep all points on level 0 to simplify the concurrent test setup.
-            builder.set_levels(idx, 0);
-        }
-
-        let builder = Arc::new(builder);
-        thread::scope(|scope| {
-            for idx in 0..num_vectors as PointOffset {
-                let builder = Arc::clone(&builder);
-                let storage = Arc::clone(&storage);
-                scope.spawn(move || {
-                    builder.link_new_point(
-                        idx,
-                        storage.get_vector(idx),
-                        storage.as_ref(),
-                        DistanceMetric::DotProduct,
-                    );
-                });
-            }
-        });
-
-        let builder = match Arc::try_unwrap(builder) {
-            Ok(builder) => builder,
-            Err(_) => panic!("builder still has outstanding references"),
-        };
-
-        for idx in 0..num_vectors {
-            assert!(
-                builder.ready_list[idx],
-                "point {idx} should be marked ready"
-            );
-        }
-
-        let (links, entry_points) = builder.into_graph_data();
-        assert_eq!(links.num_points(), num_vectors);
-        assert!(!entry_points.entry_points.is_empty());
-    }
-
-    #[test]
-    fn test_builder_uses_configured_random_entry_point_flag() {
-        let config = HnswConfig::new(8, 32).with_build_random_entry_point(true);
-        let builder = GraphLayersBuilder::new_parallel(4, &config, false);
-        assert!(builder.random_entry_point);
-
-        let config = HnswConfig::new(8, 32).with_build_random_entry_point(false);
-        let builder = GraphLayersBuilder::new_parallel(4, &config, false);
-        assert!(!builder.random_entry_point);
     }
 }

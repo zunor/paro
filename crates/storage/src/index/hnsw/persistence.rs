@@ -9,11 +9,12 @@ use super::entry_points::EntryPoints;
 use super::graph::GraphLayers;
 use super::graph_links::GraphLinks;
 use super::search_context::FixedLengthPriorityQueue;
-use super::vector_storage::VectorStorage;
+use super::vector_storage::{IndexedVectorStorage, VectorStorage};
 use super::visited_pool::VisitedPool;
 use super::{
-    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildStopCheck, HnswConfig,
-    HnswSearchMode, PreparedQuery, ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
+    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
+    HnswConfig, HnswSearchMode, HnswSearchPolicy, PreparedQuery, ScoredPoint, SearchAlgorithm,
+    SearchParams, VectorScorer,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
@@ -26,12 +27,33 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
+const HNSW_ARTIFACT_VERSION: u32 = 1;
+
+fn take_artifact_bytes<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+    len: usize,
+    field: &str,
+) -> Result<&'a [u8]> {
+    let end = offset
+        .checked_add(len)
+        .ok_or_else(|| error::data_corrupted(format!("HNSW {field} offset overflow")))?;
+    let bytes = data.get(*offset..end).ok_or_else(|| {
+        error::data_corrupted(format!(
+            "HNSW artifact truncated while reading {field}: need {end} bytes, got {}",
+            data.len()
+        ))
+    })?;
+    *offset = end;
+    Ok(bytes)
+}
+
 /// A high-level HNSW index structure that combines graph and storage.
 pub struct HnswIndex {
-    pub config: HnswConfig,
+    pub build_contract: HnswBuildContract,
     pub graph: GraphLayers,
     pub vector_storage: Arc<dyn VectorStorage>,
-    pub distance: DistanceMetric,
     single_telemetry: Mutex<SearchTelemetry>,
     batch_telemetry: Mutex<HnswBatchTelemetry>,
 }
@@ -43,11 +65,15 @@ impl HnswIndex {
         vector_storage: Arc<dyn VectorStorage>,
         distance: DistanceMetric,
     ) -> Self {
+        let vector_storage = IndexedVectorStorage::prepare(vector_storage, distance);
+        let build_contract = config.build_contract(distance);
+        build_contract
+            .validate()
+            .expect("HnswIndex::new requires a valid build contract");
         Self {
-            config,
+            build_contract,
             graph,
             vector_storage,
-            distance,
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
         }
@@ -69,10 +95,11 @@ impl HnswIndex {
         distance: DistanceMetric,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
+        let storage = IndexedVectorStorage::prepare(storage, distance);
         let num_vectors = storage.num_vectors();
         // Diverse neighbor selection is required for clustered vector sets;
         // nearest-only truncation forms disconnected local components.
-        let mut builder = GraphLayersBuilder::new_parallel(num_vectors, &config, true);
+        let mut builder = GraphLayersBuilder::new_with_heuristic(num_vectors, &config, true);
 
         // Pre-allocate levels for all points.
         for i in 0..num_vectors {
@@ -91,12 +118,7 @@ impl HnswIndex {
             if stop_check.is_some_and(|check| check.should_stop()) {
                 return Err(error::query_canceled());
             }
-            builder.link_new_point(
-                i as u32,
-                storage.get_vector(i as u32),
-                storage.as_ref(),
-                distance,
-            );
+            builder.link_new_point(i as u32, storage.as_ref(), distance);
         }
 
         let (links, entry_points) = builder.into_graph_data();
@@ -110,9 +132,10 @@ impl HnswIndex {
             fs::create_dir_all(directory).map_err(error::io)?;
         }
 
-        // Save config as JSON.
+        // Save only the immutable graph construction contract. Search policy
+        // belongs to the active definition and can change without a rebuild.
         let config_path = directory.join("config.json");
-        let config_json = serde_json::to_string_pretty(&self.config)
+        let config_json = serde_json::to_string_pretty(&self.build_contract)
             .map_err(|e| error::serialization_error(e.to_string()))?;
         fs::write(config_path, config_json).map_err(error::io)?;
 
@@ -126,20 +149,27 @@ impl HnswIndex {
         let links_path = directory.join("graph_links.bin");
         self.graph.links.save(&links_path)?;
 
+        if let Some(norms) = self.vector_storage.cosine_inverse_norms() {
+            let norms_path = directory.join("cosine_inverse_norms.bin");
+            let mut bytes = Vec::with_capacity(norms.len() * std::mem::size_of::<f32>());
+            for norm in norms {
+                bytes.extend_from_slice(&norm.to_le_bytes());
+            }
+            fs::write(norms_path, bytes).map_err(error::io)?;
+        }
+
         Ok(())
     }
 
     /// Load HNSW index from a directory.
-    pub fn load(
-        directory: &Path,
-        vector_storage: Arc<dyn VectorStorage>,
-        distance: DistanceMetric,
-    ) -> Result<Self> {
+    pub fn load(directory: &Path, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         // Load config.
         let config_path = directory.join("config.json");
         let config_json = fs::read_to_string(config_path).map_err(error::io)?;
-        let config: HnswConfig = serde_json::from_str(&config_json)
+        let build_contract: HnswBuildContract = serde_json::from_str(&config_json)
             .map_err(|e| error::serialization_error(e.to_string()))?;
+        build_contract.validate()?;
+        let distance = build_contract.distance;
 
         // Load entry points.
         let entry_points_path = directory.join("entry_points.json");
@@ -152,28 +182,57 @@ impl HnswIndex {
         let links =
             GraphLinks::load_mmap(&links_path).or_else(|_| GraphLinks::load(&links_path))?;
 
-        let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
+        let vector_storage = if distance == DistanceMetric::Cosine {
+            let norms_path = directory.join("cosine_inverse_norms.bin");
+            let bytes = fs::read(norms_path).map_err(error::io)?;
+            if bytes.len() % std::mem::size_of::<f32>() != 0 {
+                return Err(error::data_corrupted(
+                    "HNSW cosine inverse norm artifact is truncated",
+                ));
+            }
+            let norms: Arc<[f32]> = bytes
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk width")))
+                .collect::<Vec<_>>()
+                .into();
+            IndexedVectorStorage::from_persisted_cosine_norms(vector_storage, norms)?
+        } else {
+            vector_storage
+        };
+        let graph = GraphLayers::new(
+            links,
+            entry_points,
+            VisitedPool::new(),
+            (&build_contract).into(),
+        );
 
-        Ok(Self::new(config, graph, vector_storage, distance))
+        Ok(Self {
+            build_contract,
+            graph,
+            vector_storage,
+            single_telemetry: Mutex::new(SearchTelemetry::default()),
+            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
+        })
     }
 
     /// Serialize HNSW index to a byte vector for embedding in segments.
     pub fn serialize(&self) -> Result<Vec<u8>> {
         let mut data = Vec::new();
 
-        // Serialize distance metric.
-        data.push(match self.distance {
-            DistanceMetric::Euclidean => 0,
-            DistanceMetric::Cosine => 1,
-            DistanceMetric::DotProduct => 2,
-            DistanceMetric::Manhattan => 3,
-        });
+        data.extend_from_slice(&HNSW_ARTIFACT_MAGIC);
+        data.extend_from_slice(&HNSW_ARTIFACT_VERSION.to_le_bytes());
 
-        // Serialize config as JSON.
-        let config_json = serde_json::to_vec(&self.config)
+        // Serialize immutable graph construction contract as JSON.
+        let config_json = serde_json::to_vec(&self.build_contract)
             .map_err(|e| error::serialization_error(e.to_string()))?;
         data.extend_from_slice(&(config_json.len() as u32).to_le_bytes());
         data.extend_from_slice(&config_json);
+
+        let norms = self.vector_storage.cosine_inverse_norms().unwrap_or(&[]);
+        data.extend_from_slice(&(norms.len() as u64).to_le_bytes());
+        for norm in norms {
+            data.extend_from_slice(&norm.to_le_bytes());
+        }
 
         // Serialize entry points as JSON.
         let entry_points_json = serde_json::to_vec(&self.graph.entry_points)
@@ -195,58 +254,107 @@ impl HnswIndex {
     pub fn deserialize(data: &[u8], vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
         let mut offset = 0;
 
-        // Deserialize distance metric.
-        let distance_byte = data[offset];
-        offset += 1;
-        let distance = match distance_byte {
-            0 => DistanceMetric::Euclidean,
-            1 => DistanceMetric::Cosine,
-            2 => DistanceMetric::DotProduct,
-            3 => DistanceMetric::Manhattan,
-            _ => return Err(error::serialization_error("Invalid distance metric byte")),
+        let magic = take_artifact_bytes(data, &mut offset, HNSW_ARTIFACT_MAGIC.len(), "magic")?;
+        if magic != HNSW_ARTIFACT_MAGIC {
+            return Err(error::data_corrupted(
+                "legacy or invalid HNSW artifact envelope",
+            ));
+        }
+        let version = u32::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 4, "artifact version")?
+                .try_into()
+                .expect("u32 width"),
+        );
+        if version != HNSW_ARTIFACT_VERSION {
+            return Err(error::data_corrupted(format!(
+                "unsupported HNSW artifact version {version}, expected {HNSW_ARTIFACT_VERSION}"
+            )));
+        }
+
+        // Deserialize immutable graph construction contract.
+        let config_len = u32::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 4, "build contract length")?
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
+        let build_contract: HnswBuildContract = serde_json::from_slice(take_artifact_bytes(
+            data,
+            &mut offset,
+            config_len,
+            "build contract",
+        )?)
+        .map_err(|e| error::serialization_error(e.to_string()))?;
+        build_contract.validate()?;
+        let distance = build_contract.distance;
+
+        let norm_count = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "inverse norm count")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW inverse norm count exceeds usize"))?;
+        let norm_bytes = norm_count
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
+        let inverse_norms: Arc<[f32]> =
+            take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?
+                .chunks_exact(std::mem::size_of::<f32>())
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().expect("f32 chunk width")))
+                .collect::<Vec<_>>()
+                .into();
+        let vector_storage = match distance {
+            DistanceMetric::Cosine => {
+                IndexedVectorStorage::from_persisted_cosine_norms(vector_storage, inverse_norms)?
+            }
+            _ if norm_count == 0 => vector_storage,
+            _ => {
+                return Err(error::data_corrupted(
+                    "non-cosine HNSW artifact contains cosine inverse norms",
+                ))
+            }
         };
 
-        // Deserialize config.
-        let config_len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        let config: HnswConfig = serde_json::from_slice(&data[offset..offset + config_len])
-            .map_err(|e| error::serialization_error(e.to_string()))?;
-        offset += config_len;
-
         // Deserialize entry points.
-        let entry_points_len =
-            u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
-        offset += 4;
-        let entry_points: EntryPoints =
-            serde_json::from_slice(&data[offset..offset + entry_points_len])
-                .map_err(|e| error::serialization_error(e.to_string()))?;
-        offset += entry_points_len;
+        let entry_points_len = u32::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 4, "entry point length")?
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
+        let entry_points: EntryPoints = serde_json::from_slice(take_artifact_bytes(
+            data,
+            &mut offset,
+            entry_points_len,
+            "entry points",
+        )?)
+        .map_err(|e| error::serialization_error(e.to_string()))?;
 
         // Deserialize graph links.
         let links = GraphLinks::deserialize(&data[offset..])?;
 
-        let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
+        let graph = GraphLayers::new(
+            links,
+            entry_points,
+            VisitedPool::new(),
+            (&build_contract).into(),
+        );
 
-        Ok(Self::new(config, graph, vector_storage, distance))
+        Ok(Self {
+            build_contract,
+            graph,
+            vector_storage,
+            single_telemetry: Mutex::new(SearchTelemetry::default()),
+            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
+        })
     }
 
-    /// Perform a vector search using this index.
-    pub fn search_one(
+    /// Perform a vector search under the caller's active query policy.
+    pub(crate) fn search_one_with_policy_mode(
         &self,
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
         filter_bitmap: Option<&RoaringBitmap>,
-    ) -> Result<Vec<ScoredPoint>> {
-        self.search_one_with_mode(query, top_k, params, filter_bitmap, HnswSearchMode::Auto)
-    }
-
-    pub(crate) fn search_one_with_mode(
-        &self,
-        query: &[f32],
-        top_k: usize,
-        params: &SearchParams,
-        filter_bitmap: Option<&RoaringBitmap>,
+        policy: &HnswSearchPolicy,
         mode: HnswSearchMode,
     ) -> Result<Vec<ScoredPoint>> {
         if top_k == 0 {
@@ -257,13 +365,13 @@ impl HnswIndex {
         let pre_filter_count = self.graph.num_points() as u64;
         let post_filter_count = filter_bitmap.map(|bm| bm.len()).unwrap_or(pre_filter_count);
 
-        let prepared_query = self.distance.prepare(query);
+        let prepared_query = self.build_contract.distance.prepare(query);
         let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref());
-        let results = if self.should_use_plain_scan(filter_bitmap, mode) {
+        let results = if self.should_use_plain_scan(filter_bitmap, policy, mode) {
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
             let algorithm = self.choose_algorithm(params, filter_bitmap);
-            let ef = params.ef.unwrap_or(self.config.ef);
+            let ef = params.ef.unwrap_or(policy.ef_search);
             self.graph.search_one(
                 top_k,
                 ef,
@@ -284,13 +392,32 @@ impl HnswIndex {
         Ok(results)
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_one(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        params: &SearchParams,
+        filter_bitmap: Option<&RoaringBitmap>,
+    ) -> Result<Vec<ScoredPoint>> {
+        self.search_one_with_policy_mode(
+            query,
+            top_k,
+            params,
+            filter_bitmap,
+            &HnswSearchPolicy::default(),
+            HnswSearchMode::Auto,
+        )
+    }
+
     /// Perform batched vector search using one shared filter bitmap.
-    pub fn search_many_prepared(
+    pub fn search_many_prepared_with_policy(
         &self,
         queries: &[PreparedQuery],
         top_k: usize,
         params: &SearchParams,
         filter_bitmap: Option<&RoaringBitmap>,
+        policy: &HnswSearchPolicy,
         mode: HnswSearchMode,
     ) -> Result<Vec<Vec<ScoredPoint>>> {
         if queries.is_empty() {
@@ -308,7 +435,7 @@ impl HnswIndex {
             .map(|query| VectorScorer::new(query, self.vector_storage.as_ref()))
             .collect();
 
-        let results = if self.should_use_plain_scan(filter_bitmap, mode) {
+        let results = if self.should_use_plain_scan(filter_bitmap, policy, mode) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
             match filter_bitmap {
@@ -317,7 +444,7 @@ impl HnswIndex {
             }
         } else {
             let algorithm = self.choose_algorithm(params, filter_bitmap);
-            let ef = params.ef.unwrap_or(self.config.ef);
+            let ef = params.ef.unwrap_or(policy.ef_search);
             self.graph.search_many(
                 top_k,
                 ef,
@@ -337,6 +464,25 @@ impl HnswIndex {
         Ok(results)
     }
 
+    #[cfg(test)]
+    pub(crate) fn search_many_prepared(
+        &self,
+        queries: &[PreparedQuery],
+        top_k: usize,
+        params: &SearchParams,
+        filter_bitmap: Option<&RoaringBitmap>,
+        mode: HnswSearchMode,
+    ) -> Result<Vec<Vec<ScoredPoint>>> {
+        self.search_many_prepared_with_policy(
+            queries,
+            top_k,
+            params,
+            filter_bitmap,
+            &HnswSearchPolicy::default(),
+            mode,
+        )
+    }
+
     /// Snapshot single-query search telemetry.
     pub fn search_telemetry(&self) -> SearchTelemetry {
         self.single_telemetry.lock().unwrap().clone()
@@ -347,13 +493,50 @@ impl HnswIndex {
         self.batch_telemetry.lock().unwrap().clone()
     }
 
+    /// Explicit deep verifier for recovery/fsck tooling. Normal mmap open only
+    /// validates the O(N) layout and checksum boundary.
+    pub fn verify_integrity(&self) -> Result<()> {
+        self.build_contract.validate()?;
+        match (
+            self.build_contract.distance,
+            self.vector_storage.cosine_inverse_norms(),
+        ) {
+            (DistanceMetric::Cosine, Some(norms))
+                if norms.len() == self.vector_storage.num_vectors() =>
+            {
+                if let Some((point, value)) = norms
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .find(|(_, value)| !value.is_finite() || *value < 0.0)
+                {
+                    return Err(error::data_corrupted(format!(
+                        "invalid cosine inverse norm {value} for HNSW point {point}"
+                    )));
+                }
+            }
+            (DistanceMetric::Cosine, _) => {
+                return Err(error::data_corrupted(
+                    "cosine HNSW artifact is missing per-point inverse norms",
+                ))
+            }
+            (_, Some(_)) => {
+                return Err(error::data_corrupted(
+                    "non-cosine HNSW artifact contains cosine inverse norms",
+                ))
+            }
+            (_, None) => {}
+        }
+        self.graph.links.verify_integrity()
+    }
+
     fn choose_algorithm(
         &self,
         params: &SearchParams,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> SearchAlgorithm {
         if let (Some(acorn), Some(bitmap)) = (params.acorn, filter_bitmap) {
-            if acorn.enable && self.config.m0 != 0 {
+            if acorn.enable && self.build_contract.m0 != 0 {
                 let selectivity = bitmap.len() as f64 / self.graph.links.num_points() as f64;
                 if selectivity
                     <= acorn
@@ -378,11 +561,11 @@ impl HnswIndex {
     fn validate_prepared_queries(&self, queries: &[PreparedQuery]) -> Result<()> {
         let expected_dim = self.vector_storage.vector_dim();
         for (idx, query) in queries.iter().enumerate() {
-            if query.metric() != self.distance {
+            if query.metric() != self.build_contract.distance {
                 return Err(error::invalid_input(format!(
                     "query[{idx}] prepared with {:?}, but index uses {:?}",
                     query.metric(),
-                    self.distance
+                    self.build_contract.distance
                 )));
             }
             if query.as_slice().len() != expected_dim {
@@ -398,6 +581,7 @@ impl HnswIndex {
     fn should_use_plain_scan(
         &self,
         filter_bitmap: Option<&RoaringBitmap>,
+        policy: &HnswSearchPolicy,
         mode: HnswSearchMode,
     ) -> bool {
         match mode {
@@ -406,7 +590,7 @@ impl HnswIndex {
             HnswSearchMode::Auto => {}
         }
         let num_points = self.graph.num_points();
-        if num_points <= self.config.plain_scan_threshold {
+        if num_points <= policy.plain_scan_threshold {
             return true;
         }
 
@@ -417,7 +601,7 @@ impl HnswIndex {
             .iter()
             .take_while(|&idx| idx < num_points as u32)
             .count();
-        candidate_count <= self.config.filtered_plain_scan_threshold
+        candidate_count <= policy.filtered_plain_scan_threshold
     }
 
     fn plain_scan(
@@ -454,11 +638,9 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::builder::DistanceProfileSnapshot;
     use crate::index::hnsw::{AcornParams, InMemoryVectorStorage, PointOffset};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
-    use rayon::prelude::{IntoParallelIterator, ParallelIterator};
     use roaring::RoaringBitmap;
     use std::cmp::max;
     use std::sync::Arc;
@@ -547,83 +729,24 @@ mod tests {
         config: HnswConfig,
         distance: DistanceMetric,
         use_heuristic: bool,
-        parallel: bool,
     ) -> HnswIndex {
-        build_index_with_levels_and_cache(
-            vectors,
-            levels,
-            config,
-            distance,
-            use_heuristic,
-            parallel,
-            0,
-            false,
-        )
-        .0
-    }
-
-    fn build_index_with_levels_and_cache(
-        vectors: &[Vec<f32>],
-        levels: &[usize],
-        config: HnswConfig,
-        distance: DistanceMetric,
-        use_heuristic: bool,
-        parallel: bool,
-        distance_cache_slots: usize,
-        profile_distances: bool,
-    ) -> (HnswIndex, DistanceProfileSnapshot) {
         assert_eq!(vectors.len(), levels.len());
 
-        let storage: Arc<dyn VectorStorage> = make_storage(vectors);
-        let mut builder = GraphLayersBuilder::new_parallel(vectors.len(), &config, use_heuristic);
-        builder.set_distance_cache_slots_for_benchmark(distance_cache_slots);
-        builder.set_distance_profile_enabled_for_benchmark(profile_distances);
+        let storage = IndexedVectorStorage::prepare(make_storage(vectors), distance);
+        let mut builder =
+            GraphLayersBuilder::new_with_heuristic(vectors.len(), &config, use_heuristic);
 
         for (idx, level) in levels.iter().copied().enumerate() {
             builder.set_levels(idx as u32, level);
         }
 
-        if parallel {
-            const WARM_START_POINTS: usize = 256;
-            let warm_start_end = vectors.len().min(WARM_START_POINTS);
-            for i in 0..warm_start_end {
-                builder.link_new_point(
-                    i as u32,
-                    storage.get_vector(i as u32),
-                    storage.as_ref(),
-                    distance,
-                );
-            }
-
-            if warm_start_end < vectors.len() {
-                let builder_ref = &builder;
-                let storage_ref = storage.as_ref();
-                (warm_start_end..vectors.len())
-                    .into_par_iter()
-                    .for_each(|i| {
-                        builder_ref.link_new_point(
-                            i as u32,
-                            storage_ref.get_vector(i as u32),
-                            storage_ref,
-                            distance,
-                        );
-                    });
-            }
-        } else {
-            for i in 0..vectors.len() {
-                builder.link_new_point(
-                    i as u32,
-                    storage.get_vector(i as u32),
-                    storage.as_ref(),
-                    distance,
-                );
-            }
+        for i in 0..vectors.len() {
+            builder.link_new_point(i as u32, storage.as_ref(), distance);
         }
 
-        let profile = builder.distance_profile_snapshot();
         let (links, entry_points) = builder.into_graph_data();
         let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
-        (HnswIndex::new(config, graph, storage, distance), profile)
+        HnswIndex::new(config, graph, storage, distance)
     }
 
     fn brute_force_top_k_ids(
@@ -664,26 +787,6 @@ mod tests {
             total_recall += hits as f32 / top_k as f32;
         }
         total_recall / queries.len() as f32
-    }
-
-    fn average_overlap_at_k(
-        lhs: &HnswIndex,
-        rhs: &HnswIndex,
-        queries: &[Vec<f32>],
-        top_k: usize,
-        search_params: &SearchParams,
-    ) -> f32 {
-        let mut total_overlap = 0.0f32;
-        for query in queries {
-            let lhs_result = lhs.search_one(query, top_k, search_params, None).unwrap();
-            let rhs_result = rhs.search_one(query, top_k, search_params, None).unwrap();
-            let overlap = lhs_result
-                .iter()
-                .filter(|point| rhs_result.iter().any(|other| other.idx == point.idx))
-                .count();
-            total_overlap += overlap as f32 / top_k as f32;
-        }
-        total_overlap / queries.len() as f32
     }
 
     fn assert_scored_points_exact(lhs: &[ScoredPoint], rhs: &[ScoredPoint]) {
@@ -756,8 +859,7 @@ mod tests {
         let vectors = make_sift_like_vectors(0xabc, 256, 16, 12);
         let config = HnswConfig::new(12, 72)
             .with_plain_scan_threshold(0)
-            .with_build_seed(0x1234_5678_9abc_def0)
-            .with_build_random_entry_point(true);
+            .with_build_seed(0x1234_5678_9abc_def0);
         let first = HnswIndex::build(make_storage(&vectors), config, DistanceMetric::Euclidean)
             .serialize()
             .unwrap();
@@ -1096,6 +1198,78 @@ mod tests {
     }
 
     #[test]
+    fn embedded_artifact_requires_the_versioned_envelope() {
+        let vectors = vec![vec![0.0], vec![1.0]];
+        let index = HnswIndex::build(
+            make_storage(&vectors),
+            HnswConfig::new(8, 32),
+            DistanceMetric::Euclidean,
+        );
+        let bytes = index.serialize().unwrap();
+        assert_eq!(&bytes[..HNSW_ARTIFACT_MAGIC.len()], &HNSW_ARTIFACT_MAGIC);
+
+        let mut legacy = bytes.clone();
+        legacy[0] = 0;
+        assert!(HnswIndex::deserialize(&legacy, make_storage(&vectors))
+            .err()
+            .expect("legacy envelope must fail")
+            .to_string()
+            .contains("artifact envelope"));
+
+        let mut unknown = bytes;
+        unknown[4..8].copy_from_slice(&(HNSW_ARTIFACT_VERSION + 1).to_le_bytes());
+        assert!(HnswIndex::deserialize(&unknown, make_storage(&vectors))
+            .err()
+            .expect("unknown envelope version must fail")
+            .to_string()
+            .contains("unsupported HNSW artifact version"));
+    }
+
+    #[test]
+    fn cosine_inverse_norms_are_persisted_with_the_index_artifact() {
+        let vectors = vec![vec![3.0, 4.0], vec![0.0, 0.0], vec![1.0, 0.0]];
+        let storage = make_storage(&vectors);
+        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(0);
+        let index = HnswIndex::build(storage, config, DistanceMetric::Cosine);
+
+        let norms = index
+            .vector_storage
+            .cosine_inverse_norms()
+            .expect("cosine index preprocessing");
+        assert!((norms[0] - 0.2).abs() < 1e-6);
+        assert_eq!(norms[1], 0.0);
+        assert_eq!(norms[2], 1.0);
+
+        let bytes = index.serialize().unwrap();
+        let restored = HnswIndex::deserialize(&bytes, make_storage(&vectors)).unwrap();
+        assert_eq!(
+            restored.vector_storage.cosine_inverse_norms().unwrap(),
+            norms
+        );
+        let result = restored
+            .search_one(&[1.0, 0.0], 3, &SearchParams::default(), None)
+            .unwrap();
+        assert_eq!(result[0].idx, 2);
+        assert_eq!(result[2].idx, 1);
+    }
+
+    #[test]
+    fn metric_preprocessing_does_not_leak_between_artifact_contracts() {
+        let vectors = vec![vec![3.0, 4.0], vec![1.0, 0.0]];
+        let cosine_storage =
+            IndexedVectorStorage::prepare(make_storage(&vectors), DistanceMetric::Cosine);
+        assert!(cosine_storage.cosine_inverse_norms().is_some());
+
+        let dot_index = HnswIndex::build(
+            cosine_storage,
+            HnswConfig::new(8, 32),
+            DistanceMetric::DotProduct,
+        );
+        assert!(dot_index.vector_storage.cosine_inverse_norms().is_none());
+        dot_index.verify_integrity().unwrap();
+    }
+
+    #[test]
     fn test_hnsw_batch_telemetry_is_separate_from_single_query_telemetry() {
         let storage = make_storage(&[vec![0.0], vec![1.0], vec![2.0], vec![3.0]]);
         let config = HnswConfig::new(8, 32).with_plain_scan_threshold(100);
@@ -1180,6 +1354,7 @@ mod tests {
             .with_plain_scan_threshold(0)
             .with_filtered_plain_scan_threshold(12)
             .with_ef(96);
+        let policy = config.search_policy();
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
 
         let mut small_filter = RoaringBitmap::new();
@@ -1192,9 +1367,9 @@ mod tests {
             large_filter.insert(idx);
         }
 
-        assert!(!index.should_use_plain_scan(None, HnswSearchMode::Auto));
-        assert!(index.should_use_plain_scan(Some(&small_filter), HnswSearchMode::Auto));
-        assert!(!index.should_use_plain_scan(Some(&large_filter), HnswSearchMode::Auto));
+        assert!(!index.should_use_plain_scan(None, &policy, HnswSearchMode::Auto));
+        assert!(index.should_use_plain_scan(Some(&small_filter), &policy, HnswSearchMode::Auto));
+        assert!(!index.should_use_plain_scan(Some(&large_filter), &policy, HnswSearchMode::Auto));
     }
 
     #[test]
@@ -1250,8 +1425,8 @@ mod tests {
         let temp_dir = TempDir::new().unwrap();
         index.save(temp_dir.path()).unwrap();
 
-        let loaded = HnswIndex::load(temp_dir.path(), storage.clone(), DistanceMetric::DotProduct)
-            .expect("load index from directory");
+        let loaded =
+            HnswIndex::load(temp_dir.path(), storage.clone()).expect("load index from directory");
         assert!(loaded.graph.links.is_mmap_backed());
 
         let params = SearchParams {
@@ -1265,20 +1440,6 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_build_parallel_over_warm_start() {
-        // Use enough vectors to exercise the parallel build path after the serial prefix.
-        let vectors: Vec<Vec<f32>> = (0..300).map(|i| vec![i as f32, (i % 7) as f32]).collect();
-        let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 50)
-            .with_plain_scan_threshold(0)
-            .with_ef(64);
-        let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
-
-        assert_eq!(index.graph.num_points(), 300);
-        assert!(!index.graph.entry_points.entry_points.is_empty());
-    }
-
-    #[test]
     fn test_heuristic_reduces_dominated_links() {
         let num_vectors = 512;
         let dim = 64;
@@ -1288,22 +1449,10 @@ mod tests {
             .with_ef(96);
         let levels = deterministic_levels(num_vectors, config.m, 99);
 
-        let no_heuristic = build_index_with_levels(
-            &vectors,
-            &levels,
-            config,
-            DistanceMetric::Euclidean,
-            false,
-            false,
-        );
-        let with_heuristic = build_index_with_levels(
-            &vectors,
-            &levels,
-            config,
-            DistanceMetric::Euclidean,
-            true,
-            false,
-        );
+        let no_heuristic =
+            build_index_with_levels(&vectors, &levels, config, DistanceMetric::Euclidean, false);
+        let with_heuristic =
+            build_index_with_levels(&vectors, &levels, config, DistanceMetric::Euclidean, true);
 
         let no_heuristic_ratio =
             dominated_neighbor_ratio(&no_heuristic, &vectors, DistanceMetric::Euclidean);
@@ -1313,66 +1462,6 @@ mod tests {
         assert!(
             with_heuristic_ratio < no_heuristic_ratio,
             "heuristic should reduce dominated links: with={with_heuristic_ratio:.4}, without={no_heuristic_ratio:.4}"
-        );
-    }
-
-    #[test]
-    fn test_parallel_build_matches_serial_build_quality() {
-        let num_vectors = 640;
-        let dim = 64;
-        let vectors = make_sift_like_vectors(11, num_vectors, dim, 40);
-        let config = HnswConfig::new(12, 96)
-            .with_plain_scan_threshold(0)
-            .with_ef(128);
-        let levels = deterministic_levels(num_vectors, config.m, 123);
-        let queries = make_sift_like_queries(2026, &vectors, 64, 0.02);
-
-        let serial = build_index_with_levels(
-            &vectors,
-            &levels,
-            config,
-            DistanceMetric::Euclidean,
-            true,
-            false,
-        );
-        let parallel = build_index_with_levels(
-            &vectors,
-            &levels,
-            config,
-            DistanceMetric::Euclidean,
-            true,
-            true,
-        );
-
-        let search_params = SearchParams {
-            ef: Some(128),
-            ..Default::default()
-        };
-        let serial_recall = average_recall_at_k(
-            &serial,
-            &vectors,
-            &queries,
-            10,
-            &search_params,
-            DistanceMetric::Euclidean,
-        );
-        let parallel_recall = average_recall_at_k(
-            &parallel,
-            &vectors,
-            &queries,
-            10,
-            &search_params,
-            DistanceMetric::Euclidean,
-        );
-        let overlap = average_overlap_at_k(&serial, &parallel, &queries, 10, &search_params);
-
-        assert!(
-            (serial_recall - parallel_recall).abs() <= 0.03,
-            "parallel and serial recall diverged too much: serial={serial_recall:.3}, parallel={parallel_recall:.3}"
-        );
-        assert!(
-            overlap >= 0.90,
-            "parallel and serial top-k overlap too low: overlap={overlap:.3}"
         );
     }
 

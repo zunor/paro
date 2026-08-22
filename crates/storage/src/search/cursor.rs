@@ -36,13 +36,23 @@ pub struct TableReadSnapshot {
 /// through the same governed storage cache as ordinary scans. Keeping this
 /// contract explicit prevents a search provider from silently reopening
 /// segments with ungoverned/default readers.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct SearchReadOptions {
     page_cache: Option<Arc<PageCache>>,
     cache_decoded: bool,
 }
 
 impl SearchReadOptions {
+    /// Explicitly opt out of governed page caching. Intended for tests,
+    /// maintenance utilities, and benchmarks that isolate storage behavior.
+    /// Production query paths should use [`Self::with_page_cache`].
+    pub fn ungoverned() -> Self {
+        Self {
+            page_cache: None,
+            cache_decoded: false,
+        }
+    }
+
     /// Use the instance page cache for physical and codec-decoded pages.
     /// Decoded admission is globally budgeted and evicted by `PageCache`.
     pub fn with_page_cache(page_cache: Arc<PageCache>) -> Self {
@@ -147,7 +157,7 @@ impl TableReadLease {
         let segment_options = options.segment_options();
         for rowset in rowsets {
             let rowset_id = rowset.rowset_id();
-            for segment in rowset.segments_with_options(segment_options.clone())? {
+            for segment in rowset.open_segment_view(segment_options.clone())? {
                 let segment_id = segment.segment_id();
                 let entry = VisibleSegment {
                     rowset: rowset.clone(),
@@ -590,7 +600,7 @@ mod tests {
             &table.tablet(),
             table.tablet_id(),
             visible_version,
-            &SearchReadOptions::default(),
+            &SearchReadOptions::ungoverned(),
         )
         .expect("open table lease");
         let generation = GenerationReadSnapshot {

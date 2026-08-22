@@ -32,7 +32,7 @@ use super::rowset_meta::{RowsetId, RowsetMeta, RowsetState, SegmentsOverlap};
 use super::rowset_statistics::RowsetStatistics;
 use super::segment::{Segment, SegmentIterator, SegmentOptions, SegmentSharedPtr};
 use crate::index::{
-    hnsw::{ScoredPoint, SearchParams},
+    hnsw::{HnswSearchPolicy, ScoredPoint, SearchParams},
     PredicateTree,
 };
 use crate::primary_key::DeleteVector;
@@ -138,9 +138,6 @@ pub struct Rowset {
 
     /// Cached rowset statistics (lazy)
     statistics_cache: RwLock<Option<RowsetStatistics>>,
-
-    /// Segment options used when loading segments
-    segment_options: RwLock<SegmentOptions>,
 }
 
 impl Rowset {
@@ -173,7 +170,6 @@ impl Rowset {
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(false),
             statistics_cache: RwLock::new(None),
-            segment_options: RwLock::new(SegmentOptions::default()),
         })
     }
 
@@ -202,7 +198,6 @@ impl Rowset {
             refs_by_reader: AtomicU64::new(0),
             segments_loaded: RwLock::new(true),
             statistics_cache: RwLock::new(None),
-            segment_options: RwLock::new(SegmentOptions::default()),
         })
     }
 
@@ -369,6 +364,9 @@ impl Rowset {
     /// This loads segment metadata and prepares them for reading.
     /// Actual column data is loaded lazily when accessed.
     pub fn load(&self) -> Result<()> {
+        if *self.segments_loaded.read().unwrap() {
+            return Ok(());
+        }
         let mut loaded = self.segments_loaded.write().unwrap();
         self.load_segments_locked(&mut loaded)
     }
@@ -383,7 +381,7 @@ impl Rowset {
         let rowset_id = meta.rowset_id();
         let tablet_id = meta.tablet_id();
         let rowset_gen = meta.rowset_gen();
-        let options = self.segment_options.read().unwrap().clone();
+        let options = SegmentOptions::default();
 
         let mut segments = self.segments.write().unwrap();
         segments.clear();
@@ -406,22 +404,25 @@ impl Rowset {
         Ok(())
     }
 
-    /// Return segment handles configured with the requested runtime resources.
+    /// Open an immutable segment view configured with the requested runtime
+    /// resources.
     ///
-    /// Loading and cloning the handles share the same configuration lock, so
-    /// a concurrent caller cannot replace the cached Segment instances between
-    /// those operations. Existing readers remain valid through their Arc pins.
-    pub fn segments_with_options(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
-        let mut loaded = self.segments_loaded.write().unwrap();
-        {
-            let mut current = self.segment_options.write().unwrap();
-            if !current.runtime_equivalent(&options) {
-                *current = options;
-                *loaded = false;
-            }
+    /// The rowset owns one structural view. Non-default views share its
+    /// immutable footer, indexes and file descriptor, but own their PageReader
+    /// and column-reader caches. They belong to the caller (normally a read
+    /// lease) and are deliberately not retained by the rowset.
+    pub fn open_segment_view(&self, options: SegmentOptions) -> Result<Vec<SegmentSharedPtr>> {
+        self.load()?;
+        if options.runtime_equivalent(&SegmentOptions::default()) {
+            return Ok(self.segments.read().unwrap().clone());
         }
-        self.load_segments_locked(&mut loaded)?;
-        Ok(self.segments.read().unwrap().clone())
+        Ok(self
+            .segments
+            .read()
+            .unwrap()
+            .iter()
+            .map(|segment| Arc::new(segment.runtime_view(options.clone())))
+            .collect())
     }
 
     /// Reload segments (force reload from disk)
@@ -456,6 +457,7 @@ impl Rowset {
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
+        policy: &HnswSearchPolicy,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
         self.load()?;
@@ -466,7 +468,7 @@ impl Rowset {
 
         for segment in segments.iter() {
             let seg_results =
-                segment.vector_search(column_id, query, top_k, params, predicate_tree)?;
+                segment.vector_search(column_id, query, top_k, params, policy, predicate_tree)?;
             for mut p in seg_results {
                 p.idx += current_row_offset as u32;
                 all_results.push(p);
@@ -1197,7 +1199,7 @@ mod tests {
     }
 
     #[test]
-    fn segments_with_runtime_options_reopen_and_reuse_loaded_segments() {
+    fn nondefault_segment_views_are_owned_by_the_read_lease() {
         let schema = create_test_schema();
         let tmp = tempfile::tempdir().unwrap();
         let rowset_dir = tmp.path().join("rowset");
@@ -1214,16 +1216,35 @@ mod tests {
         let original = rowset.get_segment(0).unwrap();
 
         let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
-        let options = SegmentOptions::default()
+        let first_options = SegmentOptions::default()
             .with_verify_checksum(false)
             .with_page_cache(cache.clone())
             .with_cache_decoded(true);
-        let reopened_segments = rowset.segments_with_options(options.clone()).unwrap();
+        let reopened_segments = rowset.open_segment_view(first_options.clone()).unwrap();
 
         let reopened = reopened_segments[0].clone();
+        let reopened_weak = Arc::downgrade(&reopened);
         assert!(!Arc::ptr_eq(&original, &reopened));
-        let reused = rowset.segments_with_options(options).unwrap();
-        assert!(Arc::ptr_eq(&reopened, &reused[0]));
+        assert!(original.shares_structural_state_with(&reopened));
+        assert!(original.uses_page_cache(None));
+        assert!(reopened.uses_page_cache(Some(&cache)));
+        let independently_opened = rowset.open_segment_view(first_options).unwrap();
+        assert!(!Arc::ptr_eq(&reopened, &independently_opened[0]));
+
+        let second_cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        let second_options = SegmentOptions::default()
+            .with_page_cache(second_cache)
+            .with_cache_decoded(true);
+        let second_view = rowset.open_segment_view(second_options).unwrap();
+        assert!(!Arc::ptr_eq(&reopened, &second_view[0]));
+
+        assert!(Arc::ptr_eq(&original, &rowset.get_segment(0).unwrap()));
+        drop(reopened);
+        drop(reopened_segments);
+        assert!(
+            reopened_weak.upgrade().is_none(),
+            "the rowset must not retain a query-owned segment view"
+        );
     }
 
     #[test]

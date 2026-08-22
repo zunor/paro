@@ -72,7 +72,7 @@ impl SpilledArtifactReader {
     ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
         Ok(self
             .rowset
-            .segments_with_options(options)?
+            .open_segment_view(options)?
             .into_iter()
             .map(|segment| (self.rowset.clone(), segment))
             .collect())
@@ -191,7 +191,7 @@ impl TxnOverlayReader {
     ) -> Result<Vec<(RowsetSharedPtr, SegmentSharedPtr)>> {
         let mut segments = Vec::new();
         for rowset in &self.rowsets {
-            for segment in rowset.segments_with_options(options.clone())? {
+            for segment in rowset.open_segment_view(options.clone())? {
                 segments.push((rowset.clone(), segment));
             }
         }

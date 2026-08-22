@@ -4,8 +4,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
-use serde_json::Value;
-
 use crate::index::fulltext::tokenizer::TokenizerKind;
 use crate::index::hnsw::DistanceMetric;
 use crate::metrics::storage_metrics;
@@ -41,6 +39,8 @@ pub(crate) struct SearchDefinitionState {
     /// Provider contract decoded once at the registry boundary. Query and
     /// maintenance paths consume this immutable value, never the JSON image.
     pub(crate) hnsw_provider_config: Option<Arc<super::super::HnswProviderConfig>>,
+    pub(crate) fulltext_provider_config: Option<Arc<super::super::FullTextProviderConfig>>,
+    pub(crate) sparse_provider_config: Option<Arc<super::super::SparseProviderConfig>>,
     pub(crate) origin: SearchDefinitionOrigin,
     pub(crate) generation: Option<SearchGeneration>,
     pub(crate) capability: Option<SearchCapability>,
@@ -59,9 +59,21 @@ impl SearchDefinitionState {
         } else {
             None
         };
+        let fulltext_provider_config = if definition.kind == SearchIndexKind::FullText {
+            Some(Arc::new(definition.fulltext_provider_config()?))
+        } else {
+            None
+        };
+        let sparse_provider_config = if definition.kind == SearchIndexKind::Sparse {
+            Some(Arc::new(definition.sparse_provider_config()?))
+        } else {
+            None
+        };
         Ok(Self {
             definition,
             hnsw_provider_config,
+            fulltext_provider_config,
+            sparse_provider_config,
             origin,
             generation: None,
             capability: None,
@@ -170,12 +182,7 @@ impl SearchView {
             if !state.definition.column_ids.contains(&column_id) {
                 return None;
             }
-            let definition_config = state
-                .definition
-                .provider_config
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or("simple");
+            let definition_config = &state.fulltext_provider_config.as_ref()?.config;
             if definition_config.eq_ignore_ascii_case(config) {
                 Some(capability.clone())
             } else {
@@ -234,12 +241,13 @@ impl SearchView {
                     let Some(column_id) = state.definition.column_ids.first().copied() else {
                         continue;
                     };
-                    let config = state
-                        .definition
-                        .provider_config
-                        .get("config")
-                        .and_then(Value::as_str)
-                        .unwrap_or("simple");
+                    let config = &state
+                        .fulltext_provider_config
+                        .as_ref()
+                        .ok_or_else(|| {
+                            paro_error::internal("FullText definition missing typed config")
+                        })?
+                        .config;
                     let normalized = TokenizerKind::from_config(config)?
                         .config_name()
                         .to_string();
@@ -258,6 +266,9 @@ impl SearchView {
                     }
                 }
                 SearchIndexKind::Sparse => {
+                    state.sparse_provider_config.as_ref().ok_or_else(|| {
+                        paro_error::internal("Sparse definition missing typed config")
+                    })?;
                     if let Some(column_id) = state.definition.column_ids.first().copied() {
                         sparse.insert(column_id);
                     }

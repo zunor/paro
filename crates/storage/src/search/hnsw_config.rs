@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::index::hnsw::types::DEFAULT_HNSW_BUILD_SEED;
-use crate::index::hnsw::{DistanceMetric, HnswConfig};
+use crate::index::hnsw::{DistanceMetric, HnswBuildContract, HnswConfig, HnswSearchPolicy};
 use paro_common::error::{self as paro_error, Result};
 
 pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 1;
@@ -19,6 +19,7 @@ pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HnswInlineConfig {
+    pub enabled: bool,
     pub max_vector_count: u64,
     pub max_graph_memory_bytes: u64,
     pub max_dimension: u32,
@@ -42,32 +43,9 @@ pub struct HnswProviderConfig {
 }
 
 impl HnswProviderConfig {
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        dimension: u32,
-        distance: DistanceMetric,
-        m: u32,
-        ef_construct: u32,
-        ef_search: u32,
-        plain_scan_threshold: u32,
-        filtered_plain_scan_threshold: u32,
-        build_seed: u64,
-        inline_threshold: HnswInlineConfig,
-    ) -> Result<Self> {
-        let config = Self {
-            version: HNSW_PROVIDER_CONFIG_VERSION,
-            dimension,
-            distance,
-            m,
-            ef_construct,
-            ef_search,
-            plain_scan_threshold,
-            filtered_plain_scan_threshold,
-            build_seed,
-            inline_threshold,
-        };
-        config.validate()?;
-        Ok(config)
+    pub fn validated(self) -> Result<Self> {
+        self.validate()?;
+        Ok(self)
     }
 
     pub fn from_value(value: &Value) -> Result<Self> {
@@ -114,15 +92,50 @@ impl HnswProviderConfig {
                 self.ef_search
             )));
         }
+        if self.inline_threshold.enabled {
+            if self.inline_threshold.max_vector_count == 0 {
+                return Err(paro_error::invalid_input(
+                    "enabled HNSW inline_threshold max_vector_count must be greater than zero",
+                ));
+            }
+            if self.inline_threshold.max_graph_memory_bytes == 0 {
+                return Err(paro_error::invalid_input(
+                    "enabled HNSW inline_threshold max_graph_memory_bytes must be greater than zero",
+                ));
+            }
+            if self.inline_threshold.max_dimension < self.dimension {
+                return Err(paro_error::invalid_input(format!(
+                    "enabled HNSW inline_threshold max_dimension {} is below vector dimension {}",
+                    self.inline_threshold.max_dimension, self.dimension
+                )));
+            }
+        } else if self.inline_threshold.max_vector_count != 0
+            || self.inline_threshold.max_graph_memory_bytes != 0
+            || self.inline_threshold.max_dimension != 0
+        {
+            return Err(paro_error::invalid_input(
+                "disabled HNSW inline_threshold must use zero limits",
+            ));
+        }
         Ok(())
     }
 
-    pub fn index_config(&self) -> HnswConfig {
+    /// Transient builder input. Search fields are never copied into this value.
+    pub fn build_config(&self) -> HnswConfig {
         HnswConfig::new(self.m as usize, self.ef_construct as usize)
-            .with_ef(self.ef_search as usize)
-            .with_plain_scan_threshold(self.plain_scan_threshold as usize)
-            .with_filtered_plain_scan_threshold(self.filtered_plain_scan_threshold as usize)
             .with_build_seed(self.build_seed)
+    }
+
+    pub fn build_contract(&self) -> HnswBuildContract {
+        self.build_config().build_contract(self.distance)
+    }
+
+    pub const fn search_policy(&self) -> HnswSearchPolicy {
+        HnswSearchPolicy {
+            ef_search: self.ef_search as usize,
+            plain_scan_threshold: self.plain_scan_threshold as usize,
+            filtered_plain_scan_threshold: self.filtered_plain_scan_threshold as usize,
+        }
     }
 }
 
@@ -132,21 +145,24 @@ mod tests {
     use serde_json::json;
 
     fn valid_config() -> HnswProviderConfig {
-        HnswProviderConfig::new(
-            100,
-            DistanceMetric::Euclidean,
-            24,
-            100,
-            100,
-            10_000,
-            0,
-            DEFAULT_HNSW_BUILD_SEED,
-            HnswInlineConfig {
+        HnswProviderConfig {
+            version: HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: 100,
+            distance: DistanceMetric::Euclidean,
+            m: 24,
+            ef_construct: 100,
+            ef_search: 100,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: DEFAULT_HNSW_BUILD_SEED,
+            inline_threshold: HnswInlineConfig {
+                enabled: true,
                 max_vector_count: 4_096,
                 max_graph_memory_bytes: 64 * 1024 * 1024,
                 max_dimension: 1_536,
             },
-        )
+        }
+        .validated()
         .unwrap()
     }
 
@@ -172,5 +188,37 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("missing field `distance`"));
+    }
+
+    #[test]
+    fn search_policy_changes_do_not_change_the_build_contract() {
+        let base = valid_config();
+        let mut tuned = base.clone();
+        tuned.ef_search = 240;
+        tuned.plain_scan_threshold = 20_000;
+        tuned.filtered_plain_scan_threshold = 128;
+        tuned.validate().unwrap();
+
+        assert_eq!(base.build_contract(), tuned.build_contract());
+        assert_ne!(base.search_policy(), tuned.search_policy());
+    }
+
+    #[test]
+    fn inline_admission_is_explicit_and_validated() {
+        let mut invalid = valid_config();
+        invalid.inline_threshold.max_dimension = invalid.dimension - 1;
+        assert!(invalid
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("max_dimension"));
+
+        invalid.inline_threshold = HnswInlineConfig {
+            enabled: false,
+            max_vector_count: 0,
+            max_graph_memory_bytes: 0,
+            max_dimension: 0,
+        };
+        invalid.validate().unwrap();
     }
 }

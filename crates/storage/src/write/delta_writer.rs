@@ -1087,7 +1087,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: serde_json::json!({"config": "simple"}),
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 1,
         };

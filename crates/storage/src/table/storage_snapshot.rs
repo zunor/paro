@@ -128,7 +128,7 @@ impl StorageSnapshot {
         let mut segments = Vec::new();
         let materialized = self.materialize()?;
         for rowset in &materialized.rowsets {
-            for segment in rowset.segments_with_options(options.clone())? {
+            for segment in rowset.open_segment_view(options.clone())? {
                 segments.push((rowset.clone(), segment));
             }
         }

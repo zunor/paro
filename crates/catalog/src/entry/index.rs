@@ -1083,6 +1083,7 @@ mod tests {
             "filtered_plain_scan_threshold": 0,
             "build_seed": 42,
             "inline_threshold": {
+                "enabled": true,
                 "max_vector_count": 90_000,
                 "max_graph_memory_bytes": 268_435_456_u64,
                 "max_dimension": 100

@@ -6,7 +6,6 @@
 use std::collections::BTreeSet;
 
 use paro_common::error::{self as paro_error, Result};
-use serde_json::Value;
 
 use crate::rowset::{load_base_rowids, RowsetSharedPtr};
 use crate::tablet::ColumnId;
@@ -48,7 +47,7 @@ pub(crate) fn collect_visible_snapshot(
     visible_version: i64,
     visible_rowsets: &[RowsetSharedPtr],
 ) -> Result<VisibleSearchSnapshot> {
-    let mut generation_stats = empty_generation_stats_for_definition(definition);
+    let mut generation_stats = empty_generation_stats_for_definition(definition)?;
     let mut artifacts = Vec::new();
     let mut tail_entries = Vec::new();
 
@@ -95,7 +94,7 @@ pub(crate) fn collect_rowset_snapshot(
     visible_version: i64,
 ) -> Result<RowsetSearchSnapshot> {
     let mut artifacts = Vec::new();
-    let mut generation_stats = empty_generation_stats_for_definition(definition);
+    let mut generation_stats = empty_generation_stats_for_definition(definition)?;
     let mut delete_entries = Vec::new();
     let mut missing_segments = Vec::new();
 
@@ -203,13 +202,9 @@ fn segment_artifact(
             let Some(index) = segment.fulltext_index(column_id) else {
                 return Ok(None);
             };
-            let expected_config = definition
-                .provider_config
-                .get("config")
-                .and_then(Value::as_str)
-                .unwrap_or("simple");
+            let expected_config = definition.fulltext_provider_config()?.config;
             let actual = index.tokenizer().kind().config_name();
-            if !actual.eq_ignore_ascii_case(expected_config) {
+            if !actual.eq_ignore_ascii_case(&expected_config) {
                 return Ok(None);
             }
             segment

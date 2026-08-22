@@ -293,31 +293,37 @@ fn search_definition(
     tokenizer: Option<&str>,
     dimension: Option<u64>,
 ) -> SearchIndexDefinition {
-    let mut provider_config = match provider {
-        SearchIndexKind::FullText => serde_json::json!({"config": tokenizer.unwrap_or("simple")}),
-        SearchIndexKind::Sparse => serde_json::json!({"physical_encoding": "binary-v1"}),
-        SearchIndexKind::Hnsw => paro_storage::search::HnswProviderConfig::new(
-            dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
-            paro_storage::index::hnsw::DistanceMetric::Euclidean,
-            16,
-            64,
-            64,
-            10_000,
-            0,
-            paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
-            paro_storage::search::HnswInlineConfig {
+    let provider_config = match provider {
+        SearchIndexKind::FullText => serde_json::json!({
+            "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
+            "config": tokenizer.unwrap_or("simple")
+        }),
+        SearchIndexKind::Sparse => serde_json::json!({
+            "version": paro_storage::search::SPARSE_PROVIDER_CONFIG_VERSION,
+            "physical_encoding": "binary-v1"
+        }),
+        SearchIndexKind::Hnsw => paro_storage::search::HnswProviderConfig {
+            version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+            distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
+            m: 16,
+            ef_construct: 64,
+            ef_search: 64,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
+            inline_threshold: paro_storage::search::HnswInlineConfig {
+                enabled: true,
                 max_vector_count: 4_096,
                 max_graph_memory_bytes: 64 * 1024 * 1024,
                 max_dimension: 1_536,
             },
-        )
+        }
+        .validated()
         .expect("valid benchmark HNSW config")
         .to_value()
         .expect("serialize benchmark HNSW config"),
     };
-    if provider == SearchIndexKind::FullText {
-        provider_config["tokenizer"] = serde_json::json!(tokenizer.unwrap_or("simple"));
-    }
     let expression = tokenizer.map(|config| format!("to_tsvector('{config}', col_{column_id})"));
     SearchIndexDefinition {
         definition_id,

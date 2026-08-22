@@ -14,6 +14,7 @@ pub type PointOffset = u32;
 /// Score type for distance/similarity values.
 pub type ScoreType = f32;
 pub const DEFAULT_HNSW_BUILD_SEED: u64 = 0x5041_524f_484e_5357;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 1;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -141,10 +142,67 @@ impl PreparedQuery {
     }
 }
 
-/// HNSW index configuration.
+/// Immutable physical contract of one HNSW graph artifact.
 ///
-/// Controls the structure and behavior of the HNSW graph.
+/// Only fields that change graph topology belong here. Query policy is kept in
+/// [`HnswSearchPolicy`] and is deliberately absent from serialized artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswBuildContract {
+    pub version: u32,
+    pub m: u32,
+    pub m0: u32,
+    pub ef_construct: u32,
+    pub distance: super::DistanceMetric,
+    pub build_seed: u64,
+}
+
+impl HnswBuildContract {
+    pub fn validate(&self) -> paro_common::error::Result<()> {
+        if self.version != HNSW_BUILD_CONTRACT_VERSION {
+            return Err(paro_common::error::data_corrupted(format!(
+                "unsupported HNSW build contract version {}, expected {}",
+                self.version, HNSW_BUILD_CONTRACT_VERSION
+            )));
+        }
+        if !(2..=1_024).contains(&self.m) || self.m0 != self.m.saturating_mul(2) {
+            return Err(paro_common::error::data_corrupted(format!(
+                "invalid HNSW build degree contract: m={}, m0={}",
+                self.m, self.m0
+            )));
+        }
+        if self.ef_construct < self.m || self.ef_construct > 1_000_000 {
+            return Err(paro_common::error::data_corrupted(format!(
+                "invalid HNSW ef_construct {} for m {}",
+                self.ef_construct, self.m
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Mutable HNSW query policy supplied by the active search definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswSearchPolicy {
+    pub ef_search: usize,
+    pub plain_scan_threshold: usize,
+    pub filtered_plain_scan_threshold: usize,
+}
+
+impl Default for HnswSearchPolicy {
+    fn default() -> Self {
+        Self {
+            ef_search: 100,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+        }
+    }
+}
+
+/// Transient configuration used by low-level build and test APIs. Persisted
+/// artifacts store only [`HnswBuildContract`], and production search receives
+/// an explicit [`HnswSearchPolicy`] from the active definition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswConfig {
     /// Number of edges per node in the index graph (layers > 0).
     /// Larger = more accurate search, more space required.
@@ -163,8 +221,6 @@ pub struct HnswConfig {
     pub filtered_plain_scan_threshold: usize,
     /// Seed for the versioned deterministic construction RNG.
     pub build_seed: u64,
-    /// Whether to randomize entry point selection during index build.
-    pub build_random_entry_point: bool,
 }
 
 impl Default for HnswConfig {
@@ -177,7 +233,6 @@ impl Default for HnswConfig {
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
-            build_random_entry_point: false,
         }
     }
 }
@@ -193,7 +248,6 @@ impl HnswConfig {
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
-            build_random_entry_point: false,
         }
     }
 
@@ -220,10 +274,24 @@ impl HnswConfig {
         self
     }
 
-    /// Enable or disable random entry point selection during graph construction.
-    pub fn with_build_random_entry_point(mut self, enabled: bool) -> Self {
-        self.build_random_entry_point = enabled;
-        self
+    pub fn build_contract(self, distance: super::DistanceMetric) -> HnswBuildContract {
+        HnswBuildContract {
+            version: HNSW_BUILD_CONTRACT_VERSION,
+            m: u32::try_from(self.m).expect("HNSW m exceeds durable contract width"),
+            m0: u32::try_from(self.m0).expect("HNSW m0 exceeds durable contract width"),
+            ef_construct: u32::try_from(self.ef_construct)
+                .expect("HNSW ef_construct exceeds durable contract width"),
+            distance,
+            build_seed: self.build_seed,
+        }
+    }
+
+    pub const fn search_policy(self) -> HnswSearchPolicy {
+        HnswSearchPolicy {
+            ef_search: self.ef,
+            plain_scan_threshold: self.plain_scan_threshold,
+            filtered_plain_scan_threshold: self.filtered_plain_scan_threshold,
+        }
     }
 }
 
@@ -262,6 +330,15 @@ impl From<&HnswConfig> for HnswM {
     }
 }
 
+impl From<&HnswBuildContract> for HnswM {
+    fn from(contract: &HnswBuildContract) -> Self {
+        HnswM {
+            m: contract.m as usize,
+            m0: contract.m0 as usize,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,7 +365,6 @@ mod tests {
         assert_eq!(config.ef, 100);
         assert_eq!(config.plain_scan_threshold, 10_000);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
-        assert!(!config.build_random_entry_point);
     }
 
     #[test]
@@ -300,7 +376,6 @@ mod tests {
         assert_eq!(config.ef, 200);
         assert_eq!(config.plain_scan_threshold, 10_000);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
-        assert!(!config.build_random_entry_point);
     }
 
     #[test]

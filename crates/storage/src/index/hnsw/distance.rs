@@ -16,7 +16,8 @@
 //!   are negated to achieve this.
 //! - **SIMD acceleration**: Automatically inherited from `paro-common`'s
 //!   implementations (AVX/SSE/NEON), no duplicate SIMD code here.
-//! - **Preprocessing**: Cosine metric normalizes vectors before storage.
+//! - **Preprocessing**: Cosine queries are normalized once; table vectors stay
+//!   raw and the HNSW artifact stores per-point inverse norms.
 //! - **Postprocessing**: Converts internal scores back to user-facing distances.
 //!
 //! ## Two-Layer Architecture
@@ -38,7 +39,7 @@ use super::types::{PreparedQuery, ScoreType};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DistanceMetric {
-    /// Cosine similarity (dot product of normalized vectors).
+    /// Cosine similarity (dot product with index-private inverse norms).
     /// Range: [-1, 1], higher is more similar.
     Cosine,
     /// Euclidean distance (L2 norm).
@@ -101,11 +102,11 @@ impl DistanceMetric {
         }
     }
 
-    /// Preprocess a vector before storage.
+    /// Preprocess a query before graph scoring.
     ///
     /// For Cosine, this normalizes the vector to unit length.
     /// For other metrics, vectors are returned as-is.
-    pub fn preprocess(&self, vector: Vec<f32>) -> Vec<f32> {
+    pub fn preprocess_query(&self, vector: Vec<f32>) -> Vec<f32> {
         match self {
             DistanceMetric::Cosine => distance::normalize(vector),
             _ => vector,
@@ -114,7 +115,7 @@ impl DistanceMetric {
 
     /// Preprocess a raw query and record which metric produced it.
     pub fn prepare(&self, raw_query: &[f32]) -> PreparedQuery {
-        PreparedQuery::new(self.preprocess(raw_query.to_vec()), *self)
+        PreparedQuery::new(self.preprocess_query(raw_query.to_vec()), *self)
     }
 
     /// Score a vector against a query produced by [`Self::prepare`]. Cosine
@@ -130,11 +131,46 @@ impl DistanceMetric {
         if !matches!(self, Self::Cosine) {
             return self.similarity(prepared_query, vector);
         }
-        let vector_norm_squared = distance::dot_product(vector, vector);
-        if vector_norm_squared < f32::EPSILON {
-            return 0.0;
+        distance::dot_product(prepared_query, vector) * distance::inverse_norm(vector)
+    }
+
+    /// Score a prepared query against an indexed point. Cosine indexes persist
+    /// `inverse_norm` once per point, eliminating a second vector pass and
+    /// square root from every graph visit.
+    #[inline]
+    pub fn similarity_prepared_indexed(
+        &self,
+        prepared_query: &[f32],
+        vector: &[f32],
+        cosine_inverse_norm: Option<f32>,
+    ) -> ScoreType {
+        match self {
+            Self::Cosine => {
+                distance::dot_product(prepared_query, vector)
+                    * cosine_inverse_norm.expect("cosine HNSW artifact is missing inverse norms")
+            }
+            _ => self.similarity(prepared_query, vector),
         }
-        distance::dot_product(prepared_query, vector) / vector_norm_squared.sqrt()
+    }
+
+    /// Score two points whose cosine inverse norms are part of the index
+    /// artifact. Other metrics ignore the preprocessing values.
+    #[inline]
+    pub fn similarity_indexed(
+        &self,
+        v1: &[f32],
+        v2: &[f32],
+        cosine_inverse_norm_1: Option<f32>,
+        cosine_inverse_norm_2: Option<f32>,
+    ) -> ScoreType {
+        match self {
+            Self::Cosine => {
+                distance::dot_product(v1, v2)
+                    * cosine_inverse_norm_1.expect("cosine HNSW artifact is missing inverse norms")
+                    * cosine_inverse_norm_2.expect("cosine HNSW artifact is missing inverse norms")
+            }
+            _ => self.similarity(v1, v2),
+        }
     }
 
     /// Convert the internal larger-is-better score to the corresponding SQL
@@ -190,7 +226,7 @@ mod tests {
     #[test]
     fn test_cosine_preprocess() {
         let v = vec![3.0, 4.0];
-        let normalized = DistanceMetric::Cosine.preprocess(v);
+        let normalized = DistanceMetric::Cosine.preprocess_query(v);
         // length = 5, normalized = [0.6, 0.8]
         assert!(approx_eq(normalized[0], 0.6));
         assert!(approx_eq(normalized[1], 0.8));
@@ -203,14 +239,14 @@ mod tests {
     #[test]
     fn test_cosine_preprocess_zero_vector() {
         let v = vec![0.0, 0.0, 0.0];
-        let result = DistanceMetric::Cosine.preprocess(v.clone());
+        let result = DistanceMetric::Cosine.preprocess_query(v.clone());
         assert_eq!(result, v);
     }
 
     #[test]
     fn test_cosine_preprocess_already_normalized() {
         let v = vec![1.0, 0.0, 0.0];
-        let result = DistanceMetric::Cosine.preprocess(v.clone());
+        let result = DistanceMetric::Cosine.preprocess_query(v.clone());
         assert_eq!(result, v);
     }
 
@@ -218,8 +254,8 @@ mod tests {
     fn test_cosine_preprocess_stable() {
         // Renormalization should produce the same result
         let v = vec![1.5, 2.5, -0.5, 3.0];
-        let first = DistanceMetric::Cosine.preprocess(v);
-        let second = DistanceMetric::Cosine.preprocess(first.clone());
+        let first = DistanceMetric::Cosine.preprocess_query(v);
+        let second = DistanceMetric::Cosine.preprocess_query(first.clone());
         assert_eq!(first, second);
     }
 
@@ -344,7 +380,7 @@ mod tests {
     #[test]
     fn test_simd_cosine_preprocess_large() {
         let v: Vec<f32> = (1..129).map(|i| i as f32).collect();
-        let normalized = DistanceMetric::Cosine.preprocess(v);
+        let normalized = DistanceMetric::Cosine.preprocess_query(v);
 
         // Verify unit length
         let len_sq: f32 = normalized.iter().map(|x| x * x).sum();
@@ -355,7 +391,7 @@ mod tests {
         );
 
         // Verify stability (renormalization produces same result)
-        let renormalized = DistanceMetric::Cosine.preprocess(normalized.clone());
+        let renormalized = DistanceMetric::Cosine.preprocess_query(normalized.clone());
         assert_eq!(normalized, renormalized);
     }
 }

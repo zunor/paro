@@ -86,6 +86,26 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Ef: default
 
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  TOP_N  (rows=2)
+    Sort Key: #1 ASC NULLS LAST
+    Limit: 2
+    ->  PROJECTION  (rows=2048)
+      Output: id, __paro_hidden_1
+      ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
+        Columns: id, emb
+
+SELECT id FROM indexed_items
+ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
+id
+1
+2
+
 PREPARE vector_topk(VECTOR(3)) AS
     SELECT id FROM indexed_items ORDER BY emb <-> $1 LIMIT 2;
 PREPARE

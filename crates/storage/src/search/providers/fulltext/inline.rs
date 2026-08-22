@@ -40,13 +40,8 @@ impl InlineArtifactBuilder for FullTextInlineArtifactBuilder {
                     column_id
                 ))
             })?;
-        let config = ctx
-            .definition
-            .provider_config
-            .get("config")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("simple");
-        let tokenizer_kind = TokenizerKind::from_config(config)?;
+        let provider_config = ctx.definition.fulltext_provider_config()?;
+        let tokenizer_kind = TokenizerKind::from_config(&provider_config.config)?;
         Ok(Box::new(FullTextInlineSink {
             definition_id: ctx.definition.definition_id,
             generation_id: ctx.generation_id,
@@ -271,7 +266,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 99,
         };
@@ -333,7 +328,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 99,
         };

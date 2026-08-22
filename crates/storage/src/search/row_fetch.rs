@@ -996,7 +996,7 @@ mod tests {
                 },
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .expect("open vector cursor");
         let mut cursor = opened.cursor;
@@ -1099,7 +1099,7 @@ mod tests {
                 },
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .expect("open vector cursor");
         let snapshot = opened.snapshot;

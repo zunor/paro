@@ -46,6 +46,7 @@ pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;
 pub use vector_storage::{
-    InMemoryVectorStorage, MmapVectorStorage, SharedVectorStorage, VectorStorage,
+    InMemoryVectorStorage, IndexedVectorStorage, MmapVectorStorage, SharedVectorStorage,
+    VectorStorage,
 };
 pub use visited_pool::{VisitedListHandle, VisitedPool};

@@ -7,27 +7,16 @@
 //! of parsing the user-facing text form in provider hot paths.
 
 use crate::rowset::SparseVector;
+use crate::search::{SparsePhysicalEncoding, SparseProviderConfig};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
 pub(crate) fn validate_sparse_binary_row_image_column(
     logical_type: &LogicalType,
-    provider_config: &serde_json::Value,
+    provider_config: &SparseProviderConfig,
 ) -> Result<()> {
-    let encoding = provider_config
-        .get("physical_encoding")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("binary-v1");
-    match encoding {
-        "binary-v1" | "typed-binary-v1" => {}
-        other => {
-            return Err(paro_error::invalid_input(format!(
-                "unsupported sparse physical_encoding: {}",
-                other
-            )))
-        }
-    }
+    let SparsePhysicalEncoding::BinaryV1 = provider_config.physical_encoding;
 
     if !matches!(logical_type, LogicalType::Blob) {
         return Err(paro_error::not_supported(format!(
@@ -92,24 +81,20 @@ mod tests {
 
     #[test]
     fn sparse_row_image_validation_requires_blob_binary_input() {
-        validate_sparse_binary_row_image_column(&LogicalType::Blob, &serde_json::json!({}))
-            .unwrap();
-        validate_sparse_binary_row_image_column(
-            &LogicalType::Blob,
-            &serde_json::json!({ "physical_encoding": "typed-binary-v1" }),
+        let config = SparseProviderConfig::from_value(
+            &serde_json::json!({"version": 1, "physical_encoding": "binary-v1"}),
         )
         .unwrap();
+        validate_sparse_binary_row_image_column(&LogicalType::Blob, &config).unwrap();
 
-        let varchar_err =
-            validate_sparse_binary_row_image_column(&LogicalType::Varchar, &serde_json::json!({}))
-                .expect_err("Varchar text is not a sparse row image");
+        let varchar_err = validate_sparse_binary_row_image_column(&LogicalType::Varchar, &config)
+            .expect_err("Varchar text is not a sparse row image");
         assert!(varchar_err.to_string().contains("Blob binary"));
 
-        let legacy_err = validate_sparse_binary_row_image_column(
-            &LogicalType::Blob,
-            &serde_json::json!({ "physical_encoding": "legacy-text" }),
+        let legacy_err = SparseProviderConfig::from_value(
+            &serde_json::json!({"version": 1, "physical_encoding": "legacy-text" }),
         )
         .expect_err("legacy text encoding should be rejected");
-        assert!(legacy_err.to_string().contains("physical_encoding"));
+        assert!(legacy_err.to_string().contains("unknown variant"));
     }
 }

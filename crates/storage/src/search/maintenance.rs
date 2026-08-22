@@ -246,7 +246,7 @@ mod tests {
                 kind: SearchIndexKind::FullText,
                 column_ids: vec![0],
                 expression: None,
-                provider_config: serde_json::json!({"config": "simple"}),
+                provider_config: serde_json::json!({"version": 1, "config": "simple"}),
                 freshness_policy: SearchFreshnessPolicy::default_for_kind(
                     SearchIndexKind::FullText,
                 ),
@@ -277,7 +277,7 @@ mod tests {
                 kind: SearchIndexKind::FullText,
                 column_ids: vec![0],
                 expression: None,
-                provider_config: serde_json::json!({"config": "simple"}),
+                provider_config: serde_json::json!({"version": 1, "config": "simple"}),
                 freshness_policy: SearchFreshnessPolicy::default_for_kind(
                     SearchIndexKind::FullText,
                 ),
@@ -313,7 +313,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![0],
             expression: None,
-            provider_config: serde_json::json!({"config": "simple"}),
+            provider_config: serde_json::json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 99,
         };
@@ -966,21 +966,24 @@ mod tests {
 
     #[test]
     fn hnsw_maintenance_request_groups_tail_rowset_refs() {
-        let provider_config = crate::search::HnswProviderConfig::new(
-            16,
-            crate::index::hnsw::DistanceMetric::Euclidean,
-            8,
-            64,
-            100,
-            10_000,
-            0,
-            crate::search::DEFAULT_HNSW_BUILD_SEED,
-            crate::search::HnswInlineConfig {
+        let provider_config = crate::search::HnswProviderConfig {
+            version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
+            dimension: 16,
+            distance: crate::index::hnsw::DistanceMetric::Euclidean,
+            m: 8,
+            ef_construct: 64,
+            ef_search: 100,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: crate::search::DEFAULT_HNSW_BUILD_SEED,
+            inline_threshold: crate::search::HnswInlineConfig {
+                enabled: true,
                 max_vector_count: 4_096,
                 max_graph_memory_bytes: 64 * 1024 * 1024,
                 max_dimension: 1_536,
             },
-        )
+        }
+        .validated()
         .unwrap()
         .to_value()
         .unwrap();

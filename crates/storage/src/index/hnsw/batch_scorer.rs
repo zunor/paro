@@ -67,7 +67,7 @@ impl<'a> BatchScorer<'a> {
             for &idx in points {
                 let vector = self.scorers[0].scorer.vector_storage.get_vector(idx);
                 for scorer in &mut self.scorers {
-                    let score = scorer.scorer.score_cached_vector(vector);
+                    let score = scorer.scorer.score_cached_point(idx, vector);
                     scorer.top_k.push(ScoredPoint { idx, score });
                 }
             }

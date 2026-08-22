@@ -36,25 +36,28 @@ pub(crate) fn schema_seed_definition(
     })?;
     let defaults = HnswConfig::default();
     let inline = HnswInlineThreshold::DEFAULT;
-    let provider_config = HnswProviderConfig::new(
+    let provider_config = HnswProviderConfig {
+        version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
         distance,
-        u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
-        u32::try_from(column.hnsw_ef_construct)
+        m: u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        ef_construct: u32::try_from(column.hnsw_ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
-        u32::try_from(column.hnsw_ef_construct)
+        ef_search: u32::try_from(column.hnsw_ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
-        u32::try_from(defaults.plain_scan_threshold)
+        plain_scan_threshold: u32::try_from(defaults.plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
-        u32::try_from(defaults.filtered_plain_scan_threshold)
+        filtered_plain_scan_threshold: u32::try_from(defaults.filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
-        DEFAULT_HNSW_BUILD_SEED,
-        HnswInlineConfig {
+        build_seed: DEFAULT_HNSW_BUILD_SEED,
+        inline_threshold: HnswInlineConfig {
+            enabled: true,
             max_vector_count: inline.max_vector_count,
             max_graph_memory_bytes: inline.max_graph_memory_bytes,
             max_dimension: inline.max_dimension,
         },
-    )?
+    }
+    .validated()?
     .to_value()?;
     Ok(SearchIndexDefinition {
         definition_id: SCHEMA_SEED_BIT | column.id as u64,

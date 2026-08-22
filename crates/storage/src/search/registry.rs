@@ -1322,7 +1322,7 @@ impl SearchIndexRegistry {
 
         let mut added_artifacts = Vec::new();
         let mut added_tail_entries = Vec::new();
-        let mut delta_generation_stats = empty_generation_stats_for_definition(&state.definition);
+        let mut delta_generation_stats = empty_generation_stats_for_definition(&state.definition)?;
         for rowset in visible_rowsets {
             if !new_rowset_ids.contains(&rowset.rowset_id()) {
                 continue;
@@ -1679,7 +1679,7 @@ impl SearchIndexRegistry {
             .cloned()
             .collect::<Vec<_>>();
         let delta_generation_stats =
-            generation_stats_from_artifacts(&state.definition, &added_artifacts);
+            generation_stats_from_artifacts(&state.definition, &added_artifacts)?;
         root.generation_stats.merge_assign(&delta_generation_stats);
         let tail_pending = TailPendingSet {
             entries: tail_pending_entries.clone(),
@@ -1962,7 +1962,7 @@ impl SearchIndexRegistry {
         tail_pending_entries.extend(added_tail_entries.iter().cloned());
 
         let delta_generation_stats =
-            generation_stats_from_artifacts(&state.definition, &added_artifacts);
+            generation_stats_from_artifacts(&state.definition, &added_artifacts)?;
         root.generation_stats.merge_assign(&delta_generation_stats);
         let tail_pending = TailPendingSet {
             entries: tail_pending_entries.clone(),
@@ -2448,7 +2448,7 @@ mod tests {
     }
 
     fn fulltext_test_definition(definition_id: u64) -> SearchIndexDefinition {
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         SearchIndexDefinition {
             definition_id,
             table_id: 10,
@@ -2522,7 +2522,7 @@ mod tests {
     }
 
     fn sparse_test_definition(definition_id: u64) -> SearchIndexDefinition {
-        let provider_config = json!({ "physical_encoding": "binary-v1" });
+        let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
         SearchIndexDefinition {
             definition_id,
             table_id: 1,
@@ -2597,21 +2597,32 @@ mod tests {
         ef_construct: usize,
         inline_max_vector_count: u64,
     ) -> serde_json::Value {
-        crate::search::HnswProviderConfig::new(
+        crate::search::HnswProviderConfig {
+            version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
             dimension,
-            DistanceMetric::Euclidean,
-            m as u32,
-            ef_construct as u32,
-            ef_construct as u32,
-            10_000,
-            0,
-            1,
-            crate::search::HnswInlineConfig {
+            distance: DistanceMetric::Euclidean,
+            m: m as u32,
+            ef_construct: ef_construct as u32,
+            ef_search: ef_construct as u32,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: 1,
+            inline_threshold: crate::search::HnswInlineConfig {
+                enabled: inline_max_vector_count != 0,
                 max_vector_count: inline_max_vector_count,
-                max_graph_memory_bytes: 64 * 1024 * 1024,
-                max_dimension: 1_536,
+                max_graph_memory_bytes: if inline_max_vector_count == 0 {
+                    0
+                } else {
+                    64 * 1024 * 1024
+                },
+                max_dimension: if inline_max_vector_count == 0 {
+                    0
+                } else {
+                    1_536
+                },
             },
-        )
+        }
+        .validated()
         .unwrap()
         .to_value()
         .unwrap()
@@ -2841,7 +2852,7 @@ mod tests {
         let kept = fulltext_test_artifact(91, 2, 6, 18, 5, 12, 6);
         let added = fulltext_test_artifact(91, 3, 2, 4, 2, 3, 3);
         let current =
-            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]);
+            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]).unwrap();
         let materialized = vec![kept, added.clone()];
 
         let next = generation_stats_after_artifact_replacement(
@@ -2870,7 +2881,7 @@ mod tests {
         let kept = sparse_test_artifact(92, 2, 6, 20, 5, 4.0);
         let added = sparse_test_artifact(92, 3, 2, 8, 6, 5.0);
         let current =
-            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]);
+            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]).unwrap();
         let materialized = vec![kept, added.clone()];
 
         let next = generation_stats_after_artifact_replacement(
@@ -2900,7 +2911,7 @@ mod tests {
         let kept = hnsw_test_artifact(93, 2, 6, 3, 32);
         let added = hnsw_test_artifact(93, 3, 2, 5, 48);
         let current =
-            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]);
+            generation_stats_from_artifacts(&definition, &[removed.clone(), kept.clone()]).unwrap();
         let materialized = vec![kept, added.clone()];
 
         let next = generation_stats_after_artifact_replacement(
@@ -3003,7 +3014,7 @@ mod tests {
             kind: SearchIndexKind::FullText,
             column_ids: vec![1],
             expression: None,
-            provider_config: json!({"config": "simple"}),
+            provider_config: json!({"version": 1, "config": "simple"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
             config_fingerprint: 100,
         };
@@ -3014,7 +3025,7 @@ mod tests {
             kind: SearchIndexKind::Sparse,
             column_ids: vec![2],
             expression: None,
-            provider_config: json!({}),
+            provider_config: json!({"version": 1, "physical_encoding": "binary-v1"}),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::Sparse),
             config_fingerprint: 101,
         };
@@ -3062,7 +3073,7 @@ mod tests {
     #[test]
     fn inline_builder_set_coalesces_duplicate_fulltext_payloads_with_strict_policy() {
         let mut view = SearchView::default();
-        let physical_config = json!({"config": "simple"});
+        let physical_config = json!({"version": 1, "config": "simple"});
         let opportunistic = SearchIndexDefinition {
             definition_id: 12,
             table_id: 20,
@@ -3122,6 +3133,10 @@ mod tests {
         assert!(table
             .vector_capability(0, DistanceMetric::Euclidean)
             .is_some());
+        assert!(
+            table.vector_capability(0, DistanceMetric::Cosine).is_none(),
+            "metric mismatch must not expose an HNSW capability"
+        );
     }
 
     #[test]
@@ -3311,7 +3326,7 @@ mod tests {
                 },
                 None,
                 reopened_again.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .expect("query restored schema seed generation");
         let chunks = drain_search_cursor(&reopened_again, opened, &[0], false, 1)
@@ -3331,7 +3346,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 42,
             table_id: table.tablet_id(),
@@ -3403,7 +3418,7 @@ mod tests {
     fn token_open_validates_generation_head_before_snapshot() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 43,
             table_id: table.tablet_id(),
@@ -3482,7 +3497,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 48,
             table_id: table.tablet_id(),
@@ -3548,7 +3563,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 49,
             table_id: table.tablet_id(),
@@ -3607,7 +3622,7 @@ mod tests {
     fn rowset_publish_observer_eagerly_refreshes_search_manifest() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 43,
             table_id: table.tablet_id(),
@@ -3644,7 +3659,7 @@ mod tests {
     fn unpublished_rowset_with_inline_artifact_is_not_queryability_truth() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 143,
             table_id: table.tablet_id(),
@@ -3707,7 +3722,7 @@ mod tests {
     fn fulltext_registry_refresh_appends_delta_for_new_rowsets() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 7,
             table_id: table.tablet_id(),
@@ -3756,7 +3771,7 @@ mod tests {
                 "simple",
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .unwrap();
         let mut cursor = opened.cursor;
@@ -3848,7 +3863,7 @@ mod tests {
         };
         table.register_search_definition(fulltext).unwrap();
 
-        let provider_config = json!({ "physical_encoding": "binary-v1" });
+        let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
         let sparse = SearchIndexDefinition {
             definition_id: 201,
             table_id: table.tablet_id(),
@@ -3967,7 +3982,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 44,
             table_id: table.tablet_id(),
@@ -4051,7 +4066,7 @@ mod tests {
                 "simple",
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .expect("query catch-up sidecar fulltext artifact");
         let chunks =
@@ -4101,7 +4116,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 144,
             table_id: table.tablet_id(),
@@ -4164,7 +4179,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 46,
             table_id: table.tablet_id(),
@@ -4256,7 +4271,7 @@ mod tests {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 47,
             table_id: table.tablet_id(),
@@ -4323,7 +4338,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({ "physical_encoding": "binary-v1" });
+        let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
         let definition = SearchIndexDefinition {
             definition_id: 45,
             table_id: table.tablet_id(),
@@ -4420,7 +4435,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 47,
             table_id: table.tablet_id(),
@@ -4522,7 +4537,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 46,
             table_id: table.tablet_id(),
@@ -4568,7 +4583,7 @@ mod tests {
     fn maintenance_sweep_reports_and_compacts_manifest_delta_window() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 47,
             table_id: table.tablet_id(),
@@ -4663,7 +4678,7 @@ mod tests {
     fn fulltext_rowset_replacement_publishes_remove_artifact_delta() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 45,
             table_id: table.tablet_id(),
@@ -4763,7 +4778,7 @@ mod tests {
                 "simple",
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .unwrap();
         let mut cursor = opened.cursor;
@@ -4816,7 +4831,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
         let definition = SearchIndexDefinition {
             definition_id: 91,
             table_id: table.tablet_id(),
@@ -4917,7 +4932,7 @@ mod tests {
             ])]))
             .unwrap();
 
-        let provider_config = json!({ "physical_encoding": "binary-v1" });
+        let provider_config = json!({"version": 1, "physical_encoding": "binary-v1" });
         let definition = SearchIndexDefinition {
             definition_id: 94,
             table_id: table.tablet_id(),
@@ -5002,7 +5017,7 @@ mod tests {
     fn shared_fulltext_payload_definitions_replay_compaction_output_once() {
         let root = TempDir::new().unwrap();
         let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
-        let provider_config = json!({"config": "simple"});
+        let provider_config = json!({"version": 1, "config": "simple"});
 
         for definition_id in [92, 93] {
             let definition = SearchIndexDefinition {
@@ -5335,7 +5350,7 @@ mod tests {
                 SearchParams::default(),
                 None,
                 table.max_version(),
-                &crate::search::SearchReadOptions::default(),
+                &crate::search::SearchReadOptions::ungoverned(),
             )
             .unwrap();
         let mut cursor = opened.cursor;

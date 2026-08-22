@@ -49,6 +49,14 @@ fn test_dot_product_basic() {
 }
 
 #[test]
+fn test_inverse_norm_uses_the_cosine_zero_domain() {
+    assert!((inverse_norm(&[3.0, 4.0]) - 0.2).abs() < 1e-6);
+    let near_zero = [f32::EPSILON.sqrt() * 0.5];
+    assert_eq!(inverse_norm(&near_zero), 0.0);
+    assert_eq!(cosine_distance(&near_zero, &near_zero), 1.0);
+}
+
+#[test]
 fn test_cosine_distance_same_direction() {
     let v1 = vec![1.0, 2.0, 3.0];
     let v2 = vec![2.0, 4.0, 6.0];

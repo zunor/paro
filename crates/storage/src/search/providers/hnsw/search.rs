@@ -5,7 +5,9 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
-use crate::index::hnsw::{DistanceMetric, HnswIndex, HnswSearchMode, PreparedQuery};
+use crate::index::hnsw::{
+    DistanceMetric, HnswBuildContract, HnswIndex, HnswSearchMode, HnswSearchPolicy, PreparedQuery,
+};
 use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
@@ -108,6 +110,8 @@ impl VectorSearchProvider {
         }
         let distance = self.distance;
         let prepared_query = distance.prepare(&self.query);
+        let expected_build_contract = provider_config.build_contract();
+        let search_policy = provider_config.search_policy();
         let cursor = VectorSearchCursor {
             sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
                 self.tablet.data_dir().clone(),
@@ -120,7 +124,8 @@ impl VectorSearchProvider {
             storage_col_id: self.column_id as u32,
             vector_dim,
             distance,
-            provider_config,
+            expected_build_contract,
+            search_policy,
             params: self.params,
             predicate: self.predicate,
             telemetry: self.telemetry,
@@ -163,7 +168,8 @@ struct VectorSearchCursor {
     storage_col_id: u32,
     vector_dim: usize,
     distance: DistanceMetric,
-    provider_config: Arc<crate::search::HnswProviderConfig>,
+    expected_build_contract: HnswBuildContract,
+    search_policy: HnswSearchPolicy,
     params: SearchParams,
     predicate: Option<PredicateTree>,
     telemetry: Arc<dyn SearchTelemetryCollector>,
@@ -232,7 +238,7 @@ impl VectorSearchCursor {
     }
 
     fn query_wide_search_mode(&self) -> HnswSearchMode {
-        let threshold = self.provider_config.plain_scan_threshold as u64;
+        let threshold = self.search_policy.plain_scan_threshold as u64;
         let visible_rows = self
             .snapshot
             .table_lease
@@ -251,7 +257,7 @@ impl VectorSearchCursor {
     ) -> Result<(Vec<RankedRow>, bool)> {
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
         if let Some(index) = visible_segment.segment.hnsw_index(self.storage_col_id) {
-            validate_hnsw_index_contract(index.as_ref(), self.provider_config.as_ref())?;
+            validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
                 .vector_search_with_epoch_mode(
@@ -261,6 +267,7 @@ impl VectorSearchCursor {
                     &self.params,
                     snapshot_version,
                     self.predicate.as_ref(),
+                    &self.search_policy,
                     search_mode,
                 )
                 .map(|rows| {
@@ -301,7 +308,7 @@ impl VectorSearchCursor {
             self.storage_col_id,
             self.vector_dim,
         )? {
-            validate_hnsw_index_contract(&index, self.provider_config.as_ref())?;
+            validate_hnsw_index_contract(&index, &self.expected_build_contract)?;
             let filter_bitmap = visible_segment
                 .segment
                 .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
@@ -312,11 +319,12 @@ impl VectorSearchCursor {
                 return Ok((Vec::new(), false));
             }
             return index
-                .search_one_with_mode(
+                .search_one_with_policy_mode(
                     &self.query,
                     self.k,
                     &self.params,
                     filter_bitmap.as_ref(),
+                    &self.search_policy,
                     search_mode,
                 )
                 .map(|points| {
@@ -381,18 +389,11 @@ impl VectorSearchCursor {
     }
 }
 
-fn validate_hnsw_index_contract(
-    index: &HnswIndex,
-    provider: &crate::search::HnswProviderConfig,
-) -> Result<()> {
-    let expected = provider.index_config();
-    if index.distance != provider.distance || index.config != expected {
+fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract) -> Result<()> {
+    if index.build_contract != *expected {
         return Err(paro_error::data_corrupted(format!(
-            "HNSW artifact contract mismatch: artifact_distance={}, definition_distance={}, artifact_config={:?}, definition_config={:?}",
-            index.distance.durable_name(),
-            provider.distance.durable_name(),
-            index.config,
-            expected
+            "HNSW artifact build contract mismatch: artifact={:?}, definition={:?}",
+            index.build_contract, expected
         )));
     }
     Ok(())

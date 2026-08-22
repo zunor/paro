@@ -265,6 +265,22 @@ fn parse_u64_index_option(
     })
 }
 
+fn parse_bool_index_option(
+    options: &BTreeMap<String, String>,
+    name: &str,
+    default: bool,
+) -> Result<bool> {
+    options.get(name).map_or(Ok(default), |value| {
+        match value.to_ascii_lowercase().as_str() {
+            "true" | "on" | "1" => Ok(true),
+            "false" | "off" | "0" => Ok(false),
+            _ => Err(paro_error::invalid_input(format!(
+                "HNSW index option {name} must be true or false, got '{value}'"
+            ))),
+        }
+    })
+}
+
 fn hnsw_provider_config(
     options: &BTreeMap<String, String>,
     column_types: &[LogicalType],
@@ -289,6 +305,7 @@ fn hnsw_provider_config(
         "build_seed",
         "plain_scan_threshold",
         "filtered_plain_scan_threshold",
+        "inline_enabled",
         "inline_max_vector_count",
         "inline_max_graph_memory_bytes",
         "inline_max_dimension",
@@ -341,21 +358,47 @@ fn hnsw_provider_config(
         "filtered_plain_scan_threshold",
         defaults.filtered_plain_scan_threshold as u64,
     )?;
-    let inline_max_vector_count = parse_u64_index_option(
-        options,
-        "inline_max_vector_count",
-        inline_defaults.max_vector_count,
-    )?;
-    let inline_max_graph_memory_bytes = parse_u64_index_option(
-        options,
-        "inline_max_graph_memory_bytes",
-        inline_defaults.max_graph_memory_bytes,
-    )?;
-    let inline_max_dimension = parse_u64_index_option(
-        options,
-        "inline_max_dimension",
-        u64::from(inline_defaults.max_dimension),
-    )?;
+    let inline_enabled = parse_bool_index_option(options, "inline_enabled", true)?;
+    if !inline_enabled
+        && [
+            "inline_max_vector_count",
+            "inline_max_graph_memory_bytes",
+            "inline_max_dimension",
+        ]
+        .iter()
+        .any(|name| options.contains_key(*name))
+    {
+        return Err(paro_error::invalid_input(
+            "disabled HNSW inline mode cannot specify inline_max_* limits",
+        ));
+    }
+    let inline_max_vector_count = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_vector_count",
+            inline_defaults.max_vector_count,
+        )?
+    } else {
+        0
+    };
+    let inline_max_graph_memory_bytes = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_graph_memory_bytes",
+            inline_defaults.max_graph_memory_bytes,
+        )?
+    } else {
+        0
+    };
+    let inline_max_dimension = if inline_enabled {
+        parse_u64_index_option(
+            options,
+            "inline_max_dimension",
+            u64::from(inline_defaults.max_dimension),
+        )?
+    } else {
+        0
+    };
     if inline_max_dimension > u64::from(u32::MAX) {
         return Err(paro_error::invalid_input(format!(
             "HNSW index option inline_max_dimension exceeds {}, got {inline_max_dimension}",
@@ -366,23 +409,28 @@ fn hnsw_provider_config(
     let dimension = u32::try_from(*dimension).map_err(|_| {
         paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
     })?;
-    HnswProviderConfig::new(
+    HnswProviderConfig {
+        version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
         distance,
-        u32::try_from(m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
-        u32::try_from(ef_construct).map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
-        u32::try_from(ef_search).map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
-        u32::try_from(plain_scan_threshold)
+        m: u32::try_from(m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
+        ef_construct: u32::try_from(ef_construct)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
+        ef_search: u32::try_from(ef_search)
+            .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        plain_scan_threshold: u32::try_from(plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
-        u32::try_from(filtered_plain_scan_threshold)
+        filtered_plain_scan_threshold: u32::try_from(filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
         build_seed,
-        HnswInlineConfig {
+        inline_threshold: HnswInlineConfig {
+            enabled: inline_enabled,
             max_vector_count: inline_max_vector_count,
             max_graph_memory_bytes: inline_max_graph_memory_bytes,
             max_dimension: inline_max_dimension as u32,
         },
-    )?
+    }
+    .validated()?
     .to_value()
 }
 
@@ -394,8 +442,12 @@ fn provider_config_for_index(
 ) -> Result<JsonValue> {
     match index_type {
         IndexType::HNSW => hnsw_provider_config(&stmt.index_options, column_types),
-        IndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
+        IndexType::Sparse => Ok(json!({
+            "version": paro_storage::search::SPARSE_PROVIDER_CONFIG_VERSION,
+            "physical_encoding": "binary-v1"
+        })),
         IndexType::FullText => Ok(json!({
+            "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
             "config": fulltext_binding
                 .map(|(_, config)| config.as_str())
                 .unwrap_or(SIMPLE_CONFIG)
@@ -789,6 +841,10 @@ mod tests {
         assert_eq!(bound.info.provider_config["dimension"], 100);
         assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
         assert_eq!(
+            bound.info.provider_config["inline_threshold"]["enabled"],
+            true
+        );
+        assert_eq!(
             bound.info.provider_config["inline_threshold"]["max_vector_count"],
             90_000
         );
@@ -827,6 +883,17 @@ mod tests {
         assert!(invalid_distance
             .to_string()
             .contains("must be one of l2, cosine, ip, or l1"));
+
+        let invalid_inline_dimension = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_inline ON items (embedding) inline_max_dimension = 4",
+            ),
+        )
+        .expect_err("inline dimension below the indexed vector should fail");
+        assert!(invalid_inline_dimension
+            .to_string()
+            .contains("max_dimension"));
     }
 
     #[test]
