@@ -449,8 +449,8 @@ pub struct HnswInlineThreshold {
 
 impl HnswInlineThreshold {
     pub const DEFAULT: Self = Self {
-        max_vector_count: 1_000_000,
-        max_graph_memory_bytes: 256 * 1024 * 1024,
+        max_vector_count: 4_096,
+        max_graph_memory_bytes: 64 * 1024 * 1024,
         max_dimension: 1_536,
     };
 
@@ -630,10 +630,10 @@ mod tests {
     #[test]
     fn hnsw_inline_threshold_uses_all_three_dimensions() {
         let threshold = HnswInlineThreshold::DEFAULT;
-        assert!(threshold.allows(1_000_000, 256 * 1024 * 1024, 1_536));
-        assert!(!threshold.allows(1_000_001, 256 * 1024 * 1024, 1_536));
-        assert!(!threshold.allows(1_000_000, 256 * 1024 * 1024 + 1, 1_536));
-        assert!(!threshold.allows(1_000_000, 256 * 1024 * 1024, 1_537));
+        assert!(threshold.allows(4_096, 64 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(4_097, 64 * 1024 * 1024, 1_536));
+        assert!(!threshold.allows(4_096, 64 * 1024 * 1024 + 1, 1_536));
+        assert!(!threshold.allows(4_096, 64 * 1024 * 1024, 1_537));
     }
 
     #[test]

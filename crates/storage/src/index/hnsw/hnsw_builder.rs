@@ -4,7 +4,6 @@
 use super::{DistanceMetric, HnswConfig, HnswIndex, VectorStorage};
 use paro_common::error::Result;
 use std::fmt;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// Cooperative stop-check used by long-running HNSW build tasks.
@@ -39,70 +38,10 @@ impl fmt::Debug for HnswBuildStopCheck {
     }
 }
 
-/// Shared budget limiting how many concurrent HNSW builders may use rayon-parallel construction.
-#[derive(Debug)]
-pub struct HnswBuildConcurrencyBudget {
-    max_parallel_builds: usize,
-    active_parallel_builds: AtomicUsize,
-}
-
-impl HnswBuildConcurrencyBudget {
-    pub fn new(max_parallel_builds: usize) -> Self {
-        Self {
-            max_parallel_builds,
-            active_parallel_builds: AtomicUsize::new(0),
-        }
-    }
-
-    pub fn max_parallel_builds(&self) -> usize {
-        self.max_parallel_builds
-    }
-
-    fn try_acquire(self: &Arc<Self>) -> Option<HnswBuildParallelPermit> {
-        if self.max_parallel_builds == 0 {
-            return None;
-        }
-
-        let mut active = self.active_parallel_builds.load(Ordering::Acquire);
-        loop {
-            if active >= self.max_parallel_builds {
-                return None;
-            }
-            match self.active_parallel_builds.compare_exchange_weak(
-                active,
-                active + 1,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => {
-                    return Some(HnswBuildParallelPermit {
-                        budget: Arc::clone(self),
-                    })
-                }
-                Err(observed) => active = observed,
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct HnswBuildParallelPermit {
-    budget: Arc<HnswBuildConcurrencyBudget>,
-}
-
-impl Drop for HnswBuildParallelPermit {
-    fn drop(&mut self) {
-        self.budget
-            .active_parallel_builds
-            .fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
 /// Shared HNSW build entrypoint used by all storage-layer HNSW materialization paths.
 #[derive(Clone, Debug, Default)]
 pub struct HnswBuilder {
     stop_check: Option<HnswBuildStopCheck>,
-    concurrency_budget: Option<Arc<HnswBuildConcurrencyBudget>>,
 }
 
 impl HnswBuilder {
@@ -115,36 +54,13 @@ impl HnswBuilder {
         self
     }
 
-    pub fn with_concurrency_budget(
-        mut self,
-        concurrency_budget: Arc<HnswBuildConcurrencyBudget>,
-    ) -> Self {
-        self.concurrency_budget = Some(concurrency_budget);
-        self
-    }
-
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Result<HnswIndex> {
-        // The shared budget limits concurrent index-build jobs. Intra-graph
-        // insertion stays serial because heuristic neighbor selection depends
-        // on a fully published preceding topology.
-        let permit = self
-            .concurrency_budget
-            .as_ref()
-            .and_then(|budget| budget.try_acquire());
-        let result = HnswIndex::build_with_controls(
-            storage,
-            config,
-            distance,
-            false,
-            self.stop_check.as_ref(),
-        );
-        drop(permit);
-        result
+        HnswIndex::build_with_controls(storage, config, distance, self.stop_check.as_ref())
     }
 }
 
@@ -152,16 +68,7 @@ impl HnswBuilder {
 mod tests {
     use super::*;
     use crate::index::hnsw::InMemoryVectorStorage;
-
-    #[test]
-    fn concurrency_budget_limits_parallel_slots() {
-        let budget = Arc::new(HnswBuildConcurrencyBudget::new(1));
-        let first = budget.try_acquire();
-        assert!(first.is_some());
-        assert!(budget.try_acquire().is_none());
-        drop(first);
-        assert!(budget.try_acquire().is_some());
-    }
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn builder_stop_check_can_cancel_build() {

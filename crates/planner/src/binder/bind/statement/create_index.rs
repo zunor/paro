@@ -14,7 +14,11 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, CreateIndexStmt, Expr, IndexKind};
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
+use paro_storage::index::hnsw::HnswConfig;
 use paro_storage::index::IndexConstraintType;
+use paro_storage::search::HnswInlineThreshold;
+use serde_json::{json, Value as JsonValue};
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 const SIMPLE_CONFIG: &str = "simple";
@@ -215,6 +219,165 @@ fn validate_sparse_index_definition(column_types: &[LogicalType]) -> Result<()> 
     Ok(())
 }
 
+fn validate_hnsw_index_definition(
+    binder: &Binder,
+    table: &TableCatalogEntry,
+    schema_name: &str,
+    index_name: &str,
+    column_ids: &[LogicalIndex],
+) -> Result<()> {
+    let [column_id] = column_ids else {
+        return Err(paro_error::invalid_input(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    };
+    let schema = binder
+        .catalog()
+        .get_schema(&binder.catalog_txn_view(), schema_name)?;
+    for existing in schema.indexes_for_table(&binder.catalog_txn_view(), table.base.base.object_id)
+    {
+        if existing.name() == index_name || existing.index_type != IndexType::HNSW {
+            continue;
+        }
+        if existing.column_ids.as_slice() == [*column_id] {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW index '{}' already exists on column {}; one physical HNSW contract per column is supported",
+                existing.name(), column_id.index
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_u64_index_option(
+    options: &BTreeMap<String, String>,
+    name: &str,
+    default: u64,
+) -> Result<u64> {
+    options.get(name).map_or(Ok(default), |value| {
+        value.parse::<u64>().map_err(|_| {
+            paro_error::invalid_input(format!(
+                "HNSW index option {name} must be a non-negative integer, got '{value}'"
+            ))
+        })
+    })
+}
+
+fn hnsw_provider_config(
+    options: &BTreeMap<String, String>,
+    column_types: &[LogicalType],
+) -> Result<JsonValue> {
+    let [LogicalType::Array(inner, dimension)] = column_types else {
+        return Err(paro_error::not_supported(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    };
+    if !matches!(inner.as_ref(), LogicalType::Float) {
+        return Err(paro_error::not_supported(
+            "HNSW index requires exactly one VECTOR(N) column",
+        ));
+    }
+
+    const TYPE_KEYS: &[&str] = &["mode", "kind", "type", "index_type", "vector_mode"];
+    const HNSW_KEYS: &[&str] = &[
+        "m",
+        "ef_construct",
+        "plain_scan_threshold",
+        "filtered_plain_scan_threshold",
+        "inline_max_vector_count",
+        "inline_max_graph_memory_bytes",
+        "inline_max_dimension",
+    ];
+    if let Some(unknown) = options
+        .keys()
+        .find(|key| !TYPE_KEYS.contains(&key.as_str()) && !HNSW_KEYS.contains(&key.as_str()))
+    {
+        return Err(paro_error::invalid_input(format!(
+            "Unknown HNSW index option '{unknown}'"
+        )));
+    }
+
+    let defaults = HnswConfig::default();
+    let inline_defaults = HnswInlineThreshold::DEFAULT;
+    let m = parse_u64_index_option(options, "m", defaults.m as u64)?;
+    if !(2..=1_024).contains(&m) {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option m must be between 2 and 1024, got {m}"
+        )));
+    }
+    let ef_construct =
+        parse_u64_index_option(options, "ef_construct", defaults.ef_construct as u64)?;
+    if ef_construct < m || ef_construct > 1_000_000 {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option ef_construct must be between m ({m}) and 1000000, got {ef_construct}"
+        )));
+    }
+
+    let plain_scan_threshold = parse_u64_index_option(
+        options,
+        "plain_scan_threshold",
+        defaults.plain_scan_threshold as u64,
+    )?;
+    let filtered_plain_scan_threshold = parse_u64_index_option(
+        options,
+        "filtered_plain_scan_threshold",
+        defaults.filtered_plain_scan_threshold as u64,
+    )?;
+    let inline_max_vector_count = parse_u64_index_option(
+        options,
+        "inline_max_vector_count",
+        inline_defaults.max_vector_count,
+    )?;
+    let inline_max_graph_memory_bytes = parse_u64_index_option(
+        options,
+        "inline_max_graph_memory_bytes",
+        inline_defaults.max_graph_memory_bytes,
+    )?;
+    let inline_max_dimension = parse_u64_index_option(
+        options,
+        "inline_max_dimension",
+        u64::from(inline_defaults.max_dimension),
+    )?;
+    if inline_max_dimension > u64::from(u32::MAX) {
+        return Err(paro_error::invalid_input(format!(
+            "HNSW index option inline_max_dimension exceeds {}, got {inline_max_dimension}",
+            u32::MAX
+        )));
+    }
+
+    Ok(json!({
+        "m": m,
+        "ef_construct": ef_construct,
+        "distance": 0,
+        "dimension": *dimension,
+        "plain_scan_threshold": plain_scan_threshold,
+        "filtered_plain_scan_threshold": filtered_plain_scan_threshold,
+        "inline_threshold": {
+            "max_vector_count": inline_max_vector_count,
+            "max_graph_memory_bytes": inline_max_graph_memory_bytes,
+            "max_dimension": inline_max_dimension,
+        }
+    }))
+}
+
+fn provider_config_for_index(
+    stmt: &CreateIndexStmt,
+    index_type: IndexType,
+    column_types: &[LogicalType],
+    fulltext_binding: Option<&(LogicalIndex, String)>,
+) -> Result<JsonValue> {
+    match index_type {
+        IndexType::HNSW => hnsw_provider_config(&stmt.index_options, column_types),
+        IndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
+        IndexType::FullText => Ok(json!({
+            "config": fulltext_binding
+                .map(|(_, config)| config.as_str())
+                .unwrap_or(SIMPLE_CONFIG)
+        })),
+        _ => Ok(json!({})),
+    }
+}
+
 /// Bind a CREATE INDEX statement
 pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<BoundStatementKind> {
     // 1. Resolve table name
@@ -329,6 +492,17 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
     if index_type == IndexType::Sparse {
         validate_sparse_index_definition(&column_types)?;
     }
+    if index_type == IndexType::HNSW {
+        validate_hnsw_index_definition(
+            binder,
+            table.as_ref(),
+            &schema_name,
+            &index_name,
+            &column_ids,
+        )?;
+    }
+    let provider_config =
+        provider_config_for_index(&stmt, index_type, &column_types, fulltext_binding.as_ref())?;
 
     // 9. Determine constraint type
     let _constraint_type = IndexConstraintType::None; // Default for now
@@ -346,6 +520,7 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
     )
     .with_catalog(database_name)
     .with_index_type(index_type)
+    .with_provider_config(provider_config)
     .with_sql(sql.clone());
     if let Some((column_id, config)) = fulltext_binding {
         info = info.with_fulltext_options(column_id, config);
@@ -555,6 +730,61 @@ mod tests {
         assert_eq!(bound.info.index_type, IndexType::Sparse);
         assert_eq!(bound.info.column_ids, vec![LogicalIndex::new(0)]);
         assert_eq!(bound.info.column_types, vec![LogicalType::Blob]);
+    }
+
+    #[test]
+    fn bind_create_hnsw_index_persists_typed_provider_config() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 100);
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+
+        let bound = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
+                 m = 32 ef_construct = 160 plain_scan_threshold = 20000 \
+                 inline_max_vector_count = 90000 \
+                 inline_max_graph_memory_bytes = 268435456 \
+                 inline_max_dimension = 256",
+            ),
+        )
+        .expect("HNSW options should bind");
+
+        let BoundStatementKind::CreateIndex(bound) = bound else {
+            panic!("expected bound CREATE INDEX");
+        };
+        assert_eq!(bound.info.index_type, IndexType::HNSW);
+        assert_eq!(bound.info.provider_config["m"], 32);
+        assert_eq!(bound.info.provider_config["ef_construct"], 160);
+        assert_eq!(bound.info.provider_config["dimension"], 100);
+        assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
+        assert_eq!(
+            bound.info.provider_config["inline_threshold"]["max_vector_count"],
+            90_000
+        );
+    }
+
+    #[test]
+    fn bind_create_hnsw_index_rejects_unknown_or_invalid_options() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 8);
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+
+        let unknown = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_unknown ON items (embedding) magic = 1",
+            ),
+        )
+        .expect_err("unknown HNSW option should fail");
+        assert!(unknown.to_string().contains("Unknown HNSW index option"));
+
+        let invalid = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_invalid ON items (embedding) m = 32 ef_construct = 16",
+            ),
+        )
+        .expect_err("ef_construct below m should fail");
+        assert!(invalid.to_string().contains("must be between m (32)"));
     }
 
     #[test]

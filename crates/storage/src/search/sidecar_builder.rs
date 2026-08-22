@@ -360,10 +360,17 @@ fn hnsw_config_for_definition(
     fallback_m: usize,
     fallback_ef_construct: usize,
 ) -> HnswConfig {
-    HnswConfig::new(
+    let config = HnswConfig::new(
         hnsw_config_usize(definition, "m").unwrap_or(fallback_m),
         hnsw_config_usize(definition, "ef_construct").unwrap_or(fallback_ef_construct),
-    )
+    );
+    let config = hnsw_config_usize(definition, "plain_scan_threshold")
+        .map_or(config, |threshold| {
+            config.with_plain_scan_threshold(threshold)
+        });
+    hnsw_config_usize(definition, "filtered_plain_scan_threshold").map_or(config, |threshold| {
+        config.with_filtered_plain_scan_threshold(threshold)
+    })
 }
 
 fn hnsw_config_usize(

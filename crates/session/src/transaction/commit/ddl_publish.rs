@@ -15,7 +15,6 @@ use paro_common::effect::{
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
-use paro_common::types::LogicalType;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::{
     index::{
@@ -26,18 +25,10 @@ use paro_storage::{
     table::table_handle::TableHandle,
     transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor,
 };
-use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 type CommitApplyWork = Box<dyn FnOnce(u64) -> Result<()> + Send + 'static>;
-
-fn vector_dimension(logical_type: &LogicalType) -> u64 {
-    match logical_type {
-        LogicalType::Array(_, dimension) => *dimension as u64,
-        _ => 0,
-    }
-}
 
 pub(super) fn build_apply_descriptor_phase(
     instance: Arc<Instance>,
@@ -361,7 +352,7 @@ impl IndexBackfillPublishTask {
                 .collect(),
             expression: Self::search_expression(entry),
             freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
-            provider_config: Self::search_provider_config(storage, entry)?,
+            provider_config: entry.provider_config.clone(),
             config_fingerprint: 0,
         };
         let expression = definition.expression.clone();
@@ -397,41 +388,5 @@ impl IndexBackfillPublishTask {
             "to_tsvector('{}', col_{})",
             binding.config, binding.column_id.index
         ))
-    }
-
-    fn search_provider_config(storage: &TableHandle, entry: &IndexCatalogEntry) -> Result<Value> {
-        match entry.index_type {
-            CatalogIndexType::HNSW => {
-                let [column] = entry.get_column_ids() else {
-                    return Err(paro_common::error::not_supported(
-                        "HNSW search definition requires exactly one indexed column",
-                    ));
-                };
-                let schema = storage.tablet().schema().ok_or_else(|| {
-                    paro_common::error::internal("table schema missing for HNSW config")
-                })?;
-                let column = schema.column_by_id(column.index).ok_or_else(|| {
-                    paro_common::error::column_not_found(format!(
-                        "HNSW index column {} not found in schema",
-                        column.index
-                    ))
-                })?;
-                Ok(json!({
-                    "m": column.hnsw_m,
-                    "ef_construct": column.hnsw_ef_construct,
-                    "distance": column.hnsw_distance,
-                    "dimension": vector_dimension(&column.logical_type),
-                }))
-            }
-            CatalogIndexType::Sparse => Ok(json!({ "physical_encoding": "binary-v1" })),
-            CatalogIndexType::FullText => {
-                let config = entry
-                    .fulltext_binding()
-                    .map(|binding| binding.config.clone())
-                    .unwrap_or_else(|| "simple".to_string());
-                Ok(json!({ "config": config }))
-            }
-            _ => Ok(json!({})),
-        }
     }
 }

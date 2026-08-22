@@ -99,6 +99,16 @@ pub struct SearchParams {
     pub random_entry_point: Option<bool>,
 }
 
+/// Query-wide HNSW execution decision. Storage providers choose this after
+/// considering the complete visible table, rather than applying an
+/// unfiltered threshold independently to every physical segment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswSearchMode {
+    Auto,
+    Exact,
+    Graph,
+}
+
 impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
@@ -145,11 +155,8 @@ pub struct HnswConfig {
     pub ef_construct: usize,
     /// Default ef for search (can be overridden per query).
     pub ef: usize,
-    /// Maximum segment size below which an unfiltered plain scan is preferred.
-    ///
-    /// Unfiltered Top-K defaults to graph search even for small physical
-    /// segments. Applying this threshold independently to every segment turns
-    /// a segmented table into an accidental full-table scan.
+    /// Maximum visible-table row count below which an unfiltered exact scan is
+    /// preferred. Providers must evaluate it once per query, globally.
     pub plain_scan_threshold: usize,
     /// Maximum filtered candidate count below which a filtered plain scan is preferred.
     pub filtered_plain_scan_threshold: usize,
@@ -165,7 +172,7 @@ impl Default for HnswConfig {
             m0: 48, // 2 * m
             ef_construct: 100,
             ef: 100,
-            plain_scan_threshold: 0,
+            plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_random_entry_point: false,
         }
@@ -180,7 +187,7 @@ impl HnswConfig {
             m0: m * 2,
             ef_construct,
             ef: ef_construct,
-            plain_scan_threshold: 0,
+            plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_random_entry_point: false,
         }
@@ -270,7 +277,7 @@ mod tests {
         assert_eq!(config.m0, 48);
         assert_eq!(config.ef_construct, 100);
         assert_eq!(config.ef, 100);
-        assert_eq!(config.plain_scan_threshold, 0);
+        assert_eq!(config.plain_scan_threshold, 10_000);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
         assert!(!config.build_random_entry_point);
     }
@@ -282,7 +289,7 @@ mod tests {
         assert_eq!(config.m0, 16);
         assert_eq!(config.ef_construct, 200);
         assert_eq!(config.ef, 200);
-        assert_eq!(config.plain_scan_threshold, 0);
+        assert_eq!(config.plain_scan_threshold, 10_000);
         assert_eq!(config.filtered_plain_scan_threshold, 0);
         assert!(!config.build_random_entry_point);
     }

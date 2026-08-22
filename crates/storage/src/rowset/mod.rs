@@ -84,7 +84,9 @@ pub use rowset_statistics::{RowsetColumnStatistics, RowsetStatistics};
 pub use segment_statistics::{ColumnSegmentStatistics, SegmentStatistics};
 
 // Re-export segment_writer types.
-pub use segment::{ColumnData, SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions};
+pub use segment::{
+    ColumnData, HnswColumnBuildOptions, SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions,
+};
 
 // Re-export rowset_writer types.
 pub use rowset_writer::{RowsetWriter, RowsetWriterBuilder, RowsetWriterContext};

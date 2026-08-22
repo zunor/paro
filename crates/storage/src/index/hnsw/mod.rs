@@ -39,7 +39,7 @@ pub use entry_points::{EntryPoint, EntryPoints};
 pub use graph::GraphLayers;
 pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;
-pub use hnsw_builder::{HnswBuildConcurrencyBudget, HnswBuildStopCheck, HnswBuilder};
+pub use hnsw_builder::{HnswBuildStopCheck, HnswBuilder};
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub use persistence::HnswIndex;
 pub use scorer::VectorScorer;

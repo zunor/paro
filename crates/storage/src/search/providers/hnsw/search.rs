@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
-use crate::index::hnsw::{DistanceMetric, HnswIndex, PreparedQuery};
+use crate::index::hnsw::{DistanceMetric, HnswIndex, HnswSearchMode, PreparedQuery};
 use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
@@ -26,7 +26,7 @@ use crate::search::telemetry::{
     SearchTelemetryCollector,
 };
 use crate::search::topk_merge::{ranked_rows_to_batch, RankedRow, TopKCollector};
-use crate::tablet::{ColumnId, TabletRef};
+use crate::tablet::TabletRef;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
@@ -87,7 +87,7 @@ impl VectorSearchProvider {
                 top_k: self.k,
             },
         )?;
-        let distance = resolve_distance_metric(&self.tablet, self.column_id);
+        let distance = resolve_distance_metric(&snapshot.generation.provider_config);
         let prepared_query = distance.prepare(&self.query);
         let cursor = VectorSearchCursor {
             sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
@@ -171,13 +171,14 @@ impl VectorSearchCursor {
             coverage: self.snapshot.generation.coverage.clone(),
             artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
         });
+        let search_mode = self.query_wide_search_mode();
         let per_segment = dispatch_segments(
             SearchIndexKind::Hnsw,
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
             |segment| {
-                let (rows, degraded) = self.search_segment(segment)?;
+                let (rows, degraded) = self.search_segment(segment, search_mode)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
                     degraded,
@@ -209,7 +210,30 @@ impl VectorSearchCursor {
         Ok(ranked_rows)
     }
 
-    fn search_segment(&self, visible_segment: &VisibleSegment) -> Result<(Vec<RankedRow>, bool)> {
+    fn query_wide_search_mode(&self) -> HnswSearchMode {
+        let threshold = self
+            .snapshot
+            .generation
+            .provider_config
+            .get("plain_scan_threshold")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(10_000);
+        let visible_rows = self
+            .snapshot
+            .table_lease
+            .visible_segments()
+            .iter()
+            .fold(0u64, |rows, segment| {
+                rows.saturating_add(segment.segment.num_rows())
+            });
+        choose_query_wide_search_mode(self.predicate.is_some(), visible_rows, threshold)
+    }
+
+    fn search_segment(
+        &self,
+        visible_segment: &VisibleSegment,
+        search_mode: HnswSearchMode,
+    ) -> Result<(Vec<RankedRow>, bool)> {
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
         if visible_segment
             .segment
@@ -218,13 +242,14 @@ impl VectorSearchCursor {
         {
             return visible_segment
                 .segment
-                .vector_search_with_epoch(
+                .vector_search_with_epoch_mode(
                     self.storage_col_id,
                     &self.query,
                     self.k,
                     &self.params,
                     snapshot_version,
                     self.predicate.as_ref(),
+                    search_mode,
                 )
                 .map(|rows| {
                     let ranked_rows = if self.snapshot.has_overlay_delete_vectors() {
@@ -274,7 +299,13 @@ impl VectorSearchCursor {
                 return Ok((Vec::new(), false));
             }
             return index
-                .search_one(&self.query, self.k, &self.params, filter_bitmap.as_ref())
+                .search_one_with_mode(
+                    &self.query,
+                    self.k,
+                    &self.params,
+                    filter_bitmap.as_ref(),
+                    search_mode,
+                )
                 .map(|points| {
                     (
                         hnsw_ranked_rows_from_points(&self.snapshot, visible_segment, points),
@@ -472,13 +503,59 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn resolve_distance_metric(tablet: &TabletRef, column_id: usize) -> DistanceMetric {
-    tablet
-        .schema()
-        .and_then(|schema| {
-            schema
-                .column_by_id(column_id as ColumnId)
-                .map(|column| DistanceMetric::from_u8(column.hnsw_distance))
-        })
-        .unwrap_or(DistanceMetric::Euclidean)
+fn resolve_distance_metric(provider_config: &serde_json::Value) -> DistanceMetric {
+    if let Some(value) = provider_config
+        .get("distance")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+    {
+        return DistanceMetric::from_u8(value);
+    }
+    match provider_config
+        .get("distance")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("euclidean")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "cosine" | "cos" => DistanceMetric::Cosine,
+        "dot" | "dot_product" | "inner_product" | "ip" => DistanceMetric::DotProduct,
+        "manhattan" | "l1" => DistanceMetric::Manhattan,
+        _ => DistanceMetric::Euclidean,
+    }
+}
+
+fn choose_query_wide_search_mode(
+    has_predicate: bool,
+    visible_rows: u64,
+    plain_scan_threshold: u64,
+) -> HnswSearchMode {
+    if has_predicate {
+        HnswSearchMode::Auto
+    } else if visible_rows <= plain_scan_threshold {
+        HnswSearchMode::Exact
+    } else {
+        HnswSearchMode::Graph
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unfiltered_plain_scan_threshold_is_query_wide() {
+        assert_eq!(
+            choose_query_wide_search_mode(false, 10_000, 10_000),
+            HnswSearchMode::Exact
+        );
+        assert_eq!(
+            choose_query_wide_search_mode(false, 10_001, 10_000),
+            HnswSearchMode::Graph
+        );
+        assert_eq!(
+            choose_query_wide_search_mode(true, 1, 10_000),
+            HnswSearchMode::Auto
+        );
+    }
 }

@@ -252,6 +252,9 @@ pub struct GenerationReadSnapshot {
     pub coverage: CoverageState,
     pub generation_stats: GenerationStats,
     pub maintenance_state: GenerationMaintenanceState,
+    /// Immutable provider configuration used to make query-wide execution
+    /// decisions at the same generation boundary as the artifacts.
+    pub provider_config: Arc<serde_json::Value>,
     pub artifacts: Arc<GenerationArtifactSet>,
 }
 
@@ -501,6 +504,7 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
             artifacts: Arc::new(GenerationArtifactSet::default()),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);

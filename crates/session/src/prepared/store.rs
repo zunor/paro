@@ -68,8 +68,8 @@ pub struct PortalEntry {
     pub raw_stmt: Arc<Statement>,
     pub holdability: CursorHoldability,
     pub scroll_mode: ScrollMode,
-    pub result_formats: Vec<FormatCode>,
-    pub result_schema: Vec<ResultColumnDesc>,
+    pub result_formats: Arc<[FormatCode]>,
+    pub result_schema: Arc<[ResultColumnDesc]>,
     pub kind: PortalKind,
     pub execution_state: PortalExecutionState,
     pub snapshot_retention: Option<PortalSnapshotRetention>,
@@ -177,10 +177,6 @@ impl PreparedState {
         self.named_portals.remove(name)
     }
 
-    pub fn restore_portal(&mut self, entry: PortalEntry) {
-        self.named_portals.insert(entry.name.clone(), entry);
-    }
-
     pub fn clear_portals(&mut self) {
         self.named_portals.clear();
         self.unnamed_portal = None;
@@ -203,10 +199,6 @@ impl PreparedState {
 
     pub fn remove_unnamed_portal(&mut self) -> Option<PortalEntry> {
         self.unnamed_portal.take()
-    }
-
-    pub fn restore_unnamed_portal(&mut self, entry: PortalEntry) {
-        self.unnamed_portal = Some(entry);
     }
 
     pub fn portals(&self) -> impl Iterator<Item = &PortalEntry> {
@@ -329,8 +321,8 @@ mod tests {
             raw_stmt: Arc::new(parse_single("SELECT 1")),
             holdability,
             scroll_mode: ScrollMode::Scroll,
-            result_formats: vec![FormatCode::Text],
-            result_schema: Vec::new(),
+            result_formats: Arc::from([FormatCode::Text]),
+            result_schema: Arc::from([]),
             kind: PortalKind::ClientCopy {
                 stmt: Box::new(parse_single("SELECT 1")),
                 parameter_env: TypedParameterEnv::default(),

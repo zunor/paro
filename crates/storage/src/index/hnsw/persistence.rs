@@ -12,19 +12,17 @@ use super::search_context::FixedLengthPriorityQueue;
 use super::vector_storage::VectorStorage;
 use super::visited_pool::VisitedPool;
 use super::{
-    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildStopCheck, HnswConfig, PreparedQuery,
-    ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
+    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildStopCheck, HnswConfig,
+    HnswSearchMode, PreparedQuery, ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
 };
 use paro_common::error;
 use paro_common::error::Result;
-use rayon::prelude::{IntoParallelIterator, ParallelIterator};
 use roaring::RoaringBitmap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -61,7 +59,7 @@ impl HnswIndex {
         config: HnswConfig,
         distance: DistanceMetric,
     ) -> Self {
-        Self::build_with_controls(storage, config, distance, false, None)
+        Self::build_with_controls(storage, config, distance, None)
             .expect("HnswIndex::build without stop-check should not fail")
     }
 
@@ -69,12 +67,8 @@ impl HnswIndex {
         storage: Arc<dyn VectorStorage>,
         config: HnswConfig,
         distance: DistanceMetric,
-        use_parallel: bool,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
-        const WARM_START_POINTS: usize = 1_024;
-        const PARALLEL_WAVE_POINTS: usize = 1_024;
-
         let num_vectors = storage.num_vectors();
         // Diverse neighbor selection is required for clustered vector sets;
         // nearest-only truncation forms disconnected local components.
@@ -89,9 +83,11 @@ impl HnswIndex {
             builder.set_levels(i as u32, level);
         }
 
-        // Build an initial graph backbone serially.
-        let warm_start_end = num_vectors.min(WARM_START_POINTS);
-        for i in 0..warm_start_end {
+        // Heuristic insertion mutates existing neighbors. Keeping a single
+        // publication order is the correctness baseline; a future parallel
+        // builder must compute proposals against a frozen topology and publish
+        // them behind a barrier instead of exposing half-built waves.
+        for i in 0..num_vectors {
             if stop_check.is_some_and(|check| check.should_stop()) {
                 return Err(error::query_canceled());
             }
@@ -101,49 +97,6 @@ impl HnswIndex {
                 storage.as_ref(),
                 distance,
             );
-        }
-
-        // Build remaining points either in parallel (budget permitting) or serially.
-        if warm_start_end < num_vectors && use_parallel {
-            let builder_ref = &builder;
-            let storage_ref = storage.as_ref();
-            let cancelled = AtomicBool::new(false);
-            for wave_start in (warm_start_end..num_vectors).step_by(PARALLEL_WAVE_POINTS) {
-                let wave_end = (wave_start + PARALLEL_WAVE_POINTS).min(num_vectors);
-                (wave_start..wave_end).into_par_iter().for_each(|i| {
-                    if cancelled.load(Ordering::Acquire) {
-                        return;
-                    }
-                    if stop_check.is_some_and(|check| check.should_stop()) {
-                        cancelled.store(true, Ordering::Release);
-                        return;
-                    }
-                    builder_ref.link_new_point(
-                        i as u32,
-                        storage_ref.get_vector(i as u32),
-                        storage_ref,
-                        distance,
-                    );
-                });
-                if cancelled.load(Ordering::Acquire) {
-                    break;
-                }
-            }
-            if cancelled.load(Ordering::Acquire) {
-                return Err(error::query_canceled());
-            }
-        } else {
-            for i in warm_start_end..num_vectors {
-                if stop_check.is_some_and(|check| check.should_stop()) {
-                    return Err(error::query_canceled());
-                }
-                builder.link_new_point(
-                    i as u32,
-                    storage.get_vector(i as u32),
-                    storage.as_ref(),
-                    distance,
-                );
-            }
         }
 
         let (links, entry_points) = builder.into_graph_data();
@@ -285,6 +238,17 @@ impl HnswIndex {
         params: &SearchParams,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> Result<Vec<ScoredPoint>> {
+        self.search_one_with_mode(query, top_k, params, filter_bitmap, HnswSearchMode::Auto)
+    }
+
+    pub(crate) fn search_one_with_mode(
+        &self,
+        query: &[f32],
+        top_k: usize,
+        params: &SearchParams,
+        filter_bitmap: Option<&RoaringBitmap>,
+        mode: HnswSearchMode,
+    ) -> Result<Vec<ScoredPoint>> {
         if top_k == 0 {
             return Ok(Vec::new());
         }
@@ -299,7 +263,7 @@ impl HnswIndex {
             self.vector_storage.as_ref(),
             self.distance,
         );
-        let results = if self.should_use_plain_scan(filter_bitmap) {
+        let results = if self.should_use_plain_scan(filter_bitmap, mode) {
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
             let algorithm = self.choose_algorithm(params, filter_bitmap);
@@ -353,7 +317,7 @@ impl HnswIndex {
             })
             .collect();
 
-        let results = if self.should_use_plain_scan(filter_bitmap) {
+        let results = if self.should_use_plain_scan(filter_bitmap, HnswSearchMode::Auto) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
             match filter_bitmap {
@@ -440,7 +404,16 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn should_use_plain_scan(&self, filter_bitmap: Option<&RoaringBitmap>) -> bool {
+    fn should_use_plain_scan(
+        &self,
+        filter_bitmap: Option<&RoaringBitmap>,
+        mode: HnswSearchMode,
+    ) -> bool {
+        match mode {
+            HnswSearchMode::Exact => return true,
+            HnswSearchMode::Graph => return false,
+            HnswSearchMode::Auto => {}
+        }
         let num_points = self.graph.num_points();
         if num_points <= self.config.plain_scan_threshold {
             return true;
@@ -1179,9 +1152,9 @@ mod tests {
             large_filter.insert(idx);
         }
 
-        assert!(!index.should_use_plain_scan(None));
-        assert!(index.should_use_plain_scan(Some(&small_filter)));
-        assert!(!index.should_use_plain_scan(Some(&large_filter)));
+        assert!(!index.should_use_plain_scan(None, HnswSearchMode::Auto));
+        assert!(index.should_use_plain_scan(Some(&small_filter), HnswSearchMode::Auto));
+        assert!(!index.should_use_plain_scan(Some(&large_filter), HnswSearchMode::Auto));
     }
 
     #[test]

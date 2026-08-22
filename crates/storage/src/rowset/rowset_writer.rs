@@ -31,9 +31,10 @@
 use super::rowset::{Rowset, RowsetSharedPtr};
 use super::rowset_meta::{generate_rowset_id, RowsetId, RowsetMeta, RowsetState, SegmentsOverlap};
 use super::segment::{
-    ColumnData, Segment, SegmentInlineIndexKind, SegmentInlineIndexPage, SegmentWriter,
-    SegmentWriterOptions,
+    ColumnData, HnswColumnBuildOptions, Segment, SegmentInlineIndexKind, SegmentInlineIndexPage,
+    SegmentWriter, SegmentWriterOptions,
 };
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::metrics::{storage_metrics, SearchInlineBuildMetricKey};
 use crate::search::{
     AdmissionDecision, AdmissionGrant, FlushSearchMode, HnswInlineBuildEstimate,
@@ -44,6 +45,7 @@ use crate::search::{
 use crate::tablet::{ColumnId, TabletSchemaRef, Version};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -341,16 +343,22 @@ fn chunk_row_count(columns: &[ColumnData]) -> u64 {
 
 fn split_hnsw_segment_admissions<'a>(
     admitted: Vec<AdmittedInlineSink<'a>>,
-) -> (
+) -> Result<(
     Vec<AdmittedInlineSink<'a>>,
     Vec<AdmissionLease>,
     Option<u64>,
-) {
-    let mut search_sinks = Vec::new();
-    let mut hnsw_leases = Vec::new();
-    let mut hnsw_inline_row_limit: Option<u64> = None;
-    for mut admitted_sink in admitted {
-        if admitted_sink.entry.definition.kind == SearchIndexKind::Hnsw {
+    BTreeMap<ColumnId, HnswColumnBuildOptions>,
+)> {
+    // Validate the complete physical index set before transferring any raw
+    // admission grant into an RAII lease. A malformed or conflicting catalog
+    // definition must release every grant acquired for this segment.
+    let validated = (|| {
+        let mut hnsw_inline_row_limit: Option<u64> = None;
+        let mut hnsw_indexes = BTreeMap::new();
+        for admitted_sink in &admitted {
+            if admitted_sink.entry.definition.kind != SearchIndexKind::Hnsw {
+                continue;
+            }
             if let Some(estimate) = admitted_sink.hnsw_inline {
                 let limit = estimate.max_segment_vector_count();
                 hnsw_inline_row_limit = Some(
@@ -359,6 +367,27 @@ fn split_hnsw_segment_admissions<'a>(
                         .unwrap_or(limit),
                 );
             }
+            let (column_id, options) = hnsw_column_build_options(&admitted_sink.entry.definition)?;
+            if hnsw_indexes.insert(column_id, options).is_some() {
+                return Err(paro_error::invalid_input(format!(
+                    "multiple active HNSW definitions target column {column_id}"
+                )));
+            }
+        }
+        Ok((hnsw_inline_row_limit, hnsw_indexes))
+    })();
+    let (hnsw_inline_row_limit, hnsw_indexes) = match validated {
+        Ok(validated) => validated,
+        Err(err) => {
+            release_admitted_inline_sinks(admitted);
+            return Err(err);
+        }
+    };
+
+    let mut search_sinks = Vec::new();
+    let mut hnsw_leases = Vec::new();
+    for mut admitted_sink in admitted {
+        if admitted_sink.entry.definition.kind == SearchIndexKind::Hnsw {
             if let (Some(admission), Some(grant)) =
                 (admitted_sink.admission.take(), admitted_sink.grant.take())
             {
@@ -368,7 +397,65 @@ fn split_hnsw_segment_admissions<'a>(
             search_sinks.push(admitted_sink);
         }
     }
-    (search_sinks, hnsw_leases, hnsw_inline_row_limit)
+    Ok((
+        search_sinks,
+        hnsw_leases,
+        hnsw_inline_row_limit,
+        hnsw_indexes,
+    ))
+}
+
+fn hnsw_column_build_options(
+    definition: &crate::search::SearchIndexDefinition,
+) -> Result<(ColumnId, HnswColumnBuildOptions)> {
+    let [column_id] = definition.column_ids.as_slice() else {
+        return Err(paro_error::invalid_input(
+            "HNSW definition requires exactly one vector column",
+        ));
+    };
+    let read_usize = |key: &str, default: usize| {
+        definition
+            .provider_config
+            .get(key)
+            .and_then(serde_json::Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(default)
+    };
+    let defaults = HnswConfig::default();
+    let config = HnswConfig::new(
+        read_usize("m", defaults.m),
+        read_usize("ef_construct", defaults.ef_construct),
+    )
+    .with_plain_scan_threshold(read_usize(
+        "plain_scan_threshold",
+        defaults.plain_scan_threshold,
+    ))
+    .with_filtered_plain_scan_threshold(read_usize(
+        "filtered_plain_scan_threshold",
+        defaults.filtered_plain_scan_threshold,
+    ));
+    let distance = definition
+        .provider_config
+        .get("distance")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| u8::try_from(value).ok())
+        .map(DistanceMetric::from_u8)
+        .unwrap_or_else(|| {
+            match definition
+                .provider_config
+                .get("distance")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("euclidean")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "cosine" | "cos" => DistanceMetric::Cosine,
+                "dot" | "dot_product" | "inner_product" | "ip" => DistanceMetric::DotProduct,
+                "manhattan" | "l1" => DistanceMetric::Manhattan,
+                _ => DistanceMetric::Euclidean,
+            }
+        });
+    Ok((*column_id, HnswColumnBuildOptions { config, distance }))
 }
 
 fn estimate_inline_build_cost(
@@ -572,8 +659,8 @@ pub struct RowsetWriter {
     current_segment_writer: Option<SegmentWriter>,
     /// Admission leases for SegmentWriter-managed HNSW inline build on the current segment.
     current_hnsw_admission_leases: Vec<AdmissionLease>,
-    /// Whether the current SegmentWriter is allowed to build schema-native HNSW pages.
-    current_hnsw_build_admitted: bool,
+    /// Per-column physical HNSW contract admitted for the current segment.
+    current_hnsw_indexes: BTreeMap<ColumnId, HnswColumnBuildOptions>,
     /// Maximum rows allowed in the current HNSW-admitted segment.
     current_hnsw_inline_row_limit: Option<u64>,
     /// Search sinks consuming the current segment writer stream.
@@ -623,7 +710,7 @@ impl RowsetWriter {
             rowset_meta,
             current_segment_writer: None,
             current_hnsw_admission_leases: Vec::new(),
-            current_hnsw_build_admitted: false,
+            current_hnsw_indexes: BTreeMap::new(),
             current_hnsw_inline_row_limit: None,
             current_search_sinks: Vec::new(),
             current_segment_chunks: Vec::new(),
@@ -708,7 +795,7 @@ impl RowsetWriter {
     fn create_raw_segment_writer(
         &self,
         segment_id: u32,
-        build_hnsw_indexes: bool,
+        hnsw_indexes: BTreeMap<ColumnId, HnswColumnBuildOptions>,
     ) -> Result<SegmentWriter> {
         let segment_path = self.segment_path(segment_id);
         let rowset_gen = self.rowset_meta.rowset_gen();
@@ -719,24 +806,9 @@ impl RowsetWriter {
             .with_short_key_index(self.context.build_short_key_index)
             .with_num_short_key_columns(self.context.num_short_key_columns);
 
-        // Collect HNSW columns from schema
-        let mut hnsw_cols = Vec::new();
-        for col in self.context.schema.columns() {
-            if col.index_hnsw {
-                hnsw_cols.push(col.id);
-            }
-        }
-        if !hnsw_cols.is_empty() {
-            options = options
-                .with_hnsw_index_columns(hnsw_cols)
-                .with_build_hnsw_indexes(self.context.build_hnsw_indexes && build_hnsw_indexes);
-            // Use config/distance from the first column for now
-            if let Some(col) = self.context.schema.columns().iter().find(|c| c.index_hnsw) {
-                use crate::index::hnsw::{DistanceMetric, HnswConfig};
-                options = options
-                    .with_hnsw_config(HnswConfig::new(col.hnsw_m, col.hnsw_ef_construct))
-                    .with_hnsw_distance(DistanceMetric::from_u8(col.hnsw_distance));
-            }
+        options = options.with_build_hnsw_indexes(self.context.build_hnsw_indexes);
+        for (column_id, hnsw) in hnsw_indexes {
+            options = options.with_hnsw_index(column_id, hnsw.config, hnsw.distance);
         }
 
         let mut writer = SegmentWriter::create(self.context.schema.clone(), segment_path, options)?;
@@ -750,10 +822,9 @@ impl RowsetWriter {
     fn create_segment_writer(&mut self, row_count_estimate: u64) -> Result<()> {
         let segment_id = self.current_segment_id;
         let admitted = self.admitted_inline_sinks(row_count_estimate)?;
-        let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit) =
-            split_hnsw_segment_admissions(admitted);
-        let build_hnsw_indexes = !hnsw_admission_leases.is_empty();
-        let writer = self.create_raw_segment_writer(segment_id, build_hnsw_indexes)?;
+        let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit, hnsw_indexes) =
+            split_hnsw_segment_admissions(admitted)?;
+        let writer = self.create_raw_segment_writer(segment_id, hnsw_indexes.clone())?;
         let search_sinks = match self.open_segment_search_sinks(segment_id, admitted_search_sinks) {
             Ok(search_sinks) => search_sinks,
             Err(err) => {
@@ -766,7 +837,7 @@ impl RowsetWriter {
         };
         self.current_segment_writer = Some(writer);
         self.current_hnsw_admission_leases = hnsw_admission_leases;
-        self.current_hnsw_build_admitted = build_hnsw_indexes;
+        self.current_hnsw_indexes = hnsw_indexes;
         self.current_hnsw_inline_row_limit = hnsw_inline_row_limit;
         self.current_search_sinks = search_sinks;
         self.current_segment_chunks.clear();
@@ -1060,7 +1131,7 @@ impl RowsetWriter {
 
     fn clear_current_hnsw_admission(&mut self) {
         self.current_hnsw_admission_leases.clear();
-        self.current_hnsw_build_admitted = false;
+        self.current_hnsw_indexes.clear();
         self.current_hnsw_inline_row_limit = None;
     }
 
@@ -1217,8 +1288,10 @@ impl RowsetWriter {
             .collect::<Vec<_>>();
         self.current_segment_writer.take();
         self.remove_segment_outputs_from(mark.current_segment_id)?;
-        let mut writer = self
-            .create_raw_segment_writer(mark.current_segment_id, self.current_hnsw_build_admitted)?;
+        let mut writer = self.create_raw_segment_writer(
+            mark.current_segment_id,
+            self.current_hnsw_indexes.clone(),
+        )?;
         for columns in &retained_chunks {
             writer.append_chunk(columns)?;
         }

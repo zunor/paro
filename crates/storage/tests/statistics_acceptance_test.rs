@@ -178,9 +178,7 @@ fn test_index_statistics() {
 
     let opts = SegmentWriterOptions::new(0)
         .with_short_key_index(false)
-        .with_hnsw_index_columns(vec![1])
-        .with_hnsw_config(HnswConfig::new(8, 50))
-        .with_hnsw_distance(DistanceMetric::Cosine);
+        .with_hnsw_index(1, HnswConfig::new(8, 50), DistanceMetric::Cosine);
     let mut writer = SegmentWriter::create(schema.clone(), &segment_path, opts).unwrap();
 
     let ids = [0_i64, 1, 2, 3];

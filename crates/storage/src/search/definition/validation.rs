@@ -18,8 +18,66 @@ pub(crate) fn validate_definition(
 ) -> Result<()> {
     match definition.kind {
         SearchIndexKind::Sparse => validate_sparse_definition(definition, tablet),
-        SearchIndexKind::FullText | SearchIndexKind::Hnsw => Ok(()),
+        SearchIndexKind::Hnsw => validate_hnsw_definition(definition, tablet),
+        SearchIndexKind::FullText => Ok(()),
     }
+}
+
+fn validate_hnsw_definition(definition: &SearchIndexDefinition, tablet: &TabletRef) -> Result<()> {
+    let [column_id] = definition.column_ids.as_slice() else {
+        return Err(paro_error::invalid_input(
+            "HNSW search definition requires exactly one vector column",
+        ));
+    };
+    let schema = tablet
+        .schema()
+        .ok_or_else(|| paro_error::internal("table schema missing for HNSW definition"))?;
+    let column = schema.column_by_id(*column_id).ok_or_else(|| {
+        paro_error::column_not_found(format!(
+            "HNSW index column {} not found in schema",
+            column_id
+        ))
+    })?;
+    let LogicalType::Array(inner, dimension) = &column.logical_type else {
+        return Err(paro_error::not_supported(format!(
+            "HNSW index requires VECTOR(N), got {:?} for column {}",
+            column.logical_type, column_id
+        )));
+    };
+    if !matches!(inner.as_ref(), LogicalType::Float) {
+        return Err(paro_error::not_supported(format!(
+            "HNSW index requires VECTOR(N), got {:?} for column {}",
+            column.logical_type, column_id
+        )));
+    }
+    if let Some(configured_dimension) = definition
+        .provider_config
+        .get("dimension")
+        .and_then(Value::as_u64)
+    {
+        if configured_dimension != *dimension as u64 {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW configured dimension {} does not match column {} dimension {}",
+                configured_dimension, column_id, dimension
+            )));
+        }
+    }
+    let m = definition
+        .provider_config
+        .get("m")
+        .and_then(Value::as_u64)
+        .unwrap_or(24);
+    let ef_construct = definition
+        .provider_config
+        .get("ef_construct")
+        .and_then(Value::as_u64)
+        .unwrap_or(100);
+    if !(2..=1_024).contains(&m) || ef_construct < m || ef_construct > 1_000_000 {
+        return Err(paro_error::invalid_input(format!(
+            "invalid HNSW build config: m={m}, ef_construct={ef_construct}"
+        )));
+    }
+    Ok(())
 }
 
 fn validate_sparse_definition(

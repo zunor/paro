@@ -15,7 +15,7 @@ use paro_scheduler::scheduler::TaskScheduler;
 use tracing::debug;
 
 use crate::memory_runtime::QueryMemoryPool;
-use crate::query_executor::compiled::{CompiledExecutable, ExecutionRequest};
+use crate::query_executor::compiled::ExecutionRequest;
 use crate::query_executor::program_executor;
 use crate::runtime::ParameterBindings;
 
@@ -63,34 +63,15 @@ impl Executor {
             MemoryTag::Allocator,
         )) as Arc<dyn paro_common::allocator::Allocator>;
 
-        let handler = match compiled.executable() {
-            CompiledExecutable::Program(program) => {
-                let query_memory_pool = self.create_query_memory_pool();
-                self.execute_program(
-                    program,
-                    result_names,
-                    result_types,
-                    parameter_bindings,
-                    allocator,
-                    query_memory_pool,
-                )?
-            }
-            CompiledExecutable::DirectDenseTopK(executable) => {
-                let chunk = crate::query_executor::direct_dense_topk::execute(
-                    &self.session,
-                    executable,
-                    parameter_bindings.as_ref(),
-                    allocator.clone(),
-                )?;
-                ResultHandler::from_direct_chunk(
-                    result_names,
-                    result_types,
-                    chunk,
-                    allocator,
-                    self.session.cancellation.child_execution_attempt(),
-                )?
-            }
-        };
+        let query_memory_pool = self.create_query_memory_pool();
+        let handler = self.execute_program(
+            compiled.program(),
+            result_names,
+            result_types,
+            parameter_bindings,
+            allocator,
+            query_memory_pool,
+        )?;
         debug!(
             target: targets::EXECUTOR,
             is_query,

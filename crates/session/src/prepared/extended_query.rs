@@ -338,8 +338,8 @@ async fn execute_bind<R: ExtendedQueryResponder>(
         // Protocol portals are forward-only. SQL DECLARE CURSOR is the path that
         // opts into scrollability and materialization.
         scroll_mode: ScrollMode::NoScroll,
-        result_formats,
-        result_schema: portal_result_schema,
+        result_formats: result_formats.into(),
+        result_schema: portal_result_schema.into(),
         kind,
         execution_state: PortalExecutionState::Ready,
         snapshot_retention: None,
@@ -415,15 +415,7 @@ async fn execute_portal<R: ExtendedQueryResponder>(
     message: ExecutePortalMessage,
     responder: &mut R,
 ) -> Result<()> {
-    let is_query = matches!(
-        &portal_entry(session, message.name.as_deref())?.kind,
-        PortalKind::Query(_)
-    );
-    let mut portal = if is_query {
-        take_portal_entry(session, message.name.as_deref())?
-    } else {
-        portal_entry(session, message.name.as_deref())?.clone()
-    };
+    let mut portal = portal_entry(session, message.name.as_deref())?.clone();
 
     if session.is_transaction_failed() && !is_allowed_in_failed_transaction(&portal.raw_stmt) {
         return Err(paro_error::transaction_aborted());
@@ -474,9 +466,7 @@ async fn execute_portal<R: ExtendedQueryResponder>(
         Err(_) => {}
     }
 
-    if is_query {
-        restore_portal_entry(session, message.name.as_deref(), portal);
-    } else if result.is_ok() {
+    if result.is_ok() {
         overwrite_portal_entry(session, message.name.as_deref(), portal);
     }
     if message.name.is_some() && result.is_ok() {
@@ -867,7 +857,7 @@ fn revalidate_portal_execution(
 
     let parameter_types = execution.statement().parameter_types().to_vec();
     let plan = build_query_plan(snapshot, portal.raw_stmt.as_ref().clone(), &parameter_types)?;
-    if plan.result_schema() != portal.result_schema {
+    if plan.result_schema() != portal.result_schema.as_ref() {
         return Err(ParoError::new(paro_error::ErrorData::new(
             paro_error::Severity::Error,
             paro_error::codes::feature::FEATURE_NOT_SUPPORTED,
@@ -1034,26 +1024,6 @@ fn portal_entry<'a>(session: &'a Session, name: Option<&str>) -> Result<&'a Port
             .state
             .unnamed_portal()
             .ok_or_else(|| paro_error::catalog("unnamed portal does not exist".to_string())),
-    }
-}
-
-fn take_portal_entry(session: &mut Session, name: Option<&str>) -> Result<PortalEntry> {
-    match name {
-        Some(name) => session
-            .state
-            .remove_portal(name)
-            .ok_or_else(|| paro_error::catalog(format!("portal \"{name}\" does not exist"))),
-        None => session
-            .state
-            .remove_unnamed_portal()
-            .ok_or_else(|| paro_error::catalog("unnamed portal does not exist".to_string())),
-    }
-}
-
-fn restore_portal_entry(session: &mut Session, name: Option<&str>, portal: PortalEntry) {
-    match name {
-        Some(_) => session.state.restore_portal(portal),
-        None => session.state.restore_unnamed_portal(portal),
     }
 }
 
@@ -1523,6 +1493,43 @@ mod tests {
                 }
             ))
         );
+    }
+
+    #[tokio::test]
+    async fn portal_progress_cannot_resurrect_a_removed_portal() {
+        let instance = paro_instance::Instance::new_in_memory();
+        let mut session = Session::new(1, instance);
+        let mut responder = TestResponder::default();
+
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Parse(ParseMessage {
+                name: Some("s1".to_string()),
+                query: "SELECT 1".to_string(),
+                type_oids: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+        execute_extended_query_message(
+            &mut session,
+            ExtendedQueryMessage::Bind(BindMessage {
+                portal_name: Some("p1".to_string()),
+                statement_name: Some("s1".to_string()),
+                parameter_format_codes: Vec::new(),
+                parameters: Vec::new(),
+                result_column_format_codes: Vec::new(),
+            }),
+            &mut responder,
+        )
+        .await
+        .unwrap();
+
+        let detached_progress = portal_entry(&session, Some("p1")).unwrap().clone();
+        session.state.remove_portal("p1");
+        overwrite_portal_entry(&mut session, Some("p1"), detached_progress);
+        assert!(session.state.get_portal("p1").is_none());
     }
 
     #[tokio::test]

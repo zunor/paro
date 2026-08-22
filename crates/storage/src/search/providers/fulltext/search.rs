@@ -976,6 +976,7 @@ mod tests {
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
             maintenance_state: GenerationMaintenanceState::default(),
+            provider_config: Arc::new(serde_json::Value::Null),
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),

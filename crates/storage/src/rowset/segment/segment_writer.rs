@@ -46,6 +46,7 @@ use crate::tablet::{ColumnId, TabletColumn, TabletSchemaRef};
 use bytes::{Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -73,16 +74,18 @@ pub struct SegmentWriterOptions {
     pub bloom_filter_columns: Vec<ColumnId>,
     /// Columns to build bitmap index
     pub bitmap_index_columns: Vec<ColumnId>,
-    /// Columns to build HNSW index
-    pub hnsw_index_columns: Vec<ColumnId>,
+    /// Per-column HNSW physical build contract.
+    pub hnsw_indexes: BTreeMap<ColumnId, HnswColumnBuildOptions>,
     /// Whether to build HNSW index pages for configured HNSW columns.
     pub build_hnsw_indexes: bool,
-    /// Optional HNSW config
-    pub hnsw_config: Option<HnswConfig>,
-    /// Optional HNSW distance metric
-    pub hnsw_distance: Option<DistanceMetric>,
     /// Optional cooperative stop-check for HNSW build.
     pub hnsw_stop_check: Option<HnswBuildStopCheck>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswColumnBuildOptions {
+    pub config: HnswConfig,
+    pub distance: DistanceMetric,
 }
 
 impl Default for SegmentWriterOptions {
@@ -98,10 +101,8 @@ impl Default for SegmentWriterOptions {
             num_short_key_columns: 3,
             bloom_filter_columns: Vec::new(),
             bitmap_index_columns: Vec::new(),
-            hnsw_index_columns: Vec::new(),
+            hnsw_indexes: BTreeMap::new(),
             build_hnsw_indexes: true,
-            hnsw_config: None,
-            hnsw_distance: None,
             hnsw_stop_check: None,
         }
     }
@@ -165,27 +166,21 @@ impl SegmentWriterOptions {
         self
     }
 
-    /// Set columns to build HNSW index
-    pub fn with_hnsw_index_columns(mut self, columns: Vec<ColumnId>) -> Self {
-        self.hnsw_index_columns = columns;
-        self
-    }
-
     /// Enable/disable building HNSW index pages during segment write.
     pub fn with_build_hnsw_indexes(mut self, build: bool) -> Self {
         self.build_hnsw_indexes = build;
         self
     }
 
-    /// Set HNSW config
-    pub fn with_hnsw_config(mut self, config: HnswConfig) -> Self {
-        self.hnsw_config = Some(config);
-        self
-    }
-
-    /// Set HNSW distance metric
-    pub fn with_hnsw_distance(mut self, distance: DistanceMetric) -> Self {
-        self.hnsw_distance = Some(distance);
+    /// Add a physical HNSW build contract for one vector column.
+    pub fn with_hnsw_index(
+        mut self,
+        column_id: ColumnId,
+        config: HnswConfig,
+        distance: DistanceMetric,
+    ) -> Self {
+        self.hnsw_indexes
+            .insert(column_id, HnswColumnBuildOptions { config, distance });
         self
     }
 
@@ -378,7 +373,8 @@ impl SegmentWriter {
             })?;
 
             let field_type = Self::logical_type_to_field_type(&col.logical_type);
-            let is_hnsw_col = self.options.hnsw_index_columns.contains(&col.id);
+            let hnsw = self.options.hnsw_indexes.get(&col.id).copied();
+            let is_hnsw_col = hnsw.is_some();
             let mut col_opts = ColumnWriterOptions::new(field_type, col.id)
                 .with_logical_type(col.logical_type.clone())
                 .with_nullable(col.is_nullable)
@@ -389,8 +385,8 @@ impl SegmentWriter {
                 .with_hnsw(
                     self.options.build_hnsw_indexes && is_hnsw_col,
                     is_hnsw_col,
-                    self.options.hnsw_config,
-                    self.options.hnsw_distance,
+                    hnsw.map(|options| options.config),
+                    hnsw.map(|options| options.distance),
                 )
                 .with_hnsw_stop_check(self.options.hnsw_stop_check.clone());
 

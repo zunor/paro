@@ -23,6 +23,15 @@ use super::data_row::{encode_chunk_rows, encode_text_chunk_rows};
 const FORMAT_CODE_TEXT: i16 = 0;
 const NO_TABLE_ID: i32 = 0;
 const NO_COLUMN_ID: i16 = 0;
+/// Bound buffered extended-query output without forcing a syscall per row or
+/// per operator chunk. Reaching the threshold is also a cooperative yield
+/// point for large result streams.
+const EXTENDED_QUERY_FLUSH_BYTES: usize = 128 * 1024;
+
+#[inline]
+fn should_flush_extended_query_buffer(buffered_bytes: usize) -> bool {
+    buffered_bytes >= EXTENDED_QUERY_FLUSH_BYTES
+}
 
 pub struct PgWireResultSink<'a> {
     socket: &'a mut Framed<TcpStream, PgCodec>,
@@ -137,6 +146,12 @@ pub(crate) async fn send_chunk_rows(
     socket
         .write_buffer_mut()
         .unsplit(encode_chunk_rows(chunk, schema, format_codes)?.into_inner());
+    if should_flush_extended_query_buffer(socket.write_buffer().len()) {
+        socket
+            .flush()
+            .await
+            .map_err(|e| paro_common::error::internal(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -278,5 +293,15 @@ mod tests {
                 FormatCode::Binary => 1,
             }
         );
+    }
+
+    #[test]
+    fn extended_query_buffer_policy_is_bounded() {
+        assert!(!should_flush_extended_query_buffer(
+            EXTENDED_QUERY_FLUSH_BYTES - 1
+        ));
+        assert!(should_flush_extended_query_buffer(
+            EXTENDED_QUERY_FLUSH_BYTES
+        ));
     }
 }

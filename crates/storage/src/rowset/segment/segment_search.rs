@@ -5,7 +5,7 @@ use super::segment::Segment;
 use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
-use crate::index::hnsw::{PreparedQuery, ScoredPoint, SearchParams};
+use crate::index::hnsw::{HnswSearchMode, PreparedQuery, ScoredPoint, SearchParams};
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
@@ -44,6 +44,27 @@ impl Segment {
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
+        self.vector_search_with_epoch_mode(
+            column_id,
+            query,
+            top_k,
+            params,
+            snapshot_epoch,
+            predicate_tree,
+            HnswSearchMode::Auto,
+        )
+    }
+
+    pub(crate) fn vector_search_with_epoch_mode(
+        &self,
+        column_id: ColumnId,
+        query: &[f32],
+        top_k: usize,
+        params: &SearchParams,
+        snapshot_epoch: u64,
+        predicate_tree: Option<&PredicateTree>,
+        mode: HnswSearchMode,
+    ) -> Result<Vec<ScoredPoint>> {
         let index = self
             .hnsw_index(column_id)
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
@@ -53,7 +74,7 @@ impl Segment {
                 return Ok(Vec::new());
             }
         }
-        index.search_one(query, top_k, params, filter_bitmap.as_ref())
+        index.search_one_with_mode(query, top_k, params, filter_bitmap.as_ref(), mode)
     }
 
     /// Perform a batched vector search on this segment.

@@ -457,6 +457,15 @@ impl Connection {
             return Ok(Some(message));
         }
 
+        // PostgreSQL flushes pending backend messages before it can block for
+        // more frontend input. Extended-query responders deliberately use
+        // `feed` to coalesce messages produced by one dispatch, so this is the
+        // protocol boundary that makes those messages observable even when a
+        // client does not send Sync/Flush next.
+        if !self.socket.write_buffer().is_empty() {
+            self.socket.flush().await?;
+        }
+
         tokio::select! {
             biased;
             _ = self.force_close_token.cancelled() => {

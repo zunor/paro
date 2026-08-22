@@ -1024,6 +1024,57 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn extended_query_flushes_before_waiting_for_more_frontend_input() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Parse(
+                Parse::new(
+                    Some("standalone_parse".to_string()),
+                    "SELECT 1".to_string(),
+                    Vec::new(),
+                ),
+            )))
+            .await
+            .expect("write standalone Parse");
+        let parse_complete = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("ParseComplete must not wait for Sync or Flush");
+        assert_eq!(parse_complete.0, b'1');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Execute(
+                Execute::new(Some("missing_portal".to_string()), 0),
+            )))
+            .await
+            .expect("write invalid Execute");
+        let error = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("ErrorResponse must not wait for Sync or Flush");
+        assert_eq!(error.0, b'E');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Sync(
+                Sync::new(),
+            )))
+            .await
+            .expect("write recovery Sync");
+        let recovered = read_messages_until_ready(&mut client).await;
+        assert_eq!(recovered.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extended_copy_pipeline_waits_for_sync_before_ready_for_query() {
         let (server, run_task, addr) = spawn_test_server(4).await;
         let mut client = TcpStream::connect(addr).await.expect("client connection");

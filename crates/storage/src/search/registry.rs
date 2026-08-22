@@ -1012,6 +1012,25 @@ impl SearchIndexRegistry {
             .lifecycle_lock
             .lock()
             .map_err(|_| paro_error::internal("lock search definition lifecycle"))?;
+        if origin.is_catalog_index()
+            && definition.kind == SearchIndexKind::Hnsw
+            && self
+                .view
+                .load()
+                .definitions
+                .iter()
+                .any(|(definition_id, state)| {
+                    *definition_id != definition.definition_id
+                        && state.origin.is_catalog_index()
+                        && state.definition.kind == SearchIndexKind::Hnsw
+                        && state.definition.column_ids == definition.column_ids
+                })
+        {
+            return Err(paro_error::invalid_input(format!(
+                "only one catalog HNSW definition may target columns {:?}",
+                definition.column_ids
+            )));
+        }
         let duplicate_seed_ids = if origin.is_catalog_index() {
             self.view
                 .load()
@@ -5003,11 +5022,16 @@ mod tests {
     #[test]
     fn hnsw_tail_pending_delta_records_upsert_tail_entry() {
         let root = TempDir::new().unwrap();
-        let table = create_table_with_root(root.path(), &[LogicalType::Integer]);
+        let table = create_table_without_default_indexes(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
+        );
         let provider_config = json!({
             "m": 16,
             "ef_construct": 64,
             "distance": "l2",
+            "dimension": 1,
+            "inline_threshold": { "max_vector_count": 0 },
         });
         let definition = SearchIndexDefinition {
             definition_id: 88,
@@ -5028,10 +5052,16 @@ mod tests {
 
         table.register_search_definition(definition).unwrap();
         table
-            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[10])]))
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![10.0]],
+                1,
+            )]))
             .unwrap();
         table
-            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[20])]))
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![20.0]],
+                1,
+            )]))
             .unwrap();
 
         let delta_entries = load_manifest_delta_entries(&table, 88);
@@ -5077,12 +5107,16 @@ mod tests {
     #[test]
     fn hnsw_tail_pending_maintenance_report_carries_provider_request() {
         let root = TempDir::new().unwrap();
-        let table = create_table_with_root(root.path(), &[LogicalType::Integer]);
+        let table = create_table_without_default_indexes(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
+        );
         let provider_config = json!({
             "m": 16,
             "ef_construct": 64,
             "distance": "l2",
             "dimension": 4,
+            "inline_threshold": { "max_vector_count": 0 },
         });
         let definition = SearchIndexDefinition {
             definition_id: 90,
@@ -5103,7 +5137,10 @@ mod tests {
 
         table.register_search_definition(definition).unwrap();
         table
-            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[10])]))
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![10.0, 0.0, 0.0, 0.0]],
+                4,
+            )]))
             .unwrap();
 
         let report = table.search_registry().maintenance_sweep().unwrap();
@@ -5142,6 +5179,7 @@ mod tests {
             "ef_construct": 32,
             "distance": "l2",
             "dimension": 2,
+            "inline_threshold": { "max_vector_count": 0 },
         });
         let definition = SearchIndexDefinition {
             definition_id: 94,
@@ -5271,15 +5309,23 @@ mod tests {
     #[test]
     fn hnsw_full_snapshot_stores_tail_in_shard_not_root() {
         let root = TempDir::new().unwrap();
-        let table = create_table_with_root(root.path(), &[LogicalType::Integer]);
+        let table = create_table_without_default_indexes(
+            root.path(),
+            &[LogicalType::Array(Box::new(LogicalType::Float), 1)],
+        );
         table
-            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[10])]))
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![10.0]],
+                1,
+            )]))
             .unwrap();
 
         let provider_config = json!({
             "m": 16,
             "ef_construct": 64,
             "distance": "l2",
+            "dimension": 1,
+            "inline_threshold": { "max_vector_count": 0 },
         });
         let definition = SearchIndexDefinition {
             definition_id: 89,
@@ -5331,7 +5377,10 @@ mod tests {
         }
 
         table
-            .append(&test_chunk_from_vectors(vec![test_i32_vector(&[20])]))
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![20.0]],
+                1,
+            )]))
             .unwrap();
 
         let delta_entries = load_manifest_delta_entries(&table, 89);

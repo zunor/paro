@@ -161,10 +161,6 @@ impl SessionState {
         self.prepared.remove_portal(name)
     }
 
-    pub fn restore_portal(&mut self, entry: PortalEntry) {
-        self.prepared.restore_portal(entry);
-    }
-
     pub fn clear_portals(&mut self) {
         self.prepared.clear_portals();
     }
@@ -183,10 +179,6 @@ impl SessionState {
 
     pub fn remove_unnamed_portal(&mut self) -> Option<PortalEntry> {
         self.prepared.remove_unnamed_portal()
-    }
-
-    pub fn restore_unnamed_portal(&mut self, entry: PortalEntry) {
-        self.prepared.restore_unnamed_portal(entry);
     }
 
     pub fn clear_protocol_unnamed_objects(&mut self) -> bool {
@@ -312,8 +304,8 @@ mod tests {
             raw_stmt: Arc::new(parse_single("SELECT 1")),
             holdability: CursorHoldability::WithoutHold,
             scroll_mode: ScrollMode::NoScroll,
-            result_formats: vec![FormatCode::Text],
-            result_schema: Vec::new(),
+            result_formats: Arc::from([FormatCode::Text]),
+            result_schema: Arc::from([]),
             kind: crate::prepared::store::PortalKind::ClientCopy {
                 stmt: Box::new(parse_single("SELECT 1")),
                 parameter_env: crate::prepared::typed_parameters::TypedParameterEnv::default(),

@@ -319,6 +319,7 @@ pub(crate) fn generation_read_snapshot(
             .as_ref()
             .map(|manifest| manifest.root.maintenance_state.clone())
             .unwrap_or_default(),
+        provider_config: Arc::new(state.definition.provider_config.clone()),
         artifacts,
     })
 }

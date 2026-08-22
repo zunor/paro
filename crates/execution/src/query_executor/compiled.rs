@@ -5,15 +5,12 @@
 
 use std::sync::Arc;
 
+use crate::pipeline::StatementProgram;
+use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::typed_parameters::TypedParameterEnv;
 use paro_common::types::LogicalType;
 use paro_context::CompileEnvironmentKey;
-use paro_planner::expression::Expression;
-
-use crate::physical::{PhysicalNodeKind, PhysicalPlan, VectorSearchSpec};
-use crate::pipeline::StatementProgram;
-use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResultColumnDesc {
@@ -41,58 +38,10 @@ pub struct CompiledStatement {
 
 #[derive(Debug)]
 struct CompiledStatementImage {
-    executable: CompiledExecutable,
+    program: StatementProgram,
     result_schema: Box<[ResultColumnDesc]>,
     parameter_types: Box<[LogicalType]>,
     compile_environment: CompileEnvironmentKey,
-}
-
-#[derive(Debug)]
-pub enum CompiledExecutable {
-    Program(StatementProgram),
-    DirectDenseTopK(DirectDenseTopKExecutable),
-}
-
-/// Compiled execution image for the latency-critical unfiltered dense Top-K
-/// shape. It preserves the storage capability proof while removing generic
-/// pipeline/operator setup from each prepared execution.
-#[derive(Debug, Clone)]
-pub struct DirectDenseTopKExecutable {
-    pub spec: VectorSearchSpec,
-    pub output_projection: Box<[usize]>,
-}
-
-impl DirectDenseTopKExecutable {
-    pub fn try_from_physical_plan(plan: &PhysicalPlan) -> Option<Self> {
-        let root = plan.node(plan.root);
-        let PhysicalNodeKind::Project(project) = &root.kind else {
-            return None;
-        };
-        let [search_id] = plan.child_ids(&root.children) else {
-            return None;
-        };
-        let PhysicalNodeKind::VectorSearch(spec) = &plan.node(*search_id).kind else {
-            return None;
-        };
-        if spec.predicate.is_some() || !spec.emit_score {
-            return None;
-        }
-
-        let mut output_projection = Vec::with_capacity(project.expressions.len());
-        for expression in project.expressions.iter() {
-            let Expression::Reference(reference) = expression else {
-                return None;
-            };
-            if reference.index >= spec.projected_columns.len() {
-                return None;
-            }
-            output_projection.push(reference.index);
-        }
-        Some(Self {
-            spec: spec.clone(),
-            output_projection: output_projection.into_boxed_slice(),
-        })
-    }
 }
 
 impl CompiledStatement {
@@ -102,23 +51,9 @@ impl CompiledStatement {
         parameter_types: Vec<LogicalType>,
         compile_environment: CompileEnvironmentKey,
     ) -> Self {
-        Self::new_executable(
-            CompiledExecutable::Program(program),
-            result_schema,
-            parameter_types,
-            compile_environment,
-        )
-    }
-
-    pub fn new_executable(
-        executable: CompiledExecutable,
-        result_schema: Vec<ResultColumnDesc>,
-        parameter_types: Vec<LogicalType>,
-        compile_environment: CompileEnvironmentKey,
-    ) -> Self {
         Self {
             image: Arc::new(CompiledStatementImage {
-                executable,
+                program,
                 result_schema: result_schema.into_boxed_slice(),
                 parameter_types: parameter_types.into_boxed_slice(),
                 compile_environment,
@@ -127,8 +62,8 @@ impl CompiledStatement {
     }
 
     #[inline]
-    pub fn executable(&self) -> &CompiledExecutable {
-        &self.image.executable
+    pub fn program(&self) -> &StatementProgram {
+        &self.image.program
     }
 
     #[inline]

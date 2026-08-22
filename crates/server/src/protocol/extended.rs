@@ -174,7 +174,7 @@ impl ExtendedQueryResponder for PgWireExtendedQueryResponder<'_> {
 
     async fn send_error(&mut self, err: &ParoError) -> Result<()> {
         self.socket
-            .feed(PgWireBackendMessage::ErrorResponse(build_error_response(
+            .send(PgWireBackendMessage::ErrorResponse(build_error_response(
                 err,
             )))
             .await

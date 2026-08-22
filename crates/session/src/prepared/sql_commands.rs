@@ -347,8 +347,8 @@ async fn execute_declare_cursor<S: ProtocolResultSink>(
             CursorHoldability::WithoutHold
         },
         scroll_mode: scroll_mode_from_ast(stmt.scroll),
-        result_formats: vec![FormatCode::Text; result_schema.len().max(1)],
-        result_schema,
+        result_formats: vec![FormatCode::Text; result_schema.len().max(1)].into(),
+        result_schema: result_schema.into(),
         kind: PortalKind::Materialized,
         execution_state: PortalExecutionState::Active(PortalCursor {
             position: -1,

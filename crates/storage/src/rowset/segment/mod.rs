@@ -57,6 +57,6 @@ pub use segment::{Segment, SegmentMeta, SegmentOptions, SegmentSharedPtr};
 pub use segment_format::{ColumnMeta, SegmentFooter};
 pub use segment_iterator::{SegmentBatch, SegmentIterator};
 pub use segment_writer::{
-    ColumnData, SegmentInlineIndexKind, SegmentInlineIndexPage, SegmentWriter,
-    SegmentWriterBuilder, SegmentWriterOptions,
+    ColumnData, HnswColumnBuildOptions, SegmentInlineIndexKind, SegmentInlineIndexPage,
+    SegmentWriter, SegmentWriterBuilder, SegmentWriterOptions,
 };

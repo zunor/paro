@@ -117,6 +117,25 @@ impl RowFetchStats {
     }
 }
 
+fn record_row_fetch_stats(snapshot: &SearchReadSnapshot, stats: RowFetchStats) {
+    let metric_key = SearchRowFetchMetricKey {
+        table_id: snapshot.table.table_id,
+        provider: snapshot.provider_kind,
+    };
+    storage_metrics().record_search_row_fetch(
+        metric_key,
+        stats.rows,
+        stats.projected_columns,
+        stats.segment_groups,
+        stats.column_batches,
+        stats.fixed_width_column_batches,
+        stats.varlen_column_batches,
+        stats.projected_bytes,
+        stats.column_read_by_rowids_page_run_seeks,
+        stats.elapsed_micros,
+    );
+}
+
 pub(crate) struct ProjectedBatch {
     pub(crate) data_cache: HashMap<(RowsetId, u32, u64), Vec<ProjectedCell>>,
     pub(crate) stats: RowFetchStats,
@@ -390,22 +409,7 @@ fn fetch_projected_batch(
     }
 
     let stats = stats.finish(projected_bytes, started_at);
-    let metric_key = SearchRowFetchMetricKey {
-        table_id: snapshot.table.table_id,
-        provider: snapshot.provider_kind,
-    };
-    storage_metrics().record_search_row_fetch(
-        metric_key,
-        stats.rows,
-        stats.projected_columns,
-        stats.segment_groups,
-        stats.column_batches,
-        stats.fixed_width_column_batches,
-        stats.varlen_column_batches,
-        stats.projected_bytes,
-        stats.column_read_by_rowids_page_run_seeks,
-        stats.elapsed_micros,
-    );
+    record_row_fetch_stats(snapshot, stats);
 
     Ok(ProjectedBatch { data_cache, stats })
 }
@@ -587,9 +591,186 @@ fn add_projected_bytes(current: usize, added: usize, byte_limit: usize) -> Resul
     Ok(next)
 }
 
+fn account_column_batch_bytes(
+    logical_type: &LogicalType,
+    batch: &ColumnBatch,
+    rows: usize,
+    mut projected_bytes: usize,
+    byte_limit: usize,
+) -> Result<usize> {
+    if let Ok(type_size) = physical_layout::fixed_row_width(logical_type) {
+        let added = type_size.checked_mul(rows).ok_or_else(|| {
+            paro_error::out_of_memory("search row fetch projected bytes overflow")
+        })?;
+        return add_projected_bytes(projected_bytes, added, byte_limit);
+    }
+
+    if let Some(storage_dictionary) = &batch.storage_dictionary {
+        let expected_code_bytes = rows
+            .checked_mul(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("storage dictionary code count overflow"))?;
+        if storage_dictionary.codes.len() != expected_code_bytes {
+            return Err(paro_error::data_corrupted(
+                "storage dictionary code count does not match row count",
+            ));
+        }
+        let mut decoder = BinaryPlainPageDecoder::new(storage_dictionary.dictionary.clone());
+        decoder.init()?;
+        for row in 0..rows {
+            if is_null_at(batch.nulls.as_deref(), row) {
+                continue;
+            }
+            let code_offset = row * std::mem::size_of::<u32>();
+            let code = u32::from_le_bytes(
+                storage_dictionary.codes[code_offset..code_offset + std::mem::size_of::<u32>()]
+                    .try_into()
+                    .expect("validated u32 code slice"),
+            );
+            let cell = decoder.string_at(code).ok_or_else(|| {
+                paro_error::data_corrupted(format!("storage dictionary code {} out of range", code))
+            })?;
+            projected_bytes = add_projected_bytes(
+                projected_bytes,
+                std::mem::size_of::<u32>() + cell.len(),
+                byte_limit,
+            )?;
+        }
+        return Ok(projected_bytes);
+    }
+
+    let mut offset = 0usize;
+    for row in 0..rows {
+        let len_end = offset
+            .checked_add(std::mem::size_of::<u32>())
+            .ok_or_else(|| paro_error::data_corrupted("varlen row length offset overflow"))?;
+        if len_end > batch.data.len() {
+            return Err(paro_error::data_corrupted(
+                "varlen projected batch length prefix truncated",
+            ));
+        }
+        let len = u32::from_le_bytes(
+            batch.data[offset..len_end]
+                .try_into()
+                .expect("u32 length prefix"),
+        ) as usize;
+        let value_end = len_end
+            .checked_add(len)
+            .ok_or_else(|| paro_error::data_corrupted("varlen projected batch value overflow"))?;
+        if value_end > batch.data.len() {
+            return Err(paro_error::data_corrupted(
+                "varlen projected batch row extends past payload",
+            ));
+        }
+        if !is_null_at(batch.nulls.as_deref(), row) {
+            projected_bytes = add_projected_bytes(projected_bytes, value_end - offset, byte_limit)?;
+        }
+        offset = value_end;
+    }
+    if offset != batch.data.len() {
+        return Err(paro_error::data_corrupted(
+            "varlen projected batch has trailing bytes",
+        ));
+    }
+    Ok(projected_bytes)
+}
+
 fn elapsed_micros_since(started_at: Instant) -> u64 {
     let micros = started_at.elapsed().as_micros();
     micros.min(u128::from(u64::MAX)) as u64
+}
+
+/// Materialize the common Top-K shape without first expanding each cell into
+/// a row-keyed hash map. This is a row-fetch strategy, not a second execution
+/// path: it shares the same limits, metrics, output allocator, and pipeline
+/// lifecycle as the general multi-segment materializer.
+fn try_materialize_single_segment_columns(
+    column_types: &[LogicalType],
+    snapshot: &SearchReadSnapshot,
+    rows: &[PhysicalRowRef],
+    projected_columns: &[usize],
+    mode: RowFetchMode,
+    allocator: Arc<dyn Allocator>,
+) -> Result<Option<(Vec<Vector>, RowFetchStats)>> {
+    let Some(first_row) = rows.first().copied() else {
+        return Ok(None);
+    };
+    if rows
+        .iter()
+        .any(|row| row.segment_key() != first_row.segment_key())
+    {
+        return Ok(None);
+    }
+
+    let started_at = Instant::now();
+    let limits = mode.limits();
+    validate_row_fetch_limits(rows.len(), limits)?;
+    let column_ids = projected_columns
+        .iter()
+        .map(|&column_idx| {
+            column_types
+                .get(column_idx)
+                .ok_or_else(|| paro_error::internal("Invalid projected column index"))?;
+            u32::try_from(column_idx)
+                .map_err(|_| paro_error::out_of_range("projected column index exceeds u32"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let row_offsets = rows
+        .iter()
+        .map(|row| row.row_offset.get())
+        .collect::<Vec<_>>();
+    let segment = snapshot.table_lease.resolve_segment(first_row)?;
+    let encoded_columns = segment.read_by_rowids(&column_ids, &row_offsets)?;
+    if encoded_columns.len() != projected_columns.len() {
+        return Err(paro_error::internal(
+            "single-segment row fetch returned an unexpected column count",
+        ));
+    }
+
+    let mut stats = RowFetchStats {
+        rows: rows.len(),
+        projected_columns: projected_columns.len(),
+        segment_groups: 1,
+        ..Default::default()
+    };
+    let mut projected_bytes = 0usize;
+    let mut vectors = Vec::with_capacity(projected_columns.len());
+    for ((&column_idx, &expected_column_id), (actual_column_id, batch)) in projected_columns
+        .iter()
+        .zip(&column_ids)
+        .zip(encoded_columns)
+    {
+        if actual_column_id != expected_column_id {
+            return Err(paro_error::internal(
+                "single-segment row fetch returned columns out of order",
+            ));
+        }
+        let logical_type = &column_types[column_idx];
+        projected_bytes = account_column_batch_bytes(
+            logical_type,
+            &batch,
+            rows.len(),
+            projected_bytes,
+            limits.byte_limit,
+        )?;
+        stats.column_batches += 1;
+        stats.column_read_by_rowids_page_run_seeks += batch.page_run_seeks;
+        if physical_layout::fixed_row_width(logical_type).is_ok() {
+            stats.fixed_width_column_batches += 1;
+        } else {
+            stats.varlen_column_batches += 1;
+        }
+        vectors.push(vector_decoder::decode_column_batch(
+            logical_type,
+            &batch,
+            rows.len(),
+            allocator.clone(),
+            None,
+        )?);
+    }
+
+    let stats = stats.finish(projected_bytes, started_at);
+    record_row_fetch_stats(snapshot, stats);
+    Ok(Some((vectors, stats)))
 }
 
 pub(crate) fn materialize_candidate_batch(
@@ -602,39 +783,42 @@ pub(crate) fn materialize_candidate_batch(
 ) -> Result<Chunk> {
     let row_count = batch.rows.len();
     let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
-    if let Some(chunk) = try_materialize_single_segment_batch(
+    let mode = RowFetchMode::materialize(row_count);
+    let mut output_vectors = if let Some((vectors, stats)) = try_materialize_single_segment_columns(
         column_types,
         snapshot,
-        &batch,
-        projected_columns,
-        emit_score,
-        allocator.clone(),
-    )? {
-        return Ok(chunk);
-    }
-    let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
-    let projected_batch = SearchRowFetcher::new(snapshot, column_types).fetch_batch(
         &batch.rows,
         projected_columns,
-        RowFetchMode::materialize(row_count),
-    )?;
-    let ProjectedBatch { data_cache, stats } = projected_batch;
-    debug_assert!(stats.projected_bytes <= RowFetchMode::DEFAULT_MATERIALIZE_BYTES);
-
-    for (result_col_idx, &column_idx) in projected_columns.iter().enumerate() {
-        let logical_type = column_types
-            .get(column_idx)
-            .ok_or_else(|| paro_error::internal("Invalid column index"))?;
-        output_vectors.push(materialize_column(
-            tablet,
-            logical_type,
-            column_idx,
-            result_col_idx,
+        mode,
+        allocator.clone(),
+    )? {
+        debug_assert!(stats.projected_bytes <= RowFetchMode::DEFAULT_MATERIALIZE_BYTES);
+        vectors
+    } else {
+        let projected_batch = SearchRowFetcher::new(snapshot, column_types).fetch_batch(
             &batch.rows,
-            &data_cache,
-            allocator.clone(),
-        )?);
-    }
+            projected_columns,
+            mode,
+        )?;
+        let ProjectedBatch { data_cache, stats } = projected_batch;
+        debug_assert!(stats.projected_bytes <= RowFetchMode::DEFAULT_MATERIALIZE_BYTES);
+        let mut vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
+        for (result_col_idx, &column_idx) in projected_columns.iter().enumerate() {
+            let logical_type = column_types
+                .get(column_idx)
+                .ok_or_else(|| paro_error::internal("Invalid column index"))?;
+            vectors.push(materialize_column(
+                tablet,
+                logical_type,
+                column_idx,
+                result_col_idx,
+                &batch.rows,
+                &data_cache,
+                allocator.clone(),
+            )?);
+        }
+        vectors
+    };
 
     if emit_score {
         if !batch.scores.is_empty() && batch.scores.len() != row_count {
@@ -651,111 +835,6 @@ pub(crate) fn materialize_candidate_batch(
     }
 
     Ok(Chunk::from_vectors(output_vectors, allocator))
-}
-
-fn try_materialize_single_segment_batch(
-    column_types: &[LogicalType],
-    snapshot: &SearchReadSnapshot,
-    batch: &CandidateBatch,
-    projected_columns: &[usize],
-    emit_score: bool,
-    allocator: Arc<dyn Allocator>,
-) -> Result<Option<Chunk>> {
-    let Some(first_row) = batch.rows.first().copied() else {
-        return Ok(None);
-    };
-    if batch
-        .rows
-        .iter()
-        .any(|row| row.segment_key() != first_row.segment_key())
-    {
-        return Ok(None);
-    }
-
-    let segment = snapshot.table_lease.resolve_segment(first_row)?;
-    let column_ids = projected_columns
-        .iter()
-        .map(|&column_idx| {
-            column_types
-                .get(column_idx)
-                .ok_or_else(|| paro_error::internal("Invalid projected column index"))?;
-            u32::try_from(column_idx)
-                .map_err(|_| paro_error::out_of_range("projected column index exceeds u32"))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let row_offsets = batch
-        .rows
-        .iter()
-        .map(|row| row.row_offset.get())
-        .collect::<Vec<_>>();
-    let cached_columns = projected_columns
-        .iter()
-        .map(|&column_idx| {
-            segment.cached_search_projection(column_idx as u32, &column_types[column_idx])
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if cached_columns.iter().all(Option::is_some) {
-        let mut output_vectors =
-            Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
-        for cached in cached_columns.into_iter().flatten() {
-            let mut output = Vector::try_new(
-                cached.logical_type().clone(),
-                batch.rows.len(),
-                allocator.clone(),
-            )?;
-            for (output_row, &row_offset) in row_offsets.iter().enumerate() {
-                output.try_copy_at(output_row, cached.as_ref(), row_offset as usize)?;
-            }
-            output.set_count(batch.rows.len());
-            output_vectors.push(output);
-        }
-        append_score_vector(batch, emit_score, allocator.clone(), &mut output_vectors)?;
-        return Ok(Some(Chunk::from_vectors(output_vectors, allocator)));
-    }
-
-    let encoded = segment.read_by_rowids(&column_ids, &row_offsets)?;
-    let mut output_vectors = Vec::with_capacity(projected_columns.len() + usize::from(emit_score));
-    for (&column_idx, (column_id, column_batch)) in projected_columns.iter().zip(encoded) {
-        if column_id != column_idx as u32 {
-            return Err(paro_error::internal(
-                "single-segment row fetch returned columns out of order",
-            ));
-        }
-        output_vectors.push(vector_decoder::decode_column_batch(
-            &column_types[column_idx],
-            &column_batch,
-            batch.rows.len(),
-            allocator.clone(),
-            None,
-        )?);
-    }
-
-    append_score_vector(batch, emit_score, allocator.clone(), &mut output_vectors)?;
-
-    Ok(Some(Chunk::from_vectors(output_vectors, allocator)))
-}
-
-fn append_score_vector(
-    batch: &CandidateBatch,
-    emit_score: bool,
-    allocator: Arc<dyn Allocator>,
-    output_vectors: &mut Vec<Vector>,
-) -> Result<()> {
-    if !emit_score {
-        return Ok(());
-    }
-    if !batch.scores.is_empty() && batch.scores.len() != batch.rows.len() {
-        return Err(paro_error::internal(
-            "Score vector length mismatch during search materialization",
-        ));
-    }
-    let scores = if batch.scores.is_empty() {
-        vec![0.0_f32; batch.rows.len()]
-    } else {
-        batch.scores.clone()
-    };
-    output_vectors.push(Vector::try_from_f32(&scores, allocator)?);
-    Ok(())
 }
 
 #[cfg(test)]
@@ -1067,6 +1146,34 @@ mod tests {
         );
 
         let allocator: Arc<dyn Allocator> = Arc::new(default_allocator());
+        let (direct_vectors, direct_stats) = try_materialize_single_segment_columns(
+            table.types(),
+            &snapshot,
+            &rows,
+            &[2, 1],
+            RowFetchMode::materialize(rows.len()),
+            allocator.clone(),
+        )
+        .expect("materialize single-segment columns")
+        .expect("single-segment strategy should apply");
+        assert_eq!(direct_stats.rows, 4);
+        assert_eq!(direct_stats.segment_groups, 1);
+        assert_eq!(direct_stats.column_batches, 2);
+        assert_eq!(direct_stats.fixed_width_column_batches, 1);
+        assert_eq!(direct_stats.varlen_column_batches, 1);
+        assert_eq!(
+            direct_stats.projected_bytes,
+            projected.stats.projected_bytes
+        );
+        assert_eq!(direct_vectors[0].get_i64(0), Some(30));
+        assert_eq!(direct_vectors[0].get_i64(1), Some(10));
+        assert_eq!(direct_vectors[0].get_i64(2), Some(30));
+        assert_eq!(direct_vectors[0].get_i64(3), Some(20));
+        assert_eq!(direct_vectors[1].get_string(0), Some("gamma"));
+        assert_eq!(direct_vectors[1].get_string(1), Some("alpha"));
+        assert_eq!(direct_vectors[1].get_string(2), Some("gamma"));
+        assert_eq!(direct_vectors[1].get_string(3), Some("beta"));
+
         let numbers = materialize_column(
             &table.tablet(),
             &LogicalType::BigInt,

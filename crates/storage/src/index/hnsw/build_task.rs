@@ -1,10 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{
-    DistanceMetric, HnswBuildConcurrencyBudget, HnswBuildStopCheck, HnswBuilder, HnswConfig,
-    MmapVectorStorage,
-};
+use super::{DistanceMetric, HnswBuildStopCheck, HnswBuilder, HnswConfig, MmapVectorStorage};
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{
     BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
@@ -20,7 +17,6 @@ use paro_scheduler::scheduler::TaskScheduler;
 use paro_scheduler::task::Task;
 use paro_scheduler::task::TaskExecutionMode;
 use paro_scheduler::task::TaskExecutionResult;
-use rayon::current_num_threads;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
@@ -95,15 +91,10 @@ struct SharedBuildState {
     first_error: Mutex<Option<ParoError>>,
     stop_requested: AtomicBool,
     stop_check: Option<HnswBuildStopCheck>,
-    parallel_build_budget: Arc<HnswBuildConcurrencyBudget>,
 }
 
 impl SharedBuildState {
-    fn new(
-        total_tasks: usize,
-        parallel_build_budget: Arc<HnswBuildConcurrencyBudget>,
-        stop_check: Option<HnswBuildStopCheck>,
-    ) -> Self {
+    fn new(total_tasks: usize, stop_check: Option<HnswBuildStopCheck>) -> Self {
         Self {
             total_tasks,
             completed_tasks: AtomicUsize::new(0),
@@ -112,7 +103,6 @@ impl SharedBuildState {
             first_error: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
             stop_check,
-            parallel_build_budget,
         }
     }
 
@@ -170,9 +160,7 @@ impl SharedBuildState {
 
     fn create_builder(self: &Arc<Self>) -> HnswBuilder {
         let state = Arc::clone(self);
-        HnswBuilder::new()
-            .with_concurrency_budget(Arc::clone(&self.parallel_build_budget))
-            .with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
+        HnswBuilder::new().with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
     }
 }
 
@@ -499,14 +487,6 @@ fn collect_jobs(
     Ok(jobs)
 }
 
-fn derive_parallel_build_budget(scheduler: &TaskScheduler) -> Arc<HnswBuildConcurrencyBudget> {
-    let scheduler_workers = scheduler.number_of_threads().max(0) as usize;
-    let scheduler_concurrency = scheduler_workers.saturating_add(1).max(1);
-    let rayon_workers = current_num_threads().max(1);
-    let parallel_slots = (rayon_workers / scheduler_concurrency).max(1);
-    Arc::new(HnswBuildConcurrencyBudget::new(parallel_slots))
-}
-
 /// Build missing HNSW segment indexes in parallel via TaskScheduler.
 ///
 /// This is used by `CREATE INDEX ... USING HNSW` metadata-only flow to materialize
@@ -531,11 +511,7 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
         return Ok(HnswBuildSummary::default());
     }
 
-    let state = Arc::new(SharedBuildState::new(
-        jobs.len(),
-        derive_parallel_build_budget(scheduler.as_ref()),
-        stop_check,
-    ));
+    let state = Arc::new(SharedBuildState::new(jobs.len(), stop_check));
     let producer = scheduler.create_producer();
 
     let tasks: Vec<Arc<Mutex<dyn Task>>> = jobs

@@ -618,10 +618,8 @@ mod tests {
         distance: DistanceMetric,
     ) {
         let opts = SegmentWriterOptions::new(0)
-            .with_hnsw_index_columns(vec![1])
             .with_build_hnsw_indexes(build_hnsw)
-            .with_hnsw_config(config)
-            .with_hnsw_distance(distance);
+            .with_hnsw_index(1, config, distance);
         let mut writer = SegmentWriter::create(schema, path, opts).unwrap();
 
         let mut ids = Vec::with_capacity(vectors.len() * std::mem::size_of::<i64>());

@@ -1569,6 +1569,7 @@ dependencies = [
  "paro-storage",
  "paro-transaction",
  "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1779,6 +1780,7 @@ dependencies = [
  "paro-instance",
  "paro-parser",
  "paro-storage",
+ "serde_json",
  "stacker",
  "tracing",
 ]
