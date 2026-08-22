@@ -23,6 +23,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::VECTOR_SIZE;
 
 use crate::copy::{CopyFormat, CopyFromSource, CopyOptions};
+use crate::scalar::cast::array_casts::parse_vector_literal;
 use crate::scalar::cast::date_casts::parse_date_text;
 use crate::scalar::cast::decimal_casts::parse_decimal_text;
 
@@ -1315,6 +1316,9 @@ fn parse_field(field: &ParsedField, target_type: &LogicalType) -> Result<Value> 
         LogicalType::UBigInt => parse_u64(&field.value).map(Value::UBigInt),
         LogicalType::Float => parse_f64(&field.value).map(|v| Value::Float(v as f32)),
         LogicalType::Double => parse_f64(&field.value).map(Value::Double),
+        LogicalType::Array(child, size) if child.as_ref() == &LogicalType::Float => {
+            parse_float_array(&field.value, *size)
+        }
         LogicalType::Decimal { precision, scale } => {
             parse_decimal_text(&field.value, *precision, *scale)
         }
@@ -1355,6 +1359,16 @@ fn parse_f64(value: &str) -> Result<f64> {
     value
         .parse::<f64>()
         .map_err(|_| paro_error::invalid_value(LogicalType::Double.to_string(), value.to_string()))
+}
+
+fn parse_float_array(value: &str, size: usize) -> Result<Value> {
+    let values = parse_vector_literal(value)?;
+    if values.len() != size {
+        return Err(paro_error::invalid_value(format!("FLOAT[{size}]"), value));
+    }
+
+    let elements = values.into_iter().map(Value::Float).collect();
+    Ok(Value::Array(elements, LogicalType::Float, size))
 }
 
 #[cfg(test)]
@@ -1443,5 +1457,38 @@ mod tests {
         let value = parse_field(&field, &LogicalType::Date).unwrap();
 
         assert_eq!(value, Value::Date(10_561));
+    }
+
+    #[test]
+    fn parse_field_supports_pgvector_text() {
+        let field = ParsedField {
+            value: "[1.25,-2,3e-2]".to_string(),
+            is_null: false,
+        };
+
+        let value =
+            parse_field(&field, &LogicalType::Array(Box::new(LogicalType::Float), 3)).unwrap();
+
+        assert_eq!(
+            value,
+            Value::Array(
+                vec![Value::Float(1.25), Value::Float(-2.0), Value::Float(0.03)],
+                LogicalType::Float,
+                3,
+            )
+        );
+    }
+
+    #[test]
+    fn parse_field_rejects_pgvector_dimension_mismatch() {
+        let field = ParsedField {
+            value: "[1,2]".to_string(),
+            is_null: false,
+        };
+
+        let err =
+            parse_field(&field, &LogicalType::Array(Box::new(LogicalType::Float), 3)).unwrap_err();
+
+        assert!(err.message().contains("FLOAT[3]"));
     }
 }

@@ -166,7 +166,7 @@ fn append_array_literal_value(out: &mut String, value: &Value) {
 /// # Returns
 /// * `Ok(Vec<f32>)` - The parsed vector elements
 /// * `Err` - If parsing fails
-fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
+pub(crate) fn parse_vector_literal(s: &str) -> Result<Vec<f32>> {
     let trimmed = s.trim();
 
     // Check for brackets
