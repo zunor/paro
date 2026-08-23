@@ -378,6 +378,65 @@ impl Value {
             return Ok(self.clone());
         }
 
+        // Prepared-protocol integer parameters may arrive as INT2, INT4, or
+        // INT8 according to the client's smallest lossless wire type. Keep
+        // scalar Value casts aligned with the vector cast registry so a
+        // parameter can be bound once into an indexed predicate without
+        // allocating a one-row vector merely to widen an integer.
+        if let Some(value) = self.as_integral_i128() {
+            let out_of_range =
+                || paro_error::out_of_range(format!("cannot cast {self} to {target_type}"));
+            match target_type {
+                LogicalType::TinyInt => {
+                    return i8::try_from(value)
+                        .map(Value::TinyInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::SmallInt => {
+                    return i16::try_from(value)
+                        .map(Value::SmallInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::Integer => {
+                    return i32::try_from(value)
+                        .map(Value::Integer)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::BigInt => {
+                    return i64::try_from(value)
+                        .map(Value::BigInt)
+                        .map_err(|_| out_of_range());
+                }
+                LogicalType::HugeInt => return Ok(Value::HugeInt(value)),
+                LogicalType::UTinyInt
+                | LogicalType::USmallInt
+                | LogicalType::UInteger
+                | LogicalType::UBigInt
+                | LogicalType::UHugeInt => {
+                    let unsigned = u128::try_from(value).map_err(|_| out_of_range())?;
+                    return match target_type {
+                        LogicalType::UTinyInt => u8::try_from(unsigned)
+                            .map(Value::UTinyInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::USmallInt => u16::try_from(unsigned)
+                            .map(Value::USmallInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UInteger => u32::try_from(unsigned)
+                            .map(Value::UInteger)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UBigInt => u64::try_from(unsigned)
+                            .map(Value::UBigInt)
+                            .map_err(|_| out_of_range()),
+                        LogicalType::UHugeInt => Ok(Value::UHugeInt(unsigned)),
+                        _ => unreachable!("unsigned integral targets are exhaustive"),
+                    };
+                }
+                LogicalType::Float => return Ok(Value::Float(value as f32)),
+                LogicalType::Double => return Ok(Value::Double(value as f64)),
+                _ => {}
+            }
+        }
+
         match (self, target_type) {
             // Numeric casts
             (Value::Integer(v), LogicalType::BigInt) => Ok(Value::BigInt(*v as i64)),
@@ -424,6 +483,22 @@ impl Value {
                 "Cast value {} to {} not implemented",
                 self, target_type
             ))),
+        }
+    }
+
+    fn as_integral_i128(&self) -> Option<i128> {
+        match self {
+            Value::TinyInt(value) => Some(i128::from(*value)),
+            Value::SmallInt(value) => Some(i128::from(*value)),
+            Value::Integer(value) => Some(i128::from(*value)),
+            Value::BigInt(value) => Some(i128::from(*value)),
+            Value::HugeInt(value) => Some(*value),
+            Value::UTinyInt(value) => Some(i128::from(*value)),
+            Value::USmallInt(value) => Some(i128::from(*value)),
+            Value::UInteger(value) => Some(i128::from(*value)),
+            Value::UBigInt(value) => Some(i128::from(*value)),
+            Value::UHugeInt(value) => i128::try_from(*value).ok(),
+            _ => None,
         }
     }
 

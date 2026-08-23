@@ -25,25 +25,33 @@ SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
 -- Exercise the indexed path on one inline-built rowset. Persist the complete,
 -- versioned HNSW contract instead of relying on provider-local defaults.
-CREATE TABLE indexed_items (id INT, emb VECTOR(3));
+CREATE TABLE indexed_items (id INT, bucket INT, emb VECTOR(3));
+CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
 CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     distance = l2
     m = 8
     ef_construct = 32
     ef_search = 24
     build_seed = 7
-    plain_scan_threshold = 10000
-    filtered_plain_scan_threshold = 0
+    plain_scan_threshold = 0
+    filtered_plain_scan_threshold = 128
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
 INSERT INTO indexed_items
-SELECT i, '[1.0,1.0,1.0]'::VECTOR(3)
+SELECT i, i % 10, '[1.0,1.0,1.0]'::VECTOR(3)
 FROM generate_series(1, 2048) AS generated(i);
 SELECT index_name, index_type FROM paro_indexes()
 WHERE index_name = 'idx_indexed_items_emb';
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- A scalar predicate must become part of VECTOR_SEARCH, not remain as a
+-- relational FILTER above it. EXPLAIN also exposes the exact-vs-graph policy.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE bucket = 3
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
 -- A cosine operator must not consume an L2 artifact. Metric mismatch is a
@@ -62,6 +70,16 @@ EXECUTE vector_topk('[1.0, 1.0, 1.0]');
 -- @query
 EXECUTE vector_topk('[2.0, 2.0, 2.0]');
 DEALLOCATE vector_topk;
+
+-- Reusable plans retain the scalar parameter and choose the filtered search
+-- strategy from the exact bitmap cardinality when the source opens.
+PREPARE filtered_vector_topk(INT, VECTOR(3)) AS
+    SELECT id FROM indexed_items
+    WHERE bucket = $1
+    ORDER BY emb <-> $2 LIMIT 2;
+-- @normalize explain_search_ids
+EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+DEALLOCATE filtered_vector_topk;
 
 -- The hint must reach the physical vector-search request.
 -- @normalize explain_search_ids

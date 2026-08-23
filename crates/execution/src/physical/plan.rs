@@ -299,25 +299,15 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
         }
         PhysicalNodeKind::VectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Limit", spec.k.to_string());
-            push_string_property(
-                &mut properties,
-                "Search Ef",
-                spec.params
-                    .ef
-                    .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
-            );
+            push_vector_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::SparseVectorSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Limit", spec.k.to_string());
+            push_sparse_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::FullTextSearch(spec) => {
             push_search_token_properties(&mut properties, &spec.capability_token);
-            push_string_property(&mut properties, "Column", spec.column_id.to_string());
-            push_string_property(&mut properties, "Mode", format!("{:?}", spec.mode));
+            push_fulltext_search_properties(&mut properties, spec);
         }
         PhysicalNodeKind::AdaptiveSearch(spec) => {
             push_string_property(&mut properties, "Strategy", "adaptive".to_string());
@@ -325,6 +315,7 @@ fn collect_explain_properties(node: &PhysicalPlanNode) -> Vec<ExplainProperty> {
                 &mut properties,
                 search_source_token(spec.selected.as_ref()),
             );
+            push_search_source_properties(&mut properties, spec.selected.as_ref());
         }
         PhysicalNodeKind::Limit(spec) => {
             if let Some(limit) = &spec.limit {
@@ -576,6 +567,117 @@ fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &C
         "Search Capability",
         format!("{:?}", token.capability_state),
     );
+}
+
+fn push_search_filter_properties(
+    properties: &mut Vec<ExplainProperty>,
+    predicate: Option<&crate::physical::specs::SearchPredicateTemplate>,
+) {
+    let Some(predicate) = predicate else {
+        return;
+    };
+    push_string_property(properties, "Pushed Predicate", predicate.to_string());
+    push_string_property(
+        properties,
+        "Filter Pushdown",
+        "storage-level exact per-segment bitmap (no residual FILTER)".to_string(),
+    );
+}
+
+fn push_dense_search_filter_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::VectorSearchSpec,
+) {
+    push_search_filter_properties(properties, spec.predicate.as_ref());
+    if spec.predicate.is_none() {
+        return;
+    }
+
+    let has_runtime_parameters = spec
+        .predicate
+        .as_ref()
+        .is_some_and(|predicate| predicate.has_runtime_parameters());
+    if !has_runtime_parameters {
+        if let Some(rows) = spec.estimated_filter_rows {
+            push_string_property(properties, "Filter Rows (estimated)", rows.to_string());
+        }
+    }
+
+    let policy = spec
+        .table
+        .storage
+        .as_ref()
+        .and_then(|storage| storage.vector_search_policy(spec.column_id as u32, spec.distance));
+    let strategy = match (has_runtime_parameters, policy, spec.estimated_filter_rows) {
+        (true, Some(policy), _) => format!(
+            "runtime exact bitmap: exact scan at <= {}; otherwise unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement (exact fallback if underfilled)",
+            policy.filtered_plain_scan_threshold
+        ),
+        (true, None, _) => {
+            "runtime exact bitmap chooses exact scan or unfiltered-navigation filtered Top-K"
+                .to_string()
+        }
+        (false, Some(policy), Some(rows))
+            if rows <= policy.filtered_plain_scan_threshold as u64 =>
+        {
+            format!(
+                "exact filtered distance scan ({} <= threshold {})",
+                rows, policy.filtered_plain_scan_threshold
+            )
+        }
+        (false, Some(policy), Some(rows)) => format!(
+            "unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement ({} > exact threshold {}; exact fallback if underfilled)",
+            rows, policy.filtered_plain_scan_threshold
+        ),
+        _ => "runtime exact bitmap chooses exact scan or unfiltered-navigation filtered Top-K"
+            .to_string(),
+    };
+    push_string_property(properties, "Filtered Strategy", strategy);
+}
+
+fn push_vector_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::VectorSearchSpec,
+) {
+    push_string_property(properties, "Search Candidate", "dense vector".to_string());
+    push_string_property(properties, "Column", spec.column_id.to_string());
+    push_string_property(properties, "Limit", spec.k.to_string());
+    push_string_property(
+        properties,
+        "Search Ef",
+        spec.params
+            .ef
+            .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+    );
+    push_dense_search_filter_properties(properties, spec);
+}
+
+fn push_sparse_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::SparseVectorSearchSpec,
+) {
+    push_string_property(properties, "Search Candidate", "sparse vector".to_string());
+    push_string_property(properties, "Column", spec.column_id.to_string());
+    push_string_property(properties, "Limit", spec.k.to_string());
+    push_search_filter_properties(properties, spec.predicate.as_ref());
+}
+
+fn push_fulltext_search_properties(
+    properties: &mut Vec<ExplainProperty>,
+    spec: &crate::physical::specs::FullTextSearchSpec,
+) {
+    push_string_property(properties, "Search Candidate", "full text".to_string());
+    push_string_property(properties, "Column", spec.column_id.to_string());
+    push_string_property(properties, "Mode", format!("{:?}", spec.mode));
+    push_search_filter_properties(properties, spec.predicate.as_ref());
+}
+
+fn push_search_source_properties(properties: &mut Vec<ExplainProperty>, source: &SearchSourceSpec) {
+    match source {
+        SearchSourceSpec::Vector(spec) => push_vector_search_properties(properties, spec),
+        SearchSourceSpec::Sparse(spec) => push_sparse_search_properties(properties, spec),
+        SearchSourceSpec::FullText(spec) => push_fulltext_search_properties(properties, spec),
+    }
 }
 
 fn search_source_token(source: &SearchSourceSpec) -> &CapabilityToken {

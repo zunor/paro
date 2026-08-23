@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
+use crate::physical::specs::SearchPredicateTemplate;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_insert(
@@ -207,12 +208,14 @@ impl PhysicalPlanGenerator {
                 paro_error::internal("Get missing table reference for fulltext scan")
             })?;
         let (predicate_tree, mut residual) =
-            predicate_builder::build_predicate_tree(&scan.other_predicates, &scan.get)?;
-        let (runtime_tree, mut runtime_residual) = predicate_builder::build_predicate_tree(
-            &scan.get.runtime_filter_expressions,
-            &scan.get,
-        )?;
-        let predicate = predicate_builder::combine_predicate_trees(predicate_tree, runtime_tree);
+            predicate_builder::build_search_predicate_template(&scan.other_predicates, &scan.get)?;
+        let (runtime_tree, mut runtime_residual) =
+            predicate_builder::build_search_predicate_template(
+                &scan.get.runtime_filter_expressions,
+                &scan.get,
+            )?;
+        let predicate =
+            SearchPredicateTemplate::and([predicate_tree, runtime_tree].into_iter().flatten());
         residual.append(&mut runtime_residual);
         residual.extend(scan.residual_predicates.clone());
         if !residual.is_empty() {

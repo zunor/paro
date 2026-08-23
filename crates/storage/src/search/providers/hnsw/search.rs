@@ -1,6 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -33,6 +34,7 @@ use crate::tablet::TabletRef;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
+use roaring::RoaringBitmap;
 
 use crate::search::budget::{ResourceBudget, SearchBatchConfig};
 use crate::search::cursor::PhysicalRowRef;
@@ -199,14 +201,26 @@ impl VectorSearchCursor {
             coverage: self.snapshot.generation.coverage.clone(),
             artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
         });
-        let search_mode = self.query_wide_search_mode();
+        let (segment_filters, search_mode) = self.prepare_segment_filters()?;
         let per_segment = dispatch_segments(
             SearchIndexKind::Hnsw,
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
             |segment| {
-                let (rows, degraded) = self.search_segment(segment, search_mode)?;
+                let filter_bitmap = match segment_filters.as_ref() {
+                    Some(filters) => filters
+                        .get(&segment.key())
+                        .ok_or_else(|| {
+                            paro_error::internal(format!(
+                                "missing prepared filter for rowset {} segment {}",
+                                segment.rowset_id, segment.segment_id
+                            ))
+                        })?
+                        .as_ref(),
+                    None => None,
+                };
+                let (rows, degraded) = self.search_segment(segment, search_mode, filter_bitmap)?;
                 let degraded_reason = degraded
                     .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
                     .flatten();
@@ -247,7 +261,44 @@ impl VectorSearchCursor {
         Ok(ranked_rows)
     }
 
-    fn query_wide_search_mode(&self) -> HnswSearchMode {
+    fn prepare_segment_filters(
+        &self,
+    ) -> Result<(
+        Option<HashMap<(u64, u32), Option<RoaringBitmap>>>,
+        HnswSearchMode,
+    )> {
+        let predicate = self.predicate.as_ref();
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        let mut filters = HashMap::with_capacity(self.snapshot.table_lease.visible_segment_count());
+        let mut matching_rows = 0u64;
+        let mut has_materialized_filter = false;
+        for segment in self.snapshot.table_lease.visible_segments() {
+            let filter_bitmap = segment
+                .segment
+                .build_filter_bitmap_with_epoch(snapshot_version, predicate)?;
+            if predicate.is_some() && filter_bitmap.is_none() {
+                return Err(paro_error::internal(
+                    "filtered vector search did not materialize an exact segment bitmap",
+                ));
+            }
+            if let Some(bitmap) = filter_bitmap.as_ref() {
+                has_materialized_filter = true;
+                matching_rows = matching_rows.saturating_add(bitmap.len());
+            }
+            filters.insert(segment.key(), filter_bitmap);
+        }
+        let mode = if predicate.is_some() {
+            choose_filtered_query_wide_search_mode(
+                matching_rows,
+                self.search_policy.filtered_plain_scan_threshold as u64,
+            )
+        } else {
+            self.unfiltered_query_wide_search_mode()
+        };
+        Ok((has_materialized_filter.then_some(filters), mode))
+    }
+
+    fn unfiltered_query_wide_search_mode(&self) -> HnswSearchMode {
         let threshold = self.search_policy.plain_scan_threshold as u64;
         let visible_rows = self
             .snapshot
@@ -257,15 +308,15 @@ impl VectorSearchCursor {
             .fold(0u64, |rows, segment| {
                 rows.saturating_add(segment.segment.num_rows())
             });
-        choose_query_wide_search_mode(self.predicate.is_some(), visible_rows, threshold)
+        choose_query_wide_search_mode(false, visible_rows, threshold)
     }
 
     fn search_segment(
         &self,
         visible_segment: &VisibleSegment,
         search_mode: HnswSearchMode,
+        filter_bitmap: Option<&RoaringBitmap>,
     ) -> Result<(Vec<RankedRow>, bool)> {
-        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
         if let Some(index) = visible_segment
             .segment
             .open_hnsw_index(self.storage_col_id)?
@@ -273,13 +324,12 @@ impl VectorSearchCursor {
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
-                .vector_search_with_epoch_mode(
+                .vector_search_with_filter_mode(
                     self.storage_col_id,
                     &self.query,
                     self.k,
                     &self.params,
-                    snapshot_version,
-                    self.predicate.as_ref(),
+                    filter_bitmap,
                     &self.search_policy,
                     search_mode,
                 )
@@ -322,13 +372,7 @@ impl VectorSearchCursor {
             self.vector_dim,
         )? {
             validate_hnsw_index_contract(&index, &self.expected_build_contract)?;
-            let filter_bitmap = visible_segment
-                .segment
-                .build_filter_bitmap_with_epoch(snapshot_version, self.predicate.as_ref())?;
-            if filter_bitmap
-                .as_ref()
-                .is_some_and(|bitmap| bitmap.is_empty())
-            {
+            if filter_bitmap.is_some_and(|bitmap| bitmap.is_empty()) {
                 return Ok((Vec::new(), false));
             }
             return index
@@ -336,7 +380,7 @@ impl VectorSearchCursor {
                     &self.query,
                     self.k,
                     &self.params,
-                    filter_bitmap.as_ref(),
+                    filter_bitmap,
                     &self.search_policy,
                     search_mode,
                 )
@@ -571,6 +615,17 @@ fn choose_query_wide_search_mode(
     }
 }
 
+fn choose_filtered_query_wide_search_mode(
+    matching_rows: u64,
+    filtered_plain_scan_threshold: u64,
+) -> HnswSearchMode {
+    if matching_rows <= filtered_plain_scan_threshold {
+        HnswSearchMode::Exact
+    } else {
+        HnswSearchMode::Graph
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -588,6 +643,18 @@ mod tests {
         assert_eq!(
             choose_query_wide_search_mode(true, 1, 10_000),
             HnswSearchMode::Auto
+        );
+    }
+
+    #[test]
+    fn filtered_plain_scan_threshold_is_query_wide() {
+        assert_eq!(
+            choose_filtered_query_wide_search_mode(20_000, 20_000),
+            HnswSearchMode::Exact
+        );
+        assert_eq!(
+            choose_filtered_query_wide_search_mode(20_001, 20_000),
+            HnswSearchMode::Graph
         );
     }
 }

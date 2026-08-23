@@ -200,9 +200,18 @@ impl GraphLinks {
         let bytes = self.data.as_bytes();
         let start_byte = self.level0_links_offset + start * POINT_BYTES;
         let end_byte = self.level0_links_offset + end * POINT_BYTES;
+        #[cfg(target_endian = "little")]
+        if let Ok(links) = bytemuck::try_cast_slice::<u8, PointOffset>(&bytes[start_byte..end_byte])
+        {
+            for &link in links {
+                f(link);
+            }
+            return;
+        }
         // Offset-table validation makes this a single checked slice operation;
-        // individual links then decode from exact-width chunks without unsafe
-        // alignment or pointer assumptions for either Vec or mmap backing.
+        // aligned little-endian backings use the native slice above. The
+        // portable fallback retains exact-width decoding for an unaligned
+        // Bytes view or a big-endian host.
         for raw in bytes[start_byte..end_byte].chunks_exact(POINT_BYTES) {
             f(PointOffset::from_le_bytes(
                 raw.try_into().expect("level-0 link chunk width"),
@@ -265,6 +274,15 @@ impl GraphLinks {
             return None;
         }
         let bytes = self.data.as_bytes();
+        #[cfg(target_endian = "little")]
+        if let Ok(offsets) = bytemuck::try_cast_slice::<u8, u64>(
+            &bytes[self.level0_offsets_offset..self.level0_links_offset],
+        ) {
+            let start = offsets[point] as usize;
+            let end = offsets[point + 1] as usize;
+            debug_assert!(start <= end && end <= self.level0_link_count);
+            return Some((start, end));
+        }
         let start =
             Self::read_layout_u64(bytes, self.level0_offsets_offset + point * U64_BYTES) as usize;
         let end = Self::read_layout_u64(bytes, self.level0_offsets_offset + (point + 1) * U64_BYTES)

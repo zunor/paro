@@ -66,7 +66,10 @@ pub struct IndexAppendInfo {
 #[derive(Debug, Clone)]
 pub struct IndexPredicateEvaluation {
     pub candidates: PredicateResult,
-    pub guaranteed: PredicateResult,
+    /// `None` encodes the strongest proof: the candidate set itself is exact.
+    /// Keeping that state structural avoids cloning a large bitmap merely to
+    /// store the same set twice.
+    guaranteed: Option<PredicateResult>,
 }
 
 impl IndexPredicateEvaluation {
@@ -81,7 +84,38 @@ impl IndexPredicateEvaluation {
         };
         Self {
             candidates,
-            guaranteed,
+            guaranteed: Some(guaranteed),
+        }
+    }
+
+    /// Construct an exact predicate answer. Exactness is proof metadata, not
+    /// something consumers should rediscover by comparing two potentially
+    /// large bitmaps.
+    pub fn exact(candidates: PredicateResult) -> Self {
+        if matches!(candidates, PredicateResult::Unknown) {
+            return Self::candidates_only(candidates);
+        }
+        Self {
+            candidates,
+            guaranteed: None,
+        }
+    }
+
+    pub const fn is_exact(&self) -> bool {
+        self.guaranteed.is_none()
+    }
+
+    pub fn guaranteed(&self) -> &PredicateResult {
+        self.guaranteed.as_ref().unwrap_or(&self.candidates)
+    }
+
+    pub fn into_parts(self) -> (PredicateResult, PredicateResult) {
+        match self.guaranteed {
+            Some(guaranteed) => (self.candidates, guaranteed),
+            None => {
+                let guaranteed = self.candidates.clone();
+                (self.candidates, guaranteed)
+            }
         }
     }
 
@@ -394,6 +428,13 @@ mod tests {
     fn unknown_proof_is_normalized_to_no_proof() {
         let evaluation =
             IndexPredicateEvaluation::new(PredicateResult::AllMatch, PredicateResult::Unknown);
-        assert!(matches!(evaluation.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(
+            evaluation.guaranteed(),
+            PredicateResult::NoneMatch
+        ));
+
+        let unknown = IndexPredicateEvaluation::exact(PredicateResult::Unknown);
+        assert!(!unknown.is_exact());
+        assert!(matches!(unknown.guaranteed(), PredicateResult::NoneMatch));
     }
 }

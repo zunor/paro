@@ -20,7 +20,11 @@ pub const DEFAULT_HNSW_M: u32 = 24;
 pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
 pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
 pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
-pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 0;
+/// Filtered searches below this query-wide visible cardinality are exact scans.
+/// The graph path has fixed traversal cost and loses connectivity as the
+/// matching subgraph becomes sparse; 20k 128-dimensional distances remain a
+/// cache-friendly SIMD workload and give deterministic recall.
+pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 20_000;
 pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 /// Version 4 replaces the affine point order with a keyed Feistel permutation
@@ -65,38 +69,16 @@ impl Ord for ScoredPoint {
 /// Search algorithm selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SearchAlgorithm {
-    /// Standard HNSW search
+    /// Standard unfiltered HNSW search.
     Hnsw,
-    /// ACORN-1 search (improved recall for filtered searches)
-    Acorn,
+    /// Keep HNSW navigation on the connected unfiltered graph while admitting
+    /// every scored matching candidate into a separate exact-bitmap Top-K.
+    FilteredTopK,
 }
 
 impl Default for SearchAlgorithm {
     fn default() -> Self {
         SearchAlgorithm::Hnsw
-    }
-}
-
-/// ACORN search parameters.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct AcornParams {
-    /// If true, ACORN may be used based on filter selectivity.
-    pub enable: bool,
-    /// Maximum selectivity of filters to enable ACORN.
-    /// Selectivity = estimated matching points / total points.
-    /// Default: 0.4
-    pub max_selectivity: Option<f64>,
-}
-
-/// Default maximum selectivity for ACORN search.
-pub const ACORN_MAX_SELECTIVITY_DEFAULT: f64 = 0.4;
-
-impl Default for AcornParams {
-    fn default() -> Self {
-        AcornParams {
-            enable: false,
-            max_selectivity: None,
-        }
     }
 }
 
@@ -106,8 +88,6 @@ pub struct SearchParams {
     /// Size of the beam in beam-search. Larger = more accurate but slower.
     /// If None, uses the index's default ef.
     pub ef: Option<usize>,
-    /// ACORN search parameters
-    pub acorn: Option<AcornParams>,
     /// Whether to randomize entry point selection during graph search.
     /// `None` lets the index choose a default strategy.
     #[serde(default)]
@@ -128,7 +108,6 @@ impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
             ef: None,
-            acorn: None,
             random_entry_point: None,
         }
     }
@@ -404,7 +383,10 @@ mod tests {
         assert_eq!(config.ef_construct, 100);
         assert_eq!(config.ef, 100);
         assert_eq!(config.plain_scan_threshold, 10_000);
-        assert_eq!(config.filtered_plain_scan_threshold, 0);
+        assert_eq!(
+            config.filtered_plain_scan_threshold,
+            DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize
+        );
     }
 
     #[test]
@@ -415,7 +397,10 @@ mod tests {
         assert_eq!(config.ef_construct, 200);
         assert_eq!(config.ef, 200);
         assert_eq!(config.plain_scan_threshold, 10_000);
-        assert_eq!(config.filtered_plain_scan_threshold, 0);
+        assert_eq!(
+            config.filtered_plain_scan_threshold,
+            DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize
+        );
     }
 
     #[test]

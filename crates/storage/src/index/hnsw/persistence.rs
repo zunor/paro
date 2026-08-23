@@ -788,16 +788,24 @@ impl HnswIndex {
         let results = if self.should_use_plain_scan(filter_bitmap, policy, mode) {
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
-            let algorithm = self.choose_algorithm(params, filter_bitmap);
-            let ef = params.ef.unwrap_or(policy.ef_search);
-            self.graph.search_one(
+            let algorithm = Self::choose_algorithm(filter_bitmap);
+            let ef = Self::effective_graph_ef(top_k, params, policy);
+            let results = self.graph.search_one(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorer,
                 filter_bitmap,
-                self.should_use_random_entry_point(params, filter_bitmap),
-            )
+                algorithm == SearchAlgorithm::Hnsw
+                    && self.should_use_random_entry_point(params, filter_bitmap),
+            );
+            if filter_bitmap.is_some()
+                && results.len() < top_k.min(filter_bitmap.map_or(0, RoaringBitmap::len) as usize)
+            {
+                self.plain_scan(top_k, &mut scorer, filter_bitmap)
+            } else {
+                results
+            }
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -861,16 +869,32 @@ impl HnswIndex {
                 None => batch_scorer.scan(0..num_points),
             }
         } else {
-            let algorithm = self.choose_algorithm(params, filter_bitmap);
-            let ef = params.ef.unwrap_or(policy.ef_search);
-            self.graph.search_many(
+            let algorithm = Self::choose_algorithm(filter_bitmap);
+            let ef = Self::effective_graph_ef(top_k, params, policy);
+            let results = self.graph.search_many(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorers,
                 filter_bitmap,
-                self.should_use_random_entry_point(params, filter_bitmap),
-            )
+                algorithm == SearchAlgorithm::Hnsw
+                    && self.should_use_random_entry_point(params, filter_bitmap),
+            );
+            let expected_rows = top_k.min(
+                filter_bitmap.map_or(self.graph.num_points() as u64, RoaringBitmap::len) as usize,
+            );
+            if filter_bitmap.is_some() && results.iter().any(|rows| rows.len() < expected_rows) {
+                let batch_scorer = BatchScorer::new(scorers, top_k);
+                let num_points = self.graph.num_points() as u32;
+                match filter_bitmap {
+                    Some(bitmap) => {
+                        batch_scorer.scan(bitmap.iter().filter(|&idx| idx < num_points))
+                    }
+                    None => batch_scorer.scan(0..num_points),
+                }
+            } else {
+                results
+            }
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
@@ -973,24 +997,16 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn choose_algorithm(
-        &self,
-        params: &SearchParams,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> SearchAlgorithm {
-        if let (Some(acorn), Some(bitmap)) = (params.acorn, filter_bitmap) {
-            if acorn.enable && self.build_contract.m0 != 0 {
-                let selectivity = bitmap.len() as f64 / self.graph.links.num_points() as f64;
-                if selectivity
-                    <= acorn
-                        .max_selectivity
-                        .unwrap_or(super::ACORN_MAX_SELECTIVITY_DEFAULT)
-                {
-                    return SearchAlgorithm::Acorn;
-                }
-            }
+    fn choose_algorithm(filter_bitmap: Option<&RoaringBitmap>) -> SearchAlgorithm {
+        if filter_bitmap.is_some() {
+            SearchAlgorithm::FilteredTopK
+        } else {
+            SearchAlgorithm::Hnsw
         }
-        SearchAlgorithm::Hnsw
+    }
+
+    fn effective_graph_ef(top_k: usize, params: &SearchParams, policy: &HnswSearchPolicy) -> usize {
+        params.ef.unwrap_or(policy.ef_search).max(top_k).max(1)
     }
 
     fn should_use_random_entry_point(
@@ -1081,7 +1097,7 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{AcornParams, HnswBuilder, HnswM, InMemoryVectorStorage, PointOffset};
+    use crate::index::hnsw::{HnswBuilder, HnswM, InMemoryVectorStorage, PointOffset};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use roaring::RoaringBitmap;
@@ -1596,7 +1612,7 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_acorn_search() {
+    fn test_hnsw_filtered_topk_search() {
         let vectors: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32]).collect();
         let storage = make_storage(&vectors);
         let config = HnswConfig::new(8, 50)
@@ -1610,10 +1626,6 @@ mod tests {
 
         let params = SearchParams {
             ef: Some(50),
-            acorn: Some(AcornParams {
-                enable: true,
-                max_selectivity: Some(0.4),
-            }),
             random_entry_point: None,
         };
         let result = index.search_one(&[0.0], 1, &params, Some(&bitmap)).unwrap();
@@ -1622,7 +1634,17 @@ mod tests {
     }
 
     #[test]
-    fn test_hnsw_search_many_matches_search_one_acorn_path() {
+    fn filtered_algorithm_keeps_navigation_separate_from_result_admission() {
+        let filter = RoaringBitmap::from_iter([0]);
+        assert_eq!(
+            HnswIndex::choose_algorithm(Some(&filter)),
+            SearchAlgorithm::FilteredTopK
+        );
+        assert_eq!(HnswIndex::choose_algorithm(None), SearchAlgorithm::Hnsw);
+    }
+
+    #[test]
+    fn test_hnsw_search_many_matches_search_one_filtered_topk_path() {
         let vectors = make_sift_like_vectors(29, 320, 20, 12);
         let storage = make_storage(&vectors);
         let config = HnswConfig::new(16, 96)
@@ -1647,10 +1669,6 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
-            acorn: Some(AcornParams {
-                enable: true,
-                max_selectivity: Some(0.5),
-            }),
             random_entry_point: Some(false),
         };
         let top_k = 10;

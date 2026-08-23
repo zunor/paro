@@ -138,6 +138,7 @@ impl Segment {
                 predicate: SegmentPredicateIndexes {
                     bloom_filters,
                     bitmap_indexes,
+                    runtime_bitmap_indexes: RwLock::new(HashMap::new()),
                     runtime_art_indexes: RwLock::new(HashMap::new()),
                 },
                 search: SegmentSearchIndexes {

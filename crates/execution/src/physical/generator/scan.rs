@@ -8,6 +8,8 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
 use paro_storage::index::PredicateTree;
 
+use crate::physical::specs::SearchPredicateTemplate;
+
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_get(
         &mut self,
@@ -471,9 +473,9 @@ fn selected_search_candidate(decision: &SearchDecision) -> Result<&SearchCandida
 
 fn search_scan_predicate(
     scan: &LogicalSearchScan,
-) -> Result<(Option<PredicateTree>, Vec<Expression>)> {
+) -> Result<(Option<SearchPredicateTemplate>, Vec<Expression>)> {
     let (predicate_tree, mut residual) =
-        predicate_builder::build_predicate_tree(&scan.absorbed_predicates, &scan.get)?;
+        predicate_builder::build_search_predicate_template(&scan.absorbed_predicates, &scan.get)?;
     residual.extend(scan.residual_predicates.clone());
     Ok((predicate_tree, residual))
 }
@@ -514,7 +516,7 @@ fn search_source_spec_for_candidate(
     table: Arc<TableCatalogEntry>,
     candidate: &SearchCandidate,
     scan: &LogicalSearchScan,
-    predicate: Option<PredicateTree>,
+    predicate: Option<SearchPredicateTemplate>,
     projected_columns: Box<[usize]>,
     emit_score: bool,
     output_names: Box<[String]>,
@@ -533,6 +535,9 @@ fn search_source_spec_for_candidate(
                 ..Default::default()
             },
             predicate,
+            estimated_filter_rows: candidate
+                .estimated_cost()
+                .and_then(|cost| cost.estimated_rows),
             projected_columns,
             emit_score,
             output_names,

@@ -148,6 +148,17 @@ impl TableHandle {
         self.search_registry.hnsw_capability(column_id, distance)
     }
 
+    /// Return the mutable query policy associated with the active HNSW
+    /// definition. The policy is deliberately separate from artifact
+    /// statistics and the immutable build contract.
+    pub fn vector_search_policy(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswSearchPolicy> {
+        self.search_registry.hnsw_search_policy(column_id, distance)
+    }
+
     pub fn sparse_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
         self.search_registry
             .capability(SearchIndexKind::Sparse, column_id, None)

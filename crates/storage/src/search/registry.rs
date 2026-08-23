@@ -294,6 +294,15 @@ impl SearchIndexRegistry {
         self.resolve_capability_with_required_wait(|view| view.hnsw_capability(column_id, distance))
     }
 
+    pub(crate) fn hnsw_search_policy(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswSearchPolicy> {
+        self.ensure_fresh();
+        self.view.load().hnsw_search_policy(column_id, distance)
+    }
+
     fn resolve_capability_with_required_wait(
         &self,
         finder: impl Fn(&SearchView) -> Option<SearchCapability>,

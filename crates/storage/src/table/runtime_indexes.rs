@@ -7,7 +7,10 @@ use std::sync::{Arc, RwLock};
 use crate::buffer::{BufferManager, StandardBufferManager};
 use crate::codec::vector_decoder;
 use crate::index::art::{ARTConflictType, ARTKey, ART};
-use crate::index::{BoundIndex, IndexAppendMode, IndexConstraintType};
+use crate::index::{
+    value_to_bytes, BitmapIndex, BitmapIndexWriter, BoundIndex, IndexAppendMode,
+    IndexConstraintType,
+};
 use crate::rowset::{RowsetSharedPtr, SegmentSharedPtr};
 use crate::tablet::{ColumnId, TabletRef};
 use paro_common::allocator::{default_allocator, Allocator, ArenaAllocator};
@@ -17,6 +20,9 @@ use paro_common::types::LogicalType;
 use super::index_set::IndexSet;
 
 const ART_BACKFILL_BATCH_SIZE: usize = 1024;
+/// Above this cardinality, per-value posting containers lose their density
+/// advantage and the ordered ART is the sole physical representation.
+const ADAPTIVE_BITMAP_MAX_DISTINCT_VALUES: usize = 4_096;
 
 fn is_art_backfill_supported(logical_type: &LogicalType) -> bool {
     matches!(
@@ -206,6 +212,7 @@ impl RuntimeIndexes {
             logical_type.clone(),
             buffer_manager,
         );
+        let mut bitmap_writer = Some(BitmapIndexWriter::new());
         let mut row_id_base = 0u64;
 
         loop {
@@ -224,7 +231,22 @@ impl RuntimeIndexes {
 
             for row_idx in 0..count {
                 if vector.is_null(row_idx) {
+                    if let Some(writer) = bitmap_writer.as_mut() {
+                        writer.add_nulls(1);
+                    }
                     continue;
+                }
+                if let Some(writer) = bitmap_writer.as_mut() {
+                    let value = vector.get_value(row_idx);
+                    match value_to_bytes(&value, &logical_type) {
+                        Ok(bytes) => {
+                            writer.add_value_owned(bytes);
+                            if writer.num_values() > ADAPTIVE_BITMAP_MAX_DISTINCT_VALUES {
+                                bitmap_writer = None;
+                            }
+                        }
+                        Err(_) => bitmap_writer = None,
+                    }
                 }
                 let key = ARTKey::from_vector_value(&vector, row_idx, &logical_type, &mut arena)?;
                 let row_id = row_id_base
@@ -252,6 +274,16 @@ impl RuntimeIndexes {
         }
 
         segment.register_runtime_art_index(column_id, Arc::new(art));
+        if let Some(writer) = bitmap_writer {
+            let index = BitmapIndex::from_writer(
+                format!("bitmap_segment_{}_col_{}", segment.segment_id(), column_id),
+                IndexConstraintType::None,
+                vec![column_id],
+                vec![logical_type],
+                &writer,
+            )?;
+            segment.register_runtime_bitmap_index(column_id, Arc::new(index));
+        }
         Ok(())
     }
 }

@@ -19,6 +19,8 @@ use paro_planner::expression::{ComparisonType, ConjunctionType, Expression, Oper
 use paro_planner::operator::get::Get;
 use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 
+use crate::physical::specs::SearchPredicateTemplate;
+
 pub fn build_predicate_tree(
     filters: &[Expression],
     get: &Get,
@@ -39,6 +41,122 @@ pub fn build_predicate_tree(
     }
 
     Ok((combine_with_and(pushed_trees), residual_exprs))
+}
+
+/// Build a reusable search predicate. Unlike a storage `PredicateTree`, this
+/// representation may retain typed parameter slots and binds them once when a
+/// prepared search source opens.
+pub fn build_search_predicate_template(
+    filters: &[Expression],
+    get: &Get,
+) -> Result<(Option<SearchPredicateTemplate>, Vec<Expression>)> {
+    let mut pushed = Vec::new();
+    let mut residual = Vec::new();
+    for expression in filters {
+        let (template, mut expression_residual) = extract_search_predicate(expression, get)?;
+        if let Some(template) = template {
+            pushed.push(template);
+        }
+        residual.append(&mut expression_residual);
+    }
+    Ok((SearchPredicateTemplate::and(pushed), residual))
+}
+
+fn extract_search_predicate(
+    expression: &Expression,
+    get: &Get,
+) -> Result<(Option<SearchPredicateTemplate>, Vec<Expression>)> {
+    if let Some(tree) = build_predicate(expression, get)? {
+        return Ok((Some(SearchPredicateTemplate::bound(tree)), Vec::new()));
+    }
+
+    match expression {
+        Expression::Conjunction(conjunction) => {
+            let mut children = Vec::new();
+            let mut residual = Vec::new();
+            for child in &conjunction.children {
+                let (template, mut child_residual) = extract_search_predicate(child, get)?;
+                if let Some(template) = template {
+                    children.push(template);
+                }
+                residual.append(&mut child_residual);
+            }
+            match conjunction.conjunction_type {
+                ConjunctionType::And => Ok((SearchPredicateTemplate::and(children), residual)),
+                ConjunctionType::Or if residual.is_empty() => {
+                    Ok((SearchPredicateTemplate::or(children), Vec::new()))
+                }
+                ConjunctionType::Or => Ok((None, vec![expression.clone()])),
+            }
+        }
+        Expression::Comparison(comparison) => {
+            match build_parameter_comparison_template(comparison, get) {
+                Some(template) => Ok((Some(template), Vec::new())),
+                None => Ok((None, vec![expression.clone()])),
+            }
+        }
+        _ => Ok((None, vec![expression.clone()])),
+    }
+}
+
+fn build_parameter_comparison_template(
+    comparison: &paro_planner::expression::ComparisonExpression,
+    get: &Get,
+) -> Option<SearchPredicateTemplate> {
+    let left_column = extract_scan_column_operand(&comparison.left);
+    let right_column = extract_scan_column_operand(&comparison.right);
+    let (column, parameter_expression, comparison_type) = match (left_column, right_column) {
+        (Some(column), None) => (column, &comparison.right, comparison.comparison_type),
+        (None, Some(column)) => (
+            column,
+            &comparison.left,
+            flip_comparison(comparison.comparison_type)?,
+        ),
+        _ => return None,
+    };
+    if !matches!(column.transform, ScanColumnTransform::Identity) {
+        return None;
+    }
+    let column_id = get.stored_column(column.column_idx)? as u32;
+    let target_type = get.column_types.get(column.column_idx)?.clone();
+    if matches!(target_type, LogicalType::Array(..) | LogicalType::Unknown) {
+        return None;
+    }
+    let slot = extract_parameter_slot(parameter_expression, &target_type)?;
+    Some(SearchPredicateTemplate::ParameterComparison {
+        column_id,
+        comparison: storage_predicate_comparison(comparison_type)?,
+        slot,
+        target_type,
+    })
+}
+
+fn extract_parameter_slot(
+    expression: &Expression,
+    target_type: &LogicalType,
+) -> Option<paro_common::typed_parameters::ParameterSlot> {
+    match expression {
+        Expression::Parameter(parameter) => Some(parameter.slot.clone()),
+        Expression::Cast(cast)
+            if cast.cast_info.context_dependency() == CastContextDependency::Independent
+                && &cast.target_type == target_type =>
+        {
+            extract_parameter_slot(cast.child.as_ref(), target_type)
+        }
+        _ => None,
+    }
+}
+
+fn storage_predicate_comparison(comparison: ComparisonType) -> Option<PredicateComparison> {
+    match comparison {
+        ComparisonType::Equal => Some(PredicateComparison::Equal),
+        ComparisonType::NotEqual => Some(PredicateComparison::NotEqual),
+        ComparisonType::LessThan => Some(PredicateComparison::LessThan),
+        ComparisonType::LessThanOrEqual => Some(PredicateComparison::LessThanOrEqual),
+        ComparisonType::GreaterThan => Some(PredicateComparison::GreaterThan),
+        ComparisonType::GreaterThanOrEqual => Some(PredicateComparison::GreaterThanOrEqual),
+        ComparisonType::DistinctFrom | ComparisonType::NotDistinctFrom => None,
+    }
 }
 
 fn extract_predicate(
@@ -577,6 +695,7 @@ pub fn extract_scan_column_index(expr: &Expression) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
     use paro_function::scalar::cast::date_casts::{
         date_to_timestamp, parse_date_text, varchar_to_date,
     };
@@ -586,9 +705,34 @@ mod tests {
     use paro_function::scalar::ScalarBindInput;
     use paro_planner::expression::{
         CastExpression, ConstantExpression, FunctionExpression, OperatorExpression,
-        ReferenceExpression,
+        ParameterExpression, ReferenceExpression,
     };
     use paro_planner::operator::Get;
+
+    #[test]
+    fn search_predicate_template_retains_typed_runtime_parameter() {
+        let get = Get::new_without_table(7, vec!["bucket".to_string()], vec![LogicalType::Integer]);
+        let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
+        let expression =
+            Expression::Comparison(paro_planner::expression::ComparisonExpression::new(
+                ComparisonType::Equal,
+                Expression::Reference(ReferenceExpression::new(0, LogicalType::Integer)),
+                Expression::Parameter(ParameterExpression::new(slot.clone())),
+            ));
+
+        let (template, residual) =
+            build_search_predicate_template(&[expression], &get).expect("predicate template");
+        assert!(residual.is_empty());
+        assert_eq!(
+            template,
+            Some(SearchPredicateTemplate::ParameterComparison {
+                column_id: 0,
+                comparison: PredicateComparison::Equal,
+                slot,
+                target_type: LogicalType::Integer,
+            })
+        );
+    }
 
     #[test]
     fn fixed_width_column_comparison_is_pushed_to_storage() {

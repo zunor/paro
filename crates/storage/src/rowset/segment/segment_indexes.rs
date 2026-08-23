@@ -45,6 +45,10 @@ pub(super) struct DeferredHnswIndex {
 pub struct SegmentPredicateIndexes {
     pub(super) bloom_filters: HashMap<ColumnId, Arc<BloomFilterIndex>>,
     pub(super) bitmap_indexes: HashMap<ColumnId, Arc<BitmapIndex>>,
+    /// Low-cardinality posting representation built with a declared scalar
+    /// index. Segments are immutable, so the posting dictionary is immutable
+    /// too and can be shared by every filtered search on the segment.
+    pub(super) runtime_bitmap_indexes: RwLock<HashMap<ColumnId, Arc<BitmapIndex>>>,
     pub(super) runtime_art_indexes: RwLock<HashMap<ColumnId, Arc<ART>>>,
 }
 
@@ -54,7 +58,11 @@ impl SegmentPredicateIndexes {
     }
 
     pub fn bitmap_index(&self, column_id: ColumnId) -> Option<Arc<BitmapIndex>> {
-        self.bitmap_indexes.get(&column_id).cloned()
+        self.runtime_bitmap_indexes
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(&column_id).cloned())
+            .or_else(|| self.bitmap_indexes.get(&column_id).cloned())
     }
 
     pub fn art_index(&self, column_id: ColumnId) -> Option<Arc<ART>> {
@@ -70,6 +78,12 @@ impl SegmentPredicateIndexes {
                 .len()
                 .saturating_add(self.bitmap_indexes.len())
                 .saturating_add(
+                    self.runtime_bitmap_indexes
+                        .read()
+                        .map(|guard| guard.len())
+                        .unwrap_or(0),
+                )
+                .saturating_add(
                     self.runtime_art_indexes
                         .read()
                         .map(|guard| guard.len())
@@ -81,6 +95,11 @@ impl SegmentPredicateIndexes {
         }
         for idx in self.bitmap_indexes.values() {
             results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+        }
+        if let Ok(guard) = self.runtime_bitmap_indexes.read() {
+            for idx in guard.values() {
+                results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+            }
         }
         if let Ok(guard) = self.runtime_art_indexes.read() {
             for idx in guard.values() {
@@ -339,9 +358,21 @@ impl Segment {
         }
     }
 
+    /// Register the low-cardinality posting representation paired with a
+    /// runtime ART. It is a physical access path of the same scalar index, not
+    /// a second catalog index.
+    pub fn register_runtime_bitmap_index(&self, column_id: ColumnId, index: Arc<BitmapIndex>) {
+        if let Ok(mut guard) = self.indexes.predicate.runtime_bitmap_indexes.write() {
+            guard.insert(column_id, index);
+        }
+    }
+
     /// Remove a runtime ART index previously registered on this segment.
     pub fn drop_art_index(&self, column_id: ColumnId) {
         if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
+            guard.remove(&column_id);
+        }
+        if let Ok(mut guard) = self.indexes.predicate.runtime_bitmap_indexes.write() {
             guard.remove(&column_id);
         }
     }

@@ -27,7 +27,9 @@ use super::node::{GateStatus, NType, Node, ALLOCATOR_COUNT};
 use super::prefix::Prefix;
 use super::ARTKey;
 use crate::buffer::BufferManager;
-use crate::index::bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
+use crate::index::bound_index::{
+    BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode, IndexPredicateEvaluation,
+};
 use crate::index::fixed_size_allocator::FixedSizeAllocator;
 use crate::index::predicate::{value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
@@ -315,7 +317,14 @@ impl ART {
             return ARTConflictType::NoConflict;
         }
 
-        let mut active_key = key;
+        // Recursive calls inside a duplicate-key gate must keep traversing the
+        // row-id key. Reinitializing to the indexed value here collapses every
+        // duplicate whose logical key has the same suffix into that suffix.
+        let mut active_key = if status == GateStatus::Set {
+            row_id
+        } else {
+            key
+        };
 
         loop {
             if !node.has_metadata() {
@@ -959,7 +968,11 @@ impl ART {
             return false;
         }
 
-        let mut active_key = key;
+        let mut active_key = if status == GateStatus::Set {
+            row_id
+        } else {
+            key
+        };
 
         loop {
             if !node.has_metadata() {
@@ -1238,6 +1251,24 @@ impl ART {
         } else {
             true
         }
+    }
+
+    fn search_equal_bitmap(
+        &self,
+        key: &ARTKey,
+        row_ids: &mut RoaringBitmap,
+        max_count: usize,
+    ) -> bool {
+        if !self.tree.has_metadata() {
+            return true;
+        }
+        let Some(node) = self.lookup(key) else {
+            return true;
+        };
+        let mut iterator =
+            super::iterator::Iterator::new(&self.allocators, self.prefix_count as usize);
+        iterator.find_minimum(&node);
+        iterator.scan_bitmap(max_count, row_ids)
     }
 
     /// Search for all row IDs greater than [or equal to] the given key.
@@ -2039,7 +2070,15 @@ impl BoundIndex for ART {
                 let Ok(key) = ARTKey::create_key(&mut arena, logical_type, &bytes) else {
                     return PredicateResult::Unknown;
                 };
-                self.search_equal(&key, &mut row_ids, usize::MAX);
+                let mut bitmap = RoaringBitmap::new();
+                if !self.search_equal_bitmap(&key, &mut bitmap, usize::MAX) {
+                    return PredicateResult::Unknown;
+                }
+                return if bitmap.is_empty() {
+                    PredicateResult::NoneMatch
+                } else {
+                    PredicateResult::Bitmap(bitmap)
+                };
             }
             Predicate::Range { lower, upper, .. } => {
                 let Ok(lower_bytes) = value_to_bytes(lower, logical_type) else {
@@ -2078,6 +2117,15 @@ impl BoundIndex for ART {
         } else {
             PredicateResult::Bitmap(bitmap)
         }
+    }
+
+    fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        let result = self.evaluate_predicate(predicate);
+        IndexPredicateEvaluation::exact(result)
+    }
+
+    fn provides_predicate_proof(&self) -> bool {
+        true
     }
 
     fn merge_indexes(&self, _other: &dyn BoundIndex) -> Result<bool> {
@@ -2604,6 +2652,37 @@ mod tests {
         let mut row_ids = std::collections::BTreeSet::new();
         assert!(art.search_equal(&duplicate, &mut row_ids, 100));
         assert_eq!(row_ids.into_iter().collect::<Vec<_>>(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_art_search_equal_collects_large_duplicate_posting_list() {
+        let mut art = create_test_art();
+        let mut arena = create_arena();
+
+        for row_id in 0..20_000i64 {
+            let key = ARTKey::from_i64(&mut arena, row_id % 10).unwrap();
+            assert_eq!(
+                art.insert_key(&mut arena, &key, row_id, IndexAppendMode::Default),
+                ARTConflictType::NoConflict
+            );
+        }
+
+        let key = ARTKey::from_i64(&mut arena, 7).unwrap();
+        let mut row_ids = std::collections::BTreeSet::new();
+        assert!(art.search_equal(&key, &mut row_ids, usize::MAX));
+        assert_eq!(row_ids.len(), 2_000);
+        assert_eq!(row_ids.first(), Some(&7));
+        assert_eq!(row_ids.last(), Some(&19_997));
+
+        let PredicateResult::Bitmap(bitmap) = art.evaluate_predicate(&Predicate::Eq {
+            column_id: 0,
+            value: Value::BigInt(7),
+        }) else {
+            panic!("large duplicate equality must produce an exact bitmap");
+        };
+        assert_eq!(bitmap.len(), 2_000);
+        assert!(bitmap.contains(7));
+        assert!(bitmap.contains(19_997));
     }
 
     // ========== Merge Tests ==========

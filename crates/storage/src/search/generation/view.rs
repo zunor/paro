@@ -207,6 +207,24 @@ impl SearchView {
         })
     }
 
+    pub(crate) fn hnsw_search_policy(
+        &self,
+        column_id: ColumnId,
+        distance: DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswSearchPolicy> {
+        self.definitions.values().find_map(|state| {
+            let capability = state.capability.as_ref()?;
+            if capability.kind != SearchIndexKind::Hnsw
+                || !capability.is_queryable()
+                || !state.definition.column_ids.contains(&column_id)
+            {
+                return None;
+            }
+            let config = state.hnsw_provider_config.as_ref()?;
+            (config.distance == distance).then(|| config.search_policy())
+        })
+    }
+
     pub(crate) fn has_queryable_artifact(
         &self,
         kind: SearchIndexKind,

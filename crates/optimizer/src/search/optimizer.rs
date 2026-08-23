@@ -111,11 +111,18 @@ impl SearchOptimizer {
             let Some(stats) = storage.hnsw_index_statistics(intent.column_id) else {
                 return Ok(None);
             };
+            let Some(search_policy) =
+                storage.vector_search_policy(intent.column_id, intent.distance)
+            else {
+                return Ok(None);
+            };
             let estimated_cost = VectorScanCostModel::estimate_hnsw_cost(
                 &stats,
                 topn.limit,
                 filter_selectivity,
                 topn.hnsw_ef_hint,
+                search_policy,
+                !candidate_filters.is_empty(),
             );
             let Some(request) =
                 build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?

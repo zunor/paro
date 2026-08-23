@@ -2157,6 +2157,9 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     assert!(after_build
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_some()));
+    assert!(after_build
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_some()));
 
     table.drop_art_index(0).unwrap();
     table.forget_art_index(0);
@@ -2167,6 +2170,9 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     assert!(after_remove
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_none()));
+    assert!(after_remove
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_none()));
 }
 
 #[test]

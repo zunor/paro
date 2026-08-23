@@ -933,7 +933,7 @@ fn segment_bitmap_predicate_skips_late_materialize_even_with_explicit_columns() 
 }
 
 #[test]
-fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
+fn segment_bitmap_range_predicate_is_an_exact_row_selection() {
     let temp_dir = TempDir::new().unwrap();
     let file_path = temp_dir.path().join("bitmap_range_predicate.seg");
     let schema = create_int_schema();
@@ -994,7 +994,10 @@ fn segment_bitmap_range_predicate_verifies_rows_after_index_pruning() {
         .unwrap();
 
     assert!(iter.uses_late_materialize());
-    assert!(matches!(iter.evaluated_selection, PredicateResult::Unknown));
+    let PredicateResult::Bitmap(selection) = &iter.evaluated_selection else {
+        panic!("bitmap range predicate must produce an exact row selection");
+    };
+    assert_eq!(selection.len(), 1_800);
 
     let mut matched_rowids = Vec::new();
     let mut matched_values = Vec::new();
@@ -1083,6 +1086,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
 
     RuntimeIndexes::rebuild_art_index_for_segment(&segment, 0).unwrap();
     assert!(segment.art_index(0).is_some());
+    assert!(segment.bitmap_index(0).is_some());
 
     let mut art_iter =
         SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(
@@ -1107,6 +1111,7 @@ fn segment_runtime_art_predicate_switches_between_bitmap_and_fallback() {
 
     segment.drop_art_index(0);
     assert!(segment.art_index(0).is_none());
+    assert!(segment.bitmap_index(0).is_none());
 
     let removed_iter =
         SegmentIterator::new_with_delete_vector_predicate_and_prefetcher_late_materialize(

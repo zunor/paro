@@ -4,11 +4,11 @@
 //! # HNSW Graph Layers
 //!
 //! Read-only HNSW graph structure for efficient searching. Supporting both
-//! standard HNSW and ACORN-1 filtered search algorithms.
+//! standard HNSW and exact-bitmap filtered Top-K search.
 
 use super::entry_points::{EntryPoint, EntryPoints};
 use super::graph_links::GraphLinks;
-use super::search_context::SearchContext;
+use super::search_context::{FixedLengthPriorityQueue, SearchContext};
 use super::types::{HnswM, PointOffset, ScoredPoint, SearchAlgorithm};
 use super::visited_pool::VisitedPool;
 use super::VectorScorer;
@@ -52,7 +52,7 @@ impl GraphLayers {
             return Vec::new();
         }
 
-        let Some(entry_point) = self.select_entry_point(filter_bitmap, random_entry_point) else {
+        let Some(entry_point) = self.select_entry_point(None, random_entry_point) else {
             return Vec::new();
         };
 
@@ -77,12 +77,8 @@ impl GraphLayers {
         }
 
         let mut rng = thread_rng();
-        let entry_points = self.select_entry_points_for_many(
-            scorers.len(),
-            filter_bitmap,
-            random_entry_point,
-            &mut rng,
-        );
+        let entry_points =
+            self.select_entry_points_for_many(scorers.len(), None, random_entry_point, &mut rng);
 
         let mut results = Vec::with_capacity(scorers.len());
         for (entry_point, scorer) in entry_points.into_iter().zip(scorers.iter_mut()) {
@@ -152,13 +148,18 @@ impl GraphLayers {
         scorer: &mut VectorScorer<'_>,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> Vec<ScoredPoint> {
-        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, filter_bitmap);
+        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, None);
         let mut results = match algorithm {
-            SearchAlgorithm::Hnsw => {
-                self.search_on_level(zero_level_entry, ef, scorer, filter_bitmap)
-            }
-            SearchAlgorithm::Acorn => {
-                self.search_on_level_acorn(zero_level_entry, ef, scorer, filter_bitmap)
+            SearchAlgorithm::Hnsw => self.search_on_level(zero_level_entry, ef, scorer, None),
+            SearchAlgorithm::FilteredTopK => {
+                let seeds = self.search_on_level_filtered_topk(
+                    zero_level_entry,
+                    top,
+                    ef,
+                    scorer,
+                    filter_bitmap,
+                );
+                self.refine_filtered_topk(&seeds, ef, scorer, filter_bitmap)
             }
         };
         results.truncate(top);
@@ -240,78 +241,86 @@ impl GraphLayers {
         context.nearest.into_sorted_vec()
     }
 
-    /// ACORN-1 search on level 0.
-    ///
-    /// Improved recall for filtered search by exploring through non-matching points
-    /// as "stepping stones".
-    fn search_on_level_acorn(
+    /// Navigate the ordinary graph exactly as an unfiltered query while
+    /// retaining every scored candidate admitted by the exact filter bitmap.
+    /// This avoids disconnecting the graph and avoids estimating an
+    /// inverse-selectivity oversampling factor.
+    fn search_on_level_filtered_topk(
         &self,
         entry_point: ScoredPoint,
+        top: usize,
         ef: usize,
         scorer: &mut VectorScorer,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> Vec<ScoredPoint> {
-        let num_points = self.links.num_points();
-        // Use two visited sets:
-        // 1-hop for direct neighbors,
-        // 2-hop for neighbors of neighbors (stepping stones)
-        let mut hop1_visited = self.visited_pool.get(num_points);
-        let mut hop2_visited = self.visited_pool.get(num_points);
-
+        let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
-        hop1_visited.check_and_update_visited(entry_point.idx);
-
-        let hop1_limit = self.hnsw_m.get_m(0);
-        let hop2_limit = self.hnsw_m.get_m(0);
-        let mut to_score: Vec<PointOffset> = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
-        let mut to_explore: Vec<PointOffset> = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
+        // Preserve up to `ef` already-scored matching candidates as diverse
+        // refinement seeds; only the final public result is truncated to K.
+        let mut filtered = FixedLengthPriorityQueue::new(ef.max(top));
+        let mut neighbors = Vec::new();
+        visited.check_and_update_visited(entry_point.idx);
+        if filter_bitmap.is_none_or(|bitmap| bitmap.contains(entry_point.idx)) {
+            filtered.push(entry_point);
+        }
 
         while let Some(candidate) = context.candidates.pop() {
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
 
-            to_score.clear();
-            to_explore.clear();
-
-            // ===== 1-hop neighbors =====
-            self.links.for_each_link(candidate.idx, 0, |hop1| {
-                if hop1_visited.check_and_update_visited(hop1) {
-                    return;
-                }
-
-                let is_match = filter_bitmap.is_none_or(|bm| bm.contains(hop1));
-                if is_match {
-                    to_score.push(hop1);
-                } else {
-                    to_explore.push(hop1);
+            neighbors.clear();
+            self.links.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_visited(neighbor) {
+                    neighbors.push(neighbor);
                 }
             });
 
-            to_score.truncate(hop1_limit);
-
-            // ===== 2-hop neighbors (stepping stones) =====
-            for &hop1 in to_explore.iter() {
-                let total_limit = to_score.len() + hop2_limit;
-                self.links.for_each_link(hop1, 0, |hop2| {
-                    if hop1_visited.check(hop2) || hop2_visited.check_and_update_visited(hop2) {
-                        return;
-                    }
-
-                    if filter_bitmap.is_none_or(|bm| bm.contains(hop2)) {
-                        hop1_visited.check_and_update_visited(hop2);
-                        to_score.push(hop2);
-                    }
-                });
-
-                if to_score.len() >= total_limit {
-                    break;
+            for point in scorer.score_points_unfiltered(&neighbors) {
+                if filter_bitmap.is_none_or(|bitmap| bitmap.contains(point.idx)) {
+                    filtered.push(point);
                 }
+                context.process_candidate(point);
             }
+        }
 
-            // ===== batch scoring =====
-            for sp in scorer.score_points_unfiltered(to_score.as_slice()) {
-                context.process_candidate(sp);
+        filtered.into_sorted_vec()
+    }
+
+    /// Refine query-local matching seeds inside the predicate-induced graph.
+    /// The seeds came from connected unfiltered navigation, so refinement does
+    /// not depend on a global entry point happening to match the predicate.
+    fn refine_filtered_topk(
+        &self,
+        seeds: &[ScoredPoint],
+        ef: usize,
+        scorer: &mut VectorScorer,
+        filter_bitmap: Option<&RoaringBitmap>,
+    ) -> Vec<ScoredPoint> {
+        let Some((&first, remaining)) = seeds.split_first() else {
+            return Vec::new();
+        };
+        let mut visited = self.visited_pool.get(self.links.num_points());
+        let mut context = SearchContext::new(first, ef);
+        visited.check_and_update_visited(first.idx);
+        for &seed in remaining {
+            visited.check_and_update_visited(seed.idx);
+            context.process_candidate(seed);
+        }
+        let mut neighbors = Vec::new();
+
+        while let Some(candidate) = context.candidates.pop() {
+            if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
+                break;
+            }
+            neighbors.clear();
+            self.links.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_visited(neighbor) {
+                    neighbors.push(neighbor);
+                }
+            });
+            for point in scorer.score_points(&mut neighbors, filter_bitmap, 0) {
+                context.process_candidate(point);
             }
         }
 

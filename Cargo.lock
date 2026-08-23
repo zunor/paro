@@ -1855,6 +1855,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bitvec",
+ "bytemuck",
  "bytes",
  "crc32c",
  "crossbeam",

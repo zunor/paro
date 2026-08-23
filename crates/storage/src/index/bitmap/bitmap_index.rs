@@ -60,11 +60,29 @@ impl BitmapIndexWriter {
 
     /// Add a value at the current row.
     pub fn add_value(&mut self, value: &[u8]) {
-        let key = Bytes::copy_from_slice(value);
-        self.value_to_rows
-            .entry(key)
-            .or_default()
-            .insert(self.current_row_id);
+        if let Some(rows) = self.value_to_rows.get_mut(value) {
+            rows.insert(self.current_row_id);
+        } else {
+            self.value_to_rows.insert(
+                Bytes::copy_from_slice(value),
+                RoaringBitmap::from_iter([self.current_row_id]),
+            );
+        }
+        self.current_row_id += 1;
+    }
+
+    /// Add an owned encoded value without copying it when it creates a new
+    /// dictionary entry. Duplicate-heavy adaptive indexes therefore allocate
+    /// once per distinct value rather than once per row.
+    pub fn add_value_owned(&mut self, value: Vec<u8>) {
+        if let Some(rows) = self.value_to_rows.get_mut(value.as_slice()) {
+            rows.insert(self.current_row_id);
+        } else {
+            self.value_to_rows.insert(
+                Bytes::from(value),
+                RoaringBitmap::from_iter([self.current_row_id]),
+            );
+        }
         self.current_row_id += 1;
     }
 

@@ -15,7 +15,7 @@ use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 use roaring::RoaringBitmap;
 
-use crate::index::bound_index::BoundIndex;
+use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation};
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
@@ -432,6 +432,15 @@ impl BoundIndex for BitmapIndex {
             | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
+    }
+
+    fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
+        let result = self.evaluate_predicate(predicate);
+        IndexPredicateEvaluation::exact(result)
+    }
+
+    fn provides_predicate_proof(&self) -> bool {
+        true
     }
 }
 

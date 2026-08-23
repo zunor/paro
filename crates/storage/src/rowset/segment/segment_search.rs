@@ -11,12 +11,45 @@ use crate::index::hnsw::{
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
-use crate::rowset::SegmentRowId;
+use crate::rowset::{SegmentIterator, SegmentRowId};
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
 
 impl Segment {
+    fn build_exact_predicate_bitmap(
+        &self,
+        predicate_tree: &PredicateTree,
+    ) -> Result<RoaringBitmap> {
+        let evaluator = IndexEvaluator::new(self.predicate_indexes());
+        let evaluation = evaluator.evaluate_with_proof(predicate_tree);
+
+        if evaluation.is_exact() {
+            return predicate_result_to_bitmap(evaluation.candidates, self.num_rows());
+        }
+
+        // Candidate-only indexes (zone maps, bloom filters, or an index that
+        // cannot cover the complete predicate tree) are pruning hints, never
+        // an authorization to weaken SQL semantics. Materialize the exact
+        // segment-local selection once, then let every search provider consume
+        // the same immutable bitmap contract.
+        let mut iter = SegmentIterator::new_with_delete_vector_and_predicate(
+            self,
+            Vec::new(),
+            None,
+            Some(predicate_tree.clone()),
+        )?;
+        let mut bitmap = RoaringBitmap::new();
+        loop {
+            let (row_ids, _) = iter.next_batch(paro_common::vector::VECTOR_SIZE)?;
+            if row_ids.is_empty() {
+                break;
+            }
+            bitmap.extend(row_ids.into_iter().map(SegmentRowId::get));
+        }
+        Ok(bitmap)
+    }
+
     /// Perform a vector search on this segment.
     pub fn vector_search(
         &self,
@@ -72,16 +105,9 @@ impl Segment {
         policy: &HnswSearchPolicy,
         mode: HnswSearchMode,
     ) -> Result<Vec<ScoredPoint>> {
-        let index = self
-            .open_hnsw_index(column_id)?
-            .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
         let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
-        if let Some(bm) = filter_bitmap.as_ref() {
-            if bm.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-        index.search_one_with_policy_mode(
+        self.vector_search_with_filter_mode(
+            column_id,
             query,
             top_k,
             params,
@@ -89,6 +115,30 @@ impl Segment {
             policy,
             mode,
         )
+    }
+
+    /// Search with an already materialized exact segment-local filter. Query
+    /// providers use this after making a query-wide exact-vs-graph decision,
+    /// avoiding both per-segment policy drift and duplicate predicate work.
+    pub(crate) fn vector_search_with_filter_mode(
+        &self,
+        column_id: ColumnId,
+        query: &[f32],
+        top_k: usize,
+        params: &SearchParams,
+        filter_bitmap: Option<&RoaringBitmap>,
+        policy: &HnswSearchPolicy,
+        mode: HnswSearchMode,
+    ) -> Result<Vec<ScoredPoint>> {
+        let index = self
+            .open_hnsw_index(column_id)?
+            .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
+        if let Some(bm) = filter_bitmap {
+            if bm.is_empty() {
+                return Ok(Vec::new());
+            }
+        }
+        index.search_one_with_policy_mode(query, top_k, params, filter_bitmap, policy, mode)
     }
 
     /// Perform a batched vector search on this segment.
@@ -330,26 +380,7 @@ impl Segment {
     ) -> Result<Option<RoaringBitmap>> {
         let mut filter_bitmap = None;
         if let Some(tree) = predicate_tree {
-            let evaluator = IndexEvaluator::new(self.predicate_indexes());
-            let result = evaluator.evaluate(tree);
-
-            match result {
-                PredicateResult::Bitmap(bitmap) => {
-                    filter_bitmap = Some(bitmap);
-                }
-                PredicateResult::AllMatch => {}
-                PredicateResult::NoneMatch => return Ok(Some(RoaringBitmap::new())),
-                PredicateResult::PageRanges(ranges) => {
-                    let mut bitmap = RoaringBitmap::new();
-                    for range in ranges {
-                        if range.start_row < range.end_row {
-                            bitmap.insert_range(range.start_row..range.end_row);
-                        }
-                    }
-                    filter_bitmap = Some(bitmap);
-                }
-                PredicateResult::Unknown => {}
-            }
+            filter_bitmap = Some(self.build_exact_predicate_bitmap(tree)?);
         }
 
         let combined_filter = if let Some(mut bitmap) = filter_bitmap {
@@ -371,4 +402,28 @@ impl Segment {
 
         Ok(combined_filter)
     }
+}
+
+fn predicate_result_to_bitmap(result: PredicateResult, num_rows: u64) -> Result<RoaringBitmap> {
+    Ok(match result {
+        PredicateResult::AllMatch | PredicateResult::Unknown => {
+            let row_count = u32::try_from(num_rows).map_err(|_| {
+                paro_error::data_corrupted("segment row count exceeds exact-filter bitmap domain")
+            })?;
+            let mut bitmap = RoaringBitmap::new();
+            bitmap.insert_range(0..row_count);
+            bitmap
+        }
+        PredicateResult::NoneMatch => RoaringBitmap::new(),
+        PredicateResult::Bitmap(bitmap) => bitmap,
+        PredicateResult::PageRanges(ranges) => {
+            let mut bitmap = RoaringBitmap::new();
+            for range in ranges {
+                if range.start_row < range.end_row {
+                    bitmap.insert_range(range.start_row..range.end_row);
+                }
+            }
+            bitmap
+        }
+    })
 }

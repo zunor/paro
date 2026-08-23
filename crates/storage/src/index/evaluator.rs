@@ -64,8 +64,10 @@ impl IndexEvaluator {
             PredicateTree::And(children) => {
                 let mut candidates = PredicateResult::AllMatch;
                 let mut guaranteed = PredicateResult::AllMatch;
+                let mut exact = true;
                 for child in children {
                     let child = self.evaluate_with_proof(child);
+                    exact &= child.is_exact();
                     candidates = match &self.page_layout {
                         Some(layout) => {
                             intersect_with_layout(&candidates, &child.candidates, layout)
@@ -75,34 +77,42 @@ impl IndexEvaluator {
                     if matches!(candidates, PredicateResult::NoneMatch) {
                         // `guaranteed ⊆ candidates` makes the proof empty too;
                         // no remaining child can make an AND row eligible.
-                        return IndexPredicateEvaluation::candidates_only(
-                            PredicateResult::NoneMatch,
-                        );
+                        return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
                     }
                     guaranteed = match &self.page_layout {
                         Some(layout) => {
-                            intersect_with_layout(&guaranteed, &child.guaranteed, layout)
+                            intersect_with_layout(&guaranteed, child.guaranteed(), layout)
                         }
-                        None => intersect(&guaranteed, &child.guaranteed),
+                        None => intersect(&guaranteed, child.guaranteed()),
                     };
                 }
-                IndexPredicateEvaluation::new(candidates, guaranteed)
+                if exact {
+                    IndexPredicateEvaluation::exact(candidates)
+                } else {
+                    IndexPredicateEvaluation::new(candidates, guaranteed)
+                }
             }
             PredicateTree::Or(children) => {
                 let mut candidates = PredicateResult::NoneMatch;
                 let mut guaranteed = PredicateResult::NoneMatch;
+                let mut exact = true;
                 for child in children {
                     let child = self.evaluate_with_proof(child);
+                    exact &= child.is_exact();
                     candidates = match &self.page_layout {
                         Some(layout) => union_with_layout(&candidates, &child.candidates, layout),
                         None => union(&candidates, &child.candidates),
                     };
                     guaranteed = match &self.page_layout {
-                        Some(layout) => union_with_layout(&guaranteed, &child.guaranteed, layout),
-                        None => union(&guaranteed, &child.guaranteed),
+                        Some(layout) => union_with_layout(&guaranteed, child.guaranteed(), layout),
+                        None => union(&guaranteed, child.guaranteed()),
                     };
                 }
-                IndexPredicateEvaluation::new(candidates, guaranteed)
+                if exact {
+                    IndexPredicateEvaluation::exact(candidates)
+                } else {
+                    IndexPredicateEvaluation::new(candidates, guaranteed)
+                }
             }
         }
     }
@@ -110,7 +120,7 @@ impl IndexEvaluator {
     /// Evaluate a single predicate using the best available index.
     ///
     /// Indexes are pre-filtered by column_id (stored in the HashMap)
-    /// and sorted by priority (ART > Bitmap > Bloom > ZoneMap).
+    /// and sorted by priority (Bitmap > ART > Bloom > ZoneMap).
     fn evaluate_single(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
         let Some(column_id) = predicate.index_column_id() else {
             return IndexPredicateEvaluation::candidates_only(PredicateResult::Unknown);
@@ -127,15 +137,23 @@ impl IndexEvaluator {
                 continue;
             }
             let result = index.evaluate_predicate_with_proof(predicate);
+            if result.is_exact() {
+                // An exact representation has completely answered this leaf.
+                // Consulting a second exact index can only reproduce the same
+                // set and is particularly expensive when that representation
+                // is an ART duplicate-key subtree.
+                return result;
+            }
+            let next_guaranteed = match &self.page_layout {
+                Some(layout) => union_with_layout(&guaranteed, result.guaranteed(), layout),
+                None => union(&guaranteed, result.guaranteed()),
+            };
             if matches!(candidates, PredicateResult::Unknown)
                 && !matches!(result.candidates, PredicateResult::Unknown)
             {
                 candidates = result.candidates;
             }
-            guaranteed = match &self.page_layout {
-                Some(layout) => union_with_layout(&guaranteed, &result.guaranteed, layout),
-                None => union(&guaranteed, &result.guaranteed),
-            };
+            guaranteed = next_guaranteed;
         }
         IndexPredicateEvaluation::new(candidates, guaranteed)
     }
@@ -143,8 +161,12 @@ impl IndexEvaluator {
 
 fn index_priority(index_type: &str) -> u8 {
     match index_type {
-        "ART" => 0,
-        "BITMAP" => 1,
+        // A declared scalar index may expose both representations. The bitmap
+        // is exact and returns an immutable posting directly for the
+        // low-cardinality domain where it is admitted; ART remains the
+        // ordered/high-cardinality path.
+        "BITMAP" => 0,
+        "ART" => 1,
         "BLOOM" => 2,
         "ZONEMAP" => 3,
         _ => 10,
@@ -254,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn test_priority_order() {
+    fn low_cardinality_bitmap_precedes_art() {
         let art = Arc::new(MockIndex::new(
             "ART",
             PredicateResult::Bitmap(RoaringBitmap::from_iter([1])),
@@ -277,10 +299,10 @@ mod tests {
 
         match result {
             PredicateResult::Bitmap(bitmap) => {
-                assert!(bitmap.contains(1));
-                assert!(!bitmap.contains(2));
+                assert!(bitmap.contains(2));
+                assert!(!bitmap.contains(1));
             }
-            _ => panic!("expected bitmap from ART"),
+            _ => panic!("expected posting bitmap"),
         }
     }
 
@@ -329,7 +351,7 @@ mod tests {
         let result = evaluator.evaluate_with_proof(&PredicateTree::And(vec![leaf(1), leaf(2)]));
 
         assert!(matches!(result.candidates, PredicateResult::NoneMatch));
-        assert!(matches!(result.guaranteed, PredicateResult::NoneMatch));
+        assert!(matches!(result.guaranteed(), PredicateResult::NoneMatch));
         assert_eq!(rejecting.evaluations.load(Ordering::Relaxed), 1);
     }
 

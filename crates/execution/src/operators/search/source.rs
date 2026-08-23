@@ -17,6 +17,7 @@ use paro_storage::index::fulltext::query_parser::{
 };
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
 use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
+use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
 use paro_storage::search::{
     CapabilityToken, DenseVectorQuery, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig,
     SearchReadOptions, SearchRequestMode,
@@ -26,7 +27,8 @@ use paro_transaction::TableId;
 
 use crate::operators::search::driver::SearchOperatorDriver;
 use crate::physical::specs::{
-    FullTextSearchSpec, SearchSourceSpec, SparseVectorSearchSpec, VectorSearchSpec,
+    FullTextSearchSpec, SearchPredicateTemplate, SearchSourceSpec, SparseVectorSearchSpec,
+    VectorSearchSpec,
 };
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
@@ -88,6 +90,8 @@ fn create_search_driver(
                 let table = search_storage_table(&spec.table, "vector search")?;
                 record_search_table_read(ctx, &table);
                 let query_vector = resolve_dense_query(&spec.query, ctx.query.params.as_ref())?;
+                let predicate =
+                    bind_search_predicate(spec.predicate.as_ref(), ctx.query.params.as_ref())?;
                 let opened = open_planned_search_cursor(
                     &spec.capability_token,
                     "vector search",
@@ -99,7 +103,7 @@ fn create_search_driver(
                             spec.distance,
                             spec.k,
                             spec.params,
-                            spec.predicate.clone(),
+                            predicate.clone(),
                             &ctx.query.transaction,
                             &read_options,
                         )
@@ -122,6 +126,8 @@ fn create_search_driver(
             SearchSourceSpecRef::Sparse(spec) => {
                 let table = search_storage_table(&spec.table, "sparse vector search")?;
                 record_search_table_read(ctx, &table);
+                let predicate =
+                    bind_search_predicate(spec.predicate.as_ref(), ctx.query.params.as_ref())?;
                 let opened = open_planned_search_cursor(
                     &spec.capability_token,
                     "sparse vector search",
@@ -131,7 +137,7 @@ fn create_search_driver(
                             spec.column_id,
                             &spec.query_vector,
                             spec.k,
-                            spec.predicate.clone(),
+                            predicate.clone(),
                             &ctx.query.transaction,
                             &read_options,
                         )
@@ -155,6 +161,8 @@ fn create_search_driver(
                 let table = search_storage_table(&spec.table, "fulltext search")?;
                 record_search_table_read(ctx, &table);
                 let parsed = parse_fulltext_query(spec)?;
+                let predicate =
+                    bind_search_predicate(spec.predicate.as_ref(), ctx.query.params.as_ref())?;
                 let opened = match &spec.mode {
                     SearchRequestMode::Filter => open_planned_search_cursor(
                         &spec.capability_token,
@@ -165,7 +173,7 @@ fn create_search_driver(
                                 spec.column_id,
                                 &parsed,
                                 &spec.config,
-                                spec.predicate.clone(),
+                                predicate.clone(),
                                 &ctx.query.transaction,
                                 &read_options,
                             )
@@ -186,7 +194,7 @@ fn create_search_driver(
                                 &parsed,
                                 *limit,
                                 &spec.config,
-                                spec.predicate.clone(),
+                                predicate.clone(),
                                 None,
                                 spec.score_mode,
                                 &ctx.query.transaction,
@@ -233,6 +241,76 @@ fn create_search_driver(
         projected_columns,
         emit_score,
     ))
+}
+
+fn bind_search_predicate(
+    template: Option<&SearchPredicateTemplate>,
+    params: &crate::runtime::ParameterBindings,
+) -> Result<Option<PredicateTree>> {
+    template
+        .map(|template| bind_search_predicate_node(template, params))
+        .transpose()
+}
+
+fn bind_search_predicate_node(
+    template: &SearchPredicateTemplate,
+    params: &crate::runtime::ParameterBindings,
+) -> Result<PredicateTree> {
+    match template {
+        SearchPredicateTemplate::Bound(tree) => Ok(tree.clone()),
+        SearchPredicateTemplate::ParameterComparison {
+            column_id,
+            comparison,
+            slot,
+            target_type,
+        } => {
+            let bound = params.value_for_slot(slot)?;
+            if bound.is_null() {
+                return Ok(PredicateTree::leaf(Predicate::In {
+                    column_id: *column_id,
+                    values: Vec::new(),
+                }));
+            }
+            let value = if &bound.logical_type() == target_type {
+                bound.clone()
+            } else {
+                bound.cast(target_type).map_err(|error| {
+                    paro_error::type_mismatch(format!(
+                        "search predicate parameter ${} cannot be cast to {target_type}: {error}",
+                        slot.index.index() + 1
+                    ))
+                })?
+            };
+            Ok(PredicateTree::leaf(scalar_predicate(
+                *column_id,
+                *comparison,
+                value,
+            )))
+        }
+        SearchPredicateTemplate::And(children) => Ok(PredicateTree::And(
+            children
+                .iter()
+                .map(|child| bind_search_predicate_node(child, params))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+        SearchPredicateTemplate::Or(children) => Ok(PredicateTree::Or(
+            children
+                .iter()
+                .map(|child| bind_search_predicate_node(child, params))
+                .collect::<Result<Vec<_>>>()?,
+        )),
+    }
+}
+
+fn scalar_predicate(column_id: u32, comparison: PredicateComparison, value: Value) -> Predicate {
+    match comparison {
+        PredicateComparison::Equal => Predicate::Eq { column_id, value },
+        PredicateComparison::NotEqual => Predicate::NotEq { column_id, value },
+        PredicateComparison::LessThan => Predicate::Lt { column_id, value },
+        PredicateComparison::LessThanOrEqual => Predicate::Le { column_id, value },
+        PredicateComparison::GreaterThan => Predicate::Gt { column_id, value },
+        PredicateComparison::GreaterThanOrEqual => Predicate::Ge { column_id, value },
+    }
 }
 
 pub(crate) fn resolve_dense_query<'a>(
@@ -429,7 +507,11 @@ fn search_local(local: &mut SourceLocal) -> Result<&mut SearchSourceLocal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use paro_common::typed_parameters::{ParameterSlot, RuntimeParamId};
+    use paro_common::types::LogicalType;
     use paro_storage::search::{SearchCapabilityState, SearchNotQueryableReason};
+
+    use crate::runtime::{ParameterBindingEpoch, ParameterBindings};
 
     fn queryable_token(generation_id: u64) -> CapabilityToken {
         CapabilityToken {
@@ -438,6 +520,31 @@ mod tests {
             root_version: generation_id,
             capability_state: SearchCapabilityState::Queryable,
         }
+    }
+
+    #[test]
+    fn search_predicate_parameter_binds_once_to_the_storage_type() {
+        let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::SmallInt);
+        let template = SearchPredicateTemplate::ParameterComparison {
+            column_id: 3,
+            comparison: PredicateComparison::Equal,
+            slot,
+            target_type: LogicalType::Integer,
+        };
+        let bindings = ParameterBindings::new(
+            vec![Value::SmallInt(667)],
+            vec![LogicalType::SmallInt],
+            ParameterBindingEpoch::new(1),
+        )
+        .expect("parameter bindings");
+
+        assert_eq!(
+            bind_search_predicate(Some(&template), &bindings).expect("bind predicate"),
+            Some(PredicateTree::leaf(Predicate::Eq {
+                column_id: 3,
+                value: Value::Integer(667),
+            }))
+        );
     }
 
     #[test]
