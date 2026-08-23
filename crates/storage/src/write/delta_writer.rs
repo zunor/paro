@@ -443,12 +443,12 @@ impl DeltaWriter {
         Ok(())
     }
 
-    pub(crate) fn retained_memory_bytes(&self) -> u64 {
+    pub(crate) fn estimated_peak_memory_bytes(&self) -> u64 {
         let memtable_bytes = self.memtable.stats().bytes as u64;
         let segment_bytes = self
             .rowset_writer
             .as_ref()
-            .map_or(0, RowsetWriter::retained_input_bytes);
+            .map_or(0, RowsetWriter::estimated_peak_memory_bytes);
         memtable_bytes.saturating_add(segment_bytes)
     }
 

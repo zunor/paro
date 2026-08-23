@@ -11,7 +11,8 @@ use paro_storage::compaction::execution::statistics_merge::merge_rowset_statisti
 use paro_storage::compaction::plan::CompactionPlanner;
 use paro_storage::index::fulltext::text_index::FullTextIndex;
 use paro_storage::index::hnsw::{
-    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED, HNSW_BUILD_CONTRACT_VERSION,
+    DistanceMetric, HnswBuildContract, DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+    DEFAULT_HNSW_WARMUP_POINT_COUNT, HNSW_BUILD_CONTRACT_VERSION,
 };
 use paro_storage::primary_key::DeleteVector;
 use paro_storage::rowset::{
@@ -189,6 +190,8 @@ fn test_index_statistics() {
                 ef_construct: 50,
                 distance: DistanceMetric::Cosine,
                 build_seed: DEFAULT_HNSW_BUILD_SEED,
+                proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
             },
         );
     let mut writer = SegmentWriter::create(schema.clone(), &segment_path, opts).unwrap();

@@ -104,8 +104,6 @@ pub struct ColumnWriterOptions {
     pub build_hnsw: bool,
     /// Immutable HNSW physical build contract.
     pub hnsw_build_contract: Option<HnswBuildContract>,
-    /// Transient, admission-owned execution policy for the current artifact build.
-    pub hnsw_execution: Option<HnswBuildExecutionPolicy>,
     /// Optional cooperative stop-check for HNSW build.
     pub hnsw_stop_check: Option<HnswBuildStopCheck>,
 }
@@ -128,7 +126,6 @@ impl ColumnWriterOptions {
             fixed_len: 0,
             build_hnsw: false,
             hnsw_build_contract: None,
-            hnsw_execution: None,
             hnsw_stop_check: None,
         }
     }
@@ -176,11 +173,6 @@ impl ColumnWriterOptions {
     pub fn with_hnsw(mut self, build: bool, build_contract: Option<HnswBuildContract>) -> Self {
         self.build_hnsw = build;
         self.hnsw_build_contract = build_contract;
-        self
-    }
-
-    pub fn with_hnsw_execution(mut self, execution: Option<HnswBuildExecutionPolicy>) -> Self {
-        self.hnsw_execution = execution;
         self
     }
 
@@ -1465,10 +1457,8 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         let build_contract = self.opts.hnsw_build_contract.ok_or_else(|| {
             paro_error::internal("HNSW vector storage is missing its build contract")
         })?;
-        let mut hnsw_builder = HnswBuilder::new();
-        if let Some(execution) = self.opts.hnsw_execution {
-            hnsw_builder = hnsw_builder.with_execution_policy(execution);
-        }
+        let mut hnsw_builder =
+            HnswBuilder::new().with_execution_policy(HnswBuildExecutionPolicy::parallel());
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);
         }

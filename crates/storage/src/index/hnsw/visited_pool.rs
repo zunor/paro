@@ -17,8 +17,8 @@ use std::sync::RwLock;
 
 use super::types::PointOffset;
 
-/// Maximum number of VisitedList instances to keep in the pool.
-const POOL_KEEP_LIMIT: usize = 16;
+/// Default number of visited lists retained by query-time pools.
+const DEFAULT_POOL_KEEP_LIMIT: usize = 16;
 
 /// RAII handle for a VisitedList borrowed from a VisitedPool.
 ///
@@ -118,12 +118,23 @@ impl<'a> VisitedListHandle<'a> {
 #[derive(Debug)]
 pub struct VisitedPool {
     pool: RwLock<Vec<VisitedList>>,
+    keep_limit: usize,
 }
 
 impl VisitedPool {
     pub fn new() -> Self {
+        Self::with_keep_limit(DEFAULT_POOL_KEEP_LIMIT)
+    }
+
+    /// Create a pool sized for the maximum number of concurrent borrowers.
+    ///
+    /// Build callers bind this to the process build-pool width. This prevents
+    /// high-core builds from repeatedly allocating and zeroing an N-byte
+    /// visited vector after the historical fixed-size pool filled up.
+    pub fn with_keep_limit(keep_limit: usize) -> Self {
         VisitedPool {
-            pool: RwLock::new(Vec::with_capacity(POOL_KEEP_LIMIT)),
+            pool: RwLock::new(Vec::with_capacity(keep_limit)),
+            keep_limit,
         }
     }
 
@@ -144,7 +155,7 @@ impl VisitedPool {
 
     fn return_back(&self, data: VisitedList) {
         let mut pool = self.pool.write().unwrap();
-        if pool.len() < POOL_KEEP_LIMIT {
+        if pool.len() < self.keep_limit {
             pool.push(data);
         }
     }

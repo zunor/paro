@@ -105,8 +105,6 @@ pub struct GraphLayersBuilder {
     level_factor: f64,
     /// List of flags indicating whether a point is fully linked and ready for traversal.
     ready_list: BitVec<AtomicUsize>,
-    /// Current max level in the graph.
-    max_level: AtomicUsize,
     /// Whether to use heuristic link selection.
     use_heuristic: bool,
     /// Distance cache slots for heuristic scoring during build.
@@ -166,6 +164,15 @@ impl GraphLayersBuilder {
         contract: &HnswBuildContract,
         use_heuristic: bool,
     ) -> Self {
+        Self::new_from_contract_with_visited_capacity(num_points, contract, use_heuristic, 16)
+    }
+
+    pub(crate) fn new_from_contract_with_visited_capacity(
+        num_points: usize,
+        contract: &HnswBuildContract,
+        use_heuristic: bool,
+        visited_capacity: usize,
+    ) -> Self {
         let hnsw_m = HnswM::from(contract);
         let level_factor = 1.0 / (max(hnsw_m.m, 2) as f64).ln();
 
@@ -177,12 +184,11 @@ impl GraphLayersBuilder {
         Self {
             links_layers,
             entry_points: Mutex::new(EntryPoints::new()),
-            visited_pool: VisitedPool::new(),
+            visited_pool: VisitedPool::with_keep_limit(visited_capacity),
             hnsw_m,
             ef_construct: contract.ef_construct as usize,
             level_factor,
             ready_list: BitVec::repeat(false, num_points),
-            max_level: AtomicUsize::new(0),
             use_heuristic,
             distance_cache_slots: 0,
             distance_profile_enabled: false,
@@ -232,8 +238,6 @@ impl GraphLayersBuilder {
                 self.hnsw_m.get_m(level_idx),
             )));
         }
-
-        self.max_level.fetch_max(level, Ordering::Relaxed);
     }
 
     /// Highest level index for a point.
@@ -247,7 +251,7 @@ impl GraphLayersBuilder {
     /// Add a point using pre-built links.
     ///
     /// The point levels must be pre-allocated with [`Self::set_levels`].
-    /// This method is mutually exclusive with [`Self::link_new_point`].
+    /// This is used only when importing or repairing already-computed links.
     pub fn add_new_point(&self, point_id: PointOffset, links_by_level: Vec<Vec<PointOffset>>) {
         let point_idx = point_id as usize;
         assert!(
@@ -284,154 +288,23 @@ impl GraphLayersBuilder {
             .new_point(point_id, point_level, |_| true);
     }
 
-    /// Link a new point into the HNSW graph.
-    pub fn link_new_point(
+    /// Snapshot the entry points published before the current frozen wave.
+    pub(crate) fn snapshot_entry_points(&self) -> EntryPoints {
+        self.entry_points.lock().clone()
+    }
+
+    /// Insert one point through the same proposal/publication algorithm used by
+    /// parallel waves. A serial warm-up is therefore a wave of size one rather
+    /// than a second construction algorithm that can drift over time.
+    pub(crate) fn insert_single_point(
         &self,
         point_id: PointOffset,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
     ) {
-        let point_idx = point_id as usize;
-        let target_level = self
-            .links_layers
-            .get(point_idx)
-            .and_then(|levels| levels.len().checked_sub(1))
-            .expect("point levels must be preallocated via set_levels before link_new_point");
-
-        let entry_points = {
-            let mut entry_points = self.entry_points.lock();
-            if entry_points.entry_points.is_empty() {
-                // First point in the graph
-                entry_points.new_point(point_id, target_level, |_| true);
-                self.ready_list.set_aliased(point_idx, true);
-                return;
-            }
-            entry_points.clone()
-        };
-
-        let entry_point = entry_points
-            .get_entry_point(|_| true)
-            .expect("entry points must be non-empty");
-
-        let mut current_point = entry_point.point_id;
-        let mut current_score = Self::score_indexed(storage, distance, point_id, current_point);
-        let mut current_level = entry_point
-            .level
-            .min(self.max_level.load(Ordering::Relaxed));
-
-        // 1. Greedy search from top level down to target_level + 1
-        while current_level > target_level {
-            let mut changed = true;
-            while changed {
-                changed = false;
-                self.for_each_link(current_point, current_level, |neighbor| {
-                    let neighbor_score = Self::score_indexed(storage, distance, point_id, neighbor);
-                    if neighbor_score > current_score {
-                        current_score = neighbor_score;
-                        current_point = neighbor;
-                        changed = true;
-                    }
-                });
-            }
-            current_level -= 1;
-        }
-
-        // 2. Search and link at each level from target_level down to 0
-        let mut candidates = vec![ScoredPoint {
-            idx: current_point,
-            score: current_score,
-        }];
-        let mut heuristic_distance_cache = if self.distance_cache_slots > 0 {
-            Some(DistanceCache::new(self.distance_cache_slots))
-        } else {
-            None
-        };
-
-        for level in (0..=target_level.min(current_level)).rev() {
-            let ef = if level == 0 {
-                self.ef_construct
-            } else {
-                self.hnsw_m.m
-            };
-
-            // Search on this level to find best neighbors
-            let search_results =
-                self.search_on_level(point_id, candidates.clone(), level, ef, storage, distance);
-
-            let m_limit = self.hnsw_m.get_m(level);
-            if self.use_heuristic {
-                let selected_nearest = {
-                    let mut links = self.links_layers[point_idx][level].write();
-                    links.fill_from_sorted_with_heuristic(
-                        search_results.iter().copied(),
-                        m_limit,
-                        |target, candidate| {
-                            self.score_with_optional_cache(
-                                storage,
-                                distance,
-                                target,
-                                candidate,
-                                &mut heuristic_distance_cache,
-                            )
-                        },
-                    );
-                    links.as_slice().to_vec()
-                };
-
-                let mut items = ItemsBuffer::default();
-                for &neighbor_id in &selected_nearest {
-                    self.links_layers[neighbor_id as usize][level]
-                        .write()
-                        .connect_with_heuristic(
-                            point_id,
-                            neighbor_id,
-                            m_limit,
-                            |target, candidate| {
-                                self.score_with_optional_cache(
-                                    storage,
-                                    distance,
-                                    target,
-                                    candidate,
-                                    &mut heuristic_distance_cache,
-                                )
-                            },
-                            &mut items,
-                        );
-                }
-            } else {
-                let neighbors: Vec<PointOffset> =
-                    search_results.iter().take(m_limit).map(|p| p.idx).collect();
-                for &neighbor_id in &neighbors {
-                    // Link new point -> neighbor
-                    self.links_layers[point_idx][level].write().connect(
-                        neighbor_id,
-                        point_id,
-                        m_limit,
-                        |target, candidate| {
-                            Self::score_indexed(storage, distance, target, candidate)
-                        },
-                    );
-
-                    // Link neighbor -> new point
-                    self.add_link_bidirectional(
-                        neighbor_id,
-                        point_id,
-                        level,
-                        m_limit,
-                        storage,
-                        distance,
-                    );
-                }
-            }
-
-            candidates = search_results;
-        }
-
-        // Update overall entry points if the new point is at a higher level
-        self.entry_points
-            .lock()
-            .new_point(point_id, target_level, |_| true);
-        self.ready_list.set_aliased(point_idx, true);
+        let entry_points = self.snapshot_entry_points();
+        let proposal = self.propose_new_point(point_id, &entry_points, storage, distance);
+        self.publish_frozen_wave(vec![proposal], storage, distance, false);
     }
 
     /// Compute one point's outgoing links against the currently published graph.
@@ -442,11 +315,11 @@ impl GraphLayersBuilder {
     pub(crate) fn propose_new_point(
         &self,
         point_id: PointOffset,
+        entry_points: &EntryPoints,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
     ) -> FrozenPointProposal {
         let target_level = self.get_point_level(point_id);
-        let entry_points = self.entry_points.lock().clone();
         let Some(entry_point) = entry_points.get_entry_point(|_| true) else {
             return FrozenPointProposal {
                 point_id,
@@ -693,25 +566,6 @@ impl GraphLayersBuilder {
         }
 
         search_context.nearest.into_sorted_vec()
-    }
-
-    /// Add a link from `from` to `to` at `level`, ensuring `m_limit` is respected.
-    fn add_link_bidirectional(
-        &self,
-        from: PointOffset,
-        to: PointOffset,
-        level: usize,
-        m_limit: usize,
-        storage: &dyn VectorStorage,
-        distance: DistanceMetric,
-    ) {
-        let links_row = &self.links_layers[from as usize];
-        if level < links_row.len() {
-            let mut links = links_row[level].write();
-            links.connect(to, from, m_limit, |target, candidate| {
-                Self::score_indexed(storage, distance, target, candidate)
-            });
-        }
     }
 
     #[inline]

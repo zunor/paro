@@ -42,6 +42,7 @@ pub mod identity;
 pub mod journal;
 pub mod logging;
 pub mod memory;
+pub mod pg_binary;
 pub mod runtime_value;
 pub mod sort_key;
 pub mod string_pattern;

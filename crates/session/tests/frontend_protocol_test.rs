@@ -22,6 +22,8 @@ use paro_session::{
     ResultSink, Session, StatementCompletion,
 };
 use query_i64_col::query_i64_col;
+use std::collections::VecDeque;
+use std::time::Duration;
 use tokio_util::bytes::Bytes;
 use unique_test_dir::create_unique_test_dir;
 
@@ -91,7 +93,7 @@ impl CopyProtocolSink for MockCopyOutProtocol<'_> {
 }
 
 struct MockCopyInSink {
-    payload: Vec<u8>,
+    payloads: VecDeque<Vec<u8>>,
     column_count: Option<usize>,
     completion: Option<StatementCompletion>,
     errors: Vec<String>,
@@ -100,7 +102,16 @@ struct MockCopyInSink {
 impl MockCopyInSink {
     fn new(payload: impl Into<Vec<u8>>) -> Self {
         Self {
-            payload: payload.into(),
+            payloads: VecDeque::from([payload.into()]),
+            column_count: None,
+            completion: None,
+            errors: Vec::new(),
+        }
+    }
+
+    fn from_chunks(chunks: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        Self {
+            payloads: chunks.into_iter().collect(),
             column_count: None,
             completion: None,
             errors: Vec::new(),
@@ -150,12 +161,34 @@ impl CopyProtocolSource for MockCopyInProtocol<'_> {
     }
 
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
-        if self.sink.payload.is_empty() {
-            return Ok(None);
-        }
-        let payload = std::mem::take(&mut self.sink.payload);
-        Ok(Some(Bytes::from(payload)))
+        Ok(self.sink.payloads.pop_front().map(Bytes::from))
     }
+}
+
+fn binary_vector_copy_payload(rows: &[(i32, [f32; 3])]) -> Vec<u8> {
+    let mut payload = b"PGCOPY\n\xff\r\n\0".to_vec();
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    payload.extend_from_slice(&0_u32.to_be_bytes());
+    let float_oid = LogicalType::Float.pg_descriptor().oid;
+    for (id, vector) in rows {
+        payload.extend_from_slice(&2_i16.to_be_bytes());
+        payload.extend_from_slice(&4_i32.to_be_bytes());
+        payload.extend_from_slice(&id.to_be_bytes());
+
+        let vector_bytes = 20 + vector.len() * 8;
+        payload.extend_from_slice(&(vector_bytes as i32).to_be_bytes());
+        payload.extend_from_slice(&1_i32.to_be_bytes());
+        payload.extend_from_slice(&0_i32.to_be_bytes());
+        payload.extend_from_slice(&float_oid.to_be_bytes());
+        payload.extend_from_slice(&(vector.len() as i32).to_be_bytes());
+        payload.extend_from_slice(&1_i32.to_be_bytes());
+        for value in vector {
+            payload.extend_from_slice(&4_i32.to_be_bytes());
+            payload.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    payload.extend_from_slice(&(-1_i16).to_be_bytes());
+    payload
 }
 
 #[tokio::test]
@@ -253,6 +286,70 @@ async fn copy_from_stdin_uses_copy_protocol_source() {
     )
     .await;
     assert_eq!(query_i64_col(&collect, 0), vec![1, 2]);
+}
+
+#[tokio::test]
+async fn binary_copy_from_stdin_decodes_vector_columns_end_to_end() {
+    let instance = create_test_instance("copy_in_binary_vector");
+    let mut session = Session::new(1, instance);
+    let mut collect = CollectingSink::new();
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "CREATE TABLE copy_in_binary_vector (id INT, embedding VECTOR(3))",
+    )
+    .await;
+
+    let mut sink = MockCopyInSink::new(binary_vector_copy_payload(&[
+        (7, [1.0, 2.0, 3.0]),
+        (9, [4.0, 5.0, 6.0]),
+    ]));
+    session
+        .execute_simple_query(
+            "COPY copy_in_binary_vector FROM STDIN WITH (FORMAT binary)",
+            &mut sink,
+        )
+        .await
+        .expect("binary vector COPY");
+    assert_eq!(sink.completion, Some(StatementCompletion::Copy { rows: 2 }));
+
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "SELECT id FROM copy_in_binary_vector ORDER BY id",
+    )
+    .await;
+    assert_eq!(query_i64_col(&collect, 0), vec![7, 9]);
+}
+
+#[tokio::test]
+async fn copy_from_stdin_decode_error_closes_stream_before_joining_worker() {
+    let instance = create_test_instance("copy_in_early_error");
+    let mut session = Session::new(1, instance);
+    let mut collect = CollectingSink::new();
+    exec_ok(
+        &mut session,
+        &mut collect,
+        "CREATE TABLE copy_in_early_error (v INT)",
+    )
+    .await;
+
+    let chunks =
+        std::iter::once(b"not-an-integer\n".to_vec()).chain((0..128).map(|_| b"1\n".to_vec()));
+    let mut sink = MockCopyInSink::from_chunks(chunks);
+    let result = tokio::time::timeout(
+        Duration::from_secs(5),
+        session.execute_simple_query(
+            "COPY copy_in_early_error FROM STDIN WITH (FORMAT csv)",
+            &mut sink,
+        ),
+    )
+    .await
+    .expect("COPY error cleanup must not deadlock")
+    .expect_err("invalid integer should fail COPY");
+
+    assert!(result.to_string().contains("not-an-integer"));
+    assert_eq!(sink.errors.len(), 1);
 }
 
 #[tokio::test]

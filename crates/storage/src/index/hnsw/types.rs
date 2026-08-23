@@ -21,10 +21,13 @@ pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
 pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
 pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
 pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 0;
-/// Version 2 fixes the graph topology algorithm to deterministic frozen
-/// proposal waves. Any change to wave boundaries or publication semantics
-/// requires another version bump.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 2;
+pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
+pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
+/// Version 3 fixes graph construction to a seeded point permutation followed
+/// by one-point warm-up waves and deterministic frozen proposal waves. Wave
+/// boundaries are durable fields; changing publication semantics requires a
+/// new contract version.
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 3;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -165,6 +168,10 @@ pub struct HnswBuildContract {
     pub ef_construct: u32,
     pub distance: super::DistanceMetric,
     pub build_seed: u64,
+    /// Number of point proposals computed against one frozen topology.
+    pub proposal_wave_size: u32,
+    /// Number of points published as one-point waves before batched waves.
+    pub warmup_point_count: u32,
 }
 
 impl HnswBuildContract {
@@ -185,6 +192,18 @@ impl HnswBuildContract {
             return Err(paro_common::error::data_corrupted(format!(
                 "invalid HNSW ef_construct {} for m {}",
                 self.ef_construct, self.m
+            )));
+        }
+        if !(1..=4_096).contains(&self.proposal_wave_size) {
+            return Err(paro_common::error::data_corrupted(format!(
+                "invalid HNSW proposal_wave_size {}, expected 1..=4096",
+                self.proposal_wave_size
+            )));
+        }
+        if self.warmup_point_count > 1_000_000_000 {
+            return Err(paro_common::error::data_corrupted(format!(
+                "invalid HNSW warmup_point_count {}",
+                self.warmup_point_count
             )));
         }
         Ok(())
@@ -294,6 +313,8 @@ impl HnswConfig {
             })?,
             distance,
             build_seed: self.build_seed,
+            proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
         };
         contract.validate()?;
         Ok(contract)

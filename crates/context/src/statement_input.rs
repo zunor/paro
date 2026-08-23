@@ -25,6 +25,12 @@ impl StatementInput {
     pub fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
         self.copy_stdin.clone()
     }
+
+    pub fn requires_background_execution(&self) -> bool {
+        self.copy_stdin
+            .as_ref()
+            .is_some_and(|source| source.requires_background_execution())
+    }
 }
 
 impl fmt::Debug for StatementInput {

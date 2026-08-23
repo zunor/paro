@@ -116,7 +116,11 @@ fn start_program_with_output(
     completed_output: QueryOutputPort,
     fetch_driven: bool,
 ) -> Result<ProgramExecution> {
+    let requires_background_input = session.input.requires_background_execution();
     let output = match program {
+        StatementProgram::Pipeline { .. } if fetch_driven && requires_background_input => {
+            QueryOutputPort::with_blocking_writes(&streaming_output)
+        }
         StatementProgram::Pipeline { graph, .. }
             if fetch_driven
                 && PipelineScheduler::should_use_parallel_scheduler_for_session(
@@ -143,6 +147,21 @@ fn start_program_with_output(
         StatementProgram::Utility(utility) => run_utility(utility, &query)?,
         StatementProgram::ExplainAnalyze { target, spec } => {
             run_explain_analyze(target, *spec, &query, allocator)?
+        }
+        StatementProgram::Pipeline {
+            graph, programs, ..
+        } if fetch_driven && requires_background_input => {
+            let background = BackgroundExecutionDriver::spawn(
+                graph.clone(),
+                programs.clone(),
+                query.clone(),
+                allocator,
+            )?;
+            return Ok(ProgramExecution {
+                query,
+                driver: None,
+                background: Some(background),
+            });
         }
         StatementProgram::Pipeline {
             graph, programs, ..

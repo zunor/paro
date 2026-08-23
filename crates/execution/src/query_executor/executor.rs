@@ -90,23 +90,24 @@ impl Executor {
         allocator: Arc<dyn paro_common::allocator::Allocator>,
         query_memory_pool: Arc<QueryMemoryPool>,
     ) -> Result<ResultHandler> {
-        let execution = if result_types.is_empty() {
-            program_executor::execute_program(
-                self.session.clone(),
-                program,
-                params,
-                query_memory_pool.clone(),
-                allocator.clone(),
-            )?
-        } else {
-            program_executor::start_program(
-                self.session.clone(),
-                program,
-                params,
-                query_memory_pool.clone(),
-                allocator.clone(),
-            )?
-        };
+        let execution =
+            if result_types.is_empty() && !self.session.input.requires_background_execution() {
+                program_executor::execute_program(
+                    self.session.clone(),
+                    program,
+                    params,
+                    query_memory_pool.clone(),
+                    allocator.clone(),
+                )?
+            } else {
+                program_executor::start_program(
+                    self.session.clone(),
+                    program,
+                    params,
+                    query_memory_pool.clone(),
+                    allocator.clone(),
+                )?
+            };
         ResultHandler::from_program_execution(
             result_names,
             result_types,

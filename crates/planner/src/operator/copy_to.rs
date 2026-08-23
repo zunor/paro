@@ -4,14 +4,14 @@
 use std::sync::Arc;
 
 use paro_common::types::LogicalType;
-use paro_function::copy::{CopyFunction, CopyFunctionBindData, CopyOptions};
+use paro_function::copy::{CopyFunctionBindData, CopyOptions, CopyToFunction};
 use paro_parser::ast::CopySource;
 
 use crate::plan::LogicalPlan;
 
 #[derive(Debug)]
 pub struct CopyTo {
-    pub copy_function: CopyFunction,
+    pub copy_function: CopyToFunction,
     pub bind_data: Arc<dyn CopyFunctionBindData>,
     pub file_path: String,
     pub source: CopySource,
@@ -24,7 +24,7 @@ pub struct CopyTo {
 impl CopyTo {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        copy_function: CopyFunction,
+        copy_function: CopyToFunction,
         bind_data: Arc<dyn CopyFunctionBindData>,
         file_path: String,
         source: CopySource,

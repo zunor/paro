@@ -348,15 +348,7 @@ impl SearchIndexRegistry {
         let admission: Arc<dyn SearchAdmission> = Arc::new(InlineSearchAdmission::with_scheduler(
             Arc::clone(&self.maintenance_scheduler),
         ));
-        let max_threads = self
-            .hnsw_task_scheduler()
-            .map(|scheduler| scheduler.number_of_threads().max(1) as usize)
-            .unwrap_or(1);
-        let mut context = self.view.load().write_context(Some(admission))?;
-        context.inline_builders = context.inline_builders.with_hnsw_build_execution(
-            crate::index::hnsw::HnswBuildExecutionPolicy::parallel(max_threads),
-        );
-        Ok(context)
+        self.view.load().write_context(Some(admission))
     }
 
     pub(crate) fn has_queryable_artifact(
@@ -469,10 +461,7 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::new(
-            sidecar_store.clone(),
-            crate::index::hnsw::HnswBuildExecutionPolicy::serial(),
-        );
+        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -522,14 +511,14 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
-        let Some(scheduler) = self.hnsw_task_scheduler() else {
+        if self.hnsw_task_scheduler().is_none() {
             tracing::debug!(
                 tablet_id = self.tablet.tablet_id(),
                 definition_id = state.definition.definition_id,
                 "HNSW maintenance request admitted but no task scheduler is bound"
             );
             return Ok(0);
-        };
+        }
 
         let visible_rowsets = self
             .tablet
@@ -544,12 +533,7 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::new(
-            sidecar_store.clone(),
-            crate::index::hnsw::HnswBuildExecutionPolicy::parallel(
-                scheduler.number_of_threads().max(1) as usize,
-            ),
-        );
+        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -2657,6 +2641,8 @@ mod tests {
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: 1,
+            proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
             inline_threshold: crate::search::HnswInlineConfig {
                 enabled: inline_max_vector_count != 0,
                 max_vector_count: inline_max_vector_count,

@@ -3,9 +3,9 @@
 
 //! PostgreSQL binary receive codecs shared by parameters and COPY.
 
-use paro_common::error::{self as paro_error, Result};
-use paro_common::runtime_value::Value;
-use paro_common::types::LogicalType;
+use crate::error::{self as paro_error, Result};
+use crate::runtime_value::Value;
+use crate::types::LogicalType;
 
 const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;

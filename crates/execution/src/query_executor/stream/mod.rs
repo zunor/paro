@@ -35,6 +35,13 @@ enum ResultOutput {
     },
 }
 
+/// Non-blocking observation of a result stream.
+pub enum FetchState<'a> {
+    Ready(&'a Chunk),
+    Pending,
+    Exhausted,
+}
+
 /// Result handler for query execution.
 ///
 /// Completed-output queries drain an already-populated typed output port.
@@ -150,6 +157,56 @@ impl ResultHandler {
                     "result handler has no output source",
                 ))
             }
+        }
+    }
+
+    /// Fetch without parking the calling thread on a background driver.
+    ///
+    /// Async front ends use this to keep receiving bounded COPY input while a
+    /// blocking execution worker consumes it. Other result modes retain their
+    /// existing fetch-driven behavior.
+    pub fn try_fetch(&mut self) -> Result<FetchState<'_>> {
+        if !matches!(self.output, ResultOutput::Background { .. }) {
+            return Ok(match self.fetch()? {
+                Some(chunk) => FetchState::Ready(chunk),
+                None => FetchState::Exhausted,
+            });
+        }
+
+        loop {
+            if self.cancellation.is_cancelled() {
+                let _ = self.cleanup_typed_driver(CleanupReason::Cancelled(
+                    self.cancellation
+                        .reason()
+                        .unwrap_or(paro_context::StatementCancelReason::UserRequest),
+                ));
+                self.mark_closed();
+                self.cancellation.check()?;
+                return Ok(FetchState::Exhausted);
+            }
+
+            if let Some(chunk) = self.pop_background_output_chunk()? {
+                self.output_chunk = chunk;
+                if self.output_chunk.size() != 0 {
+                    return Ok(FetchState::Ready(&self.output_chunk));
+                }
+                continue;
+            }
+
+            if self.background_driver_finished()? {
+                let result = self.finish_background_driver();
+                self.mark_closed();
+                result?;
+                return Ok(FetchState::Exhausted);
+            }
+            return Ok(FetchState::Pending);
+        }
+    }
+
+    pub fn progress_port(&self) -> Option<QueryOutputPort> {
+        match &self.output {
+            ResultOutput::Background { output, .. } => Some(output.clone()),
+            _ => None,
         }
     }
 

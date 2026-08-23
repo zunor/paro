@@ -2,55 +2,98 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{HnswBuildContract, HnswIndex, VectorStorage};
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
+use rayon::ThreadPool;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock};
+
+struct HnswBuildPool {
+    threads: usize,
+    pool: ThreadPool,
+}
+
+static HNSW_BUILD_THREADS: AtomicUsize = AtomicUsize::new(0);
+static HNSW_BUILD_POOL: OnceLock<std::result::Result<HnswBuildPool, String>> = OnceLock::new();
+
+fn create_build_pool(threads: usize) -> std::result::Result<HnswBuildPool, String> {
+    let threads = threads.max(1);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .thread_name(|idx| format!("paro-hnsw-build-{idx}"))
+        .num_threads(threads)
+        .build()
+        .map_err(|error| format!("create process HNSW build pool: {error}"))?;
+    Ok(HnswBuildPool { threads, pool })
+}
+
+/// Configure the process-owned HNSW build pool before the first parallel build.
+///
+/// Every inline, catch-up, and rebuild job installs work into this one pool, so
+/// concurrent jobs share workers through Rayon work stealing instead of each
+/// creating a private pool. The first process runtime owns the width; later
+/// calls report the effective width and never create an oversubscribing pool.
+pub fn configure_hnsw_build_threads(threads: usize) -> usize {
+    let requested = threads.max(1);
+    let configured = match HNSW_BUILD_THREADS.compare_exchange(
+        0,
+        requested,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    ) {
+        Ok(_) => requested,
+        Err(configured) => configured,
+    };
+    let effective = HNSW_BUILD_POOL
+        .get()
+        .and_then(|runtime| runtime.as_ref().ok())
+        .map_or(configured, |runtime| runtime.threads);
+    if effective != requested {
+        tracing::warn!(
+            requested_threads = requested,
+            effective_threads = effective,
+            "HNSW build pool is already configured for this process"
+        );
+    }
+    effective
+}
+
+pub(crate) fn hnsw_build_pool() -> Result<(&'static ThreadPool, usize)> {
+    let configured = HNSW_BUILD_THREADS.load(Ordering::Acquire);
+    let threads = if configured == 0 {
+        std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1)
+    } else {
+        configured
+    };
+    match HNSW_BUILD_POOL.get_or_init(|| create_build_pool(threads)) {
+        Ok(runtime) => Ok((&runtime.pool, runtime.threads)),
+        Err(error) => Err(paro_error::internal(error.clone())),
+    }
+}
 
 /// Query-independent execution policy for constructing one immutable HNSW artifact.
 ///
-/// This is deliberately not part of [`HnswBuildContract`]: changing worker counts
-/// must not invalidate an artifact or alter its topology. The frozen-wave epoch
-/// is part of the builder algorithm, while this policy only controls how many workers
-/// execute that algorithm. A fixed build contract therefore produces a byte-identical
-/// graph at every worker count.
+/// This is deliberately not part of [`HnswBuildContract`]: changing whether
+/// workers cooperate must not invalidate an artifact or alter its topology.
+/// Wave boundaries and warm-up length live in the durable build contract.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct HnswBuildExecutionPolicy {
-    max_threads: usize,
+pub enum HnswBuildExecutionPolicy {
+    Serial,
+    Parallel,
 }
 
 impl HnswBuildExecutionPolicy {
-    // Topology constants belong to the versioned build algorithm, not runtime
-    // scheduling. Keep epochs small enough that proposals do not observe a
-    // materially stale graph while still exposing ample point-level parallelism.
-    const PROPOSAL_WAVE_SIZE: usize = 64;
-    const SERIAL_PREFIX_SIZE: usize = 4_096;
-
     pub const fn serial() -> Self {
-        Self { max_threads: 1 }
+        Self::Serial
     }
 
-    pub fn parallel(max_threads: usize) -> Self {
-        let max_threads = max_threads.max(1);
-        if max_threads == 1 {
-            return Self::serial();
-        }
-        Self { max_threads }
-    }
-
-    pub const fn max_threads(self) -> usize {
-        self.max_threads
-    }
-
-    pub const fn proposal_wave_size(self) -> usize {
-        Self::PROPOSAL_WAVE_SIZE
-    }
-
-    pub const fn serial_prefix_size(self) -> usize {
-        Self::SERIAL_PREFIX_SIZE
+    pub const fn parallel() -> Self {
+        Self::Parallel
     }
 
     pub const fn is_parallel(self) -> bool {
-        self.max_threads > 1
+        matches!(self, Self::Parallel)
     }
 }
 

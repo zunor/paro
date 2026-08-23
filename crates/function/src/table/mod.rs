@@ -135,7 +135,14 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
 /// to be protocol chunks, an mmap, or a bounded stream without requiring one
 /// contiguous allocation.
 pub trait CopyStdinSource: Send + Sync {
-    fn open_reader(self: Arc<Self>) -> Box<dyn Read + Send>;
+    fn open_reader(self: Arc<Self>) -> Result<Box<dyn Read + Send>>;
+
+    /// Whether the consumer must execute off the async protocol worker.
+    /// Streaming protocol sources block while waiting for the next bounded
+    /// chunk; file and fully materialized test sources do not.
+    fn requires_background_execution(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(test)]

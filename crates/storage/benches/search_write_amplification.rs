@@ -312,6 +312,8 @@ fn search_definition(
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
+            proposal_wave_size: paro_storage::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            warmup_point_count: paro_storage::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
             inline_threshold: paro_storage::search::HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,

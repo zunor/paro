@@ -750,12 +750,12 @@ impl TxnWriteBuffer {
                 .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
             writer.ensure_search_write_context(&search_write_context)?;
             let result = f(writer)?;
-            let mut retained = writer.retained_memory_bytes();
+            let mut retained = writer.estimated_peak_memory_bytes();
             let actual_projected = retained_elsewhere.saturating_add(retained);
             if self.is_over_budget(actual_projected) {
                 writer.relieve_memory_pressure()?;
                 retained = writer
-                    .retained_memory_bytes()
+                    .estimated_peak_memory_bytes()
                     .max(SPILLED_WRITER_HANDLE_BYTES);
             }
             (result, retained)

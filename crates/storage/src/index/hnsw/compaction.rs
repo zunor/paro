@@ -90,6 +90,8 @@ impl HnswIndexRebuilder {
                             ))
                         })?,
                         build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
+                        proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                        warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
                     };
                     build_contract.validate()?;
                     Ok(HnswIndexedColumn {
@@ -286,7 +288,7 @@ impl HnswIndexRebuilder {
                 continue;
             }
             let point_id = new_id as PointOffset;
-            builder.link_new_point(
+            builder.insert_single_point(
                 point_id,
                 output_storage.as_ref(),
                 indexed_col.build_contract.distance,

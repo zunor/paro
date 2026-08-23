@@ -1082,7 +1082,9 @@ mod tests {
         let copy_function = register_copy_functions()
             .into_iter()
             .next()
-            .expect("copy function");
+            .expect("copy function")
+            .copy_to
+            .expect("COPY TO function");
         let names = vec!["c1".to_string()];
         let types = vec![LogicalType::Integer];
         let bind_data: Arc<dyn CopyFunctionBindData> = Arc::from(

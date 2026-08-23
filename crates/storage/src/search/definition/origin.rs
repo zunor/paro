@@ -50,6 +50,8 @@ pub(crate) fn schema_seed_definition(
         filtered_plain_scan_threshold: u32::try_from(defaults.filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
         build_seed: DEFAULT_HNSW_BUILD_SEED,
+        proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+        warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
         inline_threshold: HnswInlineConfig {
             enabled: true,
             max_vector_count: inline.max_vector_count,

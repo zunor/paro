@@ -522,13 +522,10 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
         return Ok(HnswBuildSummary::default());
     }
 
-    let scheduler_threads = scheduler.number_of_threads().max(1) as usize;
-    let concurrent_jobs = jobs.len().min(scheduler_threads).max(1);
-    let threads_per_job = scheduler_threads.div_ceil(concurrent_jobs);
     let state = Arc::new(SharedBuildState::new(
         jobs.len(),
         stop_check,
-        HnswBuildExecutionPolicy::parallel(threads_per_job),
+        HnswBuildExecutionPolicy::parallel(),
     ));
     let producer = scheduler.create_producer();
 

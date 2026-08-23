@@ -25,6 +25,7 @@ use paro_compiler::{compile_statement, compile_statement_with_parameter_types};
 use paro_context::{StatementCancellation, StatementInput, StatementOptions, StatementSource};
 use paro_execution::query_executor::compiled::ExecutionRequest;
 use paro_execution::query_executor::executor::Executor;
+use paro_execution::query_executor::stream::FetchState;
 use paro_function::table::CopyStdinSource;
 use paro_instance::{CopyStdinMetrics, CopyStdinRejectReason};
 use paro_parser::ast::{
@@ -35,8 +36,11 @@ use paro_transaction::{
     IsolationLevel, LockMode, LockRequest, LockResource, ReadTrackingPolicy, ReadWritePromotion,
     TableId,
 };
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::Instant;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio_util::bytes::Bytes;
 use tracing::{debug, error};
 
@@ -477,19 +481,43 @@ impl Session {
                 if emits_rows {
                     sink.start_result(&result_names, &result_types).await?;
 
-                    while let Some(chunk) = stream.fetch()? {
-                        rows += chunk.len();
-                        sink.push_chunk(chunk).await?;
+                    loop {
+                        match stream.try_fetch()? {
+                            FetchState::Ready(chunk) => {
+                                rows += chunk.len();
+                                sink.push_chunk(chunk).await?;
+                            }
+                            FetchState::Pending => {
+                                let progress = stream.progress_port().ok_or_else(|| {
+                                    paro_error::internal("pending result has no progress port")
+                                })?;
+                                progress.wait_for_change().await;
+                            }
+                            FetchState::Exhausted => break,
+                        }
                     }
                 } else {
-                    while let Some(chunk) = stream.fetch()? {
-                        if chunk.len() > 0 && chunk.column_count() > 0 {
-                            if let Some(col) = chunk.column(0) {
-                                let value = col.get_value(0);
-                                if let paro_common::runtime_value::Value::BigInt(count) = value {
-                                    rows = count as usize;
+                    loop {
+                        match stream.try_fetch()? {
+                            FetchState::Ready(chunk) => {
+                                if chunk.len() > 0 && chunk.column_count() > 0 {
+                                    if let Some(col) = chunk.column(0) {
+                                        let value = col.get_value(0);
+                                        if let paro_common::runtime_value::Value::BigInt(count) =
+                                            value
+                                        {
+                                            rows = count as usize;
+                                        }
+                                    }
                                 }
                             }
+                            FetchState::Pending => {
+                                let progress = stream.progress_port().ok_or_else(|| {
+                                    paro_error::internal("pending result has no progress port")
+                                })?;
+                                progress.wait_for_change().await;
+                            }
+                            FetchState::Exhausted => break,
                         }
                     }
                 }
@@ -713,9 +741,20 @@ impl Session {
             .start_copy_out(&output_names, &result_types)
             .await?;
 
-        while let Some(chunk) = stream.fetch()? {
-            rows += chunk.len();
-            protocol_sink.push_copy_rows(chunk).await?;
+        loop {
+            match stream.try_fetch()? {
+                FetchState::Ready(chunk) => {
+                    rows += chunk.len();
+                    protocol_sink.push_copy_rows(chunk).await?;
+                }
+                FetchState::Pending => {
+                    let progress = stream.progress_port().ok_or_else(|| {
+                        paro_error::internal("pending result has no progress port")
+                    })?;
+                    progress.wait_for_change().await;
+                }
+                FetchState::Exhausted => break,
+            }
         }
 
         protocol_sink.finish_copy_out().await?;
@@ -753,30 +792,41 @@ impl Session {
         };
         protocol_source.begin_copy_in(&spec).await?;
 
-        let payload = FramedCopySourceBridge::new(
+        let (bridge, payload) = FramedCopySourceBridge::new(
             self.copy_stdin_memory_limit(),
             self.instance.copy_stdin_metrics().clone(),
-        )
-        .collect(protocol_source, cancellation)
-        .await?;
-        let input = StatementInput::copy_from_stdin(Arc::new(payload));
+        );
+        let input = StatementInput::copy_from_stdin(payload);
 
         let mut sink = CompletionCaptureSink::default();
-        let result = self
-            .execute_query_pipeline_with_parameters(
-                Statement::Copy(copy_stmt.clone()),
-                parameter_env,
-                QueryPipelineOptions {
-                    statement_format,
-                    source,
-                    input,
-                    completion_override: None,
-                    reuse_simple_query_plan: false,
-                },
-                &mut sink,
-            )
-            .await;
-
+        let mut forward = Box::pin(bridge.forward(protocol_source, cancellation.clone()));
+        let mut execute = Box::pin(self.execute_query_pipeline_with_parameters(
+            Statement::Copy(copy_stmt.clone()),
+            parameter_env,
+            QueryPipelineOptions {
+                statement_format,
+                source,
+                input,
+                completion_override: None,
+                reuse_simple_query_plan: false,
+            },
+            &mut sink,
+        ));
+        let result: Result<()> = tokio::select! {
+            result = &mut forward => match result {
+                Ok(()) => execute.as_mut().await,
+                Err(error) => Err(error),
+            },
+            result = &mut execute => match result {
+                Ok(()) => forward.as_mut().await,
+                Err(error) => Err(error),
+            },
+        };
+        // The producer owns the last sender. Drop it before the execution
+        // future: an early protocol error must turn a blocked COPY reader into
+        // EOF before ResultHandler cleanup joins the worker thread.
+        drop(forward);
+        drop(execute);
         result?;
         sink.into_completion()
     }
@@ -1406,54 +1456,83 @@ impl ResultSink for CompletionCaptureSink {
 
 impl ProtocolResultSink for CompletionCaptureSink {}
 
+const COPY_STDIN_CHANNEL_CHUNKS: usize = 32;
+
 struct FramedCopySourceBridge {
-    chunks: Vec<Bytes>,
-    retained_bytes: usize,
+    sender: mpsc::Sender<QueuedCopyChunk>,
+    permits: Arc<Semaphore>,
     limit: usize,
-    memory: CopyStdinPayloadMemoryTracker,
+    memory: Arc<StreamingCopyMemoryTracker>,
 }
 
 #[derive(Debug)]
-struct BufferedCopyStdinPayload {
-    chunks: Vec<Bytes>,
-    _memory: CopyStdinPayloadMemoryTracker,
+struct StreamingCopyStdinSource {
+    receiver: Mutex<Option<mpsc::Receiver<QueuedCopyChunk>>>,
 }
 
-impl CopyStdinSource for BufferedCopyStdinPayload {
-    fn open_reader(self: Arc<Self>) -> Box<dyn std::io::Read + Send> {
-        Box::new(CopyChunkReader {
-            payload: self,
-            chunk_index: 0,
-            chunk_offset: 0,
-        })
+impl CopyStdinSource for StreamingCopyStdinSource {
+    fn open_reader(self: Arc<Self>) -> Result<Box<dyn std::io::Read + Send>> {
+        let receiver = self
+            .receiver
+            .lock()
+            .map_err(|_| paro_error::internal("COPY source receiver lock poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                paro_error::internal("COPY FROM STDIN source was opened more than once")
+            })?;
+        Ok(Box::new(StreamingCopyChunkReader {
+            receiver,
+            current: None,
+            current_offset: 0,
+        }))
+    }
+
+    fn requires_background_execution(&self) -> bool {
+        true
     }
 }
 
-struct CopyChunkReader {
-    payload: Arc<BufferedCopyStdinPayload>,
-    chunk_index: usize,
-    chunk_offset: usize,
+#[derive(Debug)]
+struct QueuedCopyChunk {
+    bytes: Bytes,
+    _permit: OwnedSemaphorePermit,
+    memory: Arc<StreamingCopyMemoryTracker>,
 }
 
-impl std::io::Read for CopyChunkReader {
+impl Drop for QueuedCopyChunk {
+    fn drop(&mut self) {
+        self.memory.release(self.bytes.len());
+    }
+}
+
+struct StreamingCopyChunkReader {
+    receiver: mpsc::Receiver<QueuedCopyChunk>,
+    current: Option<QueuedCopyChunk>,
+    current_offset: usize,
+}
+
+impl std::io::Read for StreamingCopyChunkReader {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
         if output.is_empty() {
             return Ok(0);
         }
         let mut written = 0;
         while written < output.len() {
-            let Some(chunk) = self.payload.chunks.get(self.chunk_index) else {
+            if self.current.is_none() {
+                self.current = self.receiver.blocking_recv();
+                self.current_offset = 0;
+            }
+            let Some(chunk) = self.current.as_ref() else {
                 break;
             };
-            if self.chunk_offset >= chunk.len() {
-                self.chunk_index += 1;
-                self.chunk_offset = 0;
+            if self.current_offset >= chunk.bytes.len() {
+                self.current = None;
                 continue;
             }
-            let available = &chunk[self.chunk_offset..];
+            let available = &chunk.bytes[self.current_offset..];
             let count = available.len().min(output.len() - written);
             output[written..written + count].copy_from_slice(&available[..count]);
-            self.chunk_offset += count;
+            self.current_offset += count;
             written += count;
         }
         Ok(written)
@@ -1463,23 +1542,30 @@ impl std::io::Read for CopyChunkReader {
 #[derive(Debug)]
 /// Keeps resident-memory accounting attached to the COPY payload as ownership
 /// moves from socket collection into the statement execution context.
-struct CopyStdinPayloadMemoryTracker {
-    tracked_bytes: usize,
+struct StreamingCopyMemoryTracker {
+    buffered_bytes: AtomicUsize,
     metrics: Arc<CopyStdinMetrics>,
 }
 
-impl CopyStdinPayloadMemoryTracker {
+impl StreamingCopyMemoryTracker {
     fn new(metrics: Arc<CopyStdinMetrics>) -> Self {
         Self {
-            tracked_bytes: 0,
+            buffered_bytes: AtomicUsize::new(0),
             metrics,
         }
     }
 
-    fn observe(&mut self, new_bytes: usize) {
+    fn retain(&self, bytes: usize) {
+        let previous = self.buffered_bytes.fetch_add(bytes, Ordering::Relaxed);
         self.metrics
-            .observe_buffer_bytes(self.tracked_bytes, new_bytes);
-        self.tracked_bytes = new_bytes;
+            .observe_buffer_bytes(previous, previous.saturating_add(bytes));
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.buffered_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        debug_assert!(previous >= bytes);
+        self.metrics
+            .observe_buffer_bytes(previous, previous.saturating_sub(bytes));
     }
 
     fn record_rejection(&self, reason: CopyStdinRejectReason) {
@@ -1487,56 +1573,77 @@ impl CopyStdinPayloadMemoryTracker {
     }
 }
 
-impl Drop for CopyStdinPayloadMemoryTracker {
+impl Drop for StreamingCopyMemoryTracker {
     fn drop(&mut self) {
-        self.metrics.finish_buffering(self.tracked_bytes);
+        self.metrics
+            .finish_buffering(self.buffered_bytes.swap(0, Ordering::Relaxed));
     }
 }
 
 impl FramedCopySourceBridge {
-    fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> Self {
-        Self {
-            chunks: Vec::new(),
-            retained_bytes: 0,
-            limit,
-            memory: CopyStdinPayloadMemoryTracker::new(metrics),
-        }
+    fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> (Self, Arc<StreamingCopyStdinSource>) {
+        let limit = limit.max(1).min(u32::MAX as usize);
+        let (sender, receiver) = mpsc::channel(COPY_STDIN_CHANNEL_CHUNKS);
+        let memory = Arc::new(StreamingCopyMemoryTracker::new(metrics));
+        (
+            Self {
+                sender,
+                permits: Arc::new(Semaphore::new(limit)),
+                limit,
+                memory,
+            },
+            Arc::new(StreamingCopyStdinSource {
+                receiver: Mutex::new(Some(receiver)),
+            }),
+        )
     }
 
-    async fn collect(
-        mut self,
+    async fn forward(
+        self,
         source: &mut dyn CopyProtocolSource,
         cancellation: StatementCancellation,
-    ) -> Result<BufferedCopyStdinPayload> {
+    ) -> Result<()> {
         while let Some(chunk) = source.next_chunk().await? {
             cancellation.check()?;
-            let new_len = self
-                .retained_bytes
-                .checked_add(chunk.len())
-                .ok_or_else(|| {
-                    self.memory
-                        .record_rejection(CopyStdinRejectReason::TotalLimit);
-                    paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
-                })?;
-            if new_len > self.limit {
+            if chunk.is_empty() {
+                continue;
+            }
+            if chunk.len() > self.limit {
                 self.memory
-                    .record_rejection(CopyStdinRejectReason::TotalLimit);
+                    .record_rejection(CopyStdinRejectReason::FrameLimit);
                 return Err(paro_error::configuration_limit_exceeded(
-                    "COPY FROM STDIN payload exceeds memory limit",
+                    "COPY FROM STDIN frame exceeds the streaming buffer waterline",
                 ));
             }
-            self.chunks.try_reserve(1).map_err(|_| {
-                paro_error::out_of_memory("COPY FROM STDIN chunk directory allocation failed")
-            })?;
-            self.chunks.push(chunk);
-            self.retained_bytes = new_len;
-            self.memory.observe(new_len);
+            let permits = u32::try_from(chunk.len())
+                .expect("COPY streaming buffer is bounded to u32 permits");
+            let permit = tokio::select! {
+                result = Arc::clone(&self.permits).acquire_many_owned(permits) => {
+                    result.map_err(|_| paro_error::internal("COPY FROM STDIN buffer was closed"))?
+                }
+                _ = cancellation.cancelled() => {
+                    cancellation.check()?;
+                    unreachable!("cancelled future completed without cancellation")
+                }
+            };
+            self.memory.retain(chunk.len());
+            let queued = QueuedCopyChunk {
+                bytes: chunk,
+                _permit: permit,
+                memory: Arc::clone(&self.memory),
+            };
+            tokio::select! {
+                result = self.sender.send(queued) => {
+                    result.map_err(|_| paro_error::query_canceled())?;
+                }
+                _ = cancellation.cancelled() => {
+                    cancellation.check()?;
+                    unreachable!("cancelled future completed without cancellation")
+                }
+            }
             cancellation.check()?;
         }
-        Ok(BufferedCopyStdinPayload {
-            chunks: self.chunks,
-            _memory: self.memory,
-        })
+        Ok(())
     }
 }
 
@@ -1607,61 +1714,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn copy_stdin_payload_metrics_span_collection_and_execution() {
+    async fn copy_stdin_stream_releases_accounting_as_chunks_are_consumed() {
         let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
         };
 
-        let payload = Arc::new(
-            FramedCopySourceBridge::new(16, metrics.clone())
-                .collect(
-                    &mut source,
-                    StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
-                )
-                .await
-                .unwrap(),
-        );
-        let mut reader = Arc::clone(&payload).open_reader();
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        let (bridge, payload) = FramedCopySourceBridge::new(16, metrics.clone());
+        let input = StatementInput::copy_from_stdin(payload.clone());
+        let reader_task = tokio::task::spawn_blocking(move || {
+            let mut reader = payload.open_reader().unwrap();
+            let mut bytes = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+            bytes
+        });
+        bridge
+            .forward(
+                &mut source,
+                StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+            )
+            .await
+            .unwrap();
+        let bytes = reader_task.await.unwrap();
         assert_eq!(bytes, b"12345");
-        drop(reader);
 
         let snapshot = metrics.snapshot();
-        assert_eq!(snapshot.current_buffer_bytes, 5);
-        assert_eq!(snapshot.peak_buffer_bytes, 5);
+        assert_eq!(snapshot.current_buffer_bytes, 0);
+        assert!(snapshot.peak_buffer_bytes <= 5);
         assert_eq!(snapshot.rejected_total, 0);
 
-        let input = StatementInput::copy_from_stdin(payload);
-        assert_eq!(metrics.snapshot().current_buffer_bytes, 5);
         drop(input);
         assert_eq!(metrics.snapshot().current_buffer_bytes, 0);
     }
 
     #[tokio::test]
-    async fn framed_copy_source_bridge_records_total_limit_rejections() {
+    async fn framed_copy_source_bridge_rejects_a_frame_larger_than_the_waterline() {
         let metrics = Arc::new(CopyStdinMetrics::default());
         let mut source = TestCopySource {
-            chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
+            chunks: vec![Bytes::from_static(b"12345")],
         };
 
-        let err = FramedCopySourceBridge::new(4, metrics.clone())
-            .collect(
+        let (bridge, payload) = FramedCopySourceBridge::new(4, metrics.clone());
+        let err = bridge
+            .forward(
                 &mut source,
                 StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
             )
             .await
-            .expect_err("payload should exceed limit");
+            .expect_err("frame should exceed waterline");
         assert!(err
             .message()
-            .contains("COPY FROM STDIN payload exceeds memory limit"));
+            .contains("COPY FROM STDIN frame exceeds the streaming buffer waterline"));
+        drop(payload);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.current_buffer_bytes, 0);
-        assert_eq!(snapshot.peak_buffer_bytes, 2);
+        assert_eq!(snapshot.peak_buffer_bytes, 0);
         assert_eq!(snapshot.rejected_total, 1);
-        assert_eq!(snapshot.rejected_total_limit, 1);
-        assert_eq!(snapshot.rejected_frame_limit, 0);
+        assert_eq!(snapshot.rejected_total_limit, 0);
+        assert_eq!(snapshot.rejected_frame_limit, 1);
     }
 }

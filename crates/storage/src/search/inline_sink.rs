@@ -16,7 +16,6 @@ use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::index::hnsw::HnswBuildExecutionPolicy;
 use crate::rowset::{ColumnData, RowsetId, RowsetSharedPtr};
 use crate::tablet::{ColumnId, TabletColumn};
 
@@ -125,7 +124,6 @@ impl fmt::Debug for SearchInlineBuilderEntry {
 pub struct SearchInlineBuilderSet {
     entries: Arc<[SearchInlineBuilderEntry]>,
     admission: Option<Arc<dyn SearchAdmission>>,
-    hnsw_build_execution: HnswBuildExecutionPolicy,
 }
 
 impl SearchInlineBuilderSet {
@@ -136,13 +134,7 @@ impl SearchInlineBuilderSet {
         Self {
             entries: entries.into_boxed_slice().into(),
             admission,
-            hnsw_build_execution: HnswBuildExecutionPolicy::serial(),
         }
-    }
-
-    pub fn with_hnsw_build_execution(mut self, execution: HnswBuildExecutionPolicy) -> Self {
-        self.hnsw_build_execution = execution;
-        self
     }
 
     pub fn empty() -> Self {
@@ -164,10 +156,6 @@ impl SearchInlineBuilderSet {
     pub fn admission(&self) -> Option<&Arc<dyn SearchAdmission>> {
         self.admission.as_ref()
     }
-
-    pub const fn hnsw_build_execution(&self) -> HnswBuildExecutionPolicy {
-        self.hnsw_build_execution
-    }
 }
 
 impl Default for SearchInlineBuilderSet {
@@ -181,7 +169,6 @@ impl fmt::Debug for SearchInlineBuilderSet {
         f.debug_struct("SearchInlineBuilderSet")
             .field("entries", &self.entries)
             .field("has_admission", &self.admission.is_some())
-            .field("hnsw_build_execution", &self.hnsw_build_execution)
             .finish()
     }
 }
@@ -654,6 +641,8 @@ mod tests {
                 "plain_scan_threshold": 10_000,
                 "filtered_plain_scan_threshold": 0,
                 "build_seed": 1,
+                "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
                 "inline_threshold": {
                     "enabled": true,
                     "max_vector_count": 128,

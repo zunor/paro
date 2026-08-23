@@ -5,6 +5,7 @@ use crate::compaction::plan::types::{CompactionReason, CumulativePointAction, Po
 use crate::rowset::RowsetSharedPtr;
 use crate::tablet::Tablet;
 use paro_common::error::Result;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CompactionDecision {
@@ -140,13 +141,13 @@ impl CompactionPolicy for SizeTieredCompactionPolicy {
 }
 
 pub struct BaseCompactionPolicy {
-    _min_interval_seconds: u64,
+    min_interval_seconds: u64,
 }
 
 impl BaseCompactionPolicy {
     pub fn new() -> Self {
         Self {
-            _min_interval_seconds: 86400,
+            min_interval_seconds: 86400,
         }
     }
 }
@@ -188,6 +189,20 @@ impl CompactionPolicy for BaseCompactionPolicy {
         }
 
         if candidates.len() > 1 {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_secs());
+            let newest_compaction_output = candidates
+                .iter()
+                .map(|rowset| rowset.rowset_meta())
+                .filter(|meta| meta.is_compaction_output())
+                .map(|meta| meta.creation_time().max(0) as u64)
+                .max();
+            if newest_compaction_output
+                .is_some_and(|created| now.saturating_sub(created) < self.min_interval_seconds)
+            {
+                return Ok(Vec::new());
+            }
             Ok(candidates)
         } else {
             Ok(Vec::new())
@@ -203,9 +218,9 @@ pub struct CumulativeCompactionPolicy {
 impl CumulativeCompactionPolicy {
     pub fn new() -> Self {
         Self {
-            // Cumulative compaction is a merge policy. Two rowsets are enough
-            // to form useful work; a single rowset must never self-rewrite
-            // merely because its priority score is high.
+            // Two contiguous deltas are useful merge work. Base compaction is
+            // independently rate-limited, so advancing the cumulative point
+            // here cannot trigger an unbounded full-base rewrite loop.
             min_delta_rowsets: 2,
             max_delta_rowsets: 1000,
         }
@@ -241,21 +256,28 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
 
         let cumulative_point = tablet.cumulative_point();
         let mut candidates = Vec::new();
+        // -1 is the durable sentinel used before the first cumulative
+        // compaction. Data versions themselves start at zero.
+        let mut expected_start = cumulative_point.max(0);
 
         for rs in rowsets {
-            if rs.start_version() < cumulative_point {
+            if rs.end_version() < cumulative_point {
                 continue;
             }
-            if rs.rowset_meta().num_deleted_rows() > 0 {
-                if !candidates.is_empty() {
-                    break;
-                }
-                continue;
+            // A compaction output is a contiguous version interval. Never skip
+            // a delete-bearing or otherwise inconvenient rowset and then move
+            // the cumulative point beyond the resulting hole.
+            if rs.start_version() != expected_start {
+                break;
             }
             if candidates.len() >= self.max_delta_rowsets {
                 break;
             }
 
+            expected_start = match rs.end_version().checked_add(1) {
+                Some(next) => next,
+                None => break,
+            };
             candidates.push(rs);
         }
 
@@ -267,5 +289,89 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
         } else {
             Ok(Vec::new())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::types::LogicalType;
+
+    use super::*;
+    use crate::rowset::{Rowset, RowsetMeta};
+    use crate::tablet::{KeysType, TabletColumn, TabletSchema, Version};
+
+    fn test_tablet() -> (tempfile::TempDir, Tablet) {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(
+            TabletSchema::new(
+                1,
+                vec![TabletColumn::key(0, "id", LogicalType::BigInt)],
+                KeysType::PrimaryKeys,
+            )
+            .unwrap(),
+        );
+        let tablet = Tablet::new(1, 1, 0, schema, temp.path(), None).unwrap();
+        (temp, tablet)
+    }
+
+    fn add_rowset(tablet: &Tablet, id: u64, version: i64, deleted_rows: u64) {
+        let mut meta = RowsetMeta::new(id, tablet.tablet_id(), Version::singleton(version));
+        if deleted_rows > 0 {
+            meta.set_delete_info(1, deleted_rows);
+        }
+        let rowset = Rowset::create(
+            tablet.schema().expect("test tablet schema"),
+            meta,
+            tablet.data_dir().join(format!("rowset-{id}")),
+        )
+        .unwrap();
+        tablet.add_rowset(Arc::new(rowset)).unwrap();
+    }
+
+    #[test]
+    fn cumulative_policy_normalizes_initial_sentinel_and_keeps_delete_versions() {
+        let (_temp, tablet) = test_tablet();
+        assert_eq!(tablet.cumulative_point(), -1);
+        for version in 0..5 {
+            add_rowset(&tablet, version as u64 + 1, version, (version == 2) as u64);
+        }
+
+        let selected = CumulativeCompactionPolicy::new()
+            .pick_rowsets(&tablet)
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|rowset| rowset.start_version())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2, 3, 4]
+        );
+        assert_eq!(selected[2].rowset_meta().num_deleted_rows(), 1);
+    }
+
+    #[test]
+    fn fresh_base_compaction_output_is_rate_limited() {
+        let (_temp, tablet) = test_tablet();
+        add_rowset(&tablet, 1, 0, 0);
+        let mut recent = RowsetMeta::new(2, tablet.tablet_id(), Version::singleton(1));
+        recent.set_compaction_output(vec![10, 11]);
+        tablet
+            .add_rowset(Arc::new(
+                Rowset::create(
+                    tablet.schema().expect("test tablet schema"),
+                    recent,
+                    tablet.data_dir().join("recent-output"),
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        tablet.set_cumulative_point(2);
+
+        assert!(BaseCompactionPolicy::new()
+            .pick_rowsets(&tablet)
+            .unwrap()
+            .is_empty());
     }
 }

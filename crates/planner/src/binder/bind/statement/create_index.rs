@@ -19,7 +19,8 @@ use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
     DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD,
-    DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
+    DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+    DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -305,6 +306,8 @@ fn hnsw_provider_config(
         "ef_search",
         "distance",
         "build_seed",
+        "proposal_wave_size",
+        "warmup_point_count",
         "plain_scan_threshold",
         "filtered_plain_scan_threshold",
         "inline_enabled",
@@ -352,6 +355,16 @@ fn hnsw_provider_config(
         ))
     })?;
     let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
+    let proposal_wave_size = parse_u64_index_option(
+        options,
+        "proposal_wave_size",
+        u64::from(DEFAULT_HNSW_PROPOSAL_WAVE_SIZE),
+    )?;
+    let warmup_point_count = parse_u64_index_option(
+        options,
+        "warmup_point_count",
+        u64::from(DEFAULT_HNSW_WARMUP_POINT_COUNT),
+    )?;
 
     let plain_scan_threshold = parse_u64_index_option(
         options,
@@ -428,6 +441,10 @@ fn hnsw_provider_config(
         filtered_plain_scan_threshold: u32::try_from(filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
         build_seed,
+        proposal_wave_size: u32::try_from(proposal_wave_size)
+            .map_err(|_| paro_error::out_of_range("HNSW proposal_wave_size"))?,
+        warmup_point_count: u32::try_from(warmup_point_count)
+            .map_err(|_| paro_error::out_of_range("HNSW warmup_point_count"))?,
         inline_threshold: HnswInlineConfig {
             enabled: inline_enabled,
             max_vector_count: inline_max_vector_count,

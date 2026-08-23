@@ -13,6 +13,7 @@ use serde_json::Value;
 pub use crate::index::hnsw::types::{
     DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
     DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
+    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use crate::index::hnsw::{DistanceMetric, HnswBuildContract, HnswSearchPolicy};
 use paro_common::error::{self as paro_error, Result};
@@ -21,9 +22,8 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 2 selects the frozen-wave HNSW build contract. Provider versions
-/// are intentionally not accepted across topology algorithm changes.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 2;
+/// Version 3 makes proposal-wave and warm-up topology parameters explicit.
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +48,8 @@ pub struct HnswProviderConfig {
     pub plain_scan_threshold: u32,
     pub filtered_plain_scan_threshold: u32,
     pub build_seed: u64,
+    pub proposal_wave_size: u32,
+    pub warmup_point_count: u32,
     pub inline_threshold: HnswInlineConfig,
 }
 
@@ -87,6 +89,18 @@ impl HnswProviderConfig {
             return Err(paro_error::invalid_input(format!(
                 "HNSW ef_construct must be between m ({}) and 1000000, got {}",
                 self.m, self.ef_construct
+            )));
+        }
+        if !(1..=4_096).contains(&self.proposal_wave_size) {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW proposal_wave_size must be between 1 and 4096, got {}",
+                self.proposal_wave_size
+            )));
+        }
+        if self.warmup_point_count > 1_000_000_000 {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW warmup_point_count exceeds 1000000000, got {}",
+                self.warmup_point_count
             )));
         }
         if self.ef_search == 0 || self.ef_search > 1_000_000 {
@@ -134,6 +148,8 @@ impl HnswProviderConfig {
             ef_construct: self.ef_construct,
             distance: self.distance,
             build_seed: self.build_seed,
+            proposal_wave_size: self.proposal_wave_size,
+            warmup_point_count: self.warmup_point_count,
         }
     }
 
@@ -175,6 +191,8 @@ mod tests {
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
+            proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
             inline_threshold: HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,

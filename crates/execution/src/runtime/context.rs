@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, LockResult, Mutex, MutexGuard, WaitTimeoutResult};
 use std::time::Duration;
 
 use paro_catalog::mvcc::CatalogSnapshot;
@@ -384,7 +384,7 @@ impl QueryOutputPort {
                 stats: Mutex::new(QueryOutputPortStats::default()),
                 generation: AtomicU64::new(0),
                 closed: AtomicBool::new(false),
-                cv: Condvar::new(),
+                cv: OutputChangeNotifier::new(),
             }),
         }
     }
@@ -764,6 +764,20 @@ impl QueryOutputPort {
             .expect("query output port condvar poisoned");
     }
 
+    pub async fn wait_for_change(&self) {
+        if !self
+            .inner
+            .chunks
+            .lock()
+            .expect("query output port lock poisoned")
+            .is_empty()
+            || self.is_closed()
+        {
+            return;
+        }
+        self.inner.cv.notified().await;
+    }
+
     pub fn capacity(&self) -> usize {
         self.inner.capacity
     }
@@ -834,7 +848,45 @@ struct QueryOutputPortInner {
     stats: Mutex<QueryOutputPortStats>,
     generation: AtomicU64,
     closed: AtomicBool,
-    cv: Condvar,
+    cv: OutputChangeNotifier,
+}
+
+#[derive(Debug)]
+struct OutputChangeNotifier {
+    blocking: Condvar,
+    asynchronous: tokio::sync::Notify,
+}
+
+impl OutputChangeNotifier {
+    fn new() -> Self {
+        Self {
+            blocking: Condvar::new(),
+            asynchronous: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn notify_all(&self) {
+        self.blocking.notify_all();
+        // There is one async front-end consumer. `notify_one` retains a permit
+        // if publication races with registration, avoiding a lost wakeup.
+        self.asynchronous.notify_one();
+    }
+
+    fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
+        self.blocking.wait(guard)
+    }
+
+    fn wait_timeout<'a, T>(
+        &self,
+        guard: MutexGuard<'a, T>,
+        timeout: Duration,
+    ) -> LockResult<(MutexGuard<'a, T>, WaitTimeoutResult)> {
+        self.blocking.wait_timeout(guard, timeout)
+    }
+
+    async fn notified(&self) {
+        self.asynchronous.notified().await;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1191,6 +1243,24 @@ mod tests {
         let closed_generation = port.wake_generation();
         port.close();
         assert_eq!(port.wake_generation(), closed_generation);
+    }
+
+    #[tokio::test]
+    async fn async_output_waiter_observes_publication_without_lost_wakeup() {
+        let port = QueryOutputPort::bounded(1);
+        let waiter = port.clone();
+        let task = tokio::spawn(async move {
+            waiter.wait_for_change().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(matches!(
+            port.try_push(paro_common::test_utils::test_chunk(&[])),
+            QueryOutputWrite::Written
+        ));
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("async output waiter must be notified")
+            .unwrap();
     }
 
     #[test]

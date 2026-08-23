@@ -55,11 +55,9 @@ pub use table::{
 };
 
 pub mod copy;
-pub mod pg_binary;
-
 pub use copy::{
-    CopyFormat, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
-    CopyToLocalState, ForceQuoteOption,
+    CopyFormat, CopyFromFunction, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToFunction,
+    CopyToGlobalState, CopyToLocalState, ForceQuoteOption,
 };
 
 // Re-export log-storage registration APIs for system table functions.

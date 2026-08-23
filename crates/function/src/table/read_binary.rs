@@ -10,10 +10,10 @@ use std::sync::Mutex;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
-use paro_common::vector::{ArrayVector, VECTOR_SIZE};
+use paro_common::vector::{ArrayVector, Vector, VECTOR_SIZE};
 
 use crate::copy::CopyFromSource;
-use crate::pg_binary::{decode_binary_value, is_binary_recv_supported, BinaryInput};
+use paro_common::pg_binary::{decode_binary_value, is_binary_recv_supported, BinaryInput};
 
 use super::{
     GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
@@ -23,11 +23,99 @@ use super::{
 const BINARY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 const BINARY_HEADER_LEN: usize = 19;
 const OIDS_FLAG: u32 = 1 << 16;
+const MAX_BINARY_COPY_FIELD_BYTES: usize = 64 * 1024 * 1024;
+const TARGET_BINARY_COPY_BATCH_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ReadBinaryBindData {
     source: CopyFromSource,
     types: Vec<LogicalType>,
+    decoders: Vec<BinaryColumnDecoder>,
+}
+
+#[derive(Debug, Clone)]
+enum BinaryColumnDecoder {
+    Direct {
+        expected_width: usize,
+        decode_batch: BinaryBatchDecoder,
+    },
+    FloatArray {
+        dimension: usize,
+    },
+    Generic {
+        ty: LogicalType,
+        expected_width: Option<usize>,
+    },
+}
+
+type BinaryBatchDecoder =
+    fn(&[u8], &[Option<(usize, usize)>], usize, usize, &mut Vector, usize) -> Result<()>;
+
+impl BinaryColumnDecoder {
+    fn bind(ty: &LogicalType) -> Self {
+        match ty {
+            LogicalType::Boolean => Self::direct(1, decode_boolean_batch),
+            LogicalType::TinyInt => Self::direct(2, decode_tinyint_batch),
+            LogicalType::UTinyInt => Self::direct(2, decode_utinyint_batch),
+            LogicalType::SmallInt => Self::direct(2, decode_smallint_batch),
+            LogicalType::Integer => Self::direct(4, decode_integer_batch),
+            LogicalType::USmallInt => Self::direct(4, decode_usmallint_batch),
+            LogicalType::BigInt => Self::direct(8, decode_bigint_batch),
+            LogicalType::UInteger => Self::direct(8, decode_uinteger_batch),
+            LogicalType::Float => Self::direct(4, decode_float_batch),
+            LogicalType::Double => Self::direct(8, decode_double_batch),
+            LogicalType::Uuid => Self::direct(16, decode_uuid_batch),
+            LogicalType::Date => Self::generic(ty, Some(4)),
+            LogicalType::Timestamp | LogicalType::TimestampTz => Self::generic(ty, Some(8)),
+            LogicalType::Array(child, dimension) if matches!(**child, LogicalType::Float) => {
+                Self::FloatArray {
+                    dimension: *dimension,
+                }
+            }
+            other => Self::generic(other, None),
+        }
+    }
+
+    const fn direct(expected_width: usize, decode_batch: BinaryBatchDecoder) -> Self {
+        Self::Direct {
+            expected_width,
+            decode_batch,
+        }
+    }
+
+    fn generic(ty: &LogicalType, expected_width: Option<usize>) -> Self {
+        Self::Generic {
+            ty: ty.clone(),
+            expected_width,
+        }
+    }
+
+    fn expected_fixed_width(&self) -> Option<usize> {
+        match self {
+            Self::Direct { expected_width, .. } => Some(*expected_width),
+            Self::FloatArray { dimension } => dimension
+                .checked_mul(8)
+                .and_then(|payload| payload.checked_add(20)),
+            Self::Generic { expected_width, .. } => *expected_width,
+        }
+    }
+
+    fn validate_field_len(&self, len: usize, row: usize, column: usize) -> Result<()> {
+        if let Some(expected) = self.expected_fixed_width() {
+            if len != expected {
+                return Err(paro_error::protocol_violation(format!(
+                    "binary COPY row {row} column {column} expected {expected} bytes, got {len}",
+                )));
+            }
+            return Ok(());
+        }
+        if len > MAX_BINARY_COPY_FIELD_BYTES {
+            return Err(paro_error::configuration_limit_exceeded(format!(
+                "binary COPY row {row} column {column} exceeds the {MAX_BINARY_COPY_FIELD_BYTES}-byte field limit",
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl TableFunctionBindData for ReadBinaryBindData {
@@ -96,7 +184,12 @@ impl BinaryCopyReader {
 
     fn read_i16_or_eof(&mut self) -> Result<Option<i16>> {
         let mut bytes = [0_u8; 2];
-        let first = self.input.read(&mut bytes[..1]).map_err(paro_error::io)?;
+        let first = loop {
+            match self.input.read(&mut bytes[..1]) {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result.map_err(paro_error::io)?,
+            }
+        };
         if first == 0 {
             return Ok(None);
         }
@@ -112,7 +205,13 @@ impl BinaryCopyReader {
 
     fn reject_trailing_data(&mut self) -> Result<()> {
         let mut byte = [0_u8; 1];
-        if self.input.read(&mut byte).map_err(paro_error::io)? != 0 {
+        let read = loop {
+            match self.input.read(&mut byte) {
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                result => break result.map_err(paro_error::io)?,
+            }
+        };
+        if read != 0 {
             return Err(paro_error::protocol_violation(
                 "binary COPY contains data after its EOF marker",
             ));
@@ -141,7 +240,9 @@ impl GlobalTableFunctionState for ReadBinaryGlobalState {
 
 #[derive(Default)]
 struct ReadBinaryLocalState {
-    field_buffer: Vec<u8>,
+    batch_bytes: Vec<u8>,
+    /// Flattened row-major `(start, end)` ranges. `None` represents SQL NULL.
+    field_ranges: Vec<Option<(usize, usize)>>,
 }
 
 impl LocalTableFunctionState for ReadBinaryLocalState {
@@ -172,6 +273,7 @@ pub fn bind_copy_from(
     Ok(Box::new(ReadBinaryBindData {
         source,
         types: types.to_vec(),
+        decoders: types.iter().map(BinaryColumnDecoder::bind).collect(),
     }))
 }
 
@@ -190,7 +292,7 @@ fn read_binary_init_global(
         .and_then(|data| data.as_any().downcast_ref::<ReadBinaryBindData>())
         .ok_or_else(|| paro_error::internal("invalid read_binary bind data"))?;
     let reader: Box<dyn Read + Send> = match &bind_data.source {
-        CopyFromSource::Stdin => input.copy_stdin_source()?.open_reader(),
+        CopyFromSource::Stdin => input.copy_stdin_source()?.open_reader()?,
         CopyFromSource::File(path) => Box::new(BufReader::new(std::fs::File::open(path).map_err(
             |err| paro_error::io_error(format!("open binary COPY file '{path}': {err}")),
         )?)),
@@ -234,6 +336,12 @@ fn read_binary_function(
     }
 
     let capacity = output.capacity().min(VECTOR_SIZE);
+    local.batch_bytes.clear();
+    local.field_ranges.clear();
+    local
+        .field_ranges
+        .try_reserve(capacity.saturating_mul(bind_data.decoders.len()))
+        .map_err(|_| paro_error::out_of_memory("binary COPY field directory allocation failed"))?;
     let mut produced = 0;
     while produced < capacity {
         let Some(field_count) = reader.read_i16_or_eof()? else {
@@ -254,13 +362,10 @@ fn read_binary_function(
             )));
         }
 
-        for (column_idx, ty) in bind_data.types.iter().enumerate() {
+        for (column_idx, decoder) in bind_data.decoders.iter().enumerate() {
             let field_len = reader.read_i32("field length")?;
-            let column = output
-                .column_mut(column_idx)
-                .ok_or_else(|| paro_error::internal("binary COPY output column missing"))?;
             if field_len == -1 {
-                column.set_null(produced, true);
+                local.field_ranges.push(None);
                 continue;
             }
             let field_len = usize::try_from(field_len).map_err(|_| {
@@ -270,14 +375,26 @@ fn read_binary_function(
                     column_idx + 1,
                 ))
             })?;
-            local.field_buffer.resize(field_len, 0);
-            reader.read_exact_into(&mut local.field_buffer, "field payload")?;
-            decode_field_into_column(&local.field_buffer, ty, column, produced)?;
+            decoder.validate_field_len(field_len, reader.row_number + 1, column_idx + 1)?;
+            let start = local.batch_bytes.len();
+            let end = start.checked_add(field_len).ok_or_else(|| {
+                paro_error::configuration_limit_exceeded("binary COPY batch byte size overflow")
+            })?;
+            local.batch_bytes.try_reserve(field_len).map_err(|_| {
+                paro_error::out_of_memory("binary COPY field payload allocation failed")
+            })?;
+            local.batch_bytes.resize(end, 0);
+            reader.read_exact_into(&mut local.batch_bytes[start..end], "field payload")?;
+            local.field_ranges.push(Some((start, end)));
         }
         reader.row_number += 1;
         produced += 1;
+        if local.batch_bytes.len() >= TARGET_BINARY_COPY_BATCH_BYTES {
+            break;
+        }
     }
 
+    decode_binary_batch(bind_data, local, output, produced)?;
     output.set_cardinality(produced);
     if reader.finished {
         Ok(TableFunctionResult::Finished)
@@ -286,28 +403,215 @@ fn read_binary_function(
     }
 }
 
-fn decode_field_into_column(
-    bytes: &[u8],
-    ty: &LogicalType,
-    column: &mut paro_common::vector::Vector,
-    row: usize,
+fn decode_binary_batch(
+    bind_data: &ReadBinaryBindData,
+    local: &ReadBinaryLocalState,
+    output: &mut Chunk,
+    row_count: usize,
 ) -> Result<()> {
-    if let LogicalType::Array(child, dimension) = ty {
-        if matches!(child.as_ref(), LogicalType::Float) {
-            return decode_float_array_into_column(bytes, column, row, *dimension);
+    let column_count = bind_data.decoders.len();
+    for (column_idx, decoder) in bind_data.decoders.iter().enumerate() {
+        let column = output
+            .column_mut(column_idx)
+            .ok_or_else(|| paro_error::internal("binary COPY output column missing"))?;
+        match decoder {
+            BinaryColumnDecoder::Direct { decode_batch, .. } => decode_batch(
+                &local.batch_bytes,
+                &local.field_ranges,
+                column_count,
+                column_idx,
+                column,
+                row_count,
+            )?,
+            BinaryColumnDecoder::FloatArray { dimension } => decode_float_array_batch(
+                &local.batch_bytes,
+                &local.field_ranges,
+                column_count,
+                column_idx,
+                column,
+                row_count,
+                *dimension,
+            )?,
+            BinaryColumnDecoder::Generic { ty, .. } => decode_generic_batch(
+                &local.batch_bytes,
+                &local.field_ranges,
+                column_count,
+                column_idx,
+                column,
+                row_count,
+                ty,
+            )?,
         }
     }
-    let value = decode_binary_value(bytes, ty)?;
-    column.set_value(row, &value);
     Ok(())
 }
 
-fn decode_float_array_into_column(
-    bytes: &[u8],
+fn mark_binary_nulls(
+    field_ranges: &[Option<(usize, usize)>],
+    column_count: usize,
+    column_idx: usize,
+    column: &mut Vector,
+    row_count: usize,
+) {
+    for row in 0..row_count {
+        column.set_null(row, field_ranges[row * column_count + column_idx].is_none());
+    }
+}
+
+fn for_each_binary_field(
+    batch_bytes: &[u8],
+    field_ranges: &[Option<(usize, usize)>],
+    column_count: usize,
+    column_idx: usize,
+    row_count: usize,
+    mut decode: impl FnMut(&[u8], usize) -> Result<()>,
+) -> Result<()> {
+    for row in 0..row_count {
+        if let Some((start, end)) = field_ranges[row * column_count + column_idx] {
+            decode(&batch_bytes[start..end], row)?;
+        }
+    }
+    Ok(())
+}
+
+fn decode_direct_batch<T: Copy + 'static>(
+    batch_bytes: &[u8],
+    field_ranges: &[Option<(usize, usize)>],
+    column_count: usize,
+    column_idx: usize,
+    column: &mut Vector,
+    row_count: usize,
+    mut decode: impl FnMut(&[u8]) -> Result<T>,
+) -> Result<()> {
+    mark_binary_nulls(field_ranges, column_count, column_idx, column, row_count);
+    let values = column.as_mut_slice::<T>();
+    for_each_binary_field(
+        batch_bytes,
+        field_ranges,
+        column_count,
+        column_idx,
+        row_count,
+        |bytes, row| {
+            values[row] = decode(bytes)?;
+            Ok(())
+        },
+    )
+}
+
+macro_rules! fixed_binary_batch_decoder {
+    ($name:ident, $ty:ty, $decode:expr) => {
+        fn $name(
+            batch_bytes: &[u8],
+            field_ranges: &[Option<(usize, usize)>],
+            column_count: usize,
+            column_idx: usize,
+            column: &mut Vector,
+            row_count: usize,
+        ) -> Result<()> {
+            decode_direct_batch(
+                batch_bytes,
+                field_ranges,
+                column_count,
+                column_idx,
+                column,
+                row_count,
+                $decode,
+            )
+        }
+    };
+}
+
+fixed_binary_batch_decoder!(decode_boolean_batch, bool, |bytes: &[u8]| Ok(bytes[0] != 0));
+fixed_binary_batch_decoder!(decode_smallint_batch, i16, |bytes: &[u8]| Ok(
+    i16::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_integer_batch, i32, |bytes: &[u8]| Ok(
+    i32::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_bigint_batch, i64, |bytes: &[u8]| Ok(
+    i64::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_float_batch, f32, |bytes: &[u8]| Ok(
+    f32::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_double_batch, f64, |bytes: &[u8]| Ok(
+    f64::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_uuid_batch, u128, |bytes: &[u8]| Ok(
+    u128::from_be_bytes(bytes.try_into().expect("validated width"))
+));
+fixed_binary_batch_decoder!(decode_tinyint_batch, i8, |bytes: &[u8]| {
+    let value = i16::from_be_bytes(bytes.try_into().expect("validated width"));
+    i8::try_from(value).map_err(|_| paro_error::invalid_value("tinyint", value.to_string()))
+});
+fixed_binary_batch_decoder!(decode_utinyint_batch, u8, |bytes: &[u8]| {
+    let value = i16::from_be_bytes(bytes.try_into().expect("validated width"));
+    u8::try_from(value).map_err(|_| paro_error::invalid_value("utinyint", value.to_string()))
+});
+fixed_binary_batch_decoder!(decode_usmallint_batch, u16, |bytes: &[u8]| {
+    let value = i32::from_be_bytes(bytes.try_into().expect("validated width"));
+    u16::try_from(value).map_err(|_| paro_error::invalid_value("usmallint", value.to_string()))
+});
+fixed_binary_batch_decoder!(decode_uinteger_batch, u32, |bytes: &[u8]| {
+    let value = i64::from_be_bytes(bytes.try_into().expect("validated width"));
+    u32::try_from(value).map_err(|_| paro_error::invalid_value("uinteger", value.to_string()))
+});
+
+#[allow(clippy::too_many_arguments)]
+fn decode_generic_batch(
+    batch_bytes: &[u8],
+    field_ranges: &[Option<(usize, usize)>],
+    column_count: usize,
+    column_idx: usize,
+    column: &mut Vector,
+    row_count: usize,
+    ty: &LogicalType,
+) -> Result<()> {
+    mark_binary_nulls(field_ranges, column_count, column_idx, column, row_count);
+    for_each_binary_field(
+        batch_bytes,
+        field_ranges,
+        column_count,
+        column_idx,
+        row_count,
+        |bytes, row| {
+            column.set_value(row, &decode_binary_value(bytes, ty)?);
+            Ok(())
+        },
+    )
+}
+
+fn decode_float_array_batch(
+    batch_bytes: &[u8],
+    field_ranges: &[Option<(usize, usize)>],
+    column_count: usize,
+    column_idx: usize,
     column: &mut paro_common::vector::Vector,
-    row: usize,
+    row_count: usize,
     dimension: usize,
 ) -> Result<()> {
+    mark_binary_nulls(field_ranges, column_count, column_idx, column, row_count);
+    let child = ArrayVector::get_entry_mut(column);
+    let child_values = child.as_mut_slice::<f32>();
+    for row in 0..row_count {
+        let Some((start, end)) = field_ranges[row * column_count + column_idx] else {
+            continue;
+        };
+        let child_start = row
+            .checked_mul(dimension)
+            .ok_or_else(|| paro_error::protocol_violation("VECTOR child offset overflow"))?;
+        let child_end = child_start
+            .checked_add(dimension)
+            .ok_or_else(|| paro_error::protocol_violation("VECTOR child offset overflow"))?;
+        let target = child_values
+            .get_mut(child_start..child_end)
+            .ok_or_else(|| paro_error::internal("VECTOR output child capacity is too small"))?;
+        decode_float_array_into_slice(&batch_bytes[start..end], target, dimension)?;
+    }
+    Ok(())
+}
+
+fn decode_float_array_into_slice(bytes: &[u8], target: &mut [f32], dimension: usize) -> Result<()> {
     let mut input = BinaryInput::new(bytes);
     let dimensions = input.read_i32("array dimension count")?;
     let has_null = input.read_i32("array null flag")?;
@@ -333,18 +637,6 @@ fn decode_float_array_into_column(
         ));
     }
 
-    column.set_null(row, false);
-    let child = ArrayVector::get_entry_mut(column);
-    let start = row
-        .checked_mul(dimension)
-        .ok_or_else(|| paro_error::protocol_violation("VECTOR child offset overflow"))?;
-    let end = start
-        .checked_add(dimension)
-        .ok_or_else(|| paro_error::protocol_violation("VECTOR child offset overflow"))?;
-    let target = child
-        .as_mut_slice::<f32>()
-        .get_mut(start..end)
-        .ok_or_else(|| paro_error::internal("VECTOR output child capacity is too small"))?;
     for value in target {
         let element_len = input.read_i32("array element length")?;
         if element_len != 4 {
@@ -401,20 +693,21 @@ mod tests {
         let vector_len = reader.read_i32("vector length").unwrap() as usize;
         let mut vector = vec![0_u8; vector_len];
         reader.read_exact_into(&mut vector, "vector").unwrap();
-        let allocator = std::sync::Arc::new(paro_common::allocator::default_allocator());
-        let mut column = paro_common::vector::Vector::try_new_array(
-            LogicalType::Array(Box::new(LogicalType::Float), 3),
-            1,
-            allocator,
-        )
-        .unwrap();
-        column.set_count(1);
-        decode_float_array_into_column(&vector, &mut column, 0, 3).unwrap();
-        assert_eq!(
-            ArrayVector::get_entry(&column).as_slice::<f32>()[..3],
-            [1.0, 2.0, 3.0]
-        );
+        let mut target = [0.0_f32; 3];
+        decode_float_array_into_slice(&vector, &mut target, 3).unwrap();
+        assert_eq!(target, [1.0, 2.0, 3.0]);
         assert_eq!(reader.read_i16_or_eof().unwrap(), Some(-1));
         reader.reject_trailing_data().unwrap();
+    }
+
+    #[test]
+    fn binary_copy_rejects_unbounded_variable_field_before_allocation() {
+        let decoder = BinaryColumnDecoder::generic(&LogicalType::Varchar, None);
+        let error = decoder
+            .validate_field_len(MAX_BINARY_COPY_FIELD_BYTES + 1, 7, 3)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("exceeds the 67108864-byte field limit"));
     }
 }

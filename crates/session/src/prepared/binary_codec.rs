@@ -9,7 +9,7 @@ const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
 pub fn is_binary_recv_supported(ty: &LogicalType) -> bool {
-    paro_function::pg_binary::is_binary_recv_supported(ty)
+    paro_common::pg_binary::is_binary_recv_supported(ty)
 }
 
 pub fn is_binary_send_supported(ty: &LogicalType) -> bool {
@@ -37,7 +37,7 @@ pub fn is_binary_send_supported(ty: &LogicalType) -> bool {
 }
 
 pub fn decode_binary_param(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
-    paro_function::pg_binary::decode_binary_value(bytes, ty)
+    paro_common::pg_binary::decode_binary_value(bytes, ty)
 }
 
 pub fn encode_binary_value(value: &Value, ty: &LogicalType) -> Result<Vec<u8>> {

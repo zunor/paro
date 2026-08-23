@@ -377,7 +377,7 @@ mod tests {
             builder.set_levels(idx as u32, level);
         }
         for i in 0..vectors.len() {
-            builder.link_new_point(i as u32, storage.as_ref(), distance);
+            builder.insert_single_point(i as u32, storage.as_ref(), distance);
         }
         let (links, entry_points) = builder.into_graph_data();
         let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());

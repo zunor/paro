@@ -37,9 +37,9 @@ use super::segment::{
 use crate::metrics::{storage_metrics, SearchInlineBuildMetricKey};
 use crate::search::{
     AdmissionDecision, AdmissionGrant, FlushSearchMode, HnswInlineBuildEstimate,
-    InlineAdmissionRequest, InlineArtifactBuildResult, MaintenanceCost, SearchAdmission,
-    SearchIndexKind, SearchInlineBuilderEntry, SearchInlineBuilderSet, SegmentChunkInput,
-    SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint,
+    HnswInlineThreshold, InlineAdmissionRequest, InlineArtifactBuildResult, MaintenanceCost,
+    SearchAdmission, SearchIndexKind, SearchInlineBuilderEntry, SearchInlineBuilderSet,
+    SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint,
 };
 use crate::tablet::{ColumnId, TabletSchemaRef, Version};
 use paro_common::error::{self as paro_error, Result};
@@ -342,7 +342,6 @@ fn chunk_row_count(columns: &[ColumnData]) -> u64 {
 
 fn split_hnsw_segment_admissions<'a>(
     admitted: Vec<AdmittedInlineSink<'a>>,
-    execution: crate::index::hnsw::HnswBuildExecutionPolicy,
 ) -> Result<(
     Vec<AdmittedInlineSink<'a>>,
     Vec<AdmissionLease>,
@@ -367,8 +366,7 @@ fn split_hnsw_segment_admissions<'a>(
                         .unwrap_or(limit),
                 );
             }
-            let (column_id, options) =
-                hnsw_column_build_options(&admitted_sink.entry.definition, execution)?;
+            let (column_id, options) = hnsw_column_build_options(&admitted_sink.entry.definition)?;
             if hnsw_indexes.insert(column_id, options).is_some() {
                 return Err(paro_error::invalid_input(format!(
                     "multiple active HNSW definitions target column {column_id}"
@@ -408,7 +406,6 @@ fn split_hnsw_segment_admissions<'a>(
 
 fn hnsw_column_build_options(
     definition: &crate::search::SearchIndexDefinition,
-    execution: crate::index::hnsw::HnswBuildExecutionPolicy,
 ) -> Result<(ColumnId, HnswColumnBuildOptions)> {
     let [column_id] = definition.column_ids.as_slice() else {
         return Err(paro_error::invalid_input(
@@ -420,7 +417,6 @@ fn hnsw_column_build_options(
         *column_id,
         HnswColumnBuildOptions {
             build_contract: provider.build_contract(),
-            execution,
         },
     ))
 }
@@ -756,6 +752,39 @@ impl RowsetWriter {
             })
     }
 
+    /// Conservative peak for sealing the active segment, including immutable
+    /// source batches and admitted HNSW construction state. Build-time graph
+    /// memory is transient, but must be visible before a flush starts rather
+    /// than discovered after the allocator has already committed it.
+    pub fn estimated_peak_memory_bytes(&self) -> u64 {
+        let retained_input = self.retained_input_bytes();
+        let rows = self.current_segment_rows();
+        let hnsw_build_peak =
+            self.current_hnsw_indexes
+                .iter()
+                .fold(0_u64, |total, (column_id, options)| {
+                    let dimension = self
+                        .context
+                        .schema
+                        .column_by_id(*column_id)
+                        .and_then(|column| match &column.logical_type {
+                            LogicalType::Array(child, dimension)
+                                if matches!(child.as_ref(), LogicalType::Float) =>
+                            {
+                                u32::try_from(*dimension).ok()
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or(0);
+                    total.saturating_add(HnswInlineThreshold::estimate_graph_memory_bytes(
+                        rows,
+                        dimension,
+                        options.build_contract.m,
+                    ))
+                });
+        retained_input.saturating_add(hnsw_build_peak)
+    }
+
     /// Check if the writer has been finalized
     pub fn is_finalized(&self) -> bool {
         self.finalized
@@ -814,10 +843,7 @@ impl RowsetWriter {
         let segment_id = self.current_segment_id;
         let admitted = self.admitted_inline_sinks(row_count_estimate)?;
         let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit, hnsw_indexes) =
-            split_hnsw_segment_admissions(
-                admitted,
-                self.context.search_inline_builders.hnsw_build_execution(),
-            )?;
+            split_hnsw_segment_admissions(admitted)?;
         let writer = self.create_raw_segment_writer(segment_id, hnsw_indexes.clone())?;
         let search_sinks = match self.open_segment_search_sinks(segment_id, admitted_search_sinks) {
             Ok(search_sinks) => search_sinks,
@@ -1978,6 +2004,8 @@ mod tests {
                 "plain_scan_threshold": 10_000,
                 "filtered_plain_scan_threshold": 0,
                 "build_seed": 1,
+                "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+                "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
                 "inline_threshold": {
                     "enabled": true,
                     "max_vector_count": max_vector_count,

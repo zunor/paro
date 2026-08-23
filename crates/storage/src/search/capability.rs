@@ -632,6 +632,8 @@ mod tests {
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
             build_seed: 7,
+            proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+            warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
             inline_threshold: HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,
@@ -660,6 +662,10 @@ mod tests {
         rebuilt.m = 24;
         rebuilt.ef_construct = 120;
         assert_ne!(fingerprint(&base), fingerprint(&rebuilt));
+
+        let mut different_wave_topology = base.clone();
+        different_wave_topology.proposal_wave_size *= 2;
+        assert_ne!(fingerprint(&base), fingerprint(&different_wave_topology));
     }
 
     #[test]

@@ -43,7 +43,7 @@ pub(crate) fn open_copy_reader(
     match source {
         CopyFromSource::File(path) => open_file_reader(path),
         CopyFromSource::Stdin => Ok(Box::new(BufReader::new(
-            input.copy_stdin_source()?.open_reader(),
+            input.copy_stdin_source()?.open_reader()?,
         ))),
     }
 }
@@ -1373,8 +1373,8 @@ mod tests {
     struct TestCopyStdinSource(Vec<u8>);
 
     impl CopyStdinSource for TestCopyStdinSource {
-        fn open_reader(self: Arc<Self>) -> Box<dyn std::io::Read + Send> {
-            Box::new(std::io::Cursor::new(self.0.clone()))
+        fn open_reader(self: Arc<Self>) -> Result<Box<dyn std::io::Read + Send>> {
+            Ok(Box::new(std::io::Cursor::new(self.0.clone())))
         }
     }
 
