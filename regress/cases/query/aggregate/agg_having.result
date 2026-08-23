@@ -73,9 +73,8 @@ ORDER_BY  (rows=1)
   ->  PROJECTION  (rows=1)
     Output: grp, sum_x
     ->  AGGREGATE  (rows=1)
-      Group Key: grp
-      Aggregates: sum(x)
-      Output: grp, sum(x)
+      Group Key: agg_h_values.grp
+      Aggregates: sum(agg_h_values.x)
       ->  PROJECTION  (rows=5)
         Output: grp, x
         ->  VALUES  (rows=5)

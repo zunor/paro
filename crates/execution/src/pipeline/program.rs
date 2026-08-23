@@ -884,6 +884,7 @@ mod tests {
 
     fn values_source() -> SourceSpec {
         SourceSpec::Values(ValuesSpec {
+            relation_alias: None,
             table_index: 7,
             expressions: Box::new([]),
             output_names: Box::new(["a".to_string(), "b".to_string()]),
@@ -1084,6 +1085,7 @@ mod tests {
                         LogicalType::Integer,
                     ))]),
                     output_names: Box::new(["a".to_string()]),
+                    visible_count: 1,
                 }),
                 TransformSpec::Limit(LimitSpec {
                     limit: Some(Expression::Constant(ConstantExpression::new(

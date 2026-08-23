@@ -237,6 +237,8 @@ impl LogicalPlanDeepCopy {
                     table_index,
                     expressions: p.expressions.clone(),
                     visible_names: p.visible_names.clone(),
+                    visible_count: p.visible_count,
+                    visible_qualifier: p.visible_qualifier.clone(),
                     returned_types: p.returned_types.clone(),
                     child: Box::new(child),
                 })
@@ -395,6 +397,7 @@ impl LogicalPlanDeepCopy {
                     expressions: eg.expressions.clone(),
                     names: eg.names.clone(),
                     types: eg.types.clone(),
+                    relation_alias: eg.relation_alias.clone(),
                 })
             }
             LogicalOperator::DelimGet(dg) => {
@@ -555,6 +558,7 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::CTERef(CTERef {
                     cte_index: c.cte_index,
                     table_index,
+                    relation_alias: c.relation_alias.clone(),
                     column_names: c.column_names.clone(),
                     column_types: c.column_types.clone(),
                 })
@@ -628,6 +632,7 @@ impl LogicalPlanDeepCopy {
                     bound_pattern: gm.bound_pattern.clone(),
                     columns: gm.columns.clone(),
                     table_index,
+                    relation_alias: gm.relation_alias.clone(),
                     output_types: gm.output_types.clone(),
                     path_mode: gm.path_mode.clone(),
                     has_path_functions: gm.has_path_functions,
@@ -913,6 +918,7 @@ mod tests {
                     LogicalOperator::CTERef(CTERef::new(
                         4,
                         2,
+                        "cte".to_string(),
                         vec!["v".to_string()],
                         vec![LogicalType::Integer],
                     )),

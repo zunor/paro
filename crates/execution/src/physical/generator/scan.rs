@@ -73,6 +73,7 @@ impl PhysicalPlanGenerator {
             table_index: get.table_index,
             output_names: get.names.clone().into_boxed_slice(),
             returned_types: get.returned_types.clone().into_boxed_slice(),
+            output_sources: get.column_sources.clone().into_boxed_slice(),
             relation_name: get.relation_name.clone(),
             relation_alias: get.relation_alias.clone(),
             column_projection,
@@ -119,6 +120,7 @@ impl PhysicalPlanGenerator {
             .into_boxed_slice();
         let spec = ValuesSpec {
             table_index: values.table_index,
+            relation_alias: values.relation_alias.clone(),
             expressions,
             output_names: output_names.into_boxed_slice(),
             output_types: values.types.clone().into_boxed_slice(),
@@ -197,8 +199,21 @@ impl PhysicalPlanGenerator {
             return Ok((aggregate_kind, aggregate_children));
         }
 
-        let aggregate_output =
-            physical_output_row_type_for_kind(filter.child.as_ref(), &aggregate_kind)?;
+        let aggregate_child_outputs = aggregate_children
+            .iter()
+            .map(|child| {
+                &self
+                    .arena
+                    .get(*child)
+                    .expect("aggregate child must remain in the physical arena")
+                    .output
+            })
+            .collect::<Vec<_>>();
+        let aggregate_output = physical_output_row_type_for_kind(
+            filter.child.as_ref(),
+            &aggregate_kind,
+            &aggregate_child_outputs,
+        )?;
         let aggregate_label = OperatorLabel::new(filter.child.id, aggregate_kind.name());
         let aggregate_id = self.push_node(
             aggregate_kind,
@@ -232,6 +247,7 @@ impl PhysicalPlanGenerator {
             PhysicalNodeKind::Project(ProjectSpec {
                 expressions: expressions.into_boxed_slice(),
                 output_names: output_names.into_boxed_slice(),
+                visible_count: 0,
             }),
             vec![aggregate_id],
         ))
@@ -268,7 +284,8 @@ impl PhysicalPlanGenerator {
         }
 
         let child_kind = PhysicalNodeKind::RowsetScan(scan_spec);
-        let child_output = physical_output_row_type_for_kind(filter.child.as_ref(), &child_kind)?;
+        let child_output =
+            physical_output_row_type_for_kind(filter.child.as_ref(), &child_kind, &[])?;
         let child_label = OperatorLabel::new(filter.child.id, child_kind.name());
         let child_id = self.push_node(
             child_kind,
@@ -301,6 +318,7 @@ impl PhysicalPlanGenerator {
                 "project output",
             )?
             .into_boxed_slice(),
+            visible_count: project.visible_count,
         };
         Ok((PhysicalNodeKind::Project(spec), vec![child]))
     }
@@ -600,6 +618,7 @@ fn project_rowset_scan_spec(
 ) -> Result<()> {
     let mut output_names = Vec::with_capacity(projection_map.len());
     let mut returned_types = Vec::with_capacity(projection_map.len());
+    let mut output_sources = Vec::with_capacity(projection_map.len());
     let mut column_ids = Vec::with_capacity(projection_map.len());
     let mut value_projections = Vec::with_capacity(projection_map.len());
     let mut column_types = Vec::with_capacity(projection_map.len());
@@ -627,6 +646,7 @@ fn project_rowset_scan_spec(
 
         output_names.push(name);
         returned_types.push(returned_type);
+        output_sources.push(source);
         match source {
             paro_planner::operator::GetColumnSource::Stored { column_id } => {
                 column_ids.push(column_id);
@@ -651,6 +671,7 @@ fn project_rowset_scan_spec(
 
     spec.output_names = output_names.into_boxed_slice();
     spec.returned_types = returned_types.into_boxed_slice();
+    spec.output_sources = output_sources.into_boxed_slice();
     spec.column_projection =
         RowsetColumnProjection::try_with_value_projections(column_ids, value_projections)?;
     spec.column_types = column_types.into_boxed_slice();

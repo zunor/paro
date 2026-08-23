@@ -64,6 +64,7 @@ mod tests {
                 LogicalOperator::CTERef(CTERef::new(
                     4,
                     5,
+                    "cte".to_string(),
                     vec!["v".to_string()],
                     vec![LogicalType::Integer],
                 )),
@@ -73,12 +74,14 @@ mod tests {
         let left_ref = LogicalOperator::CTERef(CTERef::new(
             9,
             6,
+            "cte".to_string(),
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         ));
         let right_ref = LogicalOperator::CTERef(CTERef::new(
             9,
             7,
+            "cte".to_string(),
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         ));
@@ -157,6 +160,7 @@ mod tests {
         let inner_ref = LogicalOperator::CTERef(CTERef::new(
             123,
             1,
+            "cte".to_string(),
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         ));

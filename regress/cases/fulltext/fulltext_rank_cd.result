@@ -43,10 +43,10 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-    Sort Key: ts_rank_cd(to_tsvector('simple', content), 'alpha & beta') DESC NULLS FIRST, id ASC NULLS LAST
+    Sort Key: ts_rank_cd(to_tsvector('simple', public.ft_t024_rank_cd.content), 'alpha & beta') DESC NULLS FIRST, id ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=1)
-      Output: id, ts_rank_cd(to_tsvector('simple', content), 'alpha & beta')
+      Output: id, ts_rank_cd(to_tsvector('simple', public.ft_t024_rank_cd.content), 'alpha & beta')
       ->  FULLTEXT_SCAN on public.ft_t024_rank_cd  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>

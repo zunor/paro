@@ -12,7 +12,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: id
   ->  TOP_N  (rows=3)
-    Sort Key: score DESC NULLS FIRST
+    Sort Key: public.topn_fallback_spill_case.score DESC NULLS FIRST
     Limit: 3
     ->  PROJECTION  (rows=7000)
       Output: id, score

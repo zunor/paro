@@ -37,6 +37,7 @@ pub struct RecursiveCteSpec {
 pub struct CteScanSpec {
     pub cte_index: usize,
     pub table_index: usize,
+    pub relation_alias: String,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }

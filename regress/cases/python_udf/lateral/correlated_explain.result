@@ -23,10 +23,10 @@ ORDER_BY  (rows=300)
         ->  VALUES  (rows=3)
       ->  HASH_JOIN
         Join Type: INNER
-        Join Condition: x IS NOT DISTINCT FROM x
+        Join Condition: x IS NOT DISTINCT FROM t.x
         ->  EXTERNAL_TABLE  (rows=1000)
           ->  PROJECTION  (rows=1000)
-            Output: x, x
+            Output: __external_arg_1, x
             ->  CROSS_PRODUCT  (rows=1000)
               ->  DUMMY_SCAN
               ->  DELIM_SCAN  (rows=1)

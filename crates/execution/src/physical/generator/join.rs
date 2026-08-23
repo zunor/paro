@@ -646,32 +646,31 @@ impl PhysicalPlanGenerator {
                 &[join.left.as_ref(), join.right.as_ref()],
             );
         }
-        let (side, capture_input, wrapped_left, wrapped_right, cached_outer_output) =
-            if join.delim_flipped {
-                (
-                    DelimJoinSideSpec::Right,
-                    self.generate_node(join.right.as_ref())?,
-                    self.generate_node(join.left.as_ref())?,
-                    self.synthetic_cached_outer_scan(
-                        join.right.output_names(),
-                        join.right.types(),
-                        join.right.id,
-                    ),
-                    RowType::new(join.right.output_names(), join.right.types()),
-                )
-            } else {
-                (
-                    DelimJoinSideSpec::Left,
-                    self.generate_node(join.left.as_ref())?,
-                    self.synthetic_cached_outer_scan(
-                        join.left.output_names(),
-                        join.left.types(),
-                        join.left.id,
-                    ),
-                    self.generate_node(join.right.as_ref())?,
-                    RowType::new(join.left.output_names(), join.left.types()),
-                )
-            };
+        let (side, capture_input, wrapped_non_cached) = if join.delim_flipped {
+            (
+                DelimJoinSideSpec::Right,
+                self.generate_node(join.right.as_ref())?,
+                self.generate_node(join.left.as_ref())?,
+            )
+        } else {
+            (
+                DelimJoinSideSpec::Left,
+                self.generate_node(join.left.as_ref())?,
+                self.generate_node(join.right.as_ref())?,
+            )
+        };
+        let cached_outer_output = self.plan_node_output(capture_input).clone();
+        let cached_outer = self.synthetic_cached_outer_scan(
+            cached_outer_output.clone(),
+            match side {
+                DelimJoinSideSpec::Left => join.left.id,
+                DelimJoinSideSpec::Right => join.right.id,
+            },
+        );
+        let (wrapped_left, wrapped_right) = match side {
+            DelimJoinSideSpec::Left => (cached_outer, wrapped_non_cached),
+            DelimJoinSideSpec::Right => (wrapped_non_cached, cached_outer),
+        };
 
         let has_hash_key = join
             .conditions
@@ -717,18 +716,17 @@ impl PhysicalPlanGenerator {
 
     pub(crate) fn synthetic_cached_outer_scan(
         &mut self,
-        output_names: Vec<String>,
-        output_types: Vec<LogicalType>,
+        output: RowType,
         logical_id: paro_planner::plan::PlanNodeId,
     ) -> PhysicalPlanNodeId {
         let spec = DelimScanSpec {
             target: DelimScanTarget::CachedOuter,
-            output_names: output_names.clone().into_boxed_slice(),
-            output_types: output_types.clone().into_boxed_slice(),
+            output_names: output.names.clone(),
+            output_types: output.types.clone(),
         };
         self.push_node(
             PhysicalNodeKind::DelimScan(spec),
-            RowType::new(output_names, output_types),
+            output,
             Vec::new(),
             OperatorLabel::new(logical_id, "DELIM_CACHED_OUTER"),
             None,
@@ -794,9 +792,21 @@ impl PhysicalPlanGenerator {
                 && supports_external_hash_join_type(join.join_type),
             reduction_cascade: None,
         };
+        let mut output_identities = spec
+            .left_projection
+            .iter()
+            .filter_map(|index| self.plan_node_output(left).identities.get(*index).cloned())
+            .collect::<Vec<_>>();
+        output_identities.extend(
+            spec.build_input_projection
+                .iter()
+                .filter_map(|index| self.plan_node_output(right).identities.get(*index).cloned())
+                .take(build_output_count),
+        );
+        output_identities.resize(output_types.len(), ColumnIdentity::Internal);
         Ok(self.push_node(
             PhysicalNodeKind::HashJoin(spec),
-            RowType::new(output_names, output_types),
+            RowType::with_identities(output_names, output_types, output_identities),
             vec![left, right],
             OperatorLabel::new(join.left.id, "HASH_JOIN"),
             None,
@@ -838,9 +848,20 @@ impl PhysicalPlanGenerator {
             output_names: output_names.clone().into_boxed_slice(),
             output_types: output_types.clone().into_boxed_slice(),
         };
+        let mut output_identities = spec
+            .left_projection
+            .iter()
+            .filter_map(|index| self.plan_node_output(left).identities.get(*index).cloned())
+            .collect::<Vec<_>>();
+        output_identities.extend(
+            spec.right_projection
+                .iter()
+                .filter_map(|index| self.plan_node_output(right).identities.get(*index).cloned()),
+        );
+        output_identities.resize(output_types.len(), ColumnIdentity::Internal);
         Ok(self.push_node(
             PhysicalNodeKind::NestedLoopJoin(spec),
-            RowType::new(output_names, output_types),
+            RowType::with_identities(output_names, output_types, output_identities),
             vec![left, right],
             OperatorLabel::new(join.left.id, "NESTED_LOOP_JOIN"),
             None,

@@ -15,7 +15,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, l.payload
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-    Columns: l.id, l.payload
+    Columns: id, payload
 
 EXPLAIN
 SELECT l.id, r.note
@@ -49,7 +49,7 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: r.id, r.note
   ->  ROWSET_SCAN on public.join_elim_right r  (rows=2)
-    Columns: r.id, r.note
+    Columns: id, note
 
 SELECT l.id
 FROM join_elim_left AS l

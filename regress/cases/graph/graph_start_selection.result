@@ -68,7 +68,7 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: gt.person_name, gt.company_name, gt.city_name
   ->  GRAPH_PROJECT  (rows=1)
-    Output: gt.person_name, gt.company_name, gt.city_name
+    Output: person_name, company_name, city_name
     ->  GRAPH_EXPAND  (rows=1)
       Graph: start_graph
       Edge Label: WorksAt

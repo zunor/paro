@@ -801,6 +801,7 @@ fn materialized_cte_plan() -> crate::physical::PhysicalPlan {
         LogicalOperator::CTERef(CTERef::new(
             7,
             1,
+            "cte".to_string(),
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         )),
@@ -849,6 +850,7 @@ fn recursive_cte_with_invariant_hash_build_plan() -> crate::physical::PhysicalPl
         LogicalOperator::CTERef(CTERef::new(
             9,
             1,
+            "cte".to_string(),
             vec!["node".to_string()],
             vec![LogicalType::Integer],
         )),
@@ -964,6 +966,7 @@ fn recursive_cte_logical_plan(ctx: &BindContext, union_all: bool) -> LogicalPlan
         LogicalOperator::CTERef(CTERef::new(
             9,
             1,
+            "cte".to_string(),
             vec!["v".to_string()],
             vec![LogicalType::Integer],
         )),
@@ -1375,6 +1378,8 @@ fn rowset_spec_for_test() -> RowsetScanSpec {
         table_index: 0,
         output_names: vec!["a".to_string()].into_boxed_slice(),
         returned_types: vec![LogicalType::Integer].into_boxed_slice(),
+        output_sources: vec![paro_planner::operator::GetColumnSource::Stored { column_id: 0 }]
+            .into_boxed_slice(),
         relation_name: Some("t".to_string()),
         relation_alias: None,
         column_projection: crate::physical::specs::RowsetColumnProjection::new(vec![0]),

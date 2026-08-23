@@ -1437,6 +1437,7 @@ mod tests {
             paro_planner::operator::CTERef::new(
                 12,
                 30,
+                "cte".to_string(),
                 vec!["id".to_string()],
                 vec![LogicalType::Integer],
             ),

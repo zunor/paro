@@ -47,7 +47,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=3)
-    Output: gt.from_name, gt.to_name
+    Output: from_name, to_name
     ->  GRAPH_EXPAND  (rows=3)
       Graph: social_network
       Edge Label: Knows
@@ -65,7 +65,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: gt.a_name, gt.b_name, gt.c_name
   ->  GRAPH_PROJECT  (rows=3)
-    Output: gt.a_name, gt.b_name, gt.c_name
+    Output: a_name, b_name, c_name
     ->  GRAPH_EXPAND  (rows=3)
       Graph: social_network
       Edge Label: Knows
@@ -87,7 +87,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: gt.src_name, gt.dst_name
   ->  GRAPH_PROJECT  (rows=3)
-    Output: gt.src_name, gt.dst_name
+    Output: src_name, dst_name
     ->  GRAPH_EXPAND  (rows=3)
       Graph: social_network
       Edge Label: Knows
@@ -105,7 +105,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: gt.person_name, gt.company_name
   ->  GRAPH_PROJECT  (rows=3)
-    Output: gt.person_name, gt.company_name
+    Output: person_name, company_name
     ->  GRAPH_EXPAND  (rows=3)
       Graph: social_network
       Edge Label: WorksAt
@@ -123,7 +123,7 @@ QUERY PLAN
 PROJECTION  (rows=9)
   Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-    Output: gt.from_name, gt.to_name
+    Output: from_name, to_name
     ->  GRAPH_EXPAND  (rows=9)
       Graph: social_network
       Edge Label: Knows
@@ -142,7 +142,7 @@ QUERY PLAN
 PROJECTION  (rows=9)
   Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-    Output: gt.from_name, gt.to_name
+    Output: from_name, to_name
     ->  GRAPH_SHORTEST_PATH  (rows=9)
       Graph: social_network
       Edge Label: Knows
@@ -161,7 +161,7 @@ QUERY PLAN
 PROJECTION  (rows=9)
   Output: gt.from_name, gt.to_name
   ->  GRAPH_PROJECT  (rows=9)
-    Output: gt.from_name, gt.to_name
+    Output: from_name, to_name
     ->  GRAPH_SHORTEST_PATH  (rows=9)
       Graph: social_network
       Edge Label: Knows

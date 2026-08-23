@@ -76,7 +76,6 @@ PROJECTION  (rows=2)
   ->  AGGREGATE  (rows=2)
     Group Key: d.payload
     Aggregates: count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
-    Output: d.payload, count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
     ->  HASH_JOIN  (rows=4)
       Join Type: INNER
       Build Index: integer_build_time
@@ -84,7 +83,6 @@ PROJECTION  (rows=2)
       ->  AGGREGATE  (rows=5)
         Group Key: f.key_a
         Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
-        Output: f.key_a, count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
         ->  HASH_JOIN  (rows=9600)
           Join Type: INNER
           Build Index: integer_build_time

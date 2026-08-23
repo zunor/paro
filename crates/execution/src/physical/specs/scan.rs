@@ -9,6 +9,7 @@ use paro_common::chunk::Chunk;
 use paro_common::types::LogicalType;
 use paro_function::table::{BoundTableFunctionData, TableFunction};
 use paro_planner::expression::Expression;
+use paro_planner::operator::GetColumnSource;
 use paro_storage::index::{collect_predicate_columns, ColumnId, PredicateTree};
 use paro_storage::rowset::scan_cost::ScanAccessCostModel;
 use paro_storage::table::segment_reorderer::SegmentOrderOptions;
@@ -18,6 +19,7 @@ pub struct RowsetScanSpec {
     pub table_index: usize,
     pub output_names: Box<[String]>,
     pub returned_types: Box<[LogicalType]>,
+    pub output_sources: Box<[GetColumnSource]>,
     pub relation_name: Option<String>,
     pub relation_alias: Option<String>,
     pub column_projection: RowsetColumnProjection,
@@ -222,6 +224,7 @@ pub struct DummyScanSpec;
 #[derive(Debug, Clone)]
 pub struct ValuesSpec {
     pub table_index: usize,
+    pub relation_alias: Option<String>,
     pub expressions: Box<[Box<[Expression]>]>,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
@@ -240,6 +243,10 @@ pub struct FilterSpec {
 pub struct ProjectSpec {
     pub expressions: Box<[Expression]>,
     pub output_names: Box<[String]>,
+    /// SQL-visible prefix owned by this projection. Remaining expressions are
+    /// execution-only and either inherit a referenced identity or stay
+    /// explicitly internal.
+    pub visible_count: usize,
 }
 
 #[derive(Debug, Clone)]

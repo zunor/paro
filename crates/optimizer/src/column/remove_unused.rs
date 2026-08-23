@@ -318,6 +318,16 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                     .any(|name| name.starts_with("__external_arg_"));
                 // Prune projection expressions if not at root
                 if !self.everything_referenced && !carries_external_arguments {
+                    let retained_visible_count = proj
+                        .expressions
+                        .iter()
+                        .take(proj.visible_count)
+                        .enumerate()
+                        .filter(|(old_idx, expression)| {
+                            self.is_referenced(&ColumnBinding::new(proj.table_index, *old_idx))
+                                || !expression.evaluation_properties().can_share_evaluation()
+                        })
+                        .count();
                     self.clear_unused_expressions(
                         &mut proj.expressions,
                         Some(&mut proj.visible_names),
@@ -332,6 +342,9 @@ impl LogicalOperatorVisitor for RemoveUnusedColumns<'_> {
                                 return_type: paro_common::types::LogicalType::Integer,
                             }));
                         proj.visible_names = vec!["42".to_string()];
+                        proj.visible_count = 0;
+                    } else {
+                        proj.visible_count = retained_visible_count;
                     }
 
                     // Update returned types
@@ -1215,6 +1228,50 @@ mod tests {
             panic!("expected scan");
         };
         assert_eq!(scan.names, vec!["correlation_key"]);
+    }
+
+    #[test]
+    fn pruning_compacts_the_visible_projection_identity_prefix() {
+        let session = TestStatementContextBuilder::minimal().build();
+        let binder = Binder::new(session.clone());
+        let ctx = &binder.bind_context;
+        let scan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Get(Get::new_without_table(
+                10,
+                vec!["dead".into(), "visible".into(), "hidden".into()],
+                vec![LogicalType::Integer; 3],
+            )),
+        );
+        let projection = Projection::new(
+            20,
+            scan,
+            vec![int_column(10, 0), int_column(10, 1), int_column(10, 2)],
+        )
+        .with_visible_names(vec!["dead".into(), "visible".into()]);
+        let projection = LogicalPlan::new(ctx, LogicalOperator::Projection(projection));
+        let mut plan = LogicalPlan::new(
+            ctx,
+            LogicalOperator::Projection(Projection::new(
+                30,
+                projection,
+                vec![int_column(20, 1), int_column(20, 2)],
+            )),
+        );
+
+        RemoveUnusedColumns::optimize(&mut plan, &binder, session.as_ref(), true);
+
+        let LogicalOperator::Projection(root) = &plan.operator else {
+            panic!("expected root projection");
+        };
+        let LogicalOperator::Projection(projection) = &root.child.operator else {
+            panic!("expected compacted projection");
+        };
+        assert_eq!(projection.expressions.len(), 2);
+        assert_eq!(projection.visible_names, vec!["visible"]);
+        assert_eq!(projection.visible_count, 1);
+        assert_eq!(binding(&root.expressions[0]), ColumnBinding::new(20, 0));
+        assert_eq!(binding(&root.expressions[1]), ColumnBinding::new(20, 1));
     }
 
     #[test]

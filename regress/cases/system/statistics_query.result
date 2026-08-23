@@ -44,7 +44,7 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: s.id, b.payload
   Cardinality: [1, 1, 1]
-  Output Schema: s.id INTEGER, b.payload VARCHAR
+  Output Schema: "s.id" INTEGER, "b.payload" VARCHAR
   ->  HASH_JOIN  (rows=1)
     Join Type: INNER
     Build Index: integer_build_time
@@ -56,11 +56,11 @@ PROJECTION  (rows=1)
       Pushed Predicate: id <= 1 AND id = 1
       Late Materialize: auto
       Runtime Filter: id = 1
-      Output Schema: id INTEGER, payload VARCHAR
+      Output Schema: b.id INTEGER, b.payload VARCHAR
     ->  ROWSET_SCAN on public.stats_small s  (rows=1)
       Columns: id
       Cardinality: [1, 1, 1]
-      Output Schema: id INTEGER
+      Output Schema: s.id INTEGER
 
 SELECT s.id, b.payload
 FROM stats_small AS s

@@ -7,7 +7,7 @@ ORDER_BY  (rows=1)
   ->  PROJECTION  (rows=1)
     Output: v
     ->  FILTER  (rows=1)
-      Filter: v > 1
+      Filter: nums.v > 1
       ->  VALUES  (rows=3)
 
 EXPLAIN
@@ -19,14 +19,14 @@ MATERIALIZED_CTE
   Materialization: MATERIALIZED
   Reference Count: 1
   ->  FILTER  (rows=1)
-    Filter: v > 1
+    Filter: nums.v > 1
     ->  VALUES  (rows=3)
   ->  ORDER_BY
     Sort Key: v ASC NULLS LAST
     ->  PROJECTION
       Output: v
       ->  FILTER
-        Filter: v > 1
+        Filter: nums.v > 1
         ->  CTE_SCAN
           CTE Index: 0
           Table Index: 8
@@ -40,8 +40,7 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: total
   ->  AGGREGATE  (rows=1)
-    Aggregates: sum(+(v, v))
-    Output: sum(+(v, v))
+    Aggregates: sum(+(a.v, b.v))
     ->  CROSS_PRODUCT  (rows=9)
       ->  PROJECTION  (rows=3)
         Output: v

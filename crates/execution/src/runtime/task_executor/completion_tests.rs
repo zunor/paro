@@ -275,6 +275,7 @@ fn streaming_limit_stop_pipeline_still_runs_completion() {
             TransformSpec::Project(ProjectSpec {
                 expressions: vec![int_constant(1)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
+                visible_count: 1,
             }),
             TransformSpec::Limit(LimitSpec {
                 limit: Some(int_constant(0)),
@@ -321,6 +322,7 @@ fn transform_stop_pipeline_flushes_only_downstream_transforms() {
             TransformSpec::Project(ProjectSpec {
                 expressions: vec![int_constant(1)].into_boxed_slice(),
                 output_names: vec!["v".to_string()].into_boxed_slice(),
+                visible_count: 1,
             }),
         ],
         sink: SinkSpec::ClientResult(ClientResultSpec::default()),

@@ -95,6 +95,144 @@ fn physical_rewrite_composes_consecutive_projects() {
         &project.expressions[1],
         Expression::Reference(reference) if reference.index == 2
     ));
+    assert_eq!(
+        plan.nodes.len(),
+        2,
+        "folded projects must leave no arena orphans"
+    );
+}
+
+#[test]
+fn project_alias_does_not_rename_its_scan_input() {
+    let ctx = BindContext::new();
+    let get = LogicalPlan::new(&ctx, LogicalOperator::Get(test_get()));
+    let project = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Projection(
+            Projection::new(
+                1,
+                get,
+                vec![Expression::Reference(ReferenceExpression::new(
+                    0,
+                    LogicalType::Integer,
+                ))],
+            )
+            .with_visible_names(vec!["renamed".to_string()]),
+        ),
+    );
+
+    let plan = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&project)
+        .unwrap();
+    let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
+
+    assert!(explain.contains("Output: renamed"), "{explain}");
+    assert!(explain.contains("Columns: a, b, c"), "{explain}");
+    assert!(!explain.contains("Columns: renamed"), "{explain}");
+}
+
+#[test]
+fn explain_size_is_bounded_for_deep_project_filter_chains() {
+    std::thread::Builder::new()
+        .name("deep-explain-plan".to_string())
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let ctx = BindContext::new();
+            let mut plan = LogicalPlan::new(
+                &ctx,
+                LogicalOperator::ExpressionGet(ExpressionGet::new(
+                    0,
+                    vec![],
+                    vec!["flag".to_string()],
+                    vec![LogicalType::Boolean],
+                )),
+            );
+            for index in 0..12 {
+                plan = LogicalPlan::new(
+                    &ctx,
+                    LogicalOperator::Projection(
+                        Projection::new(
+                            index * 2 + 1,
+                            plan,
+                            vec![Expression::Operator(OperatorExpression::new_unary(
+                                OperatorType::Not,
+                                Expression::Reference(ReferenceExpression::new(
+                                    0,
+                                    LogicalType::Boolean,
+                                )),
+                                LogicalType::Boolean,
+                            ))],
+                        )
+                        .with_visible_names(Vec::new()),
+                    ),
+                );
+                plan = LogicalPlan::new(
+                    &ctx,
+                    LogicalOperator::Filter(Filter::new(
+                        plan,
+                        vec![Expression::Reference(ReferenceExpression::new(
+                            0,
+                            LogicalType::Boolean,
+                        ))],
+                    )),
+                );
+            }
+
+            let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+                .generate(&plan)
+                .unwrap();
+            let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
+
+            assert!(
+                explain.len() < 64 * 1024,
+                "EXPLAIN grew to {} bytes",
+                explain.len()
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn explain_parenthesizes_mixed_boolean_conjunctions() {
+    let ctx = BindContext::new();
+    let values = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::ExpressionGet(ExpressionGet::new(
+            0,
+            vec![],
+            vec!["flag_a".into(), "flag_b".into(), "flag_c".into()],
+            vec![LogicalType::Boolean; 3],
+        )),
+    );
+    let disjunction = Expression::Conjunction(ConjunctionExpression {
+        conjunction_type: ConjunctionType::Or,
+        children: vec![
+            ref_expr(0, LogicalType::Boolean),
+            ref_expr(1, LogicalType::Boolean),
+        ],
+    });
+    let filter = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(
+            values,
+            vec![Expression::Conjunction(ConjunctionExpression {
+                conjunction_type: ConjunctionType::And,
+                children: vec![disjunction, ref_expr(2, LogicalType::Boolean)],
+            })],
+        )),
+    );
+
+    let physical = PhysicalPlanGenerator::new(PlanBuildContext::default())
+        .generate(&filter)
+        .unwrap();
+    let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
+
+    assert!(
+        explain.contains("Filter: (flag_a OR flag_b) AND flag_c"),
+        "{explain}"
+    );
 }
 
 #[test]
@@ -1042,6 +1180,59 @@ fn arena_generator_lowers_single_join_to_typed_hash_path() {
     let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
     assert!(explain.contains("Join Condition: l = r"), "{explain}");
     assert!(!explain.contains("Join Condition: #"), "{explain}");
+}
+
+#[test]
+fn join_qualifiers_survive_wrapped_scans() {
+    let ctx = BindContext::new();
+    let mut left_get = test_get();
+    left_get.table_index = 0;
+    left_get.relation_alias = Some("l".to_string());
+    let mut right_get = test_get();
+    right_get.table_index = 1;
+    right_get.relation_alias = Some("r".to_string());
+    let left = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(
+            LogicalPlan::new(&ctx, LogicalOperator::Get(left_get)),
+            vec![comparison(
+                ComparisonType::GreaterThan,
+                ref_expr(0, LogicalType::Integer),
+                int_const(0),
+            )],
+        )),
+    );
+    let right = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Filter(Filter::new(
+            LogicalPlan::new(&ctx, LogicalOperator::Get(right_get)),
+            vec![comparison(
+                ComparisonType::GreaterThan,
+                ref_expr(0, LogicalType::Integer),
+                int_const(0),
+            )],
+        )),
+    );
+    let join = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Join(Join::comparison(
+            JoinType::Inner,
+            left,
+            right,
+            vec![JoinCondition::equality(
+                ref_expr(0, LogicalType::Integer),
+                ref_expr(0, LogicalType::Integer),
+            )],
+        )),
+    );
+    let mut generator = PhysicalPlanGenerator::new(PlanBuildContext {
+        rowset_scan_pushdown: false,
+        ..PlanBuildContext::default()
+    });
+    let physical = generator.generate(&join).unwrap();
+    let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
+
+    assert!(explain.contains("Join Condition: l.a = r.a"), "{explain}");
 }
 
 #[test]

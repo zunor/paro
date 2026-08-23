@@ -253,6 +253,9 @@ pub struct BoundValues {
     pub values: Vec<Vec<Expression>>,
     pub names: Vec<String>,
     pub types: Vec<LogicalType>,
+    /// Relation namespace assigned when this VALUES clause is used directly
+    /// as a derived table.
+    pub relation_alias: Option<String>,
 }
 
 impl BoundValues {

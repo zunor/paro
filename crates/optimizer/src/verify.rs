@@ -189,6 +189,16 @@ impl Verifier {
                         proj.expressions.len()
                     )));
                 }
+                if proj.visible_count > proj.visible_names.len()
+                    || proj.visible_count > proj.expressions.len()
+                {
+                    return Err(paro_error::internal(format!(
+                        "Projection visible identity prefix is invalid: visible_count={}, visible_names={}, expressions={}",
+                        proj.visible_count,
+                        proj.visible_names.len(),
+                        proj.expressions.len()
+                    )));
+                }
                 if proj.returned_types.len() != proj.expressions.len() {
                     return Err(paro_error::internal(format!(
                         "Projection returned_types mismatch: returned_types={}, expressions={}",

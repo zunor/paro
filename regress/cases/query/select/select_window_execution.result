@@ -44,7 +44,7 @@ ORDER_BY  (rows=1)
   ->  PROJECTION  (rows=1)
     Output: x, rn
     ->  FILTER  (rows=1)
-      Filter: rn <= 2
+      Filter: row_number() OVER (ORDER BY qualify_input.x ASC NULLS LAST ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) <= 2
       ->  WINDOW  (rows=3)
         ->  PROJECTION  (rows=3)
           Output: x

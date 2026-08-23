@@ -118,8 +118,23 @@ impl PhysicalPlanGenerator {
             PhysicalNodeKind::Project(ProjectSpec {
                 expressions: projection_exprs.into_boxed_slice(),
                 output_names: output_names.clone().into_boxed_slice(),
+                visible_count: 0,
             }),
-            RowType::new(output_names, output_types),
+            RowType::with_identities(
+                output_names.clone(),
+                output_types,
+                output_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        if index == table_column_count {
+                            ColumnIdentity::Internal
+                        } else {
+                            ColumnIdentity::visible(name.clone())
+                        }
+                    })
+                    .collect(),
+            ),
             vec![child],
             OperatorLabel::new(update.child.id, "UPDATE_PROJECT"),
             child_cardinality,

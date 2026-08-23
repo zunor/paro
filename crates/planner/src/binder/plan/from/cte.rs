@@ -11,6 +11,7 @@ impl Binder {
         Ok(LogicalOperator::CTERef(CTERef::new(
             cte_ref.cte_index,
             cte_ref.table_index,
+            cte_ref.alias,
             cte_ref.column_names,
             cte_ref.column_types,
         )))

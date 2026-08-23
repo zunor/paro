@@ -3,6 +3,7 @@
 
 //! Arena-backed immutable physical plan.
 
+use std::cell::Cell;
 use std::fmt::Write;
 
 use super::children::{PlanChildren, PlanChildrenArena};
@@ -10,7 +11,9 @@ use super::ids::PhysicalPlanNodeId;
 use super::node::PhysicalPlanNode;
 use super::properties::PlanPropertyMap;
 use super::specs::{AggregateSpec, NestedLoopJoinSpec, PhysicalNodeKind, SearchSourceSpec};
-use crate::explain::types::{ExplainDoc, ExplainNode, ExplainProperty, ExplainValue};
+use crate::explain::types::{
+    ExplainDoc, ExplainNode, ExplainProperty, ExplainValue, EXPLAIN_FORMAT_VERSION,
+};
 use paro_catalog::entry::{StandardEntry, TableCatalogEntry};
 use paro_planner::expression::{
     AggregateExpression, AggregateType, Expression, OperatorType, WindowFrameBound, WindowFrameType,
@@ -91,6 +94,56 @@ impl PhysicalPlan {
         children.as_slice(&self.children)
     }
 
+    /// Remove nodes made unreachable by physical rewrites and reassign dense
+    /// ids. A physical plan arena is part of the observable plan contract; it
+    /// must not retain folded operators that can be mistaken for consumers.
+    pub(crate) fn compact_reachable(&mut self) {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack = vec![self.root];
+        while let Some(id) = stack.pop() {
+            if std::mem::replace(&mut reachable[id.index()], true) {
+                continue;
+            }
+            stack.extend_from_slice(self.child_ids(&self.node(id).children));
+        }
+
+        if reachable.iter().all(|reachable| *reachable) {
+            return;
+        }
+
+        let mut remap = vec![PhysicalPlanNodeId::INVALID; reachable.len()];
+        let mut next_index = 0;
+        for (old_index, is_reachable) in reachable.iter().copied().enumerate() {
+            if is_reachable {
+                remap[old_index] = PhysicalPlanNodeId::new(next_index);
+                next_index += 1;
+            }
+        }
+
+        let old_children = std::mem::take(&mut self.children);
+        let old_nodes = std::mem::take(&mut self.nodes.nodes);
+        let mut nodes = PhysicalPlanNodeArena::default();
+        let mut children = PlanChildrenArena::default();
+        for mut node in old_nodes
+            .into_iter()
+            .filter(|node| reachable[node.id.index()])
+        {
+            let remapped_children = node
+                .children
+                .as_slice(&old_children)
+                .iter()
+                .map(|child| remap[child.index()])
+                .collect();
+            node.children = children.pack(remapped_children);
+            node.id = PhysicalPlanNodeId::INVALID;
+            nodes.push(node);
+        }
+
+        self.root = remap[self.root.index()];
+        self.nodes = nodes;
+        self.children = children;
+    }
+
     /// Return a structural one-row guarantee, independent of optimizer
     /// cardinality estimates. Consumers may use this as a semantic proof.
     pub fn guarantees_exactly_one_row(&self, id: PhysicalPlanNodeId) -> bool {
@@ -130,7 +183,7 @@ impl PhysicalPlan {
 
     fn to_explain_doc(&self, spec: ExplainSpec) -> ExplainDoc {
         ExplainDoc {
-            format_version: 1,
+            format_version: EXPLAIN_FORMAT_VERSION,
             spec,
             root: self.explain_node(self.root),
             summary: Vec::new(),
@@ -220,7 +273,15 @@ impl PhysicalPlan {
             operator_name: explain_operator_name(&node.kind).to_string(),
             relation_name: explain_relation_name(&node.kind),
             relation_alias: explain_relation_alias(&node.kind),
-            output_names: self.resolved_explain_output_names(id),
+            output_names: node.output.explain_names(matches!(
+                &node.kind,
+                PhysicalNodeKind::HashJoin(_)
+                    | PhysicalNodeKind::NestedLoopJoin(_)
+                    | PhysicalNodeKind::SortRangeJoin(_)
+                    | PhysicalNodeKind::ClassicIeJoin(_)
+                    | PhysicalNodeKind::CrossProduct(_)
+                    | PhysicalNodeKind::DelimJoin(_)
+            )),
             estimated_cardinality: explain_cardinality(&node.kind, node.cardinality),
             actual: None,
             properties: collect_explain_properties(self, id, node),
@@ -232,198 +293,184 @@ impl PhysicalPlan {
         }
     }
 
-    /// Names visible to expressions consuming this node.
-    ///
-    /// Physical expressions address columns positionally. EXPLAIN resolves
-    /// those positions against the producer schema instead of exposing the
-    /// execution ABI (`#0`, `#1`, ...). Synthetic physical outputs are
-    /// expanded here so parents inherit useful names as well.
-    fn explain_output_names(&self, id: PhysicalPlanNodeId) -> Vec<String> {
-        let node = self.node(id);
-        let child_ids = self.child_ids(&node.children);
-        match &node.kind {
-            PhysicalNodeKind::Project(spec) => {
-                let input_names = child_ids
-                    .first()
-                    .map(|child| self.explain_output_names(*child))
-                    .unwrap_or_default();
-                let formatter = ExplainExpressionFormatter::new(&input_names);
-                spec.output_names
-                    .iter()
-                    .zip(spec.expressions.iter())
-                    .map(|(name, expression)| {
-                        if is_internal_column_name(name) {
-                            formatter.format(expression)
-                        } else {
-                            name.clone()
-                        }
-                    })
-                    .collect()
-            }
-            PhysicalNodeKind::Aggregate(spec) => {
-                let input_names = child_ids
-                    .first()
-                    .map(|child| self.explain_output_names(*child))
-                    .unwrap_or_default();
-                aggregate_output_names(spec, &input_names)
-                    .filter(|names| names.len() == node.output.column_count())
-                    .unwrap_or_else(|| node.output.names.to_vec())
-            }
-            PhysicalNodeKind::Filter(spec) => child_ids
-                .first()
-                .map(|child| self.explain_output_names(*child))
-                .map(|names| project_explain_names(&names, &spec.projection_map))
-                .filter(|names| names.len() == node.output.column_count())
-                .unwrap_or_else(|| node.output.names.to_vec()),
-            PhysicalNodeKind::Sort(spec) => child_ids
-                .first()
-                .map(|child| self.explain_output_names(*child))
-                .map(|names| project_explain_names(&names, &spec.projection_map))
-                .filter(|names| names.len() == node.output.column_count())
-                .unwrap_or_else(|| node.output.names.to_vec()),
-            PhysicalNodeKind::Window(spec) => {
-                let child_names = child_ids
-                    .first()
-                    .map(|child| self.explain_output_names(*child))
-                    .unwrap_or_default();
-                let formatter = ExplainExpressionFormatter::new(&child_names);
-                let mut names = child_names
-                    .iter()
-                    .take(spec.input_width)
-                    .cloned()
-                    .collect::<Vec<_>>();
-                names.extend(
-                    spec.expressions
-                        .iter()
-                        .map(|expression| formatter.format_window(expression)),
-                );
-                if names.len() == node.output.column_count() {
-                    names
-                } else {
-                    node.output.names.to_vec()
-                }
-            }
-            PhysicalNodeKind::HashJoin(spec) => {
-                let left_names = self.join_input_names(id, 0);
-                let right_names = self.join_input_names(id, 1);
-                let mut names = project_explain_names(&left_names, &spec.left_projection);
-                names.extend(
-                    spec.build_input_projection
-                        .iter()
-                        .take(spec.build_output_count)
-                        .filter_map(|index| right_names.get(*index).cloned()),
-                );
-                complete_explain_names(names, node)
-            }
-            PhysicalNodeKind::NestedLoopJoin(spec) => {
-                let left_names = self.join_input_names(id, 0);
-                let right_names = self.join_input_names(id, 1);
-                let mut names = project_explain_names(&left_names, &spec.left_projection);
-                names.extend(project_explain_names(&right_names, &spec.right_projection));
-                complete_explain_names(names, node)
-            }
-            PhysicalNodeKind::SortRangeJoin(spec) => {
-                let left_names = self.join_input_names(id, 0);
-                let right_names = self.join_input_names(id, 1);
-                let mut names = project_explain_names(&left_names, &spec.left_projection);
-                names.extend(project_explain_names(&right_names, &spec.right_projection));
-                complete_explain_names(names, node)
-            }
-            PhysicalNodeKind::ClassicIeJoin(spec) => {
-                let left_names = self.join_input_names(id, 0);
-                let right_names = self.join_input_names(id, 1);
-                let mut names = project_explain_names(&left_names, &spec.left_projection);
-                names.extend(project_explain_names(&right_names, &spec.right_projection));
-                complete_explain_names(names, node)
-            }
-            PhysicalNodeKind::CrossProduct(_) => {
-                let mut names = self.join_input_names(id, 0);
-                names.extend(self.join_input_names(id, 1));
-                complete_explain_names(names, node)
-            }
-            PhysicalNodeKind::ExternalTable(spec) => {
-                let mut names = node.output.names.to_vec();
-                if let Some(child_id) = child_ids.first() {
-                    let child_names = self.explain_output_names(*child_id);
-                    let worker_outputs = spec.worker_output_types.len();
-                    for (output_index, name) in names.iter_mut().enumerate().skip(worker_outputs) {
-                        let child_index = spec.argument_count + output_index - worker_outputs;
-                        if is_internal_column_name(name) {
-                            if let Some(source_name) = child_names.get(child_index) {
-                                *name = source_name.clone();
-                            }
-                        }
-                    }
-                }
-                names
-            }
-            PhysicalNodeKind::Limit(_)
-            | PhysicalNodeKind::TopN(_)
-            | PhysicalNodeKind::EmptyResult(_) => child_ids
-                .first()
-                .map(|child| self.explain_output_names(*child))
-                .filter(|names| names.len() == node.output.column_count())
-                .unwrap_or_else(|| node.output.names.to_vec()),
-            _ => node.output.names.to_vec(),
-        }
-    }
-
     fn input_names(&self, id: PhysicalPlanNodeId, child_index: usize) -> Vec<String> {
         self.child_ids(&self.node(id).children)
             .get(child_index)
-            .map(|child| self.resolved_explain_output_names(*child))
+            .map(|child| self.expression_scope_names(*child))
             .unwrap_or_default()
     }
 
-    fn resolved_explain_output_names(&self, id: PhysicalPlanNodeId) -> Vec<String> {
-        let mut names = self.explain_output_names(id);
-        for (name, alias) in names.iter_mut().zip(self.consumer_aliases(id)) {
-            if let Some(alias) = alias {
-                *name = alias;
+    /// Names used only while rendering expressions consumed by `id`'s
+    /// parent. Internal definitions are expanded at most one producer hop;
+    /// they never become the producer's schema or feed another definition.
+    fn expression_scope_names(&self, id: PhysicalPlanNodeId) -> Vec<String> {
+        let node = self.node(id);
+        let mut names = node.output.explain_names(true);
+        match &node.kind {
+            PhysicalNodeKind::Project(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                let formatter = ExplainExpressionFormatter::new(&stable_input_names);
+                for (index, expression) in spec.expressions.iter().enumerate() {
+                    if node
+                        .output
+                        .identities
+                        .get(index)
+                        .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                    {
+                        names[index] = formatter.format(expression);
+                    }
+                }
             }
+            PhysicalNodeKind::Window(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                let formatter = ExplainExpressionFormatter::new(&stable_input_names);
+                for (offset, expression) in spec.expressions.iter().enumerate() {
+                    let index = spec.input_width + offset;
+                    if let Some(name) = names.get_mut(index) {
+                        *name = formatter.format(&Expression::Window(expression.clone()));
+                    }
+                }
+            }
+            PhysicalNodeKind::Aggregate(spec) => {
+                let stable_input_names = self
+                    .child_ids(&node.children)
+                    .first()
+                    .map(|child| self.node(*child).output.explain_names(true))
+                    .unwrap_or_default();
+                if let Some(scope_names) = aggregate_scope_names(spec, &stable_input_names) {
+                    for (index, scope_name) in scope_names.into_iter().enumerate() {
+                        if node
+                            .output
+                            .identities
+                            .get(index)
+                            .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                        {
+                            names[index] = scope_name;
+                        }
+                    }
+                }
+            }
+            PhysicalNodeKind::Filter(spec) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    names = spec
+                        .projection_map
+                        .iter()
+                        .filter_map(|index| child_names.get(*index).cloned())
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::Sort(spec) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    names = spec
+                        .projection_map
+                        .iter()
+                        .filter_map(|index| child_names.get(*index).cloned())
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::Limit(_)
+            | PhysicalNodeKind::TopN(_)
+            | PhysicalNodeKind::EmptyResult(_) => {
+                if let Some(child) = self.child_ids(&node.children).first() {
+                    let child_names = self.expression_scope_names(*child);
+                    if child_names.len() == names.len() {
+                        names = child_names;
+                    }
+                }
+            }
+            PhysicalNodeKind::HashJoin(spec) => {
+                let children = self.child_ids(&node.children);
+                if let [left, right] = children {
+                    let left_names = self.expression_scope_names(*left);
+                    let right_names = self.expression_scope_names(*right);
+                    names = spec
+                        .left_projection
+                        .iter()
+                        .filter_map(|index| left_names.get(*index).cloned())
+                        .chain(
+                            spec.build_input_projection
+                                .iter()
+                                .take(spec.build_output_count)
+                                .filter_map(|index| right_names.get(*index).cloned()),
+                        )
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::NestedLoopJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::SortRangeJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::ClassicIeJoin(spec) => {
+                names = self.join_expression_scope_names(
+                    node,
+                    &spec.left_projection,
+                    &spec.right_projection,
+                );
+            }
+            PhysicalNodeKind::CrossProduct(_) => {
+                let children = self.child_ids(&node.children);
+                if let [left, right] = children {
+                    names = self
+                        .expression_scope_names(*left)
+                        .into_iter()
+                        .chain(self.expression_scope_names(*right))
+                        .collect();
+                }
+            }
+            PhysicalNodeKind::DelimJoin(_) => {
+                if let Some(consumer) = self.child_ids(&node.children).get(1) {
+                    let consumer_names = self.expression_scope_names(*consumer);
+                    if consumer_names.len() == names.len() {
+                        names = consumer_names;
+                    }
+                }
+            }
+            _ => {}
         }
         names
     }
 
-    /// A simple projection above an operator owns the SQL-visible alias for a
-    /// pass-through column. Feed that alias back into the child EXPLAIN scope;
-    /// this recovers names such as `t(id)` after VALUES has been lowered to its
-    /// positional `col0` execution schema.
-    fn consumer_aliases(&self, id: PhysicalPlanNodeId) -> Vec<Option<String>> {
-        let mut aliases = vec![None; self.node(id).output.column_count()];
-        for parent in self.nodes.iter() {
-            let Some(child_index) = self
-                .child_ids(&parent.children)
-                .iter()
-                .position(|child| *child == id)
-            else {
-                continue;
-            };
-
-            match &parent.kind {
-                PhysicalNodeKind::Project(project) => {
-                    for (expression, output_name) in
-                        project.expressions.iter().zip(project.output_names.iter())
-                    {
-                        let Expression::Reference(reference) = expression else {
-                            continue;
-                        };
-                        if !is_internal_column_name(output_name) {
-                            if let Some(alias) = aliases.get_mut(reference.index) {
-                                *alias = Some(output_name.clone());
-                            }
-                        }
-                    }
-                }
-                PhysicalNodeKind::MaterializedCte(cte) if child_index == 0 => {
-                    for (alias, column_name) in aliases.iter_mut().zip(cte.column_names.iter()) {
-                        *alias = Some(column_name.clone());
-                    }
-                }
-                _ => {}
-            }
-        }
-        aliases
+    fn join_expression_scope_names(
+        &self,
+        node: &PhysicalPlanNode,
+        left_projection: &[usize],
+        right_projection: &[usize],
+    ) -> Vec<String> {
+        let children = self.child_ids(&node.children);
+        let [left, right] = children else {
+            return node.output.explain_names(true);
+        };
+        let left_names = self.expression_scope_names(*left);
+        let right_names = self.expression_scope_names(*right);
+        left_projection
+            .iter()
+            .filter_map(|index| left_names.get(*index).cloned())
+            .chain(
+                right_projection
+                    .iter()
+                    .filter_map(|index| right_names.get(*index).cloned()),
+            )
+            .collect()
     }
 
     fn join_input_names(&self, id: PhysicalPlanNodeId, child_index: usize) -> Vec<String> {
@@ -434,22 +481,7 @@ impl PhysicalPlan {
         else {
             return Vec::new();
         };
-        let names = self.resolved_explain_output_names(child_id);
-        let child = self.node(child_id);
-        let qualifier = match &child.kind {
-            PhysicalNodeKind::RowsetScan(spec) => spec
-                .relation_alias
-                .as_deref()
-                .or(spec.relation_name.as_deref()),
-            _ => None,
-        };
-        let Some(qualifier) = qualifier else {
-            return names;
-        };
-        names
-            .into_iter()
-            .map(|name| qualify_column_name(qualifier, name))
-            .collect()
+        self.node(child_id).output.explain_names(true)
     }
 }
 
@@ -460,13 +492,31 @@ fn collect_explain_properties(
 ) -> Vec<ExplainProperty> {
     let mut properties = Vec::new();
     let input_names = plan.input_names(id, 0);
-    let output_names = plan.resolved_explain_output_names(id);
+    let output_names = node.output.explain_names(false);
     let input_formatter = ExplainExpressionFormatter::new(&input_names);
 
     match &node.kind {
         PhysicalNodeKind::Project(spec) => {
             if !spec.output_names.is_empty() {
-                push_list_property(&mut properties, "Output", &output_names);
+                let scope_names = plan.expression_scope_names(id);
+                let outputs = output_names
+                    .iter()
+                    .enumerate()
+                    .map(|(index, name)| {
+                        if node
+                            .output
+                            .identities
+                            .get(index)
+                            .is_some_and(super::row_type::ColumnIdentity::is_internal)
+                            && scope_names.get(index).is_some_and(|scope| scope != name)
+                        {
+                            scope_names[index].clone()
+                        } else {
+                            name.clone()
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                push_list_property(&mut properties, "Output", &outputs);
             }
         }
         PhysicalNodeKind::RowsetScan(spec) => {
@@ -515,9 +565,7 @@ fn collect_explain_properties(
             }
         }
         PhysicalNodeKind::Filter(spec) => {
-            let filter_names =
-                input_names_with_output_aliases(&input_names, &spec.projection_map, &output_names);
-            let filter_formatter = ExplainExpressionFormatter::new(&filter_names);
+            let filter_formatter = ExplainExpressionFormatter::new(&input_names);
             if !spec.expressions.is_empty() {
                 push_string_property(
                     &mut properties,
@@ -694,11 +742,6 @@ fn collect_explain_properties(
         }
         PhysicalNodeKind::Aggregate(spec) => {
             push_aggregate_properties(&mut properties, spec, &input_names);
-            if let Some(output_names) = aggregate_output_names(spec, &input_names) {
-                if !output_names.is_empty() {
-                    push_list_property(&mut properties, "Output", &output_names);
-                }
-            }
         }
         PhysicalNodeKind::PartitionAggregateWindow(spec) => {
             push_aggregate_properties(&mut properties, &spec.aggregate, &input_names);
@@ -763,49 +806,9 @@ fn collect_explain_properties(
         _ => {}
     }
 
-    push_string_property(
-        &mut properties,
-        "Output Schema",
-        format_output_schema(node, &output_names),
-    );
+    push_string_property(&mut properties, "Output Schema", format_output_schema(node));
 
     properties
-}
-
-fn project_explain_names(names: &[String], projection: &[usize]) -> Vec<String> {
-    projection
-        .iter()
-        .filter_map(|index| names.get(*index).cloned())
-        .collect()
-}
-
-fn complete_explain_names(mut names: Vec<String>, node: &PhysicalPlanNode) -> Vec<String> {
-    let output_width = node.output.column_count();
-    if names.len() > output_width {
-        return node.output.names.to_vec();
-    }
-    names.extend(node.output.names.iter().skip(names.len()).cloned());
-    names
-}
-
-fn input_names_with_output_aliases(
-    input_names: &[String],
-    projection: &[usize],
-    output_names: &[String],
-) -> Vec<String> {
-    let mut names = input_names.to_vec();
-    for (output_index, input_index) in projection.iter().copied().enumerate() {
-        let Some((input_name, output_name)) = names
-            .get_mut(input_index)
-            .zip(output_names.get(output_index))
-        else {
-            continue;
-        };
-        if !is_internal_column_name(output_name) {
-            *input_name = output_name.clone();
-        }
-    }
-    names
 }
 
 fn push_aggregate_properties(
@@ -1041,7 +1044,10 @@ fn search_source_token(source: &SearchSourceSpec) -> &CapabilityToken {
 }
 
 fn push_string_property(properties: &mut Vec<ExplainProperty>, label: &'static str, value: String) {
-    properties.push(ExplainProperty::new(label, ExplainValue::String(value)));
+    properties.push(ExplainProperty::new(
+        label,
+        ExplainValue::String(bound_explain_text(value)),
+    ));
 }
 
 fn push_list_property(
@@ -1049,10 +1055,17 @@ fn push_list_property(
     label: &'static str,
     values: &[String],
 ) {
-    properties.push(ExplainProperty::new(
-        label,
-        ExplainValue::List(values.iter().cloned().map(ExplainValue::String).collect()),
-    ));
+    let mut bounded = values
+        .iter()
+        .take(EXPLAIN_EXPRESSION_MAX_NODES)
+        .cloned()
+        .map(bound_explain_text)
+        .map(ExplainValue::String)
+        .collect::<Vec<_>>();
+    if values.len() > EXPLAIN_EXPRESSION_MAX_NODES {
+        bounded.push(ExplainValue::String("…".to_string()));
+    }
+    properties.push(ExplainProperty::new(label, ExplainValue::List(bounded)));
 }
 
 fn push_join_conditions(
@@ -1102,6 +1115,7 @@ fn explain_relation_name(kind: &PhysicalNodeKind) -> Option<String> {
 fn explain_relation_alias(kind: &PhysicalNodeKind) -> Option<String> {
     match kind {
         PhysicalNodeKind::RowsetScan(spec) => spec.relation_alias.clone(),
+        PhysicalNodeKind::Values(spec) => spec.relation_alias.clone(),
         _ => None,
     }
 }
@@ -1212,16 +1226,53 @@ fn format_hops(min_hops: u64, max_hops: u64) -> String {
     }
 }
 
-fn format_output_schema(node: &PhysicalPlanNode, names: &[String]) -> String {
+fn format_output_schema(node: &PhysicalPlanNode) -> String {
     if node.output.column_count() == 0 {
         return "(none)".to_string();
     }
-    names
+    node.output
+        .identities
         .iter()
+        .enumerate()
         .zip(node.output.types.iter())
-        .map(|(name, ty)| format!("{name} {ty}"))
+        .map(|((ordinal, identity), ty)| {
+            let name = match identity {
+                super::row_type::ColumnIdentity::Visible {
+                    name,
+                    qualifier: Some(qualifier),
+                } => qualifier
+                    .iter()
+                    .map(|part| format_schema_identifier(part))
+                    .chain(std::iter::once(format_schema_identifier(name)))
+                    .collect::<Vec<_>>()
+                    .join("."),
+                super::row_type::ColumnIdentity::Visible {
+                    name,
+                    qualifier: None,
+                } => format_schema_identifier(name),
+                super::row_type::ColumnIdentity::Internal => {
+                    format_schema_identifier(&format!("__internal_{}", ordinal + 1))
+                }
+                super::row_type::ColumnIdentity::InternalNamed(name) => {
+                    format_schema_identifier(name)
+                }
+            };
+            format!("{name} {ty}")
+        })
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+fn format_schema_identifier(name: &str) -> String {
+    if !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
+    {
+        return name.to_string();
+    }
+    format!("\"{}\"", name.replace('"', "\"\""))
 }
 
 fn format_join_condition(
@@ -1229,13 +1280,8 @@ fn format_join_condition(
     left_names: &[String],
     right_names: &[String],
 ) -> String {
-    let mut left = ExplainExpressionFormatter::new(left_names).format(&condition.left);
-    let mut right = ExplainExpressionFormatter::new(right_names).format(&condition.right);
-    if left.starts_with("delim_") && !is_internal_column_name(&right) {
-        left = right.clone();
-    } else if right.starts_with("delim_") && !is_internal_column_name(&left) {
-        right = left.clone();
-    }
+    let left = ExplainExpressionFormatter::new(left_names).format(&condition.left);
+    let right = ExplainExpressionFormatter::new(right_names).format(&condition.right);
     format!(
         "{} {} {}",
         left,
@@ -1288,7 +1334,7 @@ fn format_cte_materialization(
     }
 }
 
-fn aggregate_output_names(spec: &AggregateSpec, input_names: &[String]) -> Option<Vec<String>> {
+fn aggregate_scope_names(spec: &AggregateSpec, input_names: &[String]) -> Option<Vec<String>> {
     let formatter = ExplainExpressionFormatter::new(input_names);
     let mut state_names = spec
         .groups
@@ -1307,7 +1353,7 @@ fn aggregate_output_names(spec: &AggregateSpec, input_names: &[String]) -> Optio
             .map(|expression| format_payload_expr(expression, spec, &formatter))
             .collect::<Vec<_>>()
             .join(", ");
-        format!("grouping({arguments})")
+        bound_explain_text(format!("grouping({arguments})"))
     }));
 
     if spec.state_output_projection.is_empty() {
@@ -1396,6 +1442,41 @@ struct ExplainExpressionFormatter<'a> {
     columns: &'a [String],
 }
 
+const EXPLAIN_EXPRESSION_MAX_NODES: usize = 1_024;
+const EXPLAIN_EXPRESSION_MAX_DEPTH: usize = 64;
+const EXPLAIN_EXPRESSION_MAX_BYTES: usize = 16 * 1_024;
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ExplainPrecedence {
+    Lowest,
+    Or,
+    And,
+    Not,
+    Comparison,
+    Primary,
+}
+
+struct ExplainFormatBudget {
+    remaining_nodes: Cell<usize>,
+}
+
+impl ExplainFormatBudget {
+    fn new() -> Self {
+        Self {
+            remaining_nodes: Cell::new(EXPLAIN_EXPRESSION_MAX_NODES),
+        }
+    }
+
+    fn enter(&self, depth: usize) -> bool {
+        let remaining = self.remaining_nodes.get();
+        if depth >= EXPLAIN_EXPRESSION_MAX_DEPTH || remaining == 0 {
+            return false;
+        }
+        self.remaining_nodes.set(remaining - 1);
+        true
+    }
+}
+
 impl<'a> ExplainExpressionFormatter<'a> {
     fn new(columns: &'a [String]) -> Self {
         Self { columns }
@@ -1409,72 +1490,161 @@ impl<'a> ExplainExpressionFormatter<'a> {
     }
 
     fn format_order_by(&self, orders: &[paro_planner::binder::ir::OrderByNode]) -> String {
-        orders
-            .iter()
-            .map(|order| {
-                format!(
-                    "{} {} NULLS {}",
-                    self.format(&order.expression),
-                    if order.ascending { "ASC" } else { "DESC" },
-                    if order.nulls_first { "FIRST" } else { "LAST" }
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(", ")
+        bound_explain_text(
+            orders
+                .iter()
+                .map(|order| {
+                    format!(
+                        "{} {} NULLS {}",
+                        self.format(&order.expression),
+                        if order.ascending { "ASC" } else { "DESC" },
+                        if order.nulls_first { "FIRST" } else { "LAST" }
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        )
     }
 
     fn format(&self, expression: &Expression) -> String {
-        match expression {
-            Expression::Reference(reference) => self.column(reference.index),
-            Expression::ColumnRef(column) => self.column(column.binding.column_index),
-            Expression::Constant(constant) => constant.value.to_string(),
-            Expression::Parameter(parameter) => format!("${}", parameter.slot.index.index() + 1),
-            Expression::Comparison(comparison) => format!(
-                "{} {} {}",
-                self.format(&comparison.left),
-                comparison.comparison_type,
-                self.format(&comparison.right)
+        let budget = ExplainFormatBudget::new();
+        bound_explain_text(self.format_expression(
+            expression,
+            ExplainPrecedence::Lowest,
+            0,
+            &budget,
+        ))
+    }
+
+    fn format_expression(
+        &self,
+        expression: &Expression,
+        parent_precedence: ExplainPrecedence,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
+        if !budget.enter(depth) {
+            return "…".to_string();
+        }
+        let next_depth = depth + 1;
+        let (rendered, precedence) = match expression {
+            Expression::Reference(reference) => {
+                (self.column(reference.index), ExplainPrecedence::Primary)
+            }
+            Expression::ColumnRef(column) => (
+                self.column(column.binding.column_index),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Constant(constant) => {
+                (constant.value.to_string(), ExplainPrecedence::Primary)
+            }
+            Expression::Parameter(parameter) => (
+                format!("${}", parameter.slot.index.index() + 1),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Comparison(comparison) => (
+                format!(
+                    "{} {} {}",
+                    self.format_expression(
+                        &comparison.left,
+                        ExplainPrecedence::Comparison,
+                        next_depth,
+                        budget,
+                    ),
+                    comparison.comparison_type,
+                    self.format_expression(
+                        &comparison.right,
+                        ExplainPrecedence::Comparison,
+                        next_depth,
+                        budget,
+                    )
+                ),
+                ExplainPrecedence::Comparison,
             ),
             Expression::Conjunction(conjunction) => {
-                let separator = match conjunction.conjunction_type {
-                    paro_planner::expression::ConjunctionType::And => " AND ",
-                    paro_planner::expression::ConjunctionType::Or => " OR ",
+                let (separator, precedence) = match conjunction.conjunction_type {
+                    paro_planner::expression::ConjunctionType::And => {
+                        (" AND ", ExplainPrecedence::And)
+                    }
+                    paro_planner::expression::ConjunctionType::Or => {
+                        (" OR ", ExplainPrecedence::Or)
+                    }
                 };
-                conjunction
-                    .children
-                    .iter()
-                    .map(|child| self.format(child))
-                    .collect::<Vec<_>>()
-                    .join(separator)
+                (
+                    conjunction
+                        .children
+                        .iter()
+                        .map(|child| self.format_expression(child, precedence, next_depth, budget))
+                        .collect::<Vec<_>>()
+                        .join(separator),
+                    precedence,
+                )
             }
             Expression::Cast(cast) => {
                 let cast_name = if cast.try_cast { "TRY_CAST" } else { "CAST" };
-                format!(
-                    "{cast_name}({} AS {})",
-                    self.format(&cast.child),
-                    cast.target_type
+                (
+                    format!(
+                        "{cast_name}({} AS {})",
+                        self.format_expression(
+                            &cast.child,
+                            ExplainPrecedence::Lowest,
+                            next_depth,
+                            budget,
+                        ),
+                        cast.target_type
+                    ),
+                    ExplainPrecedence::Primary,
                 )
             }
-            Expression::Function(function) => format!(
-                "{}({})",
-                function.function.name.as_str(),
-                function
-                    .children
-                    .iter()
-                    .map(|child| self.format(child))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            Expression::Function(function) => (
+                format!(
+                    "{}({})",
+                    function.function.name.as_str(),
+                    function
+                        .children
+                        .iter()
+                        .map(|child| self.format_expression(
+                            child,
+                            ExplainPrecedence::Lowest,
+                            next_depth,
+                            budget,
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                ExplainPrecedence::Primary,
             ),
-            Expression::Aggregate(aggregate) => {
-                format_bound_aggregate(aggregate, &|child| self.format(child))
-            }
-            Expression::Case(case_expression) => format!(
-                "CASE WHEN {} THEN {} ELSE {} END",
-                self.format(&case_expression.check),
-                self.format(&case_expression.result_if_true),
-                self.format(&case_expression.result_if_false)
+            Expression::Aggregate(aggregate) => (
+                format_bound_aggregate(aggregate, &|child| {
+                    self.format_expression(child, ExplainPrecedence::Lowest, next_depth, budget)
+                }),
+                ExplainPrecedence::Primary,
             ),
-            Expression::Operator(operator) => self.format_operator(operator),
+            Expression::Case(case_expression) => (
+                format!(
+                    "CASE WHEN {} THEN {} ELSE {} END",
+                    self.format_expression(
+                        &case_expression.check,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    ),
+                    self.format_expression(
+                        &case_expression.result_if_true,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    ),
+                    self.format_expression(
+                        &case_expression.result_if_false,
+                        ExplainPrecedence::Lowest,
+                        next_depth,
+                        budget,
+                    )
+                ),
+                ExplainPrecedence::Primary,
+            ),
+            Expression::Operator(operator) => self.format_operator(operator, next_depth, budget),
             Expression::Subquery(subquery) => {
                 let kind = match subquery.subquery_type {
                     paro_planner::expression::SubqueryType::Scalar => "SUBQUERY",
@@ -1484,95 +1654,174 @@ impl<'a> ExplainExpressionFormatter<'a> {
                     paro_planner::expression::SubqueryType::All => "ALL SUBQUERY",
                 };
                 if subquery.children.is_empty() {
-                    format!("<{kind}>")
+                    (format!("<{kind}>"), ExplainPrecedence::Primary)
                 } else {
-                    format!(
-                        "{} {} <{kind}>",
-                        subquery
-                            .children
-                            .iter()
-                            .map(|child| self.format(child))
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        subquery.comparison_type
+                    (
+                        format!(
+                            "{} {} <{kind}>",
+                            subquery
+                                .children
+                                .iter()
+                                .map(|child| self.format_expression(
+                                    child,
+                                    ExplainPrecedence::Lowest,
+                                    next_depth,
+                                    budget,
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", "),
+                            subquery.comparison_type
+                        ),
+                        ExplainPrecedence::Comparison,
                     )
                 }
             }
-            Expression::Window(window) => self.format_window(window),
+            Expression::Window(window) => (
+                self.format_window(window, next_depth, budget),
+                ExplainPrecedence::Primary,
+            ),
+        };
+        let rendered = bound_explain_text(rendered);
+        if precedence < parent_precedence {
+            bound_explain_text(format!("({rendered})"))
+        } else {
+            rendered
         }
     }
 
-    fn format_operator(&self, operator: &paro_planner::expression::OperatorExpression) -> String {
+    fn format_operator(
+        &self,
+        operator: &paro_planner::expression::OperatorExpression,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> (String, ExplainPrecedence) {
+        let child = |index: usize, precedence: ExplainPrecedence| {
+            operator
+                .children
+                .get(index)
+                .map(|child| self.format_expression(child, precedence, depth, budget))
+        };
         let children = || {
             operator
                 .children
                 .iter()
-                .map(|child| self.format(child))
+                .map(|child| {
+                    self.format_expression(child, ExplainPrecedence::Lowest, depth, budget)
+                })
                 .collect::<Vec<_>>()
         };
         match operator.operator_type {
-            OperatorType::In | OperatorType::NotIn if operator.children.len() >= 2 => format!(
-                "{} {}IN ({})",
-                self.format(&operator.children[0]),
-                if operator.operator_type == OperatorType::NotIn {
-                    "NOT "
-                } else {
-                    ""
+            OperatorType::In | OperatorType::NotIn => (
+                child(0, ExplainPrecedence::Comparison).map_or_else(
+                    || "<invalid IN>".to_string(),
+                    |left| {
+                        format!(
+                            "{} {}IN ({})",
+                            left,
+                            if operator.operator_type == OperatorType::NotIn {
+                                "NOT "
+                            } else {
+                                ""
+                            },
+                            operator.children[1..]
+                                .iter()
+                                .map(|child| self.format_expression(
+                                    child,
+                                    ExplainPrecedence::Lowest,
+                                    depth,
+                                    budget,
+                                ))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    },
+                ),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::Not => (
+                child(0, ExplainPrecedence::Not)
+                    .map(|child| format!("NOT {child}"))
+                    .unwrap_or_else(|| "<invalid NOT>".to_string()),
+                ExplainPrecedence::Not,
+            ),
+            OperatorType::IsNull => (
+                child(0, ExplainPrecedence::Comparison)
+                    .map(|child| format!("{child} IS NULL"))
+                    .unwrap_or_else(|| "<invalid IS NULL>".to_string()),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::IsNotNull => (
+                child(0, ExplainPrecedence::Comparison)
+                    .map(|child| format!("{child} IS NOT NULL"))
+                    .unwrap_or_else(|| "<invalid IS NOT NULL>".to_string()),
+                ExplainPrecedence::Comparison,
+            ),
+            OperatorType::Coalesce => (
+                format!("COALESCE({})", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::Like | OperatorType::ILike => (
+                match (
+                    child(0, ExplainPrecedence::Comparison),
+                    child(1, ExplainPrecedence::Comparison),
+                ) {
+                    (Some(left), Some(right)) => format!(
+                        "{} {} {}",
+                        left,
+                        if operator.operator_type == OperatorType::Like {
+                            "LIKE"
+                        } else {
+                            "ILIKE"
+                        },
+                        right
+                    ),
+                    _ => "<invalid LIKE>".to_string(),
                 },
-                operator.children[1..]
-                    .iter()
-                    .map(|child| self.format(child))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                ExplainPrecedence::Comparison,
             ),
-            OperatorType::Not => operator
-                .children
-                .first()
-                .map(|child| format!("NOT {}", self.format(child)))
-                .unwrap_or_else(|| "NOT".to_string()),
-            OperatorType::IsNull => operator
-                .children
-                .first()
-                .map(|child| format!("{} IS NULL", self.format(child)))
-                .unwrap_or_else(|| "IS NULL".to_string()),
-            OperatorType::IsNotNull => operator
-                .children
-                .first()
-                .map(|child| format!("{} IS NOT NULL", self.format(child)))
-                .unwrap_or_else(|| "IS NOT NULL".to_string()),
-            OperatorType::Coalesce => format!("COALESCE({})", children().join(", ")),
-            OperatorType::Like | OperatorType::ILike if operator.children.len() == 2 => format!(
-                "{} {} {}",
-                self.format(&operator.children[0]),
-                if operator.operator_type == OperatorType::Like {
-                    "LIKE"
-                } else {
-                    "ILIKE"
+            OperatorType::ArrayConstructor => (
+                format!("[{}]", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::StructConstructor => (
+                format!("({})", children().join(", ")),
+                ExplainPrecedence::Primary,
+            ),
+            OperatorType::ArrayExtract => (
+                match (
+                    child(0, ExplainPrecedence::Primary),
+                    child(1, ExplainPrecedence::Lowest),
+                ) {
+                    (Some(array), Some(index)) => format!("{array}[{index}]"),
+                    _ => "<invalid array extract>".to_string(),
                 },
-                self.format(&operator.children[1])
+                ExplainPrecedence::Primary,
             ),
-            OperatorType::ArrayConstructor => format!("[{}]", children().join(", ")),
-            OperatorType::StructConstructor => format!("({})", children().join(", ")),
-            OperatorType::ArrayExtract if operator.children.len() == 2 => format!(
-                "{}[{}]",
-                self.format(&operator.children[0]),
-                self.format(&operator.children[1])
+            OperatorType::ErrorIfMultipleRows => (
+                format!("error_if_multiple_rows({})", children().join(", ")),
+                ExplainPrecedence::Primary,
             ),
-            OperatorType::ErrorIfMultipleRows => {
-                format!("error_if_multiple_rows({})", children().join(", "))
-            }
-            _ => format!("{:?}({})", operator.operator_type, children().join(", ")),
         }
     }
 
-    fn format_window(&self, window: &paro_planner::expression::WindowExpression) -> String {
+    fn format_window(
+        &self,
+        window: &paro_planner::expression::WindowExpression,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
         let mut rendered = format!(
             "{}({}) OVER (",
             window.function_name(),
             window
                 .arguments()
                 .iter()
-                .map(|argument| self.format(argument))
+                .map(|argument| self.format_expression(
+                    argument,
+                    ExplainPrecedence::Lowest,
+                    depth,
+                    budget,
+                ))
                 .collect::<Vec<_>>()
                 .join(", ")
         );
@@ -1582,7 +1831,9 @@ impl<'a> ExplainExpressionFormatter<'a> {
                 &window
                     .partitions
                     .iter()
-                    .map(|partition| self.format(partition))
+                    .map(|partition| {
+                        self.format_expression(partition, ExplainPrecedence::Lowest, depth, budget)
+                    })
                     .collect::<Vec<_>>()
                     .join(", "),
             );
@@ -1599,7 +1850,12 @@ impl<'a> ExplainExpressionFormatter<'a> {
                     .map(|order| {
                         format!(
                             "{} {} NULLS {}",
-                            self.format(&order.expression),
+                            self.format_expression(
+                                &order.expression,
+                                ExplainPrecedence::Lowest,
+                                depth,
+                                budget,
+                            ),
                             if order.ascending { "ASC" } else { "DESC" },
                             if order.nulls_first { "FIRST" } else { "LAST" }
                         )
@@ -1615,18 +1871,30 @@ impl<'a> ExplainExpressionFormatter<'a> {
             WindowFrameType::Rows => "ROWS BETWEEN ",
             WindowFrameType::Range => "RANGE BETWEEN ",
         });
-        rendered.push_str(
-            &self.format_window_bound(&window.frame.start_bound, window.frame.start_is_preceding),
-        );
+        rendered.push_str(&self.format_window_bound(
+            &window.frame.start_bound,
+            window.frame.start_is_preceding,
+            depth,
+            budget,
+        ));
         rendered.push_str(" AND ");
-        rendered.push_str(
-            &self.format_window_bound(&window.frame.end_bound, window.frame.end_is_preceding),
-        );
+        rendered.push_str(&self.format_window_bound(
+            &window.frame.end_bound,
+            window.frame.end_is_preceding,
+            depth,
+            budget,
+        ));
         rendered.push(')');
-        rendered
+        bound_explain_text(rendered)
     }
 
-    fn format_window_bound(&self, bound: &WindowFrameBound, preceding: bool) -> String {
+    fn format_window_bound(
+        &self,
+        bound: &WindowFrameBound,
+        preceding: bool,
+        depth: usize,
+        budget: &ExplainFormatBudget,
+    ) -> String {
         match bound {
             WindowFrameBound::Unbounded => format!(
                 "UNBOUNDED {}",
@@ -1635,11 +1903,24 @@ impl<'a> ExplainExpressionFormatter<'a> {
             WindowFrameBound::CurrentRow => "CURRENT ROW".to_string(),
             WindowFrameBound::Offset(offset) => format!(
                 "{} {}",
-                self.format(offset),
+                self.format_expression(offset, ExplainPrecedence::Lowest, depth, budget),
                 if preceding { "PRECEDING" } else { "FOLLOWING" }
             ),
         }
     }
+}
+
+fn bound_explain_text(mut text: String) -> String {
+    if text.len() <= EXPLAIN_EXPRESSION_MAX_BYTES {
+        return text;
+    }
+    let mut boundary = EXPLAIN_EXPRESSION_MAX_BYTES.saturating_sub('…'.len_utf8());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
+    text.push('…');
+    text
 }
 
 fn table_column_name(table: &TableCatalogEntry, column_id: usize) -> String {
@@ -1651,18 +1932,63 @@ fn table_column_name(table: &TableCatalogEntry, column_id: usize) -> String {
 }
 
 fn format_predicate_tree(predicate: &PredicateTree, table: &TableCatalogEntry) -> String {
-    match predicate {
-        PredicateTree::Leaf(predicate) => format_predicate(predicate, table),
-        PredicateTree::And(children) => children
-            .iter()
-            .map(|child| format_predicate_tree(child, table))
-            .collect::<Vec<_>>()
-            .join(" AND "),
-        PredicateTree::Or(children) => children
-            .iter()
-            .map(|child| format_predicate_tree(child, table))
-            .collect::<Vec<_>>()
-            .join(" OR "),
+    let budget = ExplainFormatBudget::new();
+    format_predicate_tree_with_precedence(predicate, table, ExplainPrecedence::Lowest, 0, &budget)
+}
+
+fn format_predicate_tree_with_precedence(
+    predicate: &PredicateTree,
+    table: &TableCatalogEntry,
+    parent_precedence: ExplainPrecedence,
+    depth: usize,
+    budget: &ExplainFormatBudget,
+) -> String {
+    if !budget.enter(depth) {
+        return "…".to_string();
+    }
+    let next_depth = depth + 1;
+    let (rendered, precedence) = match predicate {
+        PredicateTree::Leaf(predicate) => (
+            format_predicate(predicate, table),
+            ExplainPrecedence::Primary,
+        ),
+        PredicateTree::And(children) => (
+            children
+                .iter()
+                .map(|child| {
+                    format_predicate_tree_with_precedence(
+                        child,
+                        table,
+                        ExplainPrecedence::And,
+                        next_depth,
+                        budget,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" AND "),
+            ExplainPrecedence::And,
+        ),
+        PredicateTree::Or(children) => (
+            children
+                .iter()
+                .map(|child| {
+                    format_predicate_tree_with_precedence(
+                        child,
+                        table,
+                        ExplainPrecedence::Or,
+                        next_depth,
+                        budget,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" OR "),
+            ExplainPrecedence::Or,
+        ),
+    };
+    if precedence < parent_precedence {
+        bound_explain_text(format!("({rendered})"))
+    } else {
+        bound_explain_text(rendered)
     }
 }
 
@@ -1740,9 +2066,23 @@ fn format_search_predicate(
     predicate: &crate::physical::specs::SearchPredicateTemplate,
     table: &TableCatalogEntry,
 ) -> String {
+    let budget = ExplainFormatBudget::new();
+    format_search_predicate_inner(predicate, table, 0, &budget)
+}
+
+fn format_search_predicate_inner(
+    predicate: &crate::physical::specs::SearchPredicateTemplate,
+    table: &TableCatalogEntry,
+    depth: usize,
+    budget: &ExplainFormatBudget,
+) -> String {
     use crate::physical::specs::SearchPredicateTemplate;
 
-    match predicate {
+    if !budget.enter(depth) {
+        return "…".to_string();
+    }
+    let next_depth = depth + 1;
+    bound_explain_text(match predicate {
         SearchPredicateTemplate::Bound(predicate) => format_predicate_tree(predicate, table),
         SearchPredicateTemplate::ParameterComparison {
             column_id,
@@ -1758,7 +2098,7 @@ fn format_search_predicate(
             "({})",
             children
                 .iter()
-                .map(|child| format_search_predicate(child, table))
+                .map(|child| format_search_predicate_inner(child, table, next_depth, budget))
                 .collect::<Vec<_>>()
                 .join(" AND ")
         ),
@@ -1766,36 +2106,9 @@ fn format_search_predicate(
             "({})",
             children
                 .iter()
-                .map(|child| format_search_predicate(child, table))
+                .map(|child| format_search_predicate_inner(child, table, next_depth, budget))
                 .collect::<Vec<_>>()
                 .join(" OR ")
         ),
-    }
-}
-
-fn is_internal_column_name(name: &str) -> bool {
-    if name.starts_with("__") {
-        return true;
-    }
-    [
-        "col", "expr_", "ref_", "aggr_", "group_", "window_", "delim_",
-    ]
-    .iter()
-    .any(|prefix| {
-        name.strip_prefix(prefix).is_some_and(|suffix| {
-            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_digit())
-        })
     })
-}
-
-fn qualify_column_name(qualifier: &str, name: String) -> String {
-    if name.contains('.')
-        || name
-            .chars()
-            .any(|character| !(character.is_ascii_alphanumeric() || character == '_'))
-    {
-        name
-    } else {
-        format!("{qualifier}.{name}")
-    }
 }

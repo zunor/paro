@@ -119,9 +119,8 @@ ORDER_BY  (rows=2)
       ->  PROJECTION  (rows=2)
         Output: category, sum_x
         ->  AGGREGATE  (rows=2)
-          Group Key: category
-          Aggregates: sum(x)
-          Output: category, sum(x)
+          Group Key: agg_m_values.category
+          Aggregates: sum(agg_m_values.x)
           ->  PROJECTION  (rows=4)
             Output: category, x
             ->  VALUES  (rows=4)

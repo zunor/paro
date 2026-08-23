@@ -28,6 +28,8 @@ pub struct GraphMatch {
     pub columns: Vec<BoundGraphColumn>,
     /// Table index assigned to this GRAPH_TABLE reference.
     pub table_index: usize,
+    /// Relation namespace used to bind the GRAPH_TABLE output.
+    pub relation_alias: String,
     /// Output column types (derived from COLUMNS).
     pub output_types: Vec<LogicalType>,
     /// Optional path mode (ANY SHORTEST, ALL SHORTEST, etc.)
@@ -42,6 +44,7 @@ impl GraphMatch {
         bound_pattern: BoundGraphPattern,
         columns: Vec<BoundGraphColumn>,
         table_index: usize,
+        relation_alias: String,
         output_types: Vec<LogicalType>,
         path_mode: Option<PathMode>,
         has_path_functions: bool,
@@ -51,6 +54,7 @@ impl GraphMatch {
             bound_pattern,
             columns,
             table_index,
+            relation_alias,
             output_types,
             path_mode,
             has_path_functions,

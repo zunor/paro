@@ -594,6 +594,7 @@ impl AggregateJoinSubsumption {
         projection
             .visible_names
             .push("partial_aggregate".to_string());
+        projection.visible_count += 1;
         projection.returned_types.push(aggregate_type.clone());
         Some(())
     }

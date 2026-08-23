@@ -101,7 +101,6 @@ PROJECTION  (rows=1)
   Output: COUNT(*)
   ->  AGGREGATE  (rows=1)
     Aggregates: count_star(*)
-    Output: count_star(*)
     ->  PROJECTION  (rows=100)
       Output: 42
       ->  PROJECTION  (rows=100)

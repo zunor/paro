@@ -108,7 +108,8 @@ impl TopNOptimizer {
             .and_then(Self::extract_constant_value)
             .unwrap_or(0);
 
-        let mut projections: Vec<(usize, Vec<Expression>, Vec<String>)> = Vec::new();
+        let mut projections: Vec<(usize, Vec<Expression>, Vec<String>, usize, Option<String>)> =
+            Vec::new();
         let mut child_lp = *limit.child;
 
         loop {
@@ -121,11 +122,19 @@ impl TopNOptimizer {
                 table_index,
                 expressions,
                 visible_names,
+                visible_count,
+                visible_qualifier,
                 child,
                 ..
             } = proj;
             let inner = *child;
-            projections.push((table_index, expressions, visible_names));
+            projections.push((
+                table_index,
+                expressions,
+                visible_names,
+                visible_count,
+                visible_qualifier,
+            ));
             child_lp = inner;
         }
 
@@ -136,10 +145,16 @@ impl TopNOptimizer {
                 child_lp.operator = other;
                 let mut result =
                     LogicalOperator::Order(paro_planner::operator::Order::new(child_lp, vec![]));
-                while let Some((table_index, expressions, output_names)) = projections.pop() {
-                    let proj =
+                while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
+                    projections.pop()
+                {
+                    let mut proj =
                         Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
                             .with_visible_names(output_names);
+                    proj.visible_count = visible_count;
+                    if let Some(qualifier) = qualifier {
+                        proj = proj.with_visible_qualifier(qualifier);
+                    }
                     result = LogicalOperator::Projection(proj);
                 }
                 return LogicalPlan {
@@ -155,9 +170,16 @@ impl TopNOptimizer {
             .with_hnsw_ef_hint(limit.hnsw_ef_hint);
         let mut result = LogicalOperator::TopN(topn);
 
-        while let Some((table_index, expressions, output_names)) = projections.pop() {
-            let proj = Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
-                .with_visible_names(output_names);
+        while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
+            projections.pop()
+        {
+            let mut proj =
+                Projection::new(table_index, LogicalPlan::synthetic(result), expressions)
+                    .with_visible_names(output_names);
+            proj.visible_count = visible_count;
+            if let Some(qualifier) = qualifier {
+                proj = proj.with_visible_qualifier(qualifier);
+            }
             result = LogicalOperator::Projection(proj);
         }
 

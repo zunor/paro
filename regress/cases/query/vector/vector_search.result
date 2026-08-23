@@ -33,10 +33,10 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: l2_distance(emb, [1, 1, 1]) ASC NULLS LAST
+    Sort Key: l2_distance(public.items.emb, [1, 1, 1]) ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=4)
-      Output: id, l2_distance(emb, [1, 1, 1])
+      Output: id, l2_distance(public.items.emb, [1, 1, 1])
       ->  ROWSET_SCAN on public.items  (rows=4)
         Columns: id, emb
 
@@ -119,10 +119,10 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: cosine_distance(emb, [1, 0, 0]) ASC NULLS LAST
+    Sort Key: cosine_distance(public.indexed_items.emb, [1, 0, 0]) ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=2048)
-      Output: id, cosine_distance(emb, [1, 0, 0])
+      Output: id, cosine_distance(public.indexed_items.emb, [1, 0, 0])
       ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
         Columns: id, emb
 

@@ -49,6 +49,7 @@ pub struct BoundFromGraphTable {
     pub bound_pattern: BoundGraphPattern,
     pub bound_columns: Vec<BoundGraphColumn>,
     pub table_index: usize,
+    pub relation_alias: String,
     pub output_names: Vec<String>,
     pub output_types: Vec<LogicalType>,
     pub path_mode: Option<PathMode>,

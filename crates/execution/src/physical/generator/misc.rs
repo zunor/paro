@@ -61,10 +61,25 @@ impl PhysicalPlanGenerator {
             let projection = ProjectSpec {
                 expressions: input_expressions.into_boxed_slice(),
                 output_names: input_names.clone().into_boxed_slice(),
+                visible_count: 0,
             };
+            let input_identities = projection
+                .expressions
+                .iter()
+                .map(|expression| {
+                    let Expression::Reference(reference) = expression else {
+                        return ColumnIdentity::Internal;
+                    };
+                    self.arena
+                        .get(child)
+                        .and_then(|node| node.output.identities.get(reference.index))
+                        .cloned()
+                        .unwrap_or(ColumnIdentity::Internal)
+                })
+                .collect();
             child = self.push_node(
                 PhysicalNodeKind::Project(projection),
-                RowType::new(input_names, input_types),
+                RowType::with_identities(input_names, input_types, input_identities),
                 vec![child],
                 OperatorLabel::new(window.child.id, "WINDOW_INPUT"),
                 window.child.stats.estimated_cardinality,

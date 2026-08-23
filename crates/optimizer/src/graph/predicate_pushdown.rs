@@ -474,6 +474,7 @@ mod tests {
             BoundGraphPattern { elements },
             columns,
             table_index,
+            "graph_table".to_string(),
             output_types,
             None,
             false,

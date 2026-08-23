@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::operators::aggregate::perfect_hash_key::PerfectHashKeyDomain;
+use paro_catalog::entry::StandardEntry;
 use paro_planner::operator::graph_expand::graph_path_element_list_type;
 
 pub(crate) fn extract_payload_expression(
@@ -143,15 +144,18 @@ pub(crate) fn is_read_csv_table_function(plan: &LogicalPlan) -> bool {
 
 pub(crate) fn physical_output_row_type(logical: &LogicalPlan) -> Result<RowType> {
     let types = logical.types();
-    let names = align_output_names(logical.output_names(), types.len(), "logical output")?;
-    Ok(RowType::new(names, types))
+    let visible_names = logical.output_names();
+    let names = align_output_names(visible_names.clone(), types.len(), "logical output")?;
+    let identities = identities_from_visible_names(&visible_names, types.len());
+    Ok(RowType::with_identities(names, types, identities))
 }
 
 pub(crate) fn physical_output_row_type_for_kind(
     logical: &LogicalPlan,
     kind: &PhysicalNodeKind,
+    child_outputs: &[&RowType],
 ) -> Result<RowType> {
-    match kind {
+    let mut output = match kind {
         PhysicalNodeKind::GraphScan(spec) => Ok(RowType::new(
             vec!["local_vertex_id".to_string(), "rowid".to_string()],
             spec.output_types.to_vec(),
@@ -182,9 +186,18 @@ pub(crate) fn physical_output_row_type_for_kind(
             spec.output_names.to_vec(),
             spec.output_types.to_vec(),
         )),
-        PhysicalNodeKind::Values(spec) => Ok(RowType::new(
+        PhysicalNodeKind::Values(spec) => Ok(RowType::with_identities(
             spec.output_names.to_vec(),
             spec.output_types.to_vec(),
+            spec.output_names
+                .iter()
+                .map(|name| {
+                    spec.relation_alias.as_ref().map_or_else(
+                        || ColumnIdentity::visible(name.clone()),
+                        |alias| ColumnIdentity::qualified(name.clone(), alias.clone()),
+                    )
+                })
+                .collect(),
         )),
         PhysicalNodeKind::HashJoin(spec) => Ok(RowType::new(
             spec.output_names.to_vec(),
@@ -222,7 +235,479 @@ pub(crate) fn physical_output_row_type_for_kind(
             spec.output_types.to_vec(),
         )),
         _ => physical_output_row_type(logical),
+    }?;
+
+    output.identities =
+        physical_column_identities(logical, kind, child_outputs, &output).into_boxed_slice();
+    debug_assert_eq!(output.identities.len(), output.column_count());
+    Ok(output)
+}
+
+fn physical_column_identities(
+    logical: &LogicalPlan,
+    kind: &PhysicalNodeKind,
+    child_outputs: &[&RowType],
+    output: &RowType,
+) -> Vec<ColumnIdentity> {
+    let fallback = || {
+        let visible_names = logical.output_names();
+        identities_from_visible_names(&visible_names, output.column_count())
+    };
+    let child = |index: usize| child_outputs.get(index).copied();
+
+    match kind {
+        PhysicalNodeKind::RowsetScan(spec) => {
+            let qualifier = spec.relation_alias.as_ref().map_or_else(
+                || {
+                    vec![
+                        spec.table.schema_name().to_string(),
+                        spec.table.name().to_string(),
+                    ]
+                },
+                |alias| vec![alias.clone()],
+            );
+            spec.output_names
+                .iter()
+                .zip(spec.output_sources.iter())
+                .map(|(name, source)| match source {
+                    paro_planner::operator::GetColumnSource::Stored { .. } => {
+                        ColumnIdentity::qualified_path(name.clone(), qualifier.clone())
+                    }
+                    paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                        source_column,
+                        byte_width,
+                    } => ColumnIdentity::internal_named(format!(
+                        "__matched_prefix_{source_column}_{byte_width}"
+                    )),
+                    paro_planner::operator::GetColumnSource::VirtualRowId => {
+                        ColumnIdentity::internal_named("rowid")
+                    }
+                })
+                .collect()
+        }
+        PhysicalNodeKind::Values(spec) => spec
+            .output_names
+            .iter()
+            .map(|name| {
+                spec.relation_alias.as_ref().map_or_else(
+                    || ColumnIdentity::visible(name.clone()),
+                    |alias| ColumnIdentity::qualified(name.clone(), alias.clone()),
+                )
+            })
+            .collect(),
+        PhysicalNodeKind::GraphProject(spec) => {
+            let (visible_names, visible_qualifier) = match &logical.operator {
+                LogicalOperator::Projection(project) => (
+                    project.visible_names.as_slice(),
+                    project.visible_qualifier.as_deref(),
+                ),
+                _ => (spec.output_names.as_ref(), None),
+            };
+            (0..output.column_count())
+                .map(|index| {
+                    let name = visible_names
+                        .get(index)
+                        .or_else(|| spec.output_names.get(index))
+                        .expect("graph project column must have an output name");
+                    visible_qualifier.map_or_else(
+                        || ColumnIdentity::visible(name.clone()),
+                        |qualifier| ColumnIdentity::qualified(name.clone(), qualifier),
+                    )
+                })
+                .collect()
+        }
+        PhysicalNodeKind::Project(spec) => {
+            let (visible_names, visible_qualifier) = match &logical.operator {
+                LogicalOperator::Projection(project) => (
+                    project.visible_names.clone(),
+                    project.visible_qualifier.as_deref(),
+                ),
+                _ => (logical.output_names(), None),
+            };
+            spec.expressions
+                .iter()
+                .enumerate()
+                .map(|(index, expression)| {
+                    if index < spec.visible_count {
+                        let name = visible_names
+                            .get(index)
+                            .or_else(|| spec.output_names.get(index))
+                            .expect("visible project column must have an output name");
+                        return visible_qualifier.map_or_else(
+                            || ColumnIdentity::visible(name.clone()),
+                            |qualifier| ColumnIdentity::qualified(name.clone(), qualifier),
+                        );
+                    }
+                    if let Expression::Reference(reference) = expression {
+                        if let Some(identity) =
+                            child(0).and_then(|row_type| row_type.identities.get(reference.index))
+                        {
+                            return identity.clone();
+                        }
+                    }
+                    ColumnIdentity::internal_named(format!("expression_{}", index + 1))
+                })
+                .collect()
+        }
+        PhysicalNodeKind::Filter(spec) => child(0)
+            .map(|input| project_identities(input, &spec.projection_map))
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::Sort(spec) => child(0)
+            .map(|input| project_identities(input, &spec.projection_map))
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::Limit(_)
+        | PhysicalNodeKind::TopN(_)
+        | PhysicalNodeKind::EmptyResult(_) => child(0)
+            .filter(|input| input.column_count() == output.column_count())
+            .map(|input| input.identities.to_vec())
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::HashJoin(spec) => {
+            let mut identities = child(0)
+                .map(|input| project_identities(input, &spec.left_projection))
+                .unwrap_or_default();
+            if let Some(input) = child(1) {
+                identities.extend(
+                    spec.build_input_projection
+                        .iter()
+                        .take(spec.build_output_count)
+                        .filter_map(|index| input.identities.get(*index).cloned()),
+                );
+            }
+            complete_identities(identities, output, fallback)
+        }
+        PhysicalNodeKind::NestedLoopJoin(spec) => join_projection_identities(
+            child(0),
+            child(1),
+            &spec.left_projection,
+            &spec.right_projection,
+            output,
+            fallback,
+        ),
+        PhysicalNodeKind::SortRangeJoin(spec) => join_projection_identities(
+            child(0),
+            child(1),
+            &spec.left_projection,
+            &spec.right_projection,
+            output,
+            fallback,
+        ),
+        PhysicalNodeKind::ClassicIeJoin(spec) => join_projection_identities(
+            child(0),
+            child(1),
+            &spec.left_projection,
+            &spec.right_projection,
+            output,
+            fallback,
+        ),
+        PhysicalNodeKind::CrossProduct(_) => {
+            let mut identities = child(0)
+                .map(|input| input.identities.to_vec())
+                .unwrap_or_default();
+            if let Some(input) = child(1) {
+                identities.extend(input.identities.iter().cloned());
+            }
+            complete_identities(identities, output, fallback)
+        }
+        PhysicalNodeKind::Aggregate(spec) => {
+            let mut identities = spec
+                .groups
+                .iter()
+                .enumerate()
+                .map(|(group_index, group)| {
+                    let payload = if let Expression::Reference(reference) = group {
+                        spec.projection_exprs.get(reference.index).unwrap_or(group)
+                    } else {
+                        group
+                    };
+                    if let Expression::Reference(reference) = payload {
+                        child(0)
+                            .and_then(|input| input.identities.get(reference.index))
+                            .cloned()
+                            .unwrap_or_else(|| {
+                                ColumnIdentity::internal_named(format!(
+                                    "group_key_{}",
+                                    group_index + 1
+                                ))
+                            })
+                    } else {
+                        ColumnIdentity::internal_named(format!("group_key_{}", group_index + 1))
+                    }
+                })
+                .collect::<Vec<_>>();
+            identities.extend((0..spec.aggregates.len()).map(|index| {
+                ColumnIdentity::internal_named(format!("aggregate_state_{}", index + 1))
+            }));
+            identities
+                .extend((0..spec.grouping_functions.len()).map(|index| {
+                    ColumnIdentity::internal_named(format!("grouping_{}", index + 1))
+                }));
+            identities.resize(output.column_count(), ColumnIdentity::Internal);
+            identities
+        }
+        PhysicalNodeKind::Window(spec) => {
+            let mut identities = child(0)
+                .map(|input| {
+                    input
+                        .identities
+                        .iter()
+                        .take(spec.input_width)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            identities.extend(
+                (0..spec.expressions.len())
+                    .map(|index| ColumnIdentity::internal_named(format!("window_{}", index + 1))),
+            );
+            identities.resize(output.column_count(), ColumnIdentity::Internal);
+            identities
+        }
+        PhysicalNodeKind::ExternalProject(spec) => {
+            let input_width = spec.input_types.len();
+            let mut identities = child(0)
+                .map(|input| input.identities.to_vec())
+                .unwrap_or_default();
+            identities.truncate(input_width);
+            identities.extend(
+                spec.output_names
+                    .iter()
+                    .skip(input_width)
+                    .cloned()
+                    .map(ColumnIdentity::visible),
+            );
+            complete_identities(identities, output, fallback)
+        }
+        PhysicalNodeKind::ExternalTable(spec) => {
+            let worker_width = spec.worker_output_types.len();
+            let visible_names = logical.output_names();
+            let mut identities = visible_names
+                .iter()
+                .take(worker_width)
+                .cloned()
+                .map(ColumnIdentity::visible)
+                .collect::<Vec<_>>();
+            if let Some(input) = child(0) {
+                identities.extend(input.identities.iter().skip(spec.argument_count).cloned());
+            }
+            complete_identities(identities, output, fallback)
+        }
+        PhysicalNodeKind::PartitionAggregateWindow(spec) => {
+            let mut identities = child(0)
+                .map(|input| project_identities(input, &spec.detail_columns))
+                .unwrap_or_default();
+            identities.resize(output.column_count(), ColumnIdentity::Internal);
+            identities
+        }
+        PhysicalNodeKind::MaterializedCte(_) => child(1)
+            .filter(|input| input.column_count() == output.column_count())
+            .map(|input| input.identities.to_vec())
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::DelimJoin(_) => child(1)
+            .filter(|input| input.column_count() == output.column_count())
+            .map(|input| input.identities.to_vec())
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::CteScan(spec) => spec
+            .output_names
+            .iter()
+            .cloned()
+            .map(|name| ColumnIdentity::qualified(name, spec.relation_alias.clone()))
+            .collect(),
+        PhysicalNodeKind::VectorSearch(_)
+        | PhysicalNodeKind::SparseVectorSearch(_)
+        | PhysicalNodeKind::FullTextSearch(_)
+        | PhysicalNodeKind::AdaptiveSearch(_) => match &logical.operator {
+            LogicalOperator::SearchScan(search) => search
+                .projections
+                .iter()
+                .enumerate()
+                .map(|(index, expression)| {
+                    search_projection_identity(search, expression)
+                        .or_else(|| {
+                            search
+                                .output_names
+                                .get(index)
+                                .cloned()
+                                .map(ColumnIdentity::visible)
+                        })
+                        .unwrap_or(ColumnIdentity::Internal)
+                })
+                .collect(),
+            LogicalOperator::FullTextFilterScan(search) => get_column_identities(&search.get),
+            _ => fallback(),
+        },
+        PhysicalNodeKind::RowFetch(spec) => {
+            if let Some(projection) = &spec.projection {
+                let visible_names = match &logical.operator {
+                    LogicalOperator::Projection(project) => &project.visible_names,
+                    _ => return fallback(),
+                };
+                return projection
+                    .expressions
+                    .iter()
+                    .enumerate()
+                    .map(|(index, expression)| {
+                        visible_names
+                            .get(index)
+                            .cloned()
+                            .map(ColumnIdentity::visible)
+                            .or_else(|| {
+                                let Expression::Reference(reference) = expression else {
+                                    return None;
+                                };
+                                child(0)
+                                    .and_then(|input| input.identities.get(reference.index))
+                                    .cloned()
+                            })
+                            .unwrap_or(ColumnIdentity::Internal)
+                    })
+                    .collect();
+            }
+            let mut identities = child(0)
+                .map(|input| input.identities.to_vec())
+                .unwrap_or_default();
+            for mapping in &spec.mappings {
+                identities.extend(mapping.column_ids.iter().map(|column_id| {
+                    logical_row_fetch_column_name(logical, mapping.table_index, *column_id)
+                        .map(|name| ColumnIdentity::qualified(name, mapping.table_name.clone()))
+                        .unwrap_or(ColumnIdentity::Internal)
+                }));
+            }
+            complete_identities(identities, output, fallback)
+        }
+        PhysicalNodeKind::SetOperation(_) => child(0)
+            .filter(|input| input.column_count() == output.column_count())
+            .map(|input| {
+                input
+                    .identities
+                    .iter()
+                    .map(ColumnIdentity::without_qualifier)
+                    .collect()
+            })
+            .unwrap_or_else(fallback),
+        PhysicalNodeKind::GraphScan(_) => (0..output.column_count())
+            .map(|index| match index {
+                0 => ColumnIdentity::internal_named("local_vertex_id"),
+                1 => ColumnIdentity::internal_named("rowid"),
+                _ => ColumnIdentity::Internal,
+            })
+            .collect(),
+        _ => fallback(),
     }
+}
+
+fn get_column_identities(get: &Get) -> Vec<ColumnIdentity> {
+    let qualifier = get.relation_alias.as_ref().map_or_else(
+        || {
+            get.table.as_ref().map_or_else(Vec::new, |table| {
+                vec![table.schema_name().to_string(), table.name().to_string()]
+            })
+        },
+        |alias| vec![alias.clone()],
+    );
+    get.names
+        .iter()
+        .zip(get.column_sources.iter())
+        .map(|(name, source)| match source {
+            paro_planner::operator::GetColumnSource::Stored { .. } if qualifier.is_empty() => {
+                ColumnIdentity::visible(name.clone())
+            }
+            paro_planner::operator::GetColumnSource::Stored { .. } => {
+                ColumnIdentity::qualified_path(name.clone(), qualifier.clone())
+            }
+            paro_planner::operator::GetColumnSource::MatchedUtf8Prefix {
+                source_column,
+                byte_width,
+            } => ColumnIdentity::internal_named(format!(
+                "__matched_prefix_{source_column}_{byte_width}"
+            )),
+            paro_planner::operator::GetColumnSource::VirtualRowId => {
+                ColumnIdentity::internal_named("rowid")
+            }
+        })
+        .collect()
+}
+
+fn search_projection_identity(
+    search: &LogicalSearchScan,
+    expression: &Expression,
+) -> Option<ColumnIdentity> {
+    let index = match expression {
+        Expression::ColumnRef(column) if column.binding.table_index == search.get.table_index => {
+            column.binding.column_index
+        }
+        Expression::Reference(reference) => reference.index,
+        _ => return None,
+    };
+    get_column_identities(&search.get).get(index).cloned()
+}
+
+fn logical_row_fetch_column_name(
+    logical: &LogicalPlan,
+    table_index: usize,
+    column_id: u32,
+) -> Option<String> {
+    let fetch = match &logical.operator {
+        LogicalOperator::RowFetch(fetch) => fetch,
+        LogicalOperator::Projection(project) => match &project.child.operator {
+            LogicalOperator::RowFetch(fetch) => fetch,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    fetch
+        .sources
+        .iter()
+        .find(|source| source.materialized_table_index == table_index)
+        .and_then(|source| source.table.columns.get(column_id as usize))
+        .map(|column| column.name.clone())
+}
+
+fn identities_from_visible_names(names: &[String], output_width: usize) -> Vec<ColumnIdentity> {
+    (0..output_width)
+        .map(|index| {
+            names
+                .get(index)
+                .cloned()
+                .map(ColumnIdentity::visible)
+                .unwrap_or(ColumnIdentity::Internal)
+        })
+        .collect()
+}
+
+fn project_identities(input: &RowType, projection: &[usize]) -> Vec<ColumnIdentity> {
+    projection
+        .iter()
+        .filter_map(|index| input.identities.get(*index).cloned())
+        .collect()
+}
+
+fn join_projection_identities(
+    left: Option<&RowType>,
+    right: Option<&RowType>,
+    left_projection: &[usize],
+    right_projection: &[usize],
+    output: &RowType,
+    fallback: impl FnOnce() -> Vec<ColumnIdentity>,
+) -> Vec<ColumnIdentity> {
+    let mut identities = left
+        .map(|input| project_identities(input, left_projection))
+        .unwrap_or_default();
+    if let Some(input) = right {
+        identities.extend(project_identities(input, right_projection));
+    }
+    complete_identities(identities, output, fallback)
+}
+
+fn complete_identities(
+    mut identities: Vec<ColumnIdentity>,
+    output: &RowType,
+    fallback: impl FnOnce() -> Vec<ColumnIdentity>,
+) -> Vec<ColumnIdentity> {
+    if identities.len() > output.column_count() {
+        return fallback();
+    }
+    identities.resize(output.column_count(), ColumnIdentity::Internal);
+    identities
 }
 
 pub(crate) fn align_output_names(

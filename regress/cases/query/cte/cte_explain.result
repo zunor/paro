@@ -33,14 +33,14 @@ MATERIALIZED_CTE
       Output: p.id, p.peer_id, a.total
       ->  HASH_JOIN
         Join Type: INNER
-        Join Condition: grp = grp
+        Join Condition: p.grp = a.grp
         ->  PROJECTION
           Output: id, peer_id, grp
           ->  FILTER
-            Filter: id < peer_id
+            Filter: l.id < r.id
             ->  HASH_JOIN
               Join Type: INNER
-              Join Condition: grp = grp
+              Join Condition: l.grp = r.grp
               ->  CTE_SCAN
                 CTE Index: 0
                 Table Index: 16
@@ -50,9 +50,8 @@ MATERIALIZED_CTE
         ->  PROJECTION
           Output: grp, total
           ->  AGGREGATE
-            Group Key: grp
-            Aggregates: sum(amount)
-            Output: grp, sum(amount)
+            Group Key: base.grp
+            Aggregates: sum(base.amount)
             ->  CTE_SCAN
               CTE Index: 0
               Table Index: 25

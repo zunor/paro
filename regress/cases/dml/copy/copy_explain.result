@@ -14,7 +14,7 @@ COPY_TO_FILE  (rows=1)
   ->  PROJECTION  (rows=3)
     Output: dml_copy_explain_src.id, dml_copy_explain_src.name
     ->  ROWSET_SCAN on public.dml_copy_explain_src  (rows=3)
-      Columns: dml_copy_explain_src.id, dml_copy_explain_src.name
+      Columns: id, name
 
 COPY dml_copy_explain_src
 TO '/tmp/paro_copy_t4_6_explain.csv'

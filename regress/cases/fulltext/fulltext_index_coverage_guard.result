@@ -43,10 +43,10 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-    Sort Key: ts_rank(to_tsvector('simple', content), 'vector') DESC NULLS FIRST
+    Sort Key: ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector') DESC NULLS FIRST
     Limit: 5
     ->  PROJECTION  (rows=1)
-      Output: id, ts_rank(to_tsvector('simple', content), 'vector')
+      Output: id, ts_rank(to_tsvector('simple', public.ft_coverage_guard.content), 'vector')
       ->  FULLTEXT_SCAN on public.ft_coverage_guard  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>

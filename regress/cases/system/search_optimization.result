@@ -32,14 +32,14 @@ PROJECTION  (rows=1)
   Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=1)
-    Sort Key: bm25(content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
+    Sort Key: bm25(public.search_opt_docs.content, 'graph database') DESC NULLS FIRST, id ASC NULLS LAST
     Limit: 2
     Cardinality: [0, 1, 1]
-    Output Schema: id INTEGER, bm25(content, 'graph database') FLOAT
+    Output Schema: id INTEGER, expression_2 FLOAT
     ->  PROJECTION  (rows=1)
-      Output: id, bm25(content, 'graph database')
+      Output: id, bm25(public.search_opt_docs.content, 'graph database')
       Cardinality: [0, 1, 1]
-      Output Schema: id INTEGER, bm25(content, 'graph database') FLOAT
+      Output Schema: id INTEGER, expression_2 FLOAT
       ->  FULLTEXT_SCAN on public.search_opt_docs  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
@@ -49,7 +49,7 @@ PROJECTION  (rows=1)
         Column: content
         Mode: Filter
         Cardinality: [0, 1, 1]
-        Output Schema: id INTEGER, content VARCHAR
+        Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.content VARCHAR
 
 SELECT id
 FROM search_opt_docs
@@ -82,7 +82,7 @@ PROJECTION  (rows=1)
     Pushed Predicate: category = 'tech'
     Filter Pushdown: storage-level exact per-segment bitmap (no residual FILTER)
     Cardinality: [0, 1, 1]
-    Output Schema: id INTEGER, category VARCHAR, content VARCHAR
+    Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
 
 DROP TABLE search_opt_docs;
 DROP TABLE
