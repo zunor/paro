@@ -194,11 +194,7 @@ fn bind_copy_from(binder: &mut Binder, stmt: CopyStmt) -> Result<BoundStatementK
         CopyFormat::Csv => "csv",
         CopyFormat::Text => "text",
         CopyFormat::Ndjson => "ndjson",
-        CopyFormat::Binary => {
-            return Err(paro_error::not_implemented(
-                "COPY FROM BINARY is not supported yet",
-            ))
-        }
+        CopyFormat::Binary => "binary",
     };
 
     let copy_function = lookup_copy_function(binder, format_name)?;

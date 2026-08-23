@@ -1,7 +1,9 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{HnswBuildContract, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage};
+use super::{
+    HnswBuildContract, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage,
+};
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{
     BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
@@ -90,10 +92,15 @@ struct SharedBuildState {
     first_error: Mutex<Option<ParoError>>,
     stop_requested: AtomicBool,
     stop_check: Option<HnswBuildStopCheck>,
+    execution: HnswBuildExecutionPolicy,
 }
 
 impl SharedBuildState {
-    fn new(total_tasks: usize, stop_check: Option<HnswBuildStopCheck>) -> Self {
+    fn new(
+        total_tasks: usize,
+        stop_check: Option<HnswBuildStopCheck>,
+        execution: HnswBuildExecutionPolicy,
+    ) -> Self {
         Self {
             total_tasks,
             completed_tasks: AtomicUsize::new(0),
@@ -102,6 +109,7 @@ impl SharedBuildState {
             first_error: Mutex::new(None),
             stop_requested: AtomicBool::new(false),
             stop_check,
+            execution,
         }
     }
 
@@ -159,7 +167,9 @@ impl SharedBuildState {
 
     fn create_builder(self: &Arc<Self>) -> HnswBuilder {
         let state = Arc::clone(self);
-        HnswBuilder::new().with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
+        HnswBuilder::new()
+            .with_execution_policy(self.execution)
+            .with_stop_check(HnswBuildStopCheck::new(move || state.should_stop()))
     }
 }
 
@@ -512,7 +522,14 @@ pub fn build_missing_hnsw_indexes_with_scheduler_and_stop_check(
         return Ok(HnswBuildSummary::default());
     }
 
-    let state = Arc::new(SharedBuildState::new(jobs.len(), stop_check));
+    let scheduler_threads = scheduler.number_of_threads().max(1) as usize;
+    let concurrent_jobs = jobs.len().min(scheduler_threads).max(1);
+    let threads_per_job = scheduler_threads.div_ceil(concurrent_jobs);
+    let state = Arc::new(SharedBuildState::new(
+        jobs.len(),
+        stop_check,
+        HnswBuildExecutionPolicy::parallel(threads_per_job),
+    ));
     let producer = scheduler.create_producer();
 
     let tasks: Vec<Arc<Mutex<dyn Task>>> = jobs

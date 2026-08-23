@@ -30,6 +30,7 @@
 //!
 
 pub mod range;
+pub mod read_binary;
 pub mod read_csv;
 pub mod read_ndjson;
 pub mod repeat;
@@ -38,6 +39,7 @@ pub mod unnest;
 
 use std::any::Any;
 use std::fmt;
+use std::io::Read;
 use std::sync::Arc;
 
 use paro_common::chunk::Chunk;
@@ -129,10 +131,11 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
 ///
 /// The protocol layer implements this trait so it can retain accounting and
 /// cancellation-related ownership for exactly as long as the query needs the
-/// payload. Table functions only see immutable bytes and never consult a
-/// process-wide registry.
+/// payload. The source hands execution an owned reader, allowing its backing
+/// to be protocol chunks, an mmap, or a bounded stream without requiring one
+/// contiguous allocation.
 pub trait CopyStdinSource: Send + Sync {
-    fn as_bytes(&self) -> &[u8];
+    fn open_reader(self: Arc<Self>) -> Box<dyn Read + Send>;
 }
 
 #[cfg(test)]

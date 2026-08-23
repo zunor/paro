@@ -10,7 +10,8 @@ The rebuild is required because the durable contract now:
 - uses the fixed-width HNSW artifact envelope version 2, with distance owned
   solely by the build contract and no JSON in the open path;
 - uses the version-2 hybrid CSR graph layout;
-- requires a strict, versioned provider configuration; and
+- requires HNSW provider-config version 2 and build-contract version 2, which
+  select deterministic frozen-wave construction and barrier publication;
 - persists per-point cosine inverse norms inside the HNSW artifact.
 
 Search indexes are opened lazily. An old artifact therefore does not prevent

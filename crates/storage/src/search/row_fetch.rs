@@ -842,13 +842,64 @@ mod tests {
     use super::*;
     use crate::index::hnsw::{DistanceMetric, SearchParams};
     use crate::rowset::encoding::BinaryPlainPageBuilder;
-    use crate::search::{ResourceBudget, SearchBatchConfig, SearchBatchState};
+    use crate::search::{
+        HnswInlineConfig, HnswProviderConfig, ResourceBudget, SearchBatchConfig, SearchBatchState,
+        SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind,
+        HNSW_PROVIDER_CONFIG_VERSION,
+    };
     use crate::table::table_factory::TableFactory;
     use crate::test_utils::{
         test_chunk_from_vectors, test_embedding_vector, test_i64_vector, test_string_vector,
     };
     use bytes::Bytes;
     use paro_common::allocator::default_allocator;
+
+    fn register_explicit_hnsw(
+        table: &crate::table::table_handle::TableHandle,
+        column_id: u32,
+        dimension: u32,
+    ) {
+        let config = HnswProviderConfig {
+            version: HNSW_PROVIDER_CONFIG_VERSION,
+            dimension,
+            distance: DistanceMetric::Euclidean,
+            m: 8,
+            ef_construct: 64,
+            ef_search: 64,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 0,
+            build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
+            inline_threshold: HnswInlineConfig {
+                enabled: true,
+                max_vector_count: 4_096,
+                max_graph_memory_bytes: 64 * 1024 * 1024,
+                max_dimension: dimension,
+            },
+        }
+        .validated()
+        .expect("valid HNSW fixture");
+        let provider_config = config.to_value().expect("encode HNSW fixture");
+        let definition = SearchIndexDefinition {
+            definition_id: 1,
+            table_id: table.tablet_id(),
+            name: "row_fetch_hnsw".to_string(),
+            kind: SearchIndexKind::Hnsw,
+            column_ids: vec![column_id],
+            expression: None,
+            freshness_policy: SearchFreshnessPolicy::Required,
+            config_fingerprint: SearchIndexDefinition::try_compute_config_fingerprint(
+                SearchIndexKind::Hnsw,
+                &[column_id],
+                None,
+                &provider_config,
+            )
+            .expect("fingerprint HNSW fixture"),
+            provider_config,
+        };
+        table
+            .register_search_definition(definition)
+            .expect("register explicit HNSW fixture");
+    }
 
     #[test]
     fn project_varlen_batch_decodes_length_prefixed_rows_once() {
@@ -974,6 +1025,7 @@ mod tests {
                 LogicalType::Varchar,
             ])
             .expect("create table");
+        register_explicit_hnsw(&table, 0, 2);
         table
             .append(&test_chunk_from_vectors(vec![
                 test_embedding_vector(
@@ -1076,6 +1128,7 @@ mod tests {
                 LogicalType::BigInt,
             ])
             .expect("create table");
+        register_explicit_hnsw(&table, 0, 2);
         table
             .append(&test_chunk_from_vectors(vec![
                 test_embedding_vector(

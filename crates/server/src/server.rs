@@ -1182,6 +1182,93 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_copy_imports_vector_rows_and_advertises_binary_columns() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+
+        let ddl = run_simple_query_roundtrip(
+            &mut client,
+            "CREATE TABLE binary_copy_t (id INT PRIMARY KEY, emb VECTOR(3)); \
+             CREATE VECTOR INDEX binary_copy_idx ON binary_copy_t (emb) \
+                 distance = l2 m = 8 ef_construct = 32 ef_search = 24 build_seed = 7",
+        )
+        .await;
+        assert!(!ddl.iter().any(|(tag, _)| *tag == b'E'));
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new(
+                    "COPY binary_copy_t (id, emb) FROM STDIN WITH (FORMAT binary)".to_string(),
+                ),
+            )))
+            .await
+            .expect("write binary COPY query");
+        let copy_response = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("binary CopyInResponse");
+        assert_eq!(copy_response.0, b'G');
+        assert_eq!(copy_response.1.first().copied(), Some(1));
+
+        let mut payload = b"PGCOPY\n\xff\r\n\0".to_vec();
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        payload.extend_from_slice(&0_u32.to_be_bytes());
+        for (id, vector) in [(1_i32, [1.0_f32, 1.0, 1.0]), (2, [3.0, 3.0, 3.0])] {
+            payload.extend_from_slice(&2_i16.to_be_bytes());
+            payload.extend_from_slice(&4_i32.to_be_bytes());
+            payload.extend_from_slice(&id.to_be_bytes());
+            let vector = binary_float4_array(&vector);
+            payload.extend_from_slice(&(vector.len() as i32).to_be_bytes());
+            payload.extend_from_slice(&vector);
+        }
+        payload.extend_from_slice(&(-1_i16).to_be_bytes());
+
+        for chunk in payload.chunks(7) {
+            client
+                .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                    CopyData::new(Bytes::copy_from_slice(chunk)),
+                )))
+                .await
+                .expect("write binary COPY payload");
+        }
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("finish binary COPY payload");
+        let copied = read_messages_until_ready(&mut client).await;
+        assert!(
+            !copied.iter().any(|(tag, _)| *tag == b'E'),
+            "binary COPY should succeed: {copied:?}"
+        );
+
+        let selected = run_simple_query_roundtrip(
+            &mut client,
+            "SELECT id FROM binary_copy_t ORDER BY emb <-> '[1,1,1]' LIMIT 2",
+        )
+        .await;
+        let ids = selected
+            .iter()
+            .filter_map(|(tag, payload)| {
+                (*tag == b'D')
+                    .then(|| first_text_data_row_value(payload))
+                    .flatten()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["1", "2"]);
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn extended_copy_pipeline_waits_for_sync_before_ready_for_query() {
         let (server, run_task, addr) = spawn_test_server(4).await;
         let mut client = TcpStream::connect(addr).await.expect("client connection");

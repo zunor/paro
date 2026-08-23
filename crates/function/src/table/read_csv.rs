@@ -12,9 +12,9 @@
 
 use std::any::Any;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Cursor, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Seek, SeekFrom};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
@@ -28,21 +28,13 @@ use crate::scalar::cast::date_casts::parse_date_text;
 use crate::scalar::cast::decimal_casts::parse_decimal_text;
 
 use super::{
-    CopyStdinSource, GlobalTableFunctionState, LocalTableFunctionState, TableFunction,
-    TableFunctionBindData, TableFunctionBindInput, TableFunctionInitInput, TableFunctionInput,
-    TableFunctionResult, TableFunctionSet,
+    GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
+    TableFunctionBindInput, TableFunctionInitInput, TableFunctionInput, TableFunctionResult,
+    TableFunctionSet,
 };
 
 const COPY_PARALLEL_SPLIT_MIN_BYTES: u64 = 1_048_576;
 const COPY_PARALLEL_MAX_WORKERS: usize = 32;
-
-struct SharedCopyStdinSource(Arc<dyn CopyStdinSource>);
-
-impl AsRef<[u8]> for SharedCopyStdinSource {
-    fn as_ref(&self) -> &[u8] {
-        self.0.as_bytes()
-    }
-}
 
 pub(crate) fn open_copy_reader(
     source: &CopyFromSource,
@@ -50,9 +42,9 @@ pub(crate) fn open_copy_reader(
 ) -> Result<Box<dyn BufRead + Send>> {
     match source {
         CopyFromSource::File(path) => open_file_reader(path),
-        CopyFromSource::Stdin => Ok(Box::new(BufReader::new(Cursor::new(
-            SharedCopyStdinSource(input.copy_stdin_source()?),
-        )))),
+        CopyFromSource::Stdin => Ok(Box::new(BufReader::new(
+            input.copy_stdin_source()?.open_reader(),
+        ))),
     }
 }
 
@@ -1373,14 +1365,16 @@ fn parse_float_array(value: &str, size: usize) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::CopyStdinSource;
     use super::*;
     use std::io::Read;
+    use std::sync::Arc;
 
     struct TestCopyStdinSource(Vec<u8>);
 
     impl CopyStdinSource for TestCopyStdinSource {
-        fn as_bytes(&self) -> &[u8] {
-            self.0.as_slice()
+        fn open_reader(self: Arc<Self>) -> Box<dyn std::io::Read + Send> {
+            Box::new(std::io::Cursor::new(self.0.clone()))
         }
     }
 

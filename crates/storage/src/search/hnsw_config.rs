@@ -21,7 +21,9 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 1;
+/// Version 2 selects the frozen-wave HNSW build contract. Provider versions
+/// are intentionally not accepted across topology algorithm changes.
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

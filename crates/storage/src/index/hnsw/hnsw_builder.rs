@@ -6,6 +6,60 @@ use paro_common::error::Result;
 use std::fmt;
 use std::sync::Arc;
 
+/// Query-independent execution policy for constructing one immutable HNSW artifact.
+///
+/// This is deliberately not part of [`HnswBuildContract`]: changing worker counts
+/// must not invalidate an artifact or alter its topology. The frozen-wave epoch
+/// is part of the builder algorithm, while this policy only controls how many workers
+/// execute that algorithm. A fixed build contract therefore produces a byte-identical
+/// graph at every worker count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HnswBuildExecutionPolicy {
+    max_threads: usize,
+}
+
+impl HnswBuildExecutionPolicy {
+    // Topology constants belong to the versioned build algorithm, not runtime
+    // scheduling. Keep epochs small enough that proposals do not observe a
+    // materially stale graph while still exposing ample point-level parallelism.
+    const PROPOSAL_WAVE_SIZE: usize = 64;
+    const SERIAL_PREFIX_SIZE: usize = 4_096;
+
+    pub const fn serial() -> Self {
+        Self { max_threads: 1 }
+    }
+
+    pub fn parallel(max_threads: usize) -> Self {
+        let max_threads = max_threads.max(1);
+        if max_threads == 1 {
+            return Self::serial();
+        }
+        Self { max_threads }
+    }
+
+    pub const fn max_threads(self) -> usize {
+        self.max_threads
+    }
+
+    pub const fn proposal_wave_size(self) -> usize {
+        Self::PROPOSAL_WAVE_SIZE
+    }
+
+    pub const fn serial_prefix_size(self) -> usize {
+        Self::SERIAL_PREFIX_SIZE
+    }
+
+    pub const fn is_parallel(self) -> bool {
+        self.max_threads > 1
+    }
+}
+
+impl Default for HnswBuildExecutionPolicy {
+    fn default() -> Self {
+        Self::serial()
+    }
+}
+
 /// Cooperative stop-check used by long-running HNSW build tasks.
 #[derive(Clone)]
 pub struct HnswBuildStopCheck(Arc<dyn Fn() -> bool + Send + Sync + 'static>);
@@ -42,6 +96,7 @@ impl fmt::Debug for HnswBuildStopCheck {
 #[derive(Clone, Debug, Default)]
 pub struct HnswBuilder {
     stop_check: Option<HnswBuildStopCheck>,
+    execution: HnswBuildExecutionPolicy,
 }
 
 impl HnswBuilder {
@@ -54,12 +109,22 @@ impl HnswBuilder {
         self
     }
 
+    pub fn with_execution_policy(mut self, execution: HnswBuildExecutionPolicy) -> Self {
+        self.execution = execution;
+        self
+    }
+
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
-        HnswIndex::build_with_controls(storage, build_contract, self.stop_check.as_ref())
+        HnswIndex::build_with_controls(
+            storage,
+            build_contract,
+            self.execution,
+            self.stop_check.as_ref(),
+        )
     }
 }
 

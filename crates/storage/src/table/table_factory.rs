@@ -269,9 +269,11 @@ fn build_schema_from_types(
 ) -> Result<Arc<TabletSchema>> {
     let mut columns: Vec<TabletColumn> = Vec::with_capacity(types.len());
     for (i, logical_type) in types.iter().enumerate() {
-        let mut column = TabletColumn::new(i as u32, format!("col_{i}"), logical_type.clone());
-        apply_default_index_policy(&mut column);
-        columns.push(column);
+        columns.push(TabletColumn::new(
+            i as u32,
+            format!("col_{i}"),
+            logical_type.clone(),
+        ));
     }
     if keys_type == KeysType::PrimaryKeys && !columns.is_empty() {
         columns[0].is_key = true;
@@ -301,7 +303,6 @@ fn build_schema_from_specs(
         let mut column = TabletColumn::new(i as u32, spec.name.clone(), spec.logical_type.clone());
         column.is_key = spec.is_key;
         column.is_nullable = !spec.not_null && !spec.is_key;
-        apply_default_index_policy(&mut column);
         columns.push(column);
     }
 
@@ -311,14 +312,6 @@ fn build_schema_from_specs(
         columns,
         keys_type,
     )?))
-}
-
-fn apply_default_index_policy(column: &mut TabletColumn) {
-    if let LogicalType::Array(inner, _) = &column.logical_type {
-        if matches!(**inner, LogicalType::Float) {
-            column.index_hnsw = true;
-        }
-    }
 }
 
 fn now_micros() -> u64 {

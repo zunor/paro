@@ -21,7 +21,10 @@ pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
 pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
 pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
 pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 0;
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 1;
+/// Version 2 fixes the graph topology algorithm to deterministic frozen
+/// proposal waves. Any change to wave boundaries or publication semantics
+/// requires another version bump.
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 2;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

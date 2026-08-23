@@ -342,6 +342,7 @@ fn chunk_row_count(columns: &[ColumnData]) -> u64 {
 
 fn split_hnsw_segment_admissions<'a>(
     admitted: Vec<AdmittedInlineSink<'a>>,
+    execution: crate::index::hnsw::HnswBuildExecutionPolicy,
 ) -> Result<(
     Vec<AdmittedInlineSink<'a>>,
     Vec<AdmissionLease>,
@@ -366,7 +367,8 @@ fn split_hnsw_segment_admissions<'a>(
                         .unwrap_or(limit),
                 );
             }
-            let (column_id, options) = hnsw_column_build_options(&admitted_sink.entry.definition)?;
+            let (column_id, options) =
+                hnsw_column_build_options(&admitted_sink.entry.definition, execution)?;
             if hnsw_indexes.insert(column_id, options).is_some() {
                 return Err(paro_error::invalid_input(format!(
                     "multiple active HNSW definitions target column {column_id}"
@@ -406,6 +408,7 @@ fn split_hnsw_segment_admissions<'a>(
 
 fn hnsw_column_build_options(
     definition: &crate::search::SearchIndexDefinition,
+    execution: crate::index::hnsw::HnswBuildExecutionPolicy,
 ) -> Result<(ColumnId, HnswColumnBuildOptions)> {
     let [column_id] = definition.column_ids.as_slice() else {
         return Err(paro_error::invalid_input(
@@ -417,6 +420,7 @@ fn hnsw_column_build_options(
         *column_id,
         HnswColumnBuildOptions {
             build_contract: provider.build_contract(),
+            execution,
         },
     ))
 }
@@ -734,6 +738,24 @@ impl RowsetWriter {
         self.total_index_size
     }
 
+    /// Input bytes retained to support statement savepoint rollback for the
+    /// active segment. Completed segments do not retain their source batches.
+    pub fn retained_input_bytes(&self) -> u64 {
+        self.current_segment_chunks
+            .iter()
+            .flatten()
+            .fold(0_u64, |bytes, column| {
+                bytes
+                    .saturating_add(column.data.len() as u64)
+                    .saturating_add(
+                        column
+                            .null_flags
+                            .as_ref()
+                            .map_or(0_u64, |nulls| nulls.len() as u64),
+                    )
+            })
+    }
+
     /// Check if the writer has been finalized
     pub fn is_finalized(&self) -> bool {
         self.finalized
@@ -777,7 +799,7 @@ impl RowsetWriter {
 
         options = options.with_build_hnsw_indexes(self.context.build_hnsw_indexes);
         for (column_id, hnsw) in hnsw_indexes {
-            options = options.with_hnsw_build_contract(column_id, hnsw.build_contract);
+            options = options.with_hnsw_build_options(column_id, hnsw);
         }
 
         let mut writer = SegmentWriter::create(self.context.schema.clone(), segment_path, options)?;
@@ -792,7 +814,10 @@ impl RowsetWriter {
         let segment_id = self.current_segment_id;
         let admitted = self.admitted_inline_sinks(row_count_estimate)?;
         let (admitted_search_sinks, hnsw_admission_leases, hnsw_inline_row_limit, hnsw_indexes) =
-            split_hnsw_segment_admissions(admitted)?;
+            split_hnsw_segment_admissions(
+                admitted,
+                self.context.search_inline_builders.hnsw_build_execution(),
+            )?;
         let writer = self.create_raw_segment_writer(segment_id, hnsw_indexes.clone())?;
         let search_sinks = match self.open_segment_search_sinks(segment_id, admitted_search_sinks) {
             Ok(search_sinks) => search_sinks,
@@ -1487,7 +1512,7 @@ mod tests {
         InlineArtifactBuildResult, InlineArtifactBuilder, MaintenanceCost, SearchAdmission,
         SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind, SearchInlineBuilderEntry,
         SearchInlineBuilderSet, SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx,
-        SegmentSinkSavepoint, SparseInlineArtifactBuilder,
+        SegmentSinkSavepoint, SparseInlineArtifactBuilder, HNSW_PROVIDER_CONFIG_VERSION,
     };
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
     use paro_common::types::LogicalType;
@@ -1944,7 +1969,7 @@ mod tests {
             column_ids: vec![1],
             expression: None,
             provider_config: json!({
-                "version": 1,
+                "version": HNSW_PROVIDER_CONFIG_VERSION,
                 "dimension": 2,
                 "distance": "euclidean",
                 "m": 8,

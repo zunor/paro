@@ -34,7 +34,7 @@ use super::segment::{Segment, SegmentOptions};
 use super::segment_format::{ColumnMeta, SegmentFooter};
 #[cfg(test)]
 use crate::index::hnsw::{DistanceMetric, HnswConfig};
-use crate::index::hnsw::{HnswBuildContract, HnswBuildStopCheck};
+use crate::index::hnsw::{HnswBuildContract, HnswBuildExecutionPolicy, HnswBuildStopCheck};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
 use crate::rowset::encoding::FieldType;
@@ -88,6 +88,7 @@ pub struct SegmentWriterOptions {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswColumnBuildOptions {
     pub build_contract: HnswBuildContract,
+    pub execution: HnswBuildExecutionPolicy,
 }
 
 impl Default for SegmentWriterOptions {
@@ -180,8 +181,22 @@ impl SegmentWriterOptions {
         column_id: ColumnId,
         build_contract: HnswBuildContract,
     ) -> Self {
-        self.hnsw_indexes
-            .insert(column_id, HnswColumnBuildOptions { build_contract });
+        self.hnsw_indexes.insert(
+            column_id,
+            HnswColumnBuildOptions {
+                build_contract,
+                execution: HnswBuildExecutionPolicy::serial(),
+            },
+        );
+        self
+    }
+
+    pub fn with_hnsw_build_options(
+        mut self,
+        column_id: ColumnId,
+        options: HnswColumnBuildOptions,
+    ) -> Self {
+        self.hnsw_indexes.insert(column_id, options);
         self
     }
 
@@ -400,6 +415,7 @@ impl SegmentWriter {
                     self.options.build_hnsw_indexes && is_hnsw_col,
                     hnsw.map(|options| options.build_contract),
                 )
+                .with_hnsw_execution(hnsw.map(|options| options.execution))
                 .with_hnsw_stop_check(self.options.hnsw_stop_check.clone());
 
             if field_type == FieldType::Vector {

@@ -37,6 +37,7 @@ use paro_transaction::{
 };
 use std::sync::Arc;
 use std::time::Instant;
+use tokio_util::bytes::Bytes;
 use tracing::{debug, error};
 
 #[derive(Default)]
@@ -740,11 +741,15 @@ impl Session {
         cancellation: StatementCancellation,
         protocol_source: &mut dyn CopyProtocolSource,
     ) -> Result<StatementCompletion> {
-        validate_copy_from_options(copy_stmt)?;
+        let copy_format = validate_copy_from_options(copy_stmt)?;
         let column_count = resolve_copy_from_target_columns(self, copy_stmt)?.len();
+        let wire_format = i8::from(matches!(
+            copy_format,
+            paro_function::copy::CopyFormat::Binary
+        ));
         let spec = CopyInSpec {
-            overall_format: 0,
-            column_formats: vec![0; column_count],
+            overall_format: wire_format,
+            column_formats: vec![i16::from(wire_format); column_count],
         };
         protocol_source.begin_copy_in(&spec).await?;
 
@@ -1310,15 +1315,13 @@ fn resolve_for_update_table_id(
     Ok(TableId::new(storage.table_id()))
 }
 
-fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<()> {
+fn validate_copy_from_options(copy_stmt: &CopyStmt) -> Result<paro_function::copy::CopyFormat> {
     let options = paro_function::copy::CopyOptions::from_ast(&copy_stmt.options)?;
     match options.format {
-        paro_function::copy::CopyFormat::Binary => Err(paro_error::not_implemented(
-            "COPY FROM STDIN BINARY is not supported yet",
-        )),
-        paro_function::copy::CopyFormat::Csv
+        paro_function::copy::CopyFormat::Binary
+        | paro_function::copy::CopyFormat::Csv
         | paro_function::copy::CopyFormat::Text
-        | paro_function::copy::CopyFormat::Ndjson => Ok(()),
+        | paro_function::copy::CopyFormat::Ndjson => Ok(options.format),
     }
 }
 
@@ -1404,20 +1407,56 @@ impl ResultSink for CompletionCaptureSink {
 impl ProtocolResultSink for CompletionCaptureSink {}
 
 struct FramedCopySourceBridge {
-    buffer: Vec<u8>,
+    chunks: Vec<Bytes>,
+    retained_bytes: usize,
     limit: usize,
     memory: CopyStdinPayloadMemoryTracker,
 }
 
 #[derive(Debug)]
 struct BufferedCopyStdinPayload {
-    data: Vec<u8>,
+    chunks: Vec<Bytes>,
     _memory: CopyStdinPayloadMemoryTracker,
 }
 
 impl CopyStdinSource for BufferedCopyStdinPayload {
-    fn as_bytes(&self) -> &[u8] {
-        self.data.as_slice()
+    fn open_reader(self: Arc<Self>) -> Box<dyn std::io::Read + Send> {
+        Box::new(CopyChunkReader {
+            payload: self,
+            chunk_index: 0,
+            chunk_offset: 0,
+        })
+    }
+}
+
+struct CopyChunkReader {
+    payload: Arc<BufferedCopyStdinPayload>,
+    chunk_index: usize,
+    chunk_offset: usize,
+}
+
+impl std::io::Read for CopyChunkReader {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        let mut written = 0;
+        while written < output.len() {
+            let Some(chunk) = self.payload.chunks.get(self.chunk_index) else {
+                break;
+            };
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+            let available = &chunk[self.chunk_offset..];
+            let count = available.len().min(output.len() - written);
+            output[written..written + count].copy_from_slice(&available[..count]);
+            self.chunk_offset += count;
+            written += count;
+        }
+        Ok(written)
     }
 }
 
@@ -1457,7 +1496,8 @@ impl Drop for CopyStdinPayloadMemoryTracker {
 impl FramedCopySourceBridge {
     fn new(limit: usize, metrics: Arc<CopyStdinMetrics>) -> Self {
         Self {
-            buffer: Vec::new(),
+            chunks: Vec::new(),
+            retained_bytes: 0,
             limit,
             memory: CopyStdinPayloadMemoryTracker::new(metrics),
         }
@@ -1470,11 +1510,14 @@ impl FramedCopySourceBridge {
     ) -> Result<BufferedCopyStdinPayload> {
         while let Some(chunk) = source.next_chunk().await? {
             cancellation.check()?;
-            let new_len = self.buffer.len().checked_add(chunk.len()).ok_or_else(|| {
-                self.memory
-                    .record_rejection(CopyStdinRejectReason::TotalLimit);
-                paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
-            })?;
+            let new_len = self
+                .retained_bytes
+                .checked_add(chunk.len())
+                .ok_or_else(|| {
+                    self.memory
+                        .record_rejection(CopyStdinRejectReason::TotalLimit);
+                    paro_error::configuration_limit_exceeded("COPY FROM STDIN payload overflow")
+                })?;
             if new_len > self.limit {
                 self.memory
                     .record_rejection(CopyStdinRejectReason::TotalLimit);
@@ -1482,15 +1525,16 @@ impl FramedCopySourceBridge {
                     "COPY FROM STDIN payload exceeds memory limit",
                 ));
             }
-            self.buffer.try_reserve(chunk.len()).map_err(|_| {
-                paro_error::out_of_memory("COPY FROM STDIN payload allocation failed")
+            self.chunks.try_reserve(1).map_err(|_| {
+                paro_error::out_of_memory("COPY FROM STDIN chunk directory allocation failed")
             })?;
-            self.buffer.extend_from_slice(&chunk);
+            self.chunks.push(chunk);
+            self.retained_bytes = new_len;
             self.memory.observe(new_len);
             cancellation.check()?;
         }
         Ok(BufferedCopyStdinPayload {
-            data: self.buffer,
+            chunks: self.chunks,
             _memory: self.memory,
         })
     }
@@ -1499,7 +1543,6 @@ impl FramedCopySourceBridge {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio_util::bytes::Bytes;
 
     fn parse_one(sql: &str) -> Statement {
         paro_parser::parse(sql)
@@ -1570,21 +1613,27 @@ mod tests {
             chunks: vec![Bytes::from_static(b"12"), Bytes::from_static(b"345")],
         };
 
-        let payload = FramedCopySourceBridge::new(16, metrics.clone())
-            .collect(
-                &mut source,
-                StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
-            )
-            .await
-            .unwrap();
-        assert_eq!(payload.data, b"12345");
+        let payload = Arc::new(
+            FramedCopySourceBridge::new(16, metrics.clone())
+                .collect(
+                    &mut source,
+                    StatementCancellation::new(tokio_util::sync::CancellationToken::new(), None),
+                )
+                .await
+                .unwrap(),
+        );
+        let mut reader = Arc::clone(&payload).open_reader();
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut reader, &mut bytes).unwrap();
+        assert_eq!(bytes, b"12345");
+        drop(reader);
 
         let snapshot = metrics.snapshot();
         assert_eq!(snapshot.current_buffer_bytes, 5);
         assert_eq!(snapshot.peak_buffer_bytes, 5);
         assert_eq!(snapshot.rejected_total, 0);
 
-        let input = StatementInput::copy_from_stdin(Arc::new(payload));
+        let input = StatementInput::copy_from_stdin(payload);
         assert_eq!(metrics.snapshot().current_buffer_bytes, 5);
         drop(input);
         assert_eq!(metrics.snapshot().current_buffer_bytes, 0);

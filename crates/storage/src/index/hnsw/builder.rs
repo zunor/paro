@@ -18,8 +18,22 @@ use crate::index::hnsw::vector_storage::VectorStorage;
 use crate::index::hnsw::visited_pool::VisitedPool;
 use bitvec::prelude::BitVec;
 use parking_lot::{Mutex, RwLock};
+use rayon::prelude::*;
 use std::cmp::max;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+#[derive(Debug)]
+pub(crate) struct FrozenPointProposal {
+    point_id: PointOffset,
+    links_by_level: Vec<Vec<PointOffset>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct ReciprocalLink {
+    target: PointOffset,
+    level: usize,
+    source: PointOffset,
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DistanceProfileSnapshot {
@@ -418,6 +432,198 @@ impl GraphLayersBuilder {
             .lock()
             .new_point(point_id, target_level, |_| true);
         self.ready_list.set_aliased(point_idx, true);
+    }
+
+    /// Compute one point's outgoing links against the currently published graph.
+    ///
+    /// The method does not mutate graph topology or readiness. A complete wave can
+    /// therefore run in parallel while every proposal observes the same immutable
+    /// topology. Publication is handled separately by [`Self::publish_frozen_wave`].
+    pub(crate) fn propose_new_point(
+        &self,
+        point_id: PointOffset,
+        storage: &dyn VectorStorage,
+        distance: DistanceMetric,
+    ) -> FrozenPointProposal {
+        let target_level = self.get_point_level(point_id);
+        let entry_points = self.entry_points.lock().clone();
+        let Some(entry_point) = entry_points.get_entry_point(|_| true) else {
+            return FrozenPointProposal {
+                point_id,
+                links_by_level: vec![Vec::new(); target_level + 1],
+            };
+        };
+
+        let mut current_point = entry_point.point_id;
+        let mut current_score = Self::score_indexed(storage, distance, point_id, current_point);
+        let mut current_level = entry_point.level;
+
+        while current_level > target_level {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                self.for_each_link(current_point, current_level, |neighbor| {
+                    let neighbor_score = Self::score_indexed(storage, distance, point_id, neighbor);
+                    if neighbor_score > current_score {
+                        current_score = neighbor_score;
+                        current_point = neighbor;
+                        changed = true;
+                    }
+                });
+            }
+            current_level -= 1;
+        }
+
+        let mut links_by_level = vec![Vec::new(); target_level + 1];
+        let mut candidates = vec![ScoredPoint {
+            idx: current_point,
+            score: current_score,
+        }];
+        let mut heuristic_distance_cache = if self.distance_cache_slots > 0 {
+            Some(DistanceCache::new(self.distance_cache_slots))
+        } else {
+            None
+        };
+
+        for level in (0..=target_level.min(current_level)).rev() {
+            let ef = if level == 0 {
+                self.ef_construct
+            } else {
+                self.hnsw_m.m
+            };
+            let search_results =
+                self.search_on_level(point_id, candidates, level, ef, storage, distance);
+            let m_limit = self.hnsw_m.get_m(level);
+            if self.use_heuristic {
+                let mut selected = LinksContainer::with_capacity(m_limit);
+                selected.fill_from_sorted_with_heuristic(
+                    search_results.iter().copied(),
+                    m_limit,
+                    |target, candidate| {
+                        self.score_with_optional_cache(
+                            storage,
+                            distance,
+                            target,
+                            candidate,
+                            &mut heuristic_distance_cache,
+                        )
+                    },
+                );
+                links_by_level[level] = selected.into_vec();
+            } else {
+                links_by_level[level] = search_results
+                    .iter()
+                    .take(m_limit)
+                    .map(|point| point.idx)
+                    .collect();
+            }
+            candidates = search_results;
+        }
+
+        FrozenPointProposal {
+            point_id,
+            links_by_level,
+        }
+    }
+
+    /// Publish a wave of proposals computed from one frozen topology.
+    ///
+    /// Outgoing rows are installed first. Reciprocal mutations are then grouped
+    /// by `(target, level)`: groups are independent and can run in parallel,
+    /// while updates inside a group retain point-id order. Ready bits and entry
+    /// points become visible only after every reciprocal mutation completes.
+    pub(crate) fn publish_frozen_wave(
+        &self,
+        mut proposals: Vec<FrozenPointProposal>,
+        storage: &dyn VectorStorage,
+        distance: DistanceMetric,
+        parallel: bool,
+    ) {
+        proposals.sort_unstable_by_key(|proposal| proposal.point_id);
+        let mut reciprocal = Vec::new();
+
+        for proposal in &proposals {
+            let point_idx = proposal.point_id as usize;
+            for (level, neighbors) in proposal.links_by_level.iter().enumerate() {
+                self.links_layers[point_idx][level]
+                    .write()
+                    .fill_from(neighbors.iter().copied());
+                reciprocal.extend(neighbors.iter().copied().map(|target| ReciprocalLink {
+                    target,
+                    level,
+                    source: proposal.point_id,
+                }));
+            }
+        }
+
+        reciprocal.sort_unstable();
+        let mut groups = Vec::new();
+        let mut start = 0;
+        while start < reciprocal.len() {
+            let key = (reciprocal[start].target, reciprocal[start].level);
+            let mut end = start + 1;
+            while end < reciprocal.len() && (reciprocal[end].target, reciprocal[end].level) == key {
+                end += 1;
+            }
+            groups.push((start, end));
+            start = end;
+        }
+
+        let publish_group = |(start, end): (usize, usize)| {
+            let first = reciprocal[start];
+            let m_limit = self.hnsw_m.get_m(first.level);
+            let mut links = self.links_layers[first.target as usize][first.level].write();
+            let mut items = ItemsBuffer::default();
+            let mut distance_cache = if self.distance_cache_slots > 0 {
+                Some(DistanceCache::new(self.distance_cache_slots))
+            } else {
+                None
+            };
+            for update in &reciprocal[start..end] {
+                if self.use_heuristic {
+                    links.connect_with_heuristic(
+                        update.source,
+                        update.target,
+                        m_limit,
+                        |target, candidate| {
+                            self.score_with_optional_cache(
+                                storage,
+                                distance,
+                                target,
+                                candidate,
+                                &mut distance_cache,
+                            )
+                        },
+                        &mut items,
+                    );
+                } else {
+                    links.connect(
+                        update.source,
+                        update.target,
+                        m_limit,
+                        |target, candidate| {
+                            Self::score_indexed(storage, distance, target, candidate)
+                        },
+                    );
+                }
+            }
+        };
+        if parallel {
+            groups.into_par_iter().for_each(publish_group);
+        } else {
+            groups.into_iter().for_each(publish_group);
+        }
+
+        let mut entry_points = self.entry_points.lock();
+        for proposal in proposals {
+            let point_idx = proposal.point_id as usize;
+            self.ready_list.set_aliased(point_idx, true);
+            entry_points.new_point(
+                proposal.point_id,
+                self.get_point_level(proposal.point_id),
+                |_| true,
+            );
+        }
     }
 
     fn score_with_optional_cache(

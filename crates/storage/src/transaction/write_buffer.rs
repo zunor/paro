@@ -712,11 +712,11 @@ impl TxnWriteBuffer {
             )));
         }
 
-        let projected = self
-            .estimated_memory_bytes_locked(&inner)
-            .saturating_add(estimated_new_bytes);
-        let force_flush_after_write = self.is_over_budget(projected);
-        if force_flush_after_write {
+        let estimated_before = self.estimated_memory_bytes_locked(&inner);
+        let prior_writer_bytes = inner.writer_bytes.get(&key).copied().unwrap_or(0);
+        let retained_elsewhere = estimated_before.saturating_sub(prior_writer_bytes);
+        let estimated_projected = estimated_before.saturating_add(estimated_new_bytes);
+        if self.is_over_budget(estimated_projected) {
             let current_spilled_bytes = Self::spilled_bytes_locked(&inner);
             inner
                 .spill
@@ -743,21 +743,24 @@ impl TxnWriteBuffer {
             entry.insert(writer);
         }
 
-        let writer = inner
-            .writers
-            .get_mut(&key)
-            .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
-        writer.ensure_search_write_context(&search_write_context)?;
-        let result = f(writer)?;
-        if force_flush_after_write {
-            writer.flush_memtable()?;
-        }
-        let entry = inner.writer_bytes.entry(key).or_default();
-        *entry = if force_flush_after_write {
-            SPILLED_WRITER_HANDLE_BYTES
-        } else {
-            entry.saturating_add(estimated_new_bytes)
+        let (result, retained_writer_bytes) = {
+            let writer = inner
+                .writers
+                .get_mut(&key)
+                .ok_or_else(|| paro_error::internal("failed to get pending writer"))?;
+            writer.ensure_search_write_context(&search_write_context)?;
+            let result = f(writer)?;
+            let mut retained = writer.retained_memory_bytes();
+            let actual_projected = retained_elsewhere.saturating_add(retained);
+            if self.is_over_budget(actual_projected) {
+                writer.relieve_memory_pressure()?;
+                retained = writer
+                    .retained_memory_bytes()
+                    .max(SPILLED_WRITER_HANDLE_BYTES);
+            }
+            (result, retained)
         };
+        inner.writer_bytes.insert(key, retained_writer_bytes);
         self.republish_stats_locked(&inner);
         Ok(result)
     }

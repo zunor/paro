@@ -196,15 +196,18 @@ impl CompactionPolicy for BaseCompactionPolicy {
 }
 
 pub struct CumulativeCompactionPolicy {
-    min_deltas: usize,
-    max_deltas: usize,
+    min_delta_rowsets: usize,
+    max_delta_rowsets: usize,
 }
 
 impl CumulativeCompactionPolicy {
     pub fn new() -> Self {
         Self {
-            min_deltas: 5,
-            max_deltas: 1000,
+            // Cumulative compaction is a merge policy. Two rowsets are enough
+            // to form useful work; a single rowset must never self-rewrite
+            // merely because its priority score is high.
+            min_delta_rowsets: 2,
+            max_delta_rowsets: 1000,
         }
     }
 }
@@ -220,10 +223,6 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
             .iter()
             .map(|rs| rs.rowset_meta().get_compaction_score())
             .sum();
-        if score < self.min_deltas as f64 {
-            return Ok(None);
-        }
-
         Ok(Some(CompactionDecision {
             score,
             policy_kind: PolicyKind::Cumulative,
@@ -242,7 +241,6 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
 
         let cumulative_point = tablet.cumulative_point();
         let mut candidates = Vec::new();
-        let mut score = 0.0;
 
         for rs in rowsets {
             if rs.start_version() < cumulative_point {
@@ -254,15 +252,17 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
                 }
                 continue;
             }
-            if candidates.len() >= self.max_deltas {
+            if candidates.len() >= self.max_delta_rowsets {
                 break;
             }
 
-            score += rs.rowset_meta().get_compaction_score();
             candidates.push(rs);
         }
 
-        if score >= self.min_deltas as f64 {
+        // Cumulative compaction merges delta rowsets. A rowset's segment/size
+        // priority score must never turn one freshly published rowset into a
+        // self-rewrite; intra-rowset layout is a writer responsibility.
+        if candidates.len() >= self.min_delta_rowsets {
             Ok(candidates)
         } else {
             Ok(Vec::new())

@@ -432,13 +432,24 @@ impl DeltaWriter {
         Ok(())
     }
 
-    /// Flush current memtable/segment.
-    pub fn flush_memtable(&mut self) -> Result<()> {
+    /// Release retained write memory by draining the memtable and sealing the
+    /// active segment. Transaction governance calls this only after measuring
+    /// the writer's actual retained bytes.
+    pub(crate) fn relieve_memory_pressure(&mut self) -> Result<()> {
         self.flush_memtable_to_rowset()?;
         if let Some(writer) = self.rowset_writer.as_mut() {
             writer.flush_segment()?;
         }
         Ok(())
+    }
+
+    pub(crate) fn retained_memory_bytes(&self) -> u64 {
+        let memtable_bytes = self.memtable.stats().bytes as u64;
+        let segment_bytes = self
+            .rowset_writer
+            .as_ref()
+            .map_or(0, RowsetWriter::retained_input_bytes);
+        memtable_bytes.saturating_add(segment_bytes)
     }
 
     /// Delete by primary key (in-memory index only; does not create delete vectors yet).
@@ -473,7 +484,7 @@ impl DeltaWriter {
         if self.closed {
             return Ok(());
         }
-        self.flush_memtable()?;
+        self.relieve_memory_pressure()?;
         self.closed = true;
         Ok(())
     }

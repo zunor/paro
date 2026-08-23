@@ -348,7 +348,15 @@ impl SearchIndexRegistry {
         let admission: Arc<dyn SearchAdmission> = Arc::new(InlineSearchAdmission::with_scheduler(
             Arc::clone(&self.maintenance_scheduler),
         ));
-        self.view.load().write_context(Some(admission))
+        let max_threads = self
+            .hnsw_task_scheduler()
+            .map(|scheduler| scheduler.number_of_threads().max(1) as usize)
+            .unwrap_or(1);
+        let mut context = self.view.load().write_context(Some(admission))?;
+        context.inline_builders = context.inline_builders.with_hnsw_build_execution(
+            crate::index::hnsw::HnswBuildExecutionPolicy::parallel(max_threads),
+        );
+        Ok(context)
     }
 
     pub(crate) fn has_queryable_artifact(
@@ -461,7 +469,10 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
+        let builder = ProviderSidecarArtifactBuilder::new(
+            sidecar_store.clone(),
+            crate::index::hnsw::HnswBuildExecutionPolicy::serial(),
+        );
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -511,7 +522,7 @@ impl SearchIndexRegistry {
         let Some(manifest) = state.manifest.as_ref() else {
             return Ok(0);
         };
-        if self.hnsw_task_scheduler().is_none() {
+        let Some(scheduler) = self.hnsw_task_scheduler() else {
             tracing::debug!(
                 tablet_id = self.tablet.tablet_id(),
                 definition_id = state.definition.definition_id,
@@ -533,7 +544,12 @@ impl SearchIndexRegistry {
         }
 
         let sidecar_store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
-        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store.clone());
+        let builder = ProviderSidecarArtifactBuilder::new(
+            sidecar_store.clone(),
+            crate::index::hnsw::HnswBuildExecutionPolicy::parallel(
+                scheduler.number_of_threads().max(1) as usize,
+            ),
+        );
         let input = super::inline_sink::SidecarBuildInput {
             definition: state.definition.clone(),
             generation_id: manifest.root.generation_id,
@@ -2303,7 +2319,7 @@ mod tests {
     };
     use crate::search::{OpenedSearchCursor, ResourceBudget, SearchBatchConfig, SearchBatchState};
     use crate::table::table_factory::TableFactory;
-    use crate::table::table_handle::{TableColumnSpec, TableHandle};
+    use crate::table::table_handle::TableHandle;
     use crate::tablet::{KeysType, Tablet, TabletColumn, TabletSchema, Version};
     use crate::test_utils::*;
     use paro_common::allocator::default_allocator;
@@ -2339,6 +2355,40 @@ mod tests {
         let schema = Arc::new(TabletSchema::new(1, columns, KeysType::DuplicateKeys).unwrap());
         let tablet = Tablet::new(10_001, 10_001, 0, schema, root.join("tablet"), None).unwrap();
         tablet.init().unwrap();
+        TableHandle::from_runtime_tablet(tablet, types.to_vec())
+    }
+
+    fn create_schema_seeded_hnsw_table(
+        root: &std::path::Path,
+        types: &[LogicalType],
+        vector_column: usize,
+    ) -> TableHandle {
+        let columns = types
+            .iter()
+            .enumerate()
+            .map(|(idx, logical_type)| {
+                let column =
+                    TabletColumn::new(idx as u32, format!("col_{idx}"), logical_type.clone());
+                if idx == vector_column {
+                    column.with_hnsw_index(16, 64, 0)
+                } else {
+                    column
+                }
+            })
+            .collect();
+        let schema = Arc::new(TabletSchema::new(1, columns, KeysType::DuplicateKeys).unwrap());
+        let tablet_id = 10_002;
+        let tablet = Tablet::new(
+            tablet_id,
+            tablet_id,
+            0,
+            schema,
+            root.join("tablet"),
+            Some(meta_manager(root)),
+        )
+        .unwrap();
+        tablet.init().unwrap();
+        tablet.save_meta().unwrap();
         TableHandle::from_runtime_tablet(tablet, types.to_vec())
     }
 
@@ -3124,9 +3174,10 @@ mod tests {
     #[test]
     fn schema_seeded_hnsw_definition_is_registered() {
         let root = TempDir::new().unwrap();
-        let table = create_table_with_root(
+        let table = create_schema_seeded_hnsw_table(
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
+            0,
         );
 
         assert!(table.search_registry().definition_count() >= 1);
@@ -3142,9 +3193,10 @@ mod tests {
     #[test]
     fn explicit_hnsw_definition_overrides_and_restores_schema_seed_origin() {
         let root = TempDir::new().unwrap();
-        let table = create_table_with_root(
+        let table = create_schema_seeded_hnsw_table(
             root.path(),
             &[LogicalType::Array(Box::new(LogicalType::Float), 4)],
+            0,
         );
         let seed_definition_id = SCHEMA_SEED_BIT;
         {
@@ -3195,23 +3247,8 @@ mod tests {
     fn hnsw_schema_seed_definition_recovers_after_reopen() {
         let root = TempDir::new().unwrap();
         let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 4);
-        let table = TableFactory::new(Some(meta_manager(root.path())))
-            .with_storage_root(root.path())
-            .create_table_from_specs(&[
-                TableColumnSpec {
-                    name: "id".to_string(),
-                    logical_type: LogicalType::Integer,
-                    is_key: true,
-                    not_null: true,
-                },
-                TableColumnSpec {
-                    name: "vec".to_string(),
-                    logical_type: vector_type,
-                    is_key: false,
-                    not_null: false,
-                },
-            ])
-            .expect("create hnsw table");
+        let table =
+            create_schema_seeded_hnsw_table(root.path(), &[LogicalType::Integer, vector_type], 1);
         table
             .append(&test_chunk_from_vectors(vec![
                 test_i32_vector(&[1, 2]),

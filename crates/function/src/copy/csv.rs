@@ -13,6 +13,9 @@ use super::{
     CopyFormat, CopyFromSource, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
     CopyToLocalState, ForceQuoteOption,
 };
+use crate::table::read_binary::{
+    bind_copy_from as bind_binary_copy_from, create_read_binary_function,
+};
 use crate::table::read_csv::{bind_copy_from, create_read_csv_function};
 use crate::table::{TableFunction, TableFunctionBindData};
 
@@ -60,7 +63,11 @@ impl CopyToLocalState for CsvCopyToLocalState {
 }
 
 pub fn register_copy_functions() -> Vec<CopyFunction> {
-    vec![register_csv_copy_function(), register_text_copy_function()]
+    vec![
+        register_csv_copy_function(),
+        register_text_copy_function(),
+        register_binary_copy_function(),
+    ]
 }
 
 pub fn register_csv_copy_function() -> CopyFunction {
@@ -83,6 +90,29 @@ pub fn register_text_copy_function() -> CopyFunction {
     func.name = "text".to_string();
     func.extension = "txt".to_string();
     func
+}
+
+pub fn register_binary_copy_function() -> CopyFunction {
+    let mut func = register_csv_copy_function();
+    func.name = "binary".to_string();
+    func.copy_from_bind = binary_copy_from_bind;
+    func.copy_from_function = create_read_binary_function();
+    func.extension = "bin".to_string();
+    func
+}
+
+fn binary_copy_from_bind(
+    source: CopyFromSource,
+    options: &CopyOptions,
+    names: &[String],
+    types: &[LogicalType],
+) -> Result<Box<dyn TableFunctionBindData>> {
+    if !matches!(options.format, CopyFormat::Binary) {
+        return Err(paro_error::invalid_parameter(
+            "binary copy function requires FORMAT binary",
+        ));
+    }
+    bind_binary_copy_from(source, names, types)
 }
 
 fn read_csv_table_function() -> TableFunction {

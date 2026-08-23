@@ -529,6 +529,24 @@ fn chunk_with_i32_range(start: i32, end: i32, offset: i32) -> Chunk {
     test_chunk_from_vectors(vec![test_i32_vector(&ids), test_i32_vector(&values)])
 }
 
+#[test]
+fn compaction_does_not_rewrite_a_single_fresh_rowset() {
+    let table = create_table(&[LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(
+            &(0..4_096).collect::<Vec<_>>(),
+        )]))
+        .unwrap();
+
+    assert_eq!(table.tablet().num_rowsets(), 1);
+    assert!(
+        CompactionPlanner::plan(table.tablet().as_ref())
+            .unwrap()
+            .is_none(),
+        "one fresh rowset is already a canonical publish unit"
+    );
+}
+
 fn build_duplicate_key_compaction_output(
     table: &TableHandle,
     job_id: u64,
@@ -1736,7 +1754,7 @@ fn vector_search_keeps_delete_vector_touches_bounded_per_segment() {
 }
 
 #[test]
-fn vector_column_from_specs_builds_hnsw_index() {
+fn vector_column_from_specs_requires_an_explicit_search_definition() {
     let specs = vec![
         TableColumnSpec {
             name: "id".to_string(),
@@ -1753,10 +1771,7 @@ fn vector_column_from_specs_builds_hnsw_index() {
     ];
     let table = create_table_from_specs(&specs);
     let schema = table.tablet().schema().unwrap();
-    assert!(
-        schema.column_by_id(1).unwrap().index_hnsw,
-        "vector column should enable hnsw in schema"
-    );
+    assert!(!schema.column_by_id(1).unwrap().index_hnsw);
     let chunk = chunk_with_embeddings(
         &[1, 2, 3],
         &[vec![1.0_f32, 0.0], vec![2.0_f32, 0.0], vec![3.0_f32, 0.0]],
@@ -1768,16 +1783,12 @@ fn vector_column_from_specs_builds_hnsw_index() {
     let rowsets = table.tablet().capture_consistent_rowsets(visible).unwrap();
     assert!(!rowsets.is_empty(), "expected at least one rowset");
 
-    let mut has_hnsw = false;
     for rowset in rowsets {
         rowset.load().unwrap();
         for segment in rowset.segments() {
-            if segment.hnsw_index(1).is_some() {
-                has_hnsw = true;
-            }
+            assert!(segment.hnsw_index(1).is_none());
         }
     }
-    assert!(has_hnsw, "expected auto-built HNSW index on vector column");
 }
 
 #[test]

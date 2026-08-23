@@ -22,7 +22,7 @@ use super::providers::sparse::inline::SparseInlineArtifactBuilder;
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::TailMutationKind;
-use crate::index::hnsw::HnswIndex;
+use crate::index::hnsw::{HnswBuildExecutionPolicy, HnswBuilder};
 use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -36,11 +36,18 @@ const SIDECAR_BUILD_BATCH_ROWS: usize = 8192;
 #[derive(Debug, Clone)]
 pub(crate) struct ProviderSidecarArtifactBuilder {
     store: SidecarArtifactStore,
+    hnsw_build_execution: HnswBuildExecutionPolicy,
 }
 
 impl ProviderSidecarArtifactBuilder {
-    pub(crate) fn new(store: SidecarArtifactStore) -> Self {
-        Self { store }
+    pub(crate) fn new(
+        store: SidecarArtifactStore,
+        hnsw_build_execution: HnswBuildExecutionPolicy,
+    ) -> Self {
+        Self {
+            store,
+            hnsw_build_execution,
+        }
     }
 }
 
@@ -115,6 +122,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                     input.generation_id,
                     rowset,
                     *segment_id,
+                    self.hnsw_build_execution,
                 )?;
                 for blob in result.blobs {
                     let location = writer.append_artifact(&blob.bytes)?;
@@ -197,9 +205,16 @@ fn build_segment_sidecar_artifact(
     generation_id: u64,
     rowset: &RowsetSharedPtr,
     segment_id: u32,
+    hnsw_build_execution: HnswBuildExecutionPolicy,
 ) -> Result<super::inline_sink::InlineArtifactBuildResult> {
     if matches!(definition.kind, SearchIndexKind::Hnsw) {
-        return build_hnsw_segment_sidecar_artifact(definition, generation_id, rowset, segment_id);
+        return build_hnsw_segment_sidecar_artifact(
+            definition,
+            generation_id,
+            rowset,
+            segment_id,
+            hnsw_build_execution,
+        );
     }
 
     let column_id = definition
@@ -271,6 +286,7 @@ fn build_hnsw_segment_sidecar_artifact(
     generation_id: u64,
     rowset: &RowsetSharedPtr,
     segment_id: u32,
+    execution: HnswBuildExecutionPolicy,
 ) -> Result<super::inline_sink::InlineArtifactBuildResult> {
     let column_id = definition
         .column_ids
@@ -319,7 +335,9 @@ fn build_hnsw_segment_sidecar_artifact(
             provider.dimension
         )));
     }
-    let index = HnswIndex::try_build(vector_storage, provider.build_contract())?;
+    let index = HnswBuilder::new()
+        .with_execution_policy(execution)
+        .build(vector_storage, provider.build_contract())?;
     let bytes = index.serialize()?;
     let checksum = seahash::hash(&bytes);
     let provider_stats = HnswProviderStats::from(&HnswIndexStatistics::collect(&index));

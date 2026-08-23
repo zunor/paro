@@ -14,9 +14,9 @@ use super::visited_pool::VisitedPool;
 #[cfg(test)]
 use super::HnswConfig;
 use super::{
-    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm,
-    SearchParams, VectorScorer,
+    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildExecutionPolicy,
+    HnswBuildStopCheck, HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint,
+    SearchAlgorithm, SearchParams, VectorScorer,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
@@ -25,6 +25,7 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 use paro_common::error;
 use paro_common::error::Result;
+use rayon::prelude::*;
 use roaring::RoaringBitmap;
 use std::fs;
 use std::path::Path;
@@ -248,7 +249,12 @@ impl HnswIndex {
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<Self> {
-        Self::build_with_controls(storage, build_contract, None)
+        Self::build_with_controls(
+            storage,
+            build_contract,
+            HnswBuildExecutionPolicy::serial(),
+            None,
+        )
     }
 
     #[cfg(test)]
@@ -269,12 +275,18 @@ impl HnswIndex {
     pub(crate) fn build_with_controls(
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
+        execution: HnswBuildExecutionPolicy,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
         build_contract.validate()?;
         let distance = build_contract.distance;
         let storage = IndexedVectorStorage::prepare(storage, distance);
         let num_vectors = storage.num_vectors();
+        if num_vectors > PointOffset::MAX as usize {
+            return Err(error::configuration_limit_exceeded(
+                "HNSW artifact exceeds the u32 point-id address space",
+            ));
+        }
         // Diverse neighbor selection is required for clustered vector sets;
         // nearest-only truncation forms disconnected local components.
         let mut builder = GraphLayersBuilder::new_from_contract(num_vectors, &build_contract, true);
@@ -289,15 +301,64 @@ impl HnswIndex {
             builder.set_levels(point_id, level);
         }
 
-        // Heuristic insertion mutates existing neighbors. Keeping a single
-        // publication order is the correctness baseline; a future parallel
-        // builder must compute proposals against a frozen topology and publish
-        // them behind a barrier instead of exposing half-built waves.
-        for i in 0..num_vectors {
+        let serial_end = execution.serial_prefix_size().min(num_vectors);
+        for i in 0..serial_end {
             if stop_check.is_some_and(|check| check.should_stop()) {
                 return Err(error::query_canceled());
             }
             builder.link_new_point(i as u32, storage.as_ref(), distance);
+        }
+
+        if serial_end < num_vectors {
+            let pool = execution
+                .is_parallel()
+                .then(|| {
+                    rayon::ThreadPoolBuilder::new()
+                        .thread_name(|idx| format!("paro-hnsw-build-{idx}"))
+                        .num_threads(execution.max_threads())
+                        .build()
+                })
+                .transpose()
+                .map_err(|err| error::internal(format!("create HNSW build pool: {err}")))?;
+            for wave_start in (serial_end..num_vectors).step_by(execution.proposal_wave_size()) {
+                if stop_check.is_some_and(|check| check.should_stop()) {
+                    return Err(error::query_canceled());
+                }
+                let wave_end = wave_start
+                    .saturating_add(execution.proposal_wave_size())
+                    .min(num_vectors);
+                let proposals = if let Some(pool) = &pool {
+                    pool.install(|| {
+                        (wave_start..wave_end)
+                            .into_par_iter()
+                            .map(|point| {
+                                builder.propose_new_point(
+                                    point as PointOffset,
+                                    storage.as_ref(),
+                                    distance,
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                } else {
+                    (wave_start..wave_end)
+                        .map(|point| {
+                            builder.propose_new_point(
+                                point as PointOffset,
+                                storage.as_ref(),
+                                distance,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                if let Some(pool) = &pool {
+                    pool.install(|| {
+                        builder.publish_frozen_wave(proposals, storage.as_ref(), distance, true)
+                    });
+                } else {
+                    builder.publish_frozen_wave(proposals, storage.as_ref(), distance, false);
+                }
+            }
         }
 
         let (links, entry_points) = builder.into_graph_data();
@@ -928,7 +989,7 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{AcornParams, HnswM, InMemoryVectorStorage, PointOffset};
+    use crate::index::hnsw::{AcornParams, HnswBuilder, HnswM, InMemoryVectorStorage, PointOffset};
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use roaring::RoaringBitmap;
@@ -1158,6 +1219,60 @@ mod tests {
             .unwrap();
 
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn frozen_wave_build_is_byte_deterministic_across_worker_counts() {
+        let vectors = make_sift_like_vectors(0xdef, 4_352, 24, 16);
+        let contract = HnswConfig::new(12, 72)
+            .with_build_seed(0x0fed_cba9_8765_4321)
+            .build_contract(DistanceMetric::Euclidean);
+        let first = HnswBuilder::new()
+            .with_execution_policy(HnswBuildExecutionPolicy::serial())
+            .build(make_storage(&vectors), contract)
+            .unwrap()
+            .serialize()
+            .unwrap();
+        let second = HnswBuilder::new()
+            .with_execution_policy(HnswBuildExecutionPolicy::parallel(4))
+            .build(make_storage(&vectors), contract)
+            .unwrap()
+            .serialize()
+            .unwrap();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn frozen_wave_build_retains_sift_like_recall() {
+        let vectors = make_sift_like_vectors(0x123, 2_048, 32, 24);
+        let queries = make_sift_like_queries(0x456, &vectors, 64, 0.02);
+        let config = HnswConfig::new(16, 96)
+            .with_plain_scan_threshold(0)
+            .with_ef(96);
+        let index = HnswBuilder::new()
+            .with_execution_policy(HnswBuildExecutionPolicy::parallel(2))
+            .build(
+                make_storage(&vectors),
+                config.build_contract(DistanceMetric::Euclidean),
+            )
+            .unwrap();
+        let recall = average_recall_at_k(
+            &index,
+            &vectors,
+            &queries,
+            10,
+            &SearchParams {
+                ef: Some(96),
+                ..Default::default()
+            },
+            DistanceMetric::Euclidean,
+        );
+
+        assert!(
+            recall >= 0.94,
+            "expected recall@10 >= 0.94, got {recall:.3}"
+        );
     }
 
     #[test]

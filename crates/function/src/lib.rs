@@ -55,6 +55,7 @@ pub use table::{
 };
 
 pub mod copy;
+pub mod pg_binary;
 
 pub use copy::{
     CopyFormat, CopyFunction, CopyFunctionBindData, CopyOptions, CopyToGlobalState,
