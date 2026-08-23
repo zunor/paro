@@ -73,13 +73,13 @@ GROUP BY grp
 ORDER BY grp;
 QUERY PLAN
 ORDER_BY  (rows=3)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: grp ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: grp, sum_x
     ->  AGGREGATE  (rows=3)
-      Group Key: #0
-      Aggregates: sum(#1)
-      Output: aggr_0, aggr_1
+      Group Key: grp
+      Aggregates: sum(x)
+      Output: grp, sum(x)
       ->  PROJECTION  (rows=5)
         Output: grp, x
         ->  VALUES  (rows=5)

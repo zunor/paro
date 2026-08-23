@@ -3,11 +3,11 @@ WITH nums(v) AS (VALUES (1), (2), (3))
 SELECT v FROM nums WHERE v > 1 ORDER BY v;
 QUERY PLAN
 ORDER_BY  (rows=1)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: v ASC NULLS LAST
   ->  PROJECTION  (rows=1)
     Output: v
     ->  FILTER  (rows=1)
-      Filter: #0 > 1
+      Filter: v > 1
       ->  VALUES  (rows=3)
 
 EXPLAIN
@@ -19,14 +19,14 @@ MATERIALIZED_CTE
   Materialization: MATERIALIZED
   Reference Count: 1
   ->  FILTER  (rows=1)
-    Filter: #0 > 1
+    Filter: v > 1
     ->  VALUES  (rows=3)
   ->  ORDER_BY
-    Sort Key: #0 ASC NULLS LAST
+    Sort Key: v ASC NULLS LAST
     ->  PROJECTION
       Output: v
       ->  FILTER
-        Filter: #0 > 1
+        Filter: v > 1
         ->  CTE_SCAN
           CTE Index: 0
           Table Index: 8
@@ -40,14 +40,14 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: total
   ->  AGGREGATE  (rows=1)
-    Aggregates: sum(+(#0, #1))
-    Output: aggr_0
+    Aggregates: sum(+(v, v))
+    Output: sum(+(v, v))
     ->  CROSS_PRODUCT  (rows=9)
       ->  PROJECTION  (rows=3)
-        Output: expr_1
+        Output: v
         ->  VALUES  (rows=3)
       ->  PROJECTION  (rows=3)
-        Output: expr_1
+        Output: v
         ->  VALUES  (rows=3)
 
 WITH nums(v) AS NOT MATERIALIZED (VALUES (1), (2), (3))

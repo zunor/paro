@@ -503,8 +503,15 @@ impl DependentJoinFlattener {
             .iter()
             .map(|corr| corr.return_type.clone())
             .collect();
+        let chunk_names = self
+            .correlated_columns
+            .iter()
+            .map(|corr| corr.name.clone())
+            .collect();
         (
-            LogicalOperator::DelimGet(DelimGet::new(table_index, chunk_types)),
+            LogicalOperator::DelimGet(
+                DelimGet::new(table_index, chunk_types).with_names(chunk_names),
+            ),
             ColumnBinding::new(table_index, 0),
         )
     }

@@ -15,7 +15,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: l.id, l.payload
   ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
-    Columns: id, payload
+    Columns: l.id, l.payload
 
 EXPLAIN
 SELECT l.id, r.note
@@ -27,7 +27,7 @@ PROJECTION  (rows=3)
   ->  HASH_JOIN  (rows=3)
     Join Type: LEFT
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_unique r  (rows=2)
@@ -49,7 +49,7 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: r.id, r.note
   ->  ROWSET_SCAN on public.join_elim_right r  (rows=2)
-    Columns: id, note
+    Columns: r.id, r.note
 
 SELECT l.id
 FROM join_elim_left AS l
@@ -71,7 +71,7 @@ PROJECTION  (rows=3)
   ->  HASH_JOIN  (rows=3)
     Join Type: LEFT
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.id = r.id
     ->  ROWSET_SCAN on public.join_elim_left l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.join_elim_right_nonunique r  (rows=2)

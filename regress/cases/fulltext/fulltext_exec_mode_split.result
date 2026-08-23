@@ -28,7 +28,8 @@ PROJECTION  (rows=1)
     Search Generation: <search-generation-id>
     Search Root: <search-root-id>
     Search Capability: Queryable
-    Column: 1
+    Search Candidate: full text
+    Column: content
     Mode: Filter
 
 -- @normalize explain_search_ids
@@ -45,16 +46,17 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: id
   ->  TOP_N  (rows=1)
-    Sort Key: #1 DESC NULLS FIRST
+    Sort Key: ts_rank(to_tsvector('simple', content), 'vector & database') DESC NULLS FIRST
     Limit: 2
     ->  PROJECTION  (rows=1)
-      Output: id, __paro_hidden_1
+      Output: id, ts_rank(to_tsvector('simple', content), 'vector & database')
       ->  FULLTEXT_SCAN on public.ft_exec_mode_split  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>
         Search Capability: Queryable
-        Column: 1
+        Search Candidate: full text
+        Column: content
         Mode: Filter
 
 SELECT id

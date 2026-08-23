@@ -119,10 +119,7 @@ impl PhysicalPlanGenerator {
             target: DelimScanTarget::Values {
                 table_index: get.table_index,
             },
-            output_names: (0..get.chunk_types.len())
-                .map(|idx| format!("delim_{}", idx + 1))
-                .collect::<Vec<_>>()
-                .into_boxed_slice(),
+            output_names: get.chunk_names.clone().into_boxed_slice(),
             output_types: get.chunk_types.clone().into_boxed_slice(),
         };
         (PhysicalNodeKind::DelimScan(spec), Vec::new())

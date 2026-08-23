@@ -74,26 +74,26 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: d.payload, row_count, total_amount, kept_amount
   ->  AGGREGATE  (rows=2)
-    Group Key: #3
-    Aggregates: count_partial_merge(#0), sum_partial_merge(#1), sum_partial_merge(#2)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: d.payload
+    Aggregates: count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
+    Output: d.payload, count_partial_merge(count_star(*)), sum_partial_merge(sum(f.amount)), sum_partial_merge(sum(f.amount) FILTER (WHERE f.keep))
     ->  HASH_JOIN  (rows=4)
       Join Type: INNER
       Build Index: integer_build_time
-      Join Condition: #0 = #0
+      Join Condition: f.key_a = d.key_a
       ->  AGGREGATE  (rows=5)
-        Group Key: #0
-        Aggregates: count_star(*), sum(#1), sum(#1) FILTER (WHERE #2)
-        Output: aggr_0, aggr_1, aggr_2, aggr_3
+        Group Key: f.key_a
+        Aggregates: count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
+        Output: f.key_a, count_star(*), sum(f.amount), sum(f.amount) FILTER (WHERE f.keep)
         ->  HASH_JOIN  (rows=9600)
           Join Type: INNER
           Build Index: integer_build_time
-          Join Condition: #0 = #0
+          Join Condition: f.key_a = d.key_a
           ->  ROWSET_SCAN on public.agg_defer_fact f
             Columns: key_a, amount, keep
-            Pushed Predicate: col#0 <= 4 AND col#0 >= 1
+            Pushed Predicate: key_a <= 4 AND key_a >= 1
             Late Materialize: auto
-            Runtime Filter: #0 >= 1 AND #0 <= 4
+            Runtime Filter: key_a >= 1 AND key_a <= 4
           ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)
             Columns: key_a
       ->  ROWSET_SCAN on public.agg_defer_plan_dimension d  (rows=4)

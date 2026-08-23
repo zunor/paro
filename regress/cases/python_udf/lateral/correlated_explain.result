@@ -14,7 +14,7 @@ CROSS JOIN LATERAL py_scale(t.x) AS s
 ORDER BY 1, 2;
 QUERY PLAN
 ORDER_BY  (rows=300)
-  Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
+  Sort Key: t.x ASC NULLS LAST, s.value ASC NULLS LAST
   ->  PROJECTION  (rows=300)
     Output: t.x, s.value
     ->  DELIM_JOIN  (rows=300)
@@ -23,10 +23,10 @@ ORDER_BY  (rows=300)
         ->  VALUES  (rows=3)
       ->  HASH_JOIN
         Join Type: INNER
-        Join Condition: #1 IS NOT DISTINCT FROM #0
+        Join Condition: x IS NOT DISTINCT FROM x
         ->  EXTERNAL_TABLE  (rows=1000)
           ->  PROJECTION  (rows=1000)
-            Output: __external_arg_1, __corr_1
+            Output: x, x
             ->  CROSS_PRODUCT  (rows=1000)
               ->  DUMMY_SCAN
               ->  DELIM_SCAN  (rows=1)

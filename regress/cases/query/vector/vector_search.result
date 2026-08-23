@@ -33,10 +33,10 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: #1 ASC NULLS LAST
+    Sort Key: l2_distance(emb, [1, 1, 1]) ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=4)
-      Output: id, __paro_hidden_1
+      Output: id, l2_distance(emb, [1, 1, 1])
       ->  ROWSET_SCAN on public.items  (rows=4)
         Columns: id, emb
 
@@ -86,7 +86,7 @@ PROJECTION  (rows=2)
     Search Root: <search-root-id>
     Search Capability: Queryable
     Search Candidate: dense vector
-    Column: 2
+    Column: emb
     Limit: 2
     Search Ef: default
 
@@ -104,10 +104,10 @@ PROJECTION  (rows=2)
     Search Root: <search-root-id>
     Search Capability: Queryable
     Search Candidate: dense vector
-    Column: 2
+    Column: emb
     Limit: 2
     Search Ef: default
-    Pushed Predicate: col#1 = 3
+    Pushed Predicate: bucket = 3
     Filter Pushdown: storage-level exact per-segment bitmap (no residual FILTER)
     Filter Rows (estimated): 205
     Filtered Strategy: unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement (205 > exact threshold 128; exact fallback if underfilled)
@@ -119,10 +119,10 @@ QUERY PLAN
 PROJECTION  (rows=2)
   Output: id
   ->  TOP_N  (rows=2)
-    Sort Key: #1 ASC NULLS LAST
+    Sort Key: cosine_distance(emb, [1, 0, 0]) ASC NULLS LAST
     Limit: 2
     ->  PROJECTION  (rows=2048)
-      Output: id, __paro_hidden_1
+      Output: id, cosine_distance(emb, [1, 0, 0])
       ->  ROWSET_SCAN on public.indexed_items  (rows=2048)
         Columns: id, emb
 
@@ -167,10 +167,10 @@ PROJECTION  (rows=2)
     Search Root: <search-root-id>
     Search Capability: Queryable
     Search Candidate: dense vector
-    Column: 2
+    Column: emb
     Limit: 2
     Search Ef: default
-    Pushed Predicate: col#1 = 3
+    Pushed Predicate: bucket = 3
     Filter Pushdown: storage-level exact per-segment bitmap (no residual FILTER)
     Filter Rows (estimated): 205
     Filtered Strategy: unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement (205 > exact threshold 128; exact fallback if underfilled)
@@ -192,7 +192,7 @@ PROJECTION  (rows=2)
     Search Root: <search-root-id>
     Search Capability: Queryable
     Search Candidate: dense vector
-    Column: 2
+    Column: emb
     Limit: 2
     Search Ef: 37
 

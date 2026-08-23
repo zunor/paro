@@ -14,7 +14,7 @@ FROM (VALUES (1), (2)) AS t(v)
 ORDER BY 1;
 QUERY PLAN
 ORDER_BY  (rows=2)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: py_explain(v) ASC NULLS LAST
   ->  PROJECTION  (rows=2)
     Output: py_explain(v)
     ->  EXTERNAL_PROJECT  (rows=2)

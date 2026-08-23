@@ -403,6 +403,7 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::DelimGet(DelimGetNode {
                     table_index,
                     chunk_types: dg.chunk_types.clone(),
+                    chunk_names: dg.chunk_names.clone(),
                 })
             }
             LogicalOperator::Join(join) => LogicalOperator::Join(match join {

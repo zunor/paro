@@ -74,7 +74,7 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: gt.anchor, gt.neighbor
   ->  GRAPH_PROJECT  (rows=1)
-    Output: expr_1, expr_2
+    Output: gt.anchor, gt.neighbor
     Filter: <pushed down>
     ->  GRAPH_EXPAND  (rows=1)
       Graph: ei_graph
@@ -102,7 +102,7 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: gt.src, gt.dst
   ->  GRAPH_PROJECT  (rows=3)
-    Output: expr_1, expr_2
+    Output: gt.src, gt.dst
     Filter: <pushed down>
     ->  GRAPH_SHORTEST_PATH  (rows=3)
       Graph: ei_graph

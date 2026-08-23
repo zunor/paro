@@ -65,13 +65,13 @@ GROUP BY grp
 ORDER BY grp;
 QUERY PLAN
 ORDER_BY  (rows=3)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: grp ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: grp, cd_x, sd_y
     ->  AGGREGATE  (rows=3)
-      Group Key: #0
-      Aggregates: count(DISTINCT #1), sum(DISTINCT #2)
-      Output: aggr_0, aggr_1, aggr_2
+      Group Key: grp
+      Aggregates: count(DISTINCT x), sum(DISTINCT y)
+      Output: grp, count(DISTINCT x), sum(DISTINCT y)
       ->  PROJECTION  (rows=6)
         Output: grp, x, y
         ->  VALUES  (rows=6)

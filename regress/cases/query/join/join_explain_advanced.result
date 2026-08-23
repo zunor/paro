@@ -14,7 +14,7 @@ PROJECTION  (rows=4)
   ->  NESTED_LOOP_JOIN  (rows=4)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 < #0
+    Join Condition: l.id < r.id
     ->  ROWSET_SCAN on public.join_explain_piecewise_l l  (rows=3)
       Columns: id
     ->  ROWSET_SCAN on public.join_explain_piecewise_r r  (rows=3)
@@ -32,9 +32,9 @@ PROJECTION  (rows=4)
   ->  NESTED_LOOP_JOIN  (rows=4)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 < #0
+    Join Condition: l.id < r.id
     Cardinality: [4, 4, 4]
-    Output Schema: id INTEGER, id INTEGER
+    Output Schema: l.id INTEGER, r.id INTEGER
     ->  ROWSET_SCAN on public.join_explain_piecewise_l l  (rows=3)
       Columns: id
       Cardinality: [3, 3, 3]
@@ -51,7 +51,7 @@ FROM join_explain_piecewise_l AS l
 JOIN join_explain_piecewise_r AS r ON l.id < r.id
 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.join_explain_piecewise_l"},{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.join_explain_piecewise_r"}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["id","id"],"properties":{"Join Condition":["#0 < #0"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":4,"operator":"PROJECTION","output_names":["l.id","r.id"],"properties":{"Output":["l.id","r.id"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.join_explain_piecewise_l"},{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["id"],"properties":{"Columns":["id"]},"relation":"public.join_explain_piecewise_r"}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["l.id","r.id"],"properties":{"Join Condition":["l.id < r.id"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":4,"max":4,"min":4},"estimated_rows":4,"node_id":4,"operator":"PROJECTION","output_names":["l.id","r.id"],"properties":{"Output":["l.id","r.id"]}}}
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
@@ -98,7 +98,7 @@ PROJECTION  (rows=2)
   ->  NESTED_LOOP_JOIN  (rows=2)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 <= #0, #1 >= #0
+    Join Condition: r.lo <= l.x, r.hi >= l.x
     ->  ROWSET_SCAN on public.join_explain_sort_range_r r  (rows=3)
       Columns: lo, hi
     ->  ROWSET_SCAN on public.join_explain_sort_range_l l  (rows=3)
@@ -116,9 +116,9 @@ PROJECTION  (rows=2)
   ->  NESTED_LOOP_JOIN  (rows=2)
     Join Type: INNER
     Strategy: nl_fallback
-    Join Condition: #0 <= #0, #1 >= #0
+    Join Condition: r.lo <= l.x, r.hi >= l.x
     Cardinality: [2, 2, 2]
-    Output Schema: lo INTEGER, hi INTEGER, x INTEGER
+    Output Schema: r.lo INTEGER, r.hi INTEGER, l.x INTEGER
     ->  ROWSET_SCAN on public.join_explain_sort_range_r r  (rows=3)
       Columns: lo, hi
       Cardinality: [3, 3, 3]
@@ -135,7 +135,7 @@ FROM join_explain_sort_range_l AS l
 JOIN join_explain_sort_range_r AS r ON l.x BETWEEN r.lo AND r.hi
 FORMAT JSON;
 QUERY PLAN
-{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["lo","hi"],"properties":{"Columns":["lo","hi"]},"relation":"public.join_explain_sort_range_r"},{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["x"],"properties":{"Columns":["x"]},"relation":"public.join_explain_sort_range_l"}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["lo","hi","x"],"properties":{"Join Condition":["#0 <= #0","#1 >= #0"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["l.x","r.lo","r.hi"],"properties":{"Output":["l.x","r.lo","r.hi"]}}}
+{"detail":{"memory":true,"summary":true,"timing":true,"verbose":false},"format":"json","format_version":1,"mode":"plan","plan":{"children":[{"children":[{"alias":"r","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":1,"operator":"ROWSET_SCAN","output_names":["lo","hi"],"properties":{"Columns":["lo","hi"]},"relation":"public.join_explain_sort_range_r"},{"alias":"l","estimated_cardinality":{"expected":3,"max":3,"min":3},"estimated_rows":3,"node_id":2,"operator":"ROWSET_SCAN","output_names":["x"],"properties":{"Columns":["x"]},"relation":"public.join_explain_sort_range_l"}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":3,"operator":"NESTED_LOOP_JOIN","output_names":["r.lo","r.hi","l.x"],"properties":{"Join Condition":["r.lo <= l.x","r.hi >= l.x"],"Join Type":"INNER","Strategy":"nl_fallback"}}],"estimated_cardinality":{"expected":2,"max":2,"min":2},"estimated_rows":2,"node_id":4,"operator":"PROJECTION","output_names":["l.x","r.lo","r.hi"],"properties":{"Output":["l.x","r.lo","r.hi"]}}}
 
 -- @normalize explain_operator_timing,explain_summary_timing,explain_runtime_bytes
 EXPLAIN ANALYZE
@@ -191,9 +191,9 @@ PROJECTION  (rows=5)
   ->  HASH_JOIN  (rows=5)
     Join Type: LEFT
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: l.k = r.k
     Cardinality: [5, 5, 5]
-    Output Schema: k INTEGER, payload VARCHAR
+    Output Schema: l.k INTEGER, r.payload VARCHAR
     ->  ROWSET_SCAN on public.join_explain_hash_l l  (rows=5)
       Columns: k
       Cardinality: [5, 5, 5]

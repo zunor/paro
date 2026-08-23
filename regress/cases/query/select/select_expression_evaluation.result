@@ -85,7 +85,7 @@ QUERY PLAN
 PROJECTION  (rows=30)
   Output: r
   ->  FILTER  (rows=30)
-    Filter: #0 < 0.5
+    Filter: r < 0.5
     ->  PROJECTION  (rows=100)
       Output: r
       ->  TABLE_FUNCTION_SCAN  (rows=100)
@@ -101,7 +101,7 @@ PROJECTION  (rows=1)
   Output: COUNT(*)
   ->  AGGREGATE  (rows=1)
     Aggregates: count_star(*)
-    Output: aggr_0
+    Output: count_star(*)
     ->  PROJECTION  (rows=100)
       Output: 42
       ->  PROJECTION  (rows=100)

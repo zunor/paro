@@ -62,8 +62,8 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: first_desc, labels_desc
   ->  AGGREGATE  (rows=1)
-    Aggregates: first(#0) WITHIN GROUP (ORDER BY #1 DESC NULLS LAST), string_agg(#2, '|') WITHIN GROUP (ORDER BY #1 DESC NULLS LAST)
-    Output: aggr_0, aggr_1
+    Aggregates: first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST), string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST)
+    Output: first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST), string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST)
     ->  PROJECTION  (rows=4)
       Output: x, y, label
       ->  VALUES  (rows=4)

@@ -18,8 +18,8 @@ use paro_planner::expression::{
 use paro_planner::operator::aggregate::GroupDependency;
 use paro_planner::operator::join::{Join, JoinCondition, JoinType};
 use paro_planner::operator::{
-    Aggregate, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit, LogicalOperator, Order,
-    Projection, SetOperation, Window as LogicalWindow,
+    Aggregate, ExplainSpec, ExpressionGet, Filter, Get, GraphExpand, GraphScan, Limit,
+    LogicalOperator, Order, Projection, SetOperation, Window as LogicalWindow,
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::index::PredicateTree;
@@ -213,6 +213,9 @@ fn arena_generator_lowers_distinct_to_hash_aggregate() {
     assert_eq!(spec.output_names.as_ref(), ["a"]);
     assert_eq!(plan.child_ids(&plan.node(plan.root).children).len(), 1);
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&plan).is_ok());
+    let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
+    assert!(explain.contains("Group Key: a"), "{explain}");
+    assert!(!explain.contains("Group Key: #"), "{explain}");
 }
 
 #[test]
@@ -672,9 +675,12 @@ fn arena_generator_pushes_filter_predicates_into_rowset_scan() {
         panic!("expected conjunctive storage predicate");
     };
     assert_eq!(children.len(), 3);
-    assert!(physical
-        .format_explain_text_with_spec(&paro_planner::operator::ExplainSpec::default())
-        .contains("Pushed Predicate"));
+    let explain = physical.format_explain_text_with_spec(&ExplainSpec::default());
+    assert!(
+        explain.contains("Pushed Predicate: a >= 10 AND b IN (3, 7) AND c IS NULL"),
+        "{explain}"
+    );
+    assert!(!explain.contains("col#"), "{explain}");
 }
 
 #[test]
@@ -1033,6 +1039,9 @@ fn arena_generator_lowers_single_join_to_typed_hash_path() {
     assert_eq!(spec.join_type, JoinType::Single);
     assert_eq!(plan.child_ids(&plan.node(plan.root).children).len(), 2);
     assert!(PhysicalPlanGenerator::ensure_fully_typed(&plan).is_ok());
+    let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
+    assert!(explain.contains("Join Condition: l = r"), "{explain}");
+    assert!(!explain.contains("Join Condition: #"), "{explain}");
 }
 
 #[test]
@@ -1057,7 +1066,17 @@ fn arena_generator_names_hidden_order_columns() {
             Projection::new(1, values, exprs).with_visible_names(vec!["a".into()]),
         ),
     );
-    let order = LogicalPlan::new(&ctx, LogicalOperator::Order(Order::new(project, vec![])));
+    let order = LogicalPlan::new(
+        &ctx,
+        LogicalOperator::Order(Order::new(
+            project,
+            vec![paro_planner::binder::ir::OrderByNode {
+                expression: ref_expr(1, LogicalType::Integer),
+                ascending: false,
+                nulls_first: true,
+            }],
+        )),
+    );
 
     let mut generator = PhysicalPlanGenerator::new(PlanBuildContext::default());
     let plan = generator
@@ -1073,6 +1092,12 @@ fn arena_generator_names_hidden_order_columns() {
         panic!("order child should be a project");
     };
     assert_eq!(spec.output_names.as_ref(), ["a", "__paro_hidden_1"]);
+    let explain = plan.format_explain_text_with_spec(&ExplainSpec::default());
+    assert!(
+        explain.contains("Sort Key: b DESC NULLS FIRST"),
+        "{explain}"
+    );
+    assert!(!explain.contains("Sort Key: #"), "{explain}");
 }
 
 #[test]

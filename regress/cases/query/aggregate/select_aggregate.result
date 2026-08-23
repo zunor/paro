@@ -58,9 +58,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: g, filtered_sum
   ->  AGGREGATE  (rows=3)
-    Group Key: +(#0, 10)
-    Aggregates: sum(*(#1, 2)) FILTER (WHERE #2 >= 2)
-    Output: aggr_0, aggr_1
+    Group Key: +(grp, 10)
+    Aggregates: sum(*(x, 2)) FILTER (WHERE y >= 2)
+    Output: +(grp, 10), sum(*(x, 2)) FILTER (WHERE y >= 2)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y
       ->  VALUES  (rows=6)
@@ -75,8 +75,8 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: first(x) WITHIN GROUP ( ORDER BY y DESC NULLS LAST )
   ->  AGGREGATE  (rows=1)
-    Aggregates: first(#0) WITHIN GROUP (ORDER BY #1 DESC NULLS LAST)
-    Output: aggr_0
+    Aggregates: first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
+    Output: first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
     ->  PROJECTION  (rows=3)
       Output: x, y
       ->  VALUES  (rows=3)
@@ -144,9 +144,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, sum_all, sum_distinct_x, count_distinct_y
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: sum(#1), sum(DISTINCT #1), count(DISTINCT #2)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: grp
+    Aggregates: sum(x), sum(DISTINCT x), count(DISTINCT y)
+    Output: grp, sum(x), sum(DISTINCT x), count(DISTINCT y)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y
       ->  VALUES  (rows=6)
@@ -167,9 +167,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: g, sum_x, count_filtered
   ->  AGGREGATE  (rows=3)
-    Group Key: +(#0, 10)
-    Aggregates: sum(#1), count(#1) FILTER (WHERE #2 >= 2)
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: +(grp, 10)
+    Aggregates: sum(x), count(x) FILTER (WHERE y >= 2)
+    Output: +(grp, 10), sum(x), count(x) FILTER (WHERE y >= 2)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y
       ->  VALUES  (rows=6)
@@ -230,9 +230,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, sum_y_ge_2, sum_y_ge_4, cnt_x_ge_2
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: sum(#1) FILTER (WHERE #2 >= 2), sum(#1) FILTER (WHERE #2 >= 4), count(#1) FILTER (WHERE #1 >= 2)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: grp
+    Aggregates: sum(x) FILTER (WHERE y >= 2), sum(x) FILTER (WHERE y >= 4), count(x) FILTER (WHERE x >= 2)
+    Output: grp, sum(x) FILTER (WHERE y >= 2), sum(x) FILTER (WHERE y >= 4), count(x) FILTER (WHERE x >= 2)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y
       ->  VALUES  (rows=6)
@@ -288,9 +288,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, first_desc, last_desc
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: first(#1) WITHIN GROUP (ORDER BY #2 DESC NULLS LAST), last(#1) WITHIN GROUP (ORDER BY #2 DESC NULLS LAST)
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: grp
+    Aggregates: first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST), last(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
+    Output: grp, first(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST), last(x) WITHIN GROUP (ORDER BY y DESC NULLS LAST)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y
       ->  VALUES  (rows=6)
@@ -361,10 +361,10 @@ QUERY PLAN
 PROJECTION  (rows=6)
   Output: grp_g, grp, sum_x
   ->  AGGREGATE  (rows=6)
-    Group Key: #0
-    Aggregates: sum(#1)
-    Grouping Sets: (0), ()
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: grp
+    Aggregates: sum(x)
+    Grouping Sets: (grp), ()
+    Output: grp, sum(x), grouping(grp)
     ->  PROJECTION  (rows=6)
       Output: grp, x
       ->  VALUES  (rows=6)
@@ -509,9 +509,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: grp, labels_desc, xs_ge_2, stddev_x
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: string_agg(#3, '|') WITHIN GROUP (ORDER BY #2 DESC NULLS LAST), array_agg(#1) FILTER (WHERE #1 >= 2), stddev(#1)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: grp
+    Aggregates: string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST), array_agg(x) FILTER (WHERE x >= 2), stddev(x)
+    Output: grp, string_agg(label, '|') WITHIN GROUP (ORDER BY y DESC NULLS LAST), array_agg(x) FILTER (WHERE x >= 2), stddev(x)
     ->  PROJECTION  (rows=6)
       Output: grp, x, y, label
       ->  VALUES  (rows=6)
@@ -567,9 +567,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: g_tiny, sum_x
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: sum(#1)
-    Output: aggr_0, aggr_1
+    Group Key: g_tiny
+    Aggregates: sum(x)
+    Output: g_tiny, sum(x)
     ->  PROJECTION  (rows=8)
       Output: g_tiny, x
       ->  VALUES  (rows=8)
@@ -610,9 +610,9 @@ QUERY PLAN
 PROJECTION  (rows=8)
   Output: g_tiny, h_tiny, cnt, sum_flag_true
   ->  AGGREGATE  (rows=8)
-    Group Key: #0, #1
-    Aggregates: count_star(*), sum(#2) FILTER (WHERE #3)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: g_tiny, h_tiny
+    Aggregates: count_star(*), sum(x) FILTER (WHERE flag)
+    Output: g_tiny, h_tiny, count_star(*), sum(x) FILTER (WHERE flag)
     ->  PROJECTION  (rows=8)
       Output: g_tiny, h_tiny, x, flag
       ->  VALUES  (rows=8)
@@ -635,9 +635,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: g_tiny, cd_x
   ->  AGGREGATE  (rows=3)
-    Group Key: #0
-    Aggregates: count(DISTINCT #1)
-    Output: aggr_0, aggr_1
+    Group Key: g_tiny
+    Aggregates: count(DISTINCT x)
+    Output: g_tiny, count(DISTINCT x)
     ->  PROJECTION  (rows=8)
       Output: g_tiny, x
       ->  VALUES  (rows=8)
@@ -660,10 +660,10 @@ QUERY PLAN
 PROJECTION  (rows=6)
   Output: g_tiny, sum_x
   ->  AGGREGATE  (rows=6)
-    Group Key: #0
-    Aggregates: sum(#1)
-    Grouping Sets: (0), ()
-    Output: aggr_0, aggr_1
+    Group Key: g_tiny
+    Aggregates: sum(x)
+    Grouping Sets: (g_tiny), ()
+    Output: g_tiny, sum(x)
     ->  PROJECTION  (rows=8)
       Output: g_tiny, x
       ->  VALUES  (rows=8)
@@ -705,9 +705,9 @@ QUERY PLAN
 PROJECTION  (rows=3)
   Output: inline_key, cnt
   ->  AGGREGATE  (rows=3)
-    Group Key: +(#0, *(#1, 3000000))
+    Group Key: +(k_int, *(tag, 3000000))
     Aggregates: count_star(*)
-    Output: aggr_0, aggr_1
+    Output: +(k_int, *(tag, 3000000)), count_star(*)
     ->  PROJECTION  (rows=6)
       Output: k_int, tag
       ->  VALUES  (rows=6)
@@ -728,9 +728,9 @@ QUERY PLAN
 PROJECTION  (rows=4)
   Output: k_inline_int, k_small, k_tiny, sum_v
   ->  AGGREGATE  (rows=4)
-    Group Key: +(#0, *(#3, 3000000)), #1, #2
-    Aggregates: sum(#4)
-    Output: aggr_0, aggr_1, aggr_2, aggr_3
+    Group Key: +(k_int, *(tag, 3000000)), k_small, k_tiny
+    Aggregates: sum(v)
+    Output: +(k_int, *(tag, 3000000)), k_small, k_tiny, sum(v)
     ->  PROJECTION  (rows=4)
       Output: k_int, k_small, k_tiny, tag, v
       ->  VALUES  (rows=4)
@@ -750,9 +750,9 @@ QUERY PLAN
 PROJECTION  (rows=4)
   Output: k_big_range, k_int, sum_v
   ->  AGGREGATE  (rows=4)
-    Group Key: +(#0, *(CAST(#2 AS BIGINT), 30000000000)), #1
-    Aggregates: sum(#3)
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: +(k_big, *(CAST(tag AS BIGINT), 30000000000)), k_int
+    Aggregates: sum(v)
+    Output: +(k_big, *(CAST(tag AS BIGINT), 30000000000)), k_int, sum(v)
     ->  PROJECTION  (rows=4)
       Output: k_big, k_int, tag, v
       ->  VALUES  (rows=4)
@@ -772,9 +772,9 @@ QUERY PLAN
 PROJECTION  (rows=4)
   Output: k_big, k_int, sum_v
   ->  AGGREGATE  (rows=4)
-    Group Key: #0, #1
-    Aggregates: sum(#2)
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: k_big, k_int
+    Aggregates: sum(v)
+    Output: k_big, k_int, sum(v)
     ->  PROJECTION  (rows=4)
       Output: k_big, k_int, v
       ->  VALUES  (rows=4)
@@ -794,10 +794,10 @@ QUERY PLAN
 PROJECTION  (rows=4)
   Output: k_big, k_int, sum_v
   ->  AGGREGATE  (rows=4)
-    Group Key: #0, #1
-    Aggregates: sum(#2)
-    Grouping Sets: (0, 1), ()
-    Output: aggr_0, aggr_1, aggr_2
+    Group Key: k_big, k_int
+    Aggregates: sum(v)
+    Grouping Sets: (k_big, k_int), ()
+    Output: k_big, k_int, sum(v)
     ->  PROJECTION  (rows=4)
       Output: k_big, k_int, v
       ->  VALUES  (rows=4)
@@ -880,8 +880,8 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: s1, s2, s3
   ->  AGGREGATE  (rows=1)
-    Aggregates: sum(#0), count_star(*)
-    Output: aggr_0, aggr_1
+    Aggregates: sum(x), count_star(*)
+    Output: sum(x), count_star(*)
     ->  PROJECTION  (rows=3)
       Output: x
       ->  VALUES  (rows=3)
@@ -903,13 +903,13 @@ GROUP BY grp
 ORDER BY grp;
 QUERY PLAN
 ORDER_BY  (rows=3)
-  Sort Key: #0 ASC NULLS LAST
+  Sort Key: grp ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: grp, sx, sx_plus_1, sx_plus_cnt
     ->  AGGREGATE  (rows=3)
-      Group Key: #0
-      Aggregates: sum(#1), count_star(*)
-      Output: aggr_0, aggr_1, aggr_2
+      Group Key: grp
+      Aggregates: sum(x), count_star(*)
+      Output: grp, sum(x), count_star(*)
       ->  PROJECTION  (rows=6)
         Output: grp, x
         ->  VALUES  (rows=6)
@@ -995,8 +995,8 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: min_filtered
   ->  AGGREGATE  (rows=1)
-    Aggregates: min(#0) FILTER (WHERE #0 > 2)
-    Output: aggr_0
+    Aggregates: min(x) FILTER (WHERE x > 2)
+    Output: min(x) FILTER (WHERE x > 2)
     ->  PROJECTION  (rows=6)
       Output: x
       ->  VALUES  (rows=6)

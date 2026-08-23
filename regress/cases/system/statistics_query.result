@@ -48,14 +48,14 @@ PROJECTION  (rows=1)
   ->  HASH_JOIN  (rows=1)
     Join Type: INNER
     Build Index: integer_build_time
-    Join Condition: #0 = #0
+    Join Condition: b.id = s.id
     Cardinality: [1, 1, 1]
-    Output Schema: payload VARCHAR, id INTEGER
+    Output Schema: b.payload VARCHAR, s.id INTEGER
     ->  ROWSET_SCAN on public.stats_big b
       Columns: id, payload
-      Pushed Predicate: col#0 <= 1 AND col#0 = 1
+      Pushed Predicate: id <= 1 AND id = 1
       Late Materialize: auto
-      Runtime Filter: #0 = 1
+      Runtime Filter: id = 1
       Output Schema: id INTEGER, payload VARCHAR
     ->  ROWSET_SCAN on public.stats_small s  (rows=1)
       Columns: id

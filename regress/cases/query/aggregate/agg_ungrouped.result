@@ -47,8 +47,8 @@ QUERY PLAN
 PROJECTION  (rows=1)
   Output: cnt_star, sum_x
   ->  AGGREGATE  (rows=1)
-    Aggregates: count_star(*), sum(#0)
-    Output: aggr_0, aggr_1
+    Aggregates: count_star(*), sum(x)
+    Output: count_star(*), sum(x)
     ->  PROJECTION  (rows=4)
       Output: x
       ->  VALUES  (rows=4)

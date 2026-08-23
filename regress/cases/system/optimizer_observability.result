@@ -58,20 +58,21 @@ PROJECTION  (rows=1)
   Cardinality: [0, 1, 1]
   Output Schema: id INTEGER
   ->  TOP_N  (rows=1)
-    Sort Key: #1 DESC NULLS FIRST, #0 ASC NULLS LAST
+    Sort Key: bm25(title, 'graph') DESC NULLS FIRST, id ASC NULLS LAST
     Limit: 2
     Cardinality: [0, 1, 1]
-    Output Schema: id INTEGER, __paro_hidden_1 FLOAT
+    Output Schema: id INTEGER, bm25(title, 'graph') FLOAT
     ->  PROJECTION  (rows=1)
-      Output: id, __paro_hidden_1
+      Output: id, bm25(title, 'graph')
       Cardinality: [0, 1, 1]
-      Output Schema: id INTEGER, __paro_hidden_1 FLOAT
+      Output Schema: id INTEGER, bm25(title, 'graph') FLOAT
       ->  FULLTEXT_SCAN on public.obs_docs  (rows=1)
         Search Definition: <search-definition-id>
         Search Generation: <search-generation-id>
         Search Root: <search-root-id>
         Search Capability: Queryable
-        Column: 1
+        Search Candidate: full text
+        Column: title
         Mode: Filter
         Cardinality: [0, 1, 1]
         Output Schema: id INTEGER, title VARCHAR

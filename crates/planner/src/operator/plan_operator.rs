@@ -210,9 +210,7 @@ impl LogicalOperator {
                     }
                 }
             }
-            LogicalOperator::DelimGet(op) => (0..op.chunk_types.len())
-                .map(|idx| format!("delim_{}", idx + 1))
-                .collect(),
+            LogicalOperator::DelimGet(op) => op.chunk_names.clone(),
             LogicalOperator::DependentJoin(op) => op.output_names(),
             LogicalOperator::SetOperation(op) => op.left().output_names(),
             LogicalOperator::Distinct(op) => op.child.output_names(),

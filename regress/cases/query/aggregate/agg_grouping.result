@@ -84,14 +84,14 @@ GROUP BY GROUPING SETS ((region), ())
 ORDER BY g_region, region;
 QUERY PLAN
 ORDER_BY  (rows=3)
-  Sort Key: #0 ASC NULLS LAST, #1 ASC NULLS LAST
+  Sort Key: g_region ASC NULLS LAST, region ASC NULLS LAST
   ->  PROJECTION  (rows=3)
     Output: g_region, region, sum_sales
     ->  AGGREGATE  (rows=3)
-      Group Key: #0
-      Aggregates: sum(#1)
-      Grouping Sets: (0), ()
-      Output: aggr_0, aggr_1, aggr_2
+      Group Key: region
+      Aggregates: sum(sales)
+      Grouping Sets: (region), ()
+      Output: region, sum(sales), grouping(region)
       ->  PROJECTION  (rows=3)
         Output: region, sales
         ->  VALUES  (rows=3)
