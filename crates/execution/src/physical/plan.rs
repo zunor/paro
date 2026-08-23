@@ -910,6 +910,7 @@ fn push_search_token_properties(properties: &mut Vec<ExplainProperty>, token: &C
 fn push_search_filter_properties(
     properties: &mut Vec<ExplainProperty>,
     predicate: Option<&crate::physical::specs::SearchPredicateTemplate>,
+    contract: crate::physical::specs::SearchFilterContract,
     table: &TableCatalogEntry,
 ) {
     let Some(predicate) = predicate else {
@@ -920,18 +921,25 @@ fn push_search_filter_properties(
         "Pushed Predicate",
         format_search_predicate(predicate, table),
     );
-    push_string_property(
-        properties,
-        "Filter Pushdown",
-        "storage-level exact per-segment bitmap (no residual FILTER)".to_string(),
-    );
+    let contract = match contract {
+        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual => {
+            "exact segment bitmap; no residual filter"
+        }
+        crate::physical::specs::SearchFilterContract::None => "unproven",
+    };
+    push_string_property(properties, "Filter Pushdown", contract.to_string());
 }
 
 fn push_dense_search_filter_properties(
     properties: &mut Vec<ExplainProperty>,
     spec: &crate::physical::specs::VectorSearchSpec,
 ) {
-    push_search_filter_properties(properties, spec.predicate.as_ref(), spec.table.as_ref());
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.table.as_ref(),
+    );
     if spec.predicate.is_none() {
         return;
     }
@@ -946,34 +954,54 @@ fn push_dense_search_filter_properties(
         }
     }
 
-    let policy = spec
-        .table
-        .storage
-        .as_ref()
-        .and_then(|storage| storage.vector_search_policy(spec.column_id as u32, spec.distance));
-    let strategy = match (has_runtime_parameters, policy, spec.estimated_filter_rows) {
-        (true, Some(policy), _) => format!(
-            "runtime exact bitmap: exact scan at <= {}; otherwise unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement (exact fallback if underfilled)",
-            policy.filtered_plain_scan_threshold
-        ),
-        (true, None, _) => {
-            "runtime exact bitmap chooses exact scan or unfiltered-navigation filtered Top-K"
+    let strategy = match (
+        has_runtime_parameters,
+        spec.estimated_filter_rows,
+        spec.estimated_total_rows,
+    ) {
+        (true, _, _) => {
+            "runtime exact bitmap; shared HNSW policy selects exact, masked, or predicate-refined search from cardinality and beam occupancy"
                 .to_string()
         }
-        (false, Some(policy), Some(rows))
-            if rows <= policy.filtered_plain_scan_threshold as u64 =>
-        {
-            format!(
-                "exact filtered distance scan ({} <= threshold {})",
-                rows, policy.filtered_plain_scan_threshold
-            )
+        (false, Some(rows), Some(total_rows)) => {
+            use paro_storage::index::hnsw::{
+                choose_filtered_search_strategy, HnswFilteredSearchStrategy,
+            };
+            let effective_ef = spec.search_policy.effective_ef(spec.k, spec.params.ef);
+            let decision = choose_filtered_search_strategy(
+                rows,
+                total_rows,
+                spec.k,
+                effective_ef,
+                spec.search_policy,
+            );
+            let name = match decision.strategy {
+                HnswFilteredSearchStrategy::ExactScan => "exact bitmap distance scan",
+                HnswFilteredSearchStrategy::MaskedTopK => {
+                    "connected HNSW + exact bitmap admission (no refinement)"
+                }
+                HnswFilteredSearchStrategy::RefinedTopK => {
+                    "connected HNSW + exact bitmap admission + predicate-local refinement"
+                }
+            };
+            match decision.strategy {
+                HnswFilteredSearchStrategy::ExactScan => format!(
+                    "{name} (estimated {rows}/{total_rows} rows; exact threshold {})",
+                    spec.search_policy.filtered_plain_scan_threshold
+                ),
+                HnswFilteredSearchStrategy::MaskedTopK => format!(
+                    "{name} (estimated {rows}/{total_rows} rows; admitted beam {} >= required {})",
+                    decision.expected_admitted_beam_points,
+                    decision.required_admitted_beam_points
+                ),
+                HnswFilteredSearchStrategy::RefinedTopK => format!(
+                    "{name} (estimated {rows}/{total_rows} rows; admitted beam {} < required {})",
+                    decision.expected_admitted_beam_points,
+                    decision.required_admitted_beam_points
+                ),
+            }
         }
-        (false, Some(policy), Some(rows)) => format!(
-            "unfiltered HNSW navigation + exact-bitmap filtered Top-K + predicate-local refinement ({} > exact threshold {}; exact fallback if underfilled)",
-            rows, policy.filtered_plain_scan_threshold
-        ),
-        _ => "runtime exact bitmap chooses exact scan or unfiltered-navigation filtered Top-K"
-            .to_string(),
+        _ => "runtime exact bitmap; cardinality unavailable at plan time".to_string(),
     };
     push_string_property(properties, "Filtered Strategy", strategy);
 }
@@ -1010,7 +1038,12 @@ fn push_sparse_search_properties(
         table_column_name(spec.table.as_ref(), spec.column_id),
     );
     push_string_property(properties, "Limit", spec.k.to_string());
-    push_search_filter_properties(properties, spec.predicate.as_ref(), spec.table.as_ref());
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.table.as_ref(),
+    );
 }
 
 fn push_fulltext_search_properties(
@@ -1024,7 +1057,12 @@ fn push_fulltext_search_properties(
         table_column_name(spec.table.as_ref(), spec.column_id),
     );
     push_string_property(properties, "Mode", format!("{:?}", spec.mode));
-    push_search_filter_properties(properties, spec.predicate.as_ref(), spec.table.as_ref());
+    push_search_filter_properties(
+        properties,
+        spec.predicate.as_ref(),
+        spec.filter_contract,
+        spec.table.as_ref(),
+    );
 }
 
 fn push_search_source_properties(properties: &mut Vec<ExplainProperty>, source: &SearchSourceSpec) {
@@ -1931,13 +1969,16 @@ fn table_column_name(table: &TableCatalogEntry, column_id: usize) -> String {
         .unwrap_or_else(|| format!("<column {column_id}>"))
 }
 
-fn format_predicate_tree(predicate: &PredicateTree, table: &TableCatalogEntry) -> String {
+fn format_predicate_tree<V: std::fmt::Display>(
+    predicate: &PredicateTree<V>,
+    table: &TableCatalogEntry,
+) -> String {
     let budget = ExplainFormatBudget::new();
     format_predicate_tree_with_precedence(predicate, table, ExplainPrecedence::Lowest, 0, &budget)
 }
 
-fn format_predicate_tree_with_precedence(
-    predicate: &PredicateTree,
+fn format_predicate_tree_with_precedence<V: std::fmt::Display>(
+    predicate: &PredicateTree<V>,
     table: &TableCatalogEntry,
     parent_precedence: ExplainPrecedence,
     depth: usize,
@@ -1992,7 +2033,10 @@ fn format_predicate_tree_with_precedence(
     }
 }
 
-fn format_predicate(predicate: &Predicate, table: &TableCatalogEntry) -> String {
+fn format_predicate<V: std::fmt::Display>(
+    predicate: &Predicate<V>,
+    table: &TableCatalogEntry,
+) -> String {
     let name = |column_id: u32| table_column_name(table, column_id as usize);
     match predicate {
         Predicate::Eq { column_id, value } => format!("{} = {value}", name(*column_id)),
@@ -2066,49 +2110,5 @@ fn format_search_predicate(
     predicate: &crate::physical::specs::SearchPredicateTemplate,
     table: &TableCatalogEntry,
 ) -> String {
-    let budget = ExplainFormatBudget::new();
-    format_search_predicate_inner(predicate, table, 0, &budget)
-}
-
-fn format_search_predicate_inner(
-    predicate: &crate::physical::specs::SearchPredicateTemplate,
-    table: &TableCatalogEntry,
-    depth: usize,
-    budget: &ExplainFormatBudget,
-) -> String {
-    use crate::physical::specs::SearchPredicateTemplate;
-
-    if !budget.enter(depth) {
-        return "…".to_string();
-    }
-    let next_depth = depth + 1;
-    bound_explain_text(match predicate {
-        SearchPredicateTemplate::Bound(predicate) => format_predicate_tree(predicate, table),
-        SearchPredicateTemplate::ParameterComparison {
-            column_id,
-            comparison,
-            slot,
-            ..
-        } => format!(
-            "{} {comparison} ${}",
-            table_column_name(table, *column_id as usize),
-            slot.index.index() + 1
-        ),
-        SearchPredicateTemplate::And(children) => format!(
-            "({})",
-            children
-                .iter()
-                .map(|child| format_search_predicate_inner(child, table, next_depth, budget))
-                .collect::<Vec<_>>()
-                .join(" AND ")
-        ),
-        SearchPredicateTemplate::Or(children) => format!(
-            "({})",
-            children
-                .iter()
-                .map(|child| format_search_predicate_inner(child, table, next_depth, budget))
-                .collect::<Vec<_>>()
-                .join(" OR ")
-        ),
-    })
+    format_predicate_tree(predicate.tree(), table)
 }

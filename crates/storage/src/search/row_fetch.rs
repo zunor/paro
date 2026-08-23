@@ -1061,6 +1061,7 @@ mod tests {
             parallelism_slots: 1,
             cpu_step_budget: None,
             context: None,
+            memory_accountant: None,
         };
         let candidates = loop {
             match cursor

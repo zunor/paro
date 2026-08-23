@@ -138,8 +138,7 @@ impl Segment {
                 predicate: SegmentPredicateIndexes {
                     bloom_filters,
                     bitmap_indexes,
-                    runtime_bitmap_indexes: RwLock::new(HashMap::new()),
-                    runtime_art_indexes: RwLock::new(HashMap::new()),
+                    runtime_scalar_indexes: RwLock::new(HashMap::new()),
                 },
                 search: SegmentSearchIndexes {
                     hnsw_indexes,
@@ -389,6 +388,14 @@ impl Segment {
                 vec![column.logical_type.clone()],
                 body,
             )?;
+            if index.indexed_row_count() != footer.num_rows {
+                return Err(paro_error::data_corrupted(format!(
+                    "bitmap index row coverage mismatch for segment {segment_id} column {}: index={} segment={}",
+                    meta.column_id,
+                    index.indexed_row_count(),
+                    footer.num_rows
+                )));
+            }
             indexes.insert(meta.column_id, std::sync::Arc::new(index));
         }
         Ok(indexes)

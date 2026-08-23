@@ -34,7 +34,10 @@ pub use artifact::{
     ArtifactFileId, ArtifactGcContext, ArtifactGcPolicy, ArtifactLocation, GcDecision,
     SegmentPagePointer,
 };
-pub use budget::{ResourceBudget, ResourceContext, SearchBatchConfig};
+pub use budget::{
+    ResourceBudget, ResourceContext, SearchBatchConfig, SearchMemoryAccountant,
+    SearchMemoryReservation,
+};
 pub use capability::{
     ArtifactSegmentRef, CapabilityToken, CoverageState, SearchArtifactRef, SearchCapability,
     SearchCapabilityState, SearchDefinitionOrigin, SearchFreshnessPolicy, SearchGeneration,

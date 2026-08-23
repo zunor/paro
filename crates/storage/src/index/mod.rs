@@ -69,6 +69,7 @@ mod predicate;
 mod predicate_result;
 
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
+pub(crate) use bound_index::{PredicateIndexBinding, SegmentLocalComplete};
 pub use evaluator::IndexEvaluator;
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
 pub(crate) use fixed_membership::{

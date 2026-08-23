@@ -8,7 +8,7 @@ use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
 use paro_storage::index::PredicateTree;
 
-use crate::physical::specs::SearchPredicateTemplate;
+use crate::physical::specs::{SearchFilterContract, SearchPredicateTemplate};
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_get(
@@ -540,27 +540,44 @@ fn search_source_spec_for_candidate(
     output_names: Box<[String]>,
     output_types: Box<[LogicalType]>,
 ) -> Result<SearchSourceSpec> {
+    let filter_contract = SearchFilterContract::for_predicate(predicate.as_ref());
     match &candidate.intent {
-        SearchIntent::Hnsw(intent) => Ok(SearchSourceSpec::Vector(VectorSearchSpec {
-            table,
-            capability_token: candidate.token.clone(),
-            column_id: intent.column_id as usize,
-            query: intent.query.clone(),
-            distance: intent.distance,
-            k: scan.limit,
-            params: paro_storage::index::hnsw::types::SearchParams {
-                ef: intent.ef,
-                ..Default::default()
-            },
-            predicate,
-            estimated_filter_rows: candidate
-                .estimated_cost()
-                .and_then(|cost| cost.estimated_rows),
-            projected_columns,
-            emit_score,
-            output_names,
-            output_types,
-        })),
+        SearchIntent::Hnsw(intent) => {
+            let search_policy = table
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.vector_search_policy(intent.column_id, intent.distance))
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(
+                        "queryable HNSW candidate is missing its validated search policy",
+                    )
+                })?;
+            Ok(SearchSourceSpec::Vector(VectorSearchSpec {
+                table,
+                capability_token: candidate.token.clone(),
+                column_id: intent.column_id as usize,
+                query: intent.query.clone(),
+                distance: intent.distance,
+                k: scan.limit,
+                params: paro_storage::index::hnsw::types::SearchParams {
+                    ef: intent.ef,
+                    ..Default::default()
+                },
+                search_policy,
+                predicate,
+                filter_contract,
+                estimated_filter_rows: candidate
+                    .estimated_cost()
+                    .and_then(|cost| cost.estimated_rows),
+                estimated_total_rows: candidate
+                    .estimated_cost()
+                    .and_then(|cost| cost.estimated_total_rows),
+                projected_columns,
+                emit_score,
+                output_names,
+                output_types,
+            }))
+        }
         SearchIntent::Sparse(intent) => Ok(SearchSourceSpec::Sparse(SparseVectorSearchSpec {
             table,
             capability_token: candidate.token.clone(),
@@ -568,6 +585,7 @@ fn search_source_spec_for_candidate(
             query_vector: intent.query_vector.clone(),
             k: scan.limit,
             predicate,
+            filter_contract,
             projected_columns,
             emit_score,
             output_names,
@@ -584,6 +602,7 @@ fn search_source_spec_for_candidate(
             score_mode: intent.score_mode,
             mode: SearchRequestMode::TopK { limit: scan.limit },
             predicate,
+            filter_contract,
             projected_columns,
             emit_score,
             output_names,

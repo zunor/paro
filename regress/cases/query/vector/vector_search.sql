@@ -25,7 +25,7 @@ SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
 -- Exercise the indexed path on one inline-built rowset. Persist the complete,
 -- versioned HNSW contract instead of relying on provider-local defaults.
-CREATE TABLE indexed_items (id INT, bucket INT, emb VECTOR(3));
+CREATE TABLE indexed_items (id INT, bucket SMALLINT, emb VECTOR(3));
 CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
 CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     distance = l2
@@ -34,7 +34,7 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_search = 24
     build_seed = 7
     plain_scan_threshold = 0
-    filtered_plain_scan_threshold = 128
+    filtered_plain_scan_threshold = 256
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
@@ -74,9 +74,19 @@ DEALLOCATE vector_topk;
 -- Reusable plans retain the scalar parameter and choose the filtered search
 -- strategy from the exact bitmap cardinality when the source opens.
 PREPARE filtered_vector_topk(INT, VECTOR(3)) AS
-    SELECT id FROM indexed_items
+    SELECT bucket FROM indexed_items
     WHERE bucket = $1
     ORDER BY emb <-> $2 LIMIT 2;
+-- Reuse the same prepared plan with two bindings. The returned column makes a
+-- stale, plan-cached bitmap observable without depending on HNSW tie order.
+-- @query
+EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
+-- @query
+EXECUTE filtered_vector_topk(7, '[1.0, 1.0, 1.0]');
+-- An out-of-domain comparison is an empty predicate, not a narrowing-cast
+-- error. This also protects parameter binding from changing global cast rules.
+-- @query
+EXECUTE filtered_vector_topk(100000, '[1.0, 1.0, 1.0]');
 -- @normalize explain_search_ids
 EXPLAIN EXECUTE filtered_vector_topk(3, '[1.0, 1.0, 1.0]');
 DEALLOCATE filtered_vector_topk;

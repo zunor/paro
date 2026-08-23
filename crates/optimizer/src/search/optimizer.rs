@@ -134,6 +134,7 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -173,6 +174,7 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -213,6 +215,7 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
             );
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 return Ok(None);
@@ -274,6 +277,7 @@ impl SearchOptimizer {
                 capability,
                 estimated_cost,
                 filtered.expected,
+                base_rows,
             );
             let sequential = build_sequential_capability(table_id, filtered.expected);
             let Some(decision) = select_search_decision(candidate, sequential) else {
@@ -337,8 +341,11 @@ fn build_search_candidate(
     capability: paro_storage::search::SearchCapability,
     estimated_cost: f64,
     estimated_rows: u64,
+    estimated_total_rows: u64,
 ) -> SearchCandidate {
-    let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost).with_rows(estimated_rows);
+    let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost)
+        .with_rows(estimated_rows)
+        .with_total_rows(estimated_total_rows);
     SearchCandidate {
         intent,
         token: capability.capability_token(),

@@ -6,7 +6,8 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{
-    HnswSearchMode, HnswSearchPolicy, PreparedQuery, ScoredPoint, SearchParams,
+    choose_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchFilter,
+    HnswSearchPolicy, HnswSearchStrategy, ScoredPoint, SearchParams,
 };
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
@@ -21,7 +22,8 @@ impl Segment {
         &self,
         predicate_tree: &PredicateTree,
     ) -> Result<RoaringBitmap> {
-        let evaluator = IndexEvaluator::new(self.predicate_indexes());
+        let evaluator =
+            IndexEvaluator::for_segment(self.predicate_indexes()?, None, self.num_rows());
         let evaluation = evaluator.evaluate_with_proof(predicate_tree);
 
         if evaluation.is_exact() {
@@ -82,121 +84,46 @@ impl Segment {
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<Vec<ScoredPoint>> {
-        self.vector_search_with_epoch_mode(
-            column_id,
-            query,
-            top_k,
-            params,
-            snapshot_epoch,
-            predicate_tree,
-            policy,
-            HnswSearchMode::Auto,
-        )
-    }
-
-    pub(crate) fn vector_search_with_epoch_mode(
-        &self,
-        column_id: ColumnId,
-        query: &[f32],
-        top_k: usize,
-        params: &SearchParams,
-        snapshot_epoch: u64,
-        predicate_tree: Option<&PredicateTree>,
-        policy: &HnswSearchPolicy,
-        mode: HnswSearchMode,
-    ) -> Result<Vec<ScoredPoint>> {
         let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
-        self.vector_search_with_filter_mode(
-            column_id,
-            query,
+        let filter = match (predicate_tree.is_some(), filter_bitmap.as_ref()) {
+            (_, None) => HnswSearchFilter::None,
+            (true, Some(bitmap)) => HnswSearchFilter::Predicate(bitmap),
+            (false, Some(bitmap)) => HnswSearchFilter::Visibility(bitmap),
+        };
+        let strategy = local_search_strategy(
+            filter,
+            self.num_rows(),
             top_k,
-            params,
-            filter_bitmap.as_ref(),
-            policy,
-            mode,
+            policy.effective_ef(top_k, params.ef),
+            *policy,
+        );
+        self.vector_search_with_filter_strategy(
+            column_id, query, top_k, params, filter, policy, strategy,
         )
     }
 
     /// Search with an already materialized exact segment-local filter. Query
     /// providers use this after making a query-wide exact-vs-graph decision,
     /// avoiding both per-segment policy drift and duplicate predicate work.
-    pub(crate) fn vector_search_with_filter_mode(
+    pub(crate) fn vector_search_with_filter_strategy(
         &self,
         column_id: ColumnId,
         query: &[f32],
         top_k: usize,
         params: &SearchParams,
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter: HnswSearchFilter<'_>,
         policy: &HnswSearchPolicy,
-        mode: HnswSearchMode,
+        strategy: HnswSearchStrategy,
     ) -> Result<Vec<ScoredPoint>> {
         let index = self
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
-        if let Some(bm) = filter_bitmap {
+        if let Some(bm) = filter.bitmap() {
             if bm.is_empty() {
                 return Ok(Vec::new());
             }
         }
-        index.search_one_with_policy_mode(query, top_k, params, filter_bitmap, policy, mode)
-    }
-
-    /// Perform a batched vector search on this segment.
-    pub fn vector_search_batch(
-        &self,
-        column_id: ColumnId,
-        queries: &[PreparedQuery],
-        top_k: usize,
-        params: &SearchParams,
-        policy: &HnswSearchPolicy,
-        predicate_tree: Option<&PredicateTree>,
-        mode: HnswSearchMode,
-    ) -> Result<Vec<Vec<ScoredPoint>>> {
-        self.vector_search_batch_with_epoch(
-            column_id,
-            queries,
-            top_k,
-            params,
-            policy,
-            self.rowset_gen,
-            predicate_tree,
-            mode,
-        )
-    }
-
-    /// Perform a batched vector search on this segment using a snapshot epoch.
-    pub(crate) fn vector_search_batch_with_epoch(
-        &self,
-        column_id: ColumnId,
-        queries: &[PreparedQuery],
-        top_k: usize,
-        params: &SearchParams,
-        policy: &HnswSearchPolicy,
-        snapshot_epoch: u64,
-        predicate_tree: Option<&PredicateTree>,
-        mode: HnswSearchMode,
-    ) -> Result<Vec<Vec<ScoredPoint>>> {
-        if queries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let index = self
-            .open_hnsw_index(column_id)?
-            .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
-        let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
-        if let Some(bm) = filter_bitmap.as_ref() {
-            if bm.is_empty() {
-                return Ok(vec![Vec::new(); queries.len()]);
-            }
-        }
-        index.search_many_prepared_with_policy(
-            queries,
-            top_k,
-            params,
-            filter_bitmap.as_ref(),
-            policy,
-            mode,
-        )
+        index.search_one_with_policy_strategy(query, top_k, params, filter, policy, strategy)
     }
 
     /// Perform a sparse vector search on this segment.
@@ -404,15 +331,60 @@ impl Segment {
     }
 }
 
+fn local_search_strategy(
+    filter: HnswSearchFilter<'_>,
+    total_rows: u64,
+    top_k: usize,
+    effective_ef: usize,
+    policy: HnswSearchPolicy,
+) -> HnswSearchStrategy {
+    match filter {
+        HnswSearchFilter::None => {
+            if total_rows <= policy.plain_scan_threshold as u64 {
+                HnswSearchStrategy::ExactScan
+            } else {
+                HnswSearchStrategy::UnfilteredGraph
+            }
+        }
+        HnswSearchFilter::Visibility(bitmap) => {
+            if bitmap.len() <= policy.filtered_plain_scan_threshold as u64 {
+                HnswSearchStrategy::ExactScan
+            } else {
+                HnswSearchStrategy::MaskedGraph
+            }
+        }
+        HnswSearchFilter::Predicate(bitmap) => {
+            match choose_filtered_search_strategy(
+                bitmap.len(),
+                total_rows,
+                top_k,
+                effective_ef,
+                policy,
+            )
+            .strategy
+            {
+                HnswFilteredSearchStrategy::ExactScan => HnswSearchStrategy::ExactScan,
+                HnswFilteredSearchStrategy::MaskedTopK => HnswSearchStrategy::MaskedGraph,
+                HnswFilteredSearchStrategy::RefinedTopK => HnswSearchStrategy::RefinedGraph,
+            }
+        }
+    }
+}
+
 fn predicate_result_to_bitmap(result: PredicateResult, num_rows: u64) -> Result<RoaringBitmap> {
     Ok(match result {
-        PredicateResult::AllMatch | PredicateResult::Unknown => {
+        PredicateResult::AllMatch => {
             let row_count = u32::try_from(num_rows).map_err(|_| {
                 paro_error::data_corrupted("segment row count exceeds exact-filter bitmap domain")
             })?;
             let mut bitmap = RoaringBitmap::new();
             bitmap.insert_range(0..row_count);
             bitmap
+        }
+        PredicateResult::Unknown => {
+            return Err(paro_error::internal(
+                "exact predicate proof resolved to an unknown candidate set",
+            ))
         }
         PredicateResult::NoneMatch => RoaringBitmap::new(),
         PredicateResult::Bitmap(bitmap) => bitmap,

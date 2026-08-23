@@ -5,10 +5,11 @@ use std::fmt;
 use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
+use paro_common::runtime_value::Value;
 use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_planner::operator::SearchDecision;
-use paro_storage::index::hnsw::types::SearchParams;
+use paro_storage::index::hnsw::types::{HnswSearchPolicy, SearchParams};
 use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::{PredicateComparison, PredicateTree};
 use paro_storage::rowset::SparseVector;
@@ -17,99 +18,98 @@ use paro_storage::search::{
     NormalizedSearchRequest, SearchRequestMode,
 };
 
-/// Predicate image retained by a reusable search plan. Storage predicates are
-/// concrete values, so runtime parameters are bound once when the search
-/// source opens rather than being evaluated for every candidate row.
+/// A scalar retained by a reusable search predicate.
+///
+/// The predicate structure is the storage predicate structure itself. Only
+/// its scalar values are delayed, so every predicate form can acquire runtime
+/// parameter support without growing a second, parallel predicate AST.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SearchPredicateTemplate {
-    Bound(PredicateTree),
-    ParameterComparison {
-        column_id: u32,
-        comparison: PredicateComparison,
+pub enum SearchPredicateValue {
+    Bound(Value),
+    RuntimeParameter {
         slot: ParameterSlot,
         target_type: LogicalType,
     },
-    And(Vec<SearchPredicateTemplate>),
-    Or(Vec<SearchPredicateTemplate>),
+}
+
+impl fmt::Display for SearchPredicateValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bound(value) => write!(f, "{value}"),
+            Self::RuntimeParameter { slot, .. } => write!(f, "${}", slot.index.index() + 1),
+        }
+    }
+}
+
+/// Predicate image retained by a reusable search plan. Runtime parameters are
+/// bound once when the search source opens, before segment index evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchPredicateTemplate {
+    tree: PredicateTree<SearchPredicateValue>,
 }
 
 impl SearchPredicateTemplate {
     pub fn bound(tree: PredicateTree) -> Self {
-        Self::Bound(tree)
+        Self {
+            tree: tree.map_values(&mut SearchPredicateValue::Bound),
+        }
+    }
+
+    pub fn parameter_comparison(
+        column_id: u32,
+        comparison: PredicateComparison,
+        slot: ParameterSlot,
+        target_type: LogicalType,
+    ) -> Self {
+        Self {
+            tree: PredicateTree::leaf(comparison.with_value(
+                column_id,
+                SearchPredicateValue::RuntimeParameter { slot, target_type },
+            )),
+        }
     }
 
     pub fn and(children: impl IntoIterator<Item = Self>) -> Option<Self> {
-        combine_predicate_templates(children, true)
+        PredicateTree::and(children.into_iter().map(|child| child.tree)).map(|tree| Self { tree })
     }
 
     pub fn or(children: impl IntoIterator<Item = Self>) -> Option<Self> {
-        combine_predicate_templates(children, false)
+        PredicateTree::or(children.into_iter().map(|child| child.tree)).map(|tree| Self { tree })
     }
 
     pub fn has_runtime_parameters(&self) -> bool {
-        match self {
-            Self::Bound(_) => false,
-            Self::ParameterComparison { .. } => true,
-            Self::And(children) | Self::Or(children) => {
-                children.iter().any(Self::has_runtime_parameters)
-            }
-        }
+        self.tree
+            .any_value(&|value| matches!(value, SearchPredicateValue::RuntimeParameter { .. }))
     }
-}
 
-fn combine_predicate_templates(
-    children: impl IntoIterator<Item = SearchPredicateTemplate>,
-    conjunction: bool,
-) -> Option<SearchPredicateTemplate> {
-    let mut combined = Vec::new();
-    for child in children {
-        match (conjunction, child) {
-            (true, SearchPredicateTemplate::And(mut nested))
-            | (false, SearchPredicateTemplate::Or(mut nested)) => combined.append(&mut nested),
-            (_, child) => combined.push(child),
-        }
-    }
-    match combined.len() {
-        0 => None,
-        1 => Some(combined.pop().expect("single predicate template child")),
-        _ if conjunction => Some(SearchPredicateTemplate::And(combined)),
-        _ => Some(SearchPredicateTemplate::Or(combined)),
+    pub fn tree(&self) -> &PredicateTree<SearchPredicateValue> {
+        &self.tree
     }
 }
 
 impl fmt::Display for SearchPredicateTemplate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Bound(tree) => write!(f, "{tree}"),
-            Self::ParameterComparison {
-                column_id,
-                comparison,
-                slot,
-                ..
-            } => write!(
-                f,
-                "col#{column_id} {comparison} ${}",
-                slot.index.index() + 1
-            ),
-            Self::And(children) => format_template_children(f, children, " AND "),
-            Self::Or(children) => format_template_children(f, children, " OR "),
-        }
+        write!(f, "{}", self.tree)
     }
 }
 
-fn format_template_children(
-    f: &mut fmt::Formatter<'_>,
-    children: &[SearchPredicateTemplate],
-    separator: &str,
-) -> fmt::Result {
-    f.write_str("(")?;
-    for (index, child) in children.iter().enumerate() {
-        if index > 0 {
-            f.write_str(separator)?;
+/// Proof carried by a physical search source about its absorbed predicate.
+/// EXPLAIN renders this local contract instead of assuming that every search
+/// provider happened to reject residual predicates elsewhere in lowering.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchFilterContract {
+    None,
+    ExactSegmentBitmapNoResidual,
+}
+
+impl SearchFilterContract {
+    pub fn for_predicate(predicate: Option<&SearchPredicateTemplate>) -> Self {
+        if predicate.is_some() {
+            Self::ExactSegmentBitmapNoResidual
+        } else {
+            Self::None
         }
-        write!(f, "{child}")?;
     }
-    f.write_str(")")
 }
 
 #[derive(Debug, Clone)]
@@ -121,10 +121,13 @@ pub struct VectorSearchSpec {
     pub distance: DistanceMetric,
     pub k: usize,
     pub params: SearchParams,
+    pub search_policy: HnswSearchPolicy,
     pub predicate: Option<SearchPredicateTemplate>,
+    pub filter_contract: SearchFilterContract,
     /// Cardinality estimate used to explain the provider's expected filtered
     /// exact-vs-graph strategy. Execution always decides from the exact bitmap.
     pub estimated_filter_rows: Option<u64>,
+    pub estimated_total_rows: Option<u64>,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,
@@ -139,6 +142,7 @@ pub struct SparseVectorSearchSpec {
     pub query_vector: SparseVector,
     pub k: usize,
     pub predicate: Option<SearchPredicateTemplate>,
+    pub filter_contract: SearchFilterContract,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,
@@ -157,6 +161,7 @@ pub struct FullTextSearchSpec {
     pub score_mode: FullTextScoreMode,
     pub mode: SearchRequestMode,
     pub predicate: Option<SearchPredicateTemplate>,
+    pub filter_contract: SearchFilterContract,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,

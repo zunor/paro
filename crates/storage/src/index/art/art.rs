@@ -27,9 +27,7 @@ use super::node::{GateStatus, NType, Node, ALLOCATOR_COUNT};
 use super::prefix::Prefix;
 use super::ARTKey;
 use crate::buffer::BufferManager;
-use crate::index::bound_index::{
-    BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode, IndexPredicateEvaluation,
-};
+use crate::index::bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 use crate::index::fixed_size_allocator::FixedSizeAllocator;
 use crate::index::predicate::{value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
@@ -2095,7 +2093,9 @@ impl BoundIndex for ART {
                 else {
                     return PredicateResult::Unknown;
                 };
-                self.search_close_range(&lower_key, &upper_key, &mut row_ids, usize::MAX);
+                if !self.search_close_range(&lower_key, &upper_key, &mut row_ids, usize::MAX) {
+                    return PredicateResult::Unknown;
+                }
             }
             _ => return PredicateResult::Unknown,
         }
@@ -2117,15 +2117,6 @@ impl BoundIndex for ART {
         } else {
             PredicateResult::Bitmap(bitmap)
         }
-    }
-
-    fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
-        let result = self.evaluate_predicate(predicate);
-        IndexPredicateEvaluation::exact(result)
-    }
-
-    fn provides_predicate_proof(&self) -> bool {
-        true
     }
 
     fn merge_indexes(&self, _other: &dyn BoundIndex) -> Result<bool> {

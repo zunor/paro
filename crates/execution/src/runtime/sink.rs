@@ -99,7 +99,8 @@ impl SinkExec {
         )
     }
 
-    #[inline]
+    /// Cold lifecycle dispatch; see [`SourceExec::create_global`](super::source::SourceExec::create_global).
+    #[inline(never)]
     pub fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
         match self {
             Self::ClientResult(exec) => exec.create_global(ctx),
@@ -125,7 +126,7 @@ impl SinkExec {
         }
     }
 
-    #[inline]
+    #[inline(never)]
     pub fn create_local(
         &self,
         ctx: &mut PipelineInitContext,

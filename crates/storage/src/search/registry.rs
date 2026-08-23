@@ -2444,6 +2444,7 @@ mod tests {
             parallelism_slots: 1,
             cpu_step_budget: None,
             context: None,
+            memory_accountant: None,
         };
 
         loop {
@@ -3819,6 +3820,7 @@ mod tests {
             parallelism_slots: 4,
             cpu_step_budget: None,
             context: None,
+            memory_accountant: None,
         };
         loop {
             match cursor.next_batch(&batch, &mut budget).unwrap() {
@@ -4825,6 +4827,7 @@ mod tests {
             parallelism_slots: 4,
             cpu_step_budget: None,
             context: None,
+            memory_accountant: None,
         };
         let mut row_count = 0usize;
         loop {
@@ -5396,6 +5399,7 @@ mod tests {
             parallelism_slots: 2,
             cpu_step_budget: None,
             context: None,
+            memory_accountant: None,
         };
         let mut returned = 0usize;
         while let SearchBatchState::Ready(batch) = cursor.next_batch(&batch, &mut budget).unwrap() {

@@ -6,7 +6,9 @@
 //! Cost estimators for vector and full-text search operations.
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
-use paro_storage::index::hnsw::HnswSearchPolicy;
+use paro_storage::index::hnsw::{
+    choose_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
+};
 use paro_storage::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
@@ -107,20 +109,39 @@ impl VectorScanCostModel {
             policy.plain_scan_threshold
         } as f64;
         let log_n = n.ln().max(1.0);
-        let ef_val = ef.unwrap_or(policy.ef_search).max(k).max(1) as f64;
+        let effective_ef = policy.effective_ef(k, ef);
+        let ef_val = effective_ef as f64;
         let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
+        let graph_cost = log_n * ef_val * dim_factor;
 
         if candidate_rows <= exact_threshold {
-            // The specialized scorer reads contiguous vector values and feeds
-            // Top-K directly. Keep the units relative to the generic per-row
-            // pipeline rather than pretending both paths have equal overhead.
-            return (candidate_rows * dim_factor * 0.25).max(1.0);
+            // Join the graph estimate continuously at the exact-scan boundary.
+            // This keeps increasing cardinality from making an access path
+            // appear cheaper merely because it crossed a policy threshold.
+            let threshold = exact_threshold.max(1.0);
+            return (graph_cost * candidate_rows / threshold).max(1.0);
         }
 
-        // Filtered Top-K shares the ordinary unfiltered navigation frontier;
-        // exact bitmap admission is negligible next to vector scoring and does
-        // not require inverse-selectivity oversampling.
-        log_n * ef_val * dim_factor
+        if filtered {
+            return match choose_filtered_search_strategy(
+                candidate_rows as u64,
+                stats.num_indexed_vectors as u64,
+                k,
+                effective_ef,
+                policy,
+            )
+            .strategy
+            {
+                HnswFilteredSearchStrategy::ExactScan => graph_cost,
+                HnswFilteredSearchStrategy::MaskedTopK => graph_cost,
+                // Connected navigation plus an independent predicate-local
+                // refinement generation. The exact factor is deliberately
+                // conservative; runtime telemetry can tune it later.
+                HnswFilteredSearchStrategy::RefinedTopK => graph_cost * 2.0,
+            };
+        }
+
+        graph_cost
     }
 
     /// Sparse cost: O(|query_nnz| * avg_posting_len)
@@ -258,7 +279,7 @@ mod tests {
             true,
         );
 
-        assert_eq!(cost, 5.0);
+        assert_eq!(cost, 1.0);
         assert!(
             cost < 20.0,
             "exact search source must beat generic row Top-N"
@@ -266,7 +287,7 @@ mod tests {
     }
 
     #[test]
-    fn filtered_graph_cost_shares_the_unfiltered_navigation_frontier() {
+    fn broad_filtered_graph_cost_shares_the_unfiltered_navigation_frontier() {
         let policy = HnswSearchPolicy {
             ef_search: 40,
             plain_scan_threshold: 10_000,
@@ -276,8 +297,35 @@ mod tests {
         let unfiltered =
             VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 1.0, Some(40), policy, false);
         let filtered =
-            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 0.1, Some(40), policy, true);
+            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 0.75, Some(40), policy, true);
 
         assert_eq!(filtered, unfiltered);
+    }
+
+    #[test]
+    fn exact_to_graph_cost_is_non_decreasing_at_threshold() {
+        let policy = HnswSearchPolicy {
+            ef_search: 40,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 20_000,
+        };
+        let stats = hnsw_stats(1_000_000, 128);
+        let at_threshold = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            20_000.0 / 1_000_000.0,
+            Some(40),
+            policy,
+            true,
+        );
+        let above_threshold = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            20_001.0 / 1_000_000.0,
+            Some(40),
+            policy,
+            true,
+        );
+        assert!(above_threshold >= at_threshold);
     }
 }

@@ -349,6 +349,7 @@ fn drain_search_cursor(
         parallelism_slots: parallelism_slots.max(1),
         cpu_step_budget: None,
         context: None,
+        memory_accountant: None,
     };
 
     loop {

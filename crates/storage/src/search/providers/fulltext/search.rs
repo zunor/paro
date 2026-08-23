@@ -462,7 +462,7 @@ impl FullTextTopKCursor {
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
-            |segment| {
+            |_, segment| {
                 let (rows, degraded) = self.search_segment(segment, &scoring_snapshot.stats)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),
@@ -726,7 +726,7 @@ impl FullTextFilterCursor {
             window,
             window_width,
             self.telemetry.as_ref(),
-            |segment| {
+            |_, segment| {
                 let (rows, degraded) = self.search_segment_rows(segment)?;
                 Ok(SegmentDispatchResult {
                     candidates_produced: rows.len(),

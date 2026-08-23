@@ -7,8 +7,8 @@ use std::sync::Arc;
 use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
-use paro_common::memory::MemoryAccountingClass;
-use paro_common::runtime_value::Value;
+use paro_common::memory::{MemoryAccountingClass, MemoryDomain, MemoryOwner};
+use paro_common::runtime_value::{IntegralDomainPosition, Value};
 use paro_common::types::LogicalType;
 use paro_function::scalar::cast::array_casts::parse_vector_literal;
 use paro_storage::index::fulltext::query_parser::{
@@ -17,22 +17,49 @@ use paro_storage::index::fulltext::query_parser::{
 };
 use paro_storage::index::fulltext::tokenizer::{tokenizer_from_config, Tokenizer};
 use paro_storage::index::fulltext::ts_serde::parse_serialized_tsquery;
-use paro_storage::index::{Predicate, PredicateComparison, PredicateTree};
+use paro_storage::index::PredicateComparison;
+use paro_storage::index::{Predicate, PredicateTree};
 use paro_storage::search::{
     CapabilityToken, DenseVectorQuery, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig,
-    SearchReadOptions, SearchRequestMode,
+    SearchMemoryAccountant, SearchReadOptions, SearchRequestMode,
 };
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
 
+use crate::memory_runtime::QueryMemoryPool;
 use crate::operators::search::driver::SearchOperatorDriver;
 use crate::physical::specs::{
-    FullTextSearchSpec, SearchPredicateTemplate, SearchSourceSpec, SparseVectorSearchSpec,
-    VectorSearchSpec,
+    FullTextSearchSpec, SearchPredicateTemplate, SearchPredicateValue, SearchSourceSpec,
+    SparseVectorSearchSpec, VectorSearchSpec,
 };
 use crate::runtime::context::{OperatorCallContext, PipelineInitContext};
 use crate::runtime::source::SourcePoll;
 use crate::runtime::state::{SearchSourceGlobal, SearchSourceLocal, SourceGlobal, SourceLocal};
+
+impl SearchMemoryAccountant for QueryMemoryPool {
+    fn try_reserve(&self, bytes: usize) -> Result<()> {
+        MemoryOwner::acquire_capacity(self, MemoryDomain::Host, bytes)?;
+        MemoryOwner::record_allocation(
+            self,
+            MemoryDomain::Host,
+            MemoryTag::VectorIndex,
+            MemoryAccountingClass::NonRevocable,
+            bytes,
+        );
+        Ok(())
+    }
+
+    fn release(&self, bytes: usize) {
+        MemoryOwner::release_allocation(
+            self,
+            MemoryDomain::Host,
+            MemoryTag::VectorIndex,
+            MemoryAccountingClass::NonRevocable,
+            bytes,
+        );
+        MemoryOwner::release_capacity(self, MemoryDomain::Host, bytes);
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) enum SearchSourceSpecRef<'a> {
@@ -232,6 +259,7 @@ fn create_search_driver(
         parallelism_slots: ctx.query.session.number_of_threads().max(1),
         cpu_step_budget: None,
         context: None,
+        memory_accountant: Some(ctx.query.memory.clone()),
     };
     Ok(SearchOperatorDriver::new(
         table,
@@ -256,60 +284,226 @@ fn bind_search_predicate_node(
     template: &SearchPredicateTemplate,
     params: &crate::runtime::ParameterBindings,
 ) -> Result<PredicateTree> {
-    match template {
-        SearchPredicateTemplate::Bound(tree) => Ok(tree.clone()),
-        SearchPredicateTemplate::ParameterComparison {
-            column_id,
-            comparison,
-            slot,
-            target_type,
-        } => {
-            let bound = params.value_for_slot(slot)?;
-            if bound.is_null() {
-                return Ok(PredicateTree::leaf(Predicate::In {
-                    column_id: *column_id,
-                    values: Vec::new(),
-                }));
+    let bound = template.tree().clone().try_map_values(&mut |value| {
+        match value {
+            SearchPredicateValue::Bound(value) => Ok(BoundSearchValue::Value(value)),
+            SearchPredicateValue::RuntimeParameter { slot, target_type } => {
+                let bound = params.value_for_slot(&slot)?;
+                if &bound.logical_type() == &target_type {
+                    Ok(BoundSearchValue::Value(bound.clone()))
+                } else {
+                    match bound.cast(&target_type) {
+                        Ok(value) => Ok(BoundSearchValue::Value(value)),
+                        Err(error) => match bound.integral_domain_position(&target_type) {
+                            Some(IntegralDomainPosition::Below) => Ok(BoundSearchValue::BelowDomain),
+                            Some(IntegralDomainPosition::Above) => Ok(BoundSearchValue::AboveDomain),
+                            Some(IntegralDomainPosition::Within) | None => {
+                                Err(paro_error::type_mismatch(format!(
+                                    "search predicate parameter ${} cannot be cast to {target_type}: {error}",
+                                    slot.index.index() + 1
+                                )))
+                            }
+                        },
+                    }
+                }
             }
-            let value = if &bound.logical_type() == target_type {
-                bound.clone()
-            } else {
-                bound.cast(target_type).map_err(|error| {
-                    paro_error::type_mismatch(format!(
-                        "search predicate parameter ${} cannot be cast to {target_type}: {error}",
-                        slot.index.index() + 1
-                    ))
-                })?
-            };
-            Ok(PredicateTree::leaf(scalar_predicate(
-                *column_id,
-                *comparison,
-                value,
-            )))
         }
-        SearchPredicateTemplate::And(children) => Ok(PredicateTree::And(
-            children
-                .iter()
-                .map(|child| bind_search_predicate_node(child, params))
-                .collect::<Result<Vec<_>>>()?,
-        )),
-        SearchPredicateTemplate::Or(children) => Ok(PredicateTree::Or(
-            children
-                .iter()
-                .map(|child| bind_search_predicate_node(child, params))
-                .collect::<Result<Vec<_>>>()?,
-        )),
+    })?;
+    let bound = bound.try_map_predicates(&mut bind_search_predicate_leaf)?;
+    Ok(normalize_search_null_semantics(bound))
+}
+
+#[derive(Debug)]
+enum BoundSearchValue {
+    Value(Value),
+    BelowDomain,
+    AboveDomain,
+}
+
+fn bind_search_predicate_leaf(predicate: Predicate<BoundSearchValue>) -> Result<Predicate<Value>> {
+    Ok(match predicate {
+        Predicate::Eq { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::Equal, value)
+        }
+        Predicate::NotEq { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::NotEqual, value)
+        }
+        Predicate::Lt { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::LessThan, value)
+        }
+        Predicate::Le { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::LessThanOrEqual, value)
+        }
+        Predicate::Gt { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::GreaterThan, value)
+        }
+        Predicate::Ge { column_id, value } => {
+            bind_ordered_comparison(column_id, PredicateComparison::GreaterThanOrEqual, value)
+        }
+        Predicate::In { column_id, values } => Predicate::In {
+            column_id,
+            values: values
+                .into_iter()
+                .filter_map(|value| match value {
+                    BoundSearchValue::Value(value) => Some(value),
+                    BoundSearchValue::BelowDomain | BoundSearchValue::AboveDomain => None,
+                })
+                .collect(),
+        },
+        Predicate::Range {
+            column_id,
+            lower,
+            upper,
+        } => bind_search_range(column_id, lower, upper),
+        Predicate::FixedIn { column_id, values } => Predicate::FixedIn { column_id, values },
+        Predicate::IsNull { column_id } => Predicate::IsNull { column_id },
+        Predicate::IsNotNull { column_id } => Predicate::IsNotNull { column_id },
+        Predicate::StringPrefix {
+            column_id,
+            prefix,
+            negated,
+        } => Predicate::StringPrefix {
+            column_id,
+            prefix,
+            negated,
+        },
+        Predicate::StringPrefixIn {
+            column_id,
+            prefixes,
+        } => Predicate::StringPrefixIn {
+            column_id,
+            prefixes,
+        },
+        Predicate::StringLike {
+            column_id,
+            pattern,
+            negated,
+        } => Predicate::StringLike {
+            column_id,
+            pattern,
+            negated,
+        },
+        Predicate::ColumnComparison {
+            left_column_id,
+            right_column_id,
+            comparison,
+        } => Predicate::ColumnComparison {
+            left_column_id,
+            right_column_id,
+            comparison,
+        },
+    })
+}
+
+fn bind_ordered_comparison(
+    column_id: u32,
+    comparison: PredicateComparison,
+    value: BoundSearchValue,
+) -> Predicate<Value> {
+    match value {
+        BoundSearchValue::Value(value) => comparison.with_value(column_id, value),
+        BoundSearchValue::BelowDomain => match comparison {
+            PredicateComparison::Equal
+            | PredicateComparison::LessThan
+            | PredicateComparison::LessThanOrEqual => empty_search_predicate(column_id),
+            PredicateComparison::NotEqual
+            | PredicateComparison::GreaterThan
+            | PredicateComparison::GreaterThanOrEqual => Predicate::IsNotNull { column_id },
+        },
+        BoundSearchValue::AboveDomain => match comparison {
+            PredicateComparison::Equal
+            | PredicateComparison::GreaterThan
+            | PredicateComparison::GreaterThanOrEqual => empty_search_predicate(column_id),
+            PredicateComparison::NotEqual
+            | PredicateComparison::LessThan
+            | PredicateComparison::LessThanOrEqual => Predicate::IsNotNull { column_id },
+        },
     }
 }
 
-fn scalar_predicate(column_id: u32, comparison: PredicateComparison, value: Value) -> Predicate {
-    match comparison {
-        PredicateComparison::Equal => Predicate::Eq { column_id, value },
-        PredicateComparison::NotEqual => Predicate::NotEq { column_id, value },
-        PredicateComparison::LessThan => Predicate::Lt { column_id, value },
-        PredicateComparison::LessThanOrEqual => Predicate::Le { column_id, value },
-        PredicateComparison::GreaterThan => Predicate::Gt { column_id, value },
-        PredicateComparison::GreaterThanOrEqual => Predicate::Ge { column_id, value },
+fn bind_search_range(
+    column_id: u32,
+    lower: BoundSearchValue,
+    upper: BoundSearchValue,
+) -> Predicate<Value> {
+    match (lower, upper) {
+        (BoundSearchValue::AboveDomain, _) | (_, BoundSearchValue::BelowDomain) => {
+            empty_search_predicate(column_id)
+        }
+        (BoundSearchValue::BelowDomain, BoundSearchValue::AboveDomain) => {
+            Predicate::IsNotNull { column_id }
+        }
+        (BoundSearchValue::BelowDomain, BoundSearchValue::Value(upper)) => Predicate::Le {
+            column_id,
+            value: upper,
+        },
+        (BoundSearchValue::Value(lower), BoundSearchValue::AboveDomain) => Predicate::Ge {
+            column_id,
+            value: lower,
+        },
+        (BoundSearchValue::Value(lower), BoundSearchValue::Value(upper)) => Predicate::Range {
+            column_id,
+            lower,
+            upper,
+        },
+    }
+}
+
+fn empty_search_predicate(column_id: u32) -> Predicate<Value> {
+    Predicate::In {
+        column_id,
+        values: Vec::new(),
+    }
+}
+
+/// WHERE rejects UNKNOWN, so comparisons to a NULL runtime value have an
+/// empty exact result. Keep that SQL rule at the one-time binding boundary;
+/// storage indexes never need a second parameter-specific predicate AST.
+fn normalize_search_null_semantics(tree: PredicateTree) -> PredicateTree {
+    match tree {
+        PredicateTree::Leaf(predicate) => PredicateTree::Leaf(match predicate {
+            Predicate::Eq { column_id, value }
+            | Predicate::NotEq { column_id, value }
+            | Predicate::Lt { column_id, value }
+            | Predicate::Le { column_id, value }
+            | Predicate::Gt { column_id, value }
+            | Predicate::Ge { column_id, value }
+                if value.is_null() =>
+            {
+                Predicate::In {
+                    column_id,
+                    values: Vec::new(),
+                }
+            }
+            Predicate::Range {
+                column_id,
+                lower,
+                upper,
+            } if lower.is_null() || upper.is_null() => Predicate::In {
+                column_id,
+                values: Vec::new(),
+            },
+            Predicate::In { column_id, values } => Predicate::In {
+                column_id,
+                values: values
+                    .into_iter()
+                    .filter(|value| !value.is_null())
+                    .collect(),
+            },
+            predicate => predicate,
+        }),
+        PredicateTree::And(children) => PredicateTree::And(
+            children
+                .into_iter()
+                .map(normalize_search_null_semantics)
+                .collect(),
+        ),
+        PredicateTree::Or(children) => PredicateTree::Or(
+            children
+                .into_iter()
+                .map(normalize_search_null_semantics)
+                .collect(),
+        ),
     }
 }
 
@@ -525,12 +719,12 @@ mod tests {
     #[test]
     fn search_predicate_parameter_binds_once_to_the_storage_type() {
         let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::SmallInt);
-        let template = SearchPredicateTemplate::ParameterComparison {
-            column_id: 3,
-            comparison: PredicateComparison::Equal,
+        let template = SearchPredicateTemplate::parameter_comparison(
+            3,
+            PredicateComparison::Equal,
             slot,
-            target_type: LogicalType::Integer,
-        };
+            LogicalType::Integer,
+        );
         let bindings = ParameterBindings::new(
             vec![Value::SmallInt(667)],
             vec![LogicalType::SmallInt],
@@ -544,6 +738,42 @@ mod tests {
                 column_id: 3,
                 value: Value::Integer(667),
             }))
+        );
+    }
+
+    #[test]
+    fn out_of_domain_parameter_comparison_folds_without_cast_error() {
+        let slot = ParameterSlot::new(RuntimeParamId::new(0), LogicalType::Integer);
+        let bindings = ParameterBindings::new(
+            vec![Value::Integer(100_000)],
+            vec![LogicalType::Integer],
+            ParameterBindingEpoch::new(1),
+        )
+        .expect("parameter bindings");
+
+        let equal = SearchPredicateTemplate::parameter_comparison(
+            3,
+            PredicateComparison::Equal,
+            slot.clone(),
+            LogicalType::SmallInt,
+        );
+        assert_eq!(
+            bind_search_predicate(Some(&equal), &bindings).expect("fold equality"),
+            Some(PredicateTree::leaf(Predicate::In {
+                column_id: 3,
+                values: Vec::new(),
+            }))
+        );
+
+        let less_than = SearchPredicateTemplate::parameter_comparison(
+            3,
+            PredicateComparison::LessThan,
+            slot,
+            LogicalType::SmallInt,
+        );
+        assert_eq!(
+            bind_search_predicate(Some(&less_than), &bindings).expect("fold upper bound"),
+            Some(PredicateTree::leaf(Predicate::IsNotNull { column_id: 3 }))
         );
     }
 

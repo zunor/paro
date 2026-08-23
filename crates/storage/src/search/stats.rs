@@ -671,6 +671,7 @@ pub struct GenerationMaintenanceState {
 pub struct SearchCostEstimate {
     pub score: f64,
     pub estimated_rows: Option<u64>,
+    pub estimated_total_rows: Option<u64>,
 }
 
 impl SearchCostEstimate {
@@ -678,11 +679,17 @@ impl SearchCostEstimate {
         Self {
             score,
             estimated_rows: None,
+            estimated_total_rows: None,
         }
     }
 
     pub const fn with_rows(mut self, estimated_rows: u64) -> Self {
         self.estimated_rows = Some(estimated_rows);
+        self
+    }
+
+    pub const fn with_total_rows(mut self, estimated_total_rows: u64) -> Self {
+        self.estimated_total_rows = Some(estimated_total_rows);
         self
     }
 }

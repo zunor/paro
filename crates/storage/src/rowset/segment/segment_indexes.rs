@@ -6,7 +6,10 @@ use super::segment_format::{ColumnMeta, SegmentFooter};
 use crate::index::art::ART;
 use crate::index::fulltext::text_index::FullTextIndex;
 use crate::index::sparse::SparseVectorIndex;
-use crate::index::{BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex};
+use crate::index::{
+    BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex, PredicateIndexBinding,
+    SegmentLocalComplete,
+};
 use crate::rowset::page::{CompressionType, PagePointer};
 use crate::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, IndexStatistics, IndexType,
@@ -45,11 +48,16 @@ pub(super) struct DeferredHnswIndex {
 pub struct SegmentPredicateIndexes {
     pub(super) bloom_filters: HashMap<ColumnId, Arc<BloomFilterIndex>>,
     pub(super) bitmap_indexes: HashMap<ColumnId, Arc<BitmapIndex>>,
-    /// Low-cardinality posting representation built with a declared scalar
-    /// index. Segments are immutable, so the posting dictionary is immutable
-    /// too and can be shared by every filtered search on the segment.
-    pub(super) runtime_bitmap_indexes: RwLock<HashMap<ColumnId, Arc<BitmapIndex>>>,
-    pub(super) runtime_art_indexes: RwLock<HashMap<ColumnId, Arc<ART>>>,
+    /// One catalog scalar index can expose ordered ART and low-cardinality
+    /// bitmap representations. They share one completeness credential and are
+    /// published/replaced atomically under a single lock.
+    pub(super) runtime_scalar_indexes: RwLock<HashMap<ColumnId, ScalarAccessPaths>>,
+}
+
+pub(super) struct ScalarAccessPaths {
+    art: Arc<ART>,
+    bitmap: Option<Arc<BitmapIndex>>,
+    completeness: SegmentLocalComplete,
 }
 
 impl SegmentPredicateIndexes {
@@ -58,55 +66,72 @@ impl SegmentPredicateIndexes {
     }
 
     pub fn bitmap_index(&self, column_id: ColumnId) -> Option<Arc<BitmapIndex>> {
-        self.runtime_bitmap_indexes
+        self.runtime_scalar_indexes
             .read()
             .ok()
-            .and_then(|guard| guard.get(&column_id).cloned())
+            .and_then(|guard| {
+                guard
+                    .get(&column_id)
+                    .and_then(|paths| paths.bitmap.as_ref().cloned())
+            })
             .or_else(|| self.bitmap_indexes.get(&column_id).cloned())
     }
 
     pub fn art_index(&self, column_id: ColumnId) -> Option<Arc<ART>> {
-        self.runtime_art_indexes
+        self.runtime_scalar_indexes
             .read()
             .ok()
-            .and_then(|guard| guard.get(&column_id).cloned())
+            .and_then(|guard| guard.get(&column_id).map(|paths| Arc::clone(&paths.art)))
     }
 
-    pub fn predicate_indexes(&self) -> Vec<Arc<dyn BoundIndex>> {
+    pub(crate) fn predicate_indexes(
+        &self,
+        segment_rows: u64,
+    ) -> paro_common::error::Result<Vec<PredicateIndexBinding>> {
         let mut results = Vec::with_capacity(
             self.bloom_filters
                 .len()
                 .saturating_add(self.bitmap_indexes.len())
                 .saturating_add(
-                    self.runtime_bitmap_indexes
+                    self.runtime_scalar_indexes
                         .read()
-                        .map(|guard| guard.len())
-                        .unwrap_or(0),
-                )
-                .saturating_add(
-                    self.runtime_art_indexes
-                        .read()
-                        .map(|guard| guard.len())
+                        .map(|guard| guard.len().saturating_mul(2))
                         .unwrap_or(0),
                 ),
         );
         for idx in self.bloom_filters.values() {
-            results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+            results.push(PredicateIndexBinding::candidate(
+                Arc::clone(idx) as Arc<dyn BoundIndex>
+            ));
         }
         for idx in self.bitmap_indexes.values() {
-            results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+            let completeness = SegmentLocalComplete::prove(idx.indexed_row_count(), segment_rows)?;
+            results.push(PredicateIndexBinding::complete_scalar(
+                Arc::clone(idx) as Arc<dyn BoundIndex>,
+                completeness,
+            ));
         }
-        if let Ok(guard) = self.runtime_bitmap_indexes.read() {
-            for idx in guard.values() {
-                results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
+        if let Ok(guard) = self.runtime_scalar_indexes.read() {
+            for paths in guard.values() {
+                if !paths.completeness.covers(segment_rows) {
+                    return Err(paro_common::error::data_corrupted(format!(
+                        "runtime scalar index coverage {} does not match segment rows {segment_rows}",
+                        paths.completeness.row_count()
+                    )));
+                }
+                if let Some(bitmap) = &paths.bitmap {
+                    results.push(PredicateIndexBinding::complete_scalar(
+                        Arc::clone(bitmap) as Arc<dyn BoundIndex>,
+                        paths.completeness,
+                    ));
+                }
+                results.push(PredicateIndexBinding::complete_scalar(
+                    Arc::clone(&paths.art) as Arc<dyn BoundIndex>,
+                    paths.completeness,
+                ));
             }
         }
-        if let Ok(guard) = self.runtime_art_indexes.read() {
-            for idx in guard.values() {
-                results.push(Arc::clone(idx) as Arc<dyn BoundIndex>);
-            }
-        }
-        results
+        Ok(results)
     }
 }
 
@@ -351,35 +376,39 @@ impl Segment {
         self.indexes.predicate.art_index(column_id)
     }
 
-    /// Register a runtime ART index built after segment open.
-    pub fn register_runtime_art_index(&self, column_id: ColumnId, index: Arc<ART>) {
-        if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
-            guard.insert(column_id, index);
-        }
-    }
-
-    /// Register the low-cardinality posting representation paired with a
-    /// runtime ART. It is a physical access path of the same scalar index, not
-    /// a second catalog index.
-    pub fn register_runtime_bitmap_index(&self, column_id: ColumnId, index: Arc<BitmapIndex>) {
-        if let Ok(mut guard) = self.indexes.predicate.runtime_bitmap_indexes.write() {
-            guard.insert(column_id, index);
+    /// Atomically publish every physical representation of one complete
+    /// segment-local scalar index.
+    pub(crate) fn register_runtime_scalar_index(
+        &self,
+        column_id: ColumnId,
+        art: Arc<ART>,
+        bitmap: Option<Arc<BitmapIndex>>,
+        completeness: SegmentLocalComplete,
+    ) {
+        if let Ok(mut guard) = self.indexes.predicate.runtime_scalar_indexes.write() {
+            guard.insert(
+                column_id,
+                ScalarAccessPaths {
+                    art,
+                    bitmap,
+                    completeness,
+                },
+            );
         }
     }
 
     /// Remove a runtime ART index previously registered on this segment.
     pub fn drop_art_index(&self, column_id: ColumnId) {
-        if let Ok(mut guard) = self.indexes.predicate.runtime_art_indexes.write() {
-            guard.remove(&column_id);
-        }
-        if let Ok(mut guard) = self.indexes.predicate.runtime_bitmap_indexes.write() {
+        if let Ok(mut guard) = self.indexes.predicate.runtime_scalar_indexes.write() {
             guard.remove(&column_id);
         }
     }
 
     /// Get predicate indexes for evaluator use.
-    pub fn predicate_indexes(&self) -> Vec<Arc<dyn BoundIndex>> {
-        self.indexes.predicate.predicate_indexes()
+    pub(crate) fn predicate_indexes(
+        &self,
+    ) -> paro_common::error::Result<Vec<PredicateIndexBinding>> {
+        self.indexes.predicate.predicate_indexes(self.num_rows())
     }
 
     /// Get per-column index statistics for this segment.

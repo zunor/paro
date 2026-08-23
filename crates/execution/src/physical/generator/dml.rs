@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::physical::specs::SearchPredicateTemplate;
+use crate::physical::specs::{SearchFilterContract, SearchPredicateTemplate};
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_insert(
@@ -243,6 +243,7 @@ impl PhysicalPlanGenerator {
             ));
         }
 
+        let filter_contract = SearchFilterContract::for_predicate(predicate.as_ref());
         let spec = FullTextSearchSpec {
             table,
             capability_token: candidate.token.clone(),
@@ -254,6 +255,7 @@ impl PhysicalPlanGenerator {
             score_mode: intent.score_mode,
             mode: SearchRequestMode::Filter,
             predicate,
+            filter_contract,
             projected_columns: (0..scan.get.returned_types.len())
                 .map(|output| {
                     scan.get.stored_column(output).ok_or_else(|| {

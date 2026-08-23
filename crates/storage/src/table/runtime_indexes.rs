@@ -9,7 +9,7 @@ use crate::codec::vector_decoder;
 use crate::index::art::{ARTConflictType, ARTKey, ART};
 use crate::index::{
     value_to_bytes, BitmapIndex, BitmapIndexWriter, BoundIndex, IndexAppendMode,
-    IndexConstraintType,
+    IndexConstraintType, SegmentLocalComplete,
 };
 use crate::rowset::{RowsetSharedPtr, SegmentSharedPtr};
 use crate::tablet::{ColumnId, TabletRef};
@@ -273,8 +273,8 @@ impl RuntimeIndexes {
                 .ok_or_else(|| paro_error::data_corrupted("ART batch row count overflow"))?;
         }
 
-        segment.register_runtime_art_index(column_id, Arc::new(art));
-        if let Some(writer) = bitmap_writer {
+        let completeness = SegmentLocalComplete::prove(row_id_base, segment.num_rows())?;
+        let bitmap = if let Some(writer) = bitmap_writer {
             let index = BitmapIndex::from_writer(
                 format!("bitmap_segment_{}_col_{}", segment.segment_id(), column_id),
                 IndexConstraintType::None,
@@ -282,8 +282,12 @@ impl RuntimeIndexes {
                 vec![logical_type],
                 &writer,
             )?;
-            segment.register_runtime_bitmap_index(column_id, Arc::new(index));
-        }
+            SegmentLocalComplete::prove(index.indexed_row_count(), segment.num_rows())?;
+            Some(Arc::new(index))
+        } else {
+            None
+        };
+        segment.register_runtime_scalar_index(column_id, Arc::new(art), bitmap, completeness);
         Ok(())
     }
 }

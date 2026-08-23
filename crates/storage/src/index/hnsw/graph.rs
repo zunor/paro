@@ -52,7 +52,7 @@ impl GraphLayers {
             return Vec::new();
         }
 
-        let Some(entry_point) = self.select_entry_point(None, random_entry_point) else {
+        let Some(entry_point) = self.select_entry_point(random_entry_point) else {
             return Vec::new();
         };
 
@@ -78,7 +78,7 @@ impl GraphLayers {
 
         let mut rng = thread_rng();
         let entry_points =
-            self.select_entry_points_for_many(scorers.len(), None, random_entry_point, &mut rng);
+            self.select_entry_points_for_many(scorers.len(), random_entry_point, &mut rng);
 
         let mut results = Vec::with_capacity(scorers.len());
         for (entry_point, scorer) in entry_points.into_iter().zip(scorers.iter_mut()) {
@@ -98,45 +98,29 @@ impl GraphLayers {
         results
     }
 
-    fn select_entry_point(
-        &self,
-        filter_bitmap: Option<&RoaringBitmap>,
-        random_entry_point: bool,
-    ) -> Option<EntryPoint> {
+    fn select_entry_point(&self, random_entry_point: bool) -> Option<EntryPoint> {
         if random_entry_point {
             let mut rng = thread_rng();
-            self.entry_points
-                .get_random_entry_point(&mut rng, |idx| Self::matches_filter(filter_bitmap, idx))
+            self.entry_points.get_random_entry_point(&mut rng, |_| true)
         } else {
-            self.entry_points
-                .get_entry_point(|idx| Self::matches_filter(filter_bitmap, idx))
+            self.entry_points.get_entry_point(|_| true)
         }
     }
 
     fn select_entry_points_for_many<R: Rng + ?Sized>(
         &self,
         num_queries: usize,
-        filter_bitmap: Option<&RoaringBitmap>,
         random_entry_point: bool,
         rng: &mut R,
     ) -> Vec<Option<EntryPoint>> {
         if random_entry_point {
             (0..num_queries)
-                .map(|_| {
-                    self.entry_points
-                        .get_random_entry_point(rng, |idx| Self::matches_filter(filter_bitmap, idx))
-                })
+                .map(|_| self.entry_points.get_random_entry_point(rng, |_| true))
                 .collect()
         } else {
-            let entry_point = self
-                .entry_points
-                .get_entry_point(|idx| Self::matches_filter(filter_bitmap, idx));
+            let entry_point = self.entry_points.get_entry_point(|_| true);
             vec![entry_point; num_queries]
         }
-    }
-
-    fn matches_filter(filter_bitmap: Option<&RoaringBitmap>, idx: PointOffset) -> bool {
-        filter_bitmap.is_none_or(|bm| bm.contains(idx))
     }
 
     fn search_from_entry_point(
@@ -148,19 +132,17 @@ impl GraphLayers {
         scorer: &mut VectorScorer<'_>,
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> Vec<ScoredPoint> {
-        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, None);
+        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer);
         let mut results = match algorithm {
-            SearchAlgorithm::Hnsw => self.search_on_level(zero_level_entry, ef, scorer, None),
-            SearchAlgorithm::FilteredTopK => {
-                let seeds = self.search_on_level_filtered_topk(
-                    zero_level_entry,
-                    top,
-                    ef,
-                    scorer,
-                    filter_bitmap,
-                );
-                self.refine_filtered_topk(&seeds, ef, scorer, filter_bitmap)
-            }
+            SearchAlgorithm::Hnsw => self.search_on_level(zero_level_entry, ef, scorer),
+            SearchAlgorithm::MaskedTopK | SearchAlgorithm::FilteredTopK => self.search_masked_topk(
+                zero_level_entry,
+                top,
+                ef,
+                scorer,
+                filter_bitmap,
+                algorithm == SearchAlgorithm::FilteredTopK,
+            ),
         };
         results.truncate(top);
         results
@@ -171,7 +153,6 @@ impl GraphLayers {
         &self,
         entry_point: EntryPoint,
         scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
     ) -> ScoredPoint {
         let mut current_point = entry_point.point_id;
         let mut current_score = scorer.score_point(current_point);
@@ -189,7 +170,7 @@ impl GraphLayers {
                     });
 
                 for scored in
-                    scorer.score_points(&mut links, filter_bitmap, self.hnsw_m.get_m(current_level))
+                    scorer.score_points(&mut links, None, self.hnsw_m.get_m(current_level))
                 {
                     if scored.score > current_score {
                         current_score = scored.score;
@@ -207,13 +188,13 @@ impl GraphLayers {
         }
     }
 
-    /// Standard HNSW search on a level with optional filtering.
+    /// Standard connected HNSW search on one level. Admission filters are
+    /// deliberately absent from navigation.
     fn search_on_level(
         &self,
         entry_point: ScoredPoint,
         ef: usize,
         scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
     ) -> Vec<ScoredPoint> {
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
@@ -233,7 +214,7 @@ impl GraphLayers {
                 }
             });
 
-            for sp in scorer.score_points(&mut neighbors, filter_bitmap, 0) {
+            for sp in scorer.score_points_unfiltered(&neighbors) {
                 context.process_candidate(sp);
             }
         }
@@ -245,13 +226,14 @@ impl GraphLayers {
     /// retaining every scored candidate admitted by the exact filter bitmap.
     /// This avoids disconnecting the graph and avoids estimating an
     /// inverse-selectivity oversampling factor.
-    fn search_on_level_filtered_topk(
+    fn search_masked_topk(
         &self,
         entry_point: ScoredPoint,
         top: usize,
         ef: usize,
         scorer: &mut VectorScorer,
         filter_bitmap: Option<&RoaringBitmap>,
+        refine_predicate_graph: bool,
     ) -> Vec<ScoredPoint> {
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
@@ -284,23 +266,18 @@ impl GraphLayers {
             }
         }
 
-        filtered.into_sorted_vec()
-    }
+        let seeds = filtered.into_sorted_vec();
+        if !refine_predicate_graph {
+            return seeds;
+        }
 
-    /// Refine query-local matching seeds inside the predicate-induced graph.
-    /// The seeds came from connected unfiltered navigation, so refinement does
-    /// not depend on a global entry point happening to match the predicate.
-    fn refine_filtered_topk(
-        &self,
-        seeds: &[ScoredPoint],
-        ef: usize,
-        scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
-    ) -> Vec<ScoredPoint> {
+        // Reuse the same allocation while starting a logically independent
+        // visit generation. Keeping phase-one marks would strand unexplored
+        // paths behind scored-but-not-expanded nodes and can reduce recall.
+        visited.next_iteration();
         let Some((&first, remaining)) = seeds.split_first() else {
             return Vec::new();
         };
-        let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(first, ef);
         visited.check_and_update_visited(first.idx);
         for &seed in remaining {
@@ -371,7 +348,7 @@ mod tests {
         });
 
         let mut rng = StdRng::seed_from_u64(7);
-        let selections = graph.select_entry_points_for_many(5, None, false, &mut rng);
+        let selections = graph.select_entry_points_for_many(5, false, &mut rng);
         assert_eq!(
             selections,
             vec![
@@ -419,7 +396,7 @@ mod tests {
             .collect::<Vec<_>>();
 
         let mut actual_rng = StdRng::seed_from_u64(11);
-        let actual = graph.select_entry_points_for_many(8, None, true, &mut actual_rng);
+        let actual = graph.select_entry_points_for_many(8, true, &mut actual_rng);
 
         assert_eq!(actual, expected);
         assert!(actual.windows(2).any(|pair| pair[0] != pair[1]));

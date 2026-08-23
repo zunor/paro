@@ -32,16 +32,16 @@ pub(crate) fn dispatch_segments<T, F>(
 ) -> Result<Vec<T>>
 where
     T: Send,
-    F: Fn(&VisibleSegment) -> Result<SegmentDispatchResult<T>> + Send + Sync,
+    F: Fn(usize, &VisibleSegment) -> Result<SegmentDispatchResult<T>> + Send + Sync,
 {
-    let execute_one = |segment: &VisibleSegment| {
+    let execute_one = |(index, segment): (usize, &VisibleSegment)| {
         let started_at = Instant::now();
-        let result = execute(segment);
+        let result = execute(index, segment);
         let elapsed = started_at.elapsed();
         result
             .map_err(|err| {
-                paro_error::internal(format!(
-                    "{kind:?} segment dispatch failed on rowset {} segment {}: {err}",
+                err.context(format!(
+                    "{kind:?} segment dispatch on rowset {} segment {}",
                     segment.rowset_id, segment.segment_id
                 ))
             })
@@ -63,11 +63,49 @@ where
         pool.install(|| {
             segments
                 .par_iter()
+                .enumerate()
                 .map(execute_one)
                 .collect::<Result<Vec<_>>>()
         })
     } else {
-        segments.iter().map(execute_one).collect()
+        segments.iter().enumerate().map(execute_one).collect()
+    }
+}
+
+/// Apply an ordered preparation step to visible segments on the same governed
+/// dispatch pool used by search. The returned vector remains index-aligned
+/// with `segments`, so callers do not need a hash lookup or an impossible
+/// "missing prepared segment" branch in the search hot path.
+pub(crate) fn prepare_segments<T, F>(
+    kind: SearchIndexKind,
+    segments: &[VisibleSegment],
+    parallelism_slots: usize,
+    prepare: F,
+) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn(usize, &VisibleSegment) -> Result<T> + Send + Sync,
+{
+    let prepare_one = |(index, segment): (usize, &VisibleSegment)| {
+        prepare(index, segment).map_err(|err| {
+            err.context(format!(
+                "{kind:?} segment preparation on rowset {} segment {}",
+                segment.rowset_id, segment.segment_id
+            ))
+        })
+    };
+
+    if parallelism_slots > 1 && segments.len() > 1 {
+        let pool = dispatch_pool(parallelism_slots.min(segments.len()))?;
+        pool.install(|| {
+            segments
+                .par_iter()
+                .enumerate()
+                .map(prepare_one)
+                .collect::<Result<Vec<_>>>()
+        })
+    } else {
+        segments.iter().enumerate().map(prepare_one).collect()
     }
 }
 
