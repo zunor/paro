@@ -39,9 +39,8 @@ pub use entry_points::{EntryPoint, EntryPoints};
 pub use graph::GraphLayers;
 pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;
-pub use hnsw_builder::{
-    configure_hnsw_build_threads, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
-};
+pub(crate) use hnsw_builder::hnsw_build_thread_count;
+pub use hnsw_builder::{configure_hnsw_build_threads, HnswBuildStopCheck, HnswBuilder};
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub use persistence::{hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex};
 pub use scorer::VectorScorer;

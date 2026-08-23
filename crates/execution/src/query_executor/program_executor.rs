@@ -252,8 +252,8 @@ impl BackgroundExecutionDriver {
                     Ok(result) => result,
                     Err(_) => Err(paro_error::internal("background query driver panicked")),
                 };
-                worker_query.output.close();
                 worker_state.finish(result);
+                worker_query.output.close();
             })
             .map_err(|error| {
                 paro_error::internal(format!("failed to spawn background query driver: {error}"))

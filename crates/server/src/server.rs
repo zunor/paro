@@ -32,23 +32,23 @@ pub struct ServerConfig {
     pub max_connections: usize,
     pub buffer_pool_size: usize,
     pub startup_timeout: Duration,
-    pub copy_stdin_memory_limit: usize,
+    pub copy_stdin_inflight_memory_limit: usize,
     pub frontend_message_limits: PgFrontendMessageLimits,
 }
 
 impl From<&ParoConfig> for ServerConfig {
     fn from(config: &ParoConfig) -> Self {
-        let copy_stdin_memory_limit = config
+        let copy_stdin_inflight_memory_limit = config
             .server
-            .effective_copy_stdin_memory_limit(config.cluster.max_memory);
+            .effective_copy_stdin_inflight_memory_limit(config.cluster.max_memory);
         Self {
             addr: config.server.address(),
             data_dir: config.storage.data_dir.to_string_lossy().to_string(),
             max_connections: config.server.max_connections,
             buffer_pool_size: config.storage.buffer_pool.size,
             startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-            frontend_message_limits: PgFrontendMessageLimits::new(copy_stdin_memory_limit),
-            copy_stdin_memory_limit,
+            frontend_message_limits: PgFrontendMessageLimits::new(copy_stdin_inflight_memory_limit),
+            copy_stdin_inflight_memory_limit,
         }
     }
 }
@@ -141,7 +141,7 @@ impl Server {
             data_dir = %self.config.data_dir,
             max_connections = self.config.max_connections,
             buffer_pool_size = self.config.buffer_pool_size,
-            copy_stdin_memory_limit = self.config.copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit = self.config.copy_stdin_inflight_memory_limit,
             "Server listener started"
         );
 
@@ -212,7 +212,7 @@ impl Server {
             let connection_control = Arc::clone(&control);
             let limits = Arc::clone(&self.limits);
             let frontend_message_limits = self.config.frontend_message_limits;
-            let copy_stdin_memory_limit = self.config.copy_stdin_memory_limit;
+            let copy_stdin_inflight_memory_limit = self.config.copy_stdin_inflight_memory_limit;
             let connection_drain_token = drain_token.clone();
             let connection_force_close_token = force_close_token.clone();
 
@@ -229,7 +229,7 @@ impl Server {
                     control: connection_control,
                     limits,
                     frontend_message_limits,
-                    copy_stdin_memory_limit,
+                    copy_stdin_inflight_memory_limit,
                     drain_token: connection_drain_token,
                     force_close_token: connection_force_close_token,
                 });
@@ -708,7 +708,7 @@ mod tests {
                 max_connections: 0,
                 buffer_pool_size: 0,
                 startup_timeout: DEFAULT_STARTUP_TIMEOUT,
-                copy_stdin_memory_limit: 256 * 1024 * 1024,
+                copy_stdin_inflight_memory_limit: 256 * 1024 * 1024,
                 frontend_message_limits: PgFrontendMessageLimits::new(256 * 1024 * 1024),
             },
             instance: Instance::new_in_memory(),
@@ -1257,6 +1257,70 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(ids, ["1", "2"]);
+
+        server
+            .shutdown(Duration::from_secs(5))
+            .await
+            .expect("shutdown server");
+        run_task
+            .await
+            .expect("accept loop join")
+            .expect("accept loop exit");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn copy_execution_error_drains_remaining_frames_before_leaving_copy_mode() {
+        let (server, run_task, addr) = spawn_test_server(4).await;
+        let mut client = TcpStream::connect(addr).await.expect("client connection");
+        complete_startup(&mut client).await;
+        run_simple_query_roundtrip(&mut client, "CREATE TABLE copy_error_t (v INT)").await;
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::Query(
+                Query::new("COPY copy_error_t FROM STDIN WITH (FORMAT csv)".to_string()),
+            )))
+            .await
+            .expect("write COPY query");
+        let copy_response = read_backend_message_timeout(&mut client, Duration::from_secs(2))
+            .await
+            .expect("CopyInResponse");
+        assert_eq!(copy_response.0, b'G');
+
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                CopyData::new(Bytes::from_static(b"not-an-integer\n")),
+            )))
+            .await
+            .expect("write invalid COPY row");
+        let trailing_frame = Bytes::from(vec![b'1'; 8 * 1024]);
+        for _ in 0..512 {
+            client
+                .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyData(
+                    CopyData::new(trailing_frame.clone()),
+                )))
+                .await
+                .expect("write trailing COPY frame");
+        }
+        client
+            .write_all(&encode_frontend_message(PgWireFrontendMessage::CopyDone(
+                CopyDone::new(),
+            )))
+            .await
+            .expect("write CopyDone");
+
+        let failed = read_messages_until_ready(&mut client).await;
+        assert_eq!(
+            failed.iter().filter(|(tag, _)| *tag == b'E').count(),
+            1,
+            "COPY failure must not reinterpret queued CopyData frames: {failed:?}"
+        );
+        assert_eq!(failed.last().map(|(tag, _)| *tag), Some(b'Z'));
+
+        let probe = run_simple_query_roundtrip(&mut client, "SELECT 1").await;
+        assert!(
+            !probe.iter().any(|(tag, _)| *tag == b'E'),
+            "connection must remain synchronized after COPY execution failure"
+        );
 
         server
             .shutdown(Duration::from_secs(5))

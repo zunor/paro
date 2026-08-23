@@ -163,6 +163,11 @@ impl CopyProtocolSource for MockCopyInProtocol<'_> {
     async fn next_chunk(&mut self) -> Result<Option<Bytes>> {
         Ok(self.sink.payloads.pop_front().map(Bytes::from))
     }
+
+    async fn abort(&mut self) -> Result<()> {
+        self.sink.payloads.clear();
+        Ok(())
+    }
 }
 
 fn binary_vector_copy_payload(rows: &[(i32, [f32; 3])]) -> Vec<u8> {

@@ -10,6 +10,16 @@ use crate::types::LogicalType;
 const PG_EPOCH_UNIX_DAYS: i32 = 10_957;
 const PG_EPOCH_UNIX_MICROS: i64 = 946_684_800_000_000;
 
+pub fn pg_date_to_unix_days(pg_days: i32) -> Result<i32> {
+    pg_days
+        .checked_add(PG_EPOCH_UNIX_DAYS)
+        .ok_or_else(|| paro_error::invalid_value("date", pg_days.to_string()))
+}
+
+pub fn pg_timestamp_to_unix_micros(pg_micros: i64) -> Result<i64> {
+    decode_pg_timestamp(pg_micros)
+}
+
 pub fn is_binary_recv_supported(ty: &LogicalType) -> bool {
     if matches!(
         ty,
@@ -121,20 +131,18 @@ pub fn decode_binary_value(bytes: &[u8], ty: &LogicalType) -> Result<Value> {
         LogicalType::Date => {
             require_len(bytes, 4, ty)?;
             let pg_days = i32::from_be_bytes(bytes.try_into().expect("checked length"));
-            let days = pg_days
-                .checked_add(PG_EPOCH_UNIX_DAYS)
-                .ok_or_else(|| paro_error::invalid_value("date", pg_days.to_string()))?;
+            let days = pg_date_to_unix_days(pg_days)?;
             Ok(Value::Date(days))
         }
         LogicalType::Timestamp => {
             require_len(bytes, 8, ty)?;
             let pg_micros = i64::from_be_bytes(bytes.try_into().expect("checked length"));
-            Ok(Value::Timestamp(decode_pg_timestamp(pg_micros)?))
+            Ok(Value::Timestamp(pg_timestamp_to_unix_micros(pg_micros)?))
         }
         LogicalType::TimestampTz => {
             require_len(bytes, 8, ty)?;
             let pg_micros = i64::from_be_bytes(bytes.try_into().expect("checked length"));
-            Ok(Value::TimestampTz(decode_pg_timestamp(pg_micros)?))
+            Ok(Value::TimestampTz(pg_timestamp_to_unix_micros(pg_micros)?))
         }
         LogicalType::List(child) => {
             let values = decode_binary_array(bytes, child, None)?;

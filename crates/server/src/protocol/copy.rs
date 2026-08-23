@@ -514,6 +514,7 @@ impl<'a> CopyProtocolSink for PgWireCopyOutSink<'a> {
 pub struct PgWireCopyInSink<'a> {
     sink: PgWireResultSink<'a>,
     receiver: CopyFrontendReceiver<'a>,
+    terminated: bool,
 }
 
 impl<'a> PgWireCopyInSink<'a> {
@@ -534,6 +535,7 @@ impl<'a> PgWireCopyInSink<'a> {
                 pending_frontend_messages,
                 mode,
             ),
+            terminated: false,
         }
     }
 
@@ -645,6 +647,7 @@ impl<'a> CopyFrontendReceiver<'a> {
 #[async_trait]
 impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
     async fn begin_copy_in(&mut self, spec: &CopyInSpec) -> Result<()> {
+        self.terminated = false;
         self.sink.socket_mut().codec_mut().enter_copy_data_mode();
         self.send_copy_in_response(spec).await
     }
@@ -657,6 +660,7 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                     self.receiver
                         .drain_until_copy_terminator(self.sink.socket_mut())
                         .await;
+                    self.terminated = true;
                     return Err(err);
                 }
             };
@@ -665,8 +669,12 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                 PgWireFrontendMessage::CopyData(copy_data) => {
                     return Ok(Some(copy_data.data));
                 }
-                PgWireFrontendMessage::CopyDone(_) => return Ok(None),
+                PgWireFrontendMessage::CopyDone(_) => {
+                    self.terminated = true;
+                    return Ok(None);
+                }
                 PgWireFrontendMessage::CopyFail(fail) => {
+                    self.terminated = true;
                     let message = if fail.message.is_empty() {
                         "COPY from stdin aborted by client".to_string()
                     } else {
@@ -678,9 +686,10 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                     continue;
                 }
                 PgWireFrontendMessage::Terminate(_) => {
+                    self.terminated = true;
                     return Err(paro_error::internal(
                         "connection terminated during COPY FROM STDIN".to_string(),
-                    ))
+                    ));
                 }
                 _ => {
                     let err = paro_error::protocol_violation(
@@ -689,10 +698,22 @@ impl<'a> CopyProtocolSource for PgWireCopyInSink<'a> {
                     self.receiver
                         .drain_until_copy_terminator(self.sink.socket_mut())
                         .await;
+                    self.terminated = true;
                     return Err(err);
                 }
             }
         }
+    }
+
+    async fn abort(&mut self) -> Result<()> {
+        if self.terminated {
+            return Ok(());
+        }
+        self.receiver
+            .drain_until_copy_terminator(self.sink.socket_mut())
+            .await;
+        self.terminated = true;
+        Ok(())
     }
 }
 

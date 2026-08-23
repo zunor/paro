@@ -27,7 +27,7 @@ pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 /// by one-point warm-up waves and deterministic frozen proposal waves. Wave
 /// boundaries are durable fields; changing publication semantics requires a
 /// new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 3;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 4;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

@@ -1358,6 +1358,11 @@ mod tests {
             }
             Ok(Some(self.responder.copy_in_payload.remove(0)))
         }
+
+        async fn abort(&mut self) -> Result<()> {
+            self.responder.copy_in_payload.clear();
+            Ok(())
+        }
     }
 
     async fn exec_simple_ok(session: &mut Session, sink: &mut CollectingSink, sql: &str) {

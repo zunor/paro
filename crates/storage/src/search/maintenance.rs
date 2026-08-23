@@ -104,6 +104,7 @@ impl HnswMaintenanceRequest {
                 vector_count,
                 provider.dimension,
                 provider.m,
+                crate::index::hnsw::hnsw_build_thread_count(),
             ),
             dimension: provider.dimension,
             freshness_priority,

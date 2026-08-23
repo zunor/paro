@@ -23,7 +23,7 @@ use super::provider_config::{
 };
 
 /// Version 3 makes proposal-wave and warm-up topology parameters explicit.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 3;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

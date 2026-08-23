@@ -125,6 +125,11 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
     fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
         None
     }
+
+    /// Statement memory ceiling used to size table-function-local buffers.
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        None
+    }
 }
 
 /// Query-owned byte source for COPY FROM STDIN table functions.
@@ -135,7 +140,8 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
 /// to be protocol chunks, an mmap, or a bounded stream without requiring one
 /// contiguous allocation.
 pub trait CopyStdinSource: Send + Sync {
-    fn open_reader(self: Arc<Self>) -> Result<Box<dyn Read + Send>>;
+    /// Transfers the non-replayable protocol stream to its single consumer.
+    fn take_reader(self: Arc<Self>) -> Result<Box<dyn Read + Send>>;
 
     /// Whether the consumer must execute off the async protocol worker.
     /// Streaming protocol sources block while waiting for the next bounded
@@ -176,6 +182,10 @@ impl TableFunctionRuntimeContext for TestTableFunctionRuntimeContext {
 
     fn copy_stdin_source(&self) -> Option<Arc<dyn CopyStdinSource>> {
         self.copy_stdin_source.clone()
+    }
+
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        Some(64 * 1024 * 1024)
     }
 }
 

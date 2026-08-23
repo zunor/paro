@@ -465,7 +465,12 @@ impl HnswInlineThreshold {
             && dimension <= self.max_dimension
     }
 
-    pub fn estimate_graph_memory_bytes(vector_count: u64, dimension: u32, m: u32) -> u64 {
+    pub fn estimate_graph_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        m: u32,
+        build_width: usize,
+    ) -> u64 {
         let m = u64::from(m.max(1));
         let link_bytes = std::mem::size_of::<u32>() as u64;
         let level0_links = m.saturating_mul(2);
@@ -473,12 +478,27 @@ impl HnswInlineThreshold {
         let graph_links = vector_count
             .saturating_mul(level0_links.saturating_add(upper_level_links))
             .saturating_mul(link_bytes);
-        let entry_overhead = vector_count.saturating_mul(16);
+        let outer_point_vectors =
+            vector_count.saturating_mul(std::mem::size_of::<Vec<()>>() as u64);
+        // With the standard HNSW level distribution, the expected number of
+        // materialized levels is m/(m-1), including level zero.
+        let expected_level_numerator = m.max(2);
+        let expected_level_denominator = expected_level_numerator - 1;
+        let expected_level_count = vector_count
+            .saturating_mul(expected_level_numerator)
+            .div_ceil(expected_level_denominator);
+        let level_container_bytes =
+            (std::mem::size_of::<std::sync::RwLock<crate::index::hnsw::LinksContainer>>() as u64)
+                .saturating_add(16);
+        let level_containers = expected_level_count.saturating_mul(level_container_bytes);
+        let visited_lists = vector_count.saturating_mul(build_width.max(1) as u64);
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
         graph_links
-            .saturating_add(entry_overhead)
+            .saturating_add(outer_point_vectors)
+            .saturating_add(level_containers)
+            .saturating_add(visited_lists)
             .saturating_add(build_frontier)
     }
 }
@@ -525,6 +545,7 @@ impl HnswInlineBuildEstimate {
                 vector_count,
                 dimension,
                 config.m as u32,
+                crate::index::hnsw::hnsw_build_thread_count(),
             )
             .saturating_add(metric_preprocessing_bytes),
             threshold,
@@ -620,6 +641,16 @@ mod tests {
         assert!(!threshold.allows(4_097, 64 * 1024 * 1024, 1_536));
         assert!(!threshold.allows(4_096, 64 * 1024 * 1024 + 1, 1_536));
         assert!(!threshold.allows(4_096, 64 * 1024 * 1024, 1_537));
+    }
+
+    #[test]
+    fn hnsw_build_estimate_accounts_for_each_visited_worker() {
+        let points = 1_000;
+        let serial = HnswInlineThreshold::estimate_graph_memory_bytes(points, 128, 16, 1);
+        let width_32 = HnswInlineThreshold::estimate_graph_memory_bytes(points, 128, 16, 32);
+
+        assert_eq!(width_32 - serial, points * 31);
+        assert!(serial > points * 128 * std::mem::size_of::<f32>() as u64);
     }
 
     #[test]

@@ -310,6 +310,10 @@ impl TableFunctionRuntimeContext for QueryRuntimeContext {
     fn copy_stdin_source(&self) -> Option<Arc<dyn paro_function::table::CopyStdinSource>> {
         self.session.input.copy_stdin_source()
     }
+
+    fn memory_limit_bytes(&self) -> Option<usize> {
+        Some(self.session.limits.max_memory)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -764,18 +768,15 @@ impl QueryOutputPort {
             .expect("query output port condvar poisoned");
     }
 
-    pub async fn wait_for_change(&self) {
-        if !self
-            .inner
-            .chunks
-            .lock()
-            .expect("query output port lock poisoned")
-            .is_empty()
-            || self.is_closed()
-        {
-            return;
+    /// Creates an independent async progress subscription.
+    ///
+    /// The receiver must be retained by its consumer across observations;
+    /// watch versions make publications persistent and support any number of
+    /// consumers without lost wakeups.
+    pub fn subscribe(&self) -> QueryOutputWaiter {
+        QueryOutputWaiter {
+            receiver: self.inner.cv.subscribe(),
         }
-        self.inner.cv.notified().await;
     }
 
     pub fn capacity(&self) -> usize {
@@ -854,22 +855,22 @@ struct QueryOutputPortInner {
 #[derive(Debug)]
 struct OutputChangeNotifier {
     blocking: Condvar,
-    asynchronous: tokio::sync::Notify,
+    asynchronous: tokio::sync::watch::Sender<u64>,
 }
 
 impl OutputChangeNotifier {
     fn new() -> Self {
+        let (asynchronous, _) = tokio::sync::watch::channel(0);
         Self {
             blocking: Condvar::new(),
-            asynchronous: tokio::sync::Notify::new(),
+            asynchronous,
         }
     }
 
     fn notify_all(&self) {
         self.blocking.notify_all();
-        // There is one async front-end consumer. `notify_one` retains a permit
-        // if publication races with registration, avoiding a lost wakeup.
-        self.asynchronous.notify_one();
+        self.asynchronous
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> LockResult<MutexGuard<'a, T>> {
@@ -884,8 +885,26 @@ impl OutputChangeNotifier {
         self.blocking.wait_timeout(guard, timeout)
     }
 
-    async fn notified(&self) {
-        self.asynchronous.notified().await;
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.asynchronous.subscribe()
+    }
+}
+
+#[derive(Debug)]
+pub struct QueryOutputWaiter {
+    receiver: tokio::sync::watch::Receiver<u64>,
+}
+
+impl QueryOutputWaiter {
+    pub fn mark_observed(&mut self) {
+        self.receiver.borrow_and_update();
+    }
+
+    pub async fn wait_for_change(&mut self) -> Result<()> {
+        self.receiver
+            .changed()
+            .await
+            .map_err(|_| paro_error::internal("query output progress channel closed"))
     }
 }
 
@@ -1246,21 +1265,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn async_output_waiter_observes_publication_without_lost_wakeup() {
+    async fn async_output_waiters_observe_published_state_without_lost_wakeup() {
         let port = QueryOutputPort::bounded(1);
-        let waiter = port.clone();
-        let task = tokio::spawn(async move {
-            waiter.wait_for_change().await;
-        });
-        tokio::task::yield_now().await;
+        let mut first = port.subscribe();
+        let mut second = port.subscribe();
         assert!(matches!(
             port.try_push(paro_common::test_utils::test_chunk(&[])),
             QueryOutputWrite::Written
         ));
-        tokio::time::timeout(Duration::from_secs(1), task)
+        let (first_result, second_result) =
+            tokio::time::timeout(Duration::from_secs(1), async move {
+                tokio::join!(first.wait_for_change(), second.wait_for_change())
+            })
             .await
-            .expect("async output waiter must be notified")
-            .unwrap();
+            .expect("all async output waiters must observe the publication");
+        first_result.unwrap();
+        second_result.unwrap();
     }
 
     #[test]

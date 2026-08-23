@@ -19,7 +19,7 @@ use paro_context::StatementCancellation;
 use crate::memory_runtime::QueryMemoryPool;
 use crate::query_executor::pipeline_driver::PipelineExecutionDriver;
 use crate::query_executor::program_executor::{BackgroundExecutionDriver, ProgramExecution};
-use crate::runtime::{CleanupReason, QueryOutputPort, QueryRuntimeContext};
+use crate::runtime::{CleanupReason, QueryOutputPort, QueryOutputWaiter, QueryRuntimeContext};
 
 enum ResultOutput {
     Closed,
@@ -62,6 +62,8 @@ pub struct ResultHandler {
     cancellation: StatementCancellation,
     /// Active query pool registration, detached when execution is closed.
     query_memory_pool: Option<Arc<QueryMemoryPool>>,
+    /// Persistent async progress subscription for background output.
+    progress_waiter: Option<QueryOutputWaiter>,
     /// Whether the handler is closed.
     closed: bool,
 }
@@ -90,6 +92,7 @@ impl ResultHandler {
                 None,
             ),
             query_memory_pool: None,
+            progress_waiter: None,
             closed: true,
         })
     }
@@ -105,6 +108,10 @@ impl ResultHandler {
         let output_chunk = Self::new_output_chunk(&types, allocator.clone())?;
 
         let cancellation = execution.query.cancellation.clone();
+        let progress_waiter = execution
+            .background
+            .as_ref()
+            .map(|_| execution.query.output.subscribe());
         let output = if let Some(driver) = execution.driver {
             ResultOutput::FetchDriven {
                 output: execution.query.output.clone(),
@@ -128,6 +135,7 @@ impl ResultHandler {
             output,
             cancellation,
             query_memory_pool,
+            progress_waiter,
             closed: false,
         })
     }
@@ -160,12 +168,11 @@ impl ResultHandler {
         }
     }
 
-    /// Fetch without parking the calling thread on a background driver.
+    /// Observes the current fetch state.
     ///
-    /// Async front ends use this to keep receiving bounded COPY input while a
-    /// blocking execution worker consumes it. Other result modes retain their
-    /// existing fetch-driven behavior.
-    pub fn try_fetch(&mut self) -> Result<FetchState<'_>> {
+    /// Background execution can return [`FetchState::Pending`] without parking
+    /// the caller. Other modes retain their synchronous fetch-driven behavior.
+    pub fn fetch_state(&mut self) -> Result<FetchState<'_>> {
         if !matches!(self.output, ResultOutput::Background { .. }) {
             return Ok(match self.fetch()? {
                 Some(chunk) => FetchState::Ready(chunk),
@@ -174,6 +181,12 @@ impl ResultHandler {
         }
 
         loop {
+            self.progress_waiter
+                .as_mut()
+                .ok_or_else(|| {
+                    paro_common::error::internal("background output has no progress waiter")
+                })?
+                .mark_observed();
             if self.cancellation.is_cancelled() {
                 let _ = self.cleanup_typed_driver(CleanupReason::Cancelled(
                     self.cancellation
@@ -203,11 +216,12 @@ impl ResultHandler {
         }
     }
 
-    pub fn progress_port(&self) -> Option<QueryOutputPort> {
-        match &self.output {
-            ResultOutput::Background { output, .. } => Some(output.clone()),
-            _ => None,
-        }
+    pub async fn wait_for_progress(&mut self) -> Result<()> {
+        self.progress_waiter
+            .as_mut()
+            .ok_or_else(|| paro_common::error::internal("pending result has no progress waiter"))?
+            .wait_for_change()
+            .await
     }
 
     /// Check if the handler is still open.
@@ -324,6 +338,7 @@ mod tests {
             output: ResultOutput::Completed(output),
             cancellation: StatementCancellation::new(CancellationToken::new(), None),
             query_memory_pool: None,
+            progress_waiter: None,
             closed: false,
         }
     }

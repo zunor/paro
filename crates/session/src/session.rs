@@ -91,8 +91,8 @@ pub struct Session {
     active_query: Option<ActiveQueryContext>,
     /// Registered state manager for extensible session state
     registered_state: RegisteredStateManager,
-    /// Buffered COPY FROM STDIN payload limit used by the transitional bridge.
-    copy_stdin_memory_limit: usize,
+    /// In-flight COPY FROM STDIN payload and queue-metadata memory waterline.
+    copy_stdin_inflight_memory_limit: usize,
     /// Session-owned retained result budget for holdable portals/cursors.
     session_memory_budget: Arc<SessionMemoryBudget>,
 }
@@ -569,8 +569,9 @@ impl Session {
             .default_database()
             .expect("Default database must exist");
         let default_db_name = current_database.name().to_string();
-        let default_copy_stdin_memory_limit =
-            default_copy_stdin_memory_limit(instance.runtime_tuning().snapshot().maximum_memory);
+        let default_copy_stdin_inflight_memory_limit = default_copy_stdin_inflight_memory_limit(
+            instance.runtime_tuning().snapshot().maximum_memory,
+        );
 
         let user_name = user_name.into();
         let mut session = Self {
@@ -589,7 +590,7 @@ impl Session {
             current_database,
             active_query: None,
             registered_state: RegisteredStateManager::new(),
-            copy_stdin_memory_limit: default_copy_stdin_memory_limit,
+            copy_stdin_inflight_memory_limit: default_copy_stdin_inflight_memory_limit,
             session_memory_budget: Arc::new(SessionMemoryBudget::new(
                 instance.runtime_tuning().snapshot().maximum_memory,
                 instance.get_memory_arbitrator().clone(),
@@ -719,12 +720,12 @@ impl Session {
         &self.execution_control
     }
 
-    pub fn copy_stdin_memory_limit(&self) -> usize {
-        self.copy_stdin_memory_limit
+    pub fn copy_stdin_inflight_memory_limit(&self) -> usize {
+        self.copy_stdin_inflight_memory_limit
     }
 
-    pub fn set_copy_stdin_memory_limit(&mut self, limit: usize) {
-        self.copy_stdin_memory_limit = limit;
+    pub fn set_copy_stdin_inflight_memory_limit(&mut self, limit: usize) {
+        self.copy_stdin_inflight_memory_limit = limit;
     }
 
     pub fn session_memory_budget(&self) -> Arc<SessionMemoryBudget> {
@@ -1689,7 +1690,7 @@ impl Session {
     }
 }
 
-fn default_copy_stdin_memory_limit(cluster_max_memory: usize) -> usize {
+fn default_copy_stdin_inflight_memory_limit(cluster_max_memory: usize) -> usize {
     (cluster_max_memory / 4).min(MAX_COPY_STDIN_MEMORY_LIMIT)
 }
 

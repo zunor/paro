@@ -15,9 +15,9 @@ use super::visited_pool::VisitedPool;
 #[cfg(test)]
 use super::HnswConfig;
 use super::{
-    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildExecutionPolicy,
-    HnswBuildStopCheck, HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint,
-    SearchAlgorithm, SearchParams, VectorScorer,
+    BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
+    HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm,
+    SearchParams, VectorScorer,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
@@ -37,15 +37,19 @@ const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
 const HNSW_ARTIFACT_VERSION: u32 = 3;
 const HNSW_ARTIFACT_HEADER_LEN: usize = 72;
 
-/// O(1) deterministic permutation of point ids used to decouple frozen-wave
-/// membership from ingest order. An affine map is a bijection when its
-/// multiplier is coprime to the domain size, so it needs no O(N) shuffle
-/// buffer even for very large indexes.
+/// O(1) keyed permutation of point ids used to decouple frozen-wave membership
+/// from ingest order.
+///
+/// A balanced Feistel network permutes the next even-bit power-of-two domain.
+/// Cycle walking restricts that permutation to `[0, len)`. Unlike an affine
+/// permutation, this does not preserve arithmetic progressions, so a valid but
+/// unlucky key cannot turn a wave back into a cluster of adjacent ingest ids.
 #[derive(Debug, Clone, Copy)]
 struct DeterministicPointOrder {
-    multiplier: u64,
-    offset: u64,
+    seed: u64,
     len: u64,
+    half_bits: u32,
+    half_mask: u32,
 }
 
 impl DeterministicPointOrder {
@@ -53,27 +57,19 @@ impl DeterministicPointOrder {
         let len = len as u64;
         if len <= 1 {
             return Self {
-                multiplier: 0,
-                offset: 0,
+                seed,
                 len,
+                half_bits: 0,
+                half_mask: 0,
             };
         }
-
-        let mut multiplier = splitmix64(seed ^ 0x4857_4e53_5756_3301) % len;
-        if multiplier == 0 {
-            multiplier = 1;
-        }
-        while gcd(multiplier, len) != 1 {
-            multiplier += 1;
-            if multiplier == len {
-                multiplier = 1;
-            }
-        }
-        let offset = splitmix64(seed ^ 0x4857_4e53_5756_3302) % len;
+        let domain_bits = (u64::BITS - (len - 1).leading_zeros()).next_multiple_of(2);
+        let half_bits = domain_bits / 2;
         Self {
-            multiplier,
-            offset,
+            seed,
             len,
+            half_bits,
+            half_mask: ((1_u64 << half_bits) - 1) as u32,
         }
     }
 
@@ -82,21 +78,26 @@ impl DeterministicPointOrder {
         if self.len <= 1 {
             return 0;
         }
-        // Point ids are u32-wide today, but the product of two valid ids plus
-        // the offset can still overflow u64 at the upper boundary. Compute in
-        // u128 so the affine permutation remains a bijection in every build.
-        (((self.multiplier as u128 * position as u128 + self.offset as u128) % self.len as u128)
-            as u64) as PointOffset
+        let mut candidate = position as u32;
+        loop {
+            candidate = self.permute_domain(candidate);
+            if u64::from(candidate) < self.len {
+                return candidate;
+            }
+        }
     }
-}
 
-fn gcd(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        let remainder = left % right;
-        left = right;
-        right = remainder;
+    fn permute_domain(self, value: u32) -> u32 {
+        let mut left = value >> self.half_bits;
+        let mut right = value & self.half_mask;
+        for round in 0..6_u64 {
+            let round_key =
+                self.seed ^ 0x4857_4e53_5756_3400 ^ round.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            let mixed = splitmix64(round_key ^ u64::from(right)) as u32 & self.half_mask;
+            (left, right) = (right, left ^ mixed);
+        }
+        (left << self.half_bits) | right
     }
-    left
 }
 
 fn splitmix64(mut value: u64) -> u64 {
@@ -319,12 +320,8 @@ impl HnswIndex {
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<Self> {
-        Self::build_with_controls(
-            storage,
-            build_contract,
-            HnswBuildExecutionPolicy::parallel(),
-            None,
-        )
+        let (pool, _) = hnsw_build_pool()?;
+        Self::build_with_controls(storage, build_contract, Some(pool), None)
     }
 
     #[cfg(test)]
@@ -345,7 +342,7 @@ impl HnswIndex {
     pub(crate) fn build_with_controls(
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
-        execution: HnswBuildExecutionPolicy,
+        pool: Option<&rayon::ThreadPool>,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
         build_contract.validate()?;
@@ -359,12 +356,7 @@ impl HnswIndex {
         }
         // Diverse neighbor selection is required for clustered vector sets;
         // nearest-only truncation forms disconnected local components.
-        let parallel_runtime = if execution.is_parallel() {
-            Some(hnsw_build_pool()?)
-        } else {
-            None
-        };
-        let visited_capacity = parallel_runtime.map_or(1, |(_, width)| width);
+        let visited_capacity = pool.map_or(1, rayon::ThreadPool::current_num_threads);
         let mut builder = GraphLayersBuilder::new_from_contract_with_visited_capacity(
             num_vectors,
             &build_contract,
@@ -399,7 +391,7 @@ impl HnswIndex {
                 }
                 let wave_end = wave_start.saturating_add(wave_size).min(num_vectors);
                 let entry_points = builder.snapshot_entry_points();
-                let proposals = if let Some((pool, _)) = parallel_runtime {
+                let proposals = if let Some(pool) = pool {
                     pool.install(|| {
                         (wave_start..wave_end)
                             .into_par_iter()
@@ -425,7 +417,7 @@ impl HnswIndex {
                         })
                         .collect::<Vec<_>>()
                 };
-                if let Some((pool, _)) = parallel_runtime {
+                if let Some(pool) = pool {
                     pool.install(|| {
                         builder.publish_frozen_wave(proposals, storage.as_ref(), distance, true)
                     });
@@ -1323,25 +1315,50 @@ mod tests {
     }
 
     #[test]
-    fn frozen_wave_build_is_byte_deterministic_across_serial_and_shared_pool_execution() {
+    fn frozen_wave_point_order_breaks_ingest_locality() {
+        for len in [5_000, 10_007] {
+            for seed in 0..128 {
+                let order = DeterministicPointOrder::new(len, seed);
+                let first_wave = (0..64)
+                    .map(|position| order.point_at(position))
+                    .collect::<Vec<_>>();
+                let min = first_wave.iter().copied().min().unwrap();
+                let max = first_wave.iter().copied().max().unwrap();
+                assert!(
+                    max - min > len as u32 / 4,
+                    "seed {seed} left a clustered first wave for {len} points"
+                );
+                let distinct_deltas = first_wave
+                    .windows(2)
+                    .map(|pair| pair[1].abs_diff(pair[0]))
+                    .collect::<std::collections::BTreeSet<_>>();
+                assert!(distinct_deltas.len() > 32);
+            }
+        }
+    }
+
+    #[test]
+    fn frozen_wave_build_is_byte_deterministic_across_pool_widths() {
         let vectors = make_sift_like_vectors(0xdef, 4_352, 24, 16);
         let contract = HnswConfig::new(12, 72)
             .with_build_seed(0x0fed_cba9_8765_4321)
             .build_contract(DistanceMetric::Euclidean);
-        let first = HnswBuilder::new()
-            .with_execution_policy(HnswBuildExecutionPolicy::serial())
-            .build(make_storage(&vectors), contract)
-            .unwrap()
-            .serialize()
-            .unwrap();
-        let second = HnswBuilder::new()
-            .with_execution_policy(HnswBuildExecutionPolicy::parallel())
-            .build(make_storage(&vectors), contract)
-            .unwrap()
-            .serialize()
-            .unwrap();
+        let build = |width| {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(width)
+                .build()
+                .unwrap();
+            HnswIndex::build_with_controls(make_storage(&vectors), contract, Some(&pool), None)
+                .unwrap()
+                .serialize()
+                .unwrap()
+        };
+        let width_2 = build(2);
+        let width_7 = build(7);
+        let width_16 = build(16);
 
-        assert_eq!(first, second);
+        assert_eq!(width_2, width_7);
+        assert_eq!(width_2, width_16);
     }
 
     #[test]
@@ -1352,7 +1369,6 @@ mod tests {
             .with_plain_scan_threshold(0)
             .with_ef(96);
         let index = HnswBuilder::new()
-            .with_execution_policy(HnswBuildExecutionPolicy::parallel())
             .build(
                 make_storage(&vectors),
                 config.build_contract(DistanceMetric::Euclidean),

@@ -30,8 +30,7 @@
 
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::hnsw::{
-    HnswBuildContract, HnswBuildExecutionPolicy, HnswBuildStopCheck, HnswBuilder,
-    InMemoryVectorStorage, VectorStorage,
+    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, InMemoryVectorStorage, VectorStorage,
 };
 use crate::index::{BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions};
 use crate::rowset::encoding::{
@@ -1457,8 +1456,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         let build_contract = self.opts.hnsw_build_contract.ok_or_else(|| {
             paro_error::internal("HNSW vector storage is missing its build contract")
         })?;
-        let mut hnsw_builder =
-            HnswBuilder::new().with_execution_policy(HnswBuildExecutionPolicy::parallel());
+        let mut hnsw_builder = HnswBuilder::new();
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);
         }

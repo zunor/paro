@@ -22,7 +22,7 @@ use super::providers::sparse::inline::SparseInlineArtifactBuilder;
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::TailMutationKind;
-use crate::index::hnsw::{HnswBuildExecutionPolicy, HnswBuilder};
+use crate::index::hnsw::HnswBuilder;
 use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -319,9 +319,7 @@ fn build_hnsw_segment_sidecar_artifact(
             provider.dimension
         )));
     }
-    let index = HnswBuilder::new()
-        .with_execution_policy(HnswBuildExecutionPolicy::parallel())
-        .build(vector_storage, provider.build_contract())?;
+    let index = HnswBuilder::new().build(vector_storage, provider.build_contract())?;
     let bytes = index.serialize()?;
     let checksum = seahash::hash(&bytes);
     let provider_stats = HnswProviderStats::from(&HnswIndexStatistics::collect(&index));

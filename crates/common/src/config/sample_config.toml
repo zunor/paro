@@ -24,7 +24,7 @@ max_connections = 100
 allow_plaintext = false
 # Optional cap for buffered COPY FROM STDIN payloads.
 # Defaults to min(cluster.max_memory / 4, 1GiB).
-# copy_stdin_memory_limit = "256MiB"
+# copy_stdin_inflight_memory_limit = "256MiB"
 
 # TLS configuration (optional, NOT YET SUPPORTED)
 # [server.tls]

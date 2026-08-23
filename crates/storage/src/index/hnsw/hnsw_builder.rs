@@ -72,35 +72,21 @@ pub(crate) fn hnsw_build_pool() -> Result<(&'static ThreadPool, usize)> {
     }
 }
 
-/// Query-independent execution policy for constructing one immutable HNSW artifact.
-///
-/// This is deliberately not part of [`HnswBuildContract`]: changing whether
-/// workers cooperate must not invalidate an artifact or alter its topology.
-/// Wave boundaries and warm-up length live in the durable build contract.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum HnswBuildExecutionPolicy {
-    Serial,
-    Parallel,
-}
-
-impl HnswBuildExecutionPolicy {
-    pub const fn serial() -> Self {
-        Self::Serial
-    }
-
-    pub const fn parallel() -> Self {
-        Self::Parallel
-    }
-
-    pub const fn is_parallel(self) -> bool {
-        matches!(self, Self::Parallel)
-    }
-}
-
-impl Default for HnswBuildExecutionPolicy {
-    fn default() -> Self {
-        Self::serial()
-    }
+pub(crate) fn hnsw_build_thread_count() -> usize {
+    HNSW_BUILD_POOL
+        .get()
+        .and_then(|runtime| runtime.as_ref().ok())
+        .map(|runtime| runtime.threads)
+        .unwrap_or_else(|| {
+            let configured = HNSW_BUILD_THREADS.load(Ordering::Acquire);
+            if configured == 0 {
+                std::thread::available_parallelism()
+                    .map(usize::from)
+                    .unwrap_or(1)
+            } else {
+                configured
+            }
+        })
 }
 
 /// Cooperative stop-check used by long-running HNSW build tasks.
@@ -139,7 +125,6 @@ impl fmt::Debug for HnswBuildStopCheck {
 #[derive(Clone, Debug, Default)]
 pub struct HnswBuilder {
     stop_check: Option<HnswBuildStopCheck>,
-    execution: HnswBuildExecutionPolicy,
 }
 
 impl HnswBuilder {
@@ -152,20 +137,16 @@ impl HnswBuilder {
         self
     }
 
-    pub fn with_execution_policy(mut self, execution: HnswBuildExecutionPolicy) -> Self {
-        self.execution = execution;
-        self
-    }
-
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
+        let (pool, _) = hnsw_build_pool()?;
         HnswIndex::build_with_controls(
             storage,
             build_contract,
-            self.execution,
+            Some(pool),
             self.stop_check.as_ref(),
         )
     }

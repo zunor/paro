@@ -7,12 +7,18 @@ previous artifacts. Recreate every HNSW/vector index from its
 The rebuild is required because the durable contract now:
 
 - stores only immutable graph-construction fields, separate from search policy;
-- uses the fixed-width HNSW artifact envelope version 2, with distance owned
+- uses the fixed-width HNSW artifact envelope version 3, with distance owned
   solely by the build contract and no JSON in the open path;
 - uses the version-2 hybrid CSR graph layout;
-- requires HNSW provider-config version 2 and build-contract version 2, which
-  select deterministic frozen-wave construction and barrier publication;
+- requires HNSW provider-config version 4 and build-contract version 4, which
+  select deterministic frozen-wave construction, keyed Feistel point ordering,
+  and barrier publication;
 - persists per-point cosine inverse norms inside the HNSW artifact.
+
+Frozen-wave boundaries are durable implementation details rather than SQL
+tuning policy. `proposal_wave_size` and `warmup_point_count` are therefore no
+longer accepted by `CREATE VECTOR INDEX`; changing either requires a new build
+contract and an index rebuild.
 
 Search indexes are opened lazily. An old artifact therefore does not prevent
 its segment or base table from opening: ordinary SQL remains available, and

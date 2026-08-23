@@ -780,6 +780,7 @@ impl RowsetWriter {
                         rows,
                         dimension,
                         options.build_contract.m,
+                        crate::index::hnsw::hnsw_build_thread_count(),
                     ))
                 });
         retained_input.saturating_add(hnsw_build_peak)

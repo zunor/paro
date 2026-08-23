@@ -13,7 +13,10 @@ use paro_common::types::LogicalType;
 use paro_common::vector::{ArrayVector, Vector, VECTOR_SIZE};
 
 use crate::copy::CopyFromSource;
-use paro_common::pg_binary::{decode_binary_value, is_binary_recv_supported, BinaryInput};
+use paro_common::pg_binary::{
+    decode_binary_value, is_binary_recv_supported, pg_date_to_unix_days,
+    pg_timestamp_to_unix_micros, BinaryInput,
+};
 
 use super::{
     GlobalTableFunctionState, LocalTableFunctionState, TableFunction, TableFunctionBindData,
@@ -23,8 +26,7 @@ use super::{
 const BINARY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 const BINARY_HEADER_LEN: usize = 19;
 const OIDS_FLAG: u32 = 1 << 16;
-const MAX_BINARY_COPY_FIELD_BYTES: usize = 64 * 1024 * 1024;
-const TARGET_BINARY_COPY_BATCH_BYTES: usize = 16 * 1024 * 1024;
+const MIN_BINARY_COPY_BATCH_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone)]
 struct ReadBinaryBindData {
@@ -36,6 +38,7 @@ struct ReadBinaryBindData {
 #[derive(Debug, Clone)]
 enum BinaryColumnDecoder {
     Direct {
+        expected_type: LogicalType,
         expected_width: usize,
         decode_batch: BinaryBatchDecoder,
     },
@@ -54,19 +57,20 @@ type BinaryBatchDecoder =
 impl BinaryColumnDecoder {
     fn bind(ty: &LogicalType) -> Self {
         match ty {
-            LogicalType::Boolean => Self::direct(1, decode_boolean_batch),
-            LogicalType::TinyInt => Self::direct(2, decode_tinyint_batch),
-            LogicalType::UTinyInt => Self::direct(2, decode_utinyint_batch),
-            LogicalType::SmallInt => Self::direct(2, decode_smallint_batch),
-            LogicalType::Integer => Self::direct(4, decode_integer_batch),
-            LogicalType::USmallInt => Self::direct(4, decode_usmallint_batch),
-            LogicalType::BigInt => Self::direct(8, decode_bigint_batch),
-            LogicalType::UInteger => Self::direct(8, decode_uinteger_batch),
-            LogicalType::Float => Self::direct(4, decode_float_batch),
-            LogicalType::Double => Self::direct(8, decode_double_batch),
-            LogicalType::Uuid => Self::direct(16, decode_uuid_batch),
-            LogicalType::Date => Self::generic(ty, Some(4)),
-            LogicalType::Timestamp | LogicalType::TimestampTz => Self::generic(ty, Some(8)),
+            LogicalType::Boolean => Self::direct(ty, 1, decode_boolean_batch),
+            LogicalType::TinyInt => Self::direct(ty, 2, decode_tinyint_batch),
+            LogicalType::UTinyInt => Self::direct(ty, 2, decode_utinyint_batch),
+            LogicalType::SmallInt => Self::direct(ty, 2, decode_smallint_batch),
+            LogicalType::Integer => Self::direct(ty, 4, decode_integer_batch),
+            LogicalType::USmallInt => Self::direct(ty, 4, decode_usmallint_batch),
+            LogicalType::BigInt => Self::direct(ty, 8, decode_bigint_batch),
+            LogicalType::UInteger => Self::direct(ty, 8, decode_uinteger_batch),
+            LogicalType::Float => Self::direct(ty, 4, decode_float_batch),
+            LogicalType::Double => Self::direct(ty, 8, decode_double_batch),
+            LogicalType::Uuid => Self::direct(ty, 16, decode_uuid_batch),
+            LogicalType::Date => Self::direct(ty, 4, decode_date_batch),
+            LogicalType::Timestamp => Self::direct(ty, 8, decode_timestamp_batch),
+            LogicalType::TimestampTz => Self::direct(ty, 8, decode_timestamptz_batch),
             LogicalType::Array(child, dimension) if matches!(**child, LogicalType::Float) => {
                 Self::FloatArray {
                     dimension: *dimension,
@@ -76,8 +80,13 @@ impl BinaryColumnDecoder {
         }
     }
 
-    const fn direct(expected_width: usize, decode_batch: BinaryBatchDecoder) -> Self {
+    fn direct(
+        expected_type: &LogicalType,
+        expected_width: usize,
+        decode_batch: BinaryBatchDecoder,
+    ) -> Self {
         Self::Direct {
+            expected_type: expected_type.clone(),
             expected_width,
             decode_batch,
         }
@@ -100,7 +109,18 @@ impl BinaryColumnDecoder {
         }
     }
 
-    fn validate_field_len(&self, len: usize, row: usize, column: usize) -> Result<()> {
+    fn validate_field_len(
+        &self,
+        len: usize,
+        max_field_bytes: usize,
+        row: usize,
+        column: usize,
+    ) -> Result<()> {
+        if len > max_field_bytes {
+            return Err(paro_error::configuration_limit_exceeded(format!(
+                "binary COPY row {row} column {column} exceeds the {max_field_bytes}-byte statement field limit",
+            )));
+        }
         if let Some(expected) = self.expected_fixed_width() {
             if len != expected {
                 return Err(paro_error::protocol_violation(format!(
@@ -108,11 +128,6 @@ impl BinaryColumnDecoder {
                 )));
             }
             return Ok(());
-        }
-        if len > MAX_BINARY_COPY_FIELD_BYTES {
-            return Err(paro_error::configuration_limit_exceeded(format!(
-                "binary COPY row {row} column {column} exceeds the {MAX_BINARY_COPY_FIELD_BYTES}-byte field limit",
-            )));
         }
         Ok(())
     }
@@ -222,6 +237,8 @@ impl BinaryCopyReader {
 
 struct ReadBinaryGlobalState {
     reader: Mutex<BinaryCopyReader>,
+    max_field_bytes: usize,
+    target_batch_bytes: usize,
 }
 
 impl GlobalTableFunctionState for ReadBinaryGlobalState {
@@ -292,13 +309,24 @@ fn read_binary_init_global(
         .and_then(|data| data.as_any().downcast_ref::<ReadBinaryBindData>())
         .ok_or_else(|| paro_error::internal("invalid read_binary bind data"))?;
     let reader: Box<dyn Read + Send> = match &bind_data.source {
-        CopyFromSource::Stdin => input.copy_stdin_source()?.open_reader()?,
+        CopyFromSource::Stdin => input.copy_stdin_source()?.take_reader()?,
         CopyFromSource::File(path) => Box::new(BufReader::new(std::fs::File::open(path).map_err(
             |err| paro_error::io_error(format!("open binary COPY file '{path}': {err}")),
         )?)),
     };
+    let memory_limit = input
+        .runtime
+        .memory_limit_bytes()
+        .filter(|limit| *limit > 0)
+        .ok_or_else(|| paro_error::internal("binary COPY requires a statement memory limit"))?;
+    let max_field_bytes = (memory_limit / 4).max(1);
+    let target_batch_bytes = (memory_limit / 128)
+        .max(MIN_BINARY_COPY_BATCH_BYTES)
+        .min(max_field_bytes);
     Ok(Some(Box::new(ReadBinaryGlobalState {
         reader: Mutex::new(BinaryCopyReader::new(reader)?),
+        max_field_bytes,
+        target_batch_bytes,
     })))
 }
 
@@ -375,7 +403,12 @@ fn read_binary_function(
                     column_idx + 1,
                 ))
             })?;
-            decoder.validate_field_len(field_len, reader.row_number + 1, column_idx + 1)?;
+            decoder.validate_field_len(
+                field_len,
+                global.max_field_bytes,
+                reader.row_number + 1,
+                column_idx + 1,
+            )?;
             let start = local.batch_bytes.len();
             let end = start.checked_add(field_len).ok_or_else(|| {
                 paro_error::configuration_limit_exceeded("binary COPY batch byte size overflow")
@@ -389,12 +422,16 @@ fn read_binary_function(
         }
         reader.row_number += 1;
         produced += 1;
-        if local.batch_bytes.len() >= TARGET_BINARY_COPY_BATCH_BYTES {
+        if local.batch_bytes.len() >= global.target_batch_bytes {
             break;
         }
     }
 
     decode_binary_batch(bind_data, local, output, produced)?;
+    if local.batch_bytes.capacity() > global.target_batch_bytes.saturating_mul(2) {
+        local.batch_bytes = Vec::new();
+        local.field_ranges = Vec::new();
+    }
     output.set_cardinality(produced);
     if reader.finished {
         Ok(TableFunctionResult::Finished)
@@ -415,14 +452,26 @@ fn decode_binary_batch(
             .column_mut(column_idx)
             .ok_or_else(|| paro_error::internal("binary COPY output column missing"))?;
         match decoder {
-            BinaryColumnDecoder::Direct { decode_batch, .. } => decode_batch(
-                &local.batch_bytes,
-                &local.field_ranges,
-                column_count,
-                column_idx,
-                column,
-                row_count,
-            )?,
+            BinaryColumnDecoder::Direct {
+                expected_type,
+                decode_batch,
+                ..
+            } => {
+                if column.logical_type() != expected_type {
+                    return Err(paro_error::internal(format!(
+                        "binary COPY decoder for {expected_type} received {} storage",
+                        column.logical_type()
+                    )));
+                }
+                decode_batch(
+                    &local.batch_bytes,
+                    &local.field_ranges,
+                    column_count,
+                    column_idx,
+                    column,
+                    row_count,
+                )?
+            }
             BinaryColumnDecoder::FloatArray { dimension } => decode_float_array_batch(
                 &local.batch_bytes,
                 &local.field_ranges,
@@ -540,6 +589,21 @@ fixed_binary_batch_decoder!(decode_double_batch, f64, |bytes: &[u8]| Ok(
 fixed_binary_batch_decoder!(decode_uuid_batch, u128, |bytes: &[u8]| Ok(
     u128::from_be_bytes(bytes.try_into().expect("validated width"))
 ));
+fixed_binary_batch_decoder!(decode_date_batch, i32, |bytes: &[u8]| {
+    pg_date_to_unix_days(i32::from_be_bytes(
+        bytes.try_into().expect("validated width"),
+    ))
+});
+fixed_binary_batch_decoder!(decode_timestamp_batch, i64, |bytes: &[u8]| {
+    pg_timestamp_to_unix_micros(i64::from_be_bytes(
+        bytes.try_into().expect("validated width"),
+    ))
+});
+fixed_binary_batch_decoder!(decode_timestamptz_batch, i64, |bytes: &[u8]| {
+    pg_timestamp_to_unix_micros(i64::from_be_bytes(
+        bytes.try_into().expect("validated width"),
+    ))
+});
 fixed_binary_batch_decoder!(decode_tinyint_batch, i8, |bytes: &[u8]| {
     let value = i16::from_be_bytes(bytes.try_into().expect("validated width"));
     i8::try_from(value).map_err(|_| paro_error::invalid_value("tinyint", value.to_string()))
@@ -703,11 +767,12 @@ mod tests {
     #[test]
     fn binary_copy_rejects_unbounded_variable_field_before_allocation() {
         let decoder = BinaryColumnDecoder::generic(&LogicalType::Varchar, None);
+        let max_field_bytes = 8 * 1024 * 1024;
         let error = decoder
-            .validate_field_len(MAX_BINARY_COPY_FIELD_BYTES + 1, 7, 3)
+            .validate_field_len(max_field_bytes + 1, max_field_bytes, 7, 3)
             .unwrap_err();
         assert!(error
             .to_string()
-            .contains("exceeds the 67108864-byte field limit"));
+            .contains("exceeds the 8388608-byte statement field limit"));
     }
 }
