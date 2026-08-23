@@ -18,7 +18,7 @@ use super::Allocator;
 use crate::error::Result;
 
 /// Number of memory tags (must match MemoryTag enum variants).
-pub const MEMORY_TAG_COUNT: usize = 22;
+pub const MEMORY_TAG_COUNT: usize = 23;
 
 thread_local! {
     static ALLOCATOR_TRACKING_EVENT_COUNT: Cell<u64> = const { Cell::new(0) };
@@ -77,6 +77,8 @@ pub enum MemoryTag {
     ExternalRuntimeHost = 20,
     /// Codec-decoded storage pages governed by the decoded-cache capacity
     DecodedPageCache = 21,
+    /// COPY parser payload and field-directory buffers
+    CopyReader = 22,
 }
 
 impl MemoryTag {
@@ -105,6 +107,7 @@ impl MemoryTag {
             MemoryTag::MemTable => "MEM_TABLE",
             MemoryTag::ExternalRuntimeHost => "EXTERNAL_RUNTIME_HOST",
             MemoryTag::DecodedPageCache => "DECODED_PAGE_CACHE",
+            MemoryTag::CopyReader => "COPY_READER",
         }
     }
 
@@ -133,6 +136,7 @@ impl MemoryTag {
             MemoryTag::MemTable,
             MemoryTag::ExternalRuntimeHost,
             MemoryTag::DecodedPageCache,
+            MemoryTag::CopyReader,
         ]
     }
 
@@ -167,6 +171,7 @@ impl MemoryTag {
             19 => Some(MemoryTag::MemTable),
             20 => Some(MemoryTag::ExternalRuntimeHost),
             21 => Some(MemoryTag::DecodedPageCache),
+            22 => Some(MemoryTag::CopyReader),
             _ => None,
         }
     }
@@ -722,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_memory_tag_count() {
-        assert_eq!(MEMORY_TAG_COUNT, 22);
+        assert_eq!(MEMORY_TAG_COUNT, 23);
         assert_eq!(MemoryTag::all().len(), MEMORY_TAG_COUNT);
     }
 
@@ -733,6 +738,7 @@ mod tests {
         assert_eq!(MemoryTag::Window.as_index(), 14);
         assert_eq!(MemoryTag::MemTable.as_index(), 19);
         assert_eq!(MemoryTag::ExternalRuntimeHost.as_index(), 20);
+        assert_eq!(MemoryTag::CopyReader.as_index(), 22);
     }
 
     #[test]
@@ -746,7 +752,7 @@ mod tests {
             Some(MemoryTag::ExternalRuntimeHost)
         );
         assert_eq!(MemoryTag::from_index(21), Some(MemoryTag::DecodedPageCache));
-        assert_eq!(MemoryTag::from_index(22), None);
+        assert_eq!(MemoryTag::from_index(22), Some(MemoryTag::CopyReader));
         assert_eq!(MemoryTag::from_index(100), None);
     }
 

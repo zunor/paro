@@ -5,9 +5,9 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub const MIN_COPY_STDIN_INFLIGHT_MEMORY_LIMIT: usize = 64 * 1024;
-use std::time::Duration;
 
 use super::human_bytes;
 

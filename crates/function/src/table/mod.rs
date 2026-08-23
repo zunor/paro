@@ -42,8 +42,10 @@ use std::fmt;
 use std::io::Read;
 use std::sync::Arc;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{MemoryAccountingClass, MemoryAccountingContext};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_storage::buffer::BufferManager;
@@ -129,6 +131,17 @@ pub trait TableFunctionRuntimeContext: Send + Sync {
     /// Statement memory ceiling used to size table-function-local buffers.
     fn memory_limit_bytes(&self) -> Option<usize> {
         None
+    }
+
+    /// Return an accounting target for table-function-owned native buffers.
+    /// The detached default keeps isolated embeddings functional; the query
+    /// executor overrides it with the active `QueryMemoryPool` owner.
+    fn memory_accounting_context(
+        &self,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+    ) -> MemoryAccountingContext {
+        MemoryAccountingContext::detached(tag, class)
     }
 }
 

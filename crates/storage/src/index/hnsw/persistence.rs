@@ -17,7 +17,7 @@ use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
     HnswSearchMode, HnswSearchPolicy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm,
-    SearchParams, VectorScorer,
+    SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
@@ -110,15 +110,19 @@ fn splitmix64(mut value: u64) -> u64 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswArtifactCompatibility {
     Current,
-    UnsupportedVersion(u32),
+    UnsupportedArtifactVersion(u32),
+    UnsupportedBuildContractVersion(u32),
 }
 
 impl HnswArtifactCompatibility {
     pub fn rebuild_reason(self) -> Option<String> {
         match self {
             Self::Current => None,
-            Self::UnsupportedVersion(version) => Some(format!(
+            Self::UnsupportedArtifactVersion(version) => Some(format!(
                 "HNSW artifact version {version} is not queryable (runtime expects {HNSW_ARTIFACT_VERSION}); rebuild the vector index"
+            )),
+            Self::UnsupportedBuildContractVersion(version) => Some(format!(
+                "HNSW build contract version {version} is not queryable (runtime expects {HNSW_BUILD_CONTRACT_VERSION}); rebuild the vector index"
             )),
         }
     }
@@ -139,11 +143,29 @@ pub fn hnsw_artifact_compatibility(data: &[u8]) -> Result<HnswArtifactCompatibil
         ));
     }
     let version = u32::from_le_bytes(data[4..8].try_into().expect("u32 width"));
-    Ok(if version == HNSW_ARTIFACT_VERSION {
-        HnswArtifactCompatibility::Current
-    } else {
-        HnswArtifactCompatibility::UnsupportedVersion(version)
-    })
+    if version != HNSW_ARTIFACT_VERSION {
+        return Ok(HnswArtifactCompatibility::UnsupportedArtifactVersion(
+            version,
+        ));
+    }
+    if data.len() < 16 {
+        return Err(error::data_corrupted(
+            "HNSW artifact is truncated before its build contract version",
+        ));
+    }
+    let header_len = u32::from_le_bytes(data[8..12].try_into().expect("u32 width")) as usize;
+    if header_len != HNSW_ARTIFACT_HEADER_LEN {
+        return Err(error::data_corrupted(format!(
+            "invalid HNSW artifact header length {header_len}, expected {HNSW_ARTIFACT_HEADER_LEN}"
+        )));
+    }
+    let build_contract_version = u32::from_le_bytes(data[12..16].try_into().expect("u32 width"));
+    if build_contract_version != HNSW_BUILD_CONTRACT_VERSION {
+        return Ok(HnswArtifactCompatibility::UnsupportedBuildContractVersion(
+            build_contract_version,
+        ));
+    }
+    Ok(HnswArtifactCompatibility::Current)
 }
 
 const fn distance_tag(distance: DistanceMetric) -> u8 {
@@ -1745,6 +1767,30 @@ mod tests {
             .expect("unknown envelope version must fail")
             .to_string()
             .contains("rebuild the vector index"));
+    }
+
+    #[test]
+    fn embedded_artifact_rejects_stale_build_contract_before_open() {
+        let vectors = vec![vec![0.0], vec![1.0]];
+        let index = HnswIndex::build(
+            make_storage(&vectors),
+            HnswConfig::new(8, 32),
+            DistanceMetric::Euclidean,
+        );
+        let mut bytes = index.serialize().unwrap();
+        bytes[12..16].copy_from_slice(&(HNSW_BUILD_CONTRACT_VERSION - 1).to_le_bytes());
+
+        assert_eq!(
+            hnsw_artifact_compatibility(&bytes).unwrap(),
+            HnswArtifactCompatibility::UnsupportedBuildContractVersion(
+                HNSW_BUILD_CONTRACT_VERSION - 1
+            )
+        );
+        let error = HnswIndex::deserialize(&bytes, make_storage(&vectors))
+            .err()
+            .expect("stale topology algorithm must require rebuild");
+        assert!(error.to_string().contains("build contract version"));
+        assert!(error.to_string().contains("rebuild the vector index"));
     }
 
     #[test]

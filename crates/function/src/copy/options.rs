@@ -21,7 +21,6 @@ pub struct CopyOptions {
     pub per_thread_output: bool,
     pub parallel: bool,
     pub parallel_workers: Option<usize>,
-    specified: BTreeSet<String>,
 }
 
 impl Default for CopyOptions {
@@ -41,7 +40,6 @@ impl Default for CopyOptions {
             per_thread_output: false,
             parallel: false,
             parallel_workers: None,
-            specified: BTreeSet::new(),
         }
     }
 }
@@ -49,20 +47,21 @@ impl Default for CopyOptions {
 impl CopyOptions {
     pub fn from_ast(options: &[(String, CopyOptionValue)]) -> Result<Self> {
         let mut result = CopyOptions::default();
+        let mut specified = BTreeSet::new();
         for (key, value) in options {
             let normalized = key.to_ascii_lowercase();
-            if !result.specified.insert(normalized.clone()) {
+            if !specified.insert(normalized.clone()) {
                 return Err(paro_error::invalid_parameter(format!(
                     "COPY option {normalized} was specified more than once"
                 )));
             }
             result.apply_option(key, value)?;
         }
-        result.validate_format_contract()?;
+        result.validate_format_contract(&specified)?;
         Ok(result)
     }
 
-    fn validate_format_contract(&self) -> Result<()> {
+    fn validate_format_contract(&self, specified: &BTreeSet<String>) -> Result<()> {
         if !matches!(self.format, CopyFormat::Binary) {
             return Ok(());
         }
@@ -79,7 +78,7 @@ impl CopyOptions {
             "encoding",
         ]
         .into_iter()
-        .filter(|key| self.specified.contains(*key))
+        .filter(|key| specified.contains(*key))
         .collect::<Vec<_>>();
         if invalid.is_empty() {
             return Ok(());
@@ -430,5 +429,12 @@ mod tests {
         assert!(!options.header());
         assert_eq!(options.quote(), None);
         assert_eq!(options.escape(), None);
+    }
+
+    #[test]
+    fn explicit_defaults_do_not_change_semantic_option_equality() {
+        let parsed =
+            CopyOptions::from_ast(&[("format".to_string(), CopyOptionValue::Default)]).unwrap();
+        assert_eq!(parsed, CopyOptions::default());
     }
 }

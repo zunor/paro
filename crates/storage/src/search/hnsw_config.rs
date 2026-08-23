@@ -22,7 +22,8 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 3 makes proposal-wave and warm-up topology parameters explicit.
+/// Version 4 selects keyed Feistel point ordering and removes frozen-wave
+/// topology fields from the SQL option surface.
 pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

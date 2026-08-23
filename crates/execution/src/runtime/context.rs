@@ -12,6 +12,9 @@ use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::allocator::{Allocator, BufferAllocator, MemoryTag};
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, ParoError, Result};
+use paro_common::memory::{
+    MemoryAccountingClass, MemoryAccountingContext, MemoryDomain, MemoryOwner,
+};
 use paro_context::{StatementCancellation, StatementContext, TransactionView};
 use paro_function::scalar::FunctionExecContext;
 use paro_function::table::TableFunctionRuntimeContext;
@@ -312,7 +315,16 @@ impl TableFunctionRuntimeContext for QueryRuntimeContext {
     }
 
     fn memory_limit_bytes(&self) -> Option<usize> {
-        Some(self.session.limits.max_memory)
+        (self.session.limits.max_memory > 0).then(|| self.memory.capacity_bytes())
+    }
+
+    fn memory_accounting_context(
+        &self,
+        tag: MemoryTag,
+        class: MemoryAccountingClass,
+    ) -> MemoryAccountingContext {
+        let owner: Arc<dyn MemoryOwner> = self.memory.clone();
+        MemoryAccountingContext::from_owner(owner, MemoryDomain::Host, tag, class)
     }
 }
 

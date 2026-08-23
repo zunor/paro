@@ -7,8 +7,10 @@ use std::any::Any;
 use std::io::{BufReader, Read};
 use std::sync::Mutex;
 
+use paro_common::allocator::MemoryTag;
 use paro_common::chunk::Chunk;
 use paro_common::error::{self as paro_error, Result};
+use paro_common::memory::{AccountedVec, MemoryAccountingClass};
 use paro_common::types::LogicalType;
 use paro_common::vector::{ArrayVector, Vector, VECTOR_SIZE};
 
@@ -27,6 +29,10 @@ const BINARY_SIGNATURE: &[u8; 11] = b"PGCOPY\n\xff\r\n\0";
 const BINARY_HEADER_LEN: usize = 19;
 const OIDS_FLAG: u32 = 1 << 16;
 const MIN_BINARY_COPY_BATCH_BYTES: usize = 64 * 1024;
+/// Safety window for embeddings that intentionally expose no statement memory
+/// ceiling. Actual capacity remains governed when a query memory owner exists;
+/// this value only derives per-field and per-batch parser waterlines.
+const DEFAULT_UNBOUNDED_BINARY_COPY_MEMORY_WINDOW: usize = 64 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 struct ReadBinaryBindData {
@@ -255,11 +261,14 @@ impl GlobalTableFunctionState for ReadBinaryGlobalState {
     }
 }
 
-#[derive(Default)]
 struct ReadBinaryLocalState {
-    batch_bytes: Vec<u8>,
+    buffers: Mutex<ReadBinaryLocalBuffers>,
+}
+
+struct ReadBinaryLocalBuffers {
+    batch_bytes: AccountedVec<u8>,
     /// Flattened row-major `(start, end)` ranges. `None` represents SQL NULL.
-    field_ranges: Vec<Option<(usize, usize)>>,
+    field_ranges: AccountedVec<Option<(usize, usize)>>,
 }
 
 impl LocalTableFunctionState for ReadBinaryLocalState {
@@ -314,15 +323,8 @@ fn read_binary_init_global(
             |err| paro_error::io_error(format!("open binary COPY file '{path}': {err}")),
         )?)),
     };
-    let memory_limit = input
-        .runtime
-        .memory_limit_bytes()
-        .filter(|limit| *limit > 0)
-        .ok_or_else(|| paro_error::internal("binary COPY requires a statement memory limit"))?;
-    let max_field_bytes = (memory_limit / 4).max(1);
-    let target_batch_bytes = (memory_limit / 128)
-        .max(MIN_BINARY_COPY_BATCH_BYTES)
-        .min(max_field_bytes);
+    let (max_field_bytes, target_batch_bytes) =
+        binary_copy_buffer_limits(input.runtime.memory_limit_bytes());
     Ok(Some(Box::new(ReadBinaryGlobalState {
         reader: Mutex::new(BinaryCopyReader::new(reader)?),
         max_field_bytes,
@@ -330,11 +332,38 @@ fn read_binary_init_global(
     })))
 }
 
+fn binary_copy_buffer_limits(memory_limit: Option<usize>) -> (usize, usize) {
+    let memory_limit = memory_limit
+        .filter(|limit| *limit > 0)
+        .unwrap_or(DEFAULT_UNBOUNDED_BINARY_COPY_MEMORY_WINDOW);
+    let max_field_bytes = (memory_limit / 4).max(1);
+    let target_batch_bytes = (memory_limit / 128)
+        .max(MIN_BINARY_COPY_BATCH_BYTES)
+        .min(max_field_bytes);
+    (max_field_bytes, target_batch_bytes)
+}
+
 fn read_binary_init_local(
-    _input: &TableFunctionInitInput,
+    input: &TableFunctionInitInput,
     _global_state: Option<&dyn GlobalTableFunctionState>,
 ) -> Result<Option<Box<dyn LocalTableFunctionState>>> {
-    Ok(Some(Box::new(ReadBinaryLocalState::default())))
+    let accounting = input
+        .runtime
+        .memory_accounting_context(MemoryTag::CopyReader, MemoryAccountingClass::NonRevocable);
+    Ok(Some(Box::new(ReadBinaryLocalState {
+        buffers: Mutex::new(ReadBinaryLocalBuffers {
+            batch_bytes: AccountedVec::new_with_accounting(
+                accounting.grant()?,
+                MemoryTag::CopyReader,
+                MemoryAccountingClass::NonRevocable,
+            ),
+            field_ranges: AccountedVec::new_with_accounting(
+                accounting.grant()?,
+                MemoryTag::CopyReader,
+                MemoryAccountingClass::Metadata,
+            ),
+        }),
+    })))
 }
 
 fn read_binary_function(
@@ -349,11 +378,15 @@ fn read_binary_function(
         .global_state
         .and_then(|state| state.as_any().downcast_ref::<ReadBinaryGlobalState>())
         .ok_or_else(|| paro_error::internal("invalid read_binary global state"))?;
-    let local = input
+    let local_state = input
         .local_state
         .as_mut()
         .and_then(|state| state.as_any_mut().downcast_mut::<ReadBinaryLocalState>())
         .ok_or_else(|| paro_error::internal("invalid read_binary local state"))?;
+    let mut local = local_state
+        .buffers
+        .lock()
+        .map_err(|error| paro_error::internal(format!("binary COPY local buffers: {error}")))?;
     let mut reader = global
         .reader
         .lock()
@@ -368,8 +401,7 @@ fn read_binary_function(
     local.field_ranges.clear();
     local
         .field_ranges
-        .try_reserve(capacity.saturating_mul(bind_data.decoders.len()))
-        .map_err(|_| paro_error::out_of_memory("binary COPY field directory allocation failed"))?;
+        .try_reserve(capacity.saturating_mul(bind_data.decoders.len()))?;
     let mut produced = 0;
     while produced < capacity {
         let Some(field_count) = reader.read_i16_or_eof()? else {
@@ -393,7 +425,7 @@ fn read_binary_function(
         for (column_idx, decoder) in bind_data.decoders.iter().enumerate() {
             let field_len = reader.read_i32("field length")?;
             if field_len == -1 {
-                local.field_ranges.push(None);
+                local.field_ranges.try_push(None)?;
                 continue;
             }
             let field_len = usize::try_from(field_len).map_err(|_| {
@@ -413,12 +445,13 @@ fn read_binary_function(
             let end = start.checked_add(field_len).ok_or_else(|| {
                 paro_error::configuration_limit_exceeded("binary COPY batch byte size overflow")
             })?;
-            local.batch_bytes.try_reserve(field_len).map_err(|_| {
-                paro_error::out_of_memory("binary COPY field payload allocation failed")
-            })?;
-            local.batch_bytes.resize(end, 0);
-            reader.read_exact_into(&mut local.batch_bytes[start..end], "field payload")?;
-            local.field_ranges.push(Some((start, end)));
+            local.batch_bytes.try_reserve(field_len)?;
+            local.batch_bytes.try_resize_with(end, || 0)?;
+            reader.read_exact_into(
+                &mut local.batch_bytes.as_mut_slice()[start..end],
+                "field payload",
+            )?;
+            local.field_ranges.try_push(Some((start, end)))?;
         }
         reader.row_number += 1;
         produced += 1;
@@ -427,10 +460,12 @@ fn read_binary_function(
         }
     }
 
-    decode_binary_batch(bind_data, local, output, produced)?;
+    decode_binary_batch(bind_data, &local, output, produced)?;
     if local.batch_bytes.capacity() > global.target_batch_bytes.saturating_mul(2) {
-        local.batch_bytes = Vec::new();
-        local.field_ranges = Vec::new();
+        local.batch_bytes.clear();
+        local.batch_bytes.shrink_to_fit_and_refund();
+        local.field_ranges.clear();
+        local.field_ranges.shrink_to_fit_and_refund();
     }
     output.set_cardinality(produced);
     if reader.finished {
@@ -442,7 +477,7 @@ fn read_binary_function(
 
 fn decode_binary_batch(
     bind_data: &ReadBinaryBindData,
-    local: &ReadBinaryLocalState,
+    local: &ReadBinaryLocalBuffers,
     output: &mut Chunk,
     row_count: usize,
 ) -> Result<()> {
@@ -464,8 +499,8 @@ fn decode_binary_batch(
                     )));
                 }
                 decode_batch(
-                    &local.batch_bytes,
-                    &local.field_ranges,
+                    local.batch_bytes.as_slice(),
+                    local.field_ranges.as_slice(),
                     column_count,
                     column_idx,
                     column,
@@ -473,8 +508,8 @@ fn decode_binary_batch(
                 )?
             }
             BinaryColumnDecoder::FloatArray { dimension } => decode_float_array_batch(
-                &local.batch_bytes,
-                &local.field_ranges,
+                local.batch_bytes.as_slice(),
+                local.field_ranges.as_slice(),
                 column_count,
                 column_idx,
                 column,
@@ -482,8 +517,8 @@ fn decode_binary_batch(
                 *dimension,
             )?,
             BinaryColumnDecoder::Generic { ty, .. } => decode_generic_batch(
-                &local.batch_bytes,
-                &local.field_ranges,
+                local.batch_bytes.as_slice(),
+                local.field_ranges.as_slice(),
                 column_count,
                 column_idx,
                 column,
@@ -721,7 +756,69 @@ fn decode_float_array_into_slice(bytes: &[u8], target: &mut [f32], dimension: us
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use paro_common::memory::{MemoryAccountingContext, MemoryDomain, MemoryOwner, MemoryResult};
+
     use super::*;
+    use crate::table::TableFunctionRuntimeContext;
+
+    #[derive(Debug, Default)]
+    struct TestMemoryOwner {
+        capacity: AtomicUsize,
+        published: AtomicUsize,
+    }
+
+    impl MemoryOwner for TestMemoryOwner {
+        fn acquire_capacity(&self, _domain: MemoryDomain, bytes: usize) -> MemoryResult<()> {
+            self.capacity.fetch_add(bytes, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn release_capacity(&self, _domain: MemoryDomain, bytes: usize) {
+            self.capacity.fetch_sub(bytes, Ordering::SeqCst);
+        }
+
+        fn record_allocation(
+            &self,
+            _domain: MemoryDomain,
+            _tag: MemoryTag,
+            _class: MemoryAccountingClass,
+            bytes: usize,
+        ) {
+            self.published.fetch_add(bytes, Ordering::SeqCst);
+        }
+
+        fn release_allocation(
+            &self,
+            _domain: MemoryDomain,
+            _tag: MemoryTag,
+            _class: MemoryAccountingClass,
+            bytes: usize,
+        ) {
+            self.published.fetch_sub(bytes, Ordering::SeqCst);
+        }
+    }
+
+    struct TestRuntime {
+        owner: Arc<TestMemoryOwner>,
+    }
+
+    impl TableFunctionRuntimeContext for TestRuntime {
+        fn memory_limit_bytes(&self) -> Option<usize> {
+            Some(8 * 1024 * 1024)
+        }
+
+        fn memory_accounting_context(
+            &self,
+            tag: MemoryTag,
+            class: MemoryAccountingClass,
+        ) -> MemoryAccountingContext {
+            let owner: Arc<dyn MemoryOwner> = self.owner.clone();
+            MemoryAccountingContext::from_owner(owner, MemoryDomain::Host, tag, class)
+        }
+    }
 
     fn binary_payload() -> Vec<u8> {
         let mut data = BINARY_SIGNATURE.to_vec();
@@ -774,5 +871,42 @@ mod tests {
         assert!(error
             .to_string()
             .contains("exceeds the 8388608-byte statement field limit"));
+    }
+
+    #[test]
+    fn binary_copy_local_buffers_charge_runtime_memory_owner() {
+        let owner = Arc::new(TestMemoryOwner::default());
+        let runtime = TestRuntime {
+            owner: Arc::clone(&owner),
+        };
+        let input = TableFunctionInitInput::new(&runtime, None, &[]);
+        let mut local = read_binary_init_local(&input, None)
+            .unwrap()
+            .expect("binary local state");
+        let state = local
+            .as_any_mut()
+            .downcast_mut::<ReadBinaryLocalState>()
+            .unwrap();
+        state
+            .buffers
+            .lock()
+            .unwrap()
+            .batch_bytes
+            .try_reserve(4096)
+            .unwrap();
+        assert!(owner.capacity.load(Ordering::SeqCst) >= 4096);
+        assert!(owner.published.load(Ordering::SeqCst) >= 4096);
+
+        drop(local);
+        assert_eq!(owner.capacity.load(Ordering::SeqCst), 0);
+        assert_eq!(owner.published.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn unbounded_runtime_uses_documented_binary_parser_waterline() {
+        let (field, batch) = binary_copy_buffer_limits(None);
+        assert_eq!(field, DEFAULT_UNBOUNDED_BINARY_COPY_MEMORY_WINDOW / 4);
+        assert_eq!(batch, DEFAULT_UNBOUNDED_BINARY_COPY_MEMORY_WINDOW / 128);
+        assert!(batch >= MIN_BINARY_COPY_BATCH_BYTES);
     }
 }

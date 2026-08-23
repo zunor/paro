@@ -5256,7 +5256,7 @@ mod tests {
             request.freshness_priority, definition_report.priority,
             "request should carry scheduler freshness priority"
         );
-        assert!(request.estimated_graph_memory_bytes > 0);
+        assert!(request.estimated_build_peak_memory_bytes > 0);
     }
 
     #[test]

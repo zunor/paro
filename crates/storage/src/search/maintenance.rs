@@ -77,7 +77,7 @@ pub struct HnswMaintenanceRequest {
     pub generation_id: u64,
     pub tail_window: Vec<TailPendingEntry>,
     pub rowset_refs: Vec<HnswMaintenanceRowsetRef>,
-    pub estimated_graph_memory_bytes: u64,
+    pub estimated_build_peak_memory_bytes: u64,
     pub dimension: u32,
     pub freshness_priority: MaintenancePriority,
 }
@@ -100,12 +100,13 @@ impl HnswMaintenanceRequest {
             generation_id,
             tail_window,
             rowset_refs,
-            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
-                vector_count,
-                provider.dimension,
-                provider.m,
-                crate::index::hnsw::hnsw_build_thread_count(),
-            ),
+            estimated_build_peak_memory_bytes:
+                HnswInlineThreshold::estimate_build_peak_memory_bytes(
+                    vector_count,
+                    provider.dimension,
+                    provider.m,
+                    crate::index::hnsw::hnsw_build_thread_count(),
+                ),
             dimension: provider.dimension,
             freshness_priority,
         })
@@ -948,6 +949,7 @@ mod tests {
                     vector_count: 10,
                     dimension: 8,
                     estimated_graph_memory_bytes: 1024,
+                    estimated_build_peak_memory_bytes: 2048,
                     threshold: HnswInlineThreshold {
                         max_vector_count: 10,
                         max_graph_memory_bytes: 512,
@@ -1054,7 +1056,7 @@ mod tests {
                 byte_count: 600,
             }]
         );
-        assert!(request.estimated_graph_memory_bytes > 0);
+        assert!(request.estimated_build_peak_memory_bytes > 0);
     }
 
     fn admission_request(

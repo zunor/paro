@@ -465,12 +465,11 @@ impl HnswInlineThreshold {
             && dimension <= self.max_dimension
     }
 
-    pub fn estimate_graph_memory_bytes(
-        vector_count: u64,
-        dimension: u32,
-        m: u32,
-        build_width: usize,
-    ) -> u64 {
+    /// Machine-independent resident graph estimate used by the durable inline
+    /// threshold. Runtime worker width must never affect this value: identical
+    /// definitions and segment contents must make the same inline/sidecar
+    /// placement decision on every node.
+    pub fn estimate_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
         let m = u64::from(m.max(1));
         let link_bytes = std::mem::size_of::<u32>() as u64;
         let level0_links = m.saturating_mul(2);
@@ -491,13 +490,25 @@ impl HnswInlineThreshold {
             (std::mem::size_of::<std::sync::RwLock<crate::index::hnsw::LinksContainer>>() as u64)
                 .saturating_add(16);
         let level_containers = expected_level_count.saturating_mul(level_container_bytes);
+        graph_links
+            .saturating_add(outer_point_vectors)
+            .saturating_add(level_containers)
+    }
+
+    /// Runtime peak estimate used by admission and write-buffer governance.
+    /// Unlike the placement estimate, this intentionally includes the actual
+    /// process build width and transient decoded-vector frontier.
+    pub fn estimate_build_peak_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        m: u32,
+        build_width: usize,
+    ) -> u64 {
         let visited_lists = vector_count.saturating_mul(build_width.max(1) as u64);
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
-        graph_links
-            .saturating_add(outer_point_vectors)
-            .saturating_add(level_containers)
+        Self::estimate_graph_memory_bytes(vector_count, m)
             .saturating_add(visited_lists)
             .saturating_add(build_frontier)
     }
@@ -508,6 +519,7 @@ pub struct HnswInlineBuildEstimate {
     pub vector_count: u64,
     pub dimension: u32,
     pub estimated_graph_memory_bytes: u64,
+    pub estimated_build_peak_memory_bytes: u64,
     pub threshold: HnswInlineThreshold,
 }
 
@@ -538,16 +550,22 @@ impl HnswInlineBuildEstimate {
             } else {
                 0
             };
+        let estimated_graph_memory_bytes =
+            HnswInlineThreshold::estimate_graph_memory_bytes(vector_count, config.m)
+                .saturating_add(metric_preprocessing_bytes);
+        let estimated_build_peak_memory_bytes =
+            HnswInlineThreshold::estimate_build_peak_memory_bytes(
+                vector_count,
+                dimension,
+                config.m,
+                crate::index::hnsw::hnsw_build_thread_count(),
+            )
+            .saturating_add(metric_preprocessing_bytes);
         Ok(Some(Self {
             vector_count,
             dimension,
-            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
-                vector_count,
-                dimension,
-                config.m as u32,
-                crate::index::hnsw::hnsw_build_thread_count(),
-            )
-            .saturating_add(metric_preprocessing_bytes),
+            estimated_graph_memory_bytes,
+            estimated_build_peak_memory_bytes,
             threshold,
         }))
     }
@@ -644,13 +662,17 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_build_estimate_accounts_for_each_visited_worker() {
+    fn hnsw_runtime_peak_accounts_for_workers_without_changing_graph_placement() {
         let points = 1_000;
-        let serial = HnswInlineThreshold::estimate_graph_memory_bytes(points, 128, 16, 1);
-        let width_32 = HnswInlineThreshold::estimate_graph_memory_bytes(points, 128, 16, 32);
+        let graph = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
+        let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 1);
+        let width_32 = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 32);
 
         assert_eq!(width_32 - serial, points * 31);
-        assert!(serial > points * 128 * std::mem::size_of::<f32>() as u64);
+        assert_eq!(
+            serial - graph,
+            points + points * 128 * std::mem::size_of::<f32>() as u64
+        );
     }
 
     #[test]
@@ -711,6 +733,11 @@ mod tests {
         };
         assert!(roomy.allows_inline());
         assert_eq!(roomy.max_segment_vector_count(), 16);
+        assert!(HnswInlineBuildEstimate {
+            estimated_build_peak_memory_bytes: u64::MAX,
+            ..roomy
+        }
+        .allows_inline());
     }
 
     #[test]

@@ -23,10 +23,10 @@ pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
 pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 0;
 pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
-/// Version 3 fixes graph construction to a seeded point permutation followed
-/// by one-point warm-up waves and deterministic frozen proposal waves. Wave
-/// boundaries are durable fields; changing publication semantics requires a
-/// new contract version.
+/// Version 4 replaces the affine point order with a keyed Feistel permutation
+/// followed by cycle walking. One-point warm-up waves and deterministic frozen
+/// proposal waves remain durable topology fields; changing point ordering or
+/// publication semantics requires a new contract version.
 pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 4;
 
 /// A scored point — a point with its similarity/distance score.

@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::compaction::plan::policy::{
-    BaseCompactionPolicy, CompactionDecision, CompactionPolicy, CumulativeCompactionPolicy,
-    SizeTieredCompactionPolicy,
+    BaseCompactionPolicy, CompactionPolicy, CompactionRowsetSet, CompactionSelection,
+    CumulativeCompactionPolicy, SizeTieredCompactionPolicy,
 };
 use crate::compaction::plan::types::{
     CompactionInput, CompactionPlan, CompactionPlanId, CompactionReason, CumulativePointAction,
@@ -16,6 +16,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const PK_PUBLISH_DELTA_MAX_ROWS: u64 = 5_000_000;
 const PK_PUBLISH_DELTA_MAX_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_BASELINE_TO_NEWER_BYTES: u64 = 5;
+
+/// Shared write-amplification admission applied after every policy has chosen
+/// a valid version range.
+///
+/// The oldest input is the bytes being rewritten; all later inputs are the
+/// progress that justifies that rewrite. Requiring at least one byte of newer
+/// data per five baseline bytes bounds input write amplification at 6x without
+/// relying on wall time, rowset count, or policy ordering. Size-tiered
+/// compaction can still merge small deltas independently until they are large
+/// enough to join an established base.
+fn rewrite_amplification_admitted(rowsets: &[RowsetSharedPtr]) -> bool {
+    let Some((baseline, newer)) = rowsets.split_first() else {
+        return false;
+    };
+    if newer.is_empty() {
+        return false;
+    }
+    let baseline_bytes = u128::from(baseline.total_disk_size());
+    let newer_bytes = newer.iter().fold(0_u128, |total, rowset| {
+        total.saturating_add(u128::from(rowset.total_disk_size()))
+    });
+    baseline_bytes <= newer_bytes.saturating_mul(u128::from(MAX_BASELINE_TO_NEWER_BYTES))
+}
 
 pub struct CompactionPlanner;
 
@@ -24,21 +48,25 @@ impl CompactionPlanner {
         let Some(schema) = tablet.schema() else {
             return Ok(None);
         };
+        let rowsets = CompactionRowsetSet::capture(tablet)?;
 
         if schema.keys_type() == KeysType::PrimaryKeys {
-            return Self::plan_primary_key(tablet);
+            return Self::plan_primary_key(tablet, &rowsets);
         }
 
-        let decision_and_inputs = [
-            Self::select(tablet, &SizeTieredCompactionPolicy::new())?,
-            Self::select(tablet, &CumulativeCompactionPolicy::new())?,
-            Self::select(tablet, &BaseCompactionPolicy::new())?,
-        ]
-        .into_iter()
-        .flatten()
-        .next();
+        let size_tiered = SizeTieredCompactionPolicy::new();
+        let cumulative = CumulativeCompactionPolicy::new();
+        let base = BaseCompactionPolicy::new();
+        let policies: [&dyn CompactionPolicy; 3] = [&size_tiered, &cumulative, &base];
+        let mut selected = None;
+        for policy in policies {
+            if let Some(selection) = Self::select(&rowsets, policy)? {
+                selected = Some(selection);
+                break;
+            }
+        }
 
-        let Some((decision, rowsets)) = decision_and_inputs else {
+        let Some(CompactionSelection { decision, rowsets }) = selected else {
             return Ok(None);
         };
 
@@ -98,12 +126,14 @@ impl CompactionPlanner {
         }))
     }
 
-    fn plan_primary_key(tablet: &Tablet) -> Result<Option<CompactionPlan>> {
-        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
-        if rowsets.len() <= 1 {
+    fn plan_primary_key(
+        tablet: &Tablet,
+        captured: &CompactionRowsetSet,
+    ) -> Result<Option<CompactionPlan>> {
+        if captured.rowsets().len() <= 1 {
             return Ok(None);
         }
-        rowsets.sort_by_key(|rowset| rowset.start_version());
+        let rowsets = captured.rowsets().to_vec();
 
         let output_version = output_version_for(&rowsets)?;
         let input_rowsets: Vec<CompactionInput> =
@@ -139,11 +169,13 @@ impl CompactionPlanner {
         let Some(schema) = tablet.schema() else {
             return Ok(None);
         };
+        let rowsets = CompactionRowsetSet::capture(tablet)?;
         if schema.keys_type() == KeysType::PrimaryKeys {
-            return Self::plan_primary_key(tablet);
+            return Self::plan_primary_key(tablet, &rowsets);
         }
 
-        let Some((decision, rowsets)) = Self::select(tablet, policy)? else {
+        let Some(CompactionSelection { decision, rowsets }) = Self::select(&rowsets, policy)?
+        else {
             return Ok(None);
         };
 
@@ -188,32 +220,20 @@ impl CompactionPlanner {
         }))
     }
 
-    fn select<P: CompactionPolicy>(
-        tablet: &Tablet,
+    fn select<P: CompactionPolicy + ?Sized>(
+        rowsets: &CompactionRowsetSet,
         policy: &P,
-    ) -> Result<Option<(CompactionDecision, Vec<crate::rowset::RowsetSharedPtr>)>> {
-        let Some(decision) = policy.select(tablet)? else {
+    ) -> Result<Option<CompactionSelection>> {
+        let Some(selection) = policy.select(rowsets)? else {
             return Ok(None);
         };
-        let rowsets = policy.pick_rowsets(tablet)?;
-        if rowsets.is_empty() {
+        if selection.rowsets.is_empty() {
             return Ok(None);
         }
-
-        if decision.policy_kind == PolicyKind::SizeTiered
-            && rowsets
-                .first()
-                .map(|rowset| rowset.start_version())
-                .unwrap_or_default()
-                == 0
-            && rowsets
-                .iter()
-                .any(|rowset| rowset.start_version() >= tablet.cumulative_point())
-        {
+        if !rewrite_amplification_admitted(&selection.rowsets) {
             return Ok(None);
         }
-
-        Ok(Some((decision, rowsets)))
+        Ok(Some(selection))
     }
 }
 
@@ -251,4 +271,92 @@ fn build_pk_delta_guard(
 fn next_plan_id() -> CompactionPlanId {
     static NEXT_PLAN_ID: AtomicU64 = AtomicU64::new(1);
     CompactionPlanId(NEXT_PLAN_ID.fetch_add(1, Ordering::Relaxed))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use paro_common::types::LogicalType;
+
+    use super::*;
+    use crate::rowset::{Rowset, RowsetMeta};
+    use crate::tablet::{TabletColumn, TabletSchema};
+
+    fn test_tablet() -> (tempfile::TempDir, Tablet) {
+        let temp = tempfile::tempdir().unwrap();
+        let schema = Arc::new(
+            TabletSchema::new(
+                1,
+                vec![TabletColumn::key(0, "id", LogicalType::BigInt)],
+                KeysType::DuplicateKeys,
+            )
+            .unwrap(),
+        );
+        let tablet = Tablet::new(1, 1, 0, schema, temp.path(), None).unwrap();
+        (temp, tablet)
+    }
+
+    fn add_sized_rowset(
+        tablet: &Tablet,
+        id: u64,
+        version: i64,
+        bytes: u64,
+        compaction_output: bool,
+    ) {
+        let mut meta = RowsetMeta::new(id, tablet.tablet_id(), Version::singleton(version));
+        meta.set_disk_sizes(bytes, 0);
+        if compaction_output {
+            meta.set_compaction_output(vec![id + 100]);
+        }
+        let rowset = Rowset::create(
+            tablet.schema().expect("test tablet schema"),
+            meta,
+            tablet.data_dir().join(format!("rowset-{id}")),
+        )
+        .unwrap();
+        tablet.add_rowset(Arc::new(rowset)).unwrap();
+    }
+
+    #[test]
+    fn planner_compacts_tiny_deltas_without_rewriting_large_base() {
+        let (_temp, tablet) = test_tablet();
+        add_sized_rowset(&tablet, 1, 1, 100 * 1024 * 1024 * 1024, true);
+        add_sized_rowset(&tablet, 2, 2, 4 * 1024 * 1024, false);
+        add_sized_rowset(&tablet, 3, 3, 4 * 1024 * 1024, false);
+        tablet.set_cumulative_point(2);
+
+        let plan = CompactionPlanner::plan(&tablet).unwrap().unwrap();
+        assert_eq!(plan.policy_kind, PolicyKind::SizeTiered);
+        assert_eq!(
+            plan.input_rowsets
+                .iter()
+                .map(|input| input.rowset.rowset_id())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
+        );
+        assert_eq!(plan.planned_input_size(), 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn shared_gate_bounds_base_rewrite_amplification() {
+        let (_temp, tablet) = test_tablet();
+        add_sized_rowset(&tablet, 1, 1, 100 * 1024 * 1024 * 1024, true);
+        add_sized_rowset(&tablet, 2, 2, 4 * 1024 * 1024, false);
+        add_sized_rowset(&tablet, 3, 3, 4 * 1024 * 1024, false);
+        tablet.set_cumulative_point(4);
+
+        assert!(
+            CompactionPlanner::plan_with_policy(&tablet, &BaseCompactionPolicy::new())
+                .unwrap()
+                .is_none()
+        );
+
+        add_sized_rowset(&tablet, 4, 4, 20 * 1024 * 1024 * 1024, false);
+        tablet.set_cumulative_point(5);
+        let plan = CompactionPlanner::plan_with_policy(&tablet, &BaseCompactionPolicy::new())
+            .unwrap()
+            .expect("one newer byte per five baseline bytes admits the rewrite");
+        assert_eq!(plan.input_rowsets.len(), 4);
+    }
 }

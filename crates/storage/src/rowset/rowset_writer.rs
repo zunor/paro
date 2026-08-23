@@ -776,7 +776,7 @@ impl RowsetWriter {
                             _ => None,
                         })
                         .unwrap_or(0);
-                    total.saturating_add(HnswInlineThreshold::estimate_graph_memory_bytes(
+                    total.saturating_add(HnswInlineThreshold::estimate_build_peak_memory_bytes(
                         rows,
                         dimension,
                         options.build_contract.m,
@@ -960,18 +960,23 @@ impl RowsetWriter {
         let requests = entries
             .iter()
             .map(|entry| -> Result<InlineAdmissionRequest> {
+                let hnsw_inline = hnsw_inline_build_estimate(
+                    entry,
+                    row_count_estimate,
+                    self.context.schema.columns(),
+                )?;
+                let mut estimated_cost = estimate_inline_build_cost(entry, row_count_estimate);
+                if let Some(estimate) = hnsw_inline {
+                    estimated_cost.memory_peak_bytes = estimate.estimated_build_peak_memory_bytes;
+                }
                 Ok(InlineAdmissionRequest {
                     table_id: entry.definition.table_id,
                     definition_id: entry.definition.definition_id,
                     provider: entry.definition.kind,
                     flush_mode: entry.flush_mode(),
-                    estimated_cost: estimate_inline_build_cost(entry, row_count_estimate),
+                    estimated_cost,
                     row_count: row_count_estimate.max(1),
-                    hnsw_inline: hnsw_inline_build_estimate(
-                        entry,
-                        row_count_estimate,
-                        self.context.schema.columns(),
-                    )?,
+                    hnsw_inline,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -2696,6 +2701,10 @@ mod tests {
         assert_eq!(estimate.dimension, 2);
         assert_eq!(estimate.threshold.max_vector_count, 1024);
         assert!(estimate.allows_inline());
+        assert_eq!(
+            requests[0].estimated_cost.memory_peak_bytes,
+            estimate.estimated_build_peak_memory_bytes
+        );
         assert_eq!(*releases.lock().unwrap(), vec![88]);
     }
 

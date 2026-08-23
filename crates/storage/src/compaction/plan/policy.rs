@@ -14,10 +14,70 @@ pub struct CompactionDecision {
     pub reason: CompactionReason,
 }
 
-pub trait CompactionPolicy: Send + Sync {
-    fn select(&self, tablet: &Tablet) -> Result<Option<CompactionDecision>>;
+pub struct CompactionSelection {
+    pub decision: CompactionDecision,
+    pub rowsets: Vec<RowsetSharedPtr>,
+}
 
-    fn pick_rowsets(&self, tablet: &Tablet) -> Result<Vec<RowsetSharedPtr>>;
+/// One immutable, validated view of the visible rowset graph used by every
+/// compaction policy in a planning attempt.
+///
+/// Global commit versions may contain holes when a tablet received no write,
+/// but visible rowset ranges must never overlap or straddle the durable
+/// cumulative boundary. Capturing and validating once prevents policies from
+/// silently disagreeing about the same tablet state.
+pub struct CompactionRowsetSet {
+    rowsets: Vec<RowsetSharedPtr>,
+    cumulative_point: i64,
+}
+
+impl CompactionRowsetSet {
+    pub fn capture(tablet: &Tablet) -> Result<Self> {
+        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
+        rowsets.sort_by_key(|rowset| rowset.start_version());
+        let cumulative_point = tablet.cumulative_point();
+
+        let mut previous_end = None;
+        for rowset in &rowsets {
+            if let Some(end) = previous_end {
+                if rowset.start_version() <= end {
+                    return Err(paro_error::data_corrupted(format!(
+                        "rowset version [{}, {}] overlaps an earlier visible rowset ending at {end}",
+                        rowset.start_version(),
+                        rowset.end_version(),
+                    )));
+                }
+            }
+            if cumulative_point >= 0
+                && rowset.start_version() < cumulative_point
+                && rowset.end_version() >= cumulative_point
+            {
+                return Err(paro_error::data_corrupted(format!(
+                    "rowset version [{}, {}] crosses the cumulative point {cumulative_point}",
+                    rowset.start_version(),
+                    rowset.end_version(),
+                )));
+            }
+            previous_end = Some(rowset.end_version());
+        }
+
+        Ok(Self {
+            rowsets,
+            cumulative_point,
+        })
+    }
+
+    pub fn rowsets(&self) -> &[RowsetSharedPtr] {
+        &self.rowsets
+    }
+
+    pub const fn cumulative_point(&self) -> i64 {
+        self.cumulative_point
+    }
+}
+
+pub trait CompactionPolicy: Send + Sync {
+    fn select(&self, rowsets: &CompactionRowsetSet) -> Result<Option<CompactionSelection>>;
 }
 
 pub struct SizeTieredCompactionPolicy {
@@ -68,11 +128,57 @@ impl SizeTieredCompactionPolicy {
 
         score
     }
+
+    fn pick_rowsets(&self, input: &CompactionRowsetSet) -> Result<Vec<RowsetSharedPtr>> {
+        if input.rowsets().len() < self.min_segments as usize {
+            return Ok(Vec::new());
+        }
+
+        let mut groups = Vec::new();
+        let mut current_group = Vec::new();
+        let mut current_level_size = 0u64;
+        let mut current_is_base = None;
+        for rs in input.rowsets() {
+            let rs_size = rs.total_disk_size();
+            let effective_size = rs_size.max(self.min_level_size / 10);
+            let is_base = rs.end_version() < input.cumulative_point();
+
+            if !current_group.is_empty() {
+                let larger = current_level_size.max(effective_size);
+                let smaller = current_level_size.min(effective_size).max(1);
+                if current_is_base != Some(is_base)
+                    || larger as f64 > smaller as f64 * self.level_multiple
+                {
+                    groups.push(std::mem::take(&mut current_group));
+                    current_level_size = 0;
+                }
+            }
+            current_group.push(rs.clone());
+            current_level_size = current_level_size.max(effective_size);
+            current_is_base = Some(is_base);
+        }
+        if !current_group.is_empty() {
+            groups.push(current_group);
+        }
+
+        // Multiple eligible levels may coexist. Prefer the level with the
+        // highest benefit score; for equal scores prefer the newer level so a
+        // large established base does not win merely by appearing first.
+        Ok(groups
+            .into_iter()
+            .filter(|group| group.len() >= self.min_segments as usize)
+            .max_by(|left, right| {
+                self.calculate_score(left)
+                    .total_cmp(&self.calculate_score(right))
+                    .then_with(|| left[0].start_version().cmp(&right[0].start_version()))
+            })
+            .unwrap_or_default())
+    }
 }
 
 impl CompactionPolicy for SizeTieredCompactionPolicy {
-    fn select(&self, tablet: &Tablet) -> Result<Option<CompactionDecision>> {
-        let rowsets = self.pick_rowsets(tablet)?;
+    fn select(&self, input: &CompactionRowsetSet) -> Result<Option<CompactionSelection>> {
+        let rowsets = self.pick_rowsets(input)?;
         if rowsets.is_empty() {
             return Ok(None);
         }
@@ -84,105 +190,41 @@ impl CompactionPolicy for SizeTieredCompactionPolicy {
 
         let cumulative_point_action = if rowsets
             .last()
-            .is_some_and(|rowset| rowset.end_version() < tablet.cumulative_point())
+            .is_some_and(|rowset| rowset.end_version() < input.cumulative_point())
         {
             CumulativePointAction::Preserve
         } else {
             CumulativePointAction::AdvanceToOutputEndExclusive
         };
 
-        Ok(Some(CompactionDecision {
-            score,
-            policy_kind: PolicyKind::SizeTiered,
-            cumulative_point_action,
-            reason: CompactionReason::SizeTieredPolicy,
+        Ok(Some(CompactionSelection {
+            decision: CompactionDecision {
+                score,
+                policy_kind: PolicyKind::SizeTiered,
+                cumulative_point_action,
+                reason: CompactionReason::SizeTieredPolicy,
+            },
+            rowsets,
         }))
     }
-
-    fn pick_rowsets(&self, tablet: &Tablet) -> Result<Vec<RowsetSharedPtr>> {
-        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
-        if rowsets.len() < self.min_segments as usize {
-            return Ok(Vec::new());
-        }
-
-        rowsets.sort_by_key(|rs| rs.start_version());
-
-        let mut current_group = Vec::new();
-        let mut current_level_size = 0u64;
-
-        for rs in &rowsets {
-            let rs_size = rs.total_disk_size();
-            let effective_size = rs_size.max(self.min_level_size / 10);
-
-            if current_group.is_empty() {
-                current_group.push(rs.clone());
-                current_level_size = effective_size;
-                continue;
-            }
-
-            if rs_size as f64 > current_level_size as f64 * self.level_multiple {
-                if current_group.len() >= self.min_segments as usize {
-                    break;
-                }
-
-                current_group.clear();
-                current_group.push(rs.clone());
-                current_level_size = effective_size;
-            } else {
-                current_group.push(rs.clone());
-                current_level_size = current_level_size.max(effective_size);
-            }
-        }
-
-        if current_group.len() >= self.min_segments as usize {
-            Ok(current_group)
-        } else {
-            Ok(Vec::new())
-        }
-    }
 }
 
-pub struct BaseCompactionPolicy {
-    min_newer_rowsets: usize,
-    newer_bytes_escape: u64,
-}
+pub struct BaseCompactionPolicy;
 
 impl BaseCompactionPolicy {
     pub fn new() -> Self {
-        Self {
-            min_newer_rowsets: 4,
-            newer_bytes_escape: 256 * 1024 * 1024,
-        }
-    }
-}
-
-impl CompactionPolicy for BaseCompactionPolicy {
-    fn select(&self, tablet: &Tablet) -> Result<Option<CompactionDecision>> {
-        let rowsets = self.pick_rowsets(tablet)?;
-        if rowsets.is_empty() {
-            return Ok(None);
-        }
-
-        Ok(Some(CompactionDecision {
-            score: rowsets.len() as f64,
-            policy_kind: PolicyKind::Base,
-            cumulative_point_action: CumulativePointAction::Preserve,
-            reason: CompactionReason::BasePolicy,
-        }))
+        Self
     }
 
-    fn pick_rowsets(&self, tablet: &Tablet) -> Result<Vec<RowsetSharedPtr>> {
-        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
-        if rowsets.is_empty() {
+    fn pick_rowsets(&self, input: &CompactionRowsetSet) -> Result<Vec<RowsetSharedPtr>> {
+        if input.rowsets().is_empty() {
             return Ok(Vec::new());
         }
 
-        rowsets.sort_by_key(|rs| rs.start_version());
-        let cumulative_point = tablet.cumulative_point();
         let mut candidates = Vec::new();
-        for rs in rowsets {
-            if rs.end_version() < cumulative_point {
-                candidates.push(rs);
+        for rs in input.rowsets() {
+            if rs.end_version() < input.cumulative_point() {
+                candidates.push(rs.clone());
             } else {
                 break;
             }
@@ -192,21 +234,26 @@ impl CompactionPolicy for BaseCompactionPolicy {
             return Ok(Vec::new());
         }
 
-        // A prior base output owns the earliest visible tablet prefix; global
-        // commit versions do not require that prefix to begin at zero. Rate-limit
-        // its next full rewrite using deterministic version-space progress,
-        // not wall time. A byte escape prevents large deltas from waiting on a
-        // rowset-count threshold.
-        if candidates[0].rowset_meta().is_compaction_output() {
-            let newer = &candidates[1..];
-            let newer_bytes = newer.iter().fold(0_u64, |total, rowset| {
-                total.saturating_add(rowset.total_disk_size())
-            });
-            if newer.len() < self.min_newer_rowsets && newer_bytes < self.newer_bytes_escape {
-                return Ok(Vec::new());
-            }
-        }
         Ok(candidates)
+    }
+}
+
+impl CompactionPolicy for BaseCompactionPolicy {
+    fn select(&self, input: &CompactionRowsetSet) -> Result<Option<CompactionSelection>> {
+        let rowsets = self.pick_rowsets(input)?;
+        if rowsets.is_empty() {
+            return Ok(None);
+        }
+
+        Ok(Some(CompactionSelection {
+            decision: CompactionDecision {
+                score: rowsets.len() as f64,
+                policy_kind: PolicyKind::Base,
+                cumulative_point_action: CumulativePointAction::Preserve,
+                reason: CompactionReason::BasePolicy,
+            },
+            rowsets,
+        }))
     }
 }
 
@@ -225,77 +272,25 @@ impl CumulativeCompactionPolicy {
             max_delta_rowsets: 1000,
         }
     }
-}
 
-impl CompactionPolicy for CumulativeCompactionPolicy {
-    fn select(&self, tablet: &Tablet) -> Result<Option<CompactionDecision>> {
-        let rowsets = self.pick_rowsets(tablet)?;
-        if rowsets.is_empty() {
-            return Ok(None);
-        }
-
-        let score: f64 = rowsets
-            .iter()
-            .map(|rs| rs.rowset_meta().get_compaction_score())
-            .sum();
-        Ok(Some(CompactionDecision {
-            score,
-            policy_kind: PolicyKind::Cumulative,
-            cumulative_point_action: CumulativePointAction::AdvanceToOutputEndExclusive,
-            reason: CompactionReason::CumulativePolicy,
-        }))
-    }
-
-    fn pick_rowsets(&self, tablet: &Tablet) -> Result<Vec<RowsetSharedPtr>> {
-        let mut rowsets = tablet.capture_consistent_rowsets(tablet.max_version())?;
-        if rowsets.is_empty() {
+    fn pick_rowsets(&self, input: &CompactionRowsetSet) -> Result<Vec<RowsetSharedPtr>> {
+        if input.rowsets().is_empty() {
             return Ok(Vec::new());
         }
 
-        rowsets.sort_by_key(|rs| rs.start_version());
-
-        let cumulative_point = tablet.cumulative_point();
         let mut candidates = Vec::new();
         // -1 is the durable sentinel used before the first cumulative
         // compaction. Global commit versions may contain holes where this
         // tablet had no write, so a sentinel does not imply that its first
         // rowset starts at zero.
-        let mut output_end_exclusive = cumulative_point.max(0);
-
-        for rs in rowsets {
-            if rs.end_version() < cumulative_point {
+        for rs in input.rowsets() {
+            if rs.end_version() < input.cumulative_point() {
                 continue;
-            }
-            // Never skip a delete-bearing or otherwise inconvenient rowset and
-            // then move the cumulative point beyond it. Numeric commit-version
-            // holes are valid when this tablet had no write in those commits.
-            if cumulative_point >= 0
-                && rs.start_version() < cumulative_point
-                && rs.end_version() >= cumulative_point
-            {
-                return Err(paro_error::data_corrupted(format!(
-                    "rowset version [{}, {}] crosses the cumulative point {cumulative_point}",
-                    rs.start_version(),
-                    rs.end_version(),
-                )));
-            }
-            if !candidates.is_empty() && rs.start_version() < output_end_exclusive {
-                return Err(paro_error::data_corrupted(format!(
-                    "rowset version [{}, {}] overlaps an earlier cumulative candidate ending at {}",
-                    rs.start_version(),
-                    rs.end_version(),
-                    output_end_exclusive - 1,
-                )));
             }
             if candidates.len() >= self.max_delta_rowsets {
                 break;
             }
-
-            output_end_exclusive = match rs.end_version().checked_add(1) {
-                Some(next) => next,
-                None => break,
-            };
-            candidates.push(rs);
+            candidates.push(rs.clone());
         }
 
         // Cumulative compaction merges delta rowsets. A rowset's segment/size
@@ -306,6 +301,29 @@ impl CompactionPolicy for CumulativeCompactionPolicy {
         } else {
             Ok(Vec::new())
         }
+    }
+}
+
+impl CompactionPolicy for CumulativeCompactionPolicy {
+    fn select(&self, input: &CompactionRowsetSet) -> Result<Option<CompactionSelection>> {
+        let rowsets = self.pick_rowsets(input)?;
+        if rowsets.is_empty() {
+            return Ok(None);
+        }
+
+        let score = rowsets
+            .iter()
+            .map(|rs| rs.rowset_meta().get_compaction_score())
+            .sum();
+        Ok(Some(CompactionSelection {
+            decision: CompactionDecision {
+                score,
+                policy_kind: PolicyKind::Cumulative,
+                cumulative_point_action: CumulativePointAction::AdvanceToOutputEndExclusive,
+                reason: CompactionReason::CumulativePolicy,
+            },
+            rowsets,
+        }))
     }
 }
 
@@ -347,6 +365,31 @@ mod tests {
         tablet.add_rowset(Arc::new(rowset)).unwrap();
     }
 
+    fn add_sized_rowset(
+        tablet: &Tablet,
+        id: u64,
+        version: i64,
+        bytes: u64,
+        compaction_output: bool,
+    ) {
+        let mut meta = RowsetMeta::new(id, tablet.tablet_id(), Version::singleton(version));
+        meta.set_disk_sizes(bytes, 0);
+        if compaction_output {
+            meta.set_compaction_output(vec![id + 100]);
+        }
+        let rowset = Rowset::create(
+            tablet.schema().expect("test tablet schema"),
+            meta,
+            tablet.data_dir().join(format!("rowset-{id}")),
+        )
+        .unwrap();
+        tablet.add_rowset(Arc::new(rowset)).unwrap();
+    }
+
+    fn captured(tablet: &Tablet) -> CompactionRowsetSet {
+        CompactionRowsetSet::capture(tablet).unwrap()
+    }
+
     #[test]
     fn cumulative_policy_normalizes_initial_sentinel_and_keeps_delete_versions() {
         let (_temp, tablet) = test_tablet();
@@ -356,7 +399,7 @@ mod tests {
         }
 
         let selected = CumulativeCompactionPolicy::new()
-            .pick_rowsets(&tablet)
+            .pick_rowsets(&captured(&tablet))
             .unwrap();
         assert_eq!(
             selected
@@ -369,7 +412,7 @@ mod tests {
     }
 
     #[test]
-    fn base_rewrite_waits_for_deterministic_version_progress() {
+    fn base_policy_returns_the_complete_base_prefix() {
         let (_temp, tablet) = test_tablet();
         let mut base = RowsetMeta::new(1, tablet.tablet_id(), Version::new(4, 5));
         base.set_compaction_output(vec![10, 11]);
@@ -388,16 +431,19 @@ mod tests {
         }
         tablet.set_cumulative_point(13);
 
-        assert!(BaseCompactionPolicy::new()
-            .pick_rowsets(&tablet)
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            BaseCompactionPolicy::new()
+                .pick_rowsets(&captured(&tablet))
+                .unwrap()
+                .len(),
+            4
+        );
 
         add_rowset(&tablet, 5, 14, 0);
         tablet.set_cumulative_point(15);
         assert_eq!(
             BaseCompactionPolicy::new()
-                .pick_rowsets(&tablet)
+                .pick_rowsets(&captured(&tablet))
                 .unwrap()
                 .len(),
             5
@@ -420,9 +466,9 @@ mod tests {
             .unwrap();
         tablet.set_cumulative_point(1);
 
-        let error = CumulativeCompactionPolicy::new()
-            .pick_rowsets(&tablet)
-            .unwrap_err();
+        let error = CompactionRowsetSet::capture(&tablet)
+            .err()
+            .expect("crossing cumulative point must be rejected");
         assert!(error.to_string().contains("crosses the cumulative point"));
     }
 
@@ -433,7 +479,7 @@ mod tests {
         add_rowset(&tablet, 2, 9, 0);
 
         let selected = CumulativeCompactionPolicy::new()
-            .pick_rowsets(&tablet)
+            .pick_rowsets(&captured(&tablet))
             .unwrap();
         assert_eq!(
             selected
@@ -450,25 +496,45 @@ mod tests {
         add_rowset(&base_tablet, 1, 4, 0);
         add_rowset(&base_tablet, 2, 7, 0);
         base_tablet.set_cumulative_point(10);
-        let base_decision = SizeTieredCompactionPolicy::new()
-            .select(&base_tablet)
+        let base_selection = SizeTieredCompactionPolicy::new()
+            .select(&captured(&base_tablet))
             .unwrap()
             .unwrap();
         assert_eq!(
-            base_decision.cumulative_point_action,
+            base_selection.decision.cumulative_point_action,
             CumulativePointAction::Preserve
         );
 
         let (_temp, delta_tablet) = test_tablet();
         add_rowset(&delta_tablet, 1, 4, 0);
         add_rowset(&delta_tablet, 2, 7, 0);
-        let delta_decision = SizeTieredCompactionPolicy::new()
-            .select(&delta_tablet)
+        let delta_selection = SizeTieredCompactionPolicy::new()
+            .select(&captured(&delta_tablet))
             .unwrap()
             .unwrap();
         assert_eq!(
-            delta_decision.cumulative_point_action,
+            delta_selection.decision.cumulative_point_action,
             CumulativePointAction::AdvanceToOutputEndExclusive
+        );
+    }
+
+    #[test]
+    fn size_tiered_keeps_large_base_out_of_small_delta_level() {
+        let (_temp, tablet) = test_tablet();
+        add_sized_rowset(&tablet, 1, 1, 100 * 1024 * 1024 * 1024, true);
+        add_sized_rowset(&tablet, 2, 2, 4 * 1024 * 1024, false);
+        add_sized_rowset(&tablet, 3, 3, 4 * 1024 * 1024, false);
+        tablet.set_cumulative_point(2);
+
+        let selected = SizeTieredCompactionPolicy::new()
+            .pick_rowsets(&captured(&tablet))
+            .unwrap();
+        assert_eq!(
+            selected
+                .iter()
+                .map(|rowset| rowset.rowset_id())
+                .collect::<Vec<_>>(),
+            vec![2, 3]
         );
     }
 }
