@@ -303,6 +303,15 @@ impl SearchIndexRegistry {
         self.view.load().hnsw_search_policy(column_id, distance)
     }
 
+    pub(crate) fn hnsw_filter_topology(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswFilterTopologyContract> {
+        self.ensure_fresh();
+        self.view.load().hnsw_filter_topology(column_id, distance)
+    }
+
     fn resolve_capability_with_required_wait(
         &self,
         finder: impl Fn(&SearchView) -> Option<SearchCapability>,
@@ -2646,6 +2655,9 @@ mod tests {
             build_seed: 1,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: crate::search::DEFAULT_HNSW_FILTER_M,
             inline_threshold: crate::search::HnswInlineConfig {
                 enabled: inline_max_vector_count != 0,
                 max_vector_count: inline_max_vector_count,

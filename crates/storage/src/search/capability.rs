@@ -634,6 +634,9 @@ mod tests {
             build_seed: 7,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: crate::search::DEFAULT_HNSW_FILTER_M,
             inline_threshold: HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,

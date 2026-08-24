@@ -500,6 +500,37 @@ impl HnswInlineThreshold {
             .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
     }
 
+    /// Durable footprint of the predicate-local level-0 topology. Each
+    /// configured scalar column independently partitions the full point
+    /// domain and contributes at most `2 * filter_m` local links plus
+    /// `filter_m` cross-block routing links per point. The published graph
+    /// merges those links but remains separate from the base graph so
+    /// unfiltered queries never pay this degree.
+    pub fn estimate_filter_graph_memory_bytes(
+        vector_count: u64,
+        filter_columns: usize,
+        filter_m: u32,
+    ) -> u64 {
+        if filter_columns == 0 {
+            return 0;
+        }
+        let columns = filter_columns as u64;
+        let offset_tables = vector_count
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<u64>() as u64)
+            .saturating_mul(2);
+        let links = vector_count
+            .saturating_mul(columns)
+            .saturating_mul(u64::from(filter_m).saturating_mul(3))
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        // One encoded level-count byte per point plus the fixed GraphLinks V2
+        // header. Predicate topology has no upper levels.
+        64_u64
+            .saturating_add(offset_tables)
+            .saturating_add(links)
+            .saturating_add(vector_count)
+    }
+
     /// Mutable graph-builder resident estimate. This belongs only to runtime
     /// admission/accounting and must not determine the durable segment shape.
     fn estimate_builder_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
@@ -543,6 +574,42 @@ impl HnswInlineThreshold {
             .saturating_add(visited_lists)
             .saturating_add(build_frontier)
     }
+
+    fn estimate_filter_build_peak_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        filter_columns: usize,
+        filter_m: u32,
+        build_width: usize,
+    ) -> u64 {
+        if filter_columns == 0 {
+            return 0;
+        }
+        // A single equality posting may be larger than the target block size,
+        // because equal values are never split. Use the full segment as the
+        // local-builder upper bound; runtime admission must remain safe for a
+        // constant-valued filter column.
+        let max_block_rows = vector_count;
+        let merged_containers = vector_count.saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
+        let merged_links = vector_count
+            .saturating_mul(filter_columns as u64)
+            .saturating_mul(u64::from(filter_m).saturating_mul(3))
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let block_membership = vector_count.saturating_mul(std::mem::size_of::<u32>() as u64);
+        let local_vectors = max_block_rows
+            .saturating_mul(u64::from(dimension.max(1)))
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        let local_visited = max_block_rows.saturating_mul(build_width.max(1) as u64);
+        merged_containers
+            .saturating_add(merged_links)
+            .saturating_add(block_membership)
+            .saturating_add(Self::estimate_builder_graph_memory_bytes(
+                max_block_rows,
+                filter_m,
+            ))
+            .saturating_add(local_vectors)
+            .saturating_add(local_visited)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -583,6 +650,11 @@ impl HnswInlineBuildEstimate {
             };
         let estimated_graph_memory_bytes =
             HnswInlineThreshold::estimate_graph_memory_bytes(vector_count, config.m)
+                .saturating_add(HnswInlineThreshold::estimate_filter_graph_memory_bytes(
+                    vector_count,
+                    config.filter_columns.len(),
+                    config.filter_m,
+                ))
                 .saturating_add(metric_preprocessing_bytes);
         let estimated_build_peak_memory_bytes =
             HnswInlineThreshold::estimate_build_peak_memory_bytes(
@@ -590,6 +662,15 @@ impl HnswInlineBuildEstimate {
                 dimension,
                 config.m,
                 crate::index::hnsw::hnsw_build_thread_count(),
+            )
+            .saturating_add(
+                HnswInlineThreshold::estimate_filter_build_peak_memory_bytes(
+                    vector_count,
+                    dimension,
+                    config.filter_columns.len(),
+                    config.filter_m,
+                    crate::index::hnsw::hnsw_build_thread_count(),
+                ),
             )
             .saturating_add(metric_preprocessing_bytes);
         Ok(Some(Self {

@@ -16,6 +16,7 @@ use paro_common::error::Result;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
 use std::path::Path;
+use std::ptr::NonNull;
 use std::sync::Arc;
 
 const GRAPH_LINKS_MAGIC: u32 = u32::from_le_bytes(*b"HGLK");
@@ -50,6 +51,7 @@ impl GraphLinksData {
 #[derive(Debug)]
 pub struct GraphLinks {
     data: GraphLinksData,
+    native_level0: Option<NativeLevel0View>,
     serialized_len_bytes: usize,
     point_count: usize,
     level0_link_count: usize,
@@ -58,6 +60,64 @@ pub struct GraphLinks {
     upper_offsets_offset: usize,
     upper_payload_offset: usize,
     upper_payload_len: usize,
+}
+
+/// Typed little-endian view into the immutable backing owned by `GraphLinks`.
+/// Pointers are established only after bytemuck validates alignment and exact
+/// element widths. Vec, Bytes, and mmap allocations keep their address while
+/// their owning handle moves, so the view remains valid for the owner's life.
+#[derive(Debug, Clone, Copy)]
+struct NativeLevel0View {
+    offsets: NonNull<u64>,
+    offsets_len: usize,
+    links: NonNull<PointOffset>,
+    links_len: usize,
+}
+
+// The pointed-to bytes are immutable and owned by GraphLinks. Sharing these
+// read-only views has the same thread-safety as sharing the backing itself.
+unsafe impl Send for NativeLevel0View {}
+unsafe impl Sync for NativeLevel0View {}
+
+impl NativeLevel0View {
+    fn from_bytes(bytes: &[u8], layout: ParsedLayout) -> Option<Self> {
+        #[cfg(target_endian = "little")]
+        {
+            let offsets = bytemuck::try_cast_slice::<u8, u64>(
+                &bytes[layout.level0_offsets_offset..layout.level0_links_offset],
+            )
+            .ok()?;
+            let links = bytemuck::try_cast_slice::<u8, PointOffset>(
+                &bytes[layout.level0_links_offset..layout.upper_offsets_offset],
+            )
+            .ok()?;
+            Some(Self {
+                offsets: NonNull::new(offsets.as_ptr().cast_mut())?,
+                offsets_len: offsets.len(),
+                links: NonNull::new(links.as_ptr().cast_mut())?,
+                links_len: links.len(),
+            })
+        }
+        #[cfg(not(target_endian = "little"))]
+        {
+            let _ = (bytes, layout);
+            None
+        }
+    }
+
+    #[inline(always)]
+    fn offsets(&self) -> &[u64] {
+        // SAFETY: construction validated alignment and length against the
+        // immutable backing retained by the enclosing GraphLinks.
+        unsafe { std::slice::from_raw_parts(self.offsets.as_ptr(), self.offsets_len) }
+    }
+
+    #[inline(always)]
+    fn links(&self) -> &[PointOffset] {
+        // SAFETY: construction validated alignment and length against the
+        // immutable backing retained by the enclosing GraphLinks.
+        unsafe { std::slice::from_raw_parts(self.links.as_ptr(), self.links_len) }
+    }
 }
 
 impl Default for GraphLinks {
@@ -95,8 +155,10 @@ impl GraphLinks {
     }
 
     fn from_data(data: GraphLinksData, layout: ParsedLayout) -> Self {
+        let native_level0 = NativeLevel0View::from_bytes(data.as_bytes(), layout);
         Self {
             data,
+            native_level0,
             serialized_len_bytes: layout.serialized_len_bytes,
             point_count: layout.point_count,
             level0_link_count: layout.level0_link_count,
@@ -197,21 +259,18 @@ impl GraphLinks {
         let Some((start, end)) = self.level0_range(point_id) else {
             return;
         };
-        let bytes = self.data.as_bytes();
-        let start_byte = self.level0_links_offset + start * POINT_BYTES;
-        let end_byte = self.level0_links_offset + end * POINT_BYTES;
-        #[cfg(target_endian = "little")]
-        if let Ok(links) = bytemuck::try_cast_slice::<u8, PointOffset>(&bytes[start_byte..end_byte])
-        {
-            for &link in links {
+        if let Some(native) = self.native_level0 {
+            for &link in &native.links()[start..end] {
                 f(link);
             }
             return;
         }
-        // Offset-table validation makes this a single checked slice operation;
-        // aligned little-endian backings use the native slice above. The
-        // portable fallback retains exact-width decoding for an unaligned
-        // Bytes view or a big-endian host.
+        let bytes = self.data.as_bytes();
+        let start_byte = self.level0_links_offset + start * POINT_BYTES;
+        let end_byte = self.level0_links_offset + end * POINT_BYTES;
+        // Offset-table validation makes this a single checked slice operation.
+        // The fallback retains exact-width decoding for an unaligned backing
+        // or a big-endian host.
         for raw in bytes[start_byte..end_byte].chunks_exact(POINT_BYTES) {
             f(PointOffset::from_le_bytes(
                 raw.try_into().expect("level-0 link chunk width"),
@@ -273,16 +332,14 @@ impl GraphLinks {
         if point >= self.point_count {
             return None;
         }
-        let bytes = self.data.as_bytes();
-        #[cfg(target_endian = "little")]
-        if let Ok(offsets) = bytemuck::try_cast_slice::<u8, u64>(
-            &bytes[self.level0_offsets_offset..self.level0_links_offset],
-        ) {
+        if let Some(native) = self.native_level0 {
+            let offsets = native.offsets();
             let start = offsets[point] as usize;
             let end = offsets[point + 1] as usize;
             debug_assert!(start <= end && end <= self.level0_link_count);
             return Some((start, end));
         }
+        let bytes = self.data.as_bytes();
         let start =
             Self::read_layout_u64(bytes, self.level0_offsets_offset + point * U64_BYTES) as usize;
         let end = Self::read_layout_u64(bytes, self.level0_offsets_offset + (point + 1) * U64_BYTES)

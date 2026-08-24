@@ -7,6 +7,7 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
+use paro_common::types::LogicalType;
 use roaring::RoaringBitmap;
 use std::collections::BTreeMap;
 use std::io::Cursor;
@@ -111,6 +112,60 @@ impl BitmapIndexWriter {
     /// Get the number of distinct values.
     pub fn num_values(&self) -> usize {
         self.value_to_rows.len()
+    }
+
+    /// Build deterministic, value-boundary-preserving point blocks for a
+    /// predicate-local HNSW graph. Dictionary values are ordered by SQL scalar
+    /// semantics rather than their physical little-endian bytes. Equal values
+    /// are never split, so range/equality predicates can traverse an exact
+    /// local topology after applying their normal row-set admission proof.
+    pub fn ordered_hnsw_filter_blocks(
+        &self,
+        logical_type: &LogicalType,
+        target_rows: usize,
+    ) -> Result<Vec<Box<[u32]>>> {
+        let mut entries = self.value_to_rows.iter().collect::<Vec<_>>();
+        let sort_error = std::cell::RefCell::new(None);
+        entries.sort_by(|(left, _), (right, _)| {
+            match crate::index::predicate::compare_bytes(logical_type, left, right) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    let mut first_error = sort_error.borrow_mut();
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = sort_error.into_inner() {
+            return Err(error);
+        }
+
+        let target_rows = target_rows.max(1);
+        let mut blocks = Vec::new();
+        let mut current = Vec::new();
+        for (_, posting) in entries {
+            if !current.is_empty() && current.len() >= target_rows {
+                current.sort_unstable();
+                blocks.push(std::mem::take(&mut current).into_boxed_slice());
+            }
+            current.reserve(posting.len() as usize);
+            current.extend(posting.iter());
+        }
+        if !current.is_empty() {
+            current.sort_unstable();
+            blocks.push(current.into_boxed_slice());
+        }
+        if !self.null_bitmap.is_empty() {
+            blocks.push(
+                self.null_bitmap
+                    .iter()
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            );
+        }
+        Ok(blocks)
     }
 
     /// Finish and serialize the index.

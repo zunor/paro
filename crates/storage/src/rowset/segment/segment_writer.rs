@@ -35,6 +35,7 @@ use super::segment_format::{ColumnMeta, SegmentFooter};
 #[cfg(test)]
 use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::index::hnsw::{HnswBuildContract, HnswBuildStopCheck};
+use crate::index::hnsw::{HnswFilterBlocks, HnswFilterColumnBlocks};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
 use crate::rowset::encoding::FieldType;
@@ -398,6 +399,13 @@ impl SegmentWriter {
             // absent entry means the inline build was rejected or deferred.
             let hnsw = self.options.hnsw_indexes.get(&col.id).copied();
             let is_hnsw_col = hnsw.is_some();
+            let collect_hnsw_filter_values = self.options.hnsw_indexes.values().any(|options| {
+                options
+                    .build_contract
+                    .filter_topology
+                    .columns()
+                    .contains(&col.id)
+            });
             let mut col_opts = ColumnWriterOptions::new(field_type, col.id)
                 .with_logical_type(col.logical_type.clone())
                 .with_nullable(col.is_nullable)
@@ -405,6 +413,7 @@ impl SegmentWriter {
                 .with_compression(self.options.compression)
                 .with_bloom_filter(self.options.bloom_filter_columns.contains(&col.id))
                 .with_bitmap_index(self.options.bitmap_index_columns.contains(&col.id))
+                .with_hnsw_filter_values(collect_hnsw_filter_values)
                 .with_hnsw(
                     self.options.build_hnsw_indexes && is_hnsw_col,
                     hnsw.map(|options| options.build_contract),
@@ -611,6 +620,7 @@ impl SegmentWriter {
     }
 
     fn do_finalize_columns(&mut self) -> Result<()> {
+        self.prepare_hnsw_filter_blocks()?;
         // Write column data to file
         for i in 0..self.column_writers.len() {
             // Ensure 8-byte alignment for column data (required for mmap vector access)
@@ -694,6 +704,61 @@ impl SegmentWriter {
         }
 
         self.column_writers.clear();
+        Ok(())
+    }
+
+    fn prepare_hnsw_filter_blocks(&mut self) -> Result<()> {
+        let plans = self
+            .column_writers
+            .iter()
+            .filter_map(|writer| {
+                self.options
+                    .hnsw_indexes
+                    .get(&writer.column_id)
+                    .copied()
+                    .filter(|options| options.build_contract.filter_topology.is_enabled())
+                    .map(|options| (writer.column_id, options.build_contract.filter_topology))
+            })
+            .collect::<Vec<_>>();
+
+        for (vector_column_id, topology) in plans {
+            let mut columns = Vec::new();
+            for &filter_column_id in topology.columns() {
+                let filter_writer = self
+                    .column_writers
+                    .iter()
+                    .find(|writer| writer.column_id == filter_column_id)
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "HNSW filter column {filter_column_id} is absent from the segment writer"
+                        ))
+                    })?;
+                let column_blocks = filter_writer
+                    .writer
+                    .hnsw_filter_blocks(topology.target_block_rows as usize)?
+                    .ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "HNSW filter column {filter_column_id} did not collect scalar values"
+                        ))
+                    })?;
+                columns.push(HnswFilterColumnBlocks {
+                    column_id: filter_column_id,
+                    blocks: column_blocks,
+                });
+            }
+            let vector_writer = self
+                .column_writers
+                .iter_mut()
+                .find(|writer| writer.column_id == vector_column_id)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "HNSW vector column {vector_column_id} is absent from the segment writer"
+                    ))
+                })?;
+            vector_writer
+                .writer
+                .set_hnsw_filter_blocks(HnswFilterBlocks { columns })?;
+        }
         Ok(())
     }
 
@@ -1273,6 +1338,81 @@ mod tests {
         let segment = writer.finalize().unwrap();
 
         assert_eq!(segment.num_rows(), 8);
+    }
+
+    #[test]
+    fn hnsw_predicate_topology_is_built_from_named_scalar_column() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("predicate_hnsw_segment.dat");
+        let dimension = 2;
+        let schema = std::sync::Arc::new(
+            TabletSchema::new(
+                11,
+                vec![
+                    TabletColumn::new(0, "id", LogicalType::Integer),
+                    TabletColumn::new(1, "bucket", LogicalType::Integer),
+                    TabletColumn::new(
+                        2,
+                        "embedding",
+                        LogicalType::Array(Box::new(LogicalType::Float), dimension),
+                    ),
+                ],
+                KeysType::DuplicateKeys,
+            )
+            .unwrap(),
+        );
+        let mut build_contract = HnswConfig::new(4, 32).build_contract(DistanceMetric::Euclidean);
+        build_contract.filter_topology =
+            crate::index::hnsw::HnswFilterTopologyContract::from_columns(&[1], 4, 2).unwrap();
+        let options = SegmentWriterOptions::new(0)
+            .with_short_key_index(false)
+            .with_compression(CompressionType::None)
+            .with_hnsw_build_contract(2, build_contract);
+        let mut writer = SegmentWriter::create(schema, &file_path, options).unwrap();
+
+        let rows = 32_u32;
+        let ids = (0..rows)
+            .flat_map(|row| (row as i32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let buckets = (0..rows)
+            .flat_map(|row| ((row % 4) as i32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let vectors = (0..rows)
+            .flat_map(|row| [row as f32, (row.wrapping_mul(7) % 13) as f32])
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        writer
+            .append_chunk(&[
+                ColumnData::new(ids, rows),
+                ColumnData::new(buckets, rows),
+                ColumnData::new(vectors, rows),
+            ])
+            .unwrap();
+        let segment = writer.finalize().unwrap();
+        let index = segment.open_hnsw_index(2).unwrap().unwrap();
+        let predicate_links = index
+            .graph
+            .predicate_links
+            .as_ref()
+            .expect("configured filter topology should be persisted");
+        let mut local_edge_count = 0;
+        let mut cross_block_edge_count = 0;
+        for point in 0..rows {
+            predicate_links.for_each_link(point, 0, |neighbor| {
+                if point % 4 == neighbor % 4 {
+                    local_edge_count += 1;
+                } else {
+                    let mut is_base_edge = false;
+                    index.graph.links.for_each_link(point, 0, |base_neighbor| {
+                        is_base_edge |= base_neighbor == neighbor;
+                    });
+                    assert!(is_base_edge, "cross-block routing must reuse a base edge");
+                    cross_block_edge_count += 1;
+                }
+            });
+        }
+        assert!(local_edge_count > 0);
+        assert!(cross_block_edge_count > 0);
     }
 
     #[test]

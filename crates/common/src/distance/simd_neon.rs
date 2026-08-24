@@ -12,6 +12,7 @@
 //! due to raw pointer operations.
 
 use std::arch::aarch64::*;
+use std::arch::asm;
 
 use super::scalar::is_length_zero_or_normalized;
 
@@ -79,10 +80,21 @@ pub unsafe fn l2_squared_batch_indexed_neon(
     scores: &mut [f32],
 ) {
     const ROWS_PER_GROUP: usize = 8;
+    const PREFETCH_GROUPS_AHEAD: usize = 2;
     let simd_dimension = dimension - dimension % 4;
     let mut row = 0usize;
 
     while row + ROWS_PER_GROUP <= point_ids.len() {
+        let prefetch_row = row + ROWS_PER_GROUP * PREFETCH_GROUPS_AHEAD;
+        if prefetch_row + ROWS_PER_GROUP <= point_ids.len() {
+            for &point_id in &point_ids[prefetch_row..prefetch_row + ROWS_PER_GROUP] {
+                let vector = vectors.as_ptr().add(point_id as usize * dimension);
+                prefetch_l1(vector);
+                if dimension > 16 {
+                    prefetch_l1(vector.add(16));
+                }
+            }
+        }
         let vector0 = vectors.as_ptr().add(point_ids[row] as usize * dimension);
         let vector1 = vectors
             .as_ptr()
@@ -179,6 +191,18 @@ pub unsafe fn l2_squared_batch_indexed_neon(
         *scores.get_unchecked_mut(row) = l2_squared_neon(query, &vectors[start..start + dimension]);
         row += 1;
     }
+}
+
+/// Best-effort L1 read prefetch for sparse indexed scoring. The enclosing
+/// batch kernel has already validated every point range; `prfm` itself is a
+/// non-faulting hint and does not dereference the address architecturally.
+#[inline(always)]
+unsafe fn prefetch_l1(address: *const f32) {
+    asm!(
+        "prfm pldl1keep, [{address}]",
+        address = in(reg) address,
+        options(readonly, nostack, preserves_flags)
+    );
 }
 
 /// Compute L1 distance (Manhattan distance) using NEON instructions.

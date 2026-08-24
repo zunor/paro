@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{HnswBuildContract, HnswIndex, VectorStorage};
+use super::{HnswBuildContract, HnswFilterBlocks, HnswIndex, VectorStorage};
 use paro_common::error::{self as paro_error, Result};
 use rayon::ThreadPool;
 use std::fmt;
@@ -146,6 +146,22 @@ impl HnswBuilder {
         HnswIndex::build_with_controls(
             storage,
             build_contract,
+            Some(pool),
+            self.stop_check.as_ref(),
+        )
+    }
+
+    pub fn build_with_filter_blocks(
+        &self,
+        storage: Arc<dyn VectorStorage>,
+        build_contract: HnswBuildContract,
+        filter_blocks: HnswFilterBlocks,
+    ) -> Result<HnswIndex> {
+        let (pool, _) = hnsw_build_pool()?;
+        HnswIndex::build_with_controls_and_filter_blocks(
+            storage,
+            build_contract,
+            filter_blocks,
             Some(pool),
             self.stop_check.as_ref(),
         )

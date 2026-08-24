@@ -56,6 +56,28 @@ const DEFAULT_SEGMENT_SIZE_THRESHOLD: u64 = 256 * 1024 * 1024;
 /// Default maximum rows per segment (1 million)
 const DEFAULT_MAX_ROWS_PER_SEGMENT: u64 = 1_000_000;
 
+/// Source of the physical segment row boundary. The ordinary fallback keeps
+/// non-search tables at a conservative size, while a durable HNSW placement
+/// contract may raise or lower the adaptive boundary. An explicit caller cap
+/// is always an upper bound and is never enlarged by a provider.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentRowLimit {
+    Adaptive { fallback_rows: u64 },
+    Explicit { max_rows: u64 },
+}
+
+impl SegmentRowLimit {
+    fn effective(self, provider_rows: Option<u64>) -> u64 {
+        match self {
+            Self::Adaptive { fallback_rows } => provider_rows.unwrap_or(fallback_rows),
+            Self::Explicit { max_rows } => {
+                provider_rows.map_or(max_rows, |rows| rows.min(max_rows))
+            }
+        }
+        .max(1)
+    }
+}
+
 /// Required freshness must block the current segment instead of silently
 /// falling back to tail-only. Keep the retry bounded so a broken admission
 /// implementation cannot wedge the writer forever.
@@ -76,8 +98,8 @@ pub struct RowsetWriterContext {
     pub rowset_path: PathBuf,
     /// Segment size threshold in bytes
     pub segment_size_threshold: u64,
-    /// Maximum rows per segment
-    pub max_rows_per_segment: u64,
+    /// Physical row-boundary policy.
+    pub segment_row_limit: SegmentRowLimit,
     /// Compression type for segments
     pub compression: super::page::CompressionType,
     /// Whether to build short key index
@@ -107,7 +129,9 @@ impl RowsetWriterContext {
             schema,
             rowset_path: rowset_path.into(),
             segment_size_threshold: DEFAULT_SEGMENT_SIZE_THRESHOLD,
-            max_rows_per_segment: DEFAULT_MAX_ROWS_PER_SEGMENT,
+            segment_row_limit: SegmentRowLimit::Adaptive {
+                fallback_rows: DEFAULT_MAX_ROWS_PER_SEGMENT,
+            },
             compression: super::page::CompressionType::Lz4,
             build_short_key_index: true,
             num_short_key_columns: 3,
@@ -131,7 +155,7 @@ impl RowsetWriterContext {
 
     /// Set maximum rows per segment
     pub fn with_max_rows_per_segment(mut self, max_rows: u64) -> Self {
-        self.max_rows_per_segment = max_rows;
+        self.segment_row_limit = SegmentRowLimit::Explicit { max_rows };
         self
     }
 
@@ -799,12 +823,18 @@ impl RowsetWriter {
             .unwrap_or(0)
     }
 
+    fn effective_segment_row_limit(&self) -> u64 {
+        self.context
+            .segment_row_limit
+            .effective(self.current_hnsw_inline_row_limit)
+    }
+
     /// Check if current segment should be flushed
     fn should_flush_segment(&self) -> bool {
         if let Some(writer) = &self.current_segment_writer {
             let rows = writer.num_rows();
             // Check row count threshold
-            if rows >= self.context.max_rows_per_segment {
+            if rows >= self.effective_segment_row_limit() {
                 return true;
             }
             // Note: Size threshold check would require tracking estimated size
@@ -960,12 +990,22 @@ impl RowsetWriter {
         let requests = entries
             .iter()
             .map(|entry| -> Result<InlineAdmissionRequest> {
-                let hnsw_inline = hnsw_inline_build_estimate(
+                let initial_hnsw = hnsw_inline_build_estimate(
                     entry,
                     row_count_estimate,
                     self.context.schema.columns(),
                 )?;
-                let mut estimated_cost = estimate_inline_build_cost(entry, row_count_estimate);
+                let admitted_rows = initial_hnsw.map_or(row_count_estimate, |estimate| {
+                    self.context
+                        .segment_row_limit
+                        .effective(Some(estimate.max_segment_vector_count()))
+                });
+                let hnsw_inline = if initial_hnsw.is_some() {
+                    hnsw_inline_build_estimate(entry, admitted_rows, self.context.schema.columns())?
+                } else {
+                    None
+                };
+                let mut estimated_cost = estimate_inline_build_cost(entry, admitted_rows);
                 if let Some(estimate) = hnsw_inline {
                     estimated_cost.memory_peak_bytes = estimate.estimated_build_peak_memory_bytes;
                 }
@@ -975,7 +1015,7 @@ impl RowsetWriter {
                     provider: entry.definition.kind,
                     flush_mode: entry.flush_mode(),
                     estimated_cost,
-                    row_count: row_count_estimate.max(1),
+                    row_count: admitted_rows.max(1),
                     hnsw_inline,
                 })
             })
@@ -1110,9 +1150,7 @@ impl RowsetWriter {
     }
 
     fn flush_hnsw_segment_before_limit(&mut self, incoming_rows: u64) -> Result<()> {
-        let Some(limit) = self.current_hnsw_inline_row_limit else {
-            return Ok(());
-        };
+        let limit = self.effective_segment_row_limit();
         let Some(writer) = self.current_segment_writer.as_ref() else {
             return Ok(());
         };
@@ -1488,7 +1526,7 @@ impl RowsetWriterBuilder {
 
     /// Set maximum rows per segment
     pub fn max_rows_per_segment(mut self, max_rows: u64) -> Self {
-        self.context.max_rows_per_segment = max_rows;
+        self.context.segment_row_limit = SegmentRowLimit::Explicit { max_rows };
         self
     }
 
@@ -2012,6 +2050,9 @@ mod tests {
                 "build_seed": 1,
                 "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                "filter_columns": [],
+                "filter_block_rows": crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                "filter_m": crate::search::DEFAULT_HNSW_FILTER_M,
                 "inline_threshold": {
                     "enabled": true,
                     "max_vector_count": max_vector_count,
@@ -2111,7 +2152,10 @@ mod tests {
 
         assert_eq!(context.tablet_id, 100);
         assert_eq!(context.segment_size_threshold, 128 * 1024 * 1024);
-        assert_eq!(context.max_rows_per_segment, 500_000);
+        assert_eq!(
+            context.segment_row_limit,
+            SegmentRowLimit::Explicit { max_rows: 500_000 }
+        );
         assert_eq!(context.compression, CompressionType::Zstd);
         assert!(!context.build_short_key_index);
     }
@@ -2694,10 +2738,8 @@ mod tests {
         let requests = requests.lock().unwrap();
         assert_eq!(requests.len(), 1);
         let estimate = requests[0].hnsw_inline.expect("hnsw inline estimate");
-        assert_eq!(
-            estimate.vector_count, 2,
-            "HNSW admission should estimate the incoming segment rows, not max segment capacity"
-        );
+        assert_eq!(estimate.vector_count, 128);
+        assert_eq!(requests[0].row_count, 128);
         assert_eq!(estimate.dimension, 2);
         assert_eq!(estimate.threshold.max_vector_count, 1024);
         assert!(estimate.allows_inline());
@@ -3388,5 +3430,19 @@ mod tests {
 
         let rowset = writer.build().unwrap();
         assert_eq!(rowset.num_rows(), 10);
+    }
+
+    #[test]
+    fn adaptive_segment_limit_uses_provider_placement_but_explicit_limit_caps_it() {
+        let adaptive = SegmentRowLimit::Adaptive {
+            fallback_rows: 1_000_000,
+        };
+        assert_eq!(adaptive.effective(None), 1_000_000);
+        assert_eq!(adaptive.effective(Some(2_000_000)), 2_000_000);
+
+        let explicit = SegmentRowLimit::Explicit { max_rows: 500_000 };
+        assert_eq!(explicit.effective(None), 500_000);
+        assert_eq!(explicit.effective(Some(2_000_000)), 500_000);
+        assert_eq!(explicit.effective(Some(250_000)), 250_000);
     }
 }

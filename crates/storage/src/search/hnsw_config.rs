@@ -12,19 +12,23 @@ use serde_json::Value;
 
 pub use crate::index::hnsw::types::{
     DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
-    DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
+    DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
     DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
-use crate::index::hnsw::{DistanceMetric, HnswBuildContract, HnswSearchPolicy};
+use crate::index::hnsw::{
+    DistanceMetric, HnswBuildContract, HnswFilterTopologyContract, HnswSearchPolicy,
+    MAX_HNSW_FILTER_COLUMNS,
+};
 use paro_common::error::{self as paro_error, Result};
 
 use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 4 selects keyed Feistel point ordering and removes frozen-wave
-/// topology fields from the SQL option surface.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 4;
+/// Version 5 adds explicit predicate-topology columns and durable block/degree
+/// parameters. Existing HNSW artifacts must be rebuilt.
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -51,6 +55,9 @@ pub struct HnswProviderConfig {
     pub build_seed: u64,
     pub proposal_wave_size: u32,
     pub warmup_point_count: u32,
+    pub filter_columns: Vec<u32>,
+    pub filter_block_rows: u32,
+    pub filter_m: u32,
     pub inline_threshold: HnswInlineConfig,
 }
 
@@ -110,6 +117,31 @@ impl HnswProviderConfig {
                 self.ef_search
             )));
         }
+        if self.filter_columns.len() > MAX_HNSW_FILTER_COLUMNS {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW filter_columns supports at most {MAX_HNSW_FILTER_COLUMNS} columns"
+            )));
+        }
+        if self
+            .filter_columns
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(paro_error::invalid_input(
+                "HNSW filter_columns must be sorted and unique",
+            ));
+        }
+        if self.filter_block_rows == 0 {
+            return Err(paro_error::invalid_input(
+                "HNSW filter_block_rows must be greater than zero",
+            ));
+        }
+        if !(2..=64).contains(&self.filter_m) {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW filter_m must be between 2 and 64, got {}",
+                self.filter_m
+            )));
+        }
         if self.inline_threshold.enabled {
             if self.inline_threshold.max_vector_count == 0 {
                 return Err(paro_error::invalid_input(
@@ -151,6 +183,12 @@ impl HnswProviderConfig {
             build_seed: self.build_seed,
             proposal_wave_size: self.proposal_wave_size,
             warmup_point_count: self.warmup_point_count,
+            filter_topology: HnswFilterTopologyContract::from_columns(
+                &self.filter_columns,
+                self.filter_block_rows,
+                self.filter_m,
+            )
+            .expect("validated HNSW filter topology must form a durable contract"),
         }
     }
 
@@ -194,6 +232,9 @@ mod tests {
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: DEFAULT_HNSW_FILTER_M,
             inline_threshold: HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,

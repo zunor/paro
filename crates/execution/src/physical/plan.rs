@@ -984,10 +984,34 @@ fn push_dense_search_filter_properties(
     // contract instead of duplicating the cost model as a false plan-time
     // execution claim.
     let strategy = format!(
-        "per-segment runtime choice: exact row-set distance scan at <= {} matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback",
+        "per-segment runtime choice: exact row-set distance scan at <= {} matches; otherwise predicate-agnostic HNSW navigation with exact admission, scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback",
         spec.search_policy.filtered_plain_scan_threshold
     );
     push_string_property(properties, "Filtered Strategy", strategy);
+    let predicate_columns = paro_storage::index::collect_predicate_columns(
+        spec.predicate
+            .as_ref()
+            .expect("predicate checked above")
+            .tree(),
+    );
+    let accelerated_columns = spec
+        .filter_topology
+        .columns()
+        .iter()
+        .copied()
+        .filter(|column| predicate_columns.contains(column))
+        .map(|column| table_column_name(spec.table.as_ref(), column as usize))
+        .collect::<Vec<_>>();
+    if !accelerated_columns.is_empty() {
+        push_string_property(
+            properties,
+            "Predicate Topology",
+            format!(
+                "available on {}: scalar-block HNSW plus bounded vector-aware cross-block routing; selected from exact runtime connectivity, exact row-set admission retained",
+                accelerated_columns.join(", ")
+            ),
+        );
+    }
 }
 
 fn push_vector_search_properties(

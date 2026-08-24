@@ -52,6 +52,9 @@ pub(crate) fn schema_seed_definition(
         build_seed: DEFAULT_HNSW_BUILD_SEED,
         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+        filter_columns: Vec::new(),
+        filter_block_rows: crate::index::hnsw::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+        filter_m: crate::index::hnsw::DEFAULT_HNSW_FILTER_M,
         inline_threshold: HnswInlineConfig {
             enabled: true,
             max_vector_count: inline.max_vector_count,

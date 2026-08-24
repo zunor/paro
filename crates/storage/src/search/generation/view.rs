@@ -225,6 +225,24 @@ impl SearchView {
         })
     }
 
+    pub(crate) fn hnsw_filter_topology(
+        &self,
+        column_id: ColumnId,
+        distance: DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswFilterTopologyContract> {
+        self.definitions.values().find_map(|state| {
+            let capability = state.capability.as_ref()?;
+            if capability.kind != SearchIndexKind::Hnsw
+                || !capability.is_queryable()
+                || !state.definition.column_ids.contains(&column_id)
+            {
+                return None;
+            }
+            let config = state.hnsw_provider_config.as_ref()?;
+            (config.distance == distance).then(|| config.build_contract().filter_topology)
+        })
+    }
+
     pub(crate) fn has_queryable_artifact(
         &self,
         kind: SearchIndexKind,

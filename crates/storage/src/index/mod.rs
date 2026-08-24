@@ -103,8 +103,8 @@ pub use index_type::{
 };
 pub use index_type_set::IndexTypeSet;
 pub use predicate::{
-    collect_predicate_columns, compare_bytes, value_to_bytes, Predicate, PredicateComparison,
-    PredicateTree,
+    collect_predicate_columns, compare_bytes, supports_ordered_bytes, value_to_bytes, Predicate,
+    PredicateComparison, PredicateTree,
 };
 pub use predicate_result::{
     decode_page_ranges, encode_page_ranges, intersect, to_row_ranges, union, PageRange,

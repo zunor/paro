@@ -414,6 +414,7 @@ pub struct StorageMetricsSnapshot {
     pub search_hnsw_unfiltered_graph_segment_searches_total: u64,
     pub search_hnsw_masked_graph_segment_searches_total: u64,
     pub search_hnsw_adaptive_graph_segment_searches_total: u64,
+    pub search_hnsw_predicate_topology_segment_searches_total: u64,
     pub search_hnsw_predicate_refined_segment_searches_total: u64,
     pub search_hnsw_exact_fallback_segment_searches_total: u64,
     pub column_read_by_rowids_page_run_seeks_total: u64,
@@ -524,6 +525,7 @@ pub struct StorageMetrics {
     search_hnsw_unfiltered_graph_segment_searches_total: AtomicU64,
     search_hnsw_masked_graph_segment_searches_total: AtomicU64,
     search_hnsw_adaptive_graph_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_topology_segment_searches_total: AtomicU64,
     search_hnsw_predicate_refined_segment_searches_total: AtomicU64,
     search_hnsw_exact_fallback_segment_searches_total: AtomicU64,
     column_read_by_rowids_page_run_seeks_total: AtomicU64,
@@ -1196,6 +1198,10 @@ impl StorageMetrics {
             self.search_hnsw_predicate_refined_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
         }
+        if outcome.predicate_topology_used {
+            self.search_hnsw_predicate_topology_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if outcome.exact_fallback {
             self.search_hnsw_exact_fallback_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1463,6 +1469,9 @@ impl StorageMetrics {
             search_hnsw_adaptive_graph_segment_searches_total: self
                 .search_hnsw_adaptive_graph_segment_searches_total
                 .load(Ordering::Relaxed),
+            search_hnsw_predicate_topology_segment_searches_total: self
+                .search_hnsw_predicate_topology_segment_searches_total
+                .load(Ordering::Relaxed),
             search_hnsw_predicate_refined_segment_searches_total: self
                 .search_hnsw_predicate_refined_segment_searches_total
                 .load(Ordering::Relaxed),
@@ -1610,6 +1619,8 @@ impl StorageMetrics {
             .store(0, Ordering::Relaxed);
         self.search_hnsw_adaptive_graph_segment_searches_total
             .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_topology_segment_searches_total
+            .store(0, Ordering::Relaxed);
         self.search_hnsw_predicate_refined_segment_searches_total
             .store(0, Ordering::Relaxed);
         self.search_hnsw_exact_fallback_segment_searches_total
@@ -1733,6 +1744,7 @@ mod tests {
         m.record_search_hnsw_work(
             123,
             HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph)
+                .with_predicate_topology(true)
                 .with_predicate_refinement(true)
                 .with_exact_fallback(),
         );
@@ -1757,6 +1769,10 @@ mod tests {
         assert_eq!(snap.delta_writer_commit_ns, 10);
         assert_eq!(snap.search_hnsw_scored_points_total, 123);
         assert_eq!(snap.search_hnsw_adaptive_graph_segment_searches_total, 1);
+        assert_eq!(
+            snap.search_hnsw_predicate_topology_segment_searches_total,
+            1
+        );
         assert_eq!(snap.search_hnsw_predicate_refined_segment_searches_total, 1);
         assert_eq!(snap.search_hnsw_exact_fallback_segment_searches_total, 1);
         assert_eq!(snap.delta_writer_commit_count, 1);

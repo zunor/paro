@@ -219,6 +219,15 @@ impl TableHandle {
         self.search_registry.hnsw_search_policy(column_id, distance)
     }
 
+    pub fn vector_filter_topology(
+        &self,
+        column_id: ColumnId,
+        distance: crate::index::hnsw::DistanceMetric,
+    ) -> Option<crate::index::hnsw::HnswFilterTopologyContract> {
+        self.search_registry
+            .hnsw_filter_topology(column_id, distance)
+    }
+
     pub fn sparse_capability(&self, column_id: ColumnId) -> Option<SearchCapability> {
         self.search_registry
             .capability(SearchIndexKind::Sparse, column_id, None)

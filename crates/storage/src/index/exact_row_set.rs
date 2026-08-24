@@ -75,6 +75,33 @@ pub trait ExactRowSet: std::fmt::Debug + Send + Sync {
     /// into a distance scanner.
     fn try_for_each(&self, visitor: &mut dyn FnMut(u32) -> Result<()>) -> Result<()>;
 
+    /// Visit matching row ids in caller-sized batches. The default preserves
+    /// extensibility, while index-native implementations override it so exact
+    /// scans pay dynamic dispatch once per batch rather than once per row.
+    fn try_for_each_batch(
+        &self,
+        batch: &mut [u32],
+        visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<()> {
+        if batch.is_empty() {
+            return Ok(());
+        }
+        let mut len = 0usize;
+        self.try_for_each(&mut |row_id| {
+            batch[len] = row_id;
+            len += 1;
+            if len == batch.len() {
+                visitor(batch)?;
+                len = 0;
+            }
+            Ok(())
+        })?;
+        if len != 0 {
+            visitor(&batch[..len])?;
+        }
+        Ok(())
+    }
+
     /// Query-owned retained bytes. Shared index storage is accounted by its
     /// index owner and must not be charged once per query.
     fn query_retained_bytes(&self) -> usize;
@@ -107,6 +134,14 @@ impl ExactRowSet for RoaringBitmap {
             visitor(row_id)?;
         }
         Ok(())
+    }
+
+    fn try_for_each_batch(
+        &self,
+        batch: &mut [u32],
+        visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<()> {
+        visit_row_ids_in_batches(self.iter(), batch, visitor)
     }
 
     fn query_retained_bytes(&self) -> usize {
@@ -199,6 +234,15 @@ impl ExactRowSet for OrdinalRowSet {
         Ok(())
     }
 
+    fn try_for_each_batch(
+        &self,
+        batch: &mut [u32],
+        visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
+    ) -> Result<()> {
+        let row_ids = self.postings.iter().flat_map(|posting| posting.iter());
+        visit_row_ids_in_batches(row_ids, batch, visitor)
+    }
+
     fn query_retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.accepted_ordinals.len() * std::mem::size_of::<u64>())
@@ -211,5 +255,64 @@ impl ExactRowSet for OrdinalRowSet {
             accepted_ordinals: &self.accepted_ordinals,
             accepts_null: self.accepts_null,
         }
+    }
+}
+
+fn visit_row_ids_in_batches(
+    row_ids: impl Iterator<Item = u32>,
+    batch: &mut [u32],
+    visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
+) -> Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    let mut len = 0usize;
+    for row_id in row_ids {
+        batch[len] = row_id;
+        len += 1;
+        if len == batch.len() {
+            visitor(batch)?;
+            len = 0;
+        }
+    }
+    if len != 0 {
+        visitor(&batch[..len])?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ordinal_row_set_batches_across_posting_boundaries() {
+        let first = Arc::new(RoaringBitmap::from_iter([1, 3, 5]));
+        let second = Arc::new(RoaringBitmap::from_iter([8, 13]));
+        let rows = OrdinalRowSet::new(
+            Arc::from([0_u16; 16]),
+            vec![1].into_boxed_slice(),
+            false,
+            5,
+            vec![first, second].into_boxed_slice(),
+        );
+        let mut batch = [0; 4];
+        let mut batches = Vec::new();
+        rows.try_for_each_batch(&mut batch, &mut |rows| {
+            batches.push(rows.to_vec());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(batches, vec![vec![1, 3, 5, 8], vec![13]]);
+    }
+
+    #[test]
+    fn roaring_row_set_batch_iteration_accepts_empty_scratch() {
+        let rows = RoaringBitmap::from_iter([2, 4]);
+        rows.try_for_each_batch(&mut [], &mut |_| {
+            panic!("empty scratch must not invoke the visitor")
+        })
+        .unwrap();
     }
 }

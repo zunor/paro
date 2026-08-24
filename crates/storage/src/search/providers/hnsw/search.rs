@@ -202,6 +202,9 @@ impl VectorSearchCursor {
             artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
         });
         let predicate = self.predicate.as_ref();
+        let predicate_columns = predicate
+            .map(crate::index::collect_predicate_columns)
+            .unwrap_or_default();
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
         let total_rows = self
             .snapshot
@@ -238,7 +241,9 @@ impl VectorSearchCursor {
                 let filter_row_set = filter_row_set.as_deref();
                 let filter = match (predicate.is_some(), filter_row_set) {
                     (_, None) => HnswSearchFilter::None,
-                    (true, Some(row_set)) => HnswSearchFilter::Predicate(row_set),
+                    (true, Some(row_set)) => {
+                        HnswSearchFilter::predicate(row_set, &predicate_columns)
+                    }
                     (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
                 };
                 let search_strategy = match filter.kind() {

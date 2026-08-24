@@ -192,6 +192,7 @@ fn test_index_statistics() {
                 build_seed: DEFAULT_HNSW_BUILD_SEED,
                 proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                filter_topology: Default::default(),
             },
         );
     let mut writer = SegmentWriter::create(schema.clone(), &segment_path, opts).unwrap();

@@ -768,3 +768,34 @@ pub fn compare_bytes(logical_type: &LogicalType, left: &[u8], right: &[u8]) -> R
         ))),
     }
 }
+
+/// Whether the durable scalar encoding has a total ordering understood by
+/// [`compare_bytes`]. Predicate-local graph topology must use exactly this
+/// capability boundary so definition validation and artifact construction
+/// cannot drift.
+pub fn supports_ordered_bytes(logical_type: &LogicalType) -> bool {
+    matches!(
+        logical_type,
+        LogicalType::Boolean
+            | LogicalType::TinyInt
+            | LogicalType::SmallInt
+            | LogicalType::Integer
+            | LogicalType::BigInt
+            | LogicalType::HugeInt
+            | LogicalType::UTinyInt
+            | LogicalType::USmallInt
+            | LogicalType::UInteger
+            | LogicalType::UBigInt
+            | LogicalType::UHugeInt
+            | LogicalType::Uuid
+            | LogicalType::Float
+            | LogicalType::Double
+            | LogicalType::Varchar
+            | LogicalType::VarcharCollation(_)
+            | LogicalType::TsVector
+            | LogicalType::TsQuery
+            | LogicalType::Json
+            | LogicalType::Jsonb
+            | LogicalType::Blob
+    )
+}

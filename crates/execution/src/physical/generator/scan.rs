@@ -562,6 +562,17 @@ fn search_source_spec_for_candidate(
                 .as_ref()
                 .and_then(|storage| storage.hnsw_index_statistics(intent.column_id))
                 .map_or(0.0, |stats| stats.avg_level0_degree);
+            let filter_topology = table
+                .storage
+                .as_ref()
+                .and_then(|storage| {
+                    storage.vector_filter_topology(intent.column_id, intent.distance)
+                })
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(
+                        "queryable HNSW candidate is missing its validated filter topology",
+                    )
+                })?;
             Ok(SearchSourceSpec::Vector(VectorSearchSpec {
                 table,
                 capability_token: candidate.token.clone(),
@@ -574,6 +585,7 @@ fn search_source_spec_for_candidate(
                     ..Default::default()
                 },
                 search_policy,
+                filter_topology,
                 avg_level0_degree,
                 predicate,
                 filter_contract,

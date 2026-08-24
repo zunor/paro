@@ -12,10 +12,11 @@ use crate::search::SearchWorkBudget;
 use paro_common::error::Result;
 use smallvec::SmallVec;
 
-/// Large enough to amortize work-budget checks while keeping the gathered
-/// point ids and scores in L1. Exact filtered scans perform random vector
-/// reads, so oversized batches only increase cache pressure.
-pub const BATCH_SIZE: usize = 64;
+/// Large enough to amortize row-set dispatch and work-budget checks while the
+/// gathered ids, scores, and one 32-dimensional NEON vector group remain an
+/// L1-sized working set. Vector payloads are still consumed in eight-row SIMD
+/// groups; this only widens the outer scheduling batch.
+pub const BATCH_SIZE: usize = 256;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatchScoredResult {

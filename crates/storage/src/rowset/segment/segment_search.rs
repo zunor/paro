@@ -10,7 +10,7 @@ use crate::index::hnsw::{
     SearchParams,
 };
 use crate::index::ExactRowSet;
-use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
+use crate::index::{collect_predicate_columns, IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
 use crate::rowset::{SegmentIterator, SegmentRowId};
@@ -88,9 +88,12 @@ impl Segment {
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<HnswSearchResult> {
         let filter_row_set = self.build_hnsw_filter_with_epoch(snapshot_epoch, predicate_tree)?;
+        let predicate_columns = predicate_tree
+            .map(collect_predicate_columns)
+            .unwrap_or_default();
         let filter = match (predicate_tree.is_some(), filter_row_set.as_deref()) {
             (_, None) => HnswSearchFilter::None,
-            (true, Some(row_set)) => HnswSearchFilter::Predicate(row_set),
+            (true, Some(row_set)) => HnswSearchFilter::predicate(row_set, &predicate_columns),
             (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
         };
         let matching_rows = filter.row_set().map_or(self.num_rows(), ExactRowSet::len);

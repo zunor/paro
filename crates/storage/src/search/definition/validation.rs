@@ -55,6 +55,24 @@ fn validate_hnsw_definition(definition: &SearchIndexDefinition, tablet: &TabletR
             config.dimension, column_id, dimension
         )));
     }
+    for &filter_column_id in &config.filter_columns {
+        if filter_column_id == *column_id {
+            return Err(paro_error::invalid_input(
+                "HNSW filter column cannot be the indexed vector column",
+            ));
+        }
+        let filter_column = schema.column_by_id(filter_column_id).ok_or_else(|| {
+            paro_error::column_not_found(format!(
+                "HNSW filter column {filter_column_id} not found in schema"
+            ))
+        })?;
+        if !crate::index::supports_ordered_bytes(&filter_column.logical_type) {
+            return Err(paro_error::not_supported(format!(
+                "HNSW predicate topology requires an orderable scalar filter column, got {:?} for column {}",
+                filter_column.logical_type, filter_column_id
+            )));
+        }
+    }
     Ok(())
 }
 

@@ -30,7 +30,8 @@
 
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::hnsw::{
-    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, InMemoryVectorStorage, VectorStorage,
+    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, HnswFilterBlocks, InMemoryVectorStorage,
+    VectorStorage,
 };
 use crate::index::{BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions};
 use crate::rowset::encoding::{
@@ -97,6 +98,8 @@ pub struct ColumnWriterOptions {
     pub build_bloom_filter: bool,
     /// Whether to build a bitmap index
     pub build_bitmap_index: bool,
+    /// Retain a build-only scalar dictionary for an HNSW predicate topology.
+    pub collect_hnsw_filter_values: bool,
     /// Fixed length for types like Vector
     pub fixed_len: usize,
     /// Whether to build an HNSW index (for Vector type)
@@ -122,6 +125,7 @@ impl ColumnWriterOptions {
             format_version: CURRENT_DATA_PAGE_FORMAT_VERSION,
             build_bloom_filter: false,
             build_bitmap_index: false,
+            collect_hnsw_filter_values: false,
             fixed_len: 0,
             build_hnsw: false,
             hnsw_build_contract: None,
@@ -161,6 +165,11 @@ impl ColumnWriterOptions {
 
     pub fn with_bitmap_index(mut self, build: bool) -> Self {
         self.build_bitmap_index = build;
+        self
+    }
+
+    pub fn with_hnsw_filter_values(mut self, collect: bool) -> Self {
+        self.collect_hnsw_filter_values = collect;
         self
     }
 
@@ -390,6 +399,25 @@ pub trait ColumnWriter: Send {
 
     /// Get the buffered data bytes (if in-memory).
     fn get_data(&self) -> Bytes;
+
+    /// Snapshot ordered scalar blocks for a predicate-local HNSW topology.
+    /// Non-scalar writers and columns not admitted by the HNSW contract return
+    /// `None`.
+    fn hnsw_filter_blocks(&self, _target_rows: usize) -> Result<Option<Vec<Box<[u32]>>>> {
+        Ok(None)
+    }
+
+    /// Install the cross-column filter blocks consumed when this vector
+    /// writer builds its HNSW artifact.
+    fn set_hnsw_filter_blocks(&mut self, blocks: HnswFilterBlocks) -> Result<()> {
+        if blocks.columns.is_empty() {
+            Ok(())
+        } else {
+            Err(paro_error::internal(
+                "column writer does not accept HNSW filter blocks",
+            ))
+        }
+    }
 }
 
 /// Page builder wrapper for different encoding types.
@@ -556,6 +584,10 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     bloom_filter_index: Option<BloomFilterIndexWriter>,
     /// Bitmap index writer (optional)
     bitmap_index: Option<BitmapIndexWriter>,
+    /// Build-only scalar dictionary used when a vector index explicitly names
+    /// this column as predicate topology input. It is omitted when the durable
+    /// bitmap writer already owns the same complete postings.
+    hnsw_filter_value_index: Option<BitmapIndexWriter>,
     /// Current page first ordinal
     first_ordinal: u64,
     /// Total rows written
@@ -576,6 +608,9 @@ pub struct ScalarColumnWriter<W: DataWriter> {
     data_size: u64,
     /// HNSW vector storage (in-memory during building)
     hnsw_storage: Option<InMemoryVectorStorage>,
+    /// Cross-column scalar blocks supplied by `SegmentWriter` immediately
+    /// before finalization.
+    hnsw_filter_blocks: Option<HnswFilterBlocks>,
     /// Column statistics collected during write
     column_stats: ColumnStatistics,
     /// Number of NULL values
@@ -596,6 +631,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
 
         let build_bloom_filter = opts.build_bloom_filter;
         let build_bitmap_index = opts.build_bitmap_index;
+        let collect_hnsw_filter_values = opts.collect_hnsw_filter_values;
 
         let page_builder = Self::create_page_builder(&opts, encoding)?;
         let null_builder = if opts.is_nullable {
@@ -643,6 +679,11 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             } else {
                 None
             },
+            hnsw_filter_value_index: if collect_hnsw_filter_values && !build_bitmap_index {
+                Some(BitmapIndexWriter::new())
+            } else {
+                None
+            },
             first_ordinal: 0,
             num_rows: 0,
             page_has_null: false,
@@ -653,6 +694,7 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             first_data_page: None,
             data_size: 0,
             hnsw_storage,
+            hnsw_filter_blocks: None,
             column_stats,
             null_count: 0,
             stats_logical_type,
@@ -762,6 +804,13 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
                 bitmap.add_value(value);
             }
         }
+        if let Some(ref mut bitmap) = self.hnsw_filter_value_index {
+            if is_null {
+                bitmap.add_nulls(1);
+            } else {
+                bitmap.add_value(value);
+            }
+        }
         if let Some(ref mut bloom) = self.bloom_filter_index {
             if is_null {
                 bloom.add_nulls(1);
@@ -779,7 +828,10 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         count: u32,
         type_size: usize,
     ) {
-        if self.bloom_filter_index.is_none() && self.bitmap_index.is_none() {
+        if self.bloom_filter_index.is_none()
+            && self.bitmap_index.is_none()
+            && self.hnsw_filter_value_index.is_none()
+        {
             return;
         }
         let total_bytes = count as usize * type_size;
@@ -1352,6 +1404,40 @@ impl<W: DataWriter + 'static> ColumnWriter for ScalarColumnWriter<W> {
     fn get_data(&self) -> Bytes {
         self.writer.get_data()
     }
+
+    fn hnsw_filter_blocks(&self, target_rows: usize) -> Result<Option<Vec<Box<[u32]>>>> {
+        let Some(index) = self
+            .bitmap_index
+            .as_ref()
+            .or(self.hnsw_filter_value_index.as_ref())
+        else {
+            return Ok(None);
+        };
+        let logical_type = self.opts.logical_type.as_ref().ok_or_else(|| {
+            paro_error::internal("HNSW filter-value collector is missing its logical type")
+        })?;
+        index
+            .ordered_hnsw_filter_blocks(logical_type, target_rows)
+            .map(Some)
+    }
+
+    fn set_hnsw_filter_blocks(&mut self, blocks: HnswFilterBlocks) -> Result<()> {
+        if self.hnsw_storage.is_none() {
+            return if blocks.columns.is_empty() {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "non-HNSW scalar writer received HNSW filter blocks",
+                ))
+            };
+        }
+        if self.hnsw_filter_blocks.replace(blocks).is_some() {
+            return Err(paro_error::internal(
+                "HNSW filter blocks were installed more than once",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl<W: DataWriter> ScalarColumnWriter<W> {
@@ -1460,7 +1546,16 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         if let Some(stop_check) = self.opts.hnsw_stop_check.clone() {
             hnsw_builder = hnsw_builder.with_stop_check(stop_check);
         }
-        let index = hnsw_builder.build(Arc::new(storage), build_contract)?;
+        let filter_blocks = self.hnsw_filter_blocks.take().unwrap_or_default();
+        let index = if build_contract.filter_topology.is_enabled() {
+            hnsw_builder.build_with_filter_blocks(
+                Arc::new(storage),
+                build_contract,
+                filter_blocks,
+            )?
+        } else {
+            hnsw_builder.build(Arc::new(storage), build_contract)?
+        };
 
         let statistics = HnswIndexStatistics::collect(&index);
         let index_data = index.serialize()?;

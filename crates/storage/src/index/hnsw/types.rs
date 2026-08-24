@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
 use crate::index::ExactRowSet;
+use crate::tablet::ColumnId;
 
 /// Point offset type — identifies a vector within a segment.
 pub type PointOffset = u32;
@@ -29,11 +30,21 @@ pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
 pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 20_000;
 pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
-/// Version 4 replaces the affine point order with a keyed Feistel permutation
+pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
+pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
+pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
+pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 2;
+/// Version 6 connects deterministic scalar blocks with bounded vector-aware
+/// cross-block routing edges. Range predicates can navigate the admitted
+/// union without relying on the ordinary graph to seed every block.
+/// Version 5 makes predicate-local level-0 topology part of the durable graph
+/// contract. Filter-column identities and block construction parameters are
+/// now self-describing artifact fields rather than mutable query policy.
+/// Version 4 replaced the affine point order with a keyed Feistel permutation
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 4;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 6;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -99,7 +110,10 @@ impl Default for SearchAlgorithm {
 pub enum HnswSearchFilter<'a> {
     None,
     Visibility(&'a dyn ExactRowSet),
-    Predicate(&'a dyn ExactRowSet),
+    Predicate {
+        row_set: &'a dyn ExactRowSet,
+        columns: &'a [ColumnId],
+    },
 }
 
 /// Semantic origin of an HNSW admission mask. Strategy selection consumes the
@@ -115,7 +129,7 @@ impl<'a> HnswSearchFilter<'a> {
     pub fn row_set(self) -> Option<&'a dyn ExactRowSet> {
         match self {
             Self::None => None,
-            Self::Visibility(bitmap) | Self::Predicate(bitmap) => Some(bitmap),
+            Self::Visibility(row_set) | Self::Predicate { row_set, .. } => Some(row_set),
         }
     }
 
@@ -123,7 +137,38 @@ impl<'a> HnswSearchFilter<'a> {
         match self {
             Self::None => HnswFilterKind::None,
             Self::Visibility(_) => HnswFilterKind::Visibility,
-            Self::Predicate(_) => HnswFilterKind::Predicate,
+            Self::Predicate { .. } => HnswFilterKind::Predicate,
+        }
+    }
+
+    pub const fn predicate(row_set: &'a dyn ExactRowSet, columns: &'a [ColumnId]) -> Self {
+        Self::Predicate { row_set, columns }
+    }
+
+    /// Select the predicate-local graph when exact runtime cardinality proves
+    /// that the predicate-induced base graph is below its designed local
+    /// degree. This is a per-segment connectivity decision, not a selectivity
+    /// estimate: broad predicates stay on the connected base HNSW while sparse
+    /// predicates use the denser scalar-block topology.
+    pub fn uses_predicate_topology(
+        self,
+        topology: &HnswFilterTopologyContract,
+        total_rows: usize,
+        base_level0_degree: usize,
+    ) -> bool {
+        match self {
+            Self::Predicate { row_set, columns } => {
+                if !columns
+                    .iter()
+                    .any(|column| topology.columns().contains(column))
+                {
+                    return false;
+                }
+                let admitted_degree = row_set.len().saturating_mul(base_level0_degree as u64);
+                let topology_degree = (total_rows as u64).saturating_mul(u64::from(topology.m));
+                admitted_degree < topology_degree
+            }
+            Self::None | Self::Visibility(_) => false,
         }
     }
 }
@@ -168,6 +213,7 @@ pub enum HnswSearchPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSearchOutcome {
     pub path: HnswSearchPath,
+    pub predicate_topology_used: bool,
     pub predicate_refined: bool,
     pub exact_fallback: bool,
 }
@@ -176,9 +222,15 @@ impl HnswSearchOutcome {
     pub const fn new(path: HnswSearchPath) -> Self {
         Self {
             path,
+            predicate_topology_used: false,
             predicate_refined: false,
             exact_fallback: false,
         }
+    }
+
+    pub const fn with_predicate_topology(mut self, used: bool) -> Self {
+        self.predicate_topology_used = used;
+        self
     }
 
     pub const fn with_predicate_refinement(mut self, refined: bool) -> Self {
@@ -367,6 +419,103 @@ impl PreparedQuery {
 /// [`HnswSearchPolicy`] and is deliberately absent from serialized artifacts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct HnswFilterTopologyContract {
+    pub version: u32,
+    pub column_count: u32,
+    pub column_ids: [u32; MAX_HNSW_FILTER_COLUMNS],
+    /// Target cardinality of one ordered scalar block. Build-time scalar
+    /// dictionaries may choose a slightly larger boundary to avoid splitting
+    /// equal values across blocks.
+    pub target_block_rows: u32,
+    /// Per-point degree of the predicate-local level-0 graph.
+    pub m: u32,
+}
+
+impl Default for HnswFilterTopologyContract {
+    fn default() -> Self {
+        Self {
+            version: HNSW_FILTER_TOPOLOGY_VERSION,
+            column_count: 0,
+            column_ids: [0; MAX_HNSW_FILTER_COLUMNS],
+            target_block_rows: DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            m: DEFAULT_HNSW_FILTER_M,
+        }
+    }
+}
+
+impl HnswFilterTopologyContract {
+    pub fn from_columns(
+        columns: &[u32],
+        target_block_rows: u32,
+        m: u32,
+    ) -> paro_common::error::Result<Self> {
+        if columns.len() > MAX_HNSW_FILTER_COLUMNS {
+            return Err(paro_common::error::configuration_limit_exceeded(format!(
+                "HNSW predicate topology supports at most {MAX_HNSW_FILTER_COLUMNS} columns"
+            )));
+        }
+        let mut column_ids = [0; MAX_HNSW_FILTER_COLUMNS];
+        column_ids[..columns.len()].copy_from_slice(columns);
+        let contract = Self {
+            version: HNSW_FILTER_TOPOLOGY_VERSION,
+            column_count: columns.len() as u32,
+            column_ids,
+            target_block_rows,
+            m,
+        };
+        contract.validate()?;
+        Ok(contract)
+    }
+
+    pub fn columns(&self) -> &[u32] {
+        &self.column_ids[..self.column_count as usize]
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.column_count != 0
+    }
+
+    pub fn validate(&self) -> paro_common::error::Result<()> {
+        if self.version != HNSW_FILTER_TOPOLOGY_VERSION {
+            return Err(paro_common::error::data_corrupted(format!(
+                "unsupported HNSW filter-topology version {}, expected {}",
+                self.version, HNSW_FILTER_TOPOLOGY_VERSION
+            )));
+        }
+        if self.column_count as usize > MAX_HNSW_FILTER_COLUMNS {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW filter-topology column count {} exceeds {}",
+                self.column_count, MAX_HNSW_FILTER_COLUMNS
+            )));
+        }
+        let columns = self.columns();
+        if columns.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW filter-topology column ids must be strictly increasing",
+            ));
+        }
+        if self.column_ids[columns.len()..].iter().any(|id| *id != 0) {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW filter-topology unused column slots must be zero",
+            ));
+        }
+        if self.target_block_rows == 0 {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW filter-topology target_block_rows must be greater than zero",
+            ));
+        }
+        if !(2..=64).contains(&self.m) {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW filter-topology m must be between 2 and 64, got {}",
+                self.m
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HnswBuildContract {
     pub version: u32,
     pub m: u32,
@@ -378,6 +527,8 @@ pub struct HnswBuildContract {
     pub proposal_wave_size: u32,
     /// Number of points published as one-point waves before batched waves.
     pub warmup_point_count: u32,
+    /// Predicate-local topology built from explicitly named scalar columns.
+    pub filter_topology: HnswFilterTopologyContract,
 }
 
 impl HnswBuildContract {
@@ -412,6 +563,7 @@ impl HnswBuildContract {
                 self.warmup_point_count
             )));
         }
+        self.filter_topology.validate()?;
         Ok(())
     }
 }
@@ -527,6 +679,7 @@ impl HnswConfig {
             build_seed: self.build_seed,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_topology: HnswFilterTopologyContract::default(),
         };
         contract.validate()?;
         Ok(contract)
@@ -715,5 +868,23 @@ mod tests {
             HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );
+    }
+
+    #[test]
+    fn predicate_topology_is_selected_only_for_configured_predicate_columns() {
+        let rows = roaring::RoaringBitmap::from_iter([1, 2, 3]);
+        let topology = HnswFilterTopologyContract::from_columns(&[4, 7], 20_000, 8).unwrap();
+
+        assert!(
+            HnswSearchFilter::predicate(&rows, &[7]).uses_predicate_topology(&topology, 100, 32)
+        );
+        assert!(
+            !HnswSearchFilter::predicate(&rows, &[8]).uses_predicate_topology(&topology, 100, 32)
+        );
+        assert!(!HnswSearchFilter::Visibility(&rows).uses_predicate_topology(&topology, 100, 32));
+
+        let broad_rows = roaring::RoaringBitmap::from_iter(0..50);
+        assert!(!HnswSearchFilter::predicate(&broad_rows, &[7])
+            .uses_predicate_topology(&topology, 100, 32));
     }
 }

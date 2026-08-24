@@ -9,7 +9,9 @@ use paro_common::runtime_value::Value;
 use paro_common::typed_parameters::ParameterSlot;
 use paro_common::types::LogicalType;
 use paro_planner::operator::SearchDecision;
-use paro_storage::index::hnsw::types::{HnswSearchPolicy, SearchParams};
+use paro_storage::index::hnsw::types::{
+    HnswFilterTopologyContract, HnswSearchPolicy, SearchParams,
+};
 use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::{PredicateComparison, PredicateTree};
 use paro_storage::rowset::SparseVector;
@@ -120,6 +122,7 @@ pub struct VectorSearchSpec {
     pub k: usize,
     pub params: SearchParams,
     pub search_policy: HnswSearchPolicy,
+    pub filter_topology: HnswFilterTopologyContract,
     /// Generation-level physical degree used only to predict the likely
     /// adaptive filtered-search phase in costing and EXPLAIN. Runtime observes
     /// actual admissions and does not trust this estimate.

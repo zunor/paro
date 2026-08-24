@@ -19,7 +19,8 @@ use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
     DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD,
-    DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_M,
+    DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
     DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use serde_json::{json, Value as JsonValue};
@@ -287,6 +288,8 @@ fn parse_bool_index_option(
 fn hnsw_provider_config(
     options: &BTreeMap<String, String>,
     column_types: &[LogicalType],
+    column_ids: &[LogicalIndex],
+    table: &TableCatalogEntry,
 ) -> Result<JsonValue> {
     let [LogicalType::Array(inner, dimension)] = column_types else {
         return Err(paro_error::not_supported(
@@ -308,6 +311,9 @@ fn hnsw_provider_config(
         "build_seed",
         "plain_scan_threshold",
         "filtered_plain_scan_threshold",
+        "filter_columns",
+        "filter_block_rows",
+        "filter_m",
         "inline_enabled",
         "inline_max_vector_count",
         "inline_max_graph_memory_bytes",
@@ -363,6 +369,48 @@ fn hnsw_provider_config(
         "filtered_plain_scan_threshold",
         u64::from(DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD),
     )?;
+    let mut filter_columns = options
+        .get("filter_columns")
+        .map(|value| {
+            value
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(|name| {
+                    let index = table.get_column_index(name).ok_or_else(|| {
+                        paro_error::column_not_found(format!(
+                            "HNSW filter column '{name}' not found in table {}",
+                            table.base.base.name
+                        ))
+                    })?;
+                    u32::try_from(index)
+                        .map_err(|_| paro_error::out_of_range("HNSW filter column id"))
+                })
+                .collect::<Result<Vec<_>>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    filter_columns.sort_unstable();
+    if filter_columns.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(paro_error::invalid_input(
+            "HNSW filter_columns must not contain duplicates",
+        ));
+    }
+    if let [vector_column] = column_ids {
+        let vector_column = u32::try_from(vector_column.index)
+            .map_err(|_| paro_error::out_of_range("HNSW vector column id"))?;
+        if filter_columns.binary_search(&vector_column).is_ok() {
+            return Err(paro_error::invalid_input(
+                "HNSW filter_columns must not include the indexed vector column",
+            ));
+        }
+    }
+    let filter_block_rows = parse_u64_index_option(
+        options,
+        "filter_block_rows",
+        u64::from(DEFAULT_HNSW_FILTER_BLOCK_ROWS),
+    )?;
+    let filter_m = parse_u64_index_option(options, "filter_m", u64::from(DEFAULT_HNSW_FILTER_M))?;
     let inline_enabled = parse_bool_index_option(options, "inline_enabled", true)?;
     if !inline_enabled
         && [
@@ -430,6 +478,10 @@ fn hnsw_provider_config(
         build_seed,
         proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
+        filter_columns,
+        filter_block_rows: u32::try_from(filter_block_rows)
+            .map_err(|_| paro_error::out_of_range("HNSW filter_block_rows"))?,
+        filter_m: u32::try_from(filter_m).map_err(|_| paro_error::out_of_range("HNSW filter_m"))?,
         inline_threshold: HnswInlineConfig {
             enabled: inline_enabled,
             max_vector_count: inline_max_vector_count,
@@ -444,11 +496,15 @@ fn hnsw_provider_config(
 fn provider_config_for_index(
     stmt: &CreateIndexStmt,
     index_type: IndexType,
+    column_ids: &[LogicalIndex],
     column_types: &[LogicalType],
     fulltext_binding: Option<&(LogicalIndex, String)>,
+    table: &TableCatalogEntry,
 ) -> Result<JsonValue> {
     match index_type {
-        IndexType::HNSW => hnsw_provider_config(&stmt.index_options, column_types),
+        IndexType::HNSW => {
+            hnsw_provider_config(&stmt.index_options, column_types, column_ids, table)
+        }
         IndexType::Sparse => Ok(json!({
             "version": paro_storage::search::SPARSE_PROVIDER_CONFIG_VERSION,
             "physical_encoding": "binary-v1"
@@ -586,8 +642,14 @@ pub fn bind_create_index(binder: &mut Binder, stmt: CreateIndexStmt) -> Result<B
             &column_ids,
         )?;
     }
-    let provider_config =
-        provider_config_for_index(&stmt, index_type, &column_types, fulltext_binding.as_ref())?;
+    let provider_config = provider_config_for_index(
+        &stmt,
+        index_type,
+        &column_ids,
+        &column_types,
+        fulltext_binding.as_ref(),
+        table.as_ref(),
+    )?;
 
     // 9. Determine constraint type
     let _constraint_type = IndexConstraintType::None; // Default for now
@@ -820,7 +882,10 @@ mod tests {
     #[test]
     fn bind_create_hnsw_index_persists_typed_provider_config() {
         let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 100);
-        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+        let mut binder = test_binder_with_public_table(
+            "items",
+            &[("bucket", LogicalType::Integer), ("embedding", vector_type)],
+        );
 
         let bound = bind_create_index(
             &mut binder,
@@ -828,6 +893,7 @@ mod tests {
                 "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
                  m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
                  build_seed = 42 plain_scan_threshold = 20000 \
+                 filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
                  inline_max_dimension = 256",
@@ -850,6 +916,12 @@ mod tests {
         );
         assert_eq!(bound.info.provider_config["dimension"], 100);
         assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
+        assert_eq!(
+            bound.info.provider_config["filter_columns"],
+            serde_json::json!([0])
+        );
+        assert_eq!(bound.info.provider_config["filter_block_rows"], 4_096);
+        assert_eq!(bound.info.provider_config["filter_m"], 12);
         assert_eq!(
             bound.info.provider_config["inline_threshold"]["enabled"],
             true

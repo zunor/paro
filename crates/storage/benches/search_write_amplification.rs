@@ -314,6 +314,9 @@ fn search_definition(
             build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: paro_storage::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: paro_storage::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+            filter_columns: Vec::new(),
+            filter_block_rows: paro_storage::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+            filter_m: paro_storage::search::DEFAULT_HNSW_FILTER_M,
             inline_threshold: paro_storage::search::HnswInlineConfig {
                 enabled: true,
                 max_vector_count: 4_096,

@@ -1823,6 +1823,9 @@ fn search_metric_value(
         "search_hnsw_exact_fallback_segment_searches_total" => {
             snapshot.search_hnsw_exact_fallback_segment_searches_total
         }
+        "search_hnsw_predicate_topology_segment_searches_total" => {
+            snapshot.search_hnsw_predicate_topology_segment_searches_total
+        }
         "search_row_fetch_batches_total" => snapshot.search_row_fetch_batches_total,
         "search_row_fetch_rows_total" => snapshot.search_row_fetch_rows_total,
         "search_row_fetch_projected_columns_total" => {

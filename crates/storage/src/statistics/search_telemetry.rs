@@ -30,6 +30,7 @@ pub struct SearchTelemetry {
     pub hnsw_unfiltered_graph_count: u64,
     pub hnsw_masked_graph_count: u64,
     pub hnsw_adaptive_graph_count: u64,
+    pub hnsw_predicate_topology_count: u64,
     pub hnsw_predicate_refinement_count: u64,
     pub hnsw_exact_fallback_count: u64,
 }
@@ -47,6 +48,7 @@ impl Default for SearchTelemetry {
             hnsw_unfiltered_graph_count: 0,
             hnsw_masked_graph_count: 0,
             hnsw_adaptive_graph_count: 0,
+            hnsw_predicate_topology_count: 0,
             hnsw_predicate_refinement_count: 0,
             hnsw_exact_fallback_count: 0,
         }
@@ -117,6 +119,9 @@ impl SearchTelemetry {
         self.hnsw_predicate_refinement_count = self
             .hnsw_predicate_refinement_count
             .saturating_add(u64::from(outcome.predicate_refined));
+        self.hnsw_predicate_topology_count = self
+            .hnsw_predicate_topology_count
+            .saturating_add(u64::from(outcome.predicate_topology_used));
         self.hnsw_exact_fallback_count = self
             .hnsw_exact_fallback_count
             .saturating_add(u64::from(outcome.exact_fallback));

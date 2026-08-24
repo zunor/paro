@@ -318,6 +318,10 @@ fn search_metric_data_from_snapshot(snapshot: &StorageMetricsSnapshot) -> Vec<Se
             "search_hnsw_exact_fallback_segment_searches_total",
             snapshot.search_hnsw_exact_fallback_segment_searches_total,
         ),
+        (
+            "search_hnsw_predicate_topology_segment_searches_total",
+            snapshot.search_hnsw_predicate_topology_segment_searches_total,
+        ),
     ] {
         push_value(&mut entries, name, MetricDimensions::default(), value);
     }

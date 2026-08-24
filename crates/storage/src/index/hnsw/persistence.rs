@@ -10,15 +10,17 @@ use super::graph::GraphLayers;
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::hnsw_build_pool;
 use super::search_context::FixedLengthPriorityQueue;
-use super::vector_storage::{CosineInverseNorms, IndexedVectorStorage, VectorStorage};
+use super::vector_storage::{
+    CosineInverseNorms, InMemoryVectorStorage, IndexedVectorStorage, VectorStorage,
+};
 use super::visited_pool::VisitedPool;
 #[cfg(test)]
 use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswSearchFilter, HnswSearchOutcome, HnswSearchPath, HnswSearchPolicy, HnswSearchResult,
-    HnswSearchStrategy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm, SearchParams,
-    VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
+    HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome, HnswSearchPath,
+    HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset, PreparedQuery,
+    ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
 use crate::index::ExactRowSet;
 use crate::metrics::storage_metrics;
@@ -39,8 +41,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 3;
-const HNSW_ARTIFACT_HEADER_LEN: usize = 72;
+const HNSW_ARTIFACT_VERSION: u32 = 4;
+const HNSW_ARTIFACT_HEADER_LEN: usize = 128;
 
 /// O(1) keyed permutation of point ids used to decouple frozen-wave membership
 /// from ingest order.
@@ -276,21 +278,35 @@ impl HnswArtifactBacking {
         }
     }
 
-    fn graph_links(&self, offset: usize) -> Result<GraphLinks> {
+    fn graph_links(&self, offset: usize, len: usize) -> Result<GraphLinks> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| error::data_corrupted("HNSW graph artifact range overflow"))?;
         match self {
-            Self::Bytes(bytes) => GraphLinks::deserialize_bytes(bytes.slice(offset..)),
+            Self::Bytes(bytes) => {
+                if end > bytes.len() {
+                    return Err(error::data_corrupted(
+                        "HNSW graph artifact range exceeds byte backing",
+                    ));
+                }
+                GraphLinks::deserialize_bytes(bytes.slice(offset..end))
+            }
             Self::Mmap {
                 mmap,
                 offset: artifact_offset,
-                len,
+                len: artifact_len,
             } => GraphLinks::deserialize_mmap_range(
                 Arc::clone(mmap),
                 artifact_offset
                     .checked_add(offset)
                     .ok_or_else(|| error::data_corrupted("HNSW graph artifact offset overflow"))?,
-                len.checked_sub(offset).ok_or_else(|| {
-                    error::data_corrupted("HNSW graph artifact offset exceeds artifact length")
-                })?,
+                if end <= *artifact_len {
+                    len
+                } else {
+                    return Err(error::data_corrupted(
+                        "HNSW graph artifact range exceeds mmap backing",
+                    ));
+                },
             ),
         }
     }
@@ -303,6 +319,22 @@ pub struct HnswIndex {
     pub vector_storage: Arc<dyn VectorStorage>,
     single_telemetry: Mutex<SearchTelemetry>,
     batch_telemetry: Mutex<HnswBatchTelemetry>,
+}
+
+/// Complete deterministic block partition for one configured scalar column.
+/// Every segment-local point must occur exactly once across `blocks`.
+#[derive(Debug, Clone)]
+pub struct HnswFilterColumnBlocks {
+    pub column_id: u32,
+    pub blocks: Vec<Box<[PointOffset]>>,
+}
+
+/// Deterministic predicate-local graph build input. Columns are aligned with
+/// the durable filter-topology contract. Blocks from different columns may
+/// overlap, but each column independently partitions the full point domain.
+#[derive(Debug, Clone, Default)]
+pub struct HnswFilterBlocks {
+    pub columns: Vec<HnswFilterColumnBlocks>,
 }
 
 impl HnswIndex {
@@ -372,7 +404,28 @@ impl HnswIndex {
         pool: Option<&rayon::ThreadPool>,
         stop_check: Option<&HnswBuildStopCheck>,
     ) -> Result<Self> {
+        Self::build_with_controls_and_filter_blocks(
+            storage,
+            build_contract,
+            HnswFilterBlocks::default(),
+            pool,
+            stop_check,
+        )
+    }
+
+    pub(crate) fn build_with_controls_and_filter_blocks(
+        storage: Arc<dyn VectorStorage>,
+        build_contract: HnswBuildContract,
+        filter_blocks: HnswFilterBlocks,
+        pool: Option<&rayon::ThreadPool>,
+        stop_check: Option<&HnswBuildStopCheck>,
+    ) -> Result<Self> {
         build_contract.validate()?;
+        if !build_contract.filter_topology.is_enabled() && !filter_blocks.columns.is_empty() {
+            return Err(error::invalid_input(
+                "HNSW filter blocks require an enabled filter-topology contract",
+            ));
+        }
         let distance = build_contract.distance;
         let storage = IndexedVectorStorage::prepare(storage, distance);
         let num_vectors = storage.num_vectors();
@@ -455,13 +508,172 @@ impl HnswIndex {
         }
 
         let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(
-            links,
-            entry_points,
-            VisitedPool::new(),
-            (&build_contract).into(),
-        );
+        let predicate_links = if build_contract.filter_topology.is_enabled() {
+            Some(Self::build_predicate_links(
+                storage.as_ref(),
+                &build_contract,
+                &links,
+                filter_blocks,
+                pool,
+                stop_check,
+            )?)
+        } else {
+            None
+        };
+        let graph = match predicate_links {
+            Some(predicate_links) => GraphLayers::new_with_predicate_links(
+                links,
+                predicate_links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+            None => GraphLayers::new(
+                links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+        };
         Self::try_new(build_contract, graph, storage)
+    }
+
+    fn build_predicate_links(
+        storage: &dyn VectorStorage,
+        build_contract: &HnswBuildContract,
+        base_links: &GraphLinks,
+        filter_blocks: HnswFilterBlocks,
+        pool: Option<&rayon::ThreadPool>,
+        stop_check: Option<&HnswBuildStopCheck>,
+    ) -> Result<GraphLinks> {
+        let mut merged = vec![Vec::<PointOffset>::new(); storage.num_vectors()];
+        let dimension = storage.vector_dim();
+        let filter_m = build_contract.filter_topology.m;
+        let expected_columns = build_contract.filter_topology.columns();
+        let actual_columns = filter_blocks
+            .columns
+            .iter()
+            .map(|column| column.column_id)
+            .collect::<Vec<_>>();
+        if actual_columns != expected_columns {
+            return Err(error::invalid_input(format!(
+                "HNSW filter-block columns {:?} differ from durable contract {:?}",
+                actual_columns, expected_columns
+            )));
+        }
+
+        let mut global_block_index = 0usize;
+        for column in filter_blocks.columns {
+            let mut block_by_point = vec![u32::MAX; storage.num_vectors()];
+            for (block_index, point_ids) in column.blocks.into_iter().enumerate() {
+                if stop_check.is_some_and(HnswBuildStopCheck::should_stop) {
+                    return Err(error::query_canceled());
+                }
+                if point_ids.is_empty() {
+                    return Err(error::invalid_input(
+                        "HNSW filter blocks must not contain empty partitions",
+                    ));
+                }
+                if point_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
+                    return Err(error::invalid_input(
+                        "HNSW filter block point ids must be strictly increasing",
+                    ));
+                }
+                if point_ids
+                    .last()
+                    .is_some_and(|point| *point as usize >= storage.num_vectors())
+                {
+                    return Err(error::data_corrupted(
+                        "HNSW filter block point id exceeds vector cardinality",
+                    ));
+                }
+                let block_index = u32::try_from(block_index).map_err(|_| {
+                    error::configuration_limit_exceeded(
+                        "HNSW filter topology exceeds the u32 block-id space",
+                    )
+                })?;
+                for &point_id in point_ids.iter() {
+                    if std::mem::replace(&mut block_by_point[point_id as usize], block_index)
+                        != u32::MAX
+                    {
+                        return Err(error::data_corrupted(format!(
+                            "HNSW filter column {} contains duplicate point {}",
+                            column.column_id, point_id
+                        )));
+                    }
+                }
+
+                let mut vectors = Vec::with_capacity(point_ids.len().saturating_mul(dimension));
+                for &point_id in point_ids.iter() {
+                    vectors.extend_from_slice(storage.get_vector(point_id));
+                }
+                let mut local_contract = *build_contract;
+                local_contract.m = filter_m;
+                local_contract.m0 = filter_m.saturating_mul(2);
+                local_contract.ef_construct = local_contract.ef_construct.max(filter_m);
+                local_contract.build_seed = splitmix64(
+                    build_contract.build_seed
+                        ^ 0x5052_4544_4943_4154
+                        ^ u64::from(column.column_id).rotate_left(17)
+                        ^ global_block_index as u64,
+                );
+                local_contract.filter_topology = Default::default();
+                let local = Self::build_with_controls(
+                    Arc::new(InMemoryVectorStorage::new(vectors, dimension)),
+                    local_contract,
+                    pool,
+                    stop_check,
+                )?;
+                for (local_point, &global_point) in point_ids.iter().enumerate() {
+                    local.graph.links.for_each_link(
+                        local_point as PointOffset,
+                        0,
+                        |local_neighbor| {
+                            merged[global_point as usize].push(point_ids[local_neighbor as usize]);
+                        },
+                    );
+                }
+                global_block_index = global_block_index.saturating_add(1);
+            }
+            if block_by_point.contains(&u32::MAX) {
+                return Err(error::data_corrupted(format!(
+                    "HNSW filter column {} does not cover the complete vector domain",
+                    column.column_id
+                )));
+            }
+
+            // Local block graphs make selective predicates dense, but a range
+            // spanning several blocks would otherwise be a disjoint union and
+            // could only reach blocks discovered by the base routing beam.
+            // Reuse a bounded number of deterministic base-graph edges that
+            // cross block boundaries. Exact row admission still decides which
+            // of these bridges are traversable for a concrete predicate.
+            // This keeps equality filters inside their local graph while range
+            // filters obtain a connected, vector-aware predicate surface.
+            let cross_block_degree = usize::try_from(filter_m).unwrap_or(usize::MAX);
+            for point in 0..storage.num_vectors() {
+                let point_id = point as PointOffset;
+                let point_block = block_by_point[point];
+                let links = &mut merged[point];
+                let mut added = 0usize;
+                base_links.for_each_link(point_id, 0, |neighbor| {
+                    if added < cross_block_degree
+                        && block_by_point[neighbor as usize] != point_block
+                    {
+                        links.push(neighbor);
+                        added += 1;
+                    }
+                });
+            }
+        }
+
+        for links in &mut merged {
+            links.sort_unstable();
+            links.dedup();
+        }
+        Ok(GraphLinks::new_from_edges(
+            merged.into_iter().map(|links| vec![links]).collect(),
+        ))
     }
 
     /// Save HNSW index to a directory.
@@ -489,6 +701,12 @@ impl HnswIndex {
         // Save graph links in binary form.
         let links_path = directory.join("graph_links.bin");
         self.graph.links.save(&links_path)?;
+        let predicate_links_path = directory.join("predicate_graph_links.bin");
+        if let Some(predicate_links) = &self.graph.predicate_links {
+            predicate_links.save(&predicate_links_path)?;
+        } else if predicate_links_path.exists() {
+            fs::remove_file(predicate_links_path).map_err(error::io)?;
+        }
 
         if let Some(norms) = self.vector_storage.cosine_inverse_norms() {
             let norms_path = directory.join("cosine_inverse_norms.bin");
@@ -522,6 +740,12 @@ impl HnswIndex {
         let links_path = directory.join("graph_links.bin");
         let links =
             GraphLinks::load_mmap(&links_path).or_else(|_| GraphLinks::load(&links_path))?;
+        let predicate_links = if build_contract.filter_topology.is_enabled() {
+            let path = directory.join("predicate_graph_links.bin");
+            Some(GraphLinks::load_mmap(&path).or_else(|_| GraphLinks::load(&path))?)
+        } else {
+            None
+        };
 
         let vector_storage = if distance == DistanceMetric::Cosine {
             let norms_path = directory.join("cosine_inverse_norms.bin");
@@ -536,12 +760,21 @@ impl HnswIndex {
         } else {
             vector_storage
         };
-        let graph = GraphLayers::new(
-            links,
-            entry_points,
-            VisitedPool::new(),
-            (&build_contract).into(),
-        );
+        let graph = match predicate_links {
+            Some(predicate_links) => GraphLayers::new_with_predicate_links(
+                links,
+                predicate_links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+            None => GraphLayers::new(
+                links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+        };
 
         let index = Self {
             build_contract,
@@ -586,7 +819,22 @@ impl HnswIndex {
             .map_err(|_| error::out_of_range("too many HNSW extra entry points"))?;
         data.extend_from_slice(&primary_count.to_le_bytes());
         data.extend_from_slice(&extra_count.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
+        let filter_topology = self.build_contract.filter_topology;
+        data.extend_from_slice(&filter_topology.version.to_le_bytes());
+        data.extend_from_slice(&filter_topology.column_count.to_le_bytes());
+        for column_id in filter_topology.column_ids {
+            data.extend_from_slice(&column_id.to_le_bytes());
+        }
+        data.extend_from_slice(&filter_topology.target_block_rows.to_le_bytes());
+        data.extend_from_slice(&filter_topology.m.to_le_bytes());
+        let base_graph_len = self.graph.links.serialized_size_bytes();
+        let predicate_graph_len = self
+            .graph
+            .predicate_links
+            .as_ref()
+            .map_or(0, GraphLinks::serialized_size_bytes);
+        data.extend_from_slice(&base_graph_len.to_le_bytes());
+        data.extend_from_slice(&predicate_graph_len.to_le_bytes());
         debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
 
         if let Some(norms) = norms {
@@ -600,6 +848,9 @@ impl HnswIndex {
 
         // Serialize graph links in binary form.
         self.graph.links.serialize(&mut data)?;
+        if let Some(predicate_links) = &self.graph.predicate_links {
+            predicate_links.serialize(&mut data)?;
+        }
 
         // Append statistics trailer.
         let stats = HnswIndexStatistics::collect(self);
@@ -679,7 +930,7 @@ impl HnswIndex {
                     .expect("u32 width"),
             ))
         };
-        let build_contract = HnswBuildContract {
+        let mut build_contract = HnswBuildContract {
             version: read_u32(data, &mut offset, "build contract version")?,
             m: read_u32(data, &mut offset, "m")?,
             m0: read_u32(data, &mut offset, "m0")?,
@@ -703,10 +954,8 @@ impl HnswIndex {
             },
             proposal_wave_size: read_u32(data, &mut offset, "proposal wave size")?,
             warmup_point_count: read_u32(data, &mut offset, "warm-up point count")?,
+            filter_topology: Default::default(),
         };
-        build_contract.validate()?;
-        let distance = build_contract.distance;
-
         let norm_count = usize::try_from(u64::from_le_bytes(
             take_artifact_bytes(data, &mut offset, 8, "inverse norm count")?
                 .try_into()
@@ -715,17 +964,39 @@ impl HnswIndex {
         .map_err(|_| error::data_corrupted("HNSW inverse norm count exceeds usize"))?;
         let primary_count = read_u32(data, &mut offset, "primary entry point count")? as usize;
         let extra_count = read_u32(data, &mut offset, "extra entry point count")? as usize;
-        if u64::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 8, "reserved")?
+        let filter_version = read_u32(data, &mut offset, "filter-topology version")?;
+        let filter_column_count = read_u32(data, &mut offset, "filter column count")?;
+        let mut filter_column_ids = [0; super::MAX_HNSW_FILTER_COLUMNS];
+        for column_id in &mut filter_column_ids {
+            *column_id = read_u32(data, &mut offset, "filter column id")?;
+        }
+        build_contract.filter_topology = HnswFilterTopologyContract {
+            version: filter_version,
+            column_count: filter_column_count,
+            column_ids: filter_column_ids,
+            target_block_rows: read_u32(data, &mut offset, "filter block rows")?,
+            m: read_u32(data, &mut offset, "filter m")?,
+        };
+        let base_graph_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "base graph length")?
                 .try_into()
                 .expect("u64 width"),
-        ) != 0
-        {
+        ))
+        .map_err(|_| error::data_corrupted("HNSW base graph length exceeds usize"))?;
+        let predicate_graph_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "predicate graph length")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW predicate graph length exceeds usize"))?;
+        debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
+        build_contract.validate()?;
+        if build_contract.filter_topology.is_enabled() != (predicate_graph_len != 0) {
             return Err(error::data_corrupted(
-                "HNSW artifact reserved header field must be zero",
+                "HNSW predicate graph presence does not match its filter-topology contract",
             ));
         }
-        debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
+        let distance = build_contract.distance;
         let norm_bytes = norm_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
@@ -749,15 +1020,33 @@ impl HnswIndex {
             extra_entry_points: read_entry_points(data, &mut offset, extra_count)?,
         };
 
-        // Deserialize graph links.
-        let links = backing.graph_links(offset)?;
+        // Deserialize base and predicate-local graph links from exact envelope
+        // ranges. Statistics bytes are never exposed to either graph parser.
+        let links = backing.graph_links(offset, base_graph_len)?;
+        offset = offset
+            .checked_add(base_graph_len)
+            .ok_or_else(|| error::data_corrupted("HNSW base graph offset overflow"))?;
+        let predicate_links = if predicate_graph_len == 0 {
+            None
+        } else {
+            Some(backing.graph_links(offset, predicate_graph_len)?)
+        };
 
-        let graph = GraphLayers::new(
-            links,
-            entry_points,
-            VisitedPool::new(),
-            (&build_contract).into(),
-        );
+        let graph = match predicate_links {
+            Some(predicate_links) => GraphLayers::new_with_predicate_links(
+                links,
+                predicate_links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+            None => GraphLayers::new(
+                links,
+                entry_points,
+                VisitedPool::new(),
+                (&build_contract).into(),
+            ),
+        };
 
         let index = Self {
             build_contract,
@@ -792,6 +1081,11 @@ impl HnswIndex {
         let start = Instant::now();
         let pre_filter_count = self.graph.num_points() as u64;
         let filter_row_set = filter.row_set();
+        let use_predicate_topology = filter.uses_predicate_topology(
+            &self.build_contract.filter_topology,
+            self.graph.num_points(),
+            self.graph.hnsw_m.get_m(0),
+        );
         let post_filter_count = filter_row_set
             .map(ExactRowSet::len)
             .unwrap_or(pre_filter_count);
@@ -817,6 +1111,7 @@ impl HnswIndex {
                 algorithm,
                 &mut scorer,
                 filter_row_set.map(ExactRowSet::admission),
+                use_predicate_topology,
                 Self::use_random_entry_point(params),
                 work,
             )?;
@@ -827,6 +1122,7 @@ impl HnswIndex {
                 (
                     self.plain_scan(top_k, &mut scorer, filter_row_set, work)?,
                     HnswSearchOutcome::new(path)
+                        .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined)
                         .with_exact_fallback(),
                 )
@@ -834,6 +1130,7 @@ impl HnswIndex {
                 (
                     results,
                     HnswSearchOutcome::new(path)
+                        .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined),
                 )
             }
@@ -864,7 +1161,7 @@ impl HnswIndex {
     ) -> Result<Vec<ScoredPoint>> {
         let policy = HnswSearchPolicy::default();
         let filter = filter_bitmap.map_or(HnswSearchFilter::None, |bitmap| {
-            HnswSearchFilter::Predicate(bitmap)
+            HnswSearchFilter::predicate(bitmap, &[])
         });
         let matching_rows = filter
             .row_set()
@@ -921,6 +1218,11 @@ impl HnswIndex {
             .collect::<Result<Vec<_>>>()?;
 
         let filter_row_set = filter.row_set();
+        let use_predicate_topology = filter.uses_predicate_topology(
+            &self.build_contract.filter_topology,
+            self.graph.num_points(),
+            self.graph.hnsw_m.get_m(0),
+        );
         let results: Vec<HnswSearchResult> = if self.should_use_plain_scan(filter, policy, strategy)
         {
             let batch_scorer = BatchScorer::new(scorers, top_k);
@@ -957,6 +1259,7 @@ impl HnswIndex {
                 algorithm,
                 &mut scorers,
                 filter_row_set.map(ExactRowSet::admission),
+                use_predicate_topology,
                 Self::use_random_entry_point(params),
                 work,
             )?;
@@ -966,6 +1269,7 @@ impl HnswIndex {
                 .zip(scorers.iter_mut())
                 .map(|(graph_result, scorer)| -> Result<HnswSearchResult> {
                     let mut outcome = HnswSearchOutcome::new(path)
+                        .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined);
                     let points =
                         if filter_row_set.is_some() && graph_result.points.len() < expected_rows {
@@ -1015,7 +1319,7 @@ impl HnswIndex {
             top_k,
             params,
             filter_bitmap.map_or(HnswSearchFilter::None, |bitmap| {
-                HnswSearchFilter::Predicate(bitmap)
+                HnswSearchFilter::predicate(bitmap, &[])
             }),
             &HnswSearchPolicy::default(),
             strategy,
@@ -1068,7 +1372,24 @@ impl HnswIndex {
             }
             (_, None) => {}
         }
-        self.graph.links.verify_integrity()
+        self.graph.links.verify_integrity()?;
+        match (
+            self.build_contract.filter_topology.is_enabled(),
+            self.graph.predicate_links.as_ref(),
+        ) {
+            (true, Some(predicate_links)) => {
+                if predicate_links.num_points() != self.graph.links.num_points() {
+                    return Err(error::data_corrupted(
+                        "HNSW predicate graph cardinality differs from base graph",
+                    ));
+                }
+                predicate_links.verify_integrity()
+            }
+            (false, None) => Ok(()),
+            _ => Err(error::data_corrupted(
+                "HNSW predicate graph presence differs from filter-topology contract",
+            )),
+        }
     }
 
     fn validate_entry_points(&self) -> Result<()> {
@@ -1109,7 +1430,7 @@ impl HnswIndex {
             (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::Visibility(_)) => {
                 Ok(SearchAlgorithm::MaskedTopK)
             }
-            (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::Predicate(_)) => {
+            (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::Predicate { .. }) => {
                 Ok(SearchAlgorithm::AdaptiveFilteredTopK)
             }
             (HnswSearchStrategy::ExactScan, _) => Err(error::internal(
@@ -1118,7 +1439,7 @@ impl HnswIndex {
             (HnswSearchStrategy::UnfilteredGraph, _) => Err(error::internal(
                 "unfiltered HNSW strategy received an admission bitmap",
             )),
-            (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::Predicate(_)) => Err(
+            (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::Predicate { .. }) => Err(
                 error::internal("predicate HNSW search must use adaptive graph execution"),
             ),
             (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::Visibility(_)) => Err(
@@ -1170,8 +1491,8 @@ impl HnswIndex {
 
         match filter {
             HnswSearchFilter::None => false,
-            HnswSearchFilter::Visibility(bitmap) | HnswSearchFilter::Predicate(bitmap) => {
-                bitmap.len() <= policy.filtered_plain_scan_threshold as u64
+            HnswSearchFilter::Visibility(row_set) | HnswSearchFilter::Predicate { row_set, .. } => {
+                row_set.len() <= policy.filtered_plain_scan_threshold as u64
             }
         }
     }
@@ -1204,9 +1525,15 @@ impl HnswIndex {
         match filter_row_set {
             Some(row_set) => {
                 const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
+                if row_set.domain_len() > self.graph.num_points() {
+                    return Err(error::data_corrupted(format!(
+                        "HNSW exact row-set domain {} exceeds graph cardinality {}",
+                        row_set.domain_len(),
+                        self.graph.num_points()
+                    )));
+                }
                 let mut best = FixedLengthPriorityQueue::new(top_k);
                 let mut chunk = [0; SCORE_BATCH];
-                let mut len = 0usize;
                 let mut flush = |chunk: &[PointOffset]| -> Result<()> {
                     work.check_and_consume(chunk.len())?;
                     for point in scorer.score_points_unfiltered(chunk) {
@@ -1214,21 +1541,7 @@ impl HnswIndex {
                     }
                     Ok(())
                 };
-                row_set.try_for_each(&mut |point_id| {
-                    if point_id >= num_points {
-                        return Ok(());
-                    }
-                    chunk[len] = point_id;
-                    len += 1;
-                    if len == SCORE_BATCH {
-                        flush(&chunk)?;
-                        len = 0;
-                    }
-                    Ok(())
-                })?;
-                if len != 0 {
-                    flush(&chunk[..len])?;
-                }
+                row_set.try_for_each_batch(&mut chunk, &mut flush)?;
                 Ok(best.into_sorted_vec())
             }
             None => self.plain_scan_iter(top_k, scorer, 0..num_points, work),
@@ -1621,6 +1934,34 @@ mod tests {
     }
 
     #[test]
+    fn predicate_topology_rejects_missing_or_incomplete_column_partitions() {
+        let vectors = vec![vec![0.0], vec![1.0], vec![2.0], vec![3.0]];
+        let mut contract = HnswConfig::new(4, 16).build_contract(DistanceMetric::Euclidean);
+        contract.filter_topology = HnswFilterTopologyContract::from_columns(&[7], 2, 2).unwrap();
+
+        let missing = HnswBuilder::new()
+            .build(make_storage(&vectors), contract)
+            .err()
+            .expect("enabled topology requires its configured column partition");
+        assert!(missing.to_string().contains("filter-block columns"));
+
+        let incomplete = HnswBuilder::new()
+            .build_with_filter_blocks(
+                make_storage(&vectors),
+                contract,
+                HnswFilterBlocks {
+                    columns: vec![HnswFilterColumnBlocks {
+                        column_id: 7,
+                        blocks: vec![vec![0, 1, 2].into_boxed_slice()],
+                    }],
+                },
+            )
+            .err()
+            .expect("each configured column must cover every vector exactly once");
+        assert!(incomplete.to_string().contains("complete vector domain"));
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_hnsw_search_many_matches_search_one_hnsw_path() {
         let vectors = make_sift_like_vectors(7, 384, 24, 16);
@@ -1809,7 +2150,7 @@ mod tests {
         let filter = RoaringBitmap::from_iter([0]);
         assert_eq!(
             HnswIndex::algorithm_for_strategy(
-                HnswSearchFilter::Predicate(&filter),
+                HnswSearchFilter::predicate(&filter, &[]),
                 HnswSearchStrategy::AdaptiveFilteredGraph,
             )
             .unwrap(),
@@ -1824,7 +2165,7 @@ mod tests {
             SearchAlgorithm::MaskedTopK
         );
         assert!(HnswIndex::algorithm_for_strategy(
-            HnswSearchFilter::Predicate(&filter),
+            HnswSearchFilter::predicate(&filter, &[]),
             HnswSearchStrategy::MaskedGraph,
         )
         .is_err());
@@ -1870,7 +2211,7 @@ mod tests {
                 query,
                 10,
                 &params,
-                HnswSearchFilter::Predicate(&broad),
+                HnswSearchFilter::predicate(&broad, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
                 budget.work.as_ref(),
@@ -1890,7 +2231,7 @@ mod tests {
                 query,
                 67,
                 &params,
-                HnswSearchFilter::Predicate(&almost_all),
+                HnswSearchFilter::predicate(&almost_all, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
                 budget.work.as_ref(),
@@ -1905,7 +2246,7 @@ mod tests {
                 query,
                 6,
                 &params,
-                HnswSearchFilter::Predicate(&selective),
+                HnswSearchFilter::predicate(&selective, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
                 budget.work.as_ref(),
@@ -2294,17 +2635,17 @@ mod tests {
             HnswSearchStrategy::UnfilteredGraph
         ));
         assert!(index.should_use_plain_scan(
-            HnswSearchFilter::Predicate(&small_filter),
+            HnswSearchFilter::predicate(&small_filter, &[]),
             &policy,
             HnswSearchStrategy::ExactScan
         ));
         assert!(index.should_use_plain_scan(
-            HnswSearchFilter::Predicate(&small_filter),
+            HnswSearchFilter::predicate(&small_filter, &[]),
             &policy,
             HnswSearchStrategy::AdaptiveFilteredGraph
         ));
         assert!(!index.should_use_plain_scan(
-            HnswSearchFilter::Predicate(&large_filter),
+            HnswSearchFilter::predicate(&large_filter, &[]),
             &policy,
             HnswSearchStrategy::AdaptiveFilteredGraph
         ));

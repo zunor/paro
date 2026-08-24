@@ -22,7 +22,10 @@ use super::providers::sparse::inline::SparseInlineArtifactBuilder;
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::TailMutationKind;
-use crate::index::hnsw::HnswBuilder;
+use crate::index::bitmap::BitmapIndexWriter;
+use crate::index::hnsw::{
+    HnswBuilder, HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract,
+};
 use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
@@ -319,7 +322,13 @@ fn build_hnsw_segment_sidecar_artifact(
             provider.dimension
         )));
     }
-    let index = HnswBuilder::new().build(vector_storage, provider.build_contract())?;
+    let build_contract = provider.build_contract();
+    let filter_blocks = build_hnsw_filter_blocks(&segment, &build_contract.filter_topology)?;
+    let index = HnswBuilder::new().build_with_filter_blocks(
+        vector_storage,
+        build_contract,
+        filter_blocks,
+    )?;
     let bytes = index.serialize()?;
     let checksum = seahash::hash(&bytes);
     let provider_stats = HnswProviderStats::from(&HnswIndexStatistics::collect(&index));
@@ -341,6 +350,179 @@ fn build_hnsw_segment_sidecar_artifact(
         }],
         stats_delta: None,
     })
+}
+
+fn build_hnsw_filter_blocks(
+    segment: &crate::rowset::segment::Segment,
+    topology: &HnswFilterTopologyContract,
+) -> Result<HnswFilterBlocks> {
+    if !topology.is_enabled() {
+        return Ok(HnswFilterBlocks::default());
+    }
+
+    let mut collectors = topology
+        .columns()
+        .iter()
+        .map(|&column_id| {
+            let logical_type = segment
+                .schema()
+                .column_by_id(column_id)
+                .ok_or_else(|| {
+                    paro_error::column_not_found(format!(
+                        "HNSW filter column {column_id} not found in segment schema"
+                    ))
+                })?
+                .logical_type
+                .clone();
+            if !crate::index::supports_ordered_bytes(&logical_type) {
+                return Err(paro_error::not_supported(format!(
+                    "HNSW filter column {column_id} has unsupported type {logical_type:?}"
+                )));
+            }
+            Ok((column_id, logical_type, BitmapIndexWriter::new()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let column_ids = collectors
+        .iter()
+        .map(|(column_id, _, _)| *column_id)
+        .collect::<Vec<_>>();
+    let mut iter = SegmentIterator::new_with_delete_vector(segment, column_ids.clone(), None)?;
+    let mut next_row_id = 0u32;
+    loop {
+        let (row_ids, mut batches) = iter.next_batch(SIDECAR_BUILD_BATCH_ROWS)?;
+        if row_ids.is_empty() {
+            break;
+        }
+        let base_row_id = contiguous_base_row_id(&row_ids)?;
+        if base_row_id != next_row_id {
+            return Err(paro_error::data_corrupted(format!(
+                "HNSW filter-block scan is not a dense segment domain: expected row {next_row_id}, got {base_row_id}"
+            )));
+        }
+        next_row_id = next_row_id
+            .checked_add(row_ids.len() as u32)
+            .ok_or_else(|| paro_error::out_of_range("HNSW filter-block row id overflow"))?;
+        for (column_id, logical_type, collector) in &mut collectors {
+            let position = batches
+                .iter()
+                .position(|(candidate, _)| candidate == column_id)
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "HNSW filter-block scan omitted column {column_id}"
+                    ))
+                })?;
+            let (_, batch) = batches.swap_remove(position);
+            append_hnsw_filter_batch(collector, batch, logical_type, row_ids.len())?;
+        }
+    }
+    if u64::from(next_row_id) != segment.num_rows() {
+        return Err(paro_error::data_corrupted(format!(
+            "HNSW filter-block scan covered {next_row_id} rows, segment has {}",
+            segment.num_rows()
+        )));
+    }
+
+    collectors
+        .into_iter()
+        .map(|(column_id, logical_type, collector)| {
+            Ok(HnswFilterColumnBlocks {
+                column_id,
+                blocks: collector.ordered_hnsw_filter_blocks(
+                    &logical_type,
+                    topology.target_block_rows as usize,
+                )?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()
+        .map(|columns| HnswFilterBlocks { columns })
+}
+
+fn append_hnsw_filter_batch(
+    collector: &mut BitmapIndexWriter,
+    batch: ColumnBatch,
+    logical_type: &LogicalType,
+    rows: usize,
+) -> Result<()> {
+    let nulls = batch.nulls.as_deref();
+    if let Some(dictionary) = batch.storage_dictionary {
+        let mut decoder = BinaryPlainPageDecoder::new(dictionary.dictionary);
+        decoder.init()?;
+        for row in 0..rows {
+            if row_is_null(nulls, row) {
+                collector.add_nulls(1);
+                continue;
+            }
+            let offset = row
+                .checked_mul(std::mem::size_of::<u32>())
+                .ok_or_else(|| paro_error::data_corrupted("dictionary code offset overflow"))?;
+            let end = offset + std::mem::size_of::<u32>();
+            let raw = dictionary.codes.get(offset..end).ok_or_else(|| {
+                paro_error::data_corrupted("dictionary code batch shorter than row count")
+            })?;
+            let code = u32::from_le_bytes(raw.try_into().expect("u32 code"));
+            let value = decoder.string_at(code).ok_or_else(|| {
+                paro_error::data_corrupted(format!("dictionary code {code} out of range"))
+            })?;
+            collector.add_value(value.as_ref());
+        }
+        return Ok(());
+    }
+
+    if matches!(
+        logical_type,
+        LogicalType::Varchar
+            | LogicalType::VarcharCollation(_)
+            | LogicalType::TsVector
+            | LogicalType::TsQuery
+            | LogicalType::Json
+            | LogicalType::Jsonb
+            | LogicalType::Blob
+    ) {
+        let mut input = batch.data.as_ref();
+        for row in 0..rows {
+            if input.len() < std::mem::size_of::<u32>() {
+                return Err(paro_error::data_corrupted(
+                    "variable-length filter batch is missing a value length",
+                ));
+            }
+            let len = u32::from_le_bytes(input[..4].try_into().expect("u32 length")) as usize;
+            input = &input[4..];
+            let value = input.get(..len).ok_or_else(|| {
+                paro_error::data_corrupted("variable-length filter value is truncated")
+            })?;
+            input = &input[len..];
+            if row_is_null(nulls, row) {
+                collector.add_nulls(1);
+            } else {
+                collector.add_value(value);
+            }
+        }
+        if !input.is_empty() {
+            return Err(paro_error::data_corrupted(
+                "variable-length filter batch has trailing bytes",
+            ));
+        }
+        return Ok(());
+    }
+
+    let width = crate::codec::physical_layout::fixed_row_width(logical_type)?;
+    let expected = rows
+        .checked_mul(width)
+        .ok_or_else(|| paro_error::out_of_range("fixed filter batch byte length overflow"))?;
+    if batch.data.len() != expected {
+        return Err(paro_error::data_corrupted(format!(
+            "fixed filter batch has {} bytes, expected {expected}",
+            batch.data.len()
+        )));
+    }
+    for row in 0..rows {
+        if row_is_null(nulls, row) {
+            collector.add_nulls(1);
+        } else {
+            collector.add_value(&batch.data[row * width..(row + 1) * width]);
+        }
+    }
+    Ok(())
 }
 
 fn hnsw_vector_dimension(logical_type: &LogicalType, column_id: u32) -> Result<usize> {
@@ -468,5 +650,67 @@ fn sidecar_ref_from_blob(
             provider_stats,
         },
         checksum: blob.checksum,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rowset::page::CompressionType;
+    use crate::rowset::segment::{SegmentWriter, SegmentWriterOptions};
+    use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn sidecar_filter_block_scan_covers_the_complete_scalar_column() {
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("sidecar-filter-blocks.segment");
+        let schema = Arc::new(
+            TabletSchema::new(
+                9,
+                vec![
+                    TabletColumn::new(0, "bucket", LogicalType::Integer),
+                    TabletColumn::new(
+                        1,
+                        "embedding",
+                        LogicalType::Array(Box::new(LogicalType::Float), 2),
+                    ),
+                ],
+                KeysType::DuplicateKeys,
+            )
+            .unwrap(),
+        );
+        let options = SegmentWriterOptions::new(0)
+            .with_short_key_index(false)
+            .with_compression(CompressionType::None);
+        let mut writer = SegmentWriter::create(schema, &file_path, options).unwrap();
+        let rows = 12_u32;
+        let buckets = (0..rows)
+            .flat_map(|row| ((row % 3) as i32).to_le_bytes())
+            .collect::<Vec<_>>();
+        let vectors = (0..rows)
+            .flat_map(|row| [row as f32, row.wrapping_mul(3) as f32])
+            .flat_map(f32::to_le_bytes)
+            .collect::<Vec<_>>();
+        writer
+            .append_chunk(&[
+                ColumnData::new(buckets, rows),
+                ColumnData::new(vectors, rows),
+            ])
+            .unwrap();
+        let segment = writer.finalize().unwrap();
+        let topology = HnswFilterTopologyContract::from_columns(&[0], 4, 2).unwrap();
+
+        let blocks = build_hnsw_filter_blocks(&segment, &topology).unwrap();
+        assert_eq!(blocks.columns.len(), 1);
+        assert_eq!(blocks.columns[0].column_id, 0);
+        let mut points = blocks.columns[0]
+            .blocks
+            .iter()
+            .flat_map(|block| block.iter().copied())
+            .collect::<Vec<_>>();
+        points.sort_unstable();
+        assert_eq!(points, (0..rows).collect::<Vec<_>>());
     }
 }

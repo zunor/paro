@@ -156,6 +156,11 @@ pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
         GLOBAL,
     ),
     SearchMetricDescriptor::counter(
+        "search_hnsw_predicate_topology_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
         "search_inline_build_rows_total",
         SearchMetricUnit::Rows,
         DEFINITION_PROVIDER,
