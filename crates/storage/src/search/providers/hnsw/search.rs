@@ -1,15 +1,14 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
-    choose_filtered_search_strategy, hnsw_artifact_compatibility, DistanceMetric,
-    HnswArtifactCompatibility, HnswBuildContract, HnswFilteredSearchStrategy, HnswIndex,
-    HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, PreparedQuery,
+    hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
+    HnswFilterKind, HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
+    PreparedQuery,
 };
 use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
@@ -267,7 +266,6 @@ impl VectorSearchCursor {
     ) -> Result<(PreparedSegmentFilters, HnswSearchStrategy)> {
         let predicate = self.predicate.as_ref();
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        let retained_bytes = AtomicUsize::new(0);
         let prepared = prepare_segments(
             SearchIndexKind::Hnsw,
             self.snapshot.table_lease.visible_segments(),
@@ -282,26 +280,7 @@ impl VectorSearchCursor {
                     ));
                 }
                 let reservation = if let Some(bitmap) = filter_bitmap.as_ref() {
-                    let bytes = std::mem::size_of::<RoaringBitmap>()
-                        .checked_add(bitmap.serialized_size())
-                        .ok_or_else(|| {
-                            paro_error::out_of_memory("filtered search bitmap size overflow")
-                        })?;
-                    let reservation = retained_bytes.fetch_update(
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                        |current| {
-                            current
-                                .checked_add(bytes)
-                                .filter(|next| *next <= budget.memory_limit_bytes)
-                        },
-                    );
-                    if reservation.is_err() {
-                        return Err(paro_error::out_of_memory(format!(
-                            "filtered search bitmaps exceed query budget of {} bytes",
-                            budget.memory_limit_bytes
-                        )));
-                    }
+                    let bytes = estimated_roaring_retained_bytes(bitmap)?;
                     Some(budget.try_reserve_memory(bytes)?)
                 } else {
                     None
@@ -333,23 +312,15 @@ impl VectorSearchCursor {
                             .map_or(segment.segment.num_rows(), RoaringBitmap::len),
                     )
                 });
-        let strategy = if predicate.is_some() {
-            choose_filtered_query_wide_search_strategy(
-                matching_rows,
-                total_rows,
-                self.k,
-                self.search_policy.effective_ef(self.k, self.params.ef),
-                self.search_policy,
-            )
+        let filter_kind = if predicate.is_some() {
+            HnswFilterKind::Predicate
         } else if has_visibility_mask {
-            if matching_rows <= self.search_policy.filtered_plain_scan_threshold as u64 {
-                HnswSearchStrategy::ExactScan
-            } else {
-                HnswSearchStrategy::MaskedGraph
-            }
+            HnswFilterKind::Visibility
         } else {
-            self.unfiltered_query_wide_search_strategy()
+            HnswFilterKind::None
         };
+        let strategy =
+            HnswSearchStrategy::choose(filter_kind, matching_rows, total_rows, self.search_policy);
         Ok((
             PreparedSegmentFilters {
                 bitmaps,
@@ -357,19 +328,6 @@ impl VectorSearchCursor {
             },
             strategy,
         ))
-    }
-
-    fn unfiltered_query_wide_search_strategy(&self) -> HnswSearchStrategy {
-        let threshold = self.search_policy.plain_scan_threshold as u64;
-        let visible_rows = self
-            .snapshot
-            .table_lease
-            .visible_segments()
-            .iter()
-            .fold(0u64, |rows, segment| {
-                rows.saturating_add(segment.segment.num_rows())
-            });
-        choose_query_wide_search_strategy(visible_rows, threshold)
     }
 
     fn search_segment(
@@ -505,6 +463,24 @@ impl VectorSearchCursor {
 
         Ok((collector.into_sorted_rows(), true))
     }
+}
+
+fn estimated_roaring_retained_bytes(bitmap: &RoaringBitmap) -> Result<usize> {
+    // `serialized_size` excludes Vec capacities and the container directory.
+    // The crate's statistics report allocated payload capacity; charge a
+    // conservative directory/header allowance per container as well.
+    const CONTAINER_METADATA_BYTES: usize = 32;
+    let stats = bitmap.statistics();
+    let payload = stats
+        .n_bytes_array_containers
+        .saturating_add(stats.n_bytes_run_containers)
+        .saturating_add(stats.n_bytes_bitset_containers);
+    let payload = usize::try_from(payload)
+        .map_err(|_| paro_error::out_of_memory("filtered search bitmap size overflow"))?;
+    std::mem::size_of::<RoaringBitmap>()
+        .checked_add(payload)
+        .and_then(|bytes| bytes.checked_add(stats.n_containers as usize * CONTAINER_METADATA_BYTES))
+        .ok_or_else(|| paro_error::out_of_memory("filtered search bitmap size overflow"))
 }
 
 fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract) -> Result<()> {
@@ -662,33 +638,6 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
     Ok(())
 }
 
-fn choose_query_wide_search_strategy(
-    visible_rows: u64,
-    plain_scan_threshold: u64,
-) -> HnswSearchStrategy {
-    if visible_rows <= plain_scan_threshold {
-        HnswSearchStrategy::ExactScan
-    } else {
-        HnswSearchStrategy::UnfilteredGraph
-    }
-}
-
-fn choose_filtered_query_wide_search_strategy(
-    matching_rows: u64,
-    total_rows: u64,
-    top_k: usize,
-    effective_ef: usize,
-    policy: HnswSearchPolicy,
-) -> HnswSearchStrategy {
-    match choose_filtered_search_strategy(matching_rows, total_rows, top_k, effective_ef, policy)
-        .strategy
-    {
-        HnswFilteredSearchStrategy::ExactScan => HnswSearchStrategy::ExactScan,
-        HnswFilteredSearchStrategy::MaskedTopK => HnswSearchStrategy::MaskedGraph,
-        HnswFilteredSearchStrategy::RefinedTopK => HnswSearchStrategy::RefinedGraph,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -696,11 +645,27 @@ mod tests {
     #[test]
     fn unfiltered_plain_scan_threshold_is_query_wide() {
         assert_eq!(
-            choose_query_wide_search_strategy(10_000, 10_000),
+            HnswSearchStrategy::choose(
+                HnswFilterKind::None,
+                10_000,
+                10_000,
+                HnswSearchPolicy {
+                    plain_scan_threshold: 10_000,
+                    ..HnswSearchPolicy::default()
+                },
+            ),
             HnswSearchStrategy::ExactScan
         );
         assert_eq!(
-            choose_query_wide_search_strategy(10_001, 10_000),
+            HnswSearchStrategy::choose(
+                HnswFilterKind::None,
+                10_001,
+                10_001,
+                HnswSearchPolicy {
+                    plain_scan_threshold: 10_000,
+                    ..HnswSearchPolicy::default()
+                },
+            ),
             HnswSearchStrategy::UnfilteredGraph
         );
     }
@@ -712,16 +677,16 @@ mod tests {
             ..HnswSearchPolicy::default()
         };
         assert_eq!(
-            choose_filtered_query_wide_search_strategy(20_000, 1_000_000, 10, 160, policy),
+            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_000, 1_000_000, policy,),
             HnswSearchStrategy::ExactScan
         );
         assert_eq!(
-            choose_filtered_query_wide_search_strategy(20_001, 1_000_000, 10, 160, policy),
-            HnswSearchStrategy::RefinedGraph
+            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 1_000_000, policy,),
+            HnswSearchStrategy::AdaptiveFilteredGraph
         );
         assert_eq!(
-            choose_filtered_query_wide_search_strategy(500_000, 1_000_000, 10, 160, policy),
-            HnswSearchStrategy::MaskedGraph
+            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 500_000, 1_000_000, policy,),
+            HnswSearchStrategy::AdaptiveFilteredGraph
         );
     }
 }

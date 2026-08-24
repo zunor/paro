@@ -6,7 +6,8 @@ use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
-use paro_storage::index::PredicateTree;
+use paro_storage::index::{collect_predicate_columns, PredicateTree};
+use paro_storage::search::ExactBitmapMaterialization;
 
 use crate::physical::specs::{SearchFilterContract, SearchPredicateTemplate};
 
@@ -540,7 +541,11 @@ fn search_source_spec_for_candidate(
     output_names: Box<[String]>,
     output_types: Box<[LogicalType]>,
 ) -> Result<SearchSourceSpec> {
-    let filter_contract = SearchFilterContract::for_predicate(predicate.as_ref());
+    // Every caller reaches this point only after proving that all remaining
+    // filters are represented by `predicate`; a residual would have produced
+    // an Unsupported physical node above. Make that proof construction
+    // explicit and separately describe how its exact bitmap is materialized.
+    let filter_contract = exact_search_filter_contract(table.as_ref(), predicate.as_ref());
     match &candidate.intent {
         SearchIntent::Hnsw(intent) => {
             let search_policy = table
@@ -552,6 +557,11 @@ fn search_source_spec_for_candidate(
                         "queryable HNSW candidate is missing its validated search policy",
                     )
                 })?;
+            let avg_level0_degree = table
+                .storage
+                .as_ref()
+                .and_then(|storage| storage.hnsw_index_statistics(intent.column_id))
+                .map_or(0.0, |stats| stats.avg_level0_degree);
             Ok(SearchSourceSpec::Vector(VectorSearchSpec {
                 table,
                 capability_token: candidate.token.clone(),
@@ -564,6 +574,7 @@ fn search_source_spec_for_candidate(
                     ..Default::default()
                 },
                 search_policy,
+                avg_level0_degree,
                 predicate,
                 filter_contract,
                 estimated_filter_rows: candidate
@@ -609,6 +620,23 @@ fn search_source_spec_for_candidate(
             output_types,
         })),
     }
+}
+
+pub(super) fn exact_search_filter_contract(
+    table: &TableCatalogEntry,
+    predicate: Option<&SearchPredicateTemplate>,
+) -> SearchFilterContract {
+    let materialization = predicate
+        .and_then(|predicate| table.storage.as_ref().map(|storage| (predicate, storage)))
+        .filter(|(predicate, storage)| {
+            collect_predicate_columns(predicate.tree())
+                .into_iter()
+                .all(|column_id| storage.has_declared_art_index(column_id))
+        })
+        .map_or(ExactBitmapMaterialization::ColumnScan, |_| {
+            ExactBitmapMaterialization::ScalarIndex
+        });
+    SearchFilterContract::exact_no_residual(predicate, materialization)
 }
 
 fn physical_search_source_kind(source: SearchSourceSpec) -> PhysicalNodeKind {

@@ -6,7 +6,9 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
 use paro_planner::binder::deep_copy::deep_copy_plan;
-use paro_planner::expression::{Expression, OperatorType};
+use paro_planner::expression::{
+    Expression, ExpressionIterator, ExpressionVisitDecision, OperatorType,
+};
 use paro_planner::operator::{
     build_fulltext_query_stats, normalize_fulltext_config, Confidence, Filter, FullTextFilterScan,
     FullTextQueryKind, FullTextScoreMode, Get, LogicalOperator, Projection, SearchCandidate,
@@ -14,9 +16,9 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::search::{
-    DenseVectorQuery, FullTextIntent, HnswIntent, NormalizedSearchRequest, ProjectionSpec,
-    SearchCostEstimate as PlannedSearchCostEstimate, SearchIntent, SearchRequestMode,
-    SequentialCapability, SparseIntent,
+    DenseVectorQuery, ExactBitmapMaterialization, FullTextIntent, HnswIntent,
+    NormalizedSearchRequest, ProjectionSpec, SearchCostEstimate as PlannedSearchCostEstimate,
+    SearchIntent, SearchRequestMode, SequentialCapability, SparseIntent,
 };
 
 use crate::context::OptimizationContext;
@@ -93,7 +95,9 @@ impl SearchOptimizer {
             &ctx.column_stats,
         );
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
-        let sequential = build_sequential_capability(table_id, filtered.expected);
+        // A generic filtered Top-K must inspect the base rows before it knows
+        // which vectors survive. Output cardinality is not scan work.
+        let sequential = build_sequential_capability(table_id, base_rows);
 
         if let Some(intent) = extract_vector_intent(
             pattern.order_expr,
@@ -122,7 +126,7 @@ impl SearchOptimizer {
                 filter_selectivity,
                 topn.hnsw_ef_hint,
                 search_policy,
-                !candidate_filters.is_empty(),
+                exact_bitmap_materialization(&candidate_filters, pattern.get, storage.as_ref()),
             );
             let Some(request) =
                 build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
@@ -279,7 +283,7 @@ impl SearchOptimizer {
                 filtered.expected,
                 base_rows,
             );
-            let sequential = build_sequential_capability(table_id, filtered.expected);
+            let sequential = build_sequential_capability(table_id, base_rows);
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 continue;
             };
@@ -484,6 +488,42 @@ fn candidate_filters(filters: &[Expression], get: &Get) -> Vec<Expression> {
     let mut all = filters.to_vec();
     all.extend(get.runtime_filter_expressions.iter().cloned());
     all
+}
+
+fn exact_bitmap_materialization(
+    filters: &[Expression],
+    get: &Get,
+    storage: &paro_storage::table::table_handle::TableHandle,
+) -> Option<ExactBitmapMaterialization> {
+    if filters.is_empty() {
+        return None;
+    }
+
+    let mut saw_stored_column = false;
+    let mut all_columns_indexed = true;
+    for filter in filters {
+        ExpressionIterator::visit(filter, &mut |expression| {
+            if let Expression::ColumnRef(column) = expression {
+                let stored = (column.depth == 0 && column.binding.table_index == get.table_index)
+                    .then(|| get.stored_column(column.binding.column_index))
+                    .flatten();
+                match stored {
+                    Some(column_id) => {
+                        saw_stored_column = true;
+                        all_columns_indexed &= storage.has_declared_art_index(column_id as u32);
+                    }
+                    None => all_columns_indexed = false,
+                }
+            }
+            ExpressionVisitDecision::Descend
+        });
+    }
+
+    Some(if saw_stored_column && all_columns_indexed {
+        ExactBitmapMaterialization::ScalarIndex
+    } else {
+        ExactBitmapMaterialization::ColumnScan
+    })
 }
 
 struct TopNPattern<'a> {

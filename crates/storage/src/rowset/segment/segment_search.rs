@@ -6,8 +6,7 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{
-    choose_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchFilter,
-    HnswSearchPolicy, HnswSearchStrategy, ScoredPoint, SearchParams,
+    HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, ScoredPoint, SearchParams,
 };
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
@@ -22,8 +21,7 @@ impl Segment {
         &self,
         predicate_tree: &PredicateTree,
     ) -> Result<RoaringBitmap> {
-        let evaluator =
-            IndexEvaluator::for_segment(self.predicate_indexes()?, None, self.num_rows());
+        let evaluator = IndexEvaluator::for_segment(self.predicate_indexes()?, self.num_rows());
         let evaluation = evaluator.evaluate_with_proof(predicate_tree);
 
         if evaluation.is_exact() {
@@ -90,13 +88,9 @@ impl Segment {
             (true, Some(bitmap)) => HnswSearchFilter::Predicate(bitmap),
             (false, Some(bitmap)) => HnswSearchFilter::Visibility(bitmap),
         };
-        let strategy = local_search_strategy(
-            filter,
-            self.num_rows(),
-            top_k,
-            policy.effective_ef(top_k, params.ef),
-            *policy,
-        );
+        let matching_rows = filter.bitmap().map_or(self.num_rows(), RoaringBitmap::len);
+        let strategy =
+            HnswSearchStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
         self.vector_search_with_filter_strategy(
             column_id, query, top_k, params, filter, policy, strategy,
         )
@@ -328,46 +322,6 @@ impl Segment {
         };
 
         Ok(combined_filter)
-    }
-}
-
-fn local_search_strategy(
-    filter: HnswSearchFilter<'_>,
-    total_rows: u64,
-    top_k: usize,
-    effective_ef: usize,
-    policy: HnswSearchPolicy,
-) -> HnswSearchStrategy {
-    match filter {
-        HnswSearchFilter::None => {
-            if total_rows <= policy.plain_scan_threshold as u64 {
-                HnswSearchStrategy::ExactScan
-            } else {
-                HnswSearchStrategy::UnfilteredGraph
-            }
-        }
-        HnswSearchFilter::Visibility(bitmap) => {
-            if bitmap.len() <= policy.filtered_plain_scan_threshold as u64 {
-                HnswSearchStrategy::ExactScan
-            } else {
-                HnswSearchStrategy::MaskedGraph
-            }
-        }
-        HnswSearchFilter::Predicate(bitmap) => {
-            match choose_filtered_search_strategy(
-                bitmap.len(),
-                total_rows,
-                top_k,
-                effective_ef,
-                policy,
-            )
-            .strategy
-            {
-                HnswFilteredSearchStrategy::ExactScan => HnswSearchStrategy::ExactScan,
-                HnswFilteredSearchStrategy::MaskedTopK => HnswSearchStrategy::MaskedGraph,
-                HnswFilteredSearchStrategy::RefinedTopK => HnswSearchStrategy::RefinedGraph,
-            }
-        }
     }
 }
 

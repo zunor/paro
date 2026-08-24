@@ -14,8 +14,8 @@ use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::{PredicateComparison, PredicateTree};
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::{
-    CapabilityToken, DenseVectorQuery, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
-    NormalizedSearchRequest, SearchRequestMode,
+    CapabilityToken, DenseVectorQuery, ExactBitmapMaterialization, FullTextQueryKind,
+    FullTextQueryStats, FullTextScoreMode, NormalizedSearchRequest, SearchRequestMode,
 };
 
 /// A scalar retained by a reusable search predicate.
@@ -99,16 +99,21 @@ impl fmt::Display for SearchPredicateTemplate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchFilterContract {
     None,
-    ExactSegmentBitmapNoResidual,
+    ExactSegmentBitmapNoResidual {
+        materialization: ExactBitmapMaterialization,
+    },
 }
 
 impl SearchFilterContract {
-    pub fn for_predicate(predicate: Option<&SearchPredicateTemplate>) -> Self {
-        if predicate.is_some() {
-            Self::ExactSegmentBitmapNoResidual
-        } else {
-            Self::None
-        }
+    /// Construct the proof only after lowering has established that no
+    /// residual filter remains above the search source.
+    pub fn exact_no_residual(
+        predicate: Option<&SearchPredicateTemplate>,
+        materialization: ExactBitmapMaterialization,
+    ) -> Self {
+        predicate.map_or(Self::None, |_| Self::ExactSegmentBitmapNoResidual {
+            materialization,
+        })
     }
 }
 
@@ -122,6 +127,10 @@ pub struct VectorSearchSpec {
     pub k: usize,
     pub params: SearchParams,
     pub search_policy: HnswSearchPolicy,
+    /// Generation-level physical degree used only to predict the likely
+    /// adaptive filtered-search phase in costing and EXPLAIN. Runtime observes
+    /// actual admissions and does not trust this estimate.
+    pub avg_level0_degree: f32,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
     /// Cardinality estimate used to explain the provider's expected filtered

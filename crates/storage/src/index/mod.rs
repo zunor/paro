@@ -64,7 +64,6 @@ mod index_pointer;
 mod index_storage_info;
 mod index_type;
 mod index_type_set;
-mod page_layout;
 mod predicate;
 mod predicate_result;
 
@@ -100,7 +99,6 @@ pub use index_type::{
     IndexType, IndexTypeInfo, PlanIndexInput,
 };
 pub use index_type_set::IndexTypeSet;
-pub use page_layout::PageLayout;
 pub use predicate::{
     collect_predicate_columns, compare_bytes, value_to_bytes, Predicate, PredicateComparison,
     PredicateTree,

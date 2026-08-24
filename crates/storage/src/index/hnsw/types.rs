@@ -76,9 +76,12 @@ pub enum SearchAlgorithm {
     /// every scored matching candidate into a separate exact-bitmap Top-K.
     /// This is sufficient for visibility masks and broad user predicates.
     MaskedTopK,
-    /// Start with connected masked Top-K navigation, then refine inside the
-    /// predicate-induced graph for selective user predicates.
-    FilteredTopK,
+    /// Start with connected masked Top-K navigation and inspect the observed
+    /// admission population. If it is too small, continue with bounded
+    /// predicate-aware two-hop expansion before the caller considers an exact
+    /// fallback. The decision to refine is made from observed work, not a
+    /// selectivity estimate.
+    AdaptiveFilteredTopK,
 }
 
 impl Default for SearchAlgorithm {
@@ -98,11 +101,28 @@ pub enum HnswSearchFilter<'a> {
     Predicate(&'a RoaringBitmap),
 }
 
+/// Semantic origin of an HNSW admission mask. Strategy selection consumes the
+/// origin and exact cardinalities without retaining a bitmap reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswFilterKind {
+    None,
+    Visibility,
+    Predicate,
+}
+
 impl<'a> HnswSearchFilter<'a> {
     pub fn bitmap(self) -> Option<&'a RoaringBitmap> {
         match self {
             Self::None => None,
             Self::Visibility(bitmap) | Self::Predicate(bitmap) => Some(bitmap),
+        }
+    }
+
+    pub const fn kind(self) -> HnswFilterKind {
+        match self {
+            Self::None => HnswFilterKind::None,
+            Self::Visibility(_) => HnswFilterKind::Visibility,
+            Self::Predicate(_) => HnswFilterKind::Predicate,
         }
     }
 }
@@ -129,7 +149,45 @@ pub enum HnswSearchStrategy {
     ExactScan,
     UnfilteredGraph,
     MaskedGraph,
-    RefinedGraph,
+    AdaptiveFilteredGraph,
+}
+
+impl HnswSearchStrategy {
+    /// Choose the query-wide execution contract from exact cardinalities.
+    /// Predicate graph searches are adaptive internally: the graph observes
+    /// the number of admitted points before deciding whether two-hop
+    /// predicate-aware refinement is necessary.
+    pub fn choose(
+        filter_kind: HnswFilterKind,
+        matching_rows: u64,
+        total_rows: u64,
+        policy: HnswSearchPolicy,
+    ) -> Self {
+        let matching_rows = matching_rows.min(total_rows);
+        match filter_kind {
+            HnswFilterKind::None => {
+                if total_rows <= policy.plain_scan_threshold as u64 {
+                    Self::ExactScan
+                } else {
+                    Self::UnfilteredGraph
+                }
+            }
+            HnswFilterKind::Visibility => {
+                if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
+                    Self::ExactScan
+                } else {
+                    Self::MaskedGraph
+                }
+            }
+            HnswFilterKind::Predicate => {
+                if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
+                    Self::ExactScan
+                } else {
+                    Self::AdaptiveFilteredGraph
+                }
+            }
+        }
+    }
 }
 
 /// Shared filtered-search strategy decision used by runtime, costing, and
@@ -148,39 +206,58 @@ pub enum HnswFilteredSearchStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswFilteredSearchDecision {
     pub strategy: HnswFilteredSearchStrategy,
-    /// Expected number of predicate-matching points in an ordinary connected
-    /// HNSW beam, using the exact/estimated query-wide selectivity.
-    pub expected_admitted_beam_points: u64,
+    /// Expected number of unique points scored by connected level-0 search.
+    /// Runtime does not trust this estimate; it measures admissions directly.
+    pub expected_scored_points: u64,
+    /// Expected predicate-matching points among all scored neighbors, not just
+    /// among the final `ef` beam.
+    pub expected_admitted_points: u64,
     /// Minimum expected matching beam population required before predicate
     /// refinement is considered redundant.
-    pub required_admitted_beam_points: u64,
+    pub required_admitted_points: u64,
 }
 
 const MASKED_TOPK_HEADROOM_NUMERATOR: u64 = 3;
 const MASKED_TOPK_HEADROOM_DENOMINATOR: u64 = 2;
 
-pub fn choose_filtered_search_strategy(
+pub fn required_filtered_admissions(top_k: usize) -> u64 {
+    (top_k as u128 * MASKED_TOPK_HEADROOM_NUMERATOR as u128)
+        .div_ceil(MASKED_TOPK_HEADROOM_DENOMINATOR as u128)
+        .min(u64::MAX as u128) as u64
+}
+
+/// Estimate the likely adaptive filtered-graph outcome for costing and
+/// EXPLAIN. Execution uses exact cardinalities only to choose exact scan versus
+/// adaptive graph; after graph navigation it decides from the observed number
+/// of admitted points. `avg_level0_degree` therefore cannot cause a correctness
+/// or latency cliff when filters correlate with vector geometry.
+pub fn estimate_filtered_search_strategy(
     matching_rows: u64,
     total_rows: u64,
     top_k: usize,
     effective_ef: usize,
+    avg_level0_degree: f32,
     policy: HnswSearchPolicy,
 ) -> HnswFilteredSearchDecision {
     let matching_rows = matching_rows.min(total_rows);
     let effective_ef = effective_ef.max(top_k).max(1);
-    let expected_admitted_beam_points = if total_rows == 0 {
+    let degree = if avg_level0_degree.is_finite() && avg_level0_degree > 0.0 {
+        avg_level0_degree.ceil() as u64
+    } else {
+        1
+    };
+    let expected_scored_points = (effective_ef as u64).saturating_mul(degree).min(total_rows);
+    let expected_admitted_points = if total_rows == 0 {
         0
     } else {
-        ((matching_rows as u128 * effective_ef as u128) / total_rows as u128).min(u64::MAX as u128)
-            as u64
+        ((matching_rows as u128 * expected_scored_points as u128) / total_rows as u128)
+            .min(u64::MAX as u128) as u64
     };
-    let required_admitted_beam_points = (top_k as u128 * MASKED_TOPK_HEADROOM_NUMERATOR as u128)
-        .div_ceil(MASKED_TOPK_HEADROOM_DENOMINATOR as u128)
-        .min(u64::MAX as u128) as u64;
+    let required_admitted_points = required_filtered_admissions(top_k);
 
     let strategy = if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
         HnswFilteredSearchStrategy::ExactScan
-    } else if expected_admitted_beam_points >= required_admitted_beam_points {
+    } else if expected_admitted_points >= required_admitted_points {
         // Connected navigation already expects enough exact-bitmap-admitted
         // candidates to fill Top-K with 50% headroom. Predicate-local
         // refinement would repeat graph work without adding a useful frontier.
@@ -191,8 +268,9 @@ pub fn choose_filtered_search_strategy(
 
     HnswFilteredSearchDecision {
         strategy,
-        expected_admitted_beam_points,
-        required_admitted_beam_points,
+        expected_scored_points,
+        expected_admitted_points,
+        required_admitted_points,
     }
 }
 
@@ -515,40 +593,70 @@ mod tests {
     }
 
     #[test]
-    fn filtered_strategy_uses_exact_threshold_then_beam_occupancy() {
+    fn filtered_strategy_estimate_uses_scored_neighbors_not_final_beam() {
         let policy = HnswSearchPolicy::default();
 
-        let exact = choose_filtered_search_strategy(20_000, 1_000_000, 10, 160, policy);
+        let exact = estimate_filtered_search_strategy(20_000, 1_000_000, 10, 160, 16.0, policy);
         assert_eq!(exact.strategy, HnswFilteredSearchStrategy::ExactScan);
 
-        let refined = choose_filtered_search_strategy(50_000, 1_000_000, 10, 160, policy);
-        assert_eq!(refined.expected_admitted_beam_points, 8);
-        assert_eq!(refined.required_admitted_beam_points, 15);
-        assert_eq!(refined.strategy, HnswFilteredSearchStrategy::RefinedTopK);
-
-        let masked = choose_filtered_search_strategy(100_000, 1_000_000, 10, 160, policy);
-        assert_eq!(masked.expected_admitted_beam_points, 16);
-        assert_eq!(masked.required_admitted_beam_points, 15);
+        let masked = estimate_filtered_search_strategy(50_000, 1_000_000, 10, 160, 16.0, policy);
+        assert_eq!(masked.expected_scored_points, 2_560);
+        assert_eq!(masked.expected_admitted_points, 128);
+        assert_eq!(masked.required_admitted_points, 15);
         assert_eq!(masked.strategy, HnswFilteredSearchStrategy::MaskedTopK);
+
+        let no_degree = estimate_filtered_search_strategy(
+            50_000,
+            1_000_000,
+            10,
+            160,
+            0.0,
+            HnswSearchPolicy {
+                filtered_plain_scan_threshold: 0,
+                ..policy
+            },
+        );
+        assert_eq!(no_degree.expected_admitted_points, 8);
+        assert_eq!(no_degree.strategy, HnswFilteredSearchStrategy::RefinedTopK);
     }
 
     #[test]
     fn filtered_strategy_adapts_to_topk_and_effective_ef() {
         let policy = HnswSearchPolicy::default();
-        let matching_rows = 100_000;
+        let matching_rows = 10_000;
         let total_rows = 1_000_000;
+        let policy = HnswSearchPolicy {
+            filtered_plain_scan_threshold: 0,
+            ..policy
+        };
 
         assert_eq!(
-            choose_filtered_search_strategy(matching_rows, total_rows, 10, 100, policy).strategy,
-            HnswFilteredSearchStrategy::RefinedTopK
-        );
-        assert_eq!(
-            choose_filtered_search_strategy(matching_rows, total_rows, 10, 160, policy).strategy,
+            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 100, 16.0, policy,)
+                .strategy,
             HnswFilteredSearchStrategy::MaskedTopK
         );
         assert_eq!(
-            choose_filtered_search_strategy(matching_rows, total_rows, 20, 160, policy).strategy,
+            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 160, 16.0, policy,)
+                .strategy,
+            HnswFilteredSearchStrategy::MaskedTopK
+        );
+        assert_eq!(
+            estimate_filtered_search_strategy(matching_rows, total_rows, 20, 160, 16.0, policy,)
+                .strategy,
             HnswFilteredSearchStrategy::RefinedTopK
+        );
+    }
+
+    #[test]
+    fn runtime_strategy_is_exact_or_adaptive_without_estimate_driven_cliffs() {
+        let policy = HnswSearchPolicy::default();
+        assert_eq!(
+            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_000, 10_000_000, policy,),
+            HnswSearchStrategy::ExactScan
+        );
+        assert_eq!(
+            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
+            HnswSearchStrategy::AdaptiveFilteredGraph
         );
     }
 }

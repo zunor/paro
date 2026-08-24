@@ -174,7 +174,7 @@ impl<V> Predicate<V> {
                 column_id,
                 values: values
                     .into_iter()
-                    .map(|value| map(value))
+                    .map(map)
                     .collect::<std::result::Result<Vec<_>, _>>()?,
             },
             Self::FixedIn { column_id, values } => Predicate::FixedIn { column_id, values },

@@ -436,6 +436,7 @@ impl RowFetchBenchFixture {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
         let rows = loop {
             match cursor.next_batch(

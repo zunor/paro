@@ -48,6 +48,9 @@ id
 CREATE TABLE indexed_items (id INT, bucket SMALLINT, emb VECTOR(3));
 CREATE TABLE
 
+CREATE INDEX idx_indexed_items_id ON indexed_items (id);
+CREATE INDEX
+
 CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
 CREATE INDEX
 
@@ -58,7 +61,7 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_search = 24
     build_seed = 7
     plain_scan_threshold = 0
-    filtered_plain_scan_threshold = 256
+    filtered_plain_scan_threshold = 8
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
@@ -107,9 +110,58 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Ef: default
     Pushed Predicate: bucket = 3
-    Filter Pushdown: exact segment bitmap; no residual filter
+    Filter Pushdown: exact segment bitmap from scalar postings; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: exact bitmap distance scan (estimated 205/2048 rows; exact threshold 256)
+    Filtered Strategy: adaptive connected HNSW; masked admission expected (estimated 205/2048 rows; scored 384; admitted 38 >= required 3; runtime may upgrade to refinement, then exact fallback on underfill)
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id = 1
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Ef: default
+    Pushed Predicate: id = 1
+    Filter Pushdown: exact segment bitmap from scalar postings; no residual filter
+    Filter Rows (estimated): 1
+    Filtered Strategy: exact bitmap distance scan (estimated 1/2048 rows; exact threshold 8)
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id <= 9
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Ef: default
+    Pushed Predicate: id <= 9
+    Filter Pushdown: exact segment bitmap from scalar postings; no residual filter
+    Filter Rows (estimated): 9
+    Filtered Strategy: adaptive connected HNSW; two-hop predicate refinement expected (estimated 9/2048 rows; scored 384; admitted 1 < required 3; exact scan is final fallback)
+
+SELECT id FROM indexed_items
+WHERE id <= 9
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+id
+9
+8
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -182,9 +234,9 @@ PROJECTION  (rows=2)
     Limit: 2
     Search Ef: default
     Pushed Predicate: bucket = 3
-    Filter Pushdown: exact segment bitmap; no residual filter
+    Filter Pushdown: exact segment bitmap from scalar postings; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: exact bitmap distance scan (estimated 205/2048 rows; exact threshold 256)
+    Filtered Strategy: adaptive connected HNSW; masked admission expected (estimated 205/2048 rows; scored 384; admitted 38 >= required 3; runtime may upgrade to refinement, then exact fallback on underfill)
 
 DEALLOCATE filtered_vector_topk;
 DEALLOCATE

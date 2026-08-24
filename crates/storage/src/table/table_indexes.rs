@@ -46,6 +46,20 @@ impl TableHandle {
             .declare_art_index(&self.tablet(), column_id);
     }
 
+    /// Activate the durable ART maintenance contract and backfill all visible
+    /// segments. The declaration is installed first so concurrent future
+    /// writes are covered; readers still require each segment's completeness
+    /// credential. A failed backfill rolls the declaration and artifacts back.
+    pub fn install_art_index(&self, column_id: ColumnId) -> Result<()> {
+        self.declare_art_index(column_id);
+        if let Err(error) = self.rebuild_art_index(column_id) {
+            self.forget_art_index(column_id);
+            let _ = self.drop_art_index(column_id);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub fn forget_art_index(&self, column_id: ColumnId) {
         self.runtime_indexes
             .forget_art_index(&self.tablet(), column_id);
@@ -83,6 +97,13 @@ impl TableHandle {
 
     pub(crate) fn declared_art_columns(&self) -> Vec<ColumnId> {
         self.runtime_indexes.declared_art_columns()
+    }
+
+    /// Whether the table has a declared scalar-index maintenance contract for
+    /// this column. Segment evaluation independently validates its row-count
+    /// completeness credential before treating postings as exact.
+    pub fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
+        self.runtime_indexes.has_declared_art_index(column_id)
     }
 
     /// Count runtime-visible secondary indexes across table-global and segment-local state.

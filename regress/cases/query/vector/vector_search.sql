@@ -26,6 +26,7 @@ SELECT id FROM items ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 -- Exercise the indexed path on one inline-built rowset. Persist the complete,
 -- versioned HNSW contract instead of relying on provider-local defaults.
 CREATE TABLE indexed_items (id INT, bucket SMALLINT, emb VECTOR(3));
+CREATE INDEX idx_indexed_items_id ON indexed_items (id);
 CREATE INDEX idx_indexed_items_bucket ON indexed_items (bucket);
 CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     distance = l2
@@ -34,7 +35,7 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_search = 24
     build_seed = 7
     plain_scan_threshold = 0
-    filtered_plain_scan_threshold = 256
+    filtered_plain_scan_threshold = 8
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
@@ -52,6 +53,21 @@ ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 WHERE bucket = 3
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+
+-- Keep SQL-level coverage for all adaptive stages. A singleton is an exact
+-- bitmap scan, a nine-row range predicts two-hop refinement, and the bucket
+-- predicate above predicts masked admission without refinement.
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id = 1
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+-- @normalize explain_search_ids
+EXPLAIN SELECT id FROM indexed_items
+WHERE id <= 9
+ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
+SELECT id FROM indexed_items
+WHERE id <= 9
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
 -- A cosine operator must not consume an L2 artifact. Metric mismatch is a

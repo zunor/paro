@@ -122,6 +122,12 @@ impl RuntimeIndexes {
             .unwrap_or_default()
     }
 
+    pub(crate) fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
+        self.declared_art_indexes
+            .read()
+            .is_ok_and(|guard| guard.contains(&column_id))
+    }
+
     pub(crate) fn recovery_index_count(&self, tablet: &TabletRef) -> usize {
         let mut art_columns = self
             .declared_art_indexes

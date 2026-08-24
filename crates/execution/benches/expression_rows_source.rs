@@ -82,6 +82,7 @@ impl ExpressionRowsBench {
         let exec = SourceExec::Values(ValuesSourceExec {
             spec: ValuesSpec {
                 table_index: 0,
+                relation_alias: None,
                 expressions,
                 output_names: (0..COLUMNS)
                     .map(|column| format!("c{column}"))

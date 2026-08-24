@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use crate::physical::specs::{SearchFilterContract, SearchPredicateTemplate};
+use crate::physical::specs::SearchPredicateTemplate;
 
 impl PhysicalPlanGenerator {
     pub(crate) fn lower_insert(
@@ -243,7 +243,10 @@ impl PhysicalPlanGenerator {
             ));
         }
 
-        let filter_contract = SearchFilterContract::for_predicate(predicate.as_ref());
+        // Residual predicates were rejected above, so this is the exact
+        // segment-bitmap proof boundary for the search source.
+        let filter_contract =
+            super::scan::exact_search_filter_contract(table.as_ref(), predicate.as_ref());
         let spec = FullTextSearchSpec {
             table,
             capability_token: candidate.token.clone(),

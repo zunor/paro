@@ -21,6 +21,14 @@ pub struct SearchTelemetry {
     pub post_filter_count: u64,
     /// Optional selectivity histogram buckets.
     pub filter_selectivity_histogram: Option<Vec<u64>>,
+    /// Total vector distance evaluations performed by HNSW and exact fallback
+    /// paths. Non-HNSW users leave this counter at zero.
+    pub hnsw_scored_points: u64,
+    pub hnsw_exact_scan_count: u64,
+    pub hnsw_masked_graph_count: u64,
+    pub hnsw_adaptive_graph_count: u64,
+    pub hnsw_predicate_refinement_count: u64,
+    pub hnsw_exact_fallback_count: u64,
 }
 
 impl Default for SearchTelemetry {
@@ -31,6 +39,12 @@ impl Default for SearchTelemetry {
             pre_filter_count: 0,
             post_filter_count: 0,
             filter_selectivity_histogram: None,
+            hnsw_scored_points: 0,
+            hnsw_exact_scan_count: 0,
+            hnsw_masked_graph_count: 0,
+            hnsw_adaptive_graph_count: 0,
+            hnsw_predicate_refinement_count: 0,
+            hnsw_exact_fallback_count: 0,
         }
     }
 }
@@ -77,6 +91,33 @@ impl SearchTelemetry {
                 *slot = slot.saturating_add(1);
             }
         }
+    }
+
+    pub fn record_hnsw_work(
+        &mut self,
+        scored_points: u64,
+        exact_scan: bool,
+        masked_graph: bool,
+        adaptive_graph: bool,
+        predicate_refined: bool,
+        exact_fallback: bool,
+    ) {
+        self.hnsw_scored_points = self.hnsw_scored_points.saturating_add(scored_points);
+        self.hnsw_exact_scan_count = self
+            .hnsw_exact_scan_count
+            .saturating_add(u64::from(exact_scan));
+        self.hnsw_masked_graph_count = self
+            .hnsw_masked_graph_count
+            .saturating_add(u64::from(masked_graph));
+        self.hnsw_adaptive_graph_count = self
+            .hnsw_adaptive_graph_count
+            .saturating_add(u64::from(adaptive_graph));
+        self.hnsw_predicate_refinement_count = self
+            .hnsw_predicate_refinement_count
+            .saturating_add(u64::from(predicate_refined));
+        self.hnsw_exact_fallback_count = self
+            .hnsw_exact_fallback_count
+            .saturating_add(u64::from(exact_fallback));
     }
 }
 

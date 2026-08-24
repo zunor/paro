@@ -13,7 +13,7 @@ use super::search_context::FixedLengthPriorityQueue;
 use super::vector_storage::{CosineInverseNorms, IndexedVectorStorage, VectorStorage};
 use super::visited_pool::VisitedPool;
 #[cfg(test)]
-use super::{choose_filtered_search_strategy, HnswConfig, HnswFilteredSearchStrategy};
+use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
     HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, PointOffset, PreparedQuery,
@@ -786,12 +786,20 @@ impl HnswIndex {
 
         let prepared_query = self.build_contract.distance.prepare(query);
         let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
+        let mut exact_scan = false;
+        let mut masked_graph = false;
+        let mut adaptive_graph = false;
+        let mut predicate_refined = false;
+        let mut exact_fallback = false;
         let results = if self.should_use_plain_scan(filter, policy, strategy) {
+            exact_scan = true;
             self.plain_scan(top_k, &mut scorer, filter_bitmap)
         } else {
             let algorithm = Self::algorithm_for_strategy(filter, strategy)?;
+            masked_graph = algorithm == SearchAlgorithm::MaskedTopK;
+            adaptive_graph = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
             let ef = Self::effective_graph_ef(top_k, params, policy);
-            let results = self.graph.search_one(
+            let graph_result = self.graph.search_one(
                 top_k,
                 ef,
                 algorithm,
@@ -799,9 +807,12 @@ impl HnswIndex {
                 filter_bitmap,
                 Self::use_random_entry_point(params),
             );
+            predicate_refined = graph_result.predicate_refined;
+            let results = graph_result.points;
             if filter_bitmap.is_some()
-                && results.len() < top_k.min(filter_bitmap.map_or(0, RoaringBitmap::len) as usize)
+                && results.len() < self.expected_filtered_rows(top_k, filter_bitmap)?
             {
+                exact_fallback = true;
                 self.plain_scan(top_k, &mut scorer, filter_bitmap)
             } else {
                 results
@@ -809,10 +820,15 @@ impl HnswIndex {
         };
 
         let elapsed_us = start.elapsed().as_micros() as u64;
-        self.single_telemetry.lock().unwrap().record(
-            elapsed_us,
-            pre_filter_count,
-            post_filter_count,
+        let mut telemetry = self.single_telemetry.lock().unwrap();
+        telemetry.record(elapsed_us, pre_filter_count, post_filter_count);
+        telemetry.record_hnsw_work(
+            scorer.scored_point_count(),
+            exact_scan,
+            masked_graph,
+            adaptive_graph,
+            predicate_refined,
+            exact_fallback,
         );
 
         Ok(results)
@@ -828,7 +844,15 @@ impl HnswIndex {
     ) -> Result<Vec<ScoredPoint>> {
         let policy = HnswSearchPolicy::default();
         let filter = filter_bitmap.map_or(HnswSearchFilter::None, HnswSearchFilter::Predicate);
-        let strategy = self.strategy_for_test(filter, policy, top_k, params);
+        let matching_rows = filter
+            .bitmap()
+            .map_or(self.graph.num_points() as u64, RoaringBitmap::len);
+        let strategy = HnswSearchStrategy::choose(
+            filter.kind(),
+            matching_rows,
+            self.graph.num_points() as u64,
+            policy,
+        );
         self.search_one_with_policy_strategy(query, top_k, params, filter, &policy, strategy)
     }
 
@@ -876,11 +900,12 @@ impl HnswIndex {
                 filter_bitmap,
                 Self::use_random_entry_point(params),
             );
-            let expected_rows = top_k.min(
-                filter_bitmap.map_or(self.graph.num_points() as u64, RoaringBitmap::len) as usize,
-            );
+            let expected_rows = self.expected_filtered_rows(top_k, filter_bitmap)?;
             if filter_bitmap.is_some() {
-                let mut results = results;
+                let mut results = results
+                    .into_iter()
+                    .map(|result| result.points)
+                    .collect::<Vec<_>>();
                 for (rows, scorer) in results.iter_mut().zip(scorers.iter_mut()) {
                     if rows.len() < expected_rows {
                         *rows = self.plain_scan(top_k, scorer, filter_bitmap);
@@ -888,7 +913,7 @@ impl HnswIndex {
                 }
                 results
             } else {
-                results
+                results.into_iter().map(|result| result.points).collect()
             }
         };
 
@@ -999,15 +1024,14 @@ impl HnswIndex {
         match (strategy, filter) {
             (HnswSearchStrategy::UnfilteredGraph, HnswSearchFilter::None)
             | (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::None)
-            | (HnswSearchStrategy::RefinedGraph, HnswSearchFilter::None) => {
+            | (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::None) => {
                 Ok(SearchAlgorithm::Hnsw)
             }
-            (
-                HnswSearchStrategy::MaskedGraph,
-                HnswSearchFilter::Visibility(_) | HnswSearchFilter::Predicate(_),
-            ) => Ok(SearchAlgorithm::MaskedTopK),
-            (HnswSearchStrategy::RefinedGraph, HnswSearchFilter::Predicate(_)) => {
-                Ok(SearchAlgorithm::FilteredTopK)
+            (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::Visibility(_)) => {
+                Ok(SearchAlgorithm::MaskedTopK)
+            }
+            (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::Predicate(_)) => {
+                Ok(SearchAlgorithm::AdaptiveFilteredTopK)
             }
             (HnswSearchStrategy::ExactScan, _) => Err(error::internal(
                 "exact HNSW strategy reached graph algorithm selection",
@@ -1015,7 +1039,10 @@ impl HnswIndex {
             (HnswSearchStrategy::UnfilteredGraph, _) => Err(error::internal(
                 "unfiltered HNSW strategy received an admission bitmap",
             )),
-            (HnswSearchStrategy::RefinedGraph, HnswSearchFilter::Visibility(_)) => Err(
+            (HnswSearchStrategy::MaskedGraph, HnswSearchFilter::Predicate(_)) => Err(
+                error::internal("predicate HNSW search must use adaptive graph execution"),
+            ),
+            (HnswSearchStrategy::AdaptiveFilteredGraph, HnswSearchFilter::Visibility(_)) => Err(
                 error::internal("visibility-only HNSW search cannot use predicate refinement"),
             ),
         }
@@ -1070,43 +1097,24 @@ impl HnswIndex {
         }
     }
 
-    #[cfg(test)]
-    fn strategy_for_test(
+    fn expected_filtered_rows(
         &self,
-        filter: HnswSearchFilter<'_>,
-        policy: HnswSearchPolicy,
         top_k: usize,
-        params: &SearchParams,
-    ) -> HnswSearchStrategy {
-        match filter {
-            HnswSearchFilter::None => {
-                if self.graph.num_points() <= policy.plain_scan_threshold {
-                    HnswSearchStrategy::ExactScan
-                } else {
-                    HnswSearchStrategy::UnfilteredGraph
-                }
-            }
-            HnswSearchFilter::Visibility(bitmap) => {
-                if bitmap.len() <= policy.filtered_plain_scan_threshold as u64 {
-                    HnswSearchStrategy::ExactScan
-                } else {
-                    HnswSearchStrategy::MaskedGraph
-                }
-            }
-            HnswSearchFilter::Predicate(bitmap) => match choose_filtered_search_strategy(
-                bitmap.len(),
-                self.graph.num_points() as u64,
-                top_k,
-                policy.effective_ef(top_k, params.ef),
-                policy,
-            )
-            .strategy
-            {
-                HnswFilteredSearchStrategy::ExactScan => HnswSearchStrategy::ExactScan,
-                HnswFilteredSearchStrategy::MaskedTopK => HnswSearchStrategy::MaskedGraph,
-                HnswFilteredSearchStrategy::RefinedTopK => HnswSearchStrategy::RefinedGraph,
-            },
+        filter_bitmap: Option<&RoaringBitmap>,
+    ) -> Result<usize> {
+        let Some(bitmap) = filter_bitmap else {
+            return Ok(top_k.min(self.graph.num_points()));
+        };
+        if bitmap
+            .max()
+            .is_some_and(|point| point as usize >= self.graph.num_points())
+        {
+            return Err(error::data_corrupted(format!(
+                "HNSW filter bitmap domain exceeds graph cardinality {}",
+                self.graph.num_points()
+            )));
         }
+        Ok(top_k.min(bitmap.len() as usize))
     }
 
     fn plain_scan(
@@ -1537,7 +1545,6 @@ mod tests {
         let params = SearchParams {
             ef: Some(96),
             random_entry_point: Some(false),
-            ..Default::default()
         };
         let top_k = 12;
 
@@ -1654,7 +1661,6 @@ mod tests {
         let params = SearchParams {
             ef: Some(96),
             random_entry_point: Some(false),
-            ..Default::default()
         };
         let top_k = 8;
 
@@ -1701,10 +1707,10 @@ mod tests {
         assert_eq!(
             HnswIndex::algorithm_for_strategy(
                 HnswSearchFilter::Predicate(&filter),
-                HnswSearchStrategy::RefinedGraph,
+                HnswSearchStrategy::AdaptiveFilteredGraph,
             )
             .unwrap(),
-            SearchAlgorithm::FilteredTopK
+            SearchAlgorithm::AdaptiveFilteredTopK
         );
         assert_eq!(
             HnswIndex::algorithm_for_strategy(
@@ -1714,14 +1720,11 @@ mod tests {
             .unwrap(),
             SearchAlgorithm::MaskedTopK
         );
-        assert_eq!(
-            HnswIndex::algorithm_for_strategy(
-                HnswSearchFilter::Predicate(&filter),
-                HnswSearchStrategy::MaskedGraph,
-            )
-            .unwrap(),
-            SearchAlgorithm::MaskedTopK
-        );
+        assert!(HnswIndex::algorithm_for_strategy(
+            HnswSearchFilter::Predicate(&filter),
+            HnswSearchStrategy::MaskedGraph,
+        )
+        .is_err());
         assert_eq!(
             HnswIndex::algorithm_for_strategy(
                 HnswSearchFilter::None,
@@ -1732,9 +1735,62 @@ mod tests {
         );
         assert!(HnswIndex::algorithm_for_strategy(
             HnswSearchFilter::Visibility(&filter),
-            HnswSearchStrategy::RefinedGraph,
+            HnswSearchStrategy::AdaptiveFilteredGraph,
         )
         .is_err());
+    }
+
+    #[test]
+    fn adaptive_filtered_graph_refines_from_observed_admissions() {
+        let vectors = make_sift_like_vectors(101, 512, 24, 16);
+        let storage = make_storage(&vectors);
+        let config = HnswConfig::new(16, 96)
+            .with_plain_scan_threshold(0)
+            .with_filtered_plain_scan_threshold(0)
+            .with_ef(96);
+        let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
+        let query = &vectors[7];
+        let params = SearchParams {
+            ef: Some(96),
+            random_entry_point: Some(false),
+        };
+        let policy = HnswSearchPolicy {
+            ef_search: 96,
+            plain_scan_threshold: 0,
+            filtered_plain_scan_threshold: 0,
+        };
+
+        let broad = RoaringBitmap::from_iter((0..vectors.len() as u32).filter(|idx| idx % 4 != 0));
+        let broad_rows = index
+            .search_one_with_policy_strategy(
+                query,
+                10,
+                &params,
+                HnswSearchFilter::Predicate(&broad),
+                &policy,
+                HnswSearchStrategy::AdaptiveFilteredGraph,
+            )
+            .unwrap();
+        assert_eq!(broad_rows.len(), 10);
+        let broad_telemetry = index.search_telemetry();
+        assert_eq!(broad_telemetry.hnsw_adaptive_graph_count, 1);
+        assert_eq!(broad_telemetry.hnsw_predicate_refinement_count, 0);
+
+        let selective = RoaringBitmap::from_iter((0..vectors.len() as u32).step_by(64));
+        let selective_rows = index
+            .search_one_with_policy_strategy(
+                query,
+                6,
+                &params,
+                HnswSearchFilter::Predicate(&selective),
+                &policy,
+                HnswSearchStrategy::AdaptiveFilteredGraph,
+            )
+            .unwrap();
+        assert_eq!(selective_rows.len(), 6);
+        let telemetry = index.search_telemetry();
+        assert_eq!(telemetry.hnsw_adaptive_graph_count, 2);
+        assert_eq!(telemetry.hnsw_predicate_refinement_count, 1);
     }
 
     #[test]
@@ -1773,7 +1829,7 @@ mod tests {
                 top_k,
                 &params,
                 Some(&filter),
-                HnswSearchStrategy::RefinedGraph,
+                HnswSearchStrategy::AdaptiveFilteredGraph,
             )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
@@ -2121,12 +2177,12 @@ mod tests {
         assert!(index.should_use_plain_scan(
             HnswSearchFilter::Predicate(&small_filter),
             &policy,
-            HnswSearchStrategy::RefinedGraph
+            HnswSearchStrategy::AdaptiveFilteredGraph
         ));
         assert!(!index.should_use_plain_scan(
             HnswSearchFilter::Predicate(&large_filter),
             &policy,
-            HnswSearchStrategy::RefinedGraph
+            HnswSearchStrategy::AdaptiveFilteredGraph
         ));
     }
 
@@ -2150,7 +2206,6 @@ mod tests {
         let params = SearchParams {
             ef: Some(96),
             random_entry_point: Some(false),
-            ..Default::default()
         };
         let top_k = 6;
 

@@ -2445,6 +2445,7 @@ mod tests {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
 
         loop {
@@ -3355,7 +3356,6 @@ mod tests {
                 SearchParams {
                     ef: Some(16),
                     random_entry_point: Some(false),
-                    ..Default::default()
                 },
                 None,
                 reopened_again.max_version(),
@@ -3821,6 +3821,7 @@ mod tests {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
         loop {
             match cursor.next_batch(&batch, &mut budget).unwrap() {
@@ -4828,6 +4829,7 @@ mod tests {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
         let mut row_count = 0usize;
         loop {
@@ -5400,6 +5402,7 @@ mod tests {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
         let mut returned = 0usize;
         while let SearchBatchState::Ready(batch) = cursor.next_batch(&batch, &mut budget).unwrap() {

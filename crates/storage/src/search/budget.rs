@@ -2,9 +2,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::fmt::Debug;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchBatchConfig {
@@ -36,6 +37,7 @@ pub trait SearchMemoryAccountant: Debug + Send + Sync {
 /// typed vectors. Dropping the search working set releases the query grant.
 #[derive(Debug)]
 pub struct SearchMemoryReservation {
+    tracker: Arc<SearchMemoryTracker>,
     accountant: Option<Arc<dyn SearchMemoryAccountant>>,
     bytes: usize,
 }
@@ -45,6 +47,40 @@ impl Drop for SearchMemoryReservation {
         if let Some(accountant) = &self.accountant {
             accountant.release(self.bytes);
         }
+        self.tracker.release(self.bytes);
+    }
+}
+
+/// Query-local retained-memory ledger shared by every clone of a resource
+/// budget. Providers reserve through [`ResourceBudget::try_reserve_memory`];
+/// callers never need a second ad-hoc atomic or a separate interpretation of
+/// the limit.
+#[derive(Debug, Default)]
+pub struct SearchMemoryTracker {
+    retained: AtomicUsize,
+}
+
+impl SearchMemoryTracker {
+    fn try_reserve(&self, bytes: usize, limit: usize) -> Result<()> {
+        self.retained
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_add(bytes).filter(|next| *next <= limit)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                paro_error::out_of_memory(format!(
+                    "search working set exceeds query budget of {limit} bytes"
+                ))
+            })
+    }
+
+    fn release(&self, bytes: usize) {
+        let previous = self.retained.fetch_sub(bytes, Ordering::AcqRel);
+        debug_assert!(previous >= bytes, "search memory reservation underflow");
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained.load(Ordering::Acquire)
     }
 }
 
@@ -56,14 +92,23 @@ pub struct ResourceBudget {
     pub cpu_step_budget: Option<usize>,
     pub context: Option<ResourceContext>,
     pub memory_accountant: Option<Arc<dyn SearchMemoryAccountant>>,
+    /// Shared local ledger enforcing `memory_limit_bytes`, including when no
+    /// engine-level memory accountant is installed.
+    pub memory_tracker: Arc<SearchMemoryTracker>,
 }
 
 impl ResourceBudget {
     pub fn try_reserve_memory(&self, bytes: usize) -> Result<SearchMemoryReservation> {
+        self.memory_tracker
+            .try_reserve(bytes, self.memory_limit_bytes)?;
         if let Some(accountant) = &self.memory_accountant {
-            accountant.try_reserve(bytes)?;
+            if let Err(error) = accountant.try_reserve(bytes) {
+                self.memory_tracker.release(bytes);
+                return Err(error);
+            }
         }
         Ok(SearchMemoryReservation {
+            tracker: self.memory_tracker.clone(),
             accountant: self.memory_accountant.clone(),
             bytes,
         })
@@ -79,6 +124,7 @@ impl Default for ResourceBudget {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Arc::new(SearchMemoryTracker::default()),
         }
     }
 }
@@ -114,7 +160,21 @@ mod tests {
         {
             let _reservation = budget.try_reserve_memory(4096).unwrap();
             assert_eq!(accountant.retained.load(Ordering::Acquire), 4096);
+            assert_eq!(budget.memory_tracker.retained_bytes(), 4096);
         }
         assert_eq!(accountant.retained.load(Ordering::Acquire), 0);
+        assert_eq!(budget.memory_tracker.retained_bytes(), 0);
+    }
+
+    #[test]
+    fn reservation_enforces_local_limit_without_accountant() {
+        let budget = ResourceBudget {
+            memory_limit_bytes: 4096,
+            ..ResourceBudget::default()
+        };
+        let reservation = budget.try_reserve_memory(4096).unwrap();
+        assert!(budget.try_reserve_memory(1).is_err());
+        drop(reservation);
+        assert!(budget.try_reserve_memory(4096).is_ok());
     }
 }

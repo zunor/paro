@@ -7,8 +7,9 @@
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
-    choose_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
+    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
 };
+use paro_storage::search::ExactBitmapMaterialization;
 use paro_storage::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
@@ -94,10 +95,11 @@ impl VectorScanCostModel {
         filter_selectivity: f64,
         ef: Option<usize>,
         policy: HnswSearchPolicy,
-        filtered: bool,
+        bitmap_materialization: Option<ExactBitmapMaterialization>,
     ) -> f64 {
         let n = stats.num_indexed_vectors.max(1) as f64;
         let selectivity = clamp_selectivity(filter_selectivity);
+        let filtered = bitmap_materialization.is_some();
         let candidate_rows = if filtered {
             (n * selectivity).ceil().max(1.0)
         } else {
@@ -112,33 +114,46 @@ impl VectorScanCostModel {
         let effective_ef = policy.effective_ef(k, ef);
         let ef_val = effective_ef as f64;
         let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
-        let graph_cost = log_n * ef_val * dim_factor;
+        let scored_points = ef_val * stats.avg_level0_degree.max(1.0) as f64;
+        let raw_graph_cost = (log_n + scored_points) * dim_factor;
+        // The threshold is the measured crossover contract between exact and
+        // graph execution. Anchor graph cost there so crossing the threshold
+        // cannot make a larger input look cheaper.
+        let graph_cost = raw_graph_cost.max(exact_threshold * dim_factor);
+        let bitmap_cost = match bitmap_materialization {
+            None => 0.0,
+            Some(ExactBitmapMaterialization::ScalarIndex) => {
+                log_n + candidate_rows / u64::BITS as f64
+            }
+            Some(ExactBitmapMaterialization::ColumnScan) => n * 0.25,
+        };
 
         if candidate_rows <= exact_threshold {
             // Join the graph estimate continuously at the exact-scan boundary.
             // This keeps increasing cardinality from making an access path
             // appear cheaper merely because it crossed a policy threshold.
-            let threshold = exact_threshold.max(1.0);
-            return (graph_cost * candidate_rows / threshold).max(1.0);
+            return bitmap_cost + (candidate_rows * dim_factor).max(1.0);
         }
 
         if filtered {
-            return match choose_filtered_search_strategy(
-                candidate_rows as u64,
-                stats.num_indexed_vectors as u64,
-                k,
-                effective_ef,
-                policy,
-            )
-            .strategy
-            {
-                HnswFilteredSearchStrategy::ExactScan => graph_cost,
-                HnswFilteredSearchStrategy::MaskedTopK => graph_cost,
-                // Connected navigation plus an independent predicate-local
-                // refinement generation. The exact factor is deliberately
-                // conservative; runtime telemetry can tune it later.
-                HnswFilteredSearchStrategy::RefinedTopK => graph_cost * 2.0,
-            };
+            return bitmap_cost
+                + match estimate_filtered_search_strategy(
+                    candidate_rows as u64,
+                    stats.num_indexed_vectors as u64,
+                    k,
+                    effective_ef,
+                    stats.avg_level0_degree,
+                    policy,
+                )
+                .strategy
+                {
+                    HnswFilteredSearchStrategy::ExactScan => candidate_rows * dim_factor,
+                    HnswFilteredSearchStrategy::MaskedTopK => graph_cost,
+                    // Adaptive refinement reuses the connected traversal's scored
+                    // set and adds bounded two-hop work rather than a second full
+                    // graph generation.
+                    HnswFilteredSearchStrategy::RefinedTopK => graph_cost * 1.5,
+                };
         }
 
         graph_cost
@@ -276,18 +291,18 @@ mod tests {
             0.001,
             Some(40),
             policy,
-            true,
+            Some(ExactBitmapMaterialization::ScalarIndex),
         );
 
-        assert_eq!(cost, 1.0);
+        assert!(cost > 1.0);
         assert!(
-            cost < 20.0,
+            cost < 50.0,
             "exact search source must beat generic row Top-N"
         );
     }
 
     #[test]
-    fn broad_filtered_graph_cost_shares_the_unfiltered_navigation_frontier() {
+    fn broad_filtered_graph_cost_includes_bitmap_materialization() {
         let policy = HnswSearchPolicy {
             ef_search: 40,
             plain_scan_threshold: 10_000,
@@ -295,11 +310,44 @@ mod tests {
         };
         let stats = hnsw_stats(1_000_000, 128);
         let unfiltered =
-            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 1.0, Some(40), policy, false);
-        let filtered =
-            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 0.75, Some(40), policy, true);
+            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 1.0, Some(40), policy, None);
+        let filtered = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            0.75,
+            Some(40),
+            policy,
+            Some(ExactBitmapMaterialization::ScalarIndex),
+        );
 
-        assert_eq!(filtered, unfiltered);
+        assert!(filtered > unfiltered);
+    }
+
+    #[test]
+    fn column_scan_bitmap_cost_is_visible_to_the_optimizer() {
+        let policy = HnswSearchPolicy {
+            ef_search: 80,
+            plain_scan_threshold: 10_000,
+            filtered_plain_scan_threshold: 20_000,
+        };
+        let stats = hnsw_stats(1_000_000, 128);
+        let postings = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            0.01,
+            Some(80),
+            policy,
+            Some(ExactBitmapMaterialization::ScalarIndex),
+        );
+        let scan = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            0.01,
+            Some(80),
+            policy,
+            Some(ExactBitmapMaterialization::ColumnScan),
+        );
+        assert!(scan > postings * 10.0, "scan={scan}, postings={postings}");
     }
 
     #[test]
@@ -316,7 +364,7 @@ mod tests {
             20_000.0 / 1_000_000.0,
             Some(40),
             policy,
-            true,
+            Some(ExactBitmapMaterialization::ScalarIndex),
         );
         let above_threshold = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
@@ -324,7 +372,7 @@ mod tests {
             20_001.0 / 1_000_000.0,
             Some(40),
             policy,
-            true,
+            Some(ExactBitmapMaterialization::ScalarIndex),
         );
         assert!(above_threshold >= at_threshold);
     }

@@ -260,6 +260,7 @@ fn create_search_driver(
         cpu_step_budget: None,
         context: None,
         memory_accountant: Some(ctx.query.memory.clone()),
+        memory_tracker: Default::default(),
     };
     Ok(SearchOperatorDriver::new(
         table,
@@ -289,7 +290,7 @@ fn bind_search_predicate_node(
             SearchPredicateValue::Bound(value) => Ok(BoundSearchValue::Value(value)),
             SearchPredicateValue::RuntimeParameter { slot, target_type } => {
                 let bound = params.value_for_slot(&slot)?;
-                if &bound.logical_type() == &target_type {
+                if bound.logical_type() == target_type {
                     Ok(BoundSearchValue::Value(bound.clone()))
                 } else {
                     match bound.cast(&target_type) {

@@ -245,7 +245,7 @@ impl PostCommitActions {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.rebuild_art_index(column_id.index)?;
+            storage.install_art_index(column_id.index)?;
         }
 
         Self::register_search_definition_from_entry(storage.as_ref(), action.entry.as_ref())?;
@@ -293,12 +293,7 @@ impl PostCommitActions {
                         "ART indexes currently require exactly one column",
                     ));
                 };
-                storage.declare_art_index(*column_id);
-                if let Err(err) = storage.rebuild_art_index(*column_id) {
-                    storage.forget_art_index(*column_id);
-                    let _ = storage.drop_art_index(*column_id);
-                    return Err(err);
-                }
+                storage.install_art_index(*column_id)?;
                 return Ok(());
             }
 

@@ -5,6 +5,8 @@
 //!
 //! Distance scoring helpers shared by graph search and plain/full-scan paths.
 
+use std::cell::Cell;
+
 use super::types::{PointOffset, ScoreType, ScoredPoint};
 use super::vector_storage::CosineInverseNorms;
 use super::{DistanceMetric, PreparedQuery, VectorStorage};
@@ -37,6 +39,7 @@ pub struct VectorScorer<'a> {
     pub(crate) vector_storage: &'a dyn VectorStorage,
     kernel: ScoringKernel<'a>,
     scores_buffer: Vec<ScoreType>,
+    scored_points: Cell<u64>,
 }
 
 impl<'a> VectorScorer<'a> {
@@ -67,12 +70,19 @@ impl<'a> VectorScorer<'a> {
             vector_storage,
             kernel,
             scores_buffer: Vec::new(),
+            scored_points: Cell::new(0),
         })
     }
 
     /// Score a single point.
     pub fn score_point(&self, point_id: PointOffset) -> ScoreType {
+        self.scored_points
+            .set(self.scored_points.get().saturating_add(1));
         self.score_cached_point(point_id, self.vector_storage.get_vector(point_id))
+    }
+
+    pub fn scored_point_count(&self) -> u64 {
+        self.scored_points.get()
     }
 
     /// Score an indexed point whose vector has already been fetched.

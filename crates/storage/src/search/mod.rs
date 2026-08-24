@@ -84,9 +84,9 @@ pub use providers::fulltext::inline::FullTextInlineArtifactBuilder;
 pub use providers::sparse::inline::SparseInlineArtifactBuilder;
 pub use request::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
-    DenseVectorQuery, FullTextIntent, FullTextQueryKind, FullTextQueryStats, FullTextScoreMode,
-    FusionStrategy, HnswIntent, NormalizedSearchRequest, ProjectionSpec, SearchIntent,
-    SearchRequestMode, SparseIntent,
+    DenseVectorQuery, ExactBitmapMaterialization, FullTextIntent, FullTextQueryKind,
+    FullTextQueryStats, FullTextScoreMode, FusionStrategy, HnswIntent, NormalizedSearchRequest,
+    ProjectionSpec, SearchIntent, SearchRequestMode, SparseIntent,
 };
 pub use sidecar::{
     SidecarArtifactStore, SidecarCachedArtifact, SidecarMappedPackage, SidecarPackageWriter,

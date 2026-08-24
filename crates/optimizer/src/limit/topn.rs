@@ -7,6 +7,8 @@ use paro_planner::expression::Expression;
 use paro_planner::operator::{LogicalOperator, LogicalOperatorType, Projection, TopN};
 use paro_planner::plan::LogicalPlan;
 
+type ProjectionLayer = (usize, Vec<Expression>, Vec<String>, usize, Option<String>);
+
 pub struct TopNOptimizer;
 
 impl TopNOptimizer {
@@ -108,8 +110,7 @@ impl TopNOptimizer {
             .and_then(Self::extract_constant_value)
             .unwrap_or(0);
 
-        let mut projections: Vec<(usize, Vec<Expression>, Vec<String>, usize, Option<String>)> =
-            Vec::new();
+        let mut projections: Vec<ProjectionLayer> = Vec::new();
         let mut child_lp = *limit.child;
 
         loop {

@@ -9,19 +9,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation, PredicateIndexBinding};
-use crate::index::page_layout::PageLayout;
 use crate::index::predicate::{Predicate, PredicateTree};
-use crate::index::predicate_result::{
-    intersect, intersect_with_layout, union, union_with_layout, PredicateResult,
-};
+use crate::index::predicate_result::{intersect, union, PredicateResult};
 use crate::index::ColumnId;
 
 /// Index evaluator that combines multiple indexes.
 pub struct IndexEvaluator {
     /// Column -> indexes (sorted by priority)
     indexes: HashMap<ColumnId, Vec<PredicateIndexBinding>>,
-    /// Optional page layout for precise PageRanges ↔ Bitmap conversion.
-    page_layout: Option<PageLayout>,
     /// Segment-local row domain against which completeness credentials are
     /// checked. Generic/index-unit evaluators intentionally have no domain and
     /// therefore cannot turn a scalar posting answer into an exact proof.
@@ -31,20 +26,11 @@ pub struct IndexEvaluator {
 impl IndexEvaluator {
     /// Create a new evaluator from a list of indexes.
     pub fn new(indexes: Vec<Arc<dyn BoundIndex>>) -> Self {
-        Self::with_layout(indexes, None)
-    }
-
-    /// Create a new evaluator with an optional page layout.
-    ///
-    /// When a `PageLayout` is provided, `PageRanges × Bitmap` intersections
-    /// are computed precisely by converting page ranges to row ranges first.
-    pub fn with_layout(indexes: Vec<Arc<dyn BoundIndex>>, page_layout: Option<PageLayout>) -> Self {
         Self::with_bindings(
             indexes
                 .into_iter()
                 .map(PredicateIndexBinding::candidate)
                 .collect(),
-            page_layout,
             None,
         )
     }
@@ -52,19 +38,11 @@ impl IndexEvaluator {
     /// Build an evaluator for one immutable segment. Only bindings carrying a
     /// matching [`SegmentLocalComplete`](crate::index::SegmentLocalComplete)
     /// credential may suppress row verification.
-    pub(crate) fn for_segment(
-        indexes: Vec<PredicateIndexBinding>,
-        page_layout: Option<PageLayout>,
-        segment_rows: u64,
-    ) -> Self {
-        Self::with_bindings(indexes, page_layout, Some(segment_rows))
+    pub(crate) fn for_segment(indexes: Vec<PredicateIndexBinding>, segment_rows: u64) -> Self {
+        Self::with_bindings(indexes, Some(segment_rows))
     }
 
-    fn with_bindings(
-        indexes: Vec<PredicateIndexBinding>,
-        page_layout: Option<PageLayout>,
-        segment_rows: Option<u64>,
-    ) -> Self {
+    fn with_bindings(indexes: Vec<PredicateIndexBinding>, segment_rows: Option<u64>) -> Self {
         let mut map: HashMap<ColumnId, Vec<PredicateIndexBinding>> = HashMap::new();
         for index in indexes {
             for &column_id in index.index().column_ids() {
@@ -74,7 +52,6 @@ impl IndexEvaluator {
 
         IndexEvaluator {
             indexes: map,
-            page_layout,
             segment_rows,
         }
     }
@@ -95,23 +72,13 @@ impl IndexEvaluator {
                 for child in children {
                     let child = self.evaluate_with_proof(child);
                     exact &= child.is_exact();
-                    candidates = match &self.page_layout {
-                        Some(layout) => {
-                            intersect_with_layout(&candidates, &child.candidates, layout)
-                        }
-                        None => intersect(&candidates, &child.candidates),
-                    };
+                    candidates = intersect(&candidates, &child.candidates);
                     if matches!(candidates, PredicateResult::NoneMatch) {
                         // `guaranteed ⊆ candidates` makes the proof empty too;
                         // no remaining child can make an AND row eligible.
                         return IndexPredicateEvaluation::exact(PredicateResult::NoneMatch);
                     }
-                    guaranteed = match &self.page_layout {
-                        Some(layout) => {
-                            intersect_with_layout(&guaranteed, child.guaranteed(), layout)
-                        }
-                        None => intersect(&guaranteed, child.guaranteed()),
-                    };
+                    guaranteed = intersect(&guaranteed, child.guaranteed());
                 }
                 if exact {
                     IndexPredicateEvaluation::exact(candidates)
@@ -126,14 +93,8 @@ impl IndexEvaluator {
                 for child in children {
                     let child = self.evaluate_with_proof(child);
                     exact &= child.is_exact();
-                    candidates = match &self.page_layout {
-                        Some(layout) => union_with_layout(&candidates, &child.candidates, layout),
-                        None => union(&candidates, &child.candidates),
-                    };
-                    guaranteed = match &self.page_layout {
-                        Some(layout) => union_with_layout(&guaranteed, child.guaranteed(), layout),
-                        None => union(&guaranteed, child.guaranteed()),
-                    };
+                    candidates = union(&candidates, &child.candidates);
+                    guaranteed = union(&guaranteed, child.guaranteed());
                 }
                 if exact {
                     IndexPredicateEvaluation::exact(candidates)
@@ -159,7 +120,7 @@ impl IndexEvaluator {
             Predicate::In { values, .. } if values.is_empty()
         ) || matches!(
             predicate,
-            Predicate::FixedIn { values, .. } if values.len() == 0
+            Predicate::FixedIn { values, .. } if values.is_empty()
         ) || matches!(
             predicate,
             Predicate::StringPrefixIn { prefixes, .. } if prefixes.is_empty()
@@ -176,9 +137,11 @@ impl IndexEvaluator {
 
         let mut candidates = PredicateResult::Unknown;
         let mut guaranteed = PredicateResult::NoneMatch;
-        let mut ordered = indexes.iter().collect::<Vec<_>>();
-        ordered.sort_by_key(|binding| index_priority(binding.index().index_type(), predicate));
-        for binding in ordered {
+        for binding in [0, 1, 2, 3, 10].into_iter().flat_map(|priority| {
+            indexes.iter().filter(move |binding| {
+                index_priority(binding.index().index_type(), predicate) == priority
+            })
+        }) {
             let complete_scalar = self
                 .segment_rows
                 .is_some_and(|rows| binding.is_complete_for(rows));
@@ -205,10 +168,7 @@ impl IndexEvaluator {
                 // is an ART duplicate-key subtree.
                 return result;
             }
-            let next_guaranteed = match &self.page_layout {
-                Some(layout) => union_with_layout(&guaranteed, result.guaranteed(), layout),
-                None => union(&guaranteed, result.guaranteed()),
-            };
+            let next_guaranteed = union(&guaranteed, result.guaranteed());
             if matches!(candidates, PredicateResult::Unknown)
                 && !matches!(result.candidates, PredicateResult::Unknown)
             {
@@ -413,7 +373,6 @@ mod tests {
         let completeness = SegmentLocalComplete::prove(4, 4).expect("complete segment");
         let exact = IndexEvaluator::for_segment(
             vec![PredicateIndexBinding::complete_scalar(index, completeness)],
-            None,
             4,
         );
         assert!(exact.evaluate_with_proof(&predicate).is_exact());

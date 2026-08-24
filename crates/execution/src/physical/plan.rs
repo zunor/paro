@@ -922,9 +922,12 @@ fn push_search_filter_properties(
         format_search_predicate(predicate, table),
     );
     let contract = match contract {
-        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual => {
-            "exact segment bitmap; no residual filter"
-        }
+        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual {
+            materialization: paro_storage::search::ExactBitmapMaterialization::ScalarIndex,
+        } => "exact segment bitmap from scalar postings; no residual filter",
+        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual {
+            materialization: paro_storage::search::ExactBitmapMaterialization::ColumnScan,
+        } => "exact segment bitmap materialized by column scan; no residual filter",
         crate::physical::specs::SearchFilterContract::None => "unproven",
     };
     push_string_property(properties, "Filter Pushdown", contract.to_string());
@@ -960,28 +963,29 @@ fn push_dense_search_filter_properties(
         spec.estimated_total_rows,
     ) {
         (true, _, _) => {
-            "runtime exact bitmap; shared HNSW policy selects exact, masked, or predicate-refined search from cardinality and beam occupancy"
+            "runtime exact bitmap; exact scan below cardinality threshold, otherwise adaptive connected HNSW with observed admission, two-hop predicate refinement, then exact fallback"
                 .to_string()
         }
         (false, Some(rows), Some(total_rows)) => {
             use paro_storage::index::hnsw::{
-                choose_filtered_search_strategy, HnswFilteredSearchStrategy,
+                estimate_filtered_search_strategy, HnswFilteredSearchStrategy,
             };
             let effective_ef = spec.search_policy.effective_ef(spec.k, spec.params.ef);
-            let decision = choose_filtered_search_strategy(
+            let decision = estimate_filtered_search_strategy(
                 rows,
                 total_rows,
                 spec.k,
                 effective_ef,
+                spec.avg_level0_degree,
                 spec.search_policy,
             );
             let name = match decision.strategy {
                 HnswFilteredSearchStrategy::ExactScan => "exact bitmap distance scan",
                 HnswFilteredSearchStrategy::MaskedTopK => {
-                    "connected HNSW + exact bitmap admission (no refinement)"
+                    "adaptive connected HNSW; masked admission expected"
                 }
                 HnswFilteredSearchStrategy::RefinedTopK => {
-                    "connected HNSW + exact bitmap admission + predicate-local refinement"
+                    "adaptive connected HNSW; two-hop predicate refinement expected"
                 }
             };
             match decision.strategy {
@@ -990,14 +994,16 @@ fn push_dense_search_filter_properties(
                     spec.search_policy.filtered_plain_scan_threshold
                 ),
                 HnswFilteredSearchStrategy::MaskedTopK => format!(
-                    "{name} (estimated {rows}/{total_rows} rows; admitted beam {} >= required {})",
-                    decision.expected_admitted_beam_points,
-                    decision.required_admitted_beam_points
+                    "{name} (estimated {rows}/{total_rows} rows; scored {}; admitted {} >= required {}; runtime may upgrade to refinement, then exact fallback on underfill)",
+                    decision.expected_scored_points,
+                    decision.expected_admitted_points,
+                    decision.required_admitted_points
                 ),
                 HnswFilteredSearchStrategy::RefinedTopK => format!(
-                    "{name} (estimated {rows}/{total_rows} rows; admitted beam {} < required {})",
-                    decision.expected_admitted_beam_points,
-                    decision.required_admitted_beam_points
+                    "{name} (estimated {rows}/{total_rows} rows; scored {}; admitted {} < required {}; exact scan is final fallback)",
+                    decision.expected_scored_points,
+                    decision.expected_admitted_points,
+                    decision.required_admitted_points
                 ),
             }
         }

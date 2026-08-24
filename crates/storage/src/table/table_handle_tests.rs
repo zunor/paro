@@ -350,6 +350,7 @@ fn drain_search_cursor(
         cpu_step_budget: None,
         context: None,
         memory_accountant: None,
+        memory_tracker: Default::default(),
     };
 
     loop {

@@ -1062,6 +1062,7 @@ mod tests {
             cpu_step_budget: None,
             context: None,
             memory_accountant: None,
+            memory_tracker: Default::default(),
         };
         let candidates = loop {
             match cursor

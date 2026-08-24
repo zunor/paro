@@ -171,10 +171,7 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
                 continue;
             }
 
-            storage.declare_art_index(column_id);
-            if let Err(err) = storage.rebuild_art_index(column_id) {
-                storage.forget_art_index(column_id);
-                let _ = storage.drop_art_index(column_id);
+            if let Err(err) = storage.install_art_index(column_id) {
                 index.mark_failed(Some(format!("ART runtime restore failed: {}", err)));
                 continue;
             }

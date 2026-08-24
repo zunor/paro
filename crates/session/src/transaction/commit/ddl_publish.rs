@@ -310,7 +310,7 @@ impl IndexBackfillPublishTask {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.rebuild_art_index(column_id.index)?;
+            storage.install_art_index(column_id.index)?;
         }
 
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
