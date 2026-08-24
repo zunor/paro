@@ -978,13 +978,11 @@ fn push_dense_search_filter_properties(
         }
     }
 
-    // Runtime owns exact per-segment cardinalities; a table-wide estimate
-    // cannot truthfully predict how those rows are distributed across
-    // immutable segments. EXPLAIN therefore describes the real dispatch
-    // contract instead of duplicating the cost model as a false plan-time
-    // execution claim.
+    // Runtime prepares exact segment row sets, sums their logical cardinality,
+    // and makes one query-wide decision. EXPLAIN describes that contract
+    // rather than predicting a path from a plan-time estimate.
     let strategy = format!(
-        "per-segment runtime choice: exact row-set distance scan at <= {} matches; otherwise predicate-agnostic HNSW navigation with exact admission, scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback",
+        "query-wide runtime choice: exact row-set distance scan at <= {} total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback",
         spec.search_policy.filtered_plain_scan_threshold
     );
     push_string_property(properties, "Filtered Strategy", strategy);
@@ -1007,7 +1005,7 @@ fn push_dense_search_filter_properties(
             properties,
             "Predicate Topology",
             format!(
-                "available on {}: scalar-block HNSW plus bounded vector-aware cross-block routing; selected from exact runtime connectivity, exact row-set admission retained",
+                "available on {}: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission",
                 accelerated_columns.join(", ")
             ),
         );

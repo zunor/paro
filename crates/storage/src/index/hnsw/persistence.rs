@@ -19,12 +19,13 @@ use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
     HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome, HnswSearchPath,
-    HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset, PreparedQuery,
+    HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset, PreparedQuery, ScoreType,
     ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
-use crate::index::ExactRowSet;
+use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::metrics::storage_metrics;
-use crate::search::SearchWorkBudget;
+use crate::search::segment_dispatch::install_search_pool;
+use crate::search::{ResourceBudget, SearchWorkBudget};
 use crate::statistics::{
     append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
 };
@@ -41,8 +42,27 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 4;
-const HNSW_ARTIFACT_HEADER_LEN: usize = 128;
+const HNSW_ARTIFACT_VERSION: u32 = 5;
+const HNSW_ARTIFACT_HEADER_LEN: usize = 136;
+const MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
+
+#[derive(Debug, Clone, Copy)]
+struct ExactPostingRange<'a> {
+    posting: &'a roaring::RoaringBitmap,
+    first_rank: u32,
+    len: u32,
+}
+
+#[derive(Debug, Default)]
+struct ExactScanLane<'a> {
+    ranges: Vec<ExactPostingRange<'a>>,
+}
+
+#[derive(Debug)]
+struct ExactScanLaneResult {
+    points: Vec<ScoredPoint>,
+    scored_points: u64,
+}
 
 /// O(1) keyed permutation of point ids used to decouple frozen-wave membership
 /// from ingest order.
@@ -225,6 +245,61 @@ fn read_entry_points(
     Ok(entries)
 }
 
+fn append_predicate_entry_points(
+    data: &mut Vec<u8>,
+    entries: &[super::PredicateEntryPoint],
+) -> Result<()> {
+    for entry in entries {
+        data.extend_from_slice(&entry.column_id.to_le_bytes());
+        data.extend_from_slice(&entry.point_id.to_le_bytes());
+        let level = u32::try_from(entry.level)
+            .map_err(|_| error::out_of_range("HNSW predicate entry-point level exceeds u32"))?;
+        data.extend_from_slice(&level.to_le_bytes());
+    }
+    Ok(())
+}
+
+fn read_predicate_entry_points(
+    data: &[u8],
+    offset: &mut usize,
+    count: usize,
+) -> Result<Box<[super::PredicateEntryPoint]>> {
+    const ENTRY_BYTES: usize = 3 * std::mem::size_of::<u32>();
+    let encoded_len = count
+        .checked_mul(ENTRY_BYTES)
+        .ok_or_else(|| error::data_corrupted("HNSW predicate entry-point table length overflow"))?;
+    if data.len().saturating_sub(*offset) < encoded_len {
+        return Err(error::data_corrupted(format!(
+            "HNSW predicate entry-point table is truncated: count={count}, remaining={}",
+            data.len().saturating_sub(*offset)
+        )));
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        let column_id = u32::from_le_bytes(
+            take_artifact_bytes(data, offset, 4, "predicate entry column")?
+                .try_into()
+                .expect("u32 width"),
+        );
+        let point_id = u32::from_le_bytes(
+            take_artifact_bytes(data, offset, 4, "predicate entry point id")?
+                .try_into()
+                .expect("u32 width"),
+        );
+        let level = u32::from_le_bytes(
+            take_artifact_bytes(data, offset, 4, "predicate entry point level")?
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
+        entries.push(super::PredicateEntryPoint {
+            column_id,
+            point_id,
+            level,
+        });
+    }
+    Ok(entries.into_boxed_slice())
+}
+
 fn take_artifact_bytes<'a>(
     data: &'a [u8],
     offset: &mut usize,
@@ -335,6 +410,11 @@ pub struct HnswFilterColumnBlocks {
 #[derive(Debug, Clone, Default)]
 pub struct HnswFilterBlocks {
     pub columns: Vec<HnswFilterColumnBlocks>,
+}
+
+struct BuiltPredicateGraph {
+    links: GraphLinks,
+    entry_points: Box<[super::PredicateEntryPoint]>,
 }
 
 impl HnswIndex {
@@ -508,7 +588,7 @@ impl HnswIndex {
         }
 
         let (links, entry_points) = builder.into_graph_data();
-        let predicate_links = if build_contract.filter_topology.is_enabled() {
+        let predicate_graph = if build_contract.filter_topology.is_enabled() {
             Some(Self::build_predicate_links(
                 storage.as_ref(),
                 &build_contract,
@@ -520,10 +600,11 @@ impl HnswIndex {
         } else {
             None
         };
-        let graph = match predicate_links {
-            Some(predicate_links) => GraphLayers::new_with_predicate_links(
+        let graph = match predicate_graph {
+            Some(predicate_graph) => GraphLayers::new_with_predicate_links(
                 links,
-                predicate_links,
+                predicate_graph.links,
+                predicate_graph.entry_points,
                 entry_points,
                 VisitedPool::new(),
                 (&build_contract).into(),
@@ -545,8 +626,9 @@ impl HnswIndex {
         filter_blocks: HnswFilterBlocks,
         pool: Option<&rayon::ThreadPool>,
         stop_check: Option<&HnswBuildStopCheck>,
-    ) -> Result<GraphLinks> {
-        let mut merged = vec![Vec::<PointOffset>::new(); storage.num_vectors()];
+    ) -> Result<BuiltPredicateGraph> {
+        let mut merged = vec![Vec::<Vec<PointOffset>>::new(); storage.num_vectors()];
+        let mut predicate_entry_points = Vec::new();
         let dimension = storage.vector_dim();
         let filter_m = build_contract.filter_topology.m;
         let expected_columns = build_contract.filter_topology.columns();
@@ -625,13 +707,25 @@ impl HnswIndex {
                     stop_check,
                 )?;
                 for (local_point, &global_point) in point_ids.iter().enumerate() {
-                    local.graph.links.for_each_link(
-                        local_point as PointOffset,
-                        0,
-                        |local_neighbor| {
-                            merged[global_point as usize].push(point_ids[local_neighbor as usize]);
-                        },
-                    );
+                    let local_point = local_point as PointOffset;
+                    let levels = local.graph.links.num_levels(local_point);
+                    let global_levels = &mut merged[global_point as usize];
+                    global_levels.resize_with(levels, Vec::new);
+                    for (level, global_links) in global_levels.iter_mut().enumerate() {
+                        local
+                            .graph
+                            .links
+                            .for_each_link(local_point, level, |local_neighbor| {
+                                global_links.push(point_ids[local_neighbor as usize]);
+                            });
+                    }
+                }
+                for entry in &local.graph.entry_points.entry_points {
+                    predicate_entry_points.push(super::PredicateEntryPoint {
+                        column_id: column.column_id,
+                        point_id: point_ids[entry.point_id as usize],
+                        level: entry.level,
+                    });
                 }
                 global_block_index = global_block_index.saturating_add(1);
             }
@@ -654,7 +748,11 @@ impl HnswIndex {
             for point in 0..storage.num_vectors() {
                 let point_id = point as PointOffset;
                 let point_block = block_by_point[point];
-                let links = &mut merged[point];
+                let levels = &mut merged[point];
+                if levels.is_empty() {
+                    levels.push(Vec::new());
+                }
+                let links = &mut levels[0];
                 let mut added = 0usize;
                 base_links.for_each_link(point_id, 0, |neighbor| {
                     if added < cross_block_degree
@@ -667,13 +765,18 @@ impl HnswIndex {
             }
         }
 
-        for links in &mut merged {
-            links.sort_unstable();
-            links.dedup();
+        for levels in &mut merged {
+            for links in levels {
+                links.sort_unstable();
+                links.dedup();
+            }
         }
-        Ok(GraphLinks::new_from_edges(
-            merged.into_iter().map(|links| vec![links]).collect(),
-        ))
+        predicate_entry_points
+            .sort_unstable_by_key(|entry| (entry.column_id, entry.point_id, entry.level));
+        Ok(BuiltPredicateGraph {
+            links: GraphLinks::new_from_edges(merged),
+            entry_points: predicate_entry_points.into_boxed_slice(),
+        })
     }
 
     /// Save HNSW index to a directory.
@@ -702,10 +805,17 @@ impl HnswIndex {
         let links_path = directory.join("graph_links.bin");
         self.graph.links.save(&links_path)?;
         let predicate_links_path = directory.join("predicate_graph_links.bin");
+        let predicate_entry_points_path = directory.join("predicate_entry_points.json");
         if let Some(predicate_links) = &self.graph.predicate_links {
             predicate_links.save(&predicate_links_path)?;
+            let encoded = serde_json::to_string_pretty(&self.graph.predicate_entry_points)
+                .map_err(|e| error::serialization_error(e.to_string()))?;
+            fs::write(&predicate_entry_points_path, encoded).map_err(error::io)?;
         } else if predicate_links_path.exists() {
             fs::remove_file(predicate_links_path).map_err(error::io)?;
+            if predicate_entry_points_path.exists() {
+                fs::remove_file(predicate_entry_points_path).map_err(error::io)?;
+            }
         }
 
         if let Some(norms) = self.vector_storage.cosine_inverse_norms() {
@@ -740,9 +850,15 @@ impl HnswIndex {
         let links_path = directory.join("graph_links.bin");
         let links =
             GraphLinks::load_mmap(&links_path).or_else(|_| GraphLinks::load(&links_path))?;
-        let predicate_links = if build_contract.filter_topology.is_enabled() {
+        let predicate_graph = if build_contract.filter_topology.is_enabled() {
             let path = directory.join("predicate_graph_links.bin");
-            Some(GraphLinks::load_mmap(&path).or_else(|_| GraphLinks::load(&path))?)
+            let links = GraphLinks::load_mmap(&path).or_else(|_| GraphLinks::load(&path))?;
+            let entries = fs::read_to_string(directory.join("predicate_entry_points.json"))
+                .map_err(error::io)?;
+            let entry_points = serde_json::from_str::<Vec<super::PredicateEntryPoint>>(&entries)
+                .map_err(|e| error::serialization_error(e.to_string()))?
+                .into_boxed_slice();
+            Some((links, entry_points))
         } else {
             None
         };
@@ -760,14 +876,17 @@ impl HnswIndex {
         } else {
             vector_storage
         };
-        let graph = match predicate_links {
-            Some(predicate_links) => GraphLayers::new_with_predicate_links(
-                links,
-                predicate_links,
-                entry_points,
-                VisitedPool::new(),
-                (&build_contract).into(),
-            ),
+        let graph = match predicate_graph {
+            Some((predicate_links, predicate_entry_points)) => {
+                GraphLayers::new_with_predicate_links(
+                    links,
+                    predicate_links,
+                    predicate_entry_points,
+                    entry_points,
+                    VisitedPool::new(),
+                    (&build_contract).into(),
+                )
+            }
             None => GraphLayers::new(
                 links,
                 entry_points,
@@ -835,6 +954,9 @@ impl HnswIndex {
             .map_or(0, GraphLinks::serialized_size_bytes);
         data.extend_from_slice(&base_graph_len.to_le_bytes());
         data.extend_from_slice(&predicate_graph_len.to_le_bytes());
+        let predicate_entry_count = u64::try_from(self.graph.predicate_entry_points.len())
+            .map_err(|_| error::out_of_range("too many HNSW predicate entry points"))?;
+        data.extend_from_slice(&predicate_entry_count.to_le_bytes());
         debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
 
         if let Some(norms) = norms {
@@ -845,6 +967,7 @@ impl HnswIndex {
 
         append_entry_points(&mut data, &self.graph.entry_points.entry_points)?;
         append_entry_points(&mut data, &self.graph.entry_points.extra_entry_points)?;
+        append_predicate_entry_points(&mut data, &self.graph.predicate_entry_points)?;
 
         // Serialize graph links in binary form.
         self.graph.links.serialize(&mut data)?;
@@ -989,11 +1112,22 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW predicate graph length exceeds usize"))?;
+        let predicate_entry_count = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "predicate entry-point count")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW predicate entry-point count exceeds usize"))?;
         debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
         build_contract.validate()?;
         if build_contract.filter_topology.is_enabled() != (predicate_graph_len != 0) {
             return Err(error::data_corrupted(
                 "HNSW predicate graph presence does not match its filter-topology contract",
+            ));
+        }
+        if !build_contract.filter_topology.is_enabled() && predicate_entry_count != 0 {
+            return Err(error::data_corrupted(
+                "HNSW predicate entry points require an enabled filter topology",
             ));
         }
         let distance = build_contract.distance;
@@ -1019,6 +1153,8 @@ impl HnswIndex {
             entry_points: read_entry_points(data, &mut offset, primary_count)?,
             extra_entry_points: read_entry_points(data, &mut offset, extra_count)?,
         };
+        let predicate_entry_points =
+            read_predicate_entry_points(data, &mut offset, predicate_entry_count)?;
 
         // Deserialize base and predicate-local graph links from exact envelope
         // ranges. Statistics bytes are never exposed to either graph parser.
@@ -1036,6 +1172,7 @@ impl HnswIndex {
             Some(predicate_links) => GraphLayers::new_with_predicate_links(
                 links,
                 predicate_links,
+                predicate_entry_points,
                 entry_points,
                 VisitedPool::new(),
                 (&build_contract).into(),
@@ -1068,7 +1205,7 @@ impl HnswIndex {
         filter: HnswSearchFilter<'_>,
         policy: &HnswSearchPolicy,
         strategy: HnswSearchStrategy,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<HnswSearchResult> {
         if top_k == 0 {
             return Ok(HnswSearchResult {
@@ -1094,7 +1231,7 @@ impl HnswIndex {
         let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
         let (points, outcome) = if self.should_use_plain_scan(filter, policy, strategy) {
             (
-                self.plain_scan(top_k, &mut scorer, filter_row_set, work)?,
+                self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?,
                 HnswSearchOutcome::new(HnswSearchPath::ExactScan),
             )
         } else {
@@ -1105,22 +1242,39 @@ impl HnswIndex {
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
             let ef = Self::effective_graph_ef(top_k, params, policy);
+            let seed_limit = ef.saturating_mul(2);
+            let _partition_seed_reservation = use_predicate_topology
+                .then(|| {
+                    budget.try_reserve_memory(
+                        seed_limit.saturating_mul(std::mem::size_of::<PointOffset>()),
+                    )
+                })
+                .transpose()?;
+            let mut predicate_partition_seeds =
+                Vec::with_capacity(usize::from(use_predicate_topology).saturating_mul(seed_limit));
+            if use_predicate_topology {
+                filter_row_set
+                    .expect("predicate topology requires an exact row set")
+                    .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
+            }
             let graph_result = self.graph.search_one(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorer,
                 filter_row_set.map(ExactRowSet::admission),
+                &predicate_partition_seeds,
+                filter.predicate_columns(),
                 use_predicate_topology,
                 Self::use_random_entry_point(params),
-                work,
+                budget.work.as_ref(),
             )?;
             let results = graph_result.points;
             if filter_row_set.is_some()
                 && results.len() < self.expected_filtered_rows(top_k, filter_row_set)?
             {
                 (
-                    self.plain_scan(top_k, &mut scorer, filter_row_set, work)?,
+                    self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?,
                     HnswSearchOutcome::new(path)
                         .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined)
@@ -1174,13 +1328,7 @@ impl HnswIndex {
         );
         let budget = crate::search::ResourceBudget::default();
         self.search_one_with_policy_strategy(
-            query,
-            top_k,
-            params,
-            filter,
-            &policy,
-            strategy,
-            budget.work.as_ref(),
+            query, top_k, params, filter, &policy, strategy, &budget,
         )
         .map(|result| result.points)
     }
@@ -1194,7 +1342,7 @@ impl HnswIndex {
         filter: HnswSearchFilter<'_>,
         policy: &HnswSearchPolicy,
         strategy: HnswSearchStrategy,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<Vec<HnswSearchResult>> {
         if queries.is_empty() {
             return Ok(Vec::new());
@@ -1233,9 +1381,9 @@ impl HnswIndex {
                         .materialize()
                         .into_iter()
                         .filter(|&idx| idx < num_points),
-                    work,
+                    budget.work.as_ref(),
                 )?,
-                None => batch_scorer.scan_with_work(0..num_points, work)?,
+                None => batch_scorer.scan_with_work(0..num_points, budget.work.as_ref())?,
             };
             scored
                 .into_iter()
@@ -1253,15 +1401,32 @@ impl HnswIndex {
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
             let ef = Self::effective_graph_ef(top_k, params, policy);
+            let seed_limit = ef.saturating_mul(2);
+            let _partition_seed_reservation = use_predicate_topology
+                .then(|| {
+                    budget.try_reserve_memory(
+                        seed_limit.saturating_mul(std::mem::size_of::<PointOffset>()),
+                    )
+                })
+                .transpose()?;
+            let mut predicate_partition_seeds =
+                Vec::with_capacity(usize::from(use_predicate_topology).saturating_mul(seed_limit));
+            if use_predicate_topology {
+                filter_row_set
+                    .expect("predicate topology requires an exact row set")
+                    .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
+            }
             let results = self.graph.search_many(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorers,
                 filter_row_set.map(ExactRowSet::admission),
+                &predicate_partition_seeds,
+                filter.predicate_columns(),
                 use_predicate_topology,
                 Self::use_random_entry_point(params),
-                work,
+                budget.work.as_ref(),
             )?;
             let expected_rows = self.expected_filtered_rows(top_k, filter_row_set)?;
             results
@@ -1274,7 +1439,7 @@ impl HnswIndex {
                     let points =
                         if filter_row_set.is_some() && graph_result.points.len() < expected_rows {
                             outcome = outcome.with_exact_fallback();
-                            self.plain_scan(top_k, scorer, filter_row_set, work)?
+                            self.plain_scan(top_k, scorer, filter_row_set, budget)?
                         } else {
                             graph_result.points
                         };
@@ -1323,7 +1488,7 @@ impl HnswIndex {
             }),
             &HnswSearchPolicy::default(),
             strategy,
-            budget.work.as_ref(),
+            &budget,
         )
         .map(|results| results.into_iter().map(|result| result.points).collect())
     }
@@ -1410,6 +1575,60 @@ impl HnswIndex {
             if entry.level >= self.graph.links.num_levels(entry.point_id) {
                 return Err(error::data_corrupted(format!(
                     "HNSW entry point {} level {} exceeds its graph levels",
+                    entry.point_id, entry.level
+                )));
+            }
+        }
+        let topology = &self.build_contract.filter_topology;
+        if !topology.is_enabled() {
+            if !self.graph.predicate_entry_points.is_empty() {
+                return Err(error::data_corrupted(
+                    "HNSW artifact without filter topology contains predicate entry points",
+                ));
+            }
+            return Ok(());
+        }
+        let predicate_links = self.graph.predicate_links.as_ref().ok_or_else(|| {
+            error::data_corrupted("HNSW filter topology is missing predicate graph links")
+        })?;
+        if self.vector_storage.num_vectors() != 0
+            && topology.columns().iter().any(|column_id| {
+                !self
+                    .graph
+                    .predicate_entry_points
+                    .iter()
+                    .any(|entry| entry.column_id == *column_id)
+            })
+        {
+            return Err(error::data_corrupted(
+                "HNSW predicate entry points do not cover every configured filter column",
+            ));
+        }
+        if self.graph.predicate_entry_points.windows(2).any(|entries| {
+            (entries[0].column_id, entries[0].point_id, entries[0].level)
+                >= (entries[1].column_id, entries[1].point_id, entries[1].level)
+        }) {
+            return Err(error::data_corrupted(
+                "HNSW predicate entry points must be strictly ordered",
+            ));
+        }
+        for entry in &self.graph.predicate_entry_points {
+            if !topology.columns().contains(&entry.column_id) {
+                return Err(error::data_corrupted(format!(
+                    "HNSW predicate entry column {} is absent from the filter topology",
+                    entry.column_id
+                )));
+            }
+            if entry.point_id as usize >= self.vector_storage.num_vectors() {
+                return Err(error::data_corrupted(format!(
+                    "HNSW predicate entry point {} is outside vector cardinality {}",
+                    entry.point_id,
+                    self.vector_storage.num_vectors()
+                )));
+            }
+            if entry.level >= predicate_links.num_levels(entry.point_id) {
+                return Err(error::data_corrupted(format!(
+                    "HNSW predicate entry point {} level {} exceeds its graph levels",
                     entry.point_id, entry.level
                 )));
             }
@@ -1519,7 +1738,7 @@ impl HnswIndex {
         top_k: usize,
         scorer: &mut VectorScorer,
         filter_row_set: Option<&dyn ExactRowSet>,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<Vec<ScoredPoint>> {
         let num_points = self.graph.num_points() as u32;
         match filter_row_set {
@@ -1532,10 +1751,21 @@ impl HnswIndex {
                         self.graph.num_points()
                     )));
                 }
+                if row_set.len() >= MIN_ROWS_PER_PARALLEL_EXACT_LANE.saturating_mul(2)
+                    && budget.parallelism_slots > 1
+                {
+                    return self.parallel_plain_scan(
+                        top_k,
+                        scorer,
+                        row_set.physical_partitions(),
+                        row_set.len(),
+                        budget,
+                    );
+                }
                 let mut best = FixedLengthPriorityQueue::new(top_k);
                 let mut chunk = [0; SCORE_BATCH];
                 let mut flush = |chunk: &[PointOffset]| -> Result<()> {
-                    work.check_and_consume(chunk.len())?;
+                    budget.work.check_and_consume(chunk.len())?;
                     for point in scorer.score_points_unfiltered(chunk) {
                         best.push(point);
                     }
@@ -1544,19 +1774,153 @@ impl HnswIndex {
                 row_set.try_for_each_batch(&mut chunk, &mut flush)?;
                 Ok(best.into_sorted_vec())
             }
-            None => self.plain_scan_iter(top_k, scorer, 0..num_points, work),
+            None => self.plain_scan_iter(top_k, scorer, 0..num_points, budget.work.as_ref()),
         }
     }
 
-    fn plain_scan_iter(
+    fn parallel_plain_scan(
         &self,
         top_k: usize,
         scorer: &mut VectorScorer,
+        partitions: ExactRowPartitions<'_>,
+        row_count: u64,
+        budget: &ResourceBudget,
+    ) -> Result<Vec<ScoredPoint>> {
+        let lane_count = budget
+            .parallelism_slots
+            .max(1)
+            .min(
+                usize::try_from(row_count.div_ceil(MIN_ROWS_PER_PARALLEL_EXACT_LANE))
+                    .unwrap_or(usize::MAX),
+            )
+            .max(1);
+        debug_assert!(lane_count > 1);
+        debug_assert!(!partitions.is_empty());
+
+        let partition_count = partitions.len();
+        let descriptor_count = partition_count.saturating_add(lane_count);
+        let descriptor_bytes = descriptor_count
+            .saturating_mul(std::mem::size_of::<ExactPostingRange<'_>>())
+            .saturating_mul(2)
+            .saturating_add(lane_count.saturating_mul(std::mem::size_of::<ExactScanLane<'_>>()));
+        let scorer_scratch_bytes = lane_count.saturating_mul(
+            crate::index::hnsw::batch_scorer::BATCH_SIZE
+                .saturating_mul(std::mem::size_of::<ScoreType>())
+                .saturating_add(
+                    top_k
+                        .saturating_mul(std::mem::size_of::<ScoredPoint>())
+                        .saturating_mul(2),
+                ),
+        );
+        let _reservation =
+            budget.try_reserve_memory(descriptor_bytes.saturating_add(scorer_scratch_bytes))?;
+        let lanes = Self::plan_exact_scan_lanes(partitions, row_count, lane_count)?;
+        let prepared_scoring = scorer.prepared_scoring();
+        let results = install_search_pool(budget.parallelism_slots, || {
+            lanes
+                .par_iter()
+                .map(|lane| {
+                    let mut local_scorer = prepared_scoring.scorer();
+                    let mut best = FixedLengthPriorityQueue::new(top_k);
+                    for range in &lane.ranges {
+                        let first = range.posting.select(range.first_rank).ok_or_else(|| {
+                            error::data_corrupted(
+                                "exact row-set posting rank exceeds its cardinality",
+                            )
+                        })?;
+                        self.scan_exact_points_into(
+                            &mut best,
+                            &mut local_scorer,
+                            range.posting.range(first..).take(range.len as usize),
+                            budget.work.as_ref(),
+                        )?;
+                    }
+                    Ok(ExactScanLaneResult {
+                        points: best.into_sorted_vec(),
+                        scored_points: local_scorer.scored_point_count(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        let mut best = FixedLengthPriorityQueue::new(top_k);
+        let mut scored_points = 0u64;
+        for result in results {
+            scored_points = scored_points.saturating_add(result.scored_points);
+            for point in result.points {
+                best.push(point);
+            }
+        }
+        scorer.add_scored_point_count(scored_points);
+        Ok(best.into_sorted_vec())
+    }
+
+    fn plan_exact_scan_lanes<'a>(
+        partitions: ExactRowPartitions<'a>,
+        row_count: u64,
+        lane_count: usize,
+    ) -> Result<Vec<ExactScanLane<'a>>> {
+        let mut lanes = (0..lane_count)
+            .map(|_| ExactScanLane::default())
+            .collect::<Vec<_>>();
+        let target_rows = row_count.div_ceil(lane_count as u64);
+        let mut lane = 0usize;
+        let mut rows_in_lane = 0u64;
+        let mut observed_rows = 0u64;
+        let mut append_posting = |posting: &'a roaring::RoaringBitmap| -> Result<()> {
+            let mut first_rank = 0u64;
+            let posting_rows = posting.len();
+            observed_rows = observed_rows.saturating_add(posting_rows);
+            while first_rank < posting_rows {
+                let available = target_rows.saturating_sub(rows_in_lane).max(1);
+                let take = available.min(posting_rows - first_rank);
+                lanes[lane].ranges.push(ExactPostingRange {
+                    posting,
+                    first_rank: u32::try_from(first_rank).map_err(|_| {
+                        error::data_corrupted("exact row-set posting rank exceeds u32")
+                    })?,
+                    len: u32::try_from(take).map_err(|_| {
+                        error::data_corrupted("exact row-set posting range exceeds u32")
+                    })?,
+                });
+                first_rank += take;
+                rows_in_lane += take;
+                if rows_in_lane >= target_rows && lane + 1 < lane_count {
+                    lane += 1;
+                    rows_in_lane = 0;
+                }
+            }
+            Ok(())
+        };
+        match partitions {
+            ExactRowPartitions::Single(bitmap) => append_posting(bitmap)?,
+            ExactRowPartitions::DisjointPostings(postings) => {
+                for posting in postings {
+                    append_posting(posting)?;
+                }
+            }
+        }
+        if observed_rows != row_count {
+            return Err(error::data_corrupted(format!(
+                "exact row-set partition cardinality mismatch: expected {row_count}, got {observed_rows}"
+            )));
+        }
+        if lanes.iter().any(|lane| lane.ranges.is_empty()) {
+            return Err(error::internal(
+                "exact scan lane planner produced an empty worker lane",
+            ));
+        }
+        Ok(lanes)
+    }
+
+    fn scan_exact_points_into(
+        &self,
+        best: &mut FixedLengthPriorityQueue<ScoredPoint>,
+        scorer: &mut VectorScorer,
         point_ids: impl Iterator<Item = PointOffset>,
         work: &SearchWorkBudget,
-    ) -> Result<Vec<ScoredPoint>> {
+    ) -> Result<()> {
         const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
-        let mut best = FixedLengthPriorityQueue::new(top_k);
         let mut point_ids = point_ids;
         let mut chunk = [0; SCORE_BATCH];
         loop {
@@ -1576,6 +1940,18 @@ impl HnswIndex {
                 best.push(point);
             }
         }
+        Ok(())
+    }
+
+    fn plain_scan_iter(
+        &self,
+        top_k: usize,
+        scorer: &mut VectorScorer,
+        point_ids: impl Iterator<Item = PointOffset>,
+        work: &SearchWorkBudget,
+    ) -> Result<Vec<ScoredPoint>> {
+        let mut best = FixedLengthPriorityQueue::new(top_k);
+        self.scan_exact_points_into(&mut best, scorer, point_ids, work)?;
         Ok(best.into_sorted_vec())
     }
 }
@@ -1962,6 +2338,71 @@ mod tests {
     }
 
     #[test]
+    fn predicate_topology_persists_tagged_hierarchical_block_entries() {
+        let vectors = make_sift_like_vectors(0x7711, 256, 16, 16);
+        let mut contract = HnswConfig::new(12, 72).build_contract(DistanceMetric::Euclidean);
+        contract.filter_topology = HnswFilterTopologyContract::from_columns(&[7], 64, 4).unwrap();
+        let blocks = (0..4)
+            .map(|block| {
+                ((block * 64)..((block + 1) * 64))
+                    .map(|point| point as PointOffset)
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            })
+            .collect();
+        let index = HnswBuilder::new()
+            .build_with_filter_blocks(
+                make_storage(&vectors),
+                contract,
+                HnswFilterBlocks {
+                    columns: vec![HnswFilterColumnBlocks {
+                        column_id: 7,
+                        blocks,
+                    }],
+                },
+            )
+            .unwrap();
+
+        assert_eq!(index.graph.predicate_entry_points.len(), 4);
+        assert!(index.graph.predicate_entry_points.iter().all(|entry| {
+            entry.column_id == 7
+                && index
+                    .graph
+                    .predicate_links
+                    .as_ref()
+                    .is_some_and(|links| entry.level < links.num_levels(entry.point_id))
+        }));
+
+        let artifact = index.serialize().unwrap();
+        let restored = HnswIndex::deserialize(&artifact, make_storage(&vectors)).unwrap();
+        assert_eq!(
+            restored.graph.predicate_entry_points,
+            index.graph.predicate_entry_points
+        );
+
+        let admitted = RoaringBitmap::from_iter(0..128);
+        let budget = ResourceBudget::default();
+        let result = restored
+            .search_one_with_policy_strategy(
+                &vectors[100],
+                1,
+                &SearchParams {
+                    ef: Some(64),
+                    ..Default::default()
+                },
+                HnswSearchFilter::predicate(&admitted, &[7]),
+                &HnswSearchPolicy {
+                    filtered_plain_scan_threshold: 0,
+                    ..HnswSearchPolicy::default()
+                },
+                HnswSearchStrategy::AdaptiveFilteredGraph,
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(result.points[0].idx, 100);
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_hnsw_search_many_matches_search_one_hnsw_path() {
         let vectors = make_sift_like_vectors(7, 384, 24, 16);
@@ -2214,7 +2655,7 @@ mod tests {
                 HnswSearchFilter::predicate(&broad, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
-                budget.work.as_ref(),
+                &budget,
             )
             .unwrap();
         assert_eq!(broad_rows.len(), 10);
@@ -2234,7 +2675,7 @@ mod tests {
                 HnswSearchFilter::predicate(&almost_all, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
-                budget.work.as_ref(),
+                &budget,
             )
             .unwrap();
         assert_eq!(large_k.len(), 67);
@@ -2249,7 +2690,7 @@ mod tests {
                 HnswSearchFilter::predicate(&selective, &[]),
                 &policy,
                 HnswSearchStrategy::AdaptiveFilteredGraph,
-                budget.work.as_ref(),
+                &budget,
             )
             .unwrap();
         assert_eq!(selective_rows.len(), 6);
@@ -2649,6 +3090,96 @@ mod tests {
             &policy,
             HnswSearchStrategy::AdaptiveFilteredGraph
         ));
+    }
+
+    #[test]
+    fn exact_scan_lane_planner_splits_postings_without_materializing_row_ids() {
+        let first = RoaringBitmap::from_iter(0..10_000);
+        let second = RoaringBitmap::from_iter(20_000..50_000);
+        let postings = [Arc::new(first), Arc::new(second)];
+        let lanes = HnswIndex::plan_exact_scan_lanes(
+            ExactRowPartitions::DisjointPostings(&postings),
+            40_000,
+            3,
+        )
+        .unwrap();
+
+        assert_eq!(lanes.len(), 3);
+        let lane_sizes = lanes
+            .iter()
+            .map(|lane| {
+                lane.ranges
+                    .iter()
+                    .map(|range| u64::from(range.len))
+                    .sum::<u64>()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lane_sizes, vec![13_334, 13_334, 13_332]);
+
+        let mut reconstructed = RoaringBitmap::new();
+        for lane in lanes {
+            for range in lane.ranges {
+                let first = range.posting.select(range.first_rank).unwrap();
+                reconstructed.extend(range.posting.range(first..).take(range.len as usize));
+            }
+        }
+        assert_eq!(reconstructed.len(), 40_000);
+        assert!(reconstructed.contains(0));
+        assert!(!reconstructed.contains(10_000));
+        assert!(reconstructed.contains(49_999));
+    }
+
+    #[test]
+    fn parallel_exact_scan_merges_lane_topk_and_telemetry() {
+        const ROWS: usize = 65_536;
+        let vectors = (0..ROWS).map(|row| vec![row as f32]).collect::<Vec<_>>();
+        let links = GraphLinks::new_from_edges(vec![vec![Vec::new()]; ROWS]);
+        let graph = GraphLayers::new(
+            links,
+            EntryPoints {
+                entry_points: vec![super::super::EntryPoint {
+                    point_id: 0,
+                    level: 0,
+                }],
+                extra_entry_points: Vec::new(),
+            },
+            VisitedPool::new(),
+            HnswM::new(8),
+        );
+        let config = HnswConfig::new(8, 32)
+            .with_plain_scan_threshold(0)
+            .with_filtered_plain_scan_threshold(ROWS);
+        let policy = config.search_policy();
+        let index = HnswIndex::new(
+            config,
+            graph,
+            make_storage(&vectors),
+            DistanceMetric::DotProduct,
+        );
+        let filter = RoaringBitmap::from_iter((0..ROWS as u32).step_by(2));
+        let budget = ResourceBudget::standalone(64 << 20, 1024, 4);
+
+        let result = index
+            .search_one_with_policy_strategy(
+                &[1.0],
+                5,
+                &SearchParams::default(),
+                HnswSearchFilter::predicate(&filter, &[]),
+                &policy,
+                HnswSearchStrategy::ExactScan,
+                &budget,
+            )
+            .unwrap();
+
+        assert_eq!(result.scored_points, filter.len());
+        assert_eq!(
+            result
+                .points
+                .iter()
+                .map(|point| point.idx)
+                .collect::<Vec<_>>(),
+            vec![65_534, 65_532, 65_530, 65_528, 65_526]
+        );
     }
 
     #[test]

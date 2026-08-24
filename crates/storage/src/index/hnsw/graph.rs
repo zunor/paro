@@ -6,7 +6,7 @@
 //! Read-only HNSW graph structure for efficient searching. Supporting both
 //! standard HNSW and exact-bitmap filtered Top-K search.
 
-use super::entry_points::{EntryPoint, EntryPoints};
+use super::entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
 use super::graph_links::GraphLinks;
 use super::search_context::{FixedLengthPriorityQueue, SearchContext};
 use super::types::{
@@ -31,6 +31,11 @@ pub struct GraphLayers {
     /// to rows admitted by the exact predicate, so unrelated filters and
     /// unfiltered searches never pay their degree or distance cost.
     pub predicate_links: Option<GraphLinks>,
+    /// One tagged hierarchical entry per deterministic scalar block. Unlike
+    /// ordinary HNSW entry points this table is intentionally unbounded by a
+    /// small global constant: every block must remain directly reachable when
+    /// a predicate selects it.
+    pub predicate_entry_points: Box<[PredicateEntryPoint]>,
     pub entry_points: EntryPoints,
     pub visited_pool: VisitedPool,
     pub hnsw_m: HnswM,
@@ -75,6 +80,7 @@ impl GraphLayers {
         Self {
             links,
             predicate_links: None,
+            predicate_entry_points: Box::new([]),
             entry_points,
             visited_pool,
             hnsw_m,
@@ -84,6 +90,7 @@ impl GraphLayers {
     pub fn new_with_predicate_links(
         links: GraphLinks,
         predicate_links: GraphLinks,
+        predicate_entry_points: Box<[PredicateEntryPoint]>,
         entry_points: EntryPoints,
         visited_pool: VisitedPool,
         hnsw_m: HnswM,
@@ -96,6 +103,7 @@ impl GraphLayers {
         Self {
             links,
             predicate_links: Some(predicate_links),
+            predicate_entry_points,
             entry_points,
             visited_pool,
             hnsw_m,
@@ -110,6 +118,8 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
         filter: Option<ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
         use_predicate_topology: bool,
         random_entry_point: bool,
         work: &SearchWorkBudget,
@@ -137,6 +147,8 @@ impl GraphLayers {
             algorithm,
             scorer,
             filter,
+            predicate_partition_seeds,
+            predicate_columns,
             use_predicate_topology,
             work,
         )
@@ -150,6 +162,8 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorers: &mut [VectorScorer<'_>],
         filter: Option<ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
         use_predicate_topology: bool,
         random_entry_point: bool,
         work: &SearchWorkBudget,
@@ -181,6 +195,8 @@ impl GraphLayers {
                     algorithm,
                     scorer,
                     filter,
+                    predicate_partition_seeds,
+                    predicate_columns,
                     use_predicate_topology,
                     work,
                 )?),
@@ -228,6 +244,8 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
         filter: Option<ExactRowAdmission<'_>>,
+        predicate_partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
         use_predicate_topology: bool,
         work: &SearchWorkBudget,
     ) -> Result<GraphSearchResult> {
@@ -248,6 +266,8 @@ impl GraphLayers {
                         scorer,
                         |_| true,
                         adaptive,
+                        predicate_partition_seeds,
+                        predicate_columns,
                         use_predicate_topology,
                         work,
                     )?,
@@ -258,6 +278,8 @@ impl GraphLayers {
                         scorer,
                         |row_id| bitmap.contains(row_id),
                         adaptive,
+                        predicate_partition_seeds,
+                        predicate_columns,
                         use_predicate_topology,
                         work,
                     )?,
@@ -281,6 +303,8 @@ impl GraphLayers {
                             })
                         },
                         adaptive,
+                        predicate_partition_seeds,
+                        predicate_columns,
                         use_predicate_topology,
                         work,
                     )?,
@@ -387,6 +411,8 @@ impl GraphLayers {
         scorer: &mut VectorScorer,
         admits: F,
         adaptive_predicate_refinement: bool,
+        predicate_partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
         use_predicate_topology: bool,
         work: &SearchWorkBudget,
     ) -> Result<(Vec<ScoredPoint>, bool, bool)>
@@ -461,7 +487,15 @@ impl GraphLayers {
         // this approximate path; an underfilled local beam falls through to
         // the general graph repair below.
         let (seeds, predicate_topology_used, topology_window_full) = if use_predicate_topology {
-            let (seeds, full) = self.search_predicate_topology(seeds, ef, scorer, &admits, work)?;
+            let (seeds, full) = self.search_predicate_topology(
+                seeds,
+                predicate_partition_seeds,
+                predicate_columns,
+                ef,
+                scorer,
+                &admits,
+                work,
+            )?;
             (seeds, true, full)
         } else {
             (seeds, false, false)
@@ -560,13 +594,17 @@ impl GraphLayers {
         ))
     }
 
-    /// Continue from base-graph predicate seeds on the separately persisted
-    /// predicate-local graph. This beam has its own lower bound: matching rows
-    /// must never be rejected merely because they are farther than the global
-    /// unfiltered beam. Only exact-admitted points are scored or expanded.
+    /// Continue from base-graph predicate seeds over a logical union of the
+    /// predicate-local and ordinary level-0 links. The predicate artifact only
+    /// persists links it adds; reusing the base CSR at query time gives the
+    /// same merged-topology semantics without duplicating durable edges.
+    /// This beam has its own lower bound and only exact-admitted points are
+    /// scored or expanded.
     fn search_predicate_topology<F>(
         &self,
         seeds: Vec<ScoredPoint>,
+        partition_seeds: &[PointOffset],
+        predicate_columns: &[u32],
         ef: usize,
         scorer: &mut VectorScorer<'_>,
         admits: &F,
@@ -580,35 +618,116 @@ impl GraphLayers {
                 "HNSW filter contract selected missing predicate topology",
             ));
         };
-        let Some((&first, remaining)) = seeds.split_first() else {
+        let mut visited = self.visited_pool.get(self.links.num_points());
+        let mut initial = FixedLengthPriorityQueue::new(ef.max(1));
+        for seed in seeds {
+            if !visited.check_and_update_visited(seed.idx) {
+                initial.push(seed);
+            }
+        }
+        let mut direct_seed_count = 0usize;
+        for &point_id in partition_seeds {
+            if admits(point_id) && !visited.check_and_update_visited(point_id) {
+                initial.push(ScoredPoint {
+                    idx: point_id,
+                    score: scorer.score_point(point_id),
+                });
+                direct_seed_count = direct_seed_count.saturating_add(1);
+            }
+        }
+        for entry in &self.predicate_entry_points {
+            if !predicate_columns.contains(&entry.column_id) || !admits(entry.point_id) {
+                continue;
+            }
+            if let Some(seed) =
+                self.descend_predicate_entry(*entry, predicate_links, scorer, admits, work)?
+            {
+                if !visited.check_and_update_visited(seed.idx) {
+                    initial.push(seed);
+                    direct_seed_count = direct_seed_count.saturating_add(1);
+                }
+            }
+        }
+        work.consume(direct_seed_count)?;
+        let initial = initial.into_sorted_vec();
+        let Some((&first, remaining)) = initial.split_first() else {
             return Ok((Vec::new(), false));
         };
         let mut context = SearchContext::new(first, ef);
-        let mut visited = self.visited_pool.get(self.links.num_points());
-        visited.check_and_update_visited(first.idx);
         for &seed in remaining {
-            visited.check_and_update_visited(seed.idx);
             context.process_candidate(seed);
         }
-        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0).saturating_mul(2));
         while let Some(candidate) = context.candidates.pop() {
             work.check_and_consume(1)?;
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
             neighbors.clear();
+            let mut inspected_edges = 0usize;
             predicate_links.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
                 if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
                     neighbors.push(neighbor);
                 }
             });
-            work.consume(neighbors.len())?;
+            self.links.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
+                if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
+                    neighbors.push(neighbor);
+                }
+            });
+            work.consume(inspected_edges)?;
             for point in scorer.score_points_unfiltered(&neighbors) {
                 context.process_candidate(point);
             }
         }
         let full = context.nearest.is_full();
         Ok((context.nearest.into_sorted_vec(), full))
+    }
+
+    fn descend_predicate_entry<F>(
+        &self,
+        entry: PredicateEntryPoint,
+        predicate_links: &GraphLinks,
+        scorer: &mut VectorScorer<'_>,
+        admits: &F,
+        work: &SearchWorkBudget,
+    ) -> Result<Option<ScoredPoint>>
+    where
+        F: Fn(PointOffset) -> bool,
+    {
+        if !admits(entry.point_id) {
+            return Ok(None);
+        }
+        let mut current = ScoredPoint {
+            idx: entry.point_id,
+            score: scorer.score_point(entry.point_id),
+        };
+        let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
+        for level in (1..=entry.level).rev() {
+            let mut changed = true;
+            while changed {
+                work.check_and_consume(1)?;
+                changed = false;
+                neighbors.clear();
+                let mut inspected_edges = 0usize;
+                predicate_links.for_each_link(current.idx, level, |neighbor| {
+                    inspected_edges = inspected_edges.saturating_add(1);
+                    if admits(neighbor) {
+                        neighbors.push(neighbor);
+                    }
+                });
+                work.consume(inspected_edges)?;
+                for candidate in scorer.score_points_unfiltered(&neighbors) {
+                    if candidate.score > current.score {
+                        current = candidate;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        Ok(Some(current))
     }
 
     pub fn num_points(&self) -> usize {
@@ -619,6 +738,7 @@ impl GraphLayers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::hnsw::{DistanceMetric, InMemoryVectorStorage};
     use rand::{rngs::StdRng, SeedableRng};
 
     fn make_graph(entry_points: EntryPoints) -> GraphLayers {
@@ -726,5 +846,52 @@ mod tests {
     fn adaptive_refinement_uses_locality_as_well_as_admission_count() {
         assert!(should_refine_predicate(10, 160, 20, false, Some(0.4), 0.5,));
         assert!(!should_refine_predicate(10, 160, 0, false, None, 0.5));
+    }
+
+    #[test]
+    fn predicate_topology_logically_merges_base_level0_links() {
+        let base = GraphLinks::new_from_edges(vec![
+            vec![vec![1]],
+            vec![vec![2]],
+            vec![vec![]],
+            vec![vec![]],
+        ]);
+        let predicate = GraphLinks::new_from_edges(vec![
+            vec![vec![1]],
+            vec![vec![]],
+            vec![vec![]],
+            vec![vec![]],
+        ]);
+        let graph = GraphLayers::new_with_predicate_links(
+            base,
+            predicate,
+            Box::new([]),
+            EntryPoints::default(),
+            VisitedPool::new(),
+            HnswM::new(8),
+        );
+        let storage = InMemoryVectorStorage::new(vec![10.0, 5.0, 0.0, 100.0], 1);
+        let query = DistanceMetric::Euclidean.prepare(&[0.0]);
+        let mut scorer = VectorScorer::new(&query, &storage).unwrap();
+        let seed = ScoredPoint {
+            idx: 0,
+            score: scorer.score_point(0),
+        };
+        let budget = crate::search::ResourceBudget::default();
+
+        let (points, full) = graph
+            .search_predicate_topology(
+                vec![seed],
+                &[],
+                &[],
+                3,
+                &mut scorer,
+                &|point| point <= 2,
+                budget.work.as_ref(),
+            )
+            .unwrap();
+
+        assert!(full);
+        assert_eq!(points[0].idx, 2);
     }
 }

@@ -14,7 +14,6 @@ use crate::index::{collect_predicate_columns, IndexEvaluator, PredicateResult, P
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
 use crate::rowset::{SegmentIterator, SegmentRowId};
-use crate::search::SearchWorkBudget;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
@@ -101,14 +100,7 @@ impl Segment {
             HnswSearchStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
         let budget = crate::search::ResourceBudget::default();
         self.vector_search_with_filter_strategy(
-            column_id,
-            query,
-            top_k,
-            params,
-            filter,
-            policy,
-            strategy,
-            budget.work.as_ref(),
+            column_id, query, top_k, params, filter, policy, strategy, &budget,
         )
     }
 
@@ -124,7 +116,7 @@ impl Segment {
         filter: HnswSearchFilter<'_>,
         policy: &HnswSearchPolicy,
         strategy: HnswSearchStrategy,
-        work: &SearchWorkBudget,
+        budget: &crate::search::ResourceBudget,
     ) -> Result<HnswSearchResult> {
         let index = self
             .open_hnsw_index(column_id)?
@@ -140,7 +132,8 @@ impl Segment {
                 });
             }
         }
-        index.search_one_with_policy_strategy(query, top_k, params, filter, policy, strategy, work)
+        index
+            .search_one_with_policy_strategy(query, top_k, params, filter, policy, strategy, budget)
     }
 
     /// Perform a sparse vector search on this segment.

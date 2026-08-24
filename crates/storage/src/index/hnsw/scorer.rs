@@ -13,11 +13,39 @@ use super::types::{PointOffset, ScoreType, ScoredPoint};
 use super::vector_storage::CosineInverseNorms;
 use super::{DistanceMetric, PreparedQuery, VectorStorage};
 
+#[derive(Clone, Copy)]
 enum ScoringKernel<'a> {
     Cosine(&'a CosineInverseNorms),
     Euclidean,
     DotProduct,
     Manhattan,
+}
+
+/// Immutable, shareable scoring plan for independent exact-scan partitions.
+///
+/// `VectorScorer` owns mutable scratch and telemetry and is intentionally not
+/// `Sync`. Resolving the metric and artifact invariants once into this value
+/// lets parallel workers create isolated scorers without repeating validation
+/// or sharing interior-mutable state.
+#[derive(Clone, Copy)]
+pub(crate) struct PreparedVectorScoring<'a> {
+    query: &'a PreparedQuery,
+    vectors: &'a [f32],
+    dimension: usize,
+    kernel: ScoringKernel<'a>,
+}
+
+impl<'a> PreparedVectorScoring<'a> {
+    pub(crate) fn scorer(self) -> VectorScorer<'a> {
+        VectorScorer {
+            query: self.query,
+            vectors: self.vectors,
+            dimension: self.dimension,
+            kernel: self.kernel,
+            scores_buffer: Vec::new(),
+            scored_points: Cell::new(0),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -116,6 +144,22 @@ impl<'a> VectorScorer<'a> {
 
     pub fn scored_point_count(&self) -> u64 {
         self.scored_points.get()
+    }
+
+    pub(crate) fn prepared_scoring(&self) -> PreparedVectorScoring<'a> {
+        PreparedVectorScoring {
+            query: self.query,
+            vectors: self.vectors,
+            dimension: self.dimension,
+            kernel: self.kernel,
+        }
+    }
+
+    /// Merge work performed by isolated exact-scan scorers into the query's
+    /// authoritative telemetry counter.
+    pub(crate) fn add_scored_point_count(&self, count: u64) {
+        self.scored_points
+            .set(self.scored_points.get().saturating_add(count));
     }
 
     /// Score an indexed point whose vector has already been fetched.

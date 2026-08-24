@@ -21,6 +21,19 @@ pub struct EntryPoint {
     pub level: usize,
 }
 
+/// Durable entry point for one scalar-block HNSW topology.
+///
+/// Predicate graphs contain independent local hierarchies for every declared
+/// scalar column. Tagging each entry with its column identity prevents an
+/// unrelated filter from selecting a coincidentally admitted entry point from
+/// another access path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PredicateEntryPoint {
+    pub column_id: u32,
+    pub point_id: PointOffset,
+    pub level: usize,
+}
+
 impl PartialOrd for EntryPoint {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))

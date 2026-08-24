@@ -35,11 +35,22 @@ impl HnswIndexStatistics {
         let num_vectors = index.vector_storage.num_vectors();
         let dim = index.vector_storage.vector_dim();
         let degree_summary = index.graph.links.degree_summary();
-        let graph_links_size = index.graph.links.serialized_size_bytes();
+        let graph_links_size = index.graph.predicate_links.as_ref().map_or(
+            index.graph.links.serialized_size_bytes(),
+            |predicate| {
+                index
+                    .graph
+                    .links
+                    .serialized_size_bytes()
+                    .saturating_add(predicate.serialized_size_bytes())
+            },
+        );
         let entry_points_size = (index.graph.entry_points.entry_points.len()
             + index.graph.entry_points.extra_entry_points.len())
             as u64
-            * std::mem::size_of::<crate::index::hnsw::EntryPoint>() as u64;
+            * std::mem::size_of::<crate::index::hnsw::EntryPoint>() as u64
+            + index.graph.predicate_entry_points.len() as u64
+                * std::mem::size_of::<crate::index::hnsw::PredicateEntryPoint>() as u64;
         let metric_preprocessing_size = index
             .vector_storage
             .cosine_inverse_norms()

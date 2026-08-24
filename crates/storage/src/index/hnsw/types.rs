@@ -33,7 +33,10 @@ pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
-pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 2;
+pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 3;
+/// Version 7 retains every scalar block's hierarchy and tagged entry point.
+/// Filtered navigation can enter each admitted block directly instead of
+/// relying on an ordinary level-0 beam to discover disconnected partitions.
 /// Version 6 connects deterministic scalar blocks with bounded vector-aware
 /// cross-block routing edges. Range predicates can navigate the admitted
 /// union without relying on the ordinary graph to seed every block.
@@ -44,7 +47,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 2;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 6;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 7;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -145,6 +148,13 @@ impl<'a> HnswSearchFilter<'a> {
         Self::Predicate { row_set, columns }
     }
 
+    pub const fn predicate_columns(self) -> &'a [ColumnId] {
+        match self {
+            Self::Predicate { columns, .. } => columns,
+            Self::None | Self::Visibility(_) => &[],
+        }
+    }
+
     /// Select the predicate-local graph when exact runtime cardinality proves
     /// that the predicate-induced base graph is below its designed local
     /// degree. This is a per-segment connectivity decision, not a selectivity
@@ -195,6 +205,15 @@ pub enum HnswSearchStrategy {
     UnfilteredGraph,
     MaskedGraph,
     AdaptiveFilteredGraph,
+}
+
+/// Query-wide execution decision derived from exact cardinalities. Segment
+/// boundaries and machine width are physical concerns and must not change
+/// whether the same logical candidate set is scanned exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswQueryWideStrategy {
+    ExactScan,
+    SegmentAdaptive,
 }
 
 /// Executed HNSW path. This is runtime evidence, not the strategy estimated by
@@ -294,6 +313,48 @@ impl HnswSearchStrategy {
                 } else {
                     Self::AdaptiveFilteredGraph
                 }
+            }
+        }
+    }
+}
+
+impl HnswQueryWideStrategy {
+    /// Select exact scanning from the total logical candidate set. Thresholds
+    /// are logical cardinality crossovers measured for the complete query;
+    /// scaling them by CPU count would make replicas choose different paths.
+    pub fn choose(
+        filter_kind: HnswFilterKind,
+        matching_rows: u64,
+        total_rows: u64,
+        policy: HnswSearchPolicy,
+    ) -> Self {
+        let exact_capacity = match filter_kind {
+            HnswFilterKind::None => policy.plain_scan_threshold,
+            HnswFilterKind::Visibility | HnswFilterKind::Predicate => {
+                policy.filtered_plain_scan_threshold
+            }
+        } as u64;
+        if matching_rows.min(total_rows) <= exact_capacity {
+            Self::ExactScan
+        } else {
+            Self::SegmentAdaptive
+        }
+    }
+
+    /// Lower the query-wide contract to one segment. When the whole query is
+    /// not an exact scan, locally tiny segments may still choose exact scoring;
+    /// doing so is exact and avoids wasting graph setup on a small tail.
+    pub fn for_segment(
+        self,
+        filter_kind: HnswFilterKind,
+        matching_rows: u64,
+        total_rows: u64,
+        policy: HnswSearchPolicy,
+    ) -> HnswSearchStrategy {
+        match self {
+            Self::ExactScan => HnswSearchStrategy::ExactScan,
+            Self::SegmentAdaptive => {
+                HnswSearchStrategy::choose(filter_kind, matching_rows, total_rows, policy)
             }
         }
     }
@@ -427,7 +488,7 @@ pub struct HnswFilterTopologyContract {
     /// dictionaries may choose a slightly larger boundary to avoid splitting
     /// equal values across blocks.
     pub target_block_rows: u32,
-    /// Per-point degree of the predicate-local level-0 graph.
+    /// Per-point degree of each predicate-local hierarchy.
     pub m: u32,
 }
 
@@ -866,6 +927,45 @@ mod tests {
         );
         assert_eq!(
             HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
+            HnswSearchStrategy::AdaptiveFilteredGraph
+        );
+    }
+
+    #[test]
+    fn query_wide_exact_strategy_is_independent_of_segment_shape() {
+        let policy = HnswSearchPolicy {
+            filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
+        };
+        let query_strategy =
+            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 18_000, 10_000_000, policy);
+        assert_eq!(query_strategy, HnswQueryWideStrategy::ExactScan);
+
+        // The same logical 18k candidates remain exact regardless of how a
+        // compaction partitions those rows across immutable segments.
+        for (matching_rows, segment_rows) in
+            [(3_000, 2_000_000), (10_000, 7_000_000), (5_000, 1_000_000)]
+        {
+            assert_eq!(
+                query_strategy.for_segment(
+                    HnswFilterKind::Predicate,
+                    matching_rows,
+                    segment_rows,
+                    policy,
+                ),
+                HnswSearchStrategy::ExactScan
+            );
+        }
+
+        let adaptive =
+            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 1_000_000, 10_000_000, policy);
+        assert_eq!(adaptive, HnswQueryWideStrategy::SegmentAdaptive);
+        assert_eq!(
+            adaptive.for_segment(HnswFilterKind::Predicate, 10_000, 1_000_000, policy),
+            HnswSearchStrategy::ExactScan
+        );
+        assert_eq!(
+            adaptive.for_segment(HnswFilterKind::Predicate, 100_000, 1_000_000, policy),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );
     }

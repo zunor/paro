@@ -35,7 +35,7 @@ pub use build_task::{
 };
 pub use builder::GraphLayersBuilder;
 pub use distance::DistanceMetric;
-pub use entry_points::{EntryPoint, EntryPoints};
+pub use entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
 pub use graph::GraphLayers;
 pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;

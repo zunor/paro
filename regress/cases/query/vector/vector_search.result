@@ -112,7 +112,7 @@ PROJECTION  (rows=2)
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: per-segment runtime choice: exact row-set distance scan at <= 8 matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -133,7 +133,7 @@ PROJECTION  (rows=2)
     Pushed Predicate: id = 1
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 1
-    Filtered Strategy: per-segment runtime choice: exact row-set distance scan at <= 8 matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -154,7 +154,7 @@ PROJECTION  (rows=2)
     Pushed Predicate: id <= 9
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 9
-    Filtered Strategy: per-segment runtime choice: exact row-set distance scan at <= 8 matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
 
 SELECT id FROM indexed_items
 WHERE id <= 9
@@ -236,7 +236,7 @@ PROJECTION  (rows=2)
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: per-segment runtime choice: exact row-set distance scan at <= 8 matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
 
 DEALLOCATE filtered_vector_topk;
 DEALLOCATE

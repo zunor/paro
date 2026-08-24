@@ -500,7 +500,7 @@ impl HnswInlineThreshold {
             .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
     }
 
-    /// Durable footprint of the predicate-local level-0 topology. Each
+    /// Durable footprint of the predicate-local hierarchical topology. Each
     /// configured scalar column independently partitions the full point
     /// domain and contributes at most `2 * filter_m` local links plus
     /// `filter_m` cross-block routing links per point. The published graph
@@ -509,6 +509,7 @@ impl HnswInlineThreshold {
     pub fn estimate_filter_graph_memory_bytes(
         vector_count: u64,
         filter_columns: usize,
+        target_block_rows: u32,
         filter_m: u32,
     ) -> u64 {
         if filter_columns == 0 {
@@ -523,12 +524,23 @@ impl HnswInlineThreshold {
             .saturating_mul(columns)
             .saturating_mul(u64::from(filter_m).saturating_mul(3))
             .saturating_mul(std::mem::size_of::<u32>() as u64);
-        // One encoded level-count byte per point plus the fixed GraphLinks V2
-        // header. Predicate topology has no upper levels.
+        let m = u64::from(filter_m.max(2));
+        let upper_payload_per_point = 1_u64.saturating_add(
+            m.saturating_mul(5)
+                .saturating_add(1)
+                .div_ceil(m - 1)
+                .saturating_mul(columns),
+        );
+        let block_count = vector_count
+            .div_ceil(u64::from(target_block_rows.max(1)))
+            .saturating_add(1)
+            .saturating_mul(columns);
+        let entry_points = block_count.saturating_mul(12);
         64_u64
             .saturating_add(offset_tables)
             .saturating_add(links)
-            .saturating_add(vector_count)
+            .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
+            .saturating_add(entry_points)
     }
 
     /// Mutable graph-builder resident estimate. This belongs only to runtime
@@ -595,6 +607,10 @@ impl HnswInlineThreshold {
             .saturating_mul(filter_columns as u64)
             .saturating_mul(u64::from(filter_m).saturating_mul(3))
             .saturating_mul(std::mem::size_of::<u32>() as u64);
+        let upper_level_containers = vector_count
+            .saturating_mul(filter_columns as u64)
+            .div_ceil(u64::from(filter_m.max(2)) - 1)
+            .saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
         let block_membership = vector_count.saturating_mul(std::mem::size_of::<u32>() as u64);
         let local_vectors = max_block_rows
             .saturating_mul(u64::from(dimension.max(1)))
@@ -602,6 +618,7 @@ impl HnswInlineThreshold {
         let local_visited = max_block_rows.saturating_mul(build_width.max(1) as u64);
         merged_containers
             .saturating_add(merged_links)
+            .saturating_add(upper_level_containers)
             .saturating_add(block_membership)
             .saturating_add(Self::estimate_builder_graph_memory_bytes(
                 max_block_rows,
@@ -653,6 +670,7 @@ impl HnswInlineBuildEstimate {
                 .saturating_add(HnswInlineThreshold::estimate_filter_graph_memory_bytes(
                     vector_count,
                     config.filter_columns.len(),
+                    config.filter_block_rows,
                     config.filter_m,
                 ))
                 .saturating_add(metric_preprocessing_bytes);

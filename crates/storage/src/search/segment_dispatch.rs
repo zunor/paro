@@ -58,18 +58,50 @@ where
             })
     };
 
-    if parallelism_slots > 1 && segments.len() > 1 {
-        let pool = dispatch_pool(parallelism_slots.min(segments.len()))?;
-        pool.install(|| {
+    map_segments(segments, parallelism_slots, execute_one)
+}
+
+/// Execute an ordered segment phase in the shared query-governed pool.
+///
+/// Providers with an exact preparation phase use the same executor for
+/// predicate evaluation and search. Keeping this primitive below telemetry
+/// avoids reporting predicate preparation as a completed segment search, and
+/// nested provider work reuses the pool without creating another executor.
+pub(crate) fn map_segments<T, F>(
+    segments: &[VisibleSegment],
+    parallelism_slots: usize,
+    execute: F,
+) -> Result<Vec<T>>
+where
+    T: Send,
+    F: Fn((usize, &VisibleSegment)) -> Result<T> + Send + Sync,
+{
+    if parallelism_slots > 1 && !segments.is_empty() {
+        install_search_pool(parallelism_slots, || {
             segments
                 .par_iter()
                 .enumerate()
-                .map(execute_one)
+                .map(execute)
                 .collect::<Result<Vec<_>>>()
         })
     } else {
-        segments.iter().enumerate().map(execute_one).collect()
+        segments.iter().enumerate().map(execute).collect()
     }
+}
+
+/// Run provider work in the process-level search pool selected by the query's
+/// execution grant.
+///
+/// This is the shared nesting boundary for segment dispatch and finer-grained
+/// provider partitions. Rayon can work-steal nested jobs in the same pool, so
+/// a query never creates a private executor or oversubscribes the granted
+/// width when one large segment exposes more parallel work than its siblings.
+pub(crate) fn install_search_pool<T, F>(parallelism_slots: usize, execute: F) -> Result<T>
+where
+    T: Send,
+    F: FnOnce() -> Result<T> + Send,
+{
+    dispatch_pool(parallelism_slots.max(1))?.install(execute)
 }
 
 fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {

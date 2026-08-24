@@ -7,8 +7,8 @@ use std::time::Instant;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
-    HnswFilterKind, HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
-    PreparedQuery,
+    HnswFilterKind, HnswIndex, HnswQueryWideStrategy, HnswSearchFilter, HnswSearchPolicy,
+    HnswSearchStrategy, PreparedQuery,
 };
 use crate::index::ExactRowSet;
 use crate::index::MmapVectorStorage;
@@ -20,7 +20,7 @@ use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
 use crate::search::row_fetch::snapshot_epoch;
-use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
+use crate::search::segment_dispatch::{dispatch_segments, map_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
     SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
@@ -36,7 +36,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 
-use crate::search::budget::{ResourceBudget, SearchBatchConfig};
+use crate::search::budget::{ResourceBudget, SearchBatchConfig, SearchMemoryReservation};
 use crate::search::cursor::PhysicalRowRef;
 
 pub(crate) struct VectorSearchProvider {
@@ -49,6 +49,11 @@ pub(crate) struct VectorSearchProvider {
     params: SearchParams,
     predicate: Option<PredicateTree>,
     telemetry: Arc<dyn SearchTelemetryCollector>,
+}
+
+struct PreparedPredicateFilter {
+    row_set: Arc<dyn ExactRowSet>,
+    _reservation: SearchMemoryReservation,
 }
 
 impl VectorSearchProvider {
@@ -206,69 +211,93 @@ impl VectorSearchCursor {
             .map(crate::index::collect_predicate_columns)
             .unwrap_or_default();
         let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        let total_rows = self
-            .snapshot
-            .table_lease
-            .visible_segments()
-            .iter()
-            .fold(0u64, |rows, segment| {
-                rows.saturating_add(segment.segment.num_rows())
-            });
-        let unfiltered_strategy = HnswSearchStrategy::choose(
-            HnswFilterKind::None,
-            total_rows,
-            total_rows,
-            self.search_policy,
-        );
-        let per_segment = dispatch_segments(
-            SearchIndexKind::Hnsw,
-            self.snapshot.table_lease.visible_segments(),
-            budget.parallelism_slots.max(1),
-            self.telemetry.as_ref(),
-            |_, segment| {
-                let filter_row_set = segment
-                    .segment
-                    .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
-                if predicate.is_some() && filter_row_set.is_none() {
-                    return Err(paro_error::internal(
-                        "filtered vector search did not prepare an exact segment row set",
-                    ));
-                }
-                let _reservation = filter_row_set
-                    .as_ref()
-                    .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
-                    .transpose()?;
-                let filter_row_set = filter_row_set.as_deref();
-                let filter = match (predicate.is_some(), filter_row_set) {
-                    (_, None) => HnswSearchFilter::None,
-                    (true, Some(row_set)) => {
-                        HnswSearchFilter::predicate(row_set, &predicate_columns)
-                    }
-                    (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
-                };
-                let search_strategy = match filter.kind() {
-                    HnswFilterKind::None => unfiltered_strategy,
-                    kind => HnswSearchStrategy::choose(
-                        kind,
-                        filter
-                            .row_set()
-                            .map_or(segment.segment.num_rows(), ExactRowSet::len),
-                        segment.segment.num_rows(),
-                        self.search_policy,
-                    ),
-                };
-                let (rows, degraded) =
-                    self.search_segment(segment, search_strategy, filter, budget.work.as_ref())?;
-                let degraded_reason = degraded
-                    .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
-                    .flatten();
-                Ok(SegmentDispatchResult {
-                    candidates_produced: rows.len(),
-                    degraded,
-                    output: (rows, degraded, degraded_reason),
-                })
-            },
-        )?;
+        let visible_segments = self.snapshot.table_lease.visible_segments();
+        let total_rows = visible_segments.iter().fold(0u64, |rows, segment| {
+            rows.saturating_add(segment.segment.num_rows())
+        });
+        let parallelism_slots = budget.parallelism_slots.max(1);
+
+        // Predicate cardinality is a logical query property, not a segment
+        // property. Prepare exact row sets in parallel, retain them under the
+        // query memory grant, and make one query-wide exact-vs-graph decision.
+        // This prevents compaction or a different segment envelope from
+        // silently changing result quality for the same data and predicate.
+        let prepared_predicate_filters = predicate
+            .map(|predicate| {
+                map_segments(
+                    visible_segments,
+                    parallelism_slots,
+                    |(_, segment)| -> Result<PreparedPredicateFilter> {
+                        let row_set = segment
+                            .segment
+                            .build_hnsw_filter_with_epoch(snapshot_version, Some(predicate))?
+                            .ok_or_else(|| {
+                                paro_error::internal(
+                                    "filtered vector search did not prepare an exact segment row set",
+                                )
+                            })?;
+                        let reservation =
+                            budget.try_reserve_memory(row_set.query_retained_bytes())?;
+                        Ok(PreparedPredicateFilter {
+                            row_set,
+                            _reservation: reservation,
+                        })
+                    },
+                )
+            })
+            .transpose()?;
+        let query_wide_strategy = match &prepared_predicate_filters {
+            Some(filters) => HnswQueryWideStrategy::choose(
+                HnswFilterKind::Predicate,
+                filters.iter().fold(0u64, |rows, filter| {
+                    rows.saturating_add(filter.row_set.len())
+                }),
+                total_rows,
+                self.search_policy,
+            ),
+            None => HnswQueryWideStrategy::choose(
+                HnswFilterKind::None,
+                total_rows,
+                total_rows,
+                self.search_policy,
+            ),
+        };
+
+        let per_segment = match &prepared_predicate_filters {
+            Some(filters) => dispatch_segments(
+                SearchIndexKind::Hnsw,
+                visible_segments,
+                parallelism_slots,
+                self.telemetry.as_ref(),
+                |index, segment| {
+                    let filter = HnswSearchFilter::predicate(
+                        filters[index].row_set.as_ref(),
+                        &predicate_columns,
+                    );
+                    self.dispatch_segment_search(segment, query_wide_strategy, filter, budget)
+                },
+            )?,
+            None => dispatch_segments(
+                SearchIndexKind::Hnsw,
+                visible_segments,
+                parallelism_slots,
+                self.telemetry.as_ref(),
+                |_, segment| {
+                    let filter_row_set = segment
+                        .segment
+                        .build_hnsw_filter_with_epoch(snapshot_version, None)?;
+                    let _reservation = filter_row_set
+                        .as_ref()
+                        .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
+                        .transpose()?;
+                    let filter = match filter_row_set.as_deref() {
+                        None => HnswSearchFilter::None,
+                        Some(row_set) => HnswSearchFilter::Visibility(row_set),
+                    };
+                    self.dispatch_segment_search(segment, query_wide_strategy, filter, budget)
+                },
+            )?,
+        };
 
         let mut collector = TopKCollector::new(self.k);
         let mut candidates_produced = 0usize;
@@ -299,12 +328,39 @@ impl VectorSearchCursor {
         Ok(ranked_rows)
     }
 
+    fn dispatch_segment_search(
+        &self,
+        segment: &VisibleSegment,
+        query_wide_strategy: HnswQueryWideStrategy,
+        filter: HnswSearchFilter<'_>,
+        budget: &ResourceBudget,
+    ) -> Result<SegmentDispatchResult<(Vec<RankedRow>, bool, Option<String>)>> {
+        let matching_rows = filter
+            .row_set()
+            .map_or(segment.segment.num_rows(), ExactRowSet::len);
+        let search_strategy = query_wide_strategy.for_segment(
+            filter.kind(),
+            matching_rows,
+            segment.segment.num_rows(),
+            self.search_policy,
+        );
+        let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
+        let degraded_reason = degraded
+            .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
+            .flatten();
+        Ok(SegmentDispatchResult {
+            candidates_produced: rows.len(),
+            degraded,
+            output: (rows, degraded, degraded_reason),
+        })
+    }
+
     fn search_segment(
         &self,
         visible_segment: &VisibleSegment,
         search_strategy: HnswSearchStrategy,
         filter: HnswSearchFilter<'_>,
-        work: &crate::search::SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<(Vec<RankedRow>, bool)> {
         if let Some(index) = visible_segment
             .segment
@@ -321,7 +377,7 @@ impl VectorSearchCursor {
                     filter,
                     &self.search_policy,
                     search_strategy,
-                    work,
+                    budget,
                 )
                 .map(|result| {
                     let rows = result.points;
@@ -374,7 +430,7 @@ impl VectorSearchCursor {
                     filter,
                     &self.search_policy,
                     search_strategy,
-                    work,
+                    budget,
                 )
                 .map(|result| {
                     (
@@ -604,7 +660,7 @@ mod tests {
     #[test]
     fn unfiltered_plain_scan_threshold_is_query_wide() {
         assert_eq!(
-            HnswSearchStrategy::choose(
+            HnswQueryWideStrategy::choose(
                 HnswFilterKind::None,
                 10_000,
                 10_000,
@@ -613,10 +669,10 @@ mod tests {
                     ..HnswSearchPolicy::default()
                 },
             ),
-            HnswSearchStrategy::ExactScan
+            HnswQueryWideStrategy::ExactScan
         );
         assert_eq!(
-            HnswSearchStrategy::choose(
+            HnswQueryWideStrategy::choose(
                 HnswFilterKind::None,
                 10_001,
                 10_001,
@@ -625,7 +681,7 @@ mod tests {
                     ..HnswSearchPolicy::default()
                 },
             ),
-            HnswSearchStrategy::UnfilteredGraph
+            HnswQueryWideStrategy::SegmentAdaptive
         );
     }
 
@@ -636,16 +692,16 @@ mod tests {
             ..HnswSearchPolicy::default()
         };
         assert_eq!(
-            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_000, 1_000_000, policy,),
-            HnswSearchStrategy::ExactScan
+            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 20_000, 10_000_000, policy,),
+            HnswQueryWideStrategy::ExactScan
         );
         assert_eq!(
-            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 1_000_000, policy,),
-            HnswSearchStrategy::AdaptiveFilteredGraph
+            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
+            HnswQueryWideStrategy::SegmentAdaptive
         );
         assert_eq!(
-            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 500_000, 1_000_000, policy,),
-            HnswSearchStrategy::AdaptiveFilteredGraph
+            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 500_000, 10_000_000, policy,),
+            HnswQueryWideStrategy::SegmentAdaptive
         );
     }
 }

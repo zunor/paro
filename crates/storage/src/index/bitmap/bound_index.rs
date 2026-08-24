@@ -25,6 +25,76 @@ use crate::index::{
 
 use super::{BitmapIndexReader, BitmapIndexWriter};
 
+#[derive(Debug)]
+struct AcceptedOrdinals {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl AcceptedOrdinals {
+    fn new(len: usize) -> Self {
+        Self {
+            words: vec![0; len.div_ceil(64)],
+            len,
+        }
+    }
+
+    fn insert(&mut self, ordinal: usize) {
+        if ordinal < self.len {
+            self.words[ordinal / 64] |= 1_u64 << (ordinal % 64);
+        }
+    }
+
+    fn remove(&mut self, ordinal: usize) {
+        if ordinal < self.len {
+            self.words[ordinal / 64] &= !(1_u64 << (ordinal % 64));
+        }
+    }
+
+    fn insert_range(&mut self, start: usize, end: usize) {
+        let start = start.min(self.len);
+        let end = end.min(self.len);
+        if start >= end {
+            return;
+        }
+        let first_word = start / 64;
+        let last_word = (end - 1) / 64;
+        for word_index in first_word..=last_word {
+            let word_start = word_index * 64;
+            let first_bit = start.saturating_sub(word_start).min(64);
+            let last_bit = end.saturating_sub(word_start).min(64);
+            let below_last = if last_bit == 64 {
+                u64::MAX
+            } else {
+                (1_u64 << last_bit) - 1
+            };
+            self.words[word_index] |= below_last & (u64::MAX << first_bit);
+        }
+    }
+
+    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.words
+            .iter()
+            .copied()
+            .enumerate()
+            .flat_map(move |(word_index, mut word)| {
+                std::iter::from_fn(move || {
+                    if word == 0 {
+                        return None;
+                    }
+                    let bit = word.trailing_zeros() as usize;
+                    word &= word - 1;
+                    let ordinal = word_index * 64 + bit;
+                    (ordinal < self.len).then_some(ordinal)
+                })
+            })
+    }
+
+    fn into_words(self) -> Box<[u64]> {
+        self.words.into_boxed_slice()
+    }
+}
+
 /// Bound Bitmap index.
 pub struct BitmapIndex {
     name: String,
@@ -32,6 +102,11 @@ pub struct BitmapIndex {
     column_ids: Vec<ColumnId>,
     logical_types: Vec<LogicalType>,
     reader: BitmapIndexReader,
+    /// Physical bitmap ordinals sorted by SQL scalar semantics. The durable
+    /// bitmap dictionary is byte-keyed for equality lookup; integer and other
+    /// fixed-width encodings are not lexicographically ordered, so range
+    /// predicates must use this typed access path rather than byte order.
+    ordered_ordinals: Box<[usize]>,
     index_data: Bytes,
 }
 
@@ -48,12 +123,39 @@ impl BitmapIndex {
         index_data: Bytes,
     ) -> Result<Self> {
         let reader = BitmapIndexReader::from_bytes(&index_data)?;
+        let logical_type = logical_types.first().ok_or_else(|| {
+            paro_error::invalid_input("bitmap index requires one logical column type")
+        })?;
+        let mut ordered_ordinals = (0..reader.num_values()).collect::<Vec<_>>();
+        let sort_error = std::cell::RefCell::new(None);
+        ordered_ordinals.sort_by(|&left, &right| {
+            let left = reader
+                .get_dict_value(left)
+                .expect("bitmap dictionary ordinal validated");
+            let right = reader
+                .get_dict_value(right)
+                .expect("bitmap dictionary ordinal validated");
+            match compare_bytes(logical_type, left, right) {
+                Ok(ordering) => ordering,
+                Err(error) => {
+                    let mut first_error = sort_error.borrow_mut();
+                    if first_error.is_none() {
+                        *first_error = Some(error);
+                    }
+                    std::cmp::Ordering::Equal
+                }
+            }
+        });
+        if let Some(error) = sort_error.into_inner() {
+            return Err(error.context("sort bitmap dictionary by SQL scalar semantics"));
+        }
         Ok(Self {
             name: name.into(),
             constraint_type,
             column_ids,
             logical_types,
             reader,
+            ordered_ordinals: ordered_ordinals.into_boxed_slice(),
             index_data,
         })
     }
@@ -92,12 +194,42 @@ impl BitmapIndex {
         info
     }
 
-    fn matching_ordinals(&self, predicate: &Predicate) -> Option<(Vec<bool>, bool)> {
+    fn seek_ordered_dictionary(&self, value: &[u8]) -> Option<(usize, bool)> {
+        let logical_type = self.logical_type()?;
+        let mut left = 0usize;
+        let mut right = self.ordered_ordinals.len();
+        while left < right {
+            let middle = left + (right - left) / 2;
+            let ordinal = self.ordered_ordinals[middle];
+            let candidate = self.reader.get_dict_value(ordinal)?;
+            match compare_bytes(logical_type, candidate, value).ok()? {
+                std::cmp::Ordering::Less => left = middle + 1,
+                std::cmp::Ordering::Equal | std::cmp::Ordering::Greater => right = middle,
+            }
+        }
+        let exact = self
+            .ordered_ordinals
+            .get(left)
+            .and_then(|&ordinal| self.reader.get_dict_value(ordinal))
+            .and_then(|candidate| compare_bytes(logical_type, candidate, value).ok())
+            == Some(std::cmp::Ordering::Equal);
+        Some((left, exact))
+    }
+
+    fn insert_ordered_range(&self, accepted: &mut AcceptedOrdinals, start: usize, end: usize) {
+        for &ordinal in &self.ordered_ordinals
+            [start.min(self.ordered_ordinals.len())..end.min(self.ordered_ordinals.len())]
+        {
+            accepted.insert(ordinal);
+        }
+    }
+
+    fn matching_ordinals(&self, predicate: &Predicate) -> Option<(AcceptedOrdinals, bool)> {
         if self.column_ids.len() != 1 || predicate.index_column_id() != Some(self.column_ids[0]) {
             return None;
         }
         let logical_type = self.logical_type()?;
-        let mut accepted = vec![false; self.reader.num_values()];
+        let mut accepted = AcceptedOrdinals::new(self.reader.num_values());
         let mut accepts_null = false;
 
         match predicate {
@@ -105,58 +237,61 @@ impl BitmapIndex {
                 let bytes = value_to_bytes(value, logical_type).ok()?;
                 let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
                 if exact {
-                    accepted[ordinal] = true;
+                    accepted.insert(ordinal);
                 }
             }
             Predicate::NotEq { value, .. } => {
                 let bytes = value_to_bytes(value, logical_type).ok()?;
-                for (ordinal, item) in accepted.iter_mut().enumerate() {
-                    *item = self.reader.get_dict_value(ordinal)?.as_ref() != bytes.as_slice();
+                accepted.insert_range(0, self.reader.num_values());
+                let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                if exact {
+                    accepted.remove(ordinal);
                 }
             }
-            Predicate::Lt { value, .. }
-            | Predicate::Le { value, .. }
-            | Predicate::Gt { value, .. }
-            | Predicate::Ge { value, .. } => {
+            Predicate::Lt { value, .. } => {
                 let bytes = value_to_bytes(value, logical_type).ok()?;
-                for (ordinal, item) in accepted.iter_mut().enumerate() {
-                    let ordering = compare_bytes(
-                        logical_type,
-                        self.reader.get_dict_value(ordinal)?.as_ref(),
-                        &bytes,
-                    )
-                    .ok()?;
-                    *item = match predicate {
-                        Predicate::Lt { .. } => ordering == std::cmp::Ordering::Less,
-                        Predicate::Le { .. } => ordering != std::cmp::Ordering::Greater,
-                        Predicate::Gt { .. } => ordering == std::cmp::Ordering::Greater,
-                        Predicate::Ge { .. } => ordering != std::cmp::Ordering::Less,
-                        _ => unreachable!(),
-                    };
-                }
+                let (end, _) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, 0, end);
+            }
+            Predicate::Le { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (end, exact) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, 0, end + usize::from(exact));
+            }
+            Predicate::Gt { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (start, exact) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(
+                    &mut accepted,
+                    start + usize::from(exact),
+                    self.reader.num_values(),
+                );
+            }
+            Predicate::Ge { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (start, _) = self.seek_ordered_dictionary(&bytes)?;
+                self.insert_ordered_range(&mut accepted, start, self.reader.num_values());
             }
             Predicate::In { values, .. } => {
                 for value in values {
                     let bytes = value_to_bytes(value, logical_type).ok()?;
                     let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
                     if exact {
-                        accepted[ordinal] = true;
+                        accepted.insert(ordinal);
                     }
                 }
             }
             Predicate::Range { lower, upper, .. } => {
                 let lower = value_to_bytes(lower, logical_type).ok()?;
                 let upper = value_to_bytes(upper, logical_type).ok()?;
-                for (ordinal, item) in accepted.iter_mut().enumerate() {
-                    let value = self.reader.get_dict_value(ordinal)?.as_ref();
-                    *item = compare_bytes(logical_type, value, &lower).ok()?
-                        != std::cmp::Ordering::Less
-                        && compare_bytes(logical_type, value, &upper).ok()?
-                            != std::cmp::Ordering::Greater;
-                }
+                let (start, _) = self.seek_ordered_dictionary(&lower)?;
+                let (end, exact) = self.seek_ordered_dictionary(&upper)?;
+                self.insert_ordered_range(&mut accepted, start, end + usize::from(exact));
             }
             Predicate::IsNull { .. } => accepts_null = true,
-            Predicate::IsNotNull { .. } => accepted.fill(true),
+            Predicate::IsNotNull { .. } => {
+                accepted.insert_range(0, self.reader.num_values());
+            }
             Predicate::FixedIn { .. }
             | Predicate::StringPrefix { .. }
             | Predicate::StringPrefixIn { .. }
@@ -169,18 +304,13 @@ impl BitmapIndex {
     fn compile_ordinal_row_set(&self, predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
         let row_ordinals = self.reader.row_ordinals()?;
         let (accepted, accepts_null) = self.matching_ordinals(predicate)?;
-        let mut words = vec![0_u64; accepted.len().div_ceil(64)];
         let mut cardinality = if accepts_null {
             self.reader.null_cardinality()
         } else {
             0
         };
         let mut postings = Vec::new();
-        for (ordinal, accepts) in accepted.into_iter().enumerate() {
-            if !accepts {
-                continue;
-            }
-            words[ordinal / 64] |= 1_u64 << (ordinal % 64);
+        for ordinal in accepted.iter() {
             cardinality = cardinality.saturating_add(self.reader.bitmap_cardinality(ordinal)?);
             postings.push(self.reader.bitmap(ordinal)?);
         }
@@ -191,7 +321,7 @@ impl BitmapIndex {
         }
         Some(Arc::new(OrdinalRowSet::new(
             row_ordinals,
-            words.into_boxed_slice(),
+            accepted.into_words(),
             accepts_null,
             cardinality,
             postings.into_boxed_slice(),
@@ -616,7 +746,9 @@ mod tests {
     #[test]
     fn integer_range_compiles_exact_ordinal_membership() {
         let mut writer = BitmapIndexWriter::new();
-        for value in [0_i32, 1, 2, 3, 4] {
+        // Little-endian byte order differs from SQL integer order for both
+        // negative values and values crossing a byte boundary.
+        for value in [0_i32, 256, -1, 2, 1] {
             writer.add_value(&value.to_le_bytes());
         }
         writer.add_nulls(1);
@@ -631,18 +763,20 @@ mod tests {
         let row_set = index
             .compile_ordinal_row_set(&Predicate::Lt {
                 column_id: 0,
-                value: Value::Integer(3),
+                value: Value::Integer(2),
             })
             .expect("low-cardinality range should compile");
 
         assert_eq!(row_set.len(), 3);
         assert!(row_set.contains(0));
         assert!(row_set.contains(2));
+        assert!(row_set.contains(4));
+        assert!(!row_set.contains(1));
         assert!(!row_set.contains(3));
         assert!(!row_set.contains(5));
         assert_eq!(
             row_set.materialize(),
-            RoaringBitmap::from_iter([0_u32, 1, 2])
+            RoaringBitmap::from_iter([0_u32, 2, 4])
         );
     }
 }
