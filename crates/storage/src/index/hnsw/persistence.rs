@@ -20,6 +20,7 @@ use super::{
     HnswSearchStrategy, PointOffset, PreparedQuery, ScoredPoint, SearchAlgorithm, SearchParams,
     VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
+use crate::index::ExactRowSet;
 use crate::metrics::storage_metrics;
 use crate::search::SearchWorkBudget;
 use crate::statistics::{
@@ -30,6 +31,7 @@ use memmap2::{Mmap, MmapOptions};
 use paro_common::error;
 use paro_common::error::Result;
 use rayon::prelude::*;
+#[cfg(test)]
 use roaring::RoaringBitmap;
 use std::fs;
 use std::path::Path;
@@ -789,14 +791,16 @@ impl HnswIndex {
 
         let start = Instant::now();
         let pre_filter_count = self.graph.num_points() as u64;
-        let filter_bitmap = filter.bitmap();
-        let post_filter_count = filter_bitmap.map(|bm| bm.len()).unwrap_or(pre_filter_count);
+        let filter_row_set = filter.row_set();
+        let post_filter_count = filter_row_set
+            .map(ExactRowSet::len)
+            .unwrap_or(pre_filter_count);
 
         let prepared_query = self.build_contract.distance.prepare(query);
         let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
         let (points, outcome) = if self.should_use_plain_scan(filter, policy, strategy) {
             (
-                self.plain_scan(top_k, &mut scorer, filter_bitmap, work)?,
+                self.plain_scan(top_k, &mut scorer, filter_row_set, work)?,
                 HnswSearchOutcome::new(HnswSearchPath::ExactScan),
             )
         } else {
@@ -812,16 +816,16 @@ impl HnswIndex {
                 ef,
                 algorithm,
                 &mut scorer,
-                filter_bitmap,
+                filter_row_set.map(ExactRowSet::admission),
                 Self::use_random_entry_point(params),
                 work,
             )?;
             let results = graph_result.points;
-            if filter_bitmap.is_some()
-                && results.len() < self.expected_filtered_rows(top_k, filter_bitmap)?
+            if filter_row_set.is_some()
+                && results.len() < self.expected_filtered_rows(top_k, filter_row_set)?
             {
                 (
-                    self.plain_scan(top_k, &mut scorer, filter_bitmap, work)?,
+                    self.plain_scan(top_k, &mut scorer, filter_row_set, work)?,
                     HnswSearchOutcome::new(path)
                         .with_predicate_refinement(graph_result.predicate_refined)
                         .with_exact_fallback(),
@@ -859,10 +863,12 @@ impl HnswIndex {
         filter_bitmap: Option<&RoaringBitmap>,
     ) -> Result<Vec<ScoredPoint>> {
         let policy = HnswSearchPolicy::default();
-        let filter = filter_bitmap.map_or(HnswSearchFilter::None, HnswSearchFilter::Predicate);
+        let filter = filter_bitmap.map_or(HnswSearchFilter::None, |bitmap| {
+            HnswSearchFilter::Predicate(bitmap)
+        });
         let matching_rows = filter
-            .bitmap()
-            .map_or(self.graph.num_points() as u64, RoaringBitmap::len);
+            .row_set()
+            .map_or(self.graph.num_points() as u64, ExactRowSet::len);
         let strategy = HnswSearchStrategy::choose(
             filter.kind(),
             matching_rows,
@@ -914,14 +920,19 @@ impl HnswIndex {
             .map(|query| VectorScorer::new(query, self.vector_storage.as_ref()))
             .collect::<Result<Vec<_>>>()?;
 
-        let filter_bitmap = filter.bitmap();
+        let filter_row_set = filter.row_set();
         let results: Vec<HnswSearchResult> = if self.should_use_plain_scan(filter, policy, strategy)
         {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
-            let scored = match filter_bitmap {
-                Some(bitmap) => batch_scorer
-                    .scan_with_work(bitmap.iter().filter(|&idx| idx < num_points), work)?,
+            let scored = match filter_row_set {
+                Some(row_set) => batch_scorer.scan_with_work(
+                    row_set
+                        .materialize()
+                        .into_iter()
+                        .filter(|&idx| idx < num_points),
+                    work,
+                )?,
                 None => batch_scorer.scan_with_work(0..num_points, work)?,
             };
             scored
@@ -945,11 +956,11 @@ impl HnswIndex {
                 ef,
                 algorithm,
                 &mut scorers,
-                filter_bitmap,
+                filter_row_set.map(ExactRowSet::admission),
                 Self::use_random_entry_point(params),
                 work,
             )?;
-            let expected_rows = self.expected_filtered_rows(top_k, filter_bitmap)?;
+            let expected_rows = self.expected_filtered_rows(top_k, filter_row_set)?;
             results
                 .into_iter()
                 .zip(scorers.iter_mut())
@@ -957,9 +968,9 @@ impl HnswIndex {
                     let mut outcome = HnswSearchOutcome::new(path)
                         .with_predicate_refinement(graph_result.predicate_refined);
                     let points =
-                        if filter_bitmap.is_some() && graph_result.points.len() < expected_rows {
+                        if filter_row_set.is_some() && graph_result.points.len() < expected_rows {
                             outcome = outcome.with_exact_fallback();
-                            self.plain_scan(top_k, scorer, filter_bitmap, work)?
+                            self.plain_scan(top_k, scorer, filter_row_set, work)?
                         } else {
                             graph_result.points
                         };
@@ -1003,7 +1014,9 @@ impl HnswIndex {
             queries,
             top_k,
             params,
-            filter_bitmap.map_or(HnswSearchFilter::None, HnswSearchFilter::Predicate),
+            filter_bitmap.map_or(HnswSearchFilter::None, |bitmap| {
+                HnswSearchFilter::Predicate(bitmap)
+            }),
             &HnswSearchPolicy::default(),
             strategy,
             budget.work.as_ref(),
@@ -1166,38 +1179,58 @@ impl HnswIndex {
     fn expected_filtered_rows(
         &self,
         top_k: usize,
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter_row_set: Option<&dyn ExactRowSet>,
     ) -> Result<usize> {
-        let Some(bitmap) = filter_bitmap else {
+        let Some(row_set) = filter_row_set else {
             return Ok(top_k.min(self.graph.num_points()));
         };
-        if bitmap
-            .max()
-            .is_some_and(|point| point as usize >= self.graph.num_points())
-        {
+        if row_set.domain_len() > self.graph.num_points() {
             return Err(error::data_corrupted(format!(
-                "HNSW filter bitmap domain exceeds graph cardinality {}",
+                "HNSW filter row-set domain exceeds graph cardinality {}",
                 self.graph.num_points()
             )));
         }
-        Ok(top_k.min(bitmap.len() as usize))
+        Ok(top_k.min(row_set.len() as usize))
     }
 
     fn plain_scan(
         &self,
         top_k: usize,
         scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter_row_set: Option<&dyn ExactRowSet>,
         work: &SearchWorkBudget,
     ) -> Result<Vec<ScoredPoint>> {
         let num_points = self.graph.num_points() as u32;
-        match filter_bitmap {
-            Some(bitmap) => self.plain_scan_iter(
-                top_k,
-                scorer,
-                bitmap.iter().take_while(|&idx| idx < num_points),
-                work,
-            ),
+        match filter_row_set {
+            Some(row_set) => {
+                const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
+                let mut best = FixedLengthPriorityQueue::new(top_k);
+                let mut chunk = [0; SCORE_BATCH];
+                let mut len = 0usize;
+                let mut flush = |chunk: &[PointOffset]| -> Result<()> {
+                    work.check_and_consume(chunk.len())?;
+                    for point in scorer.score_points_unfiltered(chunk) {
+                        best.push(point);
+                    }
+                    Ok(())
+                };
+                row_set.try_for_each(&mut |point_id| {
+                    if point_id >= num_points {
+                        return Ok(());
+                    }
+                    chunk[len] = point_id;
+                    len += 1;
+                    if len == SCORE_BATCH {
+                        flush(&chunk)?;
+                        len = 0;
+                    }
+                    Ok(())
+                })?;
+                if len != 0 {
+                    flush(&chunk[..len])?;
+                }
+                Ok(best.into_sorted_vec())
+            }
             None => self.plain_scan_iter(top_k, scorer, 0..num_points, work),
         }
     }

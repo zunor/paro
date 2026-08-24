@@ -12,6 +12,9 @@ use crate::search::SearchWorkBudget;
 use paro_common::error::Result;
 use smallvec::SmallVec;
 
+/// Large enough to amortize work-budget checks while keeping the gathered
+/// point ids and scores in L1. Exact filtered scans perform random vector
+/// reads, so oversized batches only increase cache pressure.
 pub const BATCH_SIZE: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +82,7 @@ impl<'a> BatchScorer<'a> {
         let mut point_ids = point_ids.into_iter();
         let mut chunk = [0; BATCH_SIZE];
         let mut scored_points = 0u64;
+        let (vectors, dimension) = self.scorers[0].scorer.vector_layout();
 
         loop {
             let mut chunk_len = 0usize;
@@ -98,7 +102,8 @@ impl<'a> BatchScorer<'a> {
             let points = &chunk[..chunk_len];
             scored_points = scored_points.saturating_add(chunk_len as u64);
             for &idx in points {
-                let vector = self.scorers[0].scorer.vector_storage.get_vector(idx);
+                let start = idx as usize * dimension;
+                let vector = &vectors[start..start + dimension];
                 for scorer in &mut self.scorers {
                     let score = scorer.scorer.score_cached_point(idx, vector);
                     scorer.top_k.push(ScoredPoint { idx, score });

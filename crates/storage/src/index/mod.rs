@@ -54,6 +54,7 @@ pub mod zonemap;
 
 mod bound_index;
 mod evaluator;
+mod exact_row_set;
 mod fixed_membership;
 mod fixed_size_allocator;
 mod fixed_size_buffer;
@@ -70,6 +71,8 @@ mod predicate_result;
 pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMode};
 pub(crate) use bound_index::{PredicateIndexBinding, SegmentLocalComplete};
 pub use evaluator::IndexEvaluator;
+pub(crate) use exact_row_set::OrdinalRowSet;
+pub use exact_row_set::{ExactRowAdmission, ExactRowSet};
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
 pub(crate) use fixed_membership::{
     FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,

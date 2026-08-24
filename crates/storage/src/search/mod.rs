@@ -84,7 +84,7 @@ pub use providers::fulltext::inline::FullTextInlineArtifactBuilder;
 pub use providers::sparse::inline::SparseInlineArtifactBuilder;
 pub use request::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
-    DenseVectorQuery, ExactBitmapMaterialization, FullTextIntent, FullTextQueryKind,
+    DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, FullTextQueryKind,
     FullTextQueryStats, FullTextScoreMode, FusionStrategy, HnswIntent, NormalizedSearchRequest,
     ProjectionSpec, SearchIntent, SearchRequestMode, SparseIntent,
 };

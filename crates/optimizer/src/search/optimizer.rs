@@ -16,7 +16,7 @@ use paro_planner::operator::{
 };
 use paro_planner::plan::LogicalPlan;
 use paro_storage::search::{
-    DenseVectorQuery, ExactBitmapMaterialization, FullTextIntent, HnswIntent,
+    DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, HnswIntent,
     NormalizedSearchRequest, ProjectionSpec, SearchCostEstimate as PlannedSearchCostEstimate,
     SearchIntent, SearchRequestMode, SequentialCapability, SparseIntent,
 };
@@ -95,8 +95,8 @@ impl SearchOptimizer {
             &ctx.column_stats,
         );
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
-        let bitmap_materialization =
-            exact_bitmap_materialization(&candidate_filters, pattern.get, storage.as_ref());
+        let filter_materialization =
+            exact_filter_materialization(&candidate_filters, pattern.get, storage.as_ref());
         // A generic filtered Top-K must inspect the base rows before it knows
         // which vectors survive. Output cardinality is not scan work.
         let sequential = build_sequential_capability(table_id, base_rows);
@@ -128,7 +128,7 @@ impl SearchOptimizer {
                 filter_selectivity,
                 topn.hnsw_ef_hint,
                 search_policy,
-                bitmap_materialization,
+                filter_materialization,
             );
             let Some(request) =
                 build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
@@ -141,7 +141,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
-                bitmap_materialization,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -182,7 +182,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
-                bitmap_materialization,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -224,7 +224,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
-                bitmap_materialization,
+                filter_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 return Ok(None);
@@ -271,8 +271,8 @@ impl SearchOptimizer {
 
             let base_rows = base_rows(filter.child.as_ref(), get);
             let candidate_filters = candidate_filters(&filter.expressions, get);
-            let bitmap_materialization =
-                exact_bitmap_materialization(&candidate_filters, get, storage.as_ref());
+            let filter_materialization =
+                exact_filter_materialization(&candidate_filters, get, storage.as_ref());
             let filtered = ctx.cost_model.estimate_filter_cardinality(
                 base_rows,
                 &candidate_filters,
@@ -289,7 +289,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
-                bitmap_materialization,
+                filter_materialization,
             );
             let sequential = build_sequential_capability(table_id, base_rows);
             let Some(decision) = select_search_decision(candidate, sequential) else {
@@ -354,7 +354,7 @@ fn build_search_candidate(
     estimated_cost: f64,
     estimated_rows: u64,
     estimated_total_rows: u64,
-    exact_bitmap_materialization: Option<ExactBitmapMaterialization>,
+    exact_filter_materialization: Option<ExactFilterMaterialization>,
 ) -> SearchCandidate {
     let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost)
         .with_rows(estimated_rows)
@@ -364,7 +364,7 @@ fn build_search_candidate(
         token: capability.capability_token(),
         kind: capability.kind,
         estimated_cost: Some(estimated_cost),
-        exact_bitmap_materialization,
+        exact_filter_materialization,
     }
 }
 
@@ -500,11 +500,11 @@ fn candidate_filters(filters: &[Expression], get: &Get) -> Vec<Expression> {
     all
 }
 
-fn exact_bitmap_materialization(
+fn exact_filter_materialization(
     filters: &[Expression],
     get: &Get,
     storage: &paro_storage::table::table_handle::TableHandle,
-) -> Option<ExactBitmapMaterialization> {
+) -> Option<ExactFilterMaterialization> {
     if filters.is_empty() {
         return None;
     }
@@ -531,19 +531,19 @@ fn exact_bitmap_materialization(
     }
 
     if stored_columns.is_empty() || has_unmapped_column {
-        return Some(ExactBitmapMaterialization::ColumnScan);
+        return Some(ExactFilterMaterialization::ColumnScan);
     }
     let Ok((indexed_rows, total_rows)) =
         storage.complete_scalar_index_row_coverage(&stored_columns)
     else {
-        return Some(ExactBitmapMaterialization::ColumnScan);
+        return Some(ExactFilterMaterialization::ColumnScan);
     };
     Some(if total_rows > 0 && indexed_rows == total_rows {
-        ExactBitmapMaterialization::ScalarIndex
+        ExactFilterMaterialization::ScalarIndex
     } else if indexed_rows == 0 {
-        ExactBitmapMaterialization::ColumnScan
+        ExactFilterMaterialization::ColumnScan
     } else {
-        ExactBitmapMaterialization::Mixed {
+        ExactFilterMaterialization::Mixed {
             indexed_rows,
             scanned_rows: total_rows.saturating_sub(indexed_rows),
         }
@@ -1181,7 +1181,7 @@ mod tests {
                 },
                 kind: paro_storage::search::SearchIndexKind::Hnsw,
                 estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
-                exact_bitmap_materialization: None,
+                exact_filter_materialization: None,
             },
             build_sequential_capability(7, 100),
         );
@@ -1304,7 +1304,7 @@ mod tests {
                     },
                     kind: paro_storage::search::SearchIndexKind::FullText,
                     estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
-                    exact_bitmap_materialization: None,
+                    exact_filter_materialization: None,
                 },
                 confidence: Confidence::High,
             },

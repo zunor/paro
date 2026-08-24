@@ -543,9 +543,9 @@ fn search_source_spec_for_candidate(
     // Every caller reaches this point only after proving that all remaining
     // filters are represented by `predicate`; a residual would have produced
     // an Unsupported physical node above. Make that proof construction
-    // explicit and separately describe how its exact bitmap is materialized.
+    // explicit and separately describe how its exact row set is obtained.
     let filter_contract = exact_search_filter_contract(predicate.as_ref());
-    let bitmap_materialization = candidate.exact_bitmap_materialization;
+    let filter_materialization = candidate.exact_filter_materialization;
     match &candidate.intent {
         SearchIntent::Hnsw(intent) => {
             let search_policy = table
@@ -577,7 +577,7 @@ fn search_source_spec_for_candidate(
                 avg_level0_degree,
                 predicate,
                 filter_contract,
-                bitmap_materialization,
+                filter_materialization,
                 estimated_filter_rows: candidate
                     .estimated_cost()
                     .and_then(|cost| cost.estimated_rows),
@@ -598,7 +598,7 @@ fn search_source_spec_for_candidate(
             k: scan.limit,
             predicate,
             filter_contract,
-            bitmap_materialization,
+            filter_materialization,
             projected_columns,
             emit_score,
             output_names,
@@ -616,7 +616,7 @@ fn search_source_spec_for_candidate(
             mode: SearchRequestMode::TopK { limit: scan.limit },
             predicate,
             filter_contract,
-            bitmap_materialization,
+            filter_materialization,
             projected_columns,
             emit_score,
             output_names,

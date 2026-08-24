@@ -844,7 +844,10 @@ mod tests {
         assert_eq!(bound.info.provider_config["ef_search"], 96);
         assert_eq!(bound.info.provider_config["distance"], "cosine");
         assert_eq!(bound.info.provider_config["build_seed"], 42);
-        assert_eq!(bound.info.provider_config["version"], 1);
+        assert_eq!(
+            bound.info.provider_config["version"],
+            paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION
+        );
         assert_eq!(bound.info.provider_config["dimension"], 100);
         assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
         assert_eq!(

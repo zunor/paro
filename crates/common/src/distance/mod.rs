@@ -71,6 +71,56 @@ pub fn l2_squared(v1: &[f32], v2: &[f32]) -> f32 {
     scalar::l2_squared(v1, v2)
 }
 
+/// Compute squared L2 distances for vectors selected from one flat row-major
+/// matrix. The query and CPU-feature dispatch are shared by the whole batch;
+/// architecture kernels may score several rows in parallel to avoid reloading
+/// the query for every candidate.
+///
+/// # Panics
+///
+/// Panics when `query.len() != dimension`, `scores` is shorter than
+/// `point_ids`, or a point id falls outside `vectors`.
+#[inline]
+pub fn l2_squared_batch_indexed(
+    query: &[f32],
+    vectors: &[f32],
+    dimension: usize,
+    point_ids: &[u32],
+    scores: &mut [f32],
+) {
+    assert_eq!(query.len(), dimension, "query dimension mismatch");
+    assert!(
+        scores.len() >= point_ids.len(),
+        "score buffer is shorter than point batch"
+    );
+    if point_ids.is_empty() {
+        return;
+    }
+    let max_point = point_ids.iter().copied().max().unwrap_or(0) as usize;
+    let required = max_point
+        .checked_add(1)
+        .and_then(|rows| rows.checked_mul(dimension))
+        .expect("indexed distance matrix shape overflow");
+    assert!(
+        required <= vectors.len(),
+        "indexed distance point exceeds vector matrix"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if dimension >= MIN_DIM_SIMD {
+        // AArch64 requires NEON as part of the base architecture. All slice
+        // bounds and row offsets were validated above.
+        return unsafe {
+            simd_neon::l2_squared_batch_indexed_neon(query, vectors, dimension, point_ids, scores)
+        };
+    }
+
+    for (&point_id, score) in point_ids.iter().zip(scores.iter_mut()) {
+        let start = point_id as usize * dimension;
+        *score = scalar::l2_squared(query, &vectors[start..start + dimension]);
+    }
+}
+
 /// Compute L2 distance (Euclidean distance).
 ///
 /// This is the square root of `l2_squared`.

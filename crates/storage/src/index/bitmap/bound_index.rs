@@ -19,7 +19,8 @@ use crate::index::bound_index::BoundIndex;
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
-    ColumnId, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType, IndexStorageInfo,
+    ColumnId, ExactRowSet, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType,
+    IndexStorageInfo, OrdinalRowSet,
 };
 
 use super::{BitmapIndexReader, BitmapIndexWriter};
@@ -89,6 +90,112 @@ impl BitmapIndex {
             }]);
         }
         info
+    }
+
+    fn matching_ordinals(&self, predicate: &Predicate) -> Option<(Vec<bool>, bool)> {
+        if self.column_ids.len() != 1 || predicate.index_column_id() != Some(self.column_ids[0]) {
+            return None;
+        }
+        let logical_type = self.logical_type()?;
+        let mut accepted = vec![false; self.reader.num_values()];
+        let mut accepts_null = false;
+
+        match predicate {
+            Predicate::Eq { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                if exact {
+                    accepted[ordinal] = true;
+                }
+            }
+            Predicate::NotEq { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                for (ordinal, item) in accepted.iter_mut().enumerate() {
+                    *item = self.reader.get_dict_value(ordinal)?.as_ref() != bytes.as_slice();
+                }
+            }
+            Predicate::Lt { value, .. }
+            | Predicate::Le { value, .. }
+            | Predicate::Gt { value, .. }
+            | Predicate::Ge { value, .. } => {
+                let bytes = value_to_bytes(value, logical_type).ok()?;
+                for (ordinal, item) in accepted.iter_mut().enumerate() {
+                    let ordering = compare_bytes(
+                        logical_type,
+                        self.reader.get_dict_value(ordinal)?.as_ref(),
+                        &bytes,
+                    )
+                    .ok()?;
+                    *item = match predicate {
+                        Predicate::Lt { .. } => ordering == std::cmp::Ordering::Less,
+                        Predicate::Le { .. } => ordering != std::cmp::Ordering::Greater,
+                        Predicate::Gt { .. } => ordering == std::cmp::Ordering::Greater,
+                        Predicate::Ge { .. } => ordering != std::cmp::Ordering::Less,
+                        _ => unreachable!(),
+                    };
+                }
+            }
+            Predicate::In { values, .. } => {
+                for value in values {
+                    let bytes = value_to_bytes(value, logical_type).ok()?;
+                    let (ordinal, exact) = self.reader.seek_dictionary(&bytes);
+                    if exact {
+                        accepted[ordinal] = true;
+                    }
+                }
+            }
+            Predicate::Range { lower, upper, .. } => {
+                let lower = value_to_bytes(lower, logical_type).ok()?;
+                let upper = value_to_bytes(upper, logical_type).ok()?;
+                for (ordinal, item) in accepted.iter_mut().enumerate() {
+                    let value = self.reader.get_dict_value(ordinal)?.as_ref();
+                    *item = compare_bytes(logical_type, value, &lower).ok()?
+                        != std::cmp::Ordering::Less
+                        && compare_bytes(logical_type, value, &upper).ok()?
+                            != std::cmp::Ordering::Greater;
+                }
+            }
+            Predicate::IsNull { .. } => accepts_null = true,
+            Predicate::IsNotNull { .. } => accepted.fill(true),
+            Predicate::FixedIn { .. }
+            | Predicate::StringPrefix { .. }
+            | Predicate::StringPrefixIn { .. }
+            | Predicate::StringLike { .. }
+            | Predicate::ColumnComparison { .. } => return None,
+        }
+        Some((accepted, accepts_null))
+    }
+
+    fn compile_ordinal_row_set(&self, predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        let row_ordinals = self.reader.row_ordinals()?;
+        let (accepted, accepts_null) = self.matching_ordinals(predicate)?;
+        let mut words = vec![0_u64; accepted.len().div_ceil(64)];
+        let mut cardinality = if accepts_null {
+            self.reader.null_cardinality()
+        } else {
+            0
+        };
+        let mut postings = Vec::new();
+        for (ordinal, accepts) in accepted.into_iter().enumerate() {
+            if !accepts {
+                continue;
+            }
+            words[ordinal / 64] |= 1_u64 << (ordinal % 64);
+            cardinality = cardinality.saturating_add(self.reader.bitmap_cardinality(ordinal)?);
+            postings.push(self.reader.bitmap(ordinal)?);
+        }
+        if accepts_null {
+            if let Some(posting) = self.reader.null_bitmap() {
+                postings.push(posting);
+            }
+        }
+        Some(Arc::new(OrdinalRowSet::new(
+            row_ordinals,
+            words.into_boxed_slice(),
+            accepts_null,
+            cardinality,
+            postings.into_boxed_slice(),
+        )))
     }
 
     fn evaluate_eq(&self, value: &Value) -> PredicateResult {
@@ -407,7 +514,9 @@ impl BoundIndex for BitmapIndex {
     fn vacuum(&self) {}
 
     fn get_in_memory_size(&self) -> usize {
-        self.index_data.len()
+        self.index_data
+            .len()
+            .saturating_add(self.reader.mem_usage())
     }
 
     fn serialize_to_disk(&self) -> Result<IndexStorageInfo> {
@@ -439,6 +548,10 @@ impl BoundIndex for BitmapIndex {
             | Predicate::StringLike { .. }
             | Predicate::ColumnComparison { .. } => PredicateResult::Unknown,
         }
+    }
+
+    fn compile_exact_row_set(&self, predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        self.compile_ordinal_row_set(predicate)
     }
 }
 
@@ -498,5 +611,38 @@ mod tests {
             }
             _ => panic!("expected bitmap"),
         }
+    }
+
+    #[test]
+    fn integer_range_compiles_exact_ordinal_membership() {
+        let mut writer = BitmapIndexWriter::new();
+        for value in [0_i32, 1, 2, 3, 4] {
+            writer.add_value(&value.to_le_bytes());
+        }
+        writer.add_nulls(1);
+        let index = BitmapIndex::from_writer(
+            "bm",
+            IndexConstraintType::None,
+            vec![0],
+            vec![LogicalType::Integer],
+            &writer,
+        )
+        .unwrap();
+        let row_set = index
+            .compile_ordinal_row_set(&Predicate::Lt {
+                column_id: 0,
+                value: Value::Integer(3),
+            })
+            .expect("low-cardinality range should compile");
+
+        assert_eq!(row_set.len(), 3);
+        assert!(row_set.contains(0));
+        assert!(row_set.contains(2));
+        assert!(!row_set.contains(3));
+        assert!(!row_set.contains(5));
+        assert_eq!(
+            row_set.materialize(),
+            RoaringBitmap::from_iter([0_u32, 1, 2])
+        );
     }
 }

@@ -258,7 +258,7 @@ impl PhysicalPlanGenerator {
             mode: SearchRequestMode::Filter,
             predicate,
             filter_contract,
-            bitmap_materialization: candidate.exact_bitmap_materialization,
+            filter_materialization: candidate.exact_filter_materialization,
             projected_columns: (0..scan.get.returned_types.len())
                 .map(|output| {
                     scan.get.stored_column(output).ok_or_else(|| {

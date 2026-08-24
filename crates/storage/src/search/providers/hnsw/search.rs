@@ -10,6 +10,7 @@ use crate::index::hnsw::{
     HnswFilterKind, HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
     PreparedQuery,
 };
+use crate::index::ExactRowSet;
 use crate::index::MmapVectorStorage;
 use crate::index::PredicateTree;
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
@@ -19,7 +20,7 @@ use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
 use crate::search::row_fetch::snapshot_epoch;
-use crate::search::segment_dispatch::{dispatch_segments, prepare_segments, SegmentDispatchResult};
+use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
     SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
@@ -34,9 +35,8 @@ use crate::tablet::TabletRef;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
-use roaring::RoaringBitmap;
 
-use crate::search::budget::{ResourceBudget, SearchBatchConfig, SearchMemoryReservation};
+use crate::search::budget::{ResourceBudget, SearchBatchConfig};
 use crate::search::cursor::PhysicalRowRef;
 
 pub(crate) struct VectorSearchProvider {
@@ -179,11 +179,6 @@ struct VectorSearchCursor {
     state: VectorCursorState,
 }
 
-struct PreparedSegmentFilters {
-    bitmaps: Vec<Option<RoaringBitmap>>,
-    _memory_reservations: Vec<SearchMemoryReservation>,
-}
-
 impl std::fmt::Debug for VectorSearchCursor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VectorSearchCursor")
@@ -206,18 +201,56 @@ impl VectorSearchCursor {
             coverage: self.snapshot.generation.coverage.clone(),
             artifact_count: self.snapshot.generation.artifacts.artifacts.len(),
         });
-        let (segment_filters, search_strategy) = self.prepare_segment_filters(budget)?;
+        let predicate = self.predicate.as_ref();
+        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
+        let total_rows = self
+            .snapshot
+            .table_lease
+            .visible_segments()
+            .iter()
+            .fold(0u64, |rows, segment| {
+                rows.saturating_add(segment.segment.num_rows())
+            });
+        let unfiltered_strategy = HnswSearchStrategy::choose(
+            HnswFilterKind::None,
+            total_rows,
+            total_rows,
+            self.search_policy,
+        );
         let per_segment = dispatch_segments(
             SearchIndexKind::Hnsw,
             self.snapshot.table_lease.visible_segments(),
             budget.parallelism_slots.max(1),
             self.telemetry.as_ref(),
-            |index, segment| {
-                let filter_bitmap = segment_filters.bitmaps[index].as_ref();
-                let filter = match (self.predicate.is_some(), filter_bitmap) {
+            |_, segment| {
+                let filter_row_set = segment
+                    .segment
+                    .build_hnsw_filter_with_epoch(snapshot_version, predicate)?;
+                if predicate.is_some() && filter_row_set.is_none() {
+                    return Err(paro_error::internal(
+                        "filtered vector search did not prepare an exact segment row set",
+                    ));
+                }
+                let _reservation = filter_row_set
+                    .as_ref()
+                    .map(|row_set| budget.try_reserve_memory(row_set.query_retained_bytes()))
+                    .transpose()?;
+                let filter_row_set = filter_row_set.as_deref();
+                let filter = match (predicate.is_some(), filter_row_set) {
                     (_, None) => HnswSearchFilter::None,
-                    (true, Some(bitmap)) => HnswSearchFilter::Predicate(bitmap),
-                    (false, Some(bitmap)) => HnswSearchFilter::Visibility(bitmap),
+                    (true, Some(row_set)) => HnswSearchFilter::Predicate(row_set),
+                    (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
+                };
+                let search_strategy = match filter.kind() {
+                    HnswFilterKind::None => unfiltered_strategy,
+                    kind => HnswSearchStrategy::choose(
+                        kind,
+                        filter
+                            .row_set()
+                            .map_or(segment.segment.num_rows(), ExactRowSet::len),
+                        segment.segment.num_rows(),
+                        self.search_policy,
+                    ),
                 };
                 let (rows, degraded) =
                     self.search_segment(segment, search_strategy, filter, budget.work.as_ref())?;
@@ -259,76 +292,6 @@ impl VectorSearchCursor {
             elapsed: started_at.elapsed(),
         });
         Ok(ranked_rows)
-    }
-
-    fn prepare_segment_filters(
-        &self,
-        budget: &ResourceBudget,
-    ) -> Result<(PreparedSegmentFilters, HnswSearchStrategy)> {
-        let predicate = self.predicate.as_ref();
-        let snapshot_version = snapshot_epoch(self.snapshot.table.visible_version);
-        let prepared = prepare_segments(
-            SearchIndexKind::Hnsw,
-            self.snapshot.table_lease.visible_segments(),
-            budget.parallelism_slots.max(1),
-            |_, segment| {
-                let filter_bitmap = segment
-                    .segment
-                    .build_filter_bitmap_with_epoch(snapshot_version, predicate)?;
-                if predicate.is_some() && filter_bitmap.is_none() {
-                    return Err(paro_error::internal(
-                        "filtered vector search did not materialize an exact segment bitmap",
-                    ));
-                }
-                let reservation = if let Some(bitmap) = filter_bitmap.as_ref() {
-                    let bytes = estimated_roaring_retained_bytes(bitmap)?;
-                    Some(budget.try_reserve_memory(bytes)?)
-                } else {
-                    None
-                };
-                Ok((filter_bitmap, reservation))
-            },
-        )?;
-        let mut bitmaps = Vec::with_capacity(prepared.len());
-        let mut memory_reservations = Vec::new();
-        for (bitmap, reservation) in prepared {
-            bitmaps.push(bitmap);
-            if let Some(reservation) = reservation {
-                memory_reservations.push(reservation);
-            }
-        }
-        let visible_segments = self.snapshot.table_lease.visible_segments();
-        let total_rows = visible_segments.iter().fold(0u64, |rows, segment| {
-            rows.saturating_add(segment.segment.num_rows())
-        });
-        let has_visibility_mask = bitmaps.iter().any(Option::is_some);
-        let matching_rows =
-            bitmaps
-                .iter()
-                .zip(visible_segments)
-                .fold(0u64, |rows, (bitmap, segment)| {
-                    rows.saturating_add(
-                        bitmap
-                            .as_ref()
-                            .map_or(segment.segment.num_rows(), RoaringBitmap::len),
-                    )
-                });
-        let filter_kind = if predicate.is_some() {
-            HnswFilterKind::Predicate
-        } else if has_visibility_mask {
-            HnswFilterKind::Visibility
-        } else {
-            HnswFilterKind::None
-        };
-        let strategy =
-            HnswSearchStrategy::choose(filter_kind, matching_rows, total_rows, self.search_policy);
-        Ok((
-            PreparedSegmentFilters {
-                bitmaps,
-                _memory_reservations: memory_reservations,
-            },
-            strategy,
-        ))
     }
 
     fn search_segment(
@@ -395,7 +358,7 @@ impl VectorSearchCursor {
             self.vector_dim,
         )? {
             validate_hnsw_index_contract(&index, &self.expected_build_contract)?;
-            if filter.bitmap().is_some_and(|bitmap| bitmap.is_empty()) {
+            if filter.row_set().is_some_and(ExactRowSet::is_empty) {
                 return Ok((Vec::new(), false));
             }
             return index
@@ -472,24 +435,6 @@ impl VectorSearchCursor {
 
         Ok((collector.into_sorted_rows(), true))
     }
-}
-
-fn estimated_roaring_retained_bytes(bitmap: &RoaringBitmap) -> Result<usize> {
-    // `serialized_size` excludes Vec capacities and the container directory.
-    // The crate's statistics report allocated payload capacity; charge a
-    // conservative directory/header allowance per container as well.
-    const CONTAINER_METADATA_BYTES: usize = 32;
-    let stats = bitmap.statistics();
-    let payload = stats
-        .n_bytes_array_containers
-        .saturating_add(stats.n_bytes_run_containers)
-        .saturating_add(stats.n_bytes_bitset_containers);
-    let payload = usize::try_from(payload)
-        .map_err(|_| paro_error::out_of_memory("filtered search bitmap size overflow"))?;
-    std::mem::size_of::<RoaringBitmap>()
-        .checked_add(payload)
-        .and_then(|bytes| bytes.checked_add(stats.n_containers as usize * CONTAINER_METADATA_BYTES))
-        .ok_or_else(|| paro_error::out_of_memory("filtered search bitmap size overflow"))
 }
 
 fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract) -> Result<()> {

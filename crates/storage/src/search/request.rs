@@ -17,14 +17,14 @@ use paro_common::typed_parameters::ParameterSlot;
 
 use super::stats::TableId;
 
-/// Planned source of an exact segment-local predicate bitmap.
+/// Planned source of an exact segment-local predicate row set.
 ///
 /// Both variants have identical SQL semantics. The distinction is physical:
 /// scalar postings are proportional to matches, while a column-scan fallback
 /// must inspect every segment row and therefore belongs in costing and
 /// EXPLAIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ExactBitmapMaterialization {
+pub enum ExactFilterMaterialization {
     ScalarIndex,
     Mixed {
         indexed_rows: u64,

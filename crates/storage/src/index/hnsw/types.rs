@@ -7,9 +7,10 @@
 
 #[cfg(test)]
 use paro_common::error::{self as paro_error, Result};
-use roaring::RoaringBitmap;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+
+use crate::index::ExactRowSet;
 
 /// Point offset type — identifies a vector within a segment.
 pub type PointOffset = u32;
@@ -97,8 +98,8 @@ impl Default for SearchAlgorithm {
 #[derive(Debug, Clone, Copy)]
 pub enum HnswSearchFilter<'a> {
     None,
-    Visibility(&'a RoaringBitmap),
-    Predicate(&'a RoaringBitmap),
+    Visibility(&'a dyn ExactRowSet),
+    Predicate(&'a dyn ExactRowSet),
 }
 
 /// Semantic origin of an HNSW admission mask. Strategy selection consumes the
@@ -111,7 +112,7 @@ pub enum HnswFilterKind {
 }
 
 impl<'a> HnswSearchFilter<'a> {
-    pub fn bitmap(self) -> Option<&'a RoaringBitmap> {
+    pub fn row_set(self) -> Option<&'a dyn ExactRowSet> {
         match self {
             Self::None => None,
             Self::Visibility(bitmap) | Self::Predicate(bitmap) => Some(bitmap),
@@ -139,11 +140,10 @@ pub struct SearchParams {
     pub random_entry_point: Option<bool>,
 }
 
-/// Query-wide HNSW execution contract. Storage providers choose this after
-/// considering the complete visible table and pass it unchanged to every
-/// segment. A segment may still downgrade to an exact scan when its local
-/// candidate bitmap is below the exact threshold, but it must not independently
-/// switch between masked and predicate-refined graph traversal.
+/// Per-segment HNSW execution contract. Exact cardinalities are known at this
+/// boundary, so each immutable segment can independently choose a sequential
+/// exact scan or graph traversal. This avoids paying random graph-navigation
+/// cost for locally small candidate sets without weakening result semantics.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswSearchStrategy {
     ExactScan,
@@ -210,7 +210,7 @@ impl HnswSearchResult {
 }
 
 impl HnswSearchStrategy {
-    /// Choose the query-wide execution contract from exact cardinalities.
+    /// Choose the segment execution contract from exact cardinalities.
     /// Predicate graph searches are adaptive internally: the graph observes
     /// the number of admitted points before deciding whether two-hop
     /// predicate-aware refinement is necessary.
@@ -258,7 +258,7 @@ pub enum HnswFilteredSearchStrategy {
 }
 
 /// Result of the shared filtered-search policy. The beam cardinalities are
-/// estimates rather than correctness guarantees; the exact bitmap remains the
+/// estimates rather than correctness guarantees; the exact row set remains the
 /// sole admission contract in every strategy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswFilteredSearchDecision {

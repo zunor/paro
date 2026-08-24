@@ -9,6 +9,7 @@ use crate::index::hnsw::{
     HnswSearchFilter, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, ScoredPoint,
     SearchParams,
 };
+use crate::index::ExactRowSet;
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
@@ -17,6 +18,7 @@ use crate::search::SearchWorkBudget;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
+use std::sync::Arc;
 
 impl Segment {
     fn build_exact_predicate_bitmap(
@@ -85,13 +87,13 @@ impl Segment {
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
     ) -> Result<HnswSearchResult> {
-        let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
-        let filter = match (predicate_tree.is_some(), filter_bitmap.as_ref()) {
+        let filter_row_set = self.build_hnsw_filter_with_epoch(snapshot_epoch, predicate_tree)?;
+        let filter = match (predicate_tree.is_some(), filter_row_set.as_deref()) {
             (_, None) => HnswSearchFilter::None,
-            (true, Some(bitmap)) => HnswSearchFilter::Predicate(bitmap),
-            (false, Some(bitmap)) => HnswSearchFilter::Visibility(bitmap),
+            (true, Some(row_set)) => HnswSearchFilter::Predicate(row_set),
+            (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
         };
-        let matching_rows = filter.bitmap().map_or(self.num_rows(), RoaringBitmap::len);
+        let matching_rows = filter.row_set().map_or(self.num_rows(), ExactRowSet::len);
         let strategy =
             HnswSearchStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
         let budget = crate::search::ResourceBudget::default();
@@ -107,9 +109,9 @@ impl Segment {
         )
     }
 
-    /// Search with an already materialized exact segment-local filter. Query
-    /// providers use this after making a query-wide exact-vs-graph decision,
-    /// avoiding both per-segment policy drift and duplicate predicate work.
+    /// Search with an already prepared exact segment-local filter. Query
+    /// providers choose the physical strategy from the same local cardinality,
+    /// avoiding both duplicate predicate work and policy drift inside HNSW.
     pub(crate) fn vector_search_with_filter_strategy(
         &self,
         column_id: ColumnId,
@@ -124,8 +126,8 @@ impl Segment {
         let index = self
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
-        if let Some(bm) = filter.bitmap() {
-            if bm.is_empty() {
+        if let Some(row_set) = filter.row_set() {
+            if row_set.is_empty() {
                 return Ok(HnswSearchResult {
                     points: Vec::new(),
                     scored_points: 0,
@@ -310,6 +312,30 @@ impl Segment {
     ) -> Result<Option<RoaringBitmap>> {
         let delete_vector = self.load_delete_vector_with_epoch(snapshot_epoch)?;
         self.build_filter_bitmap_with_delete_vector(predicate_tree, delete_vector.as_ref())
+    }
+
+    /// Prepare an exact HNSW admission set. A complete scalar access path keeps
+    /// its native membership and posting representation for both graph
+    /// admission and exact scans; generic predicate trees retain bitmap
+    /// algebra until native row sets become composable.
+    pub(crate) fn build_hnsw_filter_with_epoch(
+        &self,
+        snapshot_epoch: u64,
+        predicate_tree: Option<&PredicateTree>,
+    ) -> Result<Option<Arc<dyn ExactRowSet>>> {
+        let delete_vector = self.load_delete_vector_with_epoch(snapshot_epoch)?;
+        if delete_vector.is_none() {
+            if let Some(tree) = predicate_tree {
+                let evaluator =
+                    IndexEvaluator::for_segment(self.predicate_indexes()?, self.num_rows());
+                if let Some(row_set) = evaluator.compile_exact_row_set(tree) {
+                    return Ok(Some(row_set));
+                }
+            }
+        }
+
+        self.build_filter_bitmap_with_delete_vector(predicate_tree, delete_vector.as_ref())
+            .map(|bitmap| bitmap.map(|bitmap| Arc::new(bitmap) as Arc<dyn ExactRowSet>))
     }
 
     pub(crate) fn build_filter_bitmap_with_delete_vector(

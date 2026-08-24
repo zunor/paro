@@ -10,6 +10,7 @@ use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
 use std::collections::BTreeMap;
 use std::io::Cursor;
+use std::sync::Arc;
 
 const BITMAP_INDEX_HEADER_BYTES: usize = 6;
 
@@ -188,10 +189,17 @@ pub struct BitmapIndexReader {
     has_null: bool,
     /// Dictionary values (sorted)
     dictionary: Vec<Bytes>,
-    /// Serialized bitmaps
-    bitmaps: Vec<Bytes>,
-    /// Null bitmap (serialized)
-    null_bitmap: Option<Bytes>,
+    /// Decoded immutable postings. The serialized artifact remains owned by
+    /// `BitmapIndex`; query execution must not decode the same posting again.
+    bitmaps: Vec<Arc<RoaringBitmap>>,
+    /// Decoded NULL posting.
+    null_bitmap: Option<Arc<RoaringBitmap>>,
+    /// Dictionary ordinal for every segment-local row. This index-owned,
+    /// dense representation turns broad predicate admission into one array
+    /// lookup instead of materializing a query-wide union bitmap.
+    row_ordinals: Option<Arc<[u16]>>,
+    bitmap_cardinalities: Vec<u64>,
+    null_cardinality: u64,
 }
 
 impl BitmapIndexReader {
@@ -209,7 +217,7 @@ impl BitmapIndexReader {
         let num_values = buf.get_u32_le() as usize;
 
         let mut dictionary = Vec::with_capacity(num_values);
-        let mut bitmaps = Vec::with_capacity(num_values);
+        let mut serialized_bitmaps = Vec::with_capacity(num_values);
 
         for _ in 0..num_values {
             // Read value
@@ -239,12 +247,12 @@ impl BitmapIndexReader {
                     "BitmapIndexReader: truncated bitmap",
                 ));
             }
-            bitmaps.push(Bytes::copy_from_slice(&buf[..bitmap_len]));
+            serialized_bitmaps.push(Bytes::copy_from_slice(&buf[..bitmap_len]));
             buf.advance(bitmap_len);
         }
 
         // Read null bitmap
-        let null_bitmap = if has_null {
+        let serialized_null_bitmap = if has_null {
             if buf.remaining() < 4 {
                 return Err(paro_error::data_corrupted(
                     "BitmapIndexReader: truncated null bitmap length",
@@ -284,13 +292,49 @@ impl BitmapIndexReader {
         // from the existing durable format; the segment loader then compares it
         // with the footer before issuing a completeness credential. The proof
         // therefore does not require a breaking auxiliary-index format change.
+        let supports_ordinals = num_values < u16::MAX as usize;
+        let mut row_ordinals = supports_ordinals.then(Vec::<u16>::new);
+        let mut bitmap_cardinalities = Vec::with_capacity(serialized_bitmaps.len());
+        let mut bitmaps = Vec::with_capacity(serialized_bitmaps.len());
         let mut covered = RoaringBitmap::new();
-        for bitmap in bitmaps.iter().chain(null_bitmap.iter()) {
+        for (ordinal, bitmap) in serialized_bitmaps.iter().enumerate() {
             let posting = deserialize_bitmap_exact(bitmap)?;
+            bitmap_cardinalities.push(posting.len());
             if !covered.is_disjoint(&posting) {
                 return Err(paro_error::data_corrupted(
                     "BitmapIndexReader: row occurs in multiple postings",
                 ));
+            }
+            if let Some(row_ordinals) = row_ordinals.as_mut() {
+                for row_id in posting.iter() {
+                    let required = row_id as usize + 1;
+                    if row_ordinals.len() < required {
+                        row_ordinals.resize(required, u16::MAX);
+                    }
+                    row_ordinals[row_id as usize] = ordinal as u16;
+                }
+            }
+            covered |= &posting;
+            bitmaps.push(Arc::new(posting));
+        }
+        let null_posting = serialized_null_bitmap
+            .as_ref()
+            .map(deserialize_bitmap_exact)
+            .transpose()?;
+        let null_cardinality = null_posting.as_ref().map_or(0, RoaringBitmap::len);
+        if let Some(posting) = null_posting.as_ref() {
+            if !covered.is_disjoint(posting) {
+                return Err(paro_error::data_corrupted(
+                    "BitmapIndexReader: row occurs in multiple postings",
+                ));
+            }
+            if let Some(row_ordinals) = row_ordinals.as_mut() {
+                if let Some(last) = posting.max() {
+                    let required = last as usize + 1;
+                    if row_ordinals.len() < required {
+                        row_ordinals.resize(required, u16::MAX);
+                    }
+                }
             }
             covered |= posting;
         }
@@ -302,6 +346,9 @@ impl BitmapIndexReader {
                 row_count.saturating_sub(1)
             )));
         }
+        if let Some(row_ordinals) = row_ordinals.as_mut() {
+            row_ordinals.resize(row_count as usize, u16::MAX);
+        }
 
         Ok(BitmapIndexReader {
             row_count,
@@ -309,7 +356,10 @@ impl BitmapIndexReader {
             has_null,
             dictionary,
             bitmaps,
-            null_bitmap,
+            null_bitmap: null_posting.map(Arc::new),
+            row_ordinals: row_ordinals.map(Arc::from),
+            bitmap_cardinalities,
+            null_cardinality,
         })
     }
 
@@ -346,21 +396,41 @@ impl BitmapIndexReader {
         self.dictionary.get(ordinal)
     }
 
+    pub(crate) fn row_ordinals(&self) -> Option<Arc<[u16]>> {
+        self.row_ordinals.clone()
+    }
+
+    pub(crate) fn bitmap_cardinality(&self, ordinal: usize) -> Option<u64> {
+        self.bitmap_cardinalities.get(ordinal).copied()
+    }
+
+    pub(crate) fn null_cardinality(&self) -> u64 {
+        self.null_cardinality
+    }
+
+    pub(crate) fn bitmap(&self, ordinal: usize) -> Option<Arc<RoaringBitmap>> {
+        self.bitmaps.get(ordinal).cloned()
+    }
+
+    pub(crate) fn null_bitmap(&self) -> Option<Arc<RoaringBitmap>> {
+        self.null_bitmap.clone()
+    }
+
     /// Read bitmap at ordinal.
     pub fn read_bitmap(&self, ordinal: usize) -> Result<RoaringBitmap> {
-        let data = self.bitmaps.get(ordinal).ok_or_else(|| {
+        let bitmap = self.bitmaps.get(ordinal).ok_or_else(|| {
             paro_error::out_of_range(format!(
                 "BitmapIndexReader: ordinal {} out of range",
                 ordinal
             ))
         })?;
-        deserialize_bitmap_exact(data)
+        Ok(bitmap.as_ref().clone())
     }
 
     /// Read null bitmap.
     pub fn read_null_bitmap(&self) -> Result<RoaringBitmap> {
         match &self.null_bitmap {
-            Some(data) => deserialize_bitmap_exact(data),
+            Some(bitmap) => Ok(bitmap.as_ref().clone()),
             None => Ok(RoaringBitmap::new()),
         }
     }
@@ -403,8 +473,20 @@ impl BitmapIndexReader {
     pub fn mem_usage(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.dictionary.iter().map(|v| v.len()).sum::<usize>()
-            + self.bitmaps.iter().map(|b| b.len()).sum::<usize>()
-            + self.null_bitmap.as_ref().map_or(0, |b| b.len())
+            + self
+                .bitmaps
+                .iter()
+                .map(|bitmap| bitmap.serialized_size())
+                .sum::<usize>()
+            + self
+                .null_bitmap
+                .as_ref()
+                .map_or(0, |bitmap| bitmap.serialized_size())
+            + self
+                .row_ordinals
+                .as_ref()
+                .map_or(0, |ordinals| ordinals.len() * std::mem::size_of::<u16>())
+            + self.bitmap_cardinalities.len() * std::mem::size_of::<u64>()
     }
 }
 

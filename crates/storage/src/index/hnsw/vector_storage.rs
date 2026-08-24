@@ -132,8 +132,17 @@ impl CosineInverseNorms {
 
 /// Trait for vector storage used by HNSW.
 pub trait VectorStorage: Send + Sync {
+    /// Whole dense row-major vector artifact. Exposing the immutable physical
+    /// layout lets a query scorer resolve dynamic storage once, then perform
+    /// point lookups without one virtual call per distance calculation.
+    fn flat_vectors(&self) -> &[f32];
+
     /// Get vector at given offset.
-    fn get_vector(&self, idx: PointOffset) -> &[f32];
+    fn get_vector(&self, idx: PointOffset) -> &[f32] {
+        let dim = self.vector_dim();
+        let start = idx as usize * dim;
+        &self.flat_vectors()[start..start + dim]
+    }
     /// Get number of vectors.
     fn num_vectors(&self) -> usize;
     /// Get vector dimension.
@@ -207,8 +216,8 @@ impl IndexedVectorStorage {
 }
 
 impl VectorStorage for IndexedVectorStorage {
-    fn get_vector(&self, idx: PointOffset) -> &[f32] {
-        self.base.get_vector(idx)
+    fn flat_vectors(&self) -> &[f32] {
+        self.base.flat_vectors()
     }
 
     fn num_vectors(&self) -> usize {
@@ -265,10 +274,8 @@ impl InMemoryVectorStorage {
 }
 
 impl VectorStorage for InMemoryVectorStorage {
-    fn get_vector(&self, idx: PointOffset) -> &[f32] {
-        let start = idx as usize * self.dim;
-        let end = start + self.dim;
-        &self.vectors[start..end]
+    fn flat_vectors(&self) -> &[f32] {
+        &self.vectors
     }
 
     fn num_vectors(&self) -> usize {
@@ -314,12 +321,13 @@ impl MmapVectorStorage {
 }
 
 impl VectorStorage for MmapVectorStorage {
-    fn get_vector(&self, idx: PointOffset) -> &[f32] {
-        let start_byte = idx as usize * self.dim * std::mem::size_of::<f32>();
-        let end_byte = start_byte + self.dim * std::mem::size_of::<f32>();
-        let byte_slice = &self.mmap[start_byte..end_byte];
-
-        unsafe { std::slice::from_raw_parts(byte_slice.as_ptr() as *const f32, self.dim) }
+    fn flat_vectors(&self) -> &[f32] {
+        // SAFETY: mmap offsets are page aligned, `open_range` validates that
+        // the byte length is an exact multiple of `dim * size_of::<f32>()`,
+        // and the mapping is immutable for the lifetime of this storage.
+        unsafe {
+            std::slice::from_raw_parts(self.mmap.as_ptr().cast::<f32>(), self.count * self.dim)
+        }
     }
 
     fn num_vectors(&self) -> usize {

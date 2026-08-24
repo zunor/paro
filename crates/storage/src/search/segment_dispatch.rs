@@ -72,43 +72,6 @@ where
     }
 }
 
-/// Apply an ordered preparation step to visible segments on the same governed
-/// dispatch pool used by search. The returned vector remains index-aligned
-/// with `segments`, so callers do not need a hash lookup or an impossible
-/// "missing prepared segment" branch in the search hot path.
-pub(crate) fn prepare_segments<T, F>(
-    kind: SearchIndexKind,
-    segments: &[VisibleSegment],
-    parallelism_slots: usize,
-    prepare: F,
-) -> Result<Vec<T>>
-where
-    T: Send,
-    F: Fn(usize, &VisibleSegment) -> Result<T> + Send + Sync,
-{
-    let prepare_one = |(index, segment): (usize, &VisibleSegment)| {
-        prepare(index, segment).map_err(|err| {
-            err.context(format!(
-                "{kind:?} segment preparation on rowset {} segment {}",
-                segment.rowset_id, segment.segment_id
-            ))
-        })
-    };
-
-    if parallelism_slots > 1 && segments.len() > 1 {
-        let pool = dispatch_pool(parallelism_slots.min(segments.len()))?;
-        pool.install(|| {
-            segments
-                .par_iter()
-                .enumerate()
-                .map(prepare_one)
-                .collect::<Result<Vec<_>>>()
-        })
-    } else {
-        segments.iter().enumerate().map(prepare_one).collect()
-    }
-}
-
 fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {
     let mut guard = SEGMENT_DISPATCH_POOLS
         .lock()

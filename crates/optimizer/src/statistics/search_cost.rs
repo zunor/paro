@@ -9,7 +9,7 @@ use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
     estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
 };
-use paro_storage::search::ExactBitmapMaterialization;
+use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
@@ -107,11 +107,11 @@ impl VectorScanCostModel {
         filter_selectivity: f64,
         ef: Option<usize>,
         policy: HnswSearchPolicy,
-        bitmap_materialization: Option<ExactBitmapMaterialization>,
+        filter_materialization: Option<ExactFilterMaterialization>,
     ) -> f64 {
         let n = stats.num_indexed_vectors.max(1) as f64;
         let selectivity = clamp_selectivity(filter_selectivity);
-        let filtered = bitmap_materialization.is_some();
+        let filtered = filter_materialization.is_some();
         let candidate_rows = if filtered {
             (n * selectivity).ceil().max(1.0)
         } else {
@@ -129,12 +129,12 @@ impl VectorScanCostModel {
         let scored_points = ef_val * stats.avg_level0_degree.max(1.0) as f64;
         let raw_graph_cost = (log_n + scored_points) * dim_factor;
         let graph_cost = raw_graph_cost;
-        let bitmap_cost = match bitmap_materialization {
+        let bitmap_cost = match filter_materialization {
             None => 0.0,
-            Some(ExactBitmapMaterialization::ScalarIndex) => {
+            Some(ExactFilterMaterialization::ScalarIndex) => {
                 log_n + candidate_rows / u64::BITS as f64
             }
-            Some(ExactBitmapMaterialization::Mixed {
+            Some(ExactFilterMaterialization::Mixed {
                 indexed_rows,
                 scanned_rows,
             }) => {
@@ -144,7 +144,7 @@ impl VectorScanCostModel {
                     + candidate_rows / u64::BITS as f64
                     + n * scanned_fraction * Self::SEQUENTIAL_SCALAR_SCAN_FACTOR
             }
-            Some(ExactBitmapMaterialization::ColumnScan) => {
+            Some(ExactFilterMaterialization::ColumnScan) => {
                 n * Self::SEQUENTIAL_SCALAR_SCAN_FACTOR + candidate_rows / u64::BITS as f64
             }
         };
@@ -313,7 +313,7 @@ mod tests {
             0.001,
             Some(40),
             policy,
-            Some(ExactBitmapMaterialization::ScalarIndex),
+            Some(ExactFilterMaterialization::ScalarIndex),
         );
 
         assert!(cost > 1.0);
@@ -339,7 +339,7 @@ mod tests {
             0.75,
             Some(40),
             policy,
-            Some(ExactBitmapMaterialization::ScalarIndex),
+            Some(ExactFilterMaterialization::ScalarIndex),
         );
 
         assert!(filtered > unfiltered);
@@ -359,7 +359,7 @@ mod tests {
             0.01,
             Some(80),
             policy,
-            Some(ExactBitmapMaterialization::ScalarIndex),
+            Some(ExactFilterMaterialization::ScalarIndex),
         );
         let scan = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
@@ -367,7 +367,7 @@ mod tests {
             0.01,
             Some(80),
             policy,
-            Some(ExactBitmapMaterialization::ColumnScan),
+            Some(ExactFilterMaterialization::ColumnScan),
         );
         assert!(scan > postings * 1.5, "scan={scan}, postings={postings}");
     }
@@ -386,7 +386,7 @@ mod tests {
             20_000.0 / 1_000_000.0,
             Some(160),
             policy,
-            Some(ExactBitmapMaterialization::ScalarIndex),
+            Some(ExactFilterMaterialization::ScalarIndex),
         );
         let above_threshold = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
@@ -394,7 +394,7 @@ mod tests {
             20_001.0 / 1_000_000.0,
             Some(160),
             policy,
-            Some(ExactBitmapMaterialization::ScalarIndex),
+            Some(ExactFilterMaterialization::ScalarIndex),
         );
         assert!(above_threshold >= at_threshold);
     }

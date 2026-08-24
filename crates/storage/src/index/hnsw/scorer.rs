@@ -7,13 +7,17 @@
 
 use std::cell::Cell;
 
+use paro_common::distance;
+
 use super::types::{PointOffset, ScoreType, ScoredPoint};
 use super::vector_storage::CosineInverseNorms;
 use super::{DistanceMetric, PreparedQuery, VectorStorage};
 
 enum ScoringKernel<'a> {
     Cosine(&'a CosineInverseNorms),
-    Other(DistanceMetric),
+    Euclidean,
+    DotProduct,
+    Manhattan,
 }
 
 #[cfg(test)]
@@ -36,7 +40,8 @@ mod tests {
 /// Vector scorer responsible for calculating distances during search and build.
 pub struct VectorScorer<'a> {
     query: &'a PreparedQuery,
-    pub(crate) vector_storage: &'a dyn VectorStorage,
+    vectors: &'a [f32],
+    dimension: usize,
     kernel: ScoringKernel<'a>,
     scores_buffer: Vec<ScoreType>,
     scored_points: Cell<u64>,
@@ -63,11 +68,28 @@ impl<'a> VectorScorer<'a> {
                 }
                 ScoringKernel::Cosine(norms)
             }
-            metric => ScoringKernel::Other(metric),
+            DistanceMetric::Euclidean => ScoringKernel::Euclidean,
+            DistanceMetric::DotProduct => ScoringKernel::DotProduct,
+            DistanceMetric::Manhattan => ScoringKernel::Manhattan,
         };
+        let dimension = vector_storage.vector_dim();
+        let vectors = vector_storage.flat_vectors();
+        let expected_values = vector_storage
+            .num_vectors()
+            .checked_mul(dimension)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted("HNSW vector artifact cardinality overflow")
+            })?;
+        if vectors.len() != expected_values {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW vector artifact length mismatch: expected {expected_values} values, got {}",
+                vectors.len()
+            )));
+        }
         Ok(Self {
             query,
-            vector_storage,
+            vectors,
+            dimension,
             kernel,
             scores_buffer: Vec::new(),
             scored_points: Cell::new(0),
@@ -78,7 +100,18 @@ impl<'a> VectorScorer<'a> {
     pub fn score_point(&self, point_id: PointOffset) -> ScoreType {
         self.scored_points
             .set(self.scored_points.get().saturating_add(1));
-        self.score_cached_point(point_id, self.vector_storage.get_vector(point_id))
+        self.score_cached_point(point_id, self.vector(point_id))
+    }
+
+    #[inline]
+    pub(crate) fn vector(&self, point_id: PointOffset) -> &[f32] {
+        let start = point_id as usize * self.dimension;
+        &self.vectors[start..start + self.dimension]
+    }
+
+    #[inline]
+    pub(crate) fn vector_layout(&self) -> (&'a [f32], usize) {
+        (self.vectors, self.dimension)
     }
 
     pub fn scored_point_count(&self) -> u64 {
@@ -93,7 +126,9 @@ impl<'a> VectorScorer<'a> {
                 vector,
                 norms.value(point_id),
             ),
-            ScoringKernel::Other(metric) => metric.similarity(self.query.as_slice(), vector),
+            ScoringKernel::Euclidean => -distance::l2_squared(self.query.as_slice(), vector),
+            ScoringKernel::DotProduct => distance::dot_product(self.query.as_slice(), vector),
+            ScoringKernel::Manhattan => -distance::l1_distance(self.query.as_slice(), vector),
         }
     }
 
@@ -114,8 +149,38 @@ impl<'a> VectorScorer<'a> {
         points: &'b [PointOffset],
     ) -> impl Iterator<Item = ScoredPoint> + 'b {
         self.scores_buffer.resize(points.len(), 0.0);
-        for (i, &point_id) in points.iter().enumerate() {
-            self.scores_buffer[i] = self.score_point(point_id);
+        self.scored_points
+            .set(self.scored_points.get().saturating_add(points.len() as u64));
+        let query = self.query.as_slice();
+        match self.kernel {
+            ScoringKernel::Cosine(norms) => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    self.scores_buffer[i] =
+                        distance::dot_product(query, self.vector(point_id)) * norms.value(point_id);
+                }
+            }
+            ScoringKernel::Euclidean => {
+                distance::l2_squared_batch_indexed(
+                    query,
+                    self.vectors,
+                    self.dimension,
+                    points,
+                    &mut self.scores_buffer,
+                );
+                for score in &mut self.scores_buffer {
+                    *score = -*score;
+                }
+            }
+            ScoringKernel::DotProduct => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    self.scores_buffer[i] = distance::dot_product(query, self.vector(point_id));
+                }
+            }
+            ScoringKernel::Manhattan => {
+                for (i, &point_id) in points.iter().enumerate() {
+                    self.scores_buffer[i] = -distance::l1_distance(query, self.vector(point_id));
+                }
+            }
         }
         let scores = &self.scores_buffer;
         points

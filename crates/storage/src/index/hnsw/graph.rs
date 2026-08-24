@@ -14,10 +14,10 @@ use super::types::{
 };
 use super::visited_pool::VisitedPool;
 use super::VectorScorer;
+use crate::index::ExactRowAdmission;
 use crate::search::SearchWorkBudget;
 use paro_common::error::Result;
 use rand::{thread_rng, Rng};
-use roaring::RoaringBitmap;
 
 /// Read-only HNSW graph layers.
 pub struct GraphLayers {
@@ -77,7 +77,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter: Option<ExactRowAdmission<'_>>,
         random_entry_point: bool,
         work: &SearchWorkBudget,
     ) -> Result<GraphSearchResult> {
@@ -95,7 +95,7 @@ impl GraphLayers {
             });
         };
 
-        self.search_from_entry_point(entry_point, top, ef, algorithm, scorer, filter_bitmap, work)
+        self.search_from_entry_point(entry_point, top, ef, algorithm, scorer, filter, work)
     }
 
     /// Batched search entry point for multiple queries sharing one filter bitmap.
@@ -105,7 +105,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorers: &mut [VectorScorer<'_>],
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter: Option<ExactRowAdmission<'_>>,
         random_entry_point: bool,
         work: &SearchWorkBudget,
     ) -> Result<Vec<GraphSearchResult>> {
@@ -134,7 +134,7 @@ impl GraphLayers {
                     ef,
                     algorithm,
                     scorer,
-                    filter_bitmap,
+                    filter,
                     work,
                 )?),
                 None => results.push(GraphSearchResult {
@@ -179,7 +179,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
-        filter_bitmap: Option<&RoaringBitmap>,
+        filter: Option<ExactRowAdmission<'_>>,
         work: &SearchWorkBudget,
     ) -> Result<GraphSearchResult> {
         let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, work)?;
@@ -188,16 +188,51 @@ impl GraphLayers {
                 self.search_on_level(zero_level_entry, ef, scorer, work)?,
                 false,
             ),
-            SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => self
-                .search_masked_topk(
-                    zero_level_entry,
-                    top,
-                    ef,
-                    scorer,
-                    filter_bitmap,
-                    algorithm == SearchAlgorithm::AdaptiveFilteredTopK,
-                    work,
-                )?,
+            SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => {
+                let adaptive = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
+                match filter {
+                    None => self.search_masked_topk(
+                        zero_level_entry,
+                        top,
+                        ef,
+                        scorer,
+                        |_| true,
+                        adaptive,
+                        work,
+                    )?,
+                    Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
+                        zero_level_entry,
+                        top,
+                        ef,
+                        scorer,
+                        |row_id| bitmap.contains(row_id),
+                        adaptive,
+                        work,
+                    )?,
+                    Some(ExactRowAdmission::Ordinal {
+                        row_ordinals,
+                        accepted_ordinals,
+                        accepts_null,
+                    }) => self.search_masked_topk(
+                        zero_level_entry,
+                        top,
+                        ef,
+                        scorer,
+                        |row_id| {
+                            row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
+                                if *ordinal == u16::MAX {
+                                    return accepts_null;
+                                }
+                                accepted_ordinals
+                                    .get(*ordinal as usize / 64)
+                                    .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
+                            })
+                        },
+                        adaptive,
+                        work,
+                    )?,
+                }
+            }
         };
         points.truncate(top);
         Ok(GraphSearchResult {
@@ -290,16 +325,19 @@ impl GraphLayers {
     /// retaining every scored candidate admitted by the exact filter bitmap.
     /// This avoids disconnecting the graph and avoids estimating an
     /// inverse-selectivity oversampling factor.
-    fn search_masked_topk(
+    fn search_masked_topk<F>(
         &self,
         entry_point: ScoredPoint,
         top: usize,
         ef: usize,
         scorer: &mut VectorScorer,
-        filter_bitmap: Option<&RoaringBitmap>,
+        admits: F,
         adaptive_predicate_refinement: bool,
         work: &SearchWorkBudget,
-    ) -> Result<(Vec<ScoredPoint>, bool)> {
+    ) -> Result<(Vec<ScoredPoint>, bool)>
+    where
+        F: Fn(PointOffset) -> bool,
+    {
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
         // Preserve up to `ef` already-scored matching candidates as diverse
@@ -307,7 +345,7 @@ impl GraphLayers {
         let mut filtered = FixedLengthPriorityQueue::new(ef.max(top));
         let mut neighbors = Vec::new();
         visited.check_and_update_visited(entry_point.idx);
-        if filter_bitmap.is_none_or(|bitmap| bitmap.contains(entry_point.idx)) {
+        if admits(entry_point.idx) {
             filtered.push(entry_point);
         }
 
@@ -326,7 +364,7 @@ impl GraphLayers {
             work.consume(neighbors.len())?;
 
             for point in scorer.score_points_unfiltered(&neighbors) {
-                if filter_bitmap.is_none_or(|bitmap| bitmap.contains(point.idx)) {
+                if admits(point.idx) {
                     filtered.push(point);
                 }
                 context.process_candidate(point);
@@ -355,12 +393,9 @@ impl GraphLayers {
             return Ok((seeds, false));
         }
 
-        let Some(filter_bitmap) = filter_bitmap else {
-            return Ok((seeds, false));
-        };
         let Some((&first, remaining)) = seeds.split_first() else {
             // No refinement was executed. The caller observes underfill and
-            // performs the exact bitmap fallback.
+            // performs the exact row-set fallback.
             return Ok((Vec::new(), false));
         };
 
@@ -389,7 +424,7 @@ impl GraphLayers {
             let mut inspected_edges = 0usize;
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
-                if filter_bitmap.contains(neighbor) {
+                if admits(neighbor) {
                     if !visited.check_and_update_visited(neighbor) {
                         matching_neighbors.push(neighbor);
                     }
@@ -411,7 +446,7 @@ impl GraphLayers {
                 self.links.for_each_link(bridge, 0, |neighbor| {
                     bridge_edges = bridge_edges.saturating_add(1);
                     if matching_neighbors.len() < limit
-                        && filter_bitmap.contains(neighbor)
+                        && admits(neighbor)
                         && !visited.check_and_update_visited(neighbor)
                     {
                         matching_neighbors.push(neighbor);

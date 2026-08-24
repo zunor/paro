@@ -14,7 +14,7 @@ use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::{PredicateComparison, PredicateTree};
 use paro_storage::rowset::SparseVector;
 use paro_storage::search::{
-    CapabilityToken, DenseVectorQuery, ExactBitmapMaterialization, FullTextQueryKind,
+    CapabilityToken, DenseVectorQuery, ExactFilterMaterialization, FullTextQueryKind,
     FullTextQueryStats, FullTextScoreMode, NormalizedSearchRequest, SearchRequestMode,
 };
 
@@ -99,14 +99,14 @@ impl fmt::Display for SearchPredicateTemplate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchFilterContract {
     None,
-    ExactSegmentBitmapNoResidual,
+    ExactSegmentRowSetNoResidual,
 }
 
 impl SearchFilterContract {
     /// Construct the proof only after lowering has established that no
     /// residual filter remains above the search source.
     pub fn exact_no_residual(predicate: Option<&SearchPredicateTemplate>) -> Self {
-        predicate.map_or(Self::None, |_| Self::ExactSegmentBitmapNoResidual)
+        predicate.map_or(Self::None, |_| Self::ExactSegmentRowSetNoResidual)
     }
 }
 
@@ -126,9 +126,9 @@ pub struct VectorSearchSpec {
     pub avg_level0_degree: f32,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
-    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
+    pub filter_materialization: Option<ExactFilterMaterialization>,
     /// Cardinality estimate used to explain the provider's expected filtered
-    /// exact-vs-graph strategy. Execution always decides from the exact bitmap.
+    /// exact-vs-graph strategy. Execution always decides from the exact row set.
     pub estimated_filter_rows: Option<u64>,
     pub estimated_total_rows: Option<u64>,
     pub projected_columns: Box<[usize]>,
@@ -146,7 +146,7 @@ pub struct SparseVectorSearchSpec {
     pub k: usize,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
-    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
+    pub filter_materialization: Option<ExactFilterMaterialization>,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,
@@ -166,7 +166,7 @@ pub struct FullTextSearchSpec {
     pub mode: SearchRequestMode,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
-    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
+    pub filter_materialization: Option<ExactFilterMaterialization>,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,

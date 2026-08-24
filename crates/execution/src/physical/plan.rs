@@ -911,7 +911,7 @@ fn push_search_filter_properties(
     properties: &mut Vec<ExplainProperty>,
     predicate: Option<&crate::physical::specs::SearchPredicateTemplate>,
     contract: crate::physical::specs::SearchFilterContract,
-    materialization: Option<paro_storage::search::ExactBitmapMaterialization>,
+    materialization: Option<paro_storage::search::ExactFilterMaterialization>,
     table: &TableCatalogEntry,
 ) {
     let Some(predicate) = predicate else {
@@ -924,29 +924,29 @@ fn push_search_filter_properties(
     );
     let contract = match (contract, materialization) {
         (
-            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
-            Some(paro_storage::search::ExactBitmapMaterialization::ScalarIndex),
-        ) => "exact segment bitmap from scalar postings; no residual filter",
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::ScalarIndex),
+        ) => "exact segment row set from scalar index; ordinal admission and posting scan; no residual filter",
         (
-            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
-            Some(paro_storage::search::ExactBitmapMaterialization::ColumnScan),
-        ) => "exact segment bitmap materialized by column scan; no residual filter",
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::ColumnScan),
+        ) => "exact segment row set materialized by column scan; no residual filter",
         (
-            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
-            Some(paro_storage::search::ExactBitmapMaterialization::Mixed {
+            crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual,
+            Some(paro_storage::search::ExactFilterMaterialization::Mixed {
                 indexed_rows,
                 scanned_rows,
             }),
         ) => {
             push_string_property(
                 properties,
-                "Filter Bitmap Coverage",
+                "Filter Row-Set Coverage",
                 format!("indexed rows {indexed_rows}; column-scan rows {scanned_rows}"),
             );
-            "exact segment bitmap from mixed scalar postings and column scans; no residual filter"
+            "exact segment row set from mixed scalar indexes and column scans; no residual filter"
         }
-        (crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual, None) => {
-            "exact segment bitmap; materialization unknown; no residual filter"
+        (crate::physical::specs::SearchFilterContract::ExactSegmentRowSetNoResidual, None) => {
+            "exact segment row set; materialization unknown; no residual filter"
         }
         (crate::physical::specs::SearchFilterContract::None, _) => "unproven",
     };
@@ -961,7 +961,7 @@ fn push_dense_search_filter_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
-        spec.bitmap_materialization,
+        spec.filter_materialization,
         spec.table.as_ref(),
     );
     if spec.predicate.is_none() {
@@ -978,58 +978,15 @@ fn push_dense_search_filter_properties(
         }
     }
 
-    let strategy = match (
-        has_runtime_parameters,
-        spec.estimated_filter_rows,
-        spec.estimated_total_rows,
-    ) {
-        (true, _, _) => {
-            "runtime exact bitmap; exact scan below cardinality threshold, otherwise adaptive connected HNSW with observed admission, two-hop predicate refinement, then exact fallback"
-                .to_string()
-        }
-        (false, Some(rows), Some(total_rows)) => {
-            use paro_storage::index::hnsw::{
-                estimate_filtered_search_strategy, HnswFilteredSearchStrategy,
-            };
-            let effective_ef = spec.search_policy.effective_ef(spec.k, spec.params.ef);
-            let decision = estimate_filtered_search_strategy(
-                rows,
-                total_rows,
-                spec.k,
-                effective_ef,
-                spec.avg_level0_degree,
-                spec.search_policy,
-            );
-            let name = match decision.strategy {
-                HnswFilteredSearchStrategy::ExactScan => "exact bitmap distance scan",
-                HnswFilteredSearchStrategy::MaskedTopK => {
-                    "adaptive connected HNSW; masked admission expected"
-                }
-                HnswFilteredSearchStrategy::RefinedTopK => {
-                    "adaptive connected HNSW; two-hop predicate refinement expected"
-                }
-            };
-            match decision.strategy {
-                HnswFilteredSearchStrategy::ExactScan => format!(
-                    "{name} (estimated {rows}/{total_rows} rows; exact threshold {})",
-                    spec.search_policy.filtered_plain_scan_threshold
-                ),
-                HnswFilteredSearchStrategy::MaskedTopK => format!(
-                    "{name} (estimated {rows}/{total_rows} rows; scored {}; admitted {} >= required {}; runtime may upgrade to refinement, then exact fallback on underfill)",
-                    decision.expected_scored_points,
-                    decision.expected_admitted_points,
-                    decision.required_admitted_points
-                ),
-                HnswFilteredSearchStrategy::RefinedTopK => format!(
-                    "{name} (estimated {rows}/{total_rows} rows; scored {}; admitted {} < required {}; exact scan is final fallback)",
-                    decision.expected_scored_points,
-                    decision.expected_admitted_points,
-                    decision.required_admitted_points
-                ),
-            }
-        }
-        _ => "runtime exact bitmap; cardinality unavailable at plan time".to_string(),
-    };
+    // Runtime owns exact per-segment cardinalities; a table-wide estimate
+    // cannot truthfully predict how those rows are distributed across
+    // immutable segments. EXPLAIN therefore describes the real dispatch
+    // contract instead of duplicating the cost model as a false plan-time
+    // execution claim.
+    let strategy = format!(
+        "per-segment runtime choice: exact row-set distance scan at <= {} matches; otherwise connected masked HNSW with observed two-hop refinement and exact fallback",
+        spec.search_policy.filtered_plain_scan_threshold
+    );
     push_string_property(properties, "Filtered Strategy", strategy);
 }
 
@@ -1069,7 +1026,7 @@ fn push_sparse_search_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
-        spec.bitmap_materialization,
+        spec.filter_materialization,
         spec.table.as_ref(),
     );
 }
@@ -1089,7 +1046,7 @@ fn push_fulltext_search_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
-        spec.bitmap_materialization,
+        spec.filter_materialization,
         spec.table.as_ref(),
     );
 }

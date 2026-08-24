@@ -24,7 +24,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
 
-use super::{Index, IndexStorageInfo};
+use super::{ExactRowSet, Index, IndexStorageInfo};
 use crate::index::predicate::Predicate;
 use crate::index::predicate_result::{intersect, PredicateResult};
 
@@ -267,6 +267,12 @@ pub trait BoundIndex: Index {
     /// proof semantics inherit a candidate-only result.
     fn evaluate_predicate_with_proof(&self, predicate: &Predicate) -> IndexPredicateEvaluation {
         IndexPredicateEvaluation::candidates_only(self.evaluate_predicate(predicate))
+    }
+
+    /// Compile an exact index-native membership representation. The evaluator
+    /// only accepts this result from a complete segment-local binding.
+    fn compile_exact_row_set(&self, _predicate: &Predicate) -> Option<Arc<dyn ExactRowSet>> {
+        None
     }
 
     /// Whether this index can establish guaranteed-true rows in addition to

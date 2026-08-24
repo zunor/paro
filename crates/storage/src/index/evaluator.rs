@@ -12,6 +12,7 @@ use crate::index::bound_index::{BoundIndex, IndexPredicateEvaluation, PredicateI
 use crate::index::predicate::{Predicate, PredicateTree};
 use crate::index::predicate_result::{intersect, union, PredicateResult};
 use crate::index::ColumnId;
+use crate::index::ExactRowSet;
 
 /// Index evaluator that combines multiple indexes.
 pub struct IndexEvaluator {
@@ -103,6 +104,37 @@ impl IndexEvaluator {
                 }
             }
         }
+    }
+
+    /// Compile an exact index-native row set when one complete access path can
+    /// represent the whole predicate without materialization. Composite trees
+    /// continue through the generic bitmap algebra until their physical set
+    /// representation is made composable.
+    pub(crate) fn compile_exact_row_set(
+        &self,
+        predicate_tree: &PredicateTree,
+    ) -> Option<Arc<dyn ExactRowSet>> {
+        let PredicateTree::Leaf(predicate) = predicate_tree else {
+            return None;
+        };
+        let column_id = predicate.index_column_id()?;
+        let indexes = self.indexes.get(&column_id)?;
+        for binding in IndexPriority::ORDERED.into_iter().flat_map(|priority| {
+            indexes.iter().filter(move |binding| {
+                index_priority(binding.index().index_type(), predicate) == priority
+            })
+        }) {
+            if !self
+                .segment_rows
+                .is_some_and(|rows| binding.is_complete_for(rows))
+            {
+                continue;
+            }
+            if let Some(row_set) = binding.index().compile_exact_row_set(predicate) {
+                return Some(row_set);
+            }
+        }
+        None
     }
 
     /// Evaluate a single predicate using the best available index.
@@ -209,8 +241,9 @@ fn index_priority(index_type: &str, predicate: &Predicate) -> IndexPriority {
             | Predicate::Range { .. }
     );
     match (ordered, index_type) {
-        // ART performs an ordered cursor walk for ranges. Bitmap is preferred
-        // for equality/membership where it can return one immutable posting.
+        // ART performs an ordered cursor walk for ordinary range evaluation.
+        // Search-specific row-set compilation still reaches the bitmap path
+        // when ART cannot expose index-native membership.
         (true, "ART") | (false, "BITMAP") => IndexPriority::PreferredScalar,
         (true, "BITMAP") | (false, "ART") => IndexPriority::AlternateScalar,
         (_, "BLOOM") => IndexPriority::Bloom,
