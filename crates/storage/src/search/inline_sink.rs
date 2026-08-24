@@ -466,16 +466,47 @@ impl HnswInlineThreshold {
     }
 
     /// Machine-independent resident graph estimate used by the durable inline
-    /// threshold. Runtime worker width must never affect this value: identical
-    /// definitions and segment contents must make the same inline/sidecar
-    /// placement decision on every node.
+    /// threshold. This models the published hybrid-CSR artifact, not the
+    /// mutable builder object graph. Mixing builder containers into this
+    /// estimate makes storage segmentation depend on transient implementation
+    /// details and multiplies query-time graph work. Runtime worker width must
+    /// never affect this value: identical definitions and segment contents
+    /// must make the same inline/sidecar placement decision on every node.
     pub fn estimate_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
         let m = u64::from(m.max(1));
+        let point_bytes = std::mem::size_of::<u32>() as u64;
+        let offset_bytes = std::mem::size_of::<u64>() as u64;
+        let header_bytes = 64_u64;
+        let offset_tables = vector_count
+            .saturating_add(1)
+            .saturating_mul(offset_bytes)
+            .saturating_mul(2);
+        let level0_links = vector_count
+            .saturating_mul(m.saturating_mul(2))
+            .saturating_mul(point_bytes);
+        // Upper levels are delta-varint encoded. The standard level
+        // distribution has 1/(m-1) upper point-levels per point. Five bytes
+        // per u32 target plus level/count tags is a conservative durable bound
+        // without importing mutable builder container sizes.
+        let upper_denominator = m.max(2) - 1;
+        let upper_payload_per_point = 1_u64.saturating_add(
+            m.saturating_mul(5)
+                .saturating_add(1)
+                .div_ceil(upper_denominator),
+        );
+        header_bytes
+            .saturating_add(offset_tables)
+            .saturating_add(level0_links)
+            .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
+    }
+
+    /// Mutable graph-builder resident estimate. This belongs only to runtime
+    /// admission/accounting and must not determine the durable segment shape.
+    fn estimate_builder_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
+        let m = u64::from(m.max(1));
         let link_bytes = std::mem::size_of::<u32>() as u64;
-        let level0_links = m.saturating_mul(2);
-        let upper_level_links = m;
         let graph_links = vector_count
-            .saturating_mul(level0_links.saturating_add(upper_level_links))
+            .saturating_mul(m.saturating_mul(3))
             .saturating_mul(link_bytes);
         let outer_point_vectors =
             vector_count.saturating_mul(std::mem::size_of::<Vec<()>>() as u64);
@@ -508,7 +539,7 @@ impl HnswInlineThreshold {
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
-        Self::estimate_graph_memory_bytes(vector_count, m)
+        Self::estimate_builder_graph_memory_bytes(vector_count, m)
             .saturating_add(visited_lists)
             .saturating_add(build_frontier)
     }
@@ -665,14 +696,45 @@ mod tests {
     fn hnsw_runtime_peak_accounts_for_workers_without_changing_graph_placement() {
         let points = 1_000;
         let graph = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
+        let builder_graph = HnswInlineThreshold::estimate_builder_graph_memory_bytes(points, 16);
         let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 1);
         let width_32 = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 32);
 
         assert_eq!(width_32 - serial, points * 31);
+        assert!(builder_graph > graph);
         assert_eq!(
-            serial - graph,
+            serial - builder_graph,
             points + points * 128 * std::mem::size_of::<f32>() as u64
         );
+    }
+
+    #[test]
+    fn persisted_csr_budget_does_not_inherit_builder_container_overhead() {
+        let points = 1_000_000;
+        let resident = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
+        let builder = HnswInlineThreshold::estimate_build_peak_memory_bytes(
+            points,
+            32,
+            16,
+            crate::index::hnsw::hnsw_build_thread_count(),
+        );
+        let estimate = HnswInlineBuildEstimate {
+            vector_count: 8_192,
+            dimension: 32,
+            estimated_graph_memory_bytes: HnswInlineThreshold::estimate_graph_memory_bytes(
+                8_192, 16,
+            ),
+            estimated_build_peak_memory_bytes: 0,
+            threshold: HnswInlineThreshold {
+                max_vector_count: points,
+                max_graph_memory_bytes: 512 * 1024 * 1024,
+                max_dimension: 32,
+            },
+        };
+
+        assert!(resident < 512 * 1024 * 1024);
+        assert!(builder > resident);
+        assert_eq!(estimate.max_segment_vector_count(), points);
     }
 
     #[test]

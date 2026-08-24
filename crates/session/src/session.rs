@@ -43,6 +43,7 @@ use paro_execution::operators::graph::refresh_property_graph::{
 use paro_execution::query_executor::executor::Executor;
 use paro_instance::{DatabaseHandle, Instance};
 use paro_storage::metrics::storage_metrics;
+use paro_storage::transaction::write_buffer::transaction_write_buffer_memory_budget;
 use paro_transaction::{CommitAckPolicy, DatabaseId, IsolationLevel, ReadTrackingPolicy};
 use std::collections::HashMap;
 use std::ops::AsyncFnOnce;
@@ -1511,12 +1512,19 @@ impl Session {
     /// This is used by `execute.rs` for automatic transaction management.
     pub(crate) fn begin_transaction_internal(&mut self) -> Result<()> {
         self.wait_for_async_commit_floor_published()?;
-        self.transaction.begin_transaction_for_database(
+        let transaction = self.transaction.begin_transaction_for_database(
             self.current_database.transaction_manager(),
             DatabaseId::new(self.current_database.id()),
             self.current_database.name(),
             ReadTrackingPolicy::SafeSnapshotPreferred,
         )?;
+        let settings = EffectiveSettings::new(self.effective_settings.clone());
+        let session_memory_limit = settings
+            .memory_limit()
+            .unwrap_or_else(|| self.instance.runtime_tuning().snapshot().maximum_memory);
+        transaction.set_write_buffer_memory_budget_bytes(transaction_write_buffer_memory_budget(
+            session_memory_limit,
+        ));
         self.registered_state.notify_transaction_begin();
         Ok(())
     }

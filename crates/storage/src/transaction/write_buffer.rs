@@ -28,7 +28,33 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 pub const DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 256 * 1024 * 1024;
+const MIN_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 64 * 1024 * 1024;
+const MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET: u64 = 2 * 1024 * 1024 * 1024;
+const TXN_WRITE_BUFFER_MEMORY_FRACTION: u64 = 8;
 const SPILLED_WRITER_HANDLE_BYTES: u64 = 64 * 1024;
+
+/// Derive one transaction's write working-set waterline from the session
+/// memory contract.
+///
+/// A fixed process-wide default fragments large inline search artifacts even
+/// when a session has been admitted with substantially more memory. The
+/// transaction waterline remains only a local spill/flush threshold: global
+/// buffer reservations and provider build admission still arbitrate actual
+/// concurrent memory. Keeping the derivation here gives every protocol and
+/// embedded session the same storage-owned policy.
+pub fn transaction_write_buffer_memory_budget(session_memory_limit: usize) -> u64 {
+    if session_memory_limit == 0 {
+        return DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET;
+    }
+    let session_memory_limit = u64::try_from(session_memory_limit).unwrap_or(u64::MAX);
+    session_memory_limit
+        .div_ceil(TXN_WRITE_BUFFER_MEMORY_FRACTION)
+        .clamp(
+            MIN_TXN_WRITE_BUFFER_MEMORY_BUDGET,
+            MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET,
+        )
+        .min(session_memory_limit)
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct GraphTableDmlDelta {
@@ -1452,5 +1478,30 @@ impl TxnParticipantState for StorageTxnState {
 
     fn as_any(&self) -> &dyn std::any::Any {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transaction_budget_is_derived_from_session_contract() {
+        assert_eq!(
+            transaction_write_buffer_memory_budget(0),
+            DEFAULT_TXN_WRITE_BUFFER_MEMORY_BUDGET
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(32 * 1024 * 1024),
+            32 * 1024 * 1024
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(8 * 1024 * 1024 * 1024),
+            1024 * 1024 * 1024
+        );
+        assert_eq!(
+            transaction_write_buffer_memory_budget(usize::MAX),
+            MAX_TXN_WRITE_BUFFER_MEMORY_BUDGET
+        );
     }
 }
