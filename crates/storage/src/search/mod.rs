@@ -35,8 +35,8 @@ pub use artifact::{
     SegmentPagePointer,
 };
 pub use budget::{
-    ResourceBudget, ResourceContext, SearchBatchConfig, SearchMemoryAccountant,
-    SearchMemoryReservation,
+    ResourceBudget, ResourceContext, SearchBatchConfig, SearchCancellation, SearchMemoryAccountant,
+    SearchMemoryReservation, SearchWorkBudget,
 };
 pub use capability::{
     ArtifactSegmentRef, CapabilityToken, CoverageState, SearchArtifactRef, SearchCapability,

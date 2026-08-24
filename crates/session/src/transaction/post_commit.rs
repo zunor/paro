@@ -245,7 +245,7 @@ impl PostCommitActions {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.install_art_index(column_id.index)?;
+            storage.install_art_index(&action.info.name, column_id.index)?;
         }
 
         Self::register_search_definition_from_entry(storage.as_ref(), action.entry.as_ref())?;
@@ -293,7 +293,7 @@ impl PostCommitActions {
                         "ART indexes currently require exactly one column",
                     ));
                 };
-                storage.install_art_index(*column_id)?;
+                storage.install_art_index(&index.name, *column_id)?;
                 return Ok(());
             }
 
@@ -370,8 +370,7 @@ impl PostCommitActions {
         match CatalogIndexType::from_str(index_type) {
             CatalogIndexType::ART => {
                 for column_id in column_ids {
-                    storage.forget_art_index(*column_id);
-                    let _ = storage.drop_art_index(*column_id);
+                    let _ = storage.release_art_index(index_name, *column_id);
                 }
             }
             CatalogIndexType::HNSW => {

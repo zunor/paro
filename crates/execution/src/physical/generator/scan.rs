@@ -6,8 +6,7 @@ use std::sync::Arc;
 
 use paro_catalog::entry::TableCatalogEntry;
 use paro_planner::expression::ExpressionIterator;
-use paro_storage::index::{collect_predicate_columns, PredicateTree};
-use paro_storage::search::ExactBitmapMaterialization;
+use paro_storage::index::PredicateTree;
 
 use crate::physical::specs::{SearchFilterContract, SearchPredicateTemplate};
 
@@ -545,7 +544,8 @@ fn search_source_spec_for_candidate(
     // filters are represented by `predicate`; a residual would have produced
     // an Unsupported physical node above. Make that proof construction
     // explicit and separately describe how its exact bitmap is materialized.
-    let filter_contract = exact_search_filter_contract(table.as_ref(), predicate.as_ref());
+    let filter_contract = exact_search_filter_contract(predicate.as_ref());
+    let bitmap_materialization = candidate.exact_bitmap_materialization;
     match &candidate.intent {
         SearchIntent::Hnsw(intent) => {
             let search_policy = table
@@ -577,6 +577,7 @@ fn search_source_spec_for_candidate(
                 avg_level0_degree,
                 predicate,
                 filter_contract,
+                bitmap_materialization,
                 estimated_filter_rows: candidate
                     .estimated_cost()
                     .and_then(|cost| cost.estimated_rows),
@@ -597,6 +598,7 @@ fn search_source_spec_for_candidate(
             k: scan.limit,
             predicate,
             filter_contract,
+            bitmap_materialization,
             projected_columns,
             emit_score,
             output_names,
@@ -614,6 +616,7 @@ fn search_source_spec_for_candidate(
             mode: SearchRequestMode::TopK { limit: scan.limit },
             predicate,
             filter_contract,
+            bitmap_materialization,
             projected_columns,
             emit_score,
             output_names,
@@ -623,20 +626,9 @@ fn search_source_spec_for_candidate(
 }
 
 pub(super) fn exact_search_filter_contract(
-    table: &TableCatalogEntry,
     predicate: Option<&SearchPredicateTemplate>,
 ) -> SearchFilterContract {
-    let materialization = predicate
-        .and_then(|predicate| table.storage.as_ref().map(|storage| (predicate, storage)))
-        .filter(|(predicate, storage)| {
-            collect_predicate_columns(predicate.tree())
-                .into_iter()
-                .all(|column_id| storage.has_declared_art_index(column_id))
-        })
-        .map_or(ExactBitmapMaterialization::ColumnScan, |_| {
-            ExactBitmapMaterialization::ScalarIndex
-        });
-    SearchFilterContract::exact_no_residual(predicate, materialization)
+    SearchFilterContract::exact_no_residual(predicate)
 }
 
 fn physical_search_source_kind(source: SearchSourceSpec) -> PhysicalNodeKind {

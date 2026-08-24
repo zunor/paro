@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 use crate::buffer::{BufferManager, StandardBufferManager};
@@ -50,14 +50,14 @@ fn is_art_backfill_supported(logical_type: &LogicalType) -> bool {
 #[derive(Debug)]
 pub(crate) struct RuntimeIndexes {
     indexes: IndexSet,
-    declared_art_indexes: RwLock<HashSet<ColumnId>>,
+    declared_art_indexes: RwLock<HashMap<ColumnId, HashSet<String>>>,
 }
 
 impl RuntimeIndexes {
     pub(crate) fn new() -> Self {
         Self {
             indexes: IndexSet::new(),
-            declared_art_indexes: RwLock::new(HashSet::new()),
+            declared_art_indexes: RwLock::new(HashMap::new()),
         }
     }
 
@@ -85,18 +85,52 @@ impl RuntimeIndexes {
         self.indexes.remove_index(name)
     }
 
-    pub(crate) fn declare_art_index(&self, tablet: &TabletRef, column_id: ColumnId) {
-        if let Ok(mut guard) = self.declared_art_indexes.write() {
-            guard.insert(column_id);
+    /// Add one catalog declaration idempotently. Returns true when this is the
+    /// first owner for the column and physical access paths need to be built.
+    pub(crate) fn declare_art_index(
+        &self,
+        tablet: &TabletRef,
+        owner: &str,
+        column_id: ColumnId,
+    ) -> bool {
+        let first = self.declared_art_indexes.write().is_ok_and(|mut guard| {
+            let owners = guard.entry(column_id).or_default();
+            let was_empty = owners.is_empty();
+            owners.insert(owner.to_string());
+            was_empty
+        });
+        if first {
+            tablet.mark_declared_art_column(column_id);
         }
-        tablet.mark_declared_art_column(column_id);
+        first
     }
 
-    pub(crate) fn forget_art_index(&self, tablet: &TabletRef, column_id: ColumnId) {
-        if let Ok(mut guard) = self.declared_art_indexes.write() {
-            guard.remove(&column_id);
+    /// Release one catalog declaration by stable owner identity. Returns true
+    /// only when the last owner was removed and artifacts may be dropped.
+    pub(crate) fn forget_art_index(
+        &self,
+        tablet: &TabletRef,
+        owner: &str,
+        column_id: ColumnId,
+    ) -> bool {
+        let last = self.declared_art_indexes.write().is_ok_and(|mut guard| {
+            let Some(owners) = guard.get_mut(&column_id) else {
+                return false;
+            };
+            if !owners.remove(owner) {
+                return false;
+            }
+            if owners.is_empty() {
+                guard.remove(&column_id);
+                true
+            } else {
+                false
+            }
+        });
+        if last {
+            tablet.unmark_declared_art_column(column_id);
         }
-        tablet.unmark_declared_art_column(column_id);
+        last
     }
 
     pub(crate) fn rebuild_art_index(&self, tablet: &TabletRef, column_id: ColumnId) -> Result<()> {
@@ -115,7 +149,7 @@ impl RuntimeIndexes {
         self.declared_art_indexes
             .read()
             .map(|guard| {
-                let mut columns = guard.iter().copied().collect::<Vec<_>>();
+                let mut columns = guard.keys().copied().collect::<Vec<_>>();
                 columns.sort_unstable();
                 columns
             })
@@ -125,14 +159,14 @@ impl RuntimeIndexes {
     pub(crate) fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
         self.declared_art_indexes
             .read()
-            .is_ok_and(|guard| guard.contains(&column_id))
+            .is_ok_and(|guard| guard.contains_key(&column_id))
     }
 
     pub(crate) fn recovery_index_count(&self, tablet: &TabletRef) -> usize {
         let mut art_columns = self
             .declared_art_indexes
             .read()
-            .map(|guard| guard.iter().copied().collect::<HashSet<_>>())
+            .map(|guard| guard.keys().copied().collect::<HashSet<_>>())
             .unwrap_or_default();
 
         let visible = tablet.max_version();

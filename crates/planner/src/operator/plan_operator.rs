@@ -1635,6 +1635,7 @@ mod tests {
                     },
                     kind: SearchIndexKind::Hnsw,
                     estimated_cost: None,
+                    exact_bitmap_materialization: None,
                 },
                 confidence: crate::operator::Confidence::High,
             },

@@ -911,6 +911,7 @@ fn push_search_filter_properties(
     properties: &mut Vec<ExplainProperty>,
     predicate: Option<&crate::physical::specs::SearchPredicateTemplate>,
     contract: crate::physical::specs::SearchFilterContract,
+    materialization: Option<paro_storage::search::ExactBitmapMaterialization>,
     table: &TableCatalogEntry,
 ) {
     let Some(predicate) = predicate else {
@@ -921,14 +922,33 @@ fn push_search_filter_properties(
         "Pushed Predicate",
         format_search_predicate(predicate, table),
     );
-    let contract = match contract {
-        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual {
-            materialization: paro_storage::search::ExactBitmapMaterialization::ScalarIndex,
-        } => "exact segment bitmap from scalar postings; no residual filter",
-        crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual {
-            materialization: paro_storage::search::ExactBitmapMaterialization::ColumnScan,
-        } => "exact segment bitmap materialized by column scan; no residual filter",
-        crate::physical::specs::SearchFilterContract::None => "unproven",
+    let contract = match (contract, materialization) {
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
+            Some(paro_storage::search::ExactBitmapMaterialization::ScalarIndex),
+        ) => "exact segment bitmap from scalar postings; no residual filter",
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
+            Some(paro_storage::search::ExactBitmapMaterialization::ColumnScan),
+        ) => "exact segment bitmap materialized by column scan; no residual filter",
+        (
+            crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual,
+            Some(paro_storage::search::ExactBitmapMaterialization::Mixed {
+                indexed_rows,
+                scanned_rows,
+            }),
+        ) => {
+            push_string_property(
+                properties,
+                "Filter Bitmap Coverage",
+                format!("indexed rows {indexed_rows}; column-scan rows {scanned_rows}"),
+            );
+            "exact segment bitmap from mixed scalar postings and column scans; no residual filter"
+        }
+        (crate::physical::specs::SearchFilterContract::ExactSegmentBitmapNoResidual, None) => {
+            "exact segment bitmap; materialization unknown; no residual filter"
+        }
+        (crate::physical::specs::SearchFilterContract::None, _) => "unproven",
     };
     push_string_property(properties, "Filter Pushdown", contract.to_string());
 }
@@ -941,6 +961,7 @@ fn push_dense_search_filter_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
+        spec.bitmap_materialization,
         spec.table.as_ref(),
     );
     if spec.predicate.is_none() {
@@ -1048,6 +1069,7 @@ fn push_sparse_search_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
+        spec.bitmap_materialization,
         spec.table.as_ref(),
     );
 }
@@ -1067,6 +1089,7 @@ fn push_fulltext_search_properties(
         properties,
         spec.predicate.as_ref(),
         spec.filter_contract,
+        spec.bitmap_materialization,
         spec.table.as_ref(),
     );
 }

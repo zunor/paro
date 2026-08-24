@@ -41,28 +41,43 @@ impl TableHandle {
     }
 
     /// Record that a column declares an ART predicate index in table metadata.
-    pub fn declare_art_index(&self, column_id: ColumnId) {
+    pub fn declare_art_index(&self, owner: &str, column_id: ColumnId) -> bool {
         self.runtime_indexes
-            .declare_art_index(&self.tablet(), column_id);
+            .declare_art_index(&self.tablet(), owner, column_id)
     }
 
     /// Activate the durable ART maintenance contract and backfill all visible
     /// segments. The declaration is installed first so concurrent future
     /// writes are covered; readers still require each segment's completeness
     /// credential. A failed backfill rolls the declaration and artifacts back.
-    pub fn install_art_index(&self, column_id: ColumnId) -> Result<()> {
-        self.declare_art_index(column_id);
+    pub fn install_art_index(&self, owner: &str, column_id: ColumnId) -> Result<()> {
+        if !self.declare_art_index(owner, column_id) {
+            return Ok(());
+        }
         if let Err(error) = self.rebuild_art_index(column_id) {
-            self.forget_art_index(column_id);
-            let _ = self.drop_art_index(column_id);
+            let cleanup = self.release_art_index(owner, column_id);
+            if let Err(cleanup_error) = cleanup {
+                return Err(cleanup_error.context(format!(
+                    "ART backfill failed before rollback cleanup: {error}"
+                )));
+            }
             return Err(error);
         }
         Ok(())
     }
 
-    pub fn forget_art_index(&self, column_id: ColumnId) {
+    pub fn forget_art_index(&self, owner: &str, column_id: ColumnId) -> bool {
         self.runtime_indexes
-            .forget_art_index(&self.tablet(), column_id);
+            .forget_art_index(&self.tablet(), owner, column_id)
+    }
+
+    /// Release one catalog owner and remove physical access paths only after
+    /// the last declaration disappears.
+    pub fn release_art_index(&self, owner: &str, column_id: ColumnId) -> Result<()> {
+        if self.forget_art_index(owner, column_id) {
+            self.drop_art_index(column_id)?;
+        }
+        Ok(())
     }
 
     pub fn register_search_definition(&self, definition: SearchIndexDefinition) -> Result<()> {
@@ -104,6 +119,30 @@ impl TableHandle {
     /// completeness credential before treating postings as exact.
     pub fn has_declared_art_index(&self, column_id: ColumnId) -> bool {
         self.runtime_indexes.has_declared_art_index(column_id)
+    }
+
+    /// Runtime row coverage for an exact predicate that needs every listed
+    /// scalar column. A partially backfilled table is explicitly represented
+    /// instead of being costed from a table-level declaration bit.
+    pub fn complete_scalar_index_row_coverage(
+        &self,
+        column_ids: &[ColumnId],
+    ) -> Result<(u64, u64)> {
+        let segments = self.collect_segments(self.max_version())?;
+        let mut covered_rows = 0u64;
+        let mut total_rows = 0u64;
+        for (_, segment) in segments {
+            let rows = segment.num_rows();
+            total_rows = total_rows.saturating_add(rows);
+            if !column_ids.is_empty()
+                && column_ids
+                    .iter()
+                    .all(|column_id| segment.has_complete_scalar_index(*column_id))
+            {
+                covered_rows = covered_rows.saturating_add(rows);
+            }
+        }
+        Ok((covered_rows, total_rows))
     }
 
     /// Count runtime-visible secondary indexes across table-global and segment-local state.

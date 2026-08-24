@@ -1804,6 +1804,25 @@ fn search_metric_value(
     snapshot: &paro_storage::metrics::StorageMetricsSnapshot,
 ) -> u64 {
     match name {
+        "search_hnsw_scored_points_total" => snapshot.search_hnsw_scored_points_total,
+        "search_hnsw_exact_segment_searches_total" => {
+            snapshot.search_hnsw_exact_segment_searches_total
+        }
+        "search_hnsw_unfiltered_graph_segment_searches_total" => {
+            snapshot.search_hnsw_unfiltered_graph_segment_searches_total
+        }
+        "search_hnsw_masked_graph_segment_searches_total" => {
+            snapshot.search_hnsw_masked_graph_segment_searches_total
+        }
+        "search_hnsw_adaptive_graph_segment_searches_total" => {
+            snapshot.search_hnsw_adaptive_graph_segment_searches_total
+        }
+        "search_hnsw_predicate_refined_segment_searches_total" => {
+            snapshot.search_hnsw_predicate_refined_segment_searches_total
+        }
+        "search_hnsw_exact_fallback_segment_searches_total" => {
+            snapshot.search_hnsw_exact_fallback_segment_searches_total
+        }
         "search_row_fetch_batches_total" => snapshot.search_row_fetch_batches_total,
         "search_row_fetch_rows_total" => snapshot.search_row_fetch_rows_total,
         "search_row_fetch_projected_columns_total" => {
@@ -2527,5 +2546,32 @@ mod tests {
         assert_eq!(state.entries[0].invocation_count, 5);
         assert_eq!(state.entries[1].name, "join_order");
         assert!(!state.entries[1].enabled);
+    }
+
+    #[test]
+    fn hnsw_runtime_metrics_are_mapped_from_the_storage_snapshot() {
+        let mut snapshot = paro_storage::metrics::storage_metrics().snapshot();
+        snapshot.search_hnsw_scored_points_total = 101;
+        snapshot.search_hnsw_adaptive_graph_segment_searches_total = 7;
+        snapshot.search_hnsw_predicate_refined_segment_searches_total = 3;
+
+        assert_eq!(
+            search_metric_value("search_hnsw_scored_points_total", &snapshot),
+            101
+        );
+        assert_eq!(
+            search_metric_value(
+                "search_hnsw_adaptive_graph_segment_searches_total",
+                &snapshot
+            ),
+            7
+        );
+        assert_eq!(
+            search_metric_value(
+                "search_hnsw_predicate_refined_segment_searches_total",
+                &snapshot
+            ),
+            3
+        );
     }
 }

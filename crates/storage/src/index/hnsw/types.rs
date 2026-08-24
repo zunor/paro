@@ -152,6 +152,63 @@ pub enum HnswSearchStrategy {
     AdaptiveFilteredGraph,
 }
 
+/// Executed HNSW path. This is runtime evidence, not the strategy estimated by
+/// the optimizer or printed by plain EXPLAIN.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswSearchPath {
+    ExactScan,
+    UnfilteredGraph,
+    MaskedGraph,
+    AdaptiveGraph,
+}
+
+/// Mutually consistent runtime outcome for one segment/query search. Keeping
+/// the path as an enum prevents telemetry call sites from manufacturing
+/// impossible combinations of positional booleans.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswSearchOutcome {
+    pub path: HnswSearchPath,
+    pub predicate_refined: bool,
+    pub exact_fallback: bool,
+}
+
+impl HnswSearchOutcome {
+    pub const fn new(path: HnswSearchPath) -> Self {
+        Self {
+            path,
+            predicate_refined: false,
+            exact_fallback: false,
+        }
+    }
+
+    pub const fn with_predicate_refinement(mut self, refined: bool) -> Self {
+        self.predicate_refined = refined;
+        self
+    }
+
+    pub const fn with_exact_fallback(mut self) -> Self {
+        self.exact_fallback = true;
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct HnswSearchResult {
+    pub points: Vec<ScoredPoint>,
+    pub scored_points: u64,
+    pub outcome: HnswSearchOutcome,
+}
+
+impl HnswSearchResult {
+    pub fn len(&self) -> usize {
+        self.points.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.points.is_empty()
+    }
+}
+
 impl HnswSearchStrategy {
     /// Choose the query-wide execution contract from exact cardinalities.
     /// Predicate graph searches are adaptive internally: the graph observes

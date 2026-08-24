@@ -6,12 +6,14 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{
-    HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy, ScoredPoint, SearchParams,
+    HnswSearchFilter, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, ScoredPoint,
+    SearchParams,
 };
 use crate::index::{IndexEvaluator, PredicateResult, PredicateTree};
 use crate::primary_key::DeleteVector;
 use crate::rowset::sparse_vector::SparseVector;
 use crate::rowset::{SegmentIterator, SegmentRowId};
+use crate::search::SearchWorkBudget;
 use crate::tablet::ColumnId;
 use paro_common::error::{self as paro_error, Result};
 use roaring::RoaringBitmap;
@@ -69,6 +71,7 @@ impl Segment {
             self.rowset_gen,
             predicate_tree,
         )
+        .map(|result| result.points)
     }
 
     /// Perform a vector search on this segment using a snapshot epoch.
@@ -81,7 +84,7 @@ impl Segment {
         policy: &HnswSearchPolicy,
         snapshot_epoch: u64,
         predicate_tree: Option<&PredicateTree>,
-    ) -> Result<Vec<ScoredPoint>> {
+    ) -> Result<HnswSearchResult> {
         let filter_bitmap = self.build_filter_bitmap_with_epoch(snapshot_epoch, predicate_tree)?;
         let filter = match (predicate_tree.is_some(), filter_bitmap.as_ref()) {
             (_, None) => HnswSearchFilter::None,
@@ -91,8 +94,16 @@ impl Segment {
         let matching_rows = filter.bitmap().map_or(self.num_rows(), RoaringBitmap::len);
         let strategy =
             HnswSearchStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
+        let budget = crate::search::ResourceBudget::default();
         self.vector_search_with_filter_strategy(
-            column_id, query, top_k, params, filter, policy, strategy,
+            column_id,
+            query,
+            top_k,
+            params,
+            filter,
+            policy,
+            strategy,
+            budget.work.as_ref(),
         )
     }
 
@@ -108,16 +119,23 @@ impl Segment {
         filter: HnswSearchFilter<'_>,
         policy: &HnswSearchPolicy,
         strategy: HnswSearchStrategy,
-    ) -> Result<Vec<ScoredPoint>> {
+        work: &SearchWorkBudget,
+    ) -> Result<HnswSearchResult> {
         let index = self
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
         if let Some(bm) = filter.bitmap() {
             if bm.is_empty() {
-                return Ok(Vec::new());
+                return Ok(HnswSearchResult {
+                    points: Vec::new(),
+                    scored_points: 0,
+                    outcome: crate::index::hnsw::HnswSearchOutcome::new(
+                        crate::index::hnsw::HnswSearchPath::ExactScan,
+                    ),
+                });
             }
         }
-        index.search_one_with_policy_strategy(query, top_k, params, filter, policy, strategy)
+        index.search_one_with_policy_strategy(query, top_k, params, filter, policy, strategy, work)
     }
 
     /// Perform a sparse vector search on this segment.

@@ -2438,15 +2438,7 @@ mod tests {
             row_limit: row_limit.max(1),
             preferred_bytes: 1 << 20,
         };
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: row_limit.max(1024),
-            parallelism_slots: 1,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Default::default(),
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, row_limit.max(1024), 1);
 
         loop {
             match cursor.next_batch(&batch_config, &mut budget)? {
@@ -3814,15 +3806,7 @@ mod tests {
             row_limit: 1024,
             preferred_bytes: 1 << 20,
         };
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: 1024,
-            parallelism_slots: 4,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Default::default(),
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 1024, 4);
         loop {
             match cursor.next_batch(&batch, &mut budget).unwrap() {
                 SearchBatchState::Ready(batch) if batch.is_empty() => continue,
@@ -4822,15 +4806,7 @@ mod tests {
             row_limit: 1024,
             preferred_bytes: 1 << 20,
         };
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: 1024,
-            parallelism_slots: 4,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Default::default(),
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 1024, 4);
         let mut row_count = 0usize;
         loop {
             match cursor.next_batch(&batch, &mut budget).unwrap() {
@@ -5395,15 +5371,7 @@ mod tests {
             row_limit: 16,
             preferred_bytes: 1 << 20,
         };
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: 16,
-            parallelism_slots: 2,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Default::default(),
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 16, 2);
         let mut returned = 0usize;
         while let SearchBatchState::Ready(batch) = cursor.next_batch(&batch, &mut budget).unwrap() {
             returned += batch.len();

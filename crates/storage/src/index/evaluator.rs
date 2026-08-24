@@ -137,7 +137,7 @@ impl IndexEvaluator {
 
         let mut candidates = PredicateResult::Unknown;
         let mut guaranteed = PredicateResult::NoneMatch;
-        for binding in [0, 1, 2, 3, 10].into_iter().flat_map(|priority| {
+        for binding in IndexPriority::ORDERED.into_iter().flat_map(|priority| {
             indexes.iter().filter(move |binding| {
                 index_priority(binding.index().index_type(), predicate) == priority
             })
@@ -180,7 +180,26 @@ impl IndexEvaluator {
     }
 }
 
-fn index_priority(index_type: &str, predicate: &Predicate) -> u8 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexPriority {
+    PreferredScalar,
+    AlternateScalar,
+    Bloom,
+    ZoneMap,
+    Fallback,
+}
+
+impl IndexPriority {
+    const ORDERED: [Self; 5] = [
+        Self::PreferredScalar,
+        Self::AlternateScalar,
+        Self::Bloom,
+        Self::ZoneMap,
+        Self::Fallback,
+    ];
+}
+
+fn index_priority(index_type: &str, predicate: &Predicate) -> IndexPriority {
     let ordered = matches!(
         predicate,
         Predicate::Lt { .. }
@@ -192,11 +211,11 @@ fn index_priority(index_type: &str, predicate: &Predicate) -> u8 {
     match (ordered, index_type) {
         // ART performs an ordered cursor walk for ranges. Bitmap is preferred
         // for equality/membership where it can return one immutable posting.
-        (true, "ART") | (false, "BITMAP") => 0,
-        (true, "BITMAP") | (false, "ART") => 1,
-        (_, "BLOOM") => 2,
-        (_, "ZONEMAP") => 3,
-        _ => 10,
+        (true, "ART") | (false, "BITMAP") => IndexPriority::PreferredScalar,
+        (true, "BITMAP") | (false, "ART") => IndexPriority::AlternateScalar,
+        (_, "BLOOM") => IndexPriority::Bloom,
+        (_, "ZONEMAP") => IndexPriority::ZoneMap,
+        _ => IndexPriority::Fallback,
     }
 }
 

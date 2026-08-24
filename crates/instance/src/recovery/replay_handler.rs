@@ -263,8 +263,7 @@ impl<'a> CatalogReplayHandler<'a> {
         match IndexType::from_str(index_type) {
             IndexType::ART => {
                 for column_id in column_ids {
-                    storage.forget_art_index(*column_id);
-                    storage.drop_art_index(*column_id)?;
+                    storage.release_art_index(index_name, *column_id)?;
                 }
             }
             IndexType::HNSW | IndexType::Sparse | IndexType::FullText => {

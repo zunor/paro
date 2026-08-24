@@ -214,8 +214,7 @@ fn detach_index_state(
     match CatalogIndexType::from_str(index_type) {
         CatalogIndexType::ART => {
             for column_id in column_ids {
-                storage.forget_art_index(*column_id);
-                storage.drop_art_index(*column_id)?;
+                storage.release_art_index(index_name, *column_id)?;
             }
         }
         CatalogIndexType::HNSW | CatalogIndexType::Sparse | CatalogIndexType::FullText => {
@@ -310,7 +309,7 @@ impl IndexBackfillPublishTask {
                     "ART indexes currently require exactly one column",
                 ));
             };
-            storage.install_art_index(column_id.index)?;
+            storage.install_art_index(&self.info.name, column_id.index)?;
         }
 
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;

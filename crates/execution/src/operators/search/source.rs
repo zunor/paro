@@ -21,7 +21,7 @@ use paro_storage::index::PredicateComparison;
 use paro_storage::index::{Predicate, PredicateTree};
 use paro_storage::search::{
     CapabilityToken, DenseVectorQuery, OpenSearchCursorResult, ResourceBudget, SearchBatchConfig,
-    SearchMemoryAccountant, SearchReadOptions, SearchRequestMode,
+    SearchCancellation, SearchMemoryAccountant, SearchReadOptions, SearchRequestMode,
 };
 use paro_storage::table::table_handle::TableHandle;
 use paro_transaction::TableId;
@@ -58,6 +58,15 @@ impl SearchMemoryAccountant for QueryMemoryPool {
             bytes,
         );
         MemoryOwner::release_capacity(self, MemoryDomain::Host, bytes);
+    }
+}
+
+#[derive(Debug)]
+struct QuerySearchCancellation(paro_context::StatementCancellation);
+
+impl SearchCancellation for QuerySearchCancellation {
+    fn check(&self) -> Result<()> {
+        self.0.check()
     }
 }
 
@@ -253,15 +262,15 @@ fn create_search_driver(
         row_limit: row_limit_hint.max(1).min(1024),
         preferred_bytes: 1 << 20,
     };
-    let budget = ResourceBudget {
-        memory_limit_bytes: ctx.query.session.limits.max_memory.max(1),
-        heap_budget_items: heap_budget_items.max(1),
-        parallelism_slots: ctx.query.session.number_of_threads().max(1),
-        cpu_step_budget: None,
-        context: None,
-        memory_accountant: Some(ctx.query.memory.clone()),
-        memory_tracker: Default::default(),
-    };
+    let budget = ResourceBudget::managed(
+        heap_budget_items.max(1),
+        ctx.query.session.number_of_threads().max(1),
+        ctx.query.memory.clone(),
+    )
+    .with_work_controls(
+        None,
+        Arc::new(QuerySearchCancellation(ctx.query.cancellation.clone())),
+    );
     Ok(SearchOperatorDriver::new(
         table,
         opened,

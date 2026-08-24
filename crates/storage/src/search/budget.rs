@@ -33,43 +33,109 @@ pub trait SearchMemoryAccountant: Debug + Send + Sync {
     fn release(&self, bytes: usize);
 }
 
+pub trait SearchCancellation: Debug + Send + Sync {
+    fn check(&self) -> Result<()>;
+}
+
+#[derive(Debug, Default)]
+pub struct NoopSearchCancellation;
+
+impl SearchCancellation for NoopSearchCancellation {
+    fn check(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// Query-wide work control shared by every segment dispatch. It is deliberately
+/// independent of HNSW so sparse/full-text providers can adopt the same CPU
+/// and cancellation contract.
+#[derive(Debug)]
+pub struct SearchWorkBudget {
+    remaining_steps: Option<AtomicUsize>,
+    cancellation: Arc<dyn SearchCancellation>,
+}
+
+impl SearchWorkBudget {
+    fn new(cpu_step_budget: Option<usize>, cancellation: Arc<dyn SearchCancellation>) -> Self {
+        Self {
+            remaining_steps: cpu_step_budget.map(AtomicUsize::new),
+            cancellation,
+        }
+    }
+
+    pub fn check_and_consume(&self, steps: usize) -> Result<()> {
+        self.cancellation.check()?;
+        self.consume(steps)
+    }
+
+    /// Charge work after a nearby cancellation check. Hot graph loops use
+    /// this to account every inspected edge without repeating the atomic
+    /// cancellation read for the same bounded adjacency list.
+    pub fn consume(&self, steps: usize) -> Result<()> {
+        let Some(remaining) = &self.remaining_steps else {
+            return Ok(());
+        };
+        remaining
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                current.checked_sub(steps)
+            })
+            .map(|_| ())
+            .map_err(|_| {
+                paro_error::configuration_limit_exceeded(
+                    "search CPU step budget exceeded during provider traversal",
+                )
+            })
+    }
+}
+
 /// RAII logical charge for provider-owned memory allocated outside Paro's
 /// typed vectors. Dropping the search working set releases the query grant.
 #[derive(Debug)]
 pub struct SearchMemoryReservation {
-    tracker: Arc<SearchMemoryTracker>,
-    accountant: Option<Arc<dyn SearchMemoryAccountant>>,
+    accountant: Arc<dyn SearchMemoryAccountant>,
     bytes: usize,
 }
 
 impl Drop for SearchMemoryReservation {
     fn drop(&mut self) {
-        if let Some(accountant) = &self.accountant {
-            accountant.release(self.bytes);
-        }
-        self.tracker.release(self.bytes);
+        self.accountant.release(self.bytes);
     }
 }
 
-/// Query-local retained-memory ledger shared by every clone of a resource
-/// budget. Providers reserve through [`ResourceBudget::try_reserve_memory`];
-/// callers never need a second ad-hoc atomic or a separate interpretation of
-/// the limit.
-#[derive(Debug, Default)]
-pub struct SearchMemoryTracker {
+/// Standalone retained-memory ledger used by embedded and test callers that do
+/// not own the engine's query memory pool.
+#[derive(Debug)]
+pub struct BoundedSearchMemoryAccountant {
     retained: AtomicUsize,
+    limit: usize,
 }
 
-impl SearchMemoryTracker {
-    fn try_reserve(&self, bytes: usize, limit: usize) -> Result<()> {
+impl BoundedSearchMemoryAccountant {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            retained: AtomicUsize::new(0),
+            limit,
+        }
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.retained.load(Ordering::Acquire)
+    }
+}
+
+impl SearchMemoryAccountant for BoundedSearchMemoryAccountant {
+    fn try_reserve(&self, bytes: usize) -> Result<()> {
         self.retained
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
-                current.checked_add(bytes).filter(|next| *next <= limit)
+                current
+                    .checked_add(bytes)
+                    .filter(|next| *next <= self.limit)
             })
             .map(|_| ())
             .map_err(|_| {
                 paro_error::out_of_memory(format!(
-                    "search working set exceeds query budget of {limit} bytes"
+                    "search working set exceeds query budget of {} bytes",
+                    self.limit
                 ))
             })
     }
@@ -78,37 +144,64 @@ impl SearchMemoryTracker {
         let previous = self.retained.fetch_sub(bytes, Ordering::AcqRel);
         debug_assert!(previous >= bytes, "search memory reservation underflow");
     }
-
-    pub fn retained_bytes(&self) -> usize {
-        self.retained.load(Ordering::Acquire)
-    }
 }
 
 #[derive(Debug, Clone)]
 pub struct ResourceBudget {
-    pub memory_limit_bytes: usize,
     pub heap_budget_items: usize,
     pub parallelism_slots: usize,
-    pub cpu_step_budget: Option<usize>,
     pub context: Option<ResourceContext>,
-    pub memory_accountant: Option<Arc<dyn SearchMemoryAccountant>>,
-    /// Shared local ledger enforcing `memory_limit_bytes`, including when no
-    /// engine-level memory accountant is installed.
-    pub memory_tracker: Arc<SearchMemoryTracker>,
+    pub memory_accountant: Arc<dyn SearchMemoryAccountant>,
+    pub work: Arc<SearchWorkBudget>,
 }
 
 impl ResourceBudget {
-    pub fn try_reserve_memory(&self, bytes: usize) -> Result<SearchMemoryReservation> {
-        self.memory_tracker
-            .try_reserve(bytes, self.memory_limit_bytes)?;
-        if let Some(accountant) = &self.memory_accountant {
-            if let Err(error) = accountant.try_reserve(bytes) {
-                self.memory_tracker.release(bytes);
-                return Err(error);
-            }
+    pub fn standalone(
+        memory_limit_bytes: usize,
+        heap_budget_items: usize,
+        parallelism_slots: usize,
+    ) -> Self {
+        Self {
+            heap_budget_items,
+            parallelism_slots,
+            context: None,
+            memory_accountant: Arc::new(BoundedSearchMemoryAccountant::new(memory_limit_bytes)),
+            work: Arc::new(SearchWorkBudget::new(
+                None,
+                Arc::new(NoopSearchCancellation),
+            )),
         }
+    }
+
+    pub fn managed(
+        heap_budget_items: usize,
+        parallelism_slots: usize,
+        memory_accountant: Arc<dyn SearchMemoryAccountant>,
+    ) -> Self {
+        Self {
+            heap_budget_items,
+            parallelism_slots,
+            context: None,
+            memory_accountant,
+            work: Arc::new(SearchWorkBudget::new(
+                None,
+                Arc::new(NoopSearchCancellation),
+            )),
+        }
+    }
+
+    pub fn with_work_controls(
+        mut self,
+        cpu_step_budget: Option<usize>,
+        cancellation: Arc<dyn SearchCancellation>,
+    ) -> Self {
+        self.work = Arc::new(SearchWorkBudget::new(cpu_step_budget, cancellation));
+        self
+    }
+
+    pub fn try_reserve_memory(&self, bytes: usize) -> Result<SearchMemoryReservation> {
+        self.memory_accountant.try_reserve(bytes)?;
         Ok(SearchMemoryReservation {
-            tracker: self.memory_tracker.clone(),
             accountant: self.memory_accountant.clone(),
             bytes,
         })
@@ -117,15 +210,7 @@ impl ResourceBudget {
 
 impl Default for ResourceBudget {
     fn default() -> Self {
-        Self {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: 1024,
-            parallelism_slots: 1,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Arc::new(SearchMemoryTracker::default()),
-        }
+        Self::standalone(64 * 1024 * 1024, 1024, 1)
     }
 }
 
@@ -154,27 +239,34 @@ mod tests {
     fn reservation_releases_query_charge_on_drop() {
         let accountant = Arc::new(CountingAccountant::default());
         let budget = ResourceBudget {
-            memory_accountant: Some(accountant.clone()),
+            memory_accountant: accountant.clone(),
             ..ResourceBudget::default()
         };
         {
             let _reservation = budget.try_reserve_memory(4096).unwrap();
             assert_eq!(accountant.retained.load(Ordering::Acquire), 4096);
-            assert_eq!(budget.memory_tracker.retained_bytes(), 4096);
         }
         assert_eq!(accountant.retained.load(Ordering::Acquire), 0);
-        assert_eq!(budget.memory_tracker.retained_bytes(), 0);
     }
 
     #[test]
     fn reservation_enforces_local_limit_without_accountant() {
-        let budget = ResourceBudget {
-            memory_limit_bytes: 4096,
-            ..ResourceBudget::default()
-        };
+        let accountant = Arc::new(BoundedSearchMemoryAccountant::new(4096));
+        let budget = ResourceBudget::managed(1024, 1, accountant.clone());
         let reservation = budget.try_reserve_memory(4096).unwrap();
         assert!(budget.try_reserve_memory(1).is_err());
         drop(reservation);
+        assert_eq!(accountant.retained_bytes(), 0);
         assert!(budget.try_reserve_memory(4096).is_ok());
+    }
+
+    #[test]
+    fn cpu_steps_are_shared_by_every_clone_of_the_query_budget() {
+        let budget =
+            ResourceBudget::default().with_work_controls(Some(2), Arc::new(NoopSearchCancellation));
+        let clone = budget.clone();
+        budget.work.check_and_consume(1).unwrap();
+        clone.work.check_and_consume(1).unwrap();
+        assert!(budget.work.check_and_consume(1).is_err());
     }
 }

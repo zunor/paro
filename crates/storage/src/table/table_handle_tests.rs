@@ -343,15 +343,11 @@ fn drain_search_cursor(
         row_limit: row_limit.max(1),
         preferred_bytes: 1 << 20,
     };
-    let mut budget = ResourceBudget {
-        memory_limit_bytes: 64 * 1024 * 1024,
-        heap_budget_items: row_limit.max(1024),
-        parallelism_slots: parallelism_slots.max(1),
-        cpu_step_budget: None,
-        context: None,
-        memory_accountant: None,
-        memory_tracker: Default::default(),
-    };
+    let mut budget = ResourceBudget::standalone(
+        64 * 1024 * 1024,
+        row_limit.max(1024),
+        parallelism_slots.max(1),
+    );
 
     loop {
         match cursor.next_batch(&batch_config, &mut budget)? {
@@ -2150,7 +2146,7 @@ fn art_index_build_and_remove_tracks_visible_segments() {
         .iter()
         .all(|(_, segment)| segment.art_index(0).is_none()));
 
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
     assert_eq!(table.declared_art_columns(), vec![0]);
     assert_eq!(table.tablet().declared_art_columns(), vec![0]);
     table.rebuild_art_index(0).unwrap();
@@ -2163,8 +2159,7 @@ fn art_index_build_and_remove_tracks_visible_segments() {
         .iter()
         .all(|(_, segment)| segment.bitmap_index(0).is_some()));
 
-    table.drop_art_index(0).unwrap();
-    table.forget_art_index(0);
+    table.release_art_index("test_idx", 0).unwrap();
     assert!(table.declared_art_columns().is_empty());
     assert!(table.tablet().declared_art_columns().is_empty());
 
@@ -2178,9 +2173,42 @@ fn art_index_build_and_remove_tracks_visible_segments() {
 }
 
 #[test]
+fn duplicate_art_declarations_release_only_the_last_physical_owner() {
+    let table = create_table(&[LogicalType::Integer]);
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&[
+            1, 2, 3, 4,
+        ])]))
+        .unwrap();
+
+    table.install_art_index("idx_a", 0).unwrap();
+    table.install_art_index("idx_a", 0).unwrap();
+    table.install_art_index("idx_b", 0).unwrap();
+    table.release_art_index("idx_a", 0).unwrap();
+
+    assert!(table.has_declared_art_index(0));
+    assert!(table
+        .collect_segments(table.max_version())
+        .unwrap()
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_some()));
+
+    // A retry for the same owner is idempotent and cannot consume idx_b.
+    table.release_art_index("idx_a", 0).unwrap();
+    assert!(table.has_declared_art_index(0));
+    table.release_art_index("idx_b", 0).unwrap();
+    assert!(!table.has_declared_art_index(0));
+    assert!(table
+        .collect_segments(table.max_version())
+        .unwrap()
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_none()));
+}
+
+#[test]
 fn art_declared_index_auto_builds_for_inserts() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     table.append(&chunk_with_i32_range(0, 4, 100)).unwrap();
     table.append(&chunk_with_i32_range(10, 14, 100)).unwrap();
@@ -2243,7 +2271,7 @@ fn runtime_art_predicate_returns_all_duplicate_matches() {
         LogicalType::Integer,
         LogicalType::Integer,
     ]);
-    table.declare_art_index(1);
+    table.declare_art_index("test_idx", 1);
 
     let chunk = test_chunk_from_vectors(vec![
         test_i32_vector(&[1, 2, 3, 4]),
@@ -2306,7 +2334,7 @@ fn runtime_art_predicate_returns_all_duplicate_matches() {
 #[test]
 fn art_declared_index_auto_builds_on_transaction_commit() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     let txn = Arc::new(Transaction::new(9101, 9101));
     table
@@ -2378,7 +2406,7 @@ fn art_declared_index_auto_builds_on_transaction_commit() {
 #[test]
 fn art_backfill_failure_does_not_block_insert_or_scan_fallback() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(99);
+    table.declare_art_index("test_idx", 99);
 
     table.append(&chunk_with_i32_range(0, 4, 100)).unwrap();
 
@@ -3350,7 +3378,7 @@ fn fulltext_update_delete_respect_delete_bitmap() {
 #[test]
 fn art_compaction_rebuild_preserves_predicate_results() {
     let table = create_table(&[LogicalType::Integer, LogicalType::Integer]);
-    table.declare_art_index(0);
+    table.declare_art_index("test_idx", 0);
 
     table.append(&chunk_with_i32_range(1, 3, 100)).unwrap();
     table.append(&chunk_with_i32_range(3, 6, 100)).unwrap();

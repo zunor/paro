@@ -58,6 +58,13 @@ impl<T: Ord> FixedLengthPriorityQueue<T> {
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
+
+    /// Whether the queue has observed enough competitive elements to fill its
+    /// retained window. Adaptive callers must use this signal instead of
+    /// comparing a requested headroom larger than the queue's capacity.
+    pub fn is_full(&self) -> bool {
+        self.heap.len() == self.capacity
+    }
 }
 
 /// Search context for HNSW search.

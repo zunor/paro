@@ -84,6 +84,14 @@ impl SegmentPredicateIndexes {
             .and_then(|guard| guard.get(&column_id).map(|paths| Arc::clone(&paths.art)))
     }
 
+    fn has_complete_scalar_index(&self, column_id: ColumnId, segment_rows: u64) -> bool {
+        self.runtime_scalar_indexes.read().is_ok_and(|guard| {
+            guard
+                .get(&column_id)
+                .is_some_and(|paths| paths.completeness.covers(segment_rows))
+        })
+    }
+
     pub(crate) fn predicate_indexes(
         &self,
         segment_rows: u64,
@@ -374,6 +382,12 @@ impl Segment {
     /// Get runtime ART index for a column.
     pub fn art_index(&self, column_id: ColumnId) -> Option<Arc<ART>> {
         self.indexes.predicate.art_index(column_id)
+    }
+
+    pub(crate) fn has_complete_scalar_index(&self, column_id: ColumnId) -> bool {
+        self.indexes
+            .predicate
+            .has_complete_scalar_index(column_id, self.num_rows())
     }
 
     /// Atomically publish every physical representation of one complete

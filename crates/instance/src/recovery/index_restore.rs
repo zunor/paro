@@ -166,12 +166,11 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
             let column_id = column_id.index;
 
             if index.build_state() == IndexBuildState::Failed {
-                storage.forget_art_index(column_id);
-                let _ = storage.drop_art_index(column_id);
+                let _ = storage.release_art_index(&index.base.base.name, column_id);
                 continue;
             }
 
-            if let Err(err) = storage.install_art_index(column_id) {
+            if let Err(err) = storage.install_art_index(&index.base.base.name, column_id) {
                 index.mark_failed(Some(format!("ART runtime restore failed: {}", err)));
                 continue;
             }
@@ -181,8 +180,7 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
                     index.mark_ready_with_coverage(Some(coverage));
                 }
                 Ok(coverage) => {
-                    storage.forget_art_index(column_id);
-                    let _ = storage.drop_art_index(column_id);
+                    let _ = storage.release_art_index(&index.base.base.name, column_id);
                     index.mark_failed(Some(format!(
                         "ART coverage incomplete after recovery: indexed={}/visible={} (version={})",
                         coverage.indexed_segment_count,
@@ -191,8 +189,7 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
                     )));
                 }
                 Err(err) => {
-                    storage.forget_art_index(column_id);
-                    let _ = storage.drop_art_index(column_id);
+                    let _ = storage.release_art_index(&index.base.base.name, column_id);
                     index.mark_failed(Some(format!("ART coverage validation failed: {}", err)));
                 }
             }

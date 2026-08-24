@@ -14,6 +14,8 @@ use super::types::{
 };
 use super::visited_pool::VisitedPool;
 use super::VectorScorer;
+use crate::search::SearchWorkBudget;
+use paro_common::error::Result;
 use rand::{thread_rng, Rng};
 use roaring::RoaringBitmap;
 
@@ -32,6 +34,25 @@ pub struct GraphLayers {
 pub(crate) struct GraphSearchResult {
     pub(crate) points: Vec<ScoredPoint>,
     pub(crate) predicate_refined: bool,
+}
+
+fn should_refine_predicate(
+    top: usize,
+    admission_capacity: usize,
+    admission_count: usize,
+    admission_window_full: bool,
+    top_k_floor_score: Option<f32>,
+    phase_one_floor: f32,
+) -> bool {
+    if admission_count == 0 {
+        return false;
+    }
+    let required = usize::try_from(required_filtered_admissions(top))
+        .unwrap_or(usize::MAX)
+        .min(admission_capacity);
+    let enough_admissions = admission_window_full || admission_count >= required;
+    let top_k_is_local = top_k_floor_score.is_some_and(|score| score >= phase_one_floor);
+    !enough_admissions || !top_k_is_local
 }
 
 impl GraphLayers {
@@ -58,22 +79,23 @@ impl GraphLayers {
         scorer: &mut VectorScorer<'_>,
         filter_bitmap: Option<&RoaringBitmap>,
         random_entry_point: bool,
-    ) -> GraphSearchResult {
+        work: &SearchWorkBudget,
+    ) -> Result<GraphSearchResult> {
         if top == 0 {
-            return GraphSearchResult {
+            return Ok(GraphSearchResult {
                 points: Vec::new(),
                 predicate_refined: false,
-            };
+            });
         }
 
         let Some(entry_point) = self.select_entry_point(random_entry_point) else {
-            return GraphSearchResult {
+            return Ok(GraphSearchResult {
                 points: Vec::new(),
                 predicate_refined: false,
-            };
+            });
         };
 
-        self.search_from_entry_point(entry_point, top, ef, algorithm, scorer, filter_bitmap)
+        self.search_from_entry_point(entry_point, top, ef, algorithm, scorer, filter_bitmap, work)
     }
 
     /// Batched search entry point for multiple queries sharing one filter bitmap.
@@ -85,17 +107,18 @@ impl GraphLayers {
         scorers: &mut [VectorScorer<'_>],
         filter_bitmap: Option<&RoaringBitmap>,
         random_entry_point: bool,
-    ) -> Vec<GraphSearchResult> {
+        work: &SearchWorkBudget,
+    ) -> Result<Vec<GraphSearchResult>> {
         if scorers.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if top == 0 {
-            return (0..scorers.len())
+            return Ok((0..scorers.len())
                 .map(|_| GraphSearchResult {
                     points: Vec::new(),
                     predicate_refined: false,
                 })
-                .collect();
+                .collect());
         }
 
         let mut rng = thread_rng();
@@ -112,7 +135,8 @@ impl GraphLayers {
                     algorithm,
                     scorer,
                     filter_bitmap,
-                )),
+                    work,
+                )?),
                 None => results.push(GraphSearchResult {
                     points: Vec::new(),
                     predicate_refined: false,
@@ -120,7 +144,7 @@ impl GraphLayers {
             }
         }
 
-        results
+        Ok(results)
     }
 
     fn select_entry_point(&self, random_entry_point: bool) -> Option<EntryPoint> {
@@ -156,10 +180,14 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
         filter_bitmap: Option<&RoaringBitmap>,
-    ) -> GraphSearchResult {
-        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer);
+        work: &SearchWorkBudget,
+    ) -> Result<GraphSearchResult> {
+        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, work)?;
         let (mut points, predicate_refined) = match algorithm {
-            SearchAlgorithm::Hnsw => (self.search_on_level(zero_level_entry, ef, scorer), false),
+            SearchAlgorithm::Hnsw => (
+                self.search_on_level(zero_level_entry, ef, scorer, work)?,
+                false,
+            ),
             SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => self
                 .search_masked_topk(
                     zero_level_entry,
@@ -168,13 +196,14 @@ impl GraphLayers {
                     scorer,
                     filter_bitmap,
                     algorithm == SearchAlgorithm::AdaptiveFilteredTopK,
-                ),
+                    work,
+                )?,
         };
         points.truncate(top);
-        GraphSearchResult {
+        Ok(GraphSearchResult {
             points,
             predicate_refined,
-        }
+        })
     }
 
     /// Greedy descent from the selected entry point to level 0 for one query.
@@ -182,7 +211,8 @@ impl GraphLayers {
         &self,
         entry_point: EntryPoint,
         scorer: &mut VectorScorer<'_>,
-    ) -> ScoredPoint {
+        work: &SearchWorkBudget,
+    ) -> Result<ScoredPoint> {
         let mut current_point = entry_point.point_id;
         let mut current_score = scorer.score_point(current_point);
         let mut current_level = entry_point.level;
@@ -191,12 +221,14 @@ impl GraphLayers {
         while current_level > 0 {
             let mut changed = true;
             while changed {
+                work.check_and_consume(1)?;
                 changed = false;
                 links.clear();
                 self.links
                     .for_each_link(current_point, current_level, |neighbor| {
                         links.push(neighbor);
                     });
+                work.consume(links.len())?;
 
                 for scored in
                     scorer.score_points(&mut links, None, self.hnsw_m.get_m(current_level))
@@ -211,10 +243,10 @@ impl GraphLayers {
             current_level -= 1;
         }
 
-        ScoredPoint {
+        Ok(ScoredPoint {
             idx: current_point,
             score: current_score,
-        }
+        })
     }
 
     /// Standard connected HNSW search on one level. Admission filters are
@@ -224,7 +256,8 @@ impl GraphLayers {
         entry_point: ScoredPoint,
         ef: usize,
         scorer: &mut VectorScorer,
-    ) -> Vec<ScoredPoint> {
+        work: &SearchWorkBudget,
+    ) -> Result<Vec<ScoredPoint>> {
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
         let mut neighbors: Vec<PointOffset> = Vec::new();
@@ -232,6 +265,7 @@ impl GraphLayers {
         visited.check_and_update_visited(entry_point.idx);
 
         while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
@@ -242,13 +276,14 @@ impl GraphLayers {
                     neighbors.push(neighbor);
                 }
             });
+            work.consume(neighbors.len())?;
 
             for sp in scorer.score_points_unfiltered(&neighbors) {
                 context.process_candidate(sp);
             }
         }
 
-        context.nearest.into_sorted_vec()
+        Ok(context.nearest.into_sorted_vec())
     }
 
     /// Navigate the ordinary graph exactly as an unfiltered query while
@@ -263,7 +298,8 @@ impl GraphLayers {
         scorer: &mut VectorScorer,
         filter_bitmap: Option<&RoaringBitmap>,
         adaptive_predicate_refinement: bool,
-    ) -> (Vec<ScoredPoint>, bool) {
+        work: &SearchWorkBudget,
+    ) -> Result<(Vec<ScoredPoint>, bool)> {
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, ef);
         // Preserve up to `ef` already-scored matching candidates as diverse
@@ -276,6 +312,7 @@ impl GraphLayers {
         }
 
         while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
@@ -286,6 +323,7 @@ impl GraphLayers {
                     neighbors.push(neighbor);
                 }
             });
+            work.consume(neighbors.len())?;
 
             for point in scorer.score_points_unfiltered(&neighbors) {
                 if filter_bitmap.is_none_or(|bitmap| bitmap.contains(point.idx)) {
@@ -295,48 +333,71 @@ impl GraphLayers {
             }
         }
 
+        let filtered_window_full = filtered.is_full();
+        let phase_one_floor = context.lower_bound();
         let seeds = filtered.into_sorted_vec();
-        let required = usize::try_from(required_filtered_admissions(top)).unwrap_or(usize::MAX);
-        if !adaptive_predicate_refinement || seeds.len() >= required {
-            return (seeds, false);
+        // Quantity and locality answer different questions. A full admission
+        // window proves phase one found enough predicate rows even when K is
+        // close to ef. Requiring the Kth predicate row to be inside the final
+        // unfiltered beam catches geometry/predicate anti-correlation: one
+        // nearby match plus K-1 distant matches must not suppress refinement.
+        let should_refine = should_refine_predicate(
+            top,
+            ef.max(top),
+            seeds.len(),
+            filtered_window_full,
+            seeds
+                .get(top.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .map(|point| point.score),
+            phase_one_floor,
+        );
+        if !adaptive_predicate_refinement || !should_refine {
+            return Ok((seeds, false));
         }
 
         let Some(filter_bitmap) = filter_bitmap else {
-            return (seeds, false);
+            return Ok((seeds, false));
         };
         let Some((&first, remaining)) = seeds.split_first() else {
-            return (Vec::new(), true);
+            // No refinement was executed. The caller observes underfill and
+            // performs the exact bitmap fallback.
+            return Ok((Vec::new(), false));
         };
 
         // Phase one already scored every point in `visited`. A matching point
         // omitted from the `ef` seeds cannot improve their Top-K, so retaining
         // those marks avoids duplicate distance work without reducing the
-        // reachable result frontier. Non-matching bridge nodes use a separate
-        // sparse set: they must remain eligible for two-hop expansion even if
-        // ordinary HNSW navigation scored them in phase one.
+        // reachable result frontier. Non-matching bridge nodes use a second
+        // pooled dense generation set: refinement happens when non-matches are
+        // common, so a fresh Roaring bitmap is both the wrong density and an
+        // ungoverned per-query allocation.
         let mut context = SearchContext::new(first, ef);
         for &seed in remaining {
             context.process_candidate(seed);
         }
-        let mut bridge_visited = RoaringBitmap::new();
+        let mut bridge_visited = self.visited_pool.get(self.links.num_points());
         let mut matching_neighbors = Vec::new();
         let mut bridge_neighbors = Vec::new();
 
         while let Some(candidate) = context.candidates.pop() {
+            work.check_and_consume(1)?;
             if candidate.score < context.lower_bound() && context.nearest.len() >= ef {
                 break;
             }
             matching_neighbors.clear();
             bridge_neighbors.clear();
+            let mut inspected_edges = 0usize;
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
+                inspected_edges = inspected_edges.saturating_add(1);
                 if filter_bitmap.contains(neighbor) {
                     if !visited.check_and_update_visited(neighbor) {
                         matching_neighbors.push(neighbor);
                     }
-                } else if bridge_visited.insert(neighbor) {
+                } else if !bridge_visited.check_and_update_visited(neighbor) {
                     bridge_neighbors.push(neighbor);
                 }
             });
+            work.consume(inspected_edges)?;
 
             // ACORN-1-style bridge expansion: non-matching direct neighbors
             // are never scored or admitted, but their matching neighbors can
@@ -344,8 +405,11 @@ impl GraphLayers {
             // is below one. Each bridge contributes at most M0 new candidates.
             let hop_limit = self.hnsw_m.get_m(0);
             for bridge in bridge_neighbors.iter().copied() {
+                work.check_and_consume(1)?;
                 let limit = matching_neighbors.len().saturating_add(hop_limit);
+                let mut bridge_edges = 0usize;
                 self.links.for_each_link(bridge, 0, |neighbor| {
+                    bridge_edges = bridge_edges.saturating_add(1);
                     if matching_neighbors.len() < limit
                         && filter_bitmap.contains(neighbor)
                         && !visited.check_and_update_visited(neighbor)
@@ -353,14 +417,16 @@ impl GraphLayers {
                         matching_neighbors.push(neighbor);
                     }
                 });
+                work.consume(bridge_edges)?;
             }
 
+            work.consume(matching_neighbors.len())?;
             for point in scorer.score_points_unfiltered(&matching_neighbors) {
                 context.process_candidate(point);
             }
         }
 
-        (context.nearest.into_sorted_vec(), true)
+        Ok((context.nearest.into_sorted_vec(), true))
     }
 
     pub fn num_points(&self) -> usize {
@@ -459,5 +525,24 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert!(actual.windows(2).any(|pair| pair[0] != pair[1]));
+    }
+
+    #[test]
+    fn adaptive_refinement_respects_a_full_admission_window_when_k_reaches_ef() {
+        assert!(!should_refine_predicate(67, 100, 100, true, Some(1.0), 0.5,));
+        assert!(!should_refine_predicate(
+            100,
+            100,
+            100,
+            true,
+            Some(1.0),
+            0.5,
+        ));
+    }
+
+    #[test]
+    fn adaptive_refinement_uses_locality_as_well_as_admission_count() {
+        assert!(should_refine_predicate(10, 160, 20, false, Some(0.4), 0.5,));
+        assert!(!should_refine_predicate(10, 160, 0, false, None, 0.5));
     }
 }

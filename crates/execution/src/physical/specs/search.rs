@@ -99,21 +99,14 @@ impl fmt::Display for SearchPredicateTemplate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchFilterContract {
     None,
-    ExactSegmentBitmapNoResidual {
-        materialization: ExactBitmapMaterialization,
-    },
+    ExactSegmentBitmapNoResidual,
 }
 
 impl SearchFilterContract {
     /// Construct the proof only after lowering has established that no
     /// residual filter remains above the search source.
-    pub fn exact_no_residual(
-        predicate: Option<&SearchPredicateTemplate>,
-        materialization: ExactBitmapMaterialization,
-    ) -> Self {
-        predicate.map_or(Self::None, |_| Self::ExactSegmentBitmapNoResidual {
-            materialization,
-        })
+    pub fn exact_no_residual(predicate: Option<&SearchPredicateTemplate>) -> Self {
+        predicate.map_or(Self::None, |_| Self::ExactSegmentBitmapNoResidual)
     }
 }
 
@@ -133,6 +126,7 @@ pub struct VectorSearchSpec {
     pub avg_level0_degree: f32,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
+    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
     /// Cardinality estimate used to explain the provider's expected filtered
     /// exact-vs-graph strategy. Execution always decides from the exact bitmap.
     pub estimated_filter_rows: Option<u64>,
@@ -152,6 +146,7 @@ pub struct SparseVectorSearchSpec {
     pub k: usize,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
+    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,
@@ -171,6 +166,7 @@ pub struct FullTextSearchSpec {
     pub mode: SearchRequestMode,
     pub predicate: Option<SearchPredicateTemplate>,
     pub filter_contract: SearchFilterContract,
+    pub bitmap_materialization: Option<ExactBitmapMaterialization>,
     pub projected_columns: Box<[usize]>,
     pub emit_score: bool,
     pub output_names: Box<[String]>,

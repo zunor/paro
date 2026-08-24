@@ -1597,6 +1597,7 @@ fn arena_generator_lowers_search_scan_with_planned_token() {
                 token: token.clone(),
                 kind: paro_storage::search::SearchIndexKind::FullText,
                 estimated_cost: None,
+                exact_bitmap_materialization: None,
             },
             confidence: paro_planner::operator::Confidence::High,
         },

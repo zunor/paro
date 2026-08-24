@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::index::hnsw::{HnswSearchOutcome, HnswSearchPath};
 use crate::search::{SearchIndexKind, SEARCH_BUILD_LATENCY_BUCKETS_US, SEARCH_LATENCY_BUCKETS_US};
 
 pub const SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT: usize = SEARCH_LATENCY_BUCKETS_US.len() + 1;
@@ -408,6 +409,13 @@ pub struct StorageMetricsSnapshot {
     pub search_row_fetch_latency_us_total: u64,
     pub search_row_fetch_latency_us_buckets: [u64; SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT],
     pub search_row_fetch_by_key: Vec<SearchRowFetchMetricsByKey>,
+    pub search_hnsw_scored_points_total: u64,
+    pub search_hnsw_exact_segment_searches_total: u64,
+    pub search_hnsw_unfiltered_graph_segment_searches_total: u64,
+    pub search_hnsw_masked_graph_segment_searches_total: u64,
+    pub search_hnsw_adaptive_graph_segment_searches_total: u64,
+    pub search_hnsw_predicate_refined_segment_searches_total: u64,
+    pub search_hnsw_exact_fallback_segment_searches_total: u64,
     pub column_read_by_rowids_page_run_seeks_total: u64,
     pub txn_spill_bytes: u64,
     pub txn_spill_artifacts: u64,
@@ -511,6 +519,13 @@ pub struct StorageMetrics {
     search_row_fetch_latency_us_total: AtomicU64,
     search_row_fetch_latency_us_buckets: [AtomicU64; SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT],
     search_row_fetch_by_key: Mutex<BTreeMap<SearchRowFetchMetricKey, SearchRowFetchMetricCounters>>,
+    search_hnsw_scored_points_total: AtomicU64,
+    search_hnsw_exact_segment_searches_total: AtomicU64,
+    search_hnsw_unfiltered_graph_segment_searches_total: AtomicU64,
+    search_hnsw_masked_graph_segment_searches_total: AtomicU64,
+    search_hnsw_adaptive_graph_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_refined_segment_searches_total: AtomicU64,
+    search_hnsw_exact_fallback_segment_searches_total: AtomicU64,
     column_read_by_rowids_page_run_seeks_total: AtomicU64,
     txn_spill_bytes: AtomicU64,
     txn_spill_artifacts: AtomicU64,
@@ -1160,6 +1175,33 @@ impl StorageMetrics {
             );
     }
 
+    /// Record the path actually executed by one HNSW segment search. These
+    /// counters are runtime evidence exposed through `paro_search_metrics()`;
+    /// they deliberately do not reuse EXPLAIN's planning-time estimate.
+    pub fn record_search_hnsw_work(&self, scored_points: u64, outcome: HnswSearchOutcome) {
+        self.search_hnsw_scored_points_total
+            .fetch_add(scored_points, Ordering::Relaxed);
+        match outcome.path {
+            HnswSearchPath::ExactScan => &self.search_hnsw_exact_segment_searches_total,
+            HnswSearchPath::UnfilteredGraph => {
+                &self.search_hnsw_unfiltered_graph_segment_searches_total
+            }
+            HnswSearchPath::MaskedGraph => &self.search_hnsw_masked_graph_segment_searches_total,
+            HnswSearchPath::AdaptiveGraph => {
+                &self.search_hnsw_adaptive_graph_segment_searches_total
+            }
+        }
+        .fetch_add(1, Ordering::Relaxed);
+        if outcome.predicate_refined {
+            self.search_hnsw_predicate_refined_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.exact_fallback {
+            self.search_hnsw_exact_fallback_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Record page-local span seeks performed by the column-layer random rowid path.
     pub fn add_column_read_by_rowids_page_run_seeks(&self, delta: usize) {
         add_usize_counter(&self.column_read_by_rowids_page_run_seeks_total, delta);
@@ -1406,6 +1448,27 @@ impl StorageMetrics {
                 .load(Ordering::Relaxed),
             search_row_fetch_latency_us_buckets,
             search_row_fetch_by_key,
+            search_hnsw_scored_points_total: self
+                .search_hnsw_scored_points_total
+                .load(Ordering::Relaxed),
+            search_hnsw_exact_segment_searches_total: self
+                .search_hnsw_exact_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_unfiltered_graph_segment_searches_total: self
+                .search_hnsw_unfiltered_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_masked_graph_segment_searches_total: self
+                .search_hnsw_masked_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_adaptive_graph_segment_searches_total: self
+                .search_hnsw_adaptive_graph_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_predicate_refined_segment_searches_total: self
+                .search_hnsw_predicate_refined_segment_searches_total
+                .load(Ordering::Relaxed),
+            search_hnsw_exact_fallback_segment_searches_total: self
+                .search_hnsw_exact_fallback_segment_searches_total
+                .load(Ordering::Relaxed),
             column_read_by_rowids_page_run_seeks_total: self
                 .column_read_by_rowids_page_run_seeks_total
                 .load(Ordering::Relaxed),
@@ -1537,6 +1600,20 @@ impl StorageMetrics {
             .lock()
             .expect("search row fetch metrics lock poisoned")
             .clear();
+        self.search_hnsw_scored_points_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_exact_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_unfiltered_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_masked_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_adaptive_graph_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_refined_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_exact_fallback_segment_searches_total
+            .store(0, Ordering::Relaxed);
         self.column_read_by_rowids_page_run_seeks_total
             .store(0, Ordering::Relaxed);
         self.txn_spill_bytes.store(0, Ordering::Relaxed);
@@ -1653,6 +1730,12 @@ mod tests {
             provider: SearchIndexKind::FullText,
         };
         m.record_search_row_fetch(row_fetch_key, 3, 2, 1, 2, 1, 1, 96, 4, 7);
+        m.record_search_hnsw_work(
+            123,
+            HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph)
+                .with_predicate_refinement(true)
+                .with_exact_fallback(),
+        );
         m.add_column_read_by_rowids_page_run_seeks(3);
 
         let snap = m.snapshot();
@@ -1672,6 +1755,10 @@ mod tests {
         assert_eq!(snap.memtable_backpressure_count, 1);
         assert_eq!(snap.memtable_backpressure_ns, 30);
         assert_eq!(snap.delta_writer_commit_ns, 10);
+        assert_eq!(snap.search_hnsw_scored_points_total, 123);
+        assert_eq!(snap.search_hnsw_adaptive_graph_segment_searches_total, 1);
+        assert_eq!(snap.search_hnsw_predicate_refined_segment_searches_total, 1);
+        assert_eq!(snap.search_hnsw_exact_fallback_segment_searches_total, 1);
         assert_eq!(snap.delta_writer_commit_count, 1);
         assert_eq!(snap.delta_writer_flush_ns, 20);
         assert_eq!(snap.delta_writer_flush_count, 1);

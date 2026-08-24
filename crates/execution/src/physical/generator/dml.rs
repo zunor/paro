@@ -245,8 +245,7 @@ impl PhysicalPlanGenerator {
 
         // Residual predicates were rejected above, so this is the exact
         // segment-bitmap proof boundary for the search source.
-        let filter_contract =
-            super::scan::exact_search_filter_contract(table.as_ref(), predicate.as_ref());
+        let filter_contract = super::scan::exact_search_filter_contract(predicate.as_ref());
         let spec = FullTextSearchSpec {
             table,
             capability_token: candidate.token.clone(),
@@ -259,6 +258,7 @@ impl PhysicalPlanGenerator {
             mode: SearchRequestMode::Filter,
             predicate,
             filter_contract,
+            bitmap_materialization: candidate.exact_bitmap_materialization,
             projected_columns: (0..scan.get.returned_types.len())
                 .map(|output| {
                     scan.get.stored_column(output).ok_or_else(|| {

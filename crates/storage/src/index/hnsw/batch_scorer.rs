@@ -8,9 +8,17 @@
 use super::search_context::FixedLengthPriorityQueue;
 use super::types::{PointOffset, ScoredPoint};
 use super::VectorScorer;
+use crate::search::SearchWorkBudget;
+use paro_common::error::Result;
 use smallvec::SmallVec;
 
 pub const BATCH_SIZE: usize = 64;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatchScoredResult {
+    pub points: Vec<ScoredPoint>,
+    pub scored_points: u64,
+}
 
 /// Batch scorer for full-scan style search.
 pub struct BatchScorer<'a> {
@@ -35,19 +43,42 @@ impl<'a> BatchScorer<'a> {
         Self { scorers }
     }
 
-    pub fn scan<I>(mut self, point_ids: I) -> Vec<Vec<ScoredPoint>>
+    #[cfg(test)]
+    pub fn scan<I>(self, point_ids: I) -> Vec<Vec<ScoredPoint>>
+    where
+        I: IntoIterator<Item = PointOffset>,
+    {
+        let budget = crate::search::ResourceBudget::default();
+        self.scan_with_work(point_ids, budget.work.as_ref())
+            .expect("unlimited test work budget")
+            .into_iter()
+            .map(|result| result.points)
+            .collect()
+    }
+
+    pub fn scan_with_work<I>(
+        mut self,
+        point_ids: I,
+        work: &SearchWorkBudget,
+    ) -> Result<Vec<BatchScoredResult>>
     where
         I: IntoIterator<Item = PointOffset>,
     {
         if self.scorers.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         if self.scorers[0].top_k.capacity == 0 {
-            return vec![Vec::new(); self.scorers.len()];
+            return Ok((0..self.scorers.len())
+                .map(|_| BatchScoredResult {
+                    points: Vec::new(),
+                    scored_points: 0,
+                })
+                .collect());
         }
 
         let mut point_ids = point_ids.into_iter();
         let mut chunk = [0; BATCH_SIZE];
+        let mut scored_points = 0u64;
 
         loop {
             let mut chunk_len = 0usize;
@@ -63,7 +94,9 @@ impl<'a> BatchScorer<'a> {
                 break;
             }
 
+            work.check_and_consume(chunk_len.saturating_mul(self.scorers.len()))?;
             let points = &chunk[..chunk_len];
+            scored_points = scored_points.saturating_add(chunk_len as u64);
             for &idx in points {
                 let vector = self.scorers[0].scorer.vector_storage.get_vector(idx);
                 for scorer in &mut self.scorers {
@@ -73,10 +106,14 @@ impl<'a> BatchScorer<'a> {
             }
         }
 
-        self.scorers
+        Ok(self
+            .scorers
             .into_iter()
-            .map(|scorer| scorer.top_k.into_sorted_vec())
-            .collect()
+            .map(|scorer| BatchScoredResult {
+                points: scorer.top_k.into_sorted_vec(),
+                scored_points,
+            })
+            .collect())
     }
 }
 
@@ -160,5 +197,21 @@ mod tests {
             .collect::<Vec<_>>();
 
         assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn exact_batch_scan_obeys_the_shared_query_work_budget() {
+        let storage = Arc::new(InMemoryVectorStorage::new(vec![0.0; 32], 2));
+        let prepared = DistanceMetric::Euclidean.prepare(&[0.0, 0.0]);
+        let scorer = VectorScorer::new(&prepared, storage.as_ref()).unwrap();
+        let budget = crate::search::ResourceBudget::default().with_work_controls(
+            Some(8),
+            Arc::new(crate::search::budget::NoopSearchCancellation),
+        );
+
+        let error = BatchScorer::new(vec![scorer], 1)
+            .scan_with_work(0..storage.num_vectors() as u32, budget.work.as_ref())
+            .unwrap_err();
+        assert!(error.to_string().contains("CPU step budget"));
     }
 }

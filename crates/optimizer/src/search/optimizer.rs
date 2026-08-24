@@ -95,6 +95,8 @@ impl SearchOptimizer {
             &ctx.column_stats,
         );
         let filter_selectivity = estimate_selectivity(base_rows, filtered.expected);
+        let bitmap_materialization =
+            exact_bitmap_materialization(&candidate_filters, pattern.get, storage.as_ref());
         // A generic filtered Top-K must inspect the base rows before it knows
         // which vectors survive. Output cardinality is not scan work.
         let sequential = build_sequential_capability(table_id, base_rows);
@@ -126,7 +128,7 @@ impl SearchOptimizer {
                 filter_selectivity,
                 topn.hnsw_ef_hint,
                 search_policy,
-                exact_bitmap_materialization(&candidate_filters, pattern.get, storage.as_ref()),
+                bitmap_materialization,
             );
             let Some(request) =
                 build_topk_request(table_id, pattern.get, topn.limit, search_intent.clone())?
@@ -139,6 +141,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
+                bitmap_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -179,6 +182,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
+                bitmap_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential.clone()) else {
                 return Ok(None);
@@ -220,6 +224,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
+                bitmap_materialization,
             );
             let Some(decision) = select_search_decision(candidate, sequential) else {
                 return Ok(None);
@@ -266,6 +271,8 @@ impl SearchOptimizer {
 
             let base_rows = base_rows(filter.child.as_ref(), get);
             let candidate_filters = candidate_filters(&filter.expressions, get);
+            let bitmap_materialization =
+                exact_bitmap_materialization(&candidate_filters, get, storage.as_ref());
             let filtered = ctx.cost_model.estimate_filter_cardinality(
                 base_rows,
                 &candidate_filters,
@@ -282,6 +289,7 @@ impl SearchOptimizer {
                 estimated_cost,
                 filtered.expected,
                 base_rows,
+                bitmap_materialization,
             );
             let sequential = build_sequential_capability(table_id, base_rows);
             let Some(decision) = select_search_decision(candidate, sequential) else {
@@ -346,6 +354,7 @@ fn build_search_candidate(
     estimated_cost: f64,
     estimated_rows: u64,
     estimated_total_rows: u64,
+    exact_bitmap_materialization: Option<ExactBitmapMaterialization>,
 ) -> SearchCandidate {
     let estimated_cost = PlannedSearchCostEstimate::new(estimated_cost)
         .with_rows(estimated_rows)
@@ -355,6 +364,7 @@ fn build_search_candidate(
         token: capability.capability_token(),
         kind: capability.kind,
         estimated_cost: Some(estimated_cost),
+        exact_bitmap_materialization,
     }
 }
 
@@ -499,8 +509,8 @@ fn exact_bitmap_materialization(
         return None;
     }
 
-    let mut saw_stored_column = false;
-    let mut all_columns_indexed = true;
+    let mut stored_columns = Vec::new();
+    let mut has_unmapped_column = false;
     for filter in filters {
         ExpressionIterator::visit(filter, &mut |expression| {
             if let Expression::ColumnRef(column) = expression {
@@ -509,20 +519,34 @@ fn exact_bitmap_materialization(
                     .flatten();
                 match stored {
                     Some(column_id) => {
-                        saw_stored_column = true;
-                        all_columns_indexed &= storage.has_declared_art_index(column_id as u32);
+                        if !stored_columns.contains(&(column_id as u32)) {
+                            stored_columns.push(column_id as u32);
+                        }
                     }
-                    None => all_columns_indexed = false,
+                    None => has_unmapped_column = true,
                 }
             }
             ExpressionVisitDecision::Descend
         });
     }
 
-    Some(if saw_stored_column && all_columns_indexed {
+    if stored_columns.is_empty() || has_unmapped_column {
+        return Some(ExactBitmapMaterialization::ColumnScan);
+    }
+    let Ok((indexed_rows, total_rows)) =
+        storage.complete_scalar_index_row_coverage(&stored_columns)
+    else {
+        return Some(ExactBitmapMaterialization::ColumnScan);
+    };
+    Some(if total_rows > 0 && indexed_rows == total_rows {
         ExactBitmapMaterialization::ScalarIndex
-    } else {
+    } else if indexed_rows == 0 {
         ExactBitmapMaterialization::ColumnScan
+    } else {
+        ExactBitmapMaterialization::Mixed {
+            indexed_rows,
+            scanned_rows: total_rows.saturating_sub(indexed_rows),
+        }
     })
 }
 
@@ -1157,6 +1181,7 @@ mod tests {
                 },
                 kind: paro_storage::search::SearchIndexKind::Hnsw,
                 estimated_cost: Some(PlannedSearchCostEstimate::new(95.0)),
+                exact_bitmap_materialization: None,
             },
             build_sequential_capability(7, 100),
         );
@@ -1279,6 +1304,7 @@ mod tests {
                     },
                     kind: paro_storage::search::SearchIndexKind::FullText,
                     estimated_cost: Some(PlannedSearchCostEstimate::new(1.0)),
+                    exact_bitmap_materialization: None,
                 },
                 confidence: Confidence::High,
             },

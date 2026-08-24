@@ -97,6 +97,7 @@ impl SearchMetricDescriptor {
 }
 
 const PROVIDER: &[SearchMetricDimension] = &[SearchMetricDimension::Provider];
+const GLOBAL: &[SearchMetricDimension] = &[SearchMetricDimension::Global];
 const TABLE_PROVIDER: &[SearchMetricDimension] = &[
     SearchMetricDimension::Table,
     SearchMetricDimension::Provider,
@@ -119,6 +120,41 @@ const GLOBAL_CODEC: &[SearchMetricDimension] =
     &[SearchMetricDimension::Global, SearchMetricDimension::Codec];
 
 pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
+    SearchMetricDescriptor::counter(
+        "search_hnsw_scored_points_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_exact_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_unfiltered_graph_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_masked_graph_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_adaptive_graph_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_predicate_refined_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_exact_fallback_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
     SearchMetricDescriptor::counter(
         "search_inline_build_rows_total",
         SearchMetricUnit::Rows,

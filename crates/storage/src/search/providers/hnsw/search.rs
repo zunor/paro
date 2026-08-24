@@ -219,7 +219,8 @@ impl VectorSearchCursor {
                     (true, Some(bitmap)) => HnswSearchFilter::Predicate(bitmap),
                     (false, Some(bitmap)) => HnswSearchFilter::Visibility(bitmap),
                 };
-                let (rows, degraded) = self.search_segment(segment, search_strategy, filter)?;
+                let (rows, degraded) =
+                    self.search_segment(segment, search_strategy, filter, budget.work.as_ref())?;
                 let degraded_reason = degraded
                     .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))
                     .flatten();
@@ -335,6 +336,7 @@ impl VectorSearchCursor {
         visible_segment: &VisibleSegment,
         search_strategy: HnswSearchStrategy,
         filter: HnswSearchFilter<'_>,
+        work: &crate::search::SearchWorkBudget,
     ) -> Result<(Vec<RankedRow>, bool)> {
         if let Some(index) = visible_segment
             .segment
@@ -351,8 +353,10 @@ impl VectorSearchCursor {
                     filter,
                     &self.search_policy,
                     search_strategy,
+                    work,
                 )
-                .map(|rows| {
+                .map(|result| {
+                    let rows = result.points;
                     let ranked_rows = if self.snapshot.has_overlay_delete_vectors() {
                         rows.into_iter()
                             .filter_map(|point| {
@@ -402,10 +406,15 @@ impl VectorSearchCursor {
                     filter,
                     &self.search_policy,
                     search_strategy,
+                    work,
                 )
-                .map(|points| {
+                .map(|result| {
                     (
-                        hnsw_ranked_rows_from_points(&self.snapshot, visible_segment, points),
+                        hnsw_ranked_rows_from_points(
+                            &self.snapshot,
+                            visible_segment,
+                            result.points,
+                        ),
                         false,
                     )
                 });

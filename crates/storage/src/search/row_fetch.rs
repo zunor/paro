@@ -1055,15 +1055,7 @@ mod tests {
             .expect("open vector cursor");
         let mut cursor = opened.cursor;
         let snapshot = opened.snapshot;
-        let mut budget = ResourceBudget {
-            memory_limit_bytes: 64 * 1024 * 1024,
-            heap_budget_items: 1024,
-            parallelism_slots: 1,
-            cpu_step_budget: None,
-            context: None,
-            memory_accountant: None,
-            memory_tracker: Default::default(),
-        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 1024, 1);
         let candidates = loop {
             match cursor
                 .next_batch(

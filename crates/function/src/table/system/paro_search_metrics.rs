@@ -289,6 +289,38 @@ fn collect_search_metric_data() -> Vec<SearchMetricData> {
 
 fn search_metric_data_from_snapshot(snapshot: &StorageMetricsSnapshot) -> Vec<SearchMetricData> {
     let mut entries = Vec::new();
+    for (name, value) in [
+        (
+            "search_hnsw_scored_points_total",
+            snapshot.search_hnsw_scored_points_total,
+        ),
+        (
+            "search_hnsw_exact_segment_searches_total",
+            snapshot.search_hnsw_exact_segment_searches_total,
+        ),
+        (
+            "search_hnsw_unfiltered_graph_segment_searches_total",
+            snapshot.search_hnsw_unfiltered_graph_segment_searches_total,
+        ),
+        (
+            "search_hnsw_masked_graph_segment_searches_total",
+            snapshot.search_hnsw_masked_graph_segment_searches_total,
+        ),
+        (
+            "search_hnsw_adaptive_graph_segment_searches_total",
+            snapshot.search_hnsw_adaptive_graph_segment_searches_total,
+        ),
+        (
+            "search_hnsw_predicate_refined_segment_searches_total",
+            snapshot.search_hnsw_predicate_refined_segment_searches_total,
+        ),
+        (
+            "search_hnsw_exact_fallback_segment_searches_total",
+            snapshot.search_hnsw_exact_fallback_segment_searches_total,
+        ),
+    ] {
+        push_value(&mut entries, name, MetricDimensions::default(), value);
+    }
 
     for series in &snapshot.search_inline_build_by_key {
         let dims = MetricDimensions {
@@ -746,6 +778,7 @@ mod tests {
     use std::collections::HashMap;
 
     use paro_common::runtime_value::Value;
+    use paro_storage::index::hnsw::{HnswSearchOutcome, HnswSearchPath};
     use paro_storage::metrics::SearchSidecarBuildMetricKey;
 
     #[test]
@@ -860,6 +893,10 @@ mod tests {
             512,
             17,
         );
+        storage_metrics().record_search_hnsw_work(
+            17,
+            HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph).with_predicate_refinement(true),
+        );
 
         let input = TableFunctionInitInput::new_for_test(None, &[]);
         let state_box = paro_search_metrics_init_global(&input).unwrap().unwrap();
@@ -887,5 +924,9 @@ mod tests {
             }),
             "histogram buckets should be expanded into table rows"
         );
+        assert!(state.entries.iter().any(|entry| {
+            entry.metric_name == "search_hnsw_predicate_refined_segment_searches_total"
+                && entry.value >= 1
+        }));
     }
 }

@@ -26,7 +26,7 @@ pub mod types;
 pub mod vector_storage;
 pub mod visited_pool;
 
-pub use batch_scorer::BatchScorer;
+pub use batch_scorer::{BatchScoredResult, BatchScorer};
 pub use build_cache::DistanceCache;
 pub use build_task::{
     build_missing_hnsw_indexes_with_scheduler,

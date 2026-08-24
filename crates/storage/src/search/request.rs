@@ -26,6 +26,10 @@ use super::stats::TableId;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExactBitmapMaterialization {
     ScalarIndex,
+    Mixed {
+        indexed_rows: u64,
+        scanned_rows: u64,
+    },
     ColumnScan,
 }
 
