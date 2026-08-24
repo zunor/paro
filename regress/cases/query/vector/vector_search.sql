@@ -36,6 +36,7 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     build_seed = 7
     plain_scan_threshold = 0
     filtered_plain_scan_threshold = 8
+    filter_columns = 'id,bucket'
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
@@ -80,7 +81,10 @@ ORDER BY emb <=> '[1.0, 0.0, 0.0]', id LIMIT 2;
 
 -- Prepared Top-K must preserve PostgreSQL's reusable $n parameter identity.
 PREPARE vector_topk(VECTOR(3)) AS
-    SELECT id FROM indexed_items ORDER BY emb <-> $1 LIMIT 2;
+    SELECT emb <-> $1 AS dist
+    FROM indexed_items
+    ORDER BY emb <-> $1
+    LIMIT 2;
 -- @query
 EXECUTE vector_topk('[1.0, 1.0, 1.0]');
 -- @query

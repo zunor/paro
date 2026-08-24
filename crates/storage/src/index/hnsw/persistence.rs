@@ -9,19 +9,21 @@ use super::entry_points::EntryPoints;
 use super::graph::GraphLayers;
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::hnsw_build_pool;
-use super::search_context::FixedLengthPriorityQueue;
-use super::vector_storage::{
-    CosineInverseNorms, InMemoryVectorStorage, IndexedVectorStorage, VectorStorage,
+use super::predicate_scan::{
+    PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
 };
+use super::search_context::FixedLengthPriorityQueue;
+use super::vector_storage::{CosineInverseNorms, IndexedVectorStorage, VectorStorage};
 use super::visited_pool::VisitedPool;
-#[cfg(test)]
-use super::HnswConfig;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome, HnswSearchPath,
-    HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset, PreparedQuery, ScoreType,
-    ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
+    HnswExactScanKind, HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome,
+    HnswSearchPath, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset,
+    PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
+    HNSW_BUILD_CONTRACT_VERSION,
 };
+#[cfg(test)]
+use super::{HnswConfig, HnswQueryWideStrategy, HnswSegmentSearchInput};
 use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::metrics::storage_metrics;
 use crate::search::segment_dispatch::install_search_pool;
@@ -42,8 +44,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 5;
-const HNSW_ARTIFACT_HEADER_LEN: usize = 136;
+const HNSW_ARTIFACT_VERSION: u32 = 7;
+const HNSW_ARTIFACT_HEADER_LEN: usize = 144;
 const MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy)]
@@ -62,6 +64,18 @@ struct ExactScanLane<'a> {
 struct ExactScanLaneResult {
     points: Vec<ScoredPoint>,
     scored_points: u64,
+}
+
+struct ExactScanResult {
+    points: Vec<ScoredPoint>,
+    kind: HnswExactScanKind,
+}
+
+fn aligned_offset(offset: usize, alignment: usize) -> Result<usize> {
+    offset
+        .checked_add(alignment - 1)
+        .map(|value| value / alignment * alignment)
+        .ok_or_else(|| error::out_of_range("HNSW artifact alignment overflow"))
 }
 
 /// O(1) keyed permutation of point ids used to decouple frozen-wave membership
@@ -385,6 +399,39 @@ impl HnswArtifactBacking {
             ),
         }
     }
+
+    fn predicate_scan(&self, offset: usize, len: usize) -> Result<PredicateScanLayout> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| error::data_corrupted("HNSW predicate scan range overflow"))?;
+        match self {
+            Self::Bytes(bytes) => {
+                if end > bytes.len() {
+                    return Err(error::data_corrupted(
+                        "HNSW predicate scan range exceeds byte backing",
+                    ));
+                }
+                PredicateScanLayout::deserialize_bytes(bytes.slice(offset..end))
+            }
+            Self::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            } => PredicateScanLayout::deserialize_mmap_range(
+                Arc::clone(mmap),
+                artifact_offset.checked_add(offset).ok_or_else(|| {
+                    error::data_corrupted("HNSW predicate scan mmap offset overflow")
+                })?,
+                if end <= *artifact_len {
+                    len
+                } else {
+                    return Err(error::data_corrupted(
+                        "HNSW predicate scan range exceeds mmap backing",
+                    ));
+                },
+            ),
+        }
+    }
 }
 
 /// A high-level HNSW index structure that combines graph and storage.
@@ -392,6 +439,7 @@ pub struct HnswIndex {
     pub build_contract: HnswBuildContract,
     pub graph: GraphLayers,
     pub vector_storage: Arc<dyn VectorStorage>,
+    pub(crate) predicate_scan: Option<PredicateScanLayout>,
     single_telemetry: Mutex<SearchTelemetry>,
     batch_telemetry: Mutex<HnswBatchTelemetry>,
 }
@@ -401,7 +449,15 @@ pub struct HnswIndex {
 #[derive(Debug, Clone)]
 pub struct HnswFilterColumnBlocks {
     pub column_id: u32,
-    pub blocks: Vec<Box<[PointOffset]>>,
+    pub blocks: Vec<HnswFilterBlock>,
+}
+
+#[derive(Debug, Clone)]
+pub struct HnswFilterBlock {
+    pub dictionary_ordinals: Box<[u32]>,
+    pub ordinal_row_counts: Box<[u32]>,
+    pub ordinal_fingerprints: Box<[u64]>,
+    pub point_ids: Box<[PointOffset]>,
 }
 
 /// Deterministic predicate-local graph build input. Columns are aligned with
@@ -415,6 +471,7 @@ pub struct HnswFilterBlocks {
 struct BuiltPredicateGraph {
     links: GraphLinks,
     entry_points: Box<[super::PredicateEntryPoint]>,
+    scan_layout: PredicateScanLayout,
 }
 
 impl HnswIndex {
@@ -423,6 +480,15 @@ impl HnswIndex {
         graph: GraphLayers,
         vector_storage: Arc<dyn VectorStorage>,
     ) -> Result<Self> {
+        Self::try_new_with_predicate_scan(build_contract, graph, vector_storage, None)
+    }
+
+    fn try_new_with_predicate_scan(
+        build_contract: HnswBuildContract,
+        graph: GraphLayers,
+        vector_storage: Arc<dyn VectorStorage>,
+        predicate_scan: Option<PredicateScanLayout>,
+    ) -> Result<Self> {
         build_contract.validate()?;
         let distance = build_contract.distance;
         let vector_storage = IndexedVectorStorage::prepare(vector_storage, distance);
@@ -430,10 +496,11 @@ impl HnswIndex {
             build_contract,
             graph,
             vector_storage,
+            predicate_scan,
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
         };
-        index.validate_entry_points()?;
+        index.validate_artifact_contract()?;
         Ok(index)
     }
 
@@ -600,23 +667,29 @@ impl HnswIndex {
         } else {
             None
         };
-        let graph = match predicate_graph {
-            Some(predicate_graph) => GraphLayers::new_with_predicate_links(
-                links,
-                predicate_graph.links,
-                predicate_graph.entry_points,
-                entry_points,
-                VisitedPool::new(),
-                (&build_contract).into(),
+        let (graph, predicate_scan) = match predicate_graph {
+            Some(predicate_graph) => (
+                GraphLayers::new_with_predicate_links(
+                    links,
+                    predicate_graph.links,
+                    predicate_graph.entry_points,
+                    entry_points,
+                    VisitedPool::new(),
+                    (&build_contract).into(),
+                ),
+                Some(predicate_graph.scan_layout),
             ),
-            None => GraphLayers::new(
-                links,
-                entry_points,
-                VisitedPool::new(),
-                (&build_contract).into(),
+            None => (
+                GraphLayers::new(
+                    links,
+                    entry_points,
+                    VisitedPool::new(),
+                    (&build_contract).into(),
+                ),
+                None,
             ),
         };
-        Self::try_new(build_contract, graph, storage)
+        Self::try_new_with_predicate_scan(build_contract, graph, storage, predicate_scan)
     }
 
     fn build_predicate_links(
@@ -629,6 +702,7 @@ impl HnswIndex {
     ) -> Result<BuiltPredicateGraph> {
         let mut merged = vec![Vec::<Vec<PointOffset>>::new(); storage.num_vectors()];
         let mut predicate_entry_points = Vec::new();
+        let mut scan_columns = Vec::with_capacity(filter_blocks.columns.len());
         let dimension = storage.vector_dim();
         let filter_m = build_contract.filter_topology.m;
         let expected_columns = build_contract.filter_topology.columns();
@@ -646,8 +720,30 @@ impl HnswIndex {
 
         let mut global_block_index = 0usize;
         for column in filter_blocks.columns {
+            let column_id = column.column_id;
             let mut block_by_point = vec![u32::MAX; storage.num_vectors()];
-            for (block_index, point_ids) in column.blocks.into_iter().enumerate() {
+            let mut scan_blocks = Vec::with_capacity(column.blocks.len());
+            for (block_index, block) in column.blocks.into_iter().enumerate() {
+                let mut scan_vectors =
+                    Vec::with_capacity(block.point_ids.len().saturating_mul(dimension));
+                for &point_id in block.point_ids.iter() {
+                    scan_vectors.extend_from_slice(storage.get_vector(point_id));
+                }
+                let scan_block = PredicateScanBuildBlock {
+                    dictionary_ordinals: block.dictionary_ordinals,
+                    ordinal_row_counts: block.ordinal_row_counts,
+                    ordinal_fingerprints: block.ordinal_fingerprints,
+                    row_ids: block.point_ids,
+                    vectors: Arc::from(scan_vectors),
+                };
+                // Predicate topology and covering scans have different
+                // physical locality requirements. Keep graph-local point ids
+                // in stable segment-row order so changing scan encoding never
+                // perturbs topology quality; keep the scan copy in exact
+                // ordinal-run order so every posting is contiguous.
+                let mut graph_point_ids = scan_block.row_ids.to_vec();
+                graph_point_ids.sort_unstable();
+                let point_ids = graph_point_ids.as_slice();
                 if stop_check.is_some_and(HnswBuildStopCheck::should_stop) {
                     return Err(error::query_canceled());
                 }
@@ -656,39 +752,27 @@ impl HnswIndex {
                         "HNSW filter blocks must not contain empty partitions",
                     ));
                 }
-                if point_ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-                    return Err(error::invalid_input(
-                        "HNSW filter block point ids must be strictly increasing",
-                    ));
-                }
-                if point_ids
-                    .last()
-                    .is_some_and(|point| *point as usize >= storage.num_vectors())
-                {
-                    return Err(error::data_corrupted(
-                        "HNSW filter block point id exceeds vector cardinality",
-                    ));
-                }
                 let block_index = u32::try_from(block_index).map_err(|_| {
                     error::configuration_limit_exceeded(
                         "HNSW filter topology exceeds the u32 block-id space",
                     )
                 })?;
                 for &point_id in point_ids.iter() {
+                    if point_id as usize >= storage.num_vectors() {
+                        return Err(error::data_corrupted(
+                            "HNSW filter block point id exceeds vector cardinality",
+                        ));
+                    }
                     if std::mem::replace(&mut block_by_point[point_id as usize], block_index)
                         != u32::MAX
                     {
                         return Err(error::data_corrupted(format!(
                             "HNSW filter column {} contains duplicate point {}",
-                            column.column_id, point_id
+                            column_id, point_id
                         )));
                     }
                 }
 
-                let mut vectors = Vec::with_capacity(point_ids.len().saturating_mul(dimension));
-                for &point_id in point_ids.iter() {
-                    vectors.extend_from_slice(storage.get_vector(point_id));
-                }
                 let mut local_contract = *build_contract;
                 local_contract.m = filter_m;
                 local_contract.m0 = filter_m.saturating_mul(2);
@@ -696,12 +780,17 @@ impl HnswIndex {
                 local_contract.build_seed = splitmix64(
                     build_contract.build_seed
                         ^ 0x5052_4544_4943_4154
-                        ^ u64::from(column.column_id).rotate_left(17)
+                        ^ u64::from(column_id).rotate_left(17)
                         ^ global_block_index as u64,
                 );
                 local_contract.filter_topology = Default::default();
+                let mut graph_vectors =
+                    Vec::with_capacity(point_ids.len().saturating_mul(dimension));
+                for &point_id in point_ids {
+                    graph_vectors.extend_from_slice(storage.get_vector(point_id));
+                }
                 let local = Self::build_with_controls(
-                    Arc::new(InMemoryVectorStorage::new(vectors, dimension)),
+                    Arc::new(super::InMemoryVectorStorage::new(graph_vectors, dimension)),
                     local_contract,
                     pool,
                     stop_check,
@@ -710,8 +799,10 @@ impl HnswIndex {
                     let local_point = local_point as PointOffset;
                     let levels = local.graph.links.num_levels(local_point);
                     let global_levels = &mut merged[global_point as usize];
-                    global_levels.resize_with(levels, Vec::new);
-                    for (level, global_links) in global_levels.iter_mut().enumerate() {
+                    if global_levels.len() < levels {
+                        global_levels.resize_with(levels, Vec::new);
+                    }
+                    for (level, global_links) in global_levels.iter_mut().take(levels).enumerate() {
                         local
                             .graph
                             .links
@@ -722,19 +813,24 @@ impl HnswIndex {
                 }
                 for entry in &local.graph.entry_points.entry_points {
                     predicate_entry_points.push(super::PredicateEntryPoint {
-                        column_id: column.column_id,
+                        column_id,
                         point_id: point_ids[entry.point_id as usize],
                         level: entry.level,
                     });
                 }
                 global_block_index = global_block_index.saturating_add(1);
+                scan_blocks.push(scan_block);
             }
             if block_by_point.contains(&u32::MAX) {
                 return Err(error::data_corrupted(format!(
                     "HNSW filter column {} does not cover the complete vector domain",
-                    column.column_id
+                    column_id
                 )));
             }
+            scan_columns.push(PredicateScanBuildColumn {
+                column_id,
+                blocks: scan_blocks,
+            });
 
             // Local block graphs make selective predicates dense, but a range
             // spanning several blocks would otherwise be a disjoint union and
@@ -776,6 +872,11 @@ impl HnswIndex {
         Ok(BuiltPredicateGraph {
             links: GraphLinks::new_from_edges(merged),
             entry_points: predicate_entry_points.into_boxed_slice(),
+            scan_layout: PredicateScanLayout::from_build_columns(
+                dimension,
+                storage.num_vectors(),
+                scan_columns,
+            )?,
         })
     }
 
@@ -806,15 +907,27 @@ impl HnswIndex {
         self.graph.links.save(&links_path)?;
         let predicate_links_path = directory.join("predicate_graph_links.bin");
         let predicate_entry_points_path = directory.join("predicate_entry_points.json");
+        let predicate_scan_path = directory.join("predicate_scan.bin");
         if let Some(predicate_links) = &self.graph.predicate_links {
             predicate_links.save(&predicate_links_path)?;
             let encoded = serde_json::to_string_pretty(&self.graph.predicate_entry_points)
                 .map_err(|e| error::serialization_error(e.to_string()))?;
             fs::write(&predicate_entry_points_path, encoded).map_err(error::io)?;
-        } else if predicate_links_path.exists() {
-            fs::remove_file(predicate_links_path).map_err(error::io)?;
+            self.predicate_scan
+                .as_ref()
+                .ok_or_else(|| {
+                    error::data_corrupted("predicate graph is missing its covering scan layout")
+                })?
+                .save(&predicate_scan_path)?;
+        } else {
+            if predicate_links_path.exists() {
+                fs::remove_file(predicate_links_path).map_err(error::io)?;
+            }
             if predicate_entry_points_path.exists() {
                 fs::remove_file(predicate_entry_points_path).map_err(error::io)?;
+            }
+            if predicate_scan_path.exists() {
+                fs::remove_file(predicate_scan_path).map_err(error::io)?;
             }
         }
 
@@ -858,7 +971,9 @@ impl HnswIndex {
             let entry_points = serde_json::from_str::<Vec<super::PredicateEntryPoint>>(&entries)
                 .map_err(|e| error::serialization_error(e.to_string()))?
                 .into_boxed_slice();
-            Some((links, entry_points))
+            let scan_layout =
+                PredicateScanLayout::load_mmap(&directory.join("predicate_scan.bin"))?;
+            Some((links, entry_points, scan_layout))
         } else {
             None
         };
@@ -876,8 +991,8 @@ impl HnswIndex {
         } else {
             vector_storage
         };
-        let graph = match predicate_graph {
-            Some((predicate_links, predicate_entry_points)) => {
+        let (graph, predicate_scan) = match predicate_graph {
+            Some((predicate_links, predicate_entry_points, scan_layout)) => (
                 GraphLayers::new_with_predicate_links(
                     links,
                     predicate_links,
@@ -885,25 +1000,21 @@ impl HnswIndex {
                     entry_points,
                     VisitedPool::new(),
                     (&build_contract).into(),
-                )
-            }
-            None => GraphLayers::new(
-                links,
-                entry_points,
-                VisitedPool::new(),
-                (&build_contract).into(),
+                ),
+                Some(scan_layout),
+            ),
+            None => (
+                GraphLayers::new(
+                    links,
+                    entry_points,
+                    VisitedPool::new(),
+                    (&build_contract).into(),
+                ),
+                None,
             ),
         };
 
-        let index = Self {
-            build_contract,
-            graph,
-            vector_storage,
-            single_telemetry: Mutex::new(SearchTelemetry::default()),
-            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
-        };
-        index.validate_entry_points()?;
-        Ok(index)
+        Self::try_new_with_predicate_scan(build_contract, graph, vector_storage, predicate_scan)
     }
 
     /// Serialize HNSW index to a byte vector for embedding in segments.
@@ -912,6 +1023,23 @@ impl HnswIndex {
         // Run the expensive semantic verifier here, while the freshly built
         // graph is hot, instead of imposing O(E) work on every open.
         self.verify_integrity()?;
+        let predicate_scan = match (
+            self.build_contract.filter_topology.is_enabled(),
+            self.predicate_scan.as_ref(),
+        ) {
+            (true, Some(layout)) => Some(layout.serialize()?),
+            (false, None) => None,
+            (true, None) => {
+                return Err(error::data_corrupted(
+                    "enabled HNSW filter topology is missing its covering scan layout",
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(error::data_corrupted(
+                    "HNSW covering scan layout requires an enabled filter topology",
+                ))
+            }
+        };
         let mut data = Vec::new();
 
         data.extend_from_slice(&HNSW_ARTIFACT_MAGIC);
@@ -957,6 +1085,12 @@ impl HnswIndex {
         let predicate_entry_count = u64::try_from(self.graph.predicate_entry_points.len())
             .map_err(|_| error::out_of_range("too many HNSW predicate entry points"))?;
         data.extend_from_slice(&predicate_entry_count.to_le_bytes());
+        let predicate_scan_len = predicate_scan.as_ref().map_or(0, Vec::len);
+        data.extend_from_slice(
+            &u64::try_from(predicate_scan_len)
+                .map_err(|_| error::out_of_range("HNSW predicate scan length exceeds u64"))?
+                .to_le_bytes(),
+        );
         debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
 
         if let Some(norms) = norms {
@@ -968,6 +1102,12 @@ impl HnswIndex {
         append_entry_points(&mut data, &self.graph.entry_points.entry_points)?;
         append_entry_points(&mut data, &self.graph.entry_points.extra_entry_points)?;
         append_predicate_entry_points(&mut data, &self.graph.predicate_entry_points)?;
+
+        let predicate_scan_offset = aligned_offset(data.len(), 8)?;
+        data.resize(predicate_scan_offset, 0);
+        if let Some(predicate_scan) = predicate_scan {
+            data.extend_from_slice(&predicate_scan);
+        }
 
         // Serialize graph links in binary form.
         self.graph.links.serialize(&mut data)?;
@@ -1118,6 +1258,12 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW predicate entry-point count exceeds usize"))?;
+        let predicate_scan_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "predicate scan length")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW predicate scan length exceeds usize"))?;
         debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
         build_contract.validate()?;
         if build_contract.filter_topology.is_enabled() != (predicate_graph_len != 0) {
@@ -1128,6 +1274,11 @@ impl HnswIndex {
         if !build_contract.filter_topology.is_enabled() && predicate_entry_count != 0 {
             return Err(error::data_corrupted(
                 "HNSW predicate entry points require an enabled filter topology",
+            ));
+        }
+        if build_contract.filter_topology.is_enabled() != (predicate_scan_len != 0) {
+            return Err(error::data_corrupted(
+                "HNSW covering scan presence does not match its filter-topology contract",
             ));
         }
         let distance = build_contract.distance;
@@ -1155,6 +1306,25 @@ impl HnswIndex {
         };
         let predicate_entry_points =
             read_predicate_entry_points(data, &mut offset, predicate_entry_count)?;
+        let predicate_scan_offset = aligned_offset(offset, 8)?;
+        if data
+            .get(offset..predicate_scan_offset)
+            .is_none_or(|padding| padding.iter().any(|byte| *byte != 0))
+        {
+            return Err(error::data_corrupted(
+                "HNSW predicate scan alignment padding is invalid",
+            ));
+        }
+        offset = predicate_scan_offset;
+        let predicate_scan = if predicate_scan_len == 0 {
+            None
+        } else {
+            let layout = backing.predicate_scan(offset, predicate_scan_len)?;
+            offset = offset
+                .checked_add(predicate_scan_len)
+                .ok_or_else(|| error::data_corrupted("HNSW predicate scan offset overflow"))?;
+            Some(layout)
+        };
 
         // Deserialize base and predicate-local graph links from exact envelope
         // ranges. Statistics bytes are never exposed to either graph parser.
@@ -1185,15 +1355,7 @@ impl HnswIndex {
             ),
         };
 
-        let index = Self {
-            build_contract,
-            graph,
-            vector_storage,
-            single_telemetry: Mutex::new(SearchTelemetry::default()),
-            batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
-        };
-        index.validate_entry_points()?;
-        Ok(index)
+        Self::try_new_with_predicate_scan(build_contract, graph, vector_storage, predicate_scan)
     }
 
     /// Perform a vector search under the caller's active query policy.
@@ -1211,7 +1373,9 @@ impl HnswIndex {
             return Ok(HnswSearchResult {
                 points: Vec::new(),
                 scored_points: 0,
-                outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan),
+                outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan(
+                    HnswExactScanKind::BaseVectors,
+                )),
             });
         }
 
@@ -1229,10 +1393,11 @@ impl HnswIndex {
 
         let prepared_query = self.build_contract.distance.prepare(query);
         let mut scorer = VectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
-        let (points, outcome) = if self.should_use_plain_scan(filter, policy, strategy) {
+        let (points, outcome) = if Self::should_use_plain_scan(strategy) {
+            let exact = self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?;
             (
-                self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?,
-                HnswSearchOutcome::new(HnswSearchPath::ExactScan),
+                exact.points,
+                HnswSearchOutcome::new(HnswSearchPath::ExactScan(exact.kind)),
             )
         } else {
             let algorithm = Self::algorithm_for_strategy(filter, strategy)?;
@@ -1273,17 +1438,22 @@ impl HnswIndex {
             if filter_row_set.is_some()
                 && results.len() < self.expected_filtered_rows(top_k, filter_row_set)?
             {
-                (
-                    self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?,
-                    HnswSearchOutcome::new(path)
-                        .with_predicate_topology(graph_result.predicate_topology_used)
-                        .with_predicate_refinement(graph_result.predicate_refined)
-                        .with_exact_fallback(),
-                )
+                {
+                    let exact = self.plain_scan(top_k, &mut scorer, filter_row_set, budget)?;
+                    (
+                        exact.points,
+                        HnswSearchOutcome::new(path)
+                            .with_predicate_admission(graph_result.predicate_admission)
+                            .with_predicate_topology(graph_result.predicate_topology_used)
+                            .with_predicate_refinement(graph_result.predicate_refined)
+                            .with_exact_fallback(exact.kind),
+                    )
+                }
             } else {
                 (
                     results,
                     HnswSearchOutcome::new(path)
+                        .with_predicate_admission(graph_result.predicate_admission)
                         .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined),
                 )
@@ -1320,12 +1490,19 @@ impl HnswIndex {
         let matching_rows = filter
             .row_set()
             .map_or(self.graph.num_points() as u64, ExactRowSet::len);
-        let strategy = HnswSearchStrategy::choose(
+        let query_strategy = HnswQueryWideStrategy::choose(
             filter.kind(),
             matching_rows,
             self.graph.num_points() as u64,
             policy,
         );
+        let strategy = query_strategy.for_segment(HnswSegmentSearchInput {
+            filter_kind: filter.kind(),
+            matching_rows,
+            total_rows: self.graph.num_points() as u64,
+            effective_ef: policy.effective_ef(top_k, params.ef),
+            level0_degree: self.graph.hnsw_m.get_m(0),
+        });
         let budget = crate::search::ResourceBudget::default();
         self.search_one_with_policy_strategy(
             query, top_k, params, filter, &policy, strategy, &budget,
@@ -1352,7 +1529,9 @@ impl HnswIndex {
                 .map(|_| HnswSearchResult {
                     points: Vec::new(),
                     scored_points: 0,
-                    outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan),
+                    outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan(
+                        HnswExactScanKind::BaseVectors,
+                    )),
                 })
                 .collect());
         }
@@ -1371,8 +1550,7 @@ impl HnswIndex {
             self.graph.num_points(),
             self.graph.hnsw_m.get_m(0),
         );
-        let results: Vec<HnswSearchResult> = if self.should_use_plain_scan(filter, policy, strategy)
-        {
+        let results: Vec<HnswSearchResult> = if Self::should_use_plain_scan(strategy) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
             let scored = match filter_row_set {
@@ -1390,7 +1568,9 @@ impl HnswIndex {
                 .map(|result| HnswSearchResult {
                     points: result.points,
                     scored_points: result.scored_points,
-                    outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan),
+                    outcome: HnswSearchOutcome::new(HnswSearchPath::ExactScan(
+                        HnswExactScanKind::BaseVectors,
+                    )),
                 })
                 .collect()
         } else {
@@ -1434,12 +1614,14 @@ impl HnswIndex {
                 .zip(scorers.iter_mut())
                 .map(|(graph_result, scorer)| -> Result<HnswSearchResult> {
                     let mut outcome = HnswSearchOutcome::new(path)
+                        .with_predicate_admission(graph_result.predicate_admission)
                         .with_predicate_topology(graph_result.predicate_topology_used)
                         .with_predicate_refinement(graph_result.predicate_refined);
                     let points =
                         if filter_row_set.is_some() && graph_result.points.len() < expected_rows {
-                            outcome = outcome.with_exact_fallback();
-                            self.plain_scan(top_k, scorer, filter_row_set, budget)?
+                            let exact = self.plain_scan(top_k, scorer, filter_row_set, budget)?;
+                            outcome = outcome.with_exact_fallback(exact.kind);
+                            exact.points
                         } else {
                             graph_result.points
                         };
@@ -1506,8 +1688,7 @@ impl HnswIndex {
     /// Explicit deep verifier for recovery/fsck tooling. Normal mmap open only
     /// validates the O(N) layout and checksum boundary.
     pub fn verify_integrity(&self) -> Result<()> {
-        self.build_contract.validate()?;
-        self.validate_entry_points()?;
+        self.validate_artifact_contract()?;
         match (
             self.build_contract.distance,
             self.vector_storage.cosine_inverse_norms(),
@@ -1548,13 +1729,52 @@ impl HnswIndex {
                         "HNSW predicate graph cardinality differs from base graph",
                     ));
                 }
-                predicate_links.verify_integrity()
+                predicate_links.verify_integrity()?
             }
-            (false, None) => Ok(()),
-            _ => Err(error::data_corrupted(
-                "HNSW predicate graph presence differs from filter-topology contract",
-            )),
+            (false, None) => {}
+            _ => {
+                return Err(error::data_corrupted(
+                    "HNSW predicate graph presence differs from filter-topology contract",
+                ))
+            }
         }
+        if let Some(layout) = &self.predicate_scan {
+            layout.verify_integrity()?;
+        }
+        Ok(())
+    }
+
+    fn validate_artifact_contract(&self) -> Result<()> {
+        self.build_contract.validate()?;
+        if self.graph.num_points() != self.vector_storage.num_vectors() {
+            return Err(error::data_corrupted(format!(
+                "HNSW graph cardinality {} differs from vector cardinality {}",
+                self.graph.num_points(),
+                self.vector_storage.num_vectors()
+            )));
+        }
+        match (
+            self.build_contract.filter_topology.is_enabled(),
+            self.predicate_scan.as_ref(),
+        ) {
+            (true, Some(layout)) => layout.validate_contract(
+                self.vector_storage.vector_dim(),
+                self.graph.num_points(),
+                self.build_contract.filter_topology.columns(),
+            )?,
+            (false, None) => {}
+            (true, None) => {
+                return Err(error::data_corrupted(
+                    "HNSW filter topology is missing its predicate covering scan layout",
+                ))
+            }
+            (false, Some(_)) => {
+                return Err(error::data_corrupted(
+                    "HNSW predicate covering scan layout requires a filter topology",
+                ))
+            }
+        }
+        self.validate_entry_points()
     }
 
     fn validate_entry_points(&self) -> Result<()> {
@@ -1695,25 +1915,8 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn should_use_plain_scan(
-        &self,
-        filter: HnswSearchFilter<'_>,
-        policy: &HnswSearchPolicy,
-        strategy: HnswSearchStrategy,
-    ) -> bool {
-        if strategy == HnswSearchStrategy::ExactScan {
-            return true;
-        }
-        if self.graph.num_points() <= policy.plain_scan_threshold {
-            return true;
-        }
-
-        match filter {
-            HnswSearchFilter::None => false,
-            HnswSearchFilter::Visibility(row_set) | HnswSearchFilter::Predicate { row_set, .. } => {
-                row_set.len() <= policy.filtered_plain_scan_threshold as u64
-            }
-        }
+    fn should_use_plain_scan(strategy: HnswSearchStrategy) -> bool {
+        strategy == HnswSearchStrategy::ExactScan
     }
 
     fn expected_filtered_rows(
@@ -1739,7 +1942,7 @@ impl HnswIndex {
         scorer: &mut VectorScorer,
         filter_row_set: Option<&dyn ExactRowSet>,
         budget: &ResourceBudget,
-    ) -> Result<Vec<ScoredPoint>> {
+    ) -> Result<ExactScanResult> {
         let num_points = self.graph.num_points() as u32;
         match filter_row_set {
             Some(row_set) => {
@@ -1751,16 +1954,26 @@ impl HnswIndex {
                         self.graph.num_points()
                     )));
                 }
+                if let Some(points) = self.covering_plain_scan(top_k, scorer, row_set, budget)? {
+                    return Ok(ExactScanResult {
+                        points,
+                        kind: HnswExactScanKind::PredicateCovering,
+                    });
+                }
                 if row_set.len() >= MIN_ROWS_PER_PARALLEL_EXACT_LANE.saturating_mul(2)
                     && budget.parallelism_slots > 1
                 {
-                    return self.parallel_plain_scan(
+                    let points = self.parallel_plain_scan(
                         top_k,
                         scorer,
                         row_set.physical_partitions(),
                         row_set.len(),
                         budget,
-                    );
+                    )?;
+                    return Ok(ExactScanResult {
+                        points,
+                        kind: HnswExactScanKind::BaseVectors,
+                    });
                 }
                 let mut best = FixedLengthPriorityQueue::new(top_k);
                 let mut chunk = [0; SCORE_BATCH];
@@ -1772,10 +1985,82 @@ impl HnswIndex {
                     Ok(())
                 };
                 row_set.try_for_each_batch(&mut chunk, &mut flush)?;
-                Ok(best.into_sorted_vec())
+                Ok(ExactScanResult {
+                    points: best.into_sorted_vec(),
+                    kind: HnswExactScanKind::BaseVectors,
+                })
             }
-            None => self.plain_scan_iter(top_k, scorer, 0..num_points, budget.work.as_ref()),
+            None => Ok(ExactScanResult {
+                points: self.plain_scan_iter(top_k, scorer, 0..num_points, budget.work.as_ref())?,
+                kind: HnswExactScanKind::BaseVectors,
+            }),
         }
+    }
+
+    fn covering_plain_scan(
+        &self,
+        top_k: usize,
+        scorer: &mut VectorScorer,
+        row_set: &dyn ExactRowSet,
+        budget: &ResourceBudget,
+    ) -> Result<Option<Vec<ScoredPoint>>> {
+        let Some(layout) = self.predicate_scan.as_ref() else {
+            return Ok(None);
+        };
+        let ExactRowPartitions::OrdinalPostings {
+            column_id,
+            postings,
+        } = row_set.physical_partitions()
+        else {
+            return Ok(None);
+        };
+        let selection_bytes =
+            postings
+                .len()
+                .saturating_mul(
+                    std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<
+                        super::predicate_scan::PredicateScanRangeRef<'_>,
+                    >()),
+                );
+        let _selection_reservation = budget.try_reserve_memory(selection_bytes)?;
+        let Some(ranges) = layout.selected_ranges(column_id, postings)? else {
+            return Ok(None);
+        };
+        const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
+        let mut best = FixedLengthPriorityQueue::new(top_k);
+        let mut local_points = [0; SCORE_BATCH];
+        let mut covered_rows = 0u64;
+        for range in ranges {
+            let row_ids = range.row_ids();
+            let vectors = range.vectors();
+            let mut position = 0usize;
+            while position < row_ids.len() {
+                let end = position.saturating_add(SCORE_BATCH).min(row_ids.len());
+                budget.work.check_and_consume(end - position)?;
+                let rows = &row_ids[position..end];
+                for (slot, &row_id) in rows.iter().enumerate() {
+                    if row_id as usize >= self.graph.num_points() {
+                        return Err(error::data_corrupted(
+                            "predicate covering scan row id exceeds graph cardinality",
+                        ));
+                    }
+                    local_points[slot] = (position + slot) as PointOffset;
+                }
+                let len = rows.len();
+                covered_rows = covered_rows.saturating_add(len as u64);
+                for point in scorer.score_covering_points(rows, &local_points[..len], vectors) {
+                    best.push(point);
+                }
+                position = end;
+            }
+        }
+        if covered_rows != row_set.len() {
+            return Err(error::data_corrupted(format!(
+                "predicate covering scan covered {covered_rows} exact rows, expected {}",
+                row_set.len()
+            )));
+        }
+        Ok(Some(best.into_sorted_vec()))
     }
 
     fn parallel_plain_scan(
@@ -1894,9 +2179,9 @@ impl HnswIndex {
         };
         match partitions {
             ExactRowPartitions::Single(bitmap) => append_posting(bitmap)?,
-            ExactRowPartitions::DisjointPostings(postings) => {
+            ExactRowPartitions::OrdinalPostings { postings, .. } => {
                 for posting in postings {
-                    append_posting(posting)?;
+                    append_posting(posting.rows())?;
                 }
             }
         }
@@ -2267,6 +2552,7 @@ mod tests {
         let queries = make_sift_like_queries(0x456, &vectors, 64, 0.02);
         let config = HnswConfig::new(16, 96)
             .with_plain_scan_threshold(0)
+            .with_filtered_plain_scan_threshold(0)
             .with_ef(96);
         let index = HnswBuilder::new()
             .build(
@@ -2328,7 +2614,15 @@ mod tests {
                 HnswFilterBlocks {
                     columns: vec![HnswFilterColumnBlocks {
                         column_id: 7,
-                        blocks: vec![vec![0, 1, 2].into_boxed_slice()],
+                        blocks: vec![HnswFilterBlock {
+                            dictionary_ordinals: vec![0].into_boxed_slice(),
+                            ordinal_row_counts: vec![3].into_boxed_slice(),
+                            ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
+                                &RoaringBitmap::from_iter([0, 1, 2]),
+                            )]
+                            .into_boxed_slice(),
+                            point_ids: vec![0, 1, 2].into_boxed_slice(),
+                        }],
                     }],
                 },
             )
@@ -2341,13 +2635,39 @@ mod tests {
     fn predicate_topology_persists_tagged_hierarchical_block_entries() {
         let vectors = make_sift_like_vectors(0x7711, 256, 16, 16);
         let mut contract = HnswConfig::new(12, 72).build_contract(DistanceMetric::Euclidean);
-        contract.filter_topology = HnswFilterTopologyContract::from_columns(&[7], 64, 4).unwrap();
+        contract.filter_topology =
+            HnswFilterTopologyContract::from_columns(&[7, 8], 64, 4).unwrap();
         let blocks = (0..4)
             .map(|block| {
-                ((block * 64)..((block + 1) * 64))
+                let point_ids = ((block * 64)..((block + 1) * 64))
                     .map(|point| point as PointOffset)
-                    .collect::<Vec<_>>()
-                    .into_boxed_slice()
+                    .collect::<Vec<_>>();
+                HnswFilterBlock {
+                    dictionary_ordinals: vec![block as u32].into_boxed_slice(),
+                    ordinal_row_counts: vec![64].into_boxed_slice(),
+                    ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
+                        &RoaringBitmap::from_iter(point_ids.iter().copied()),
+                    )]
+                    .into_boxed_slice(),
+                    point_ids: point_ids.into_boxed_slice(),
+                }
+            })
+            .collect::<Vec<_>>();
+        let interleaved_blocks = (0..4)
+            .map(|block| {
+                let point_ids = (block..256)
+                    .step_by(4)
+                    .map(|point| point as PointOffset)
+                    .collect::<Vec<_>>();
+                HnswFilterBlock {
+                    dictionary_ordinals: vec![block as u32].into_boxed_slice(),
+                    ordinal_row_counts: vec![64].into_boxed_slice(),
+                    ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
+                        &RoaringBitmap::from_iter(point_ids.iter().copied()),
+                    )]
+                    .into_boxed_slice(),
+                    point_ids: point_ids.into_boxed_slice(),
+                }
             })
             .collect();
         let index = HnswBuilder::new()
@@ -2355,17 +2675,23 @@ mod tests {
                 make_storage(&vectors),
                 contract,
                 HnswFilterBlocks {
-                    columns: vec![HnswFilterColumnBlocks {
-                        column_id: 7,
-                        blocks,
-                    }],
+                    columns: vec![
+                        HnswFilterColumnBlocks {
+                            column_id: 7,
+                            blocks,
+                        },
+                        HnswFilterColumnBlocks {
+                            column_id: 8,
+                            blocks: interleaved_blocks,
+                        },
+                    ],
                 },
             )
             .unwrap();
 
-        assert_eq!(index.graph.predicate_entry_points.len(), 4);
+        assert_eq!(index.graph.predicate_entry_points.len(), 8);
         assert!(index.graph.predicate_entry_points.iter().all(|entry| {
-            entry.column_id == 7
+            [7, 8].contains(&entry.column_id)
                 && index
                     .graph
                     .predicate_links
@@ -2400,6 +2726,46 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result.points[0].idx, 100);
+
+        let ordinal_rows = crate::index::OrdinalRowSet::new(
+            7,
+            (0..256)
+                .map(|point| (point / 64) as u16)
+                .collect::<Vec<_>>()
+                .into(),
+            vec![0b11].into_boxed_slice(),
+            false,
+            128,
+            vec![
+                crate::index::ExactOrdinalPosting::new(
+                    0,
+                    Arc::new(RoaringBitmap::from_iter(0..64)),
+                ),
+                crate::index::ExactOrdinalPosting::new(
+                    1,
+                    Arc::new(RoaringBitmap::from_iter(64..128)),
+                ),
+            ]
+            .into_boxed_slice(),
+        );
+        let exact = restored
+            .search_one_with_policy_strategy(
+                &vectors[100],
+                5,
+                &SearchParams::default(),
+                HnswSearchFilter::predicate(&ordinal_rows, &[7]),
+                &HnswSearchPolicy::default(),
+                HnswSearchStrategy::ExactScan,
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(
+            exact.outcome.path,
+            HnswSearchPath::ExactScan(HnswExactScanKind::PredicateCovering)
+        );
+        assert_eq!(exact.scored_points, 128);
+        assert_eq!(exact.points[0].idx, 100);
+        assert!(exact.points.iter().all(|point| point.idx < 128));
     }
 
     #[test]
@@ -2439,7 +2805,7 @@ mod tests {
                 top_k,
                 &params,
                 Some(&filter),
-                HnswSearchStrategy::MaskedGraph,
+                HnswSearchStrategy::AdaptiveFilteredGraph,
             )
             .unwrap();
         assert_eq!(batch.len(), queries.len());
@@ -2662,6 +3028,7 @@ mod tests {
         let broad_telemetry = index.search_telemetry();
         assert_eq!(broad_telemetry.hnsw_adaptive_graph_count, 1);
         assert_eq!(broad_telemetry.hnsw_predicate_refinement_count, 0);
+        assert_eq!(broad_telemetry.hnsw_deferred_beam_admission_count, 1);
 
         // The admission window, not an impossible 1.5*K target, governs the
         // decision when K approaches ef. This used to refine unconditionally
@@ -3050,44 +3417,14 @@ mod tests {
     }
 
     #[test]
-    fn test_filter_aware_plain_scan_uses_candidate_count() {
-        let vectors = make_sift_like_vectors(41, 256, 16, 12);
-        let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_filtered_plain_scan_threshold(12)
-            .with_ef(96);
-        let policy = config.search_policy();
-        let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
-
-        let mut small_filter = RoaringBitmap::new();
-        for idx in (0..vectors.len() as u32).step_by(32) {
-            small_filter.insert(idx);
-        }
-
-        let mut large_filter = small_filter.clone();
-        for idx in (1..vectors.len() as u32).step_by(8) {
-            large_filter.insert(idx);
-        }
-
-        assert!(!index.should_use_plain_scan(
-            HnswSearchFilter::None,
-            &policy,
-            HnswSearchStrategy::UnfilteredGraph
-        ));
-        assert!(index.should_use_plain_scan(
-            HnswSearchFilter::predicate(&small_filter, &[]),
-            &policy,
+    fn exact_scan_execution_uses_the_lowered_segment_strategy_only() {
+        assert!(HnswIndex::should_use_plain_scan(
             HnswSearchStrategy::ExactScan
         ));
-        assert!(index.should_use_plain_scan(
-            HnswSearchFilter::predicate(&small_filter, &[]),
-            &policy,
-            HnswSearchStrategy::AdaptiveFilteredGraph
+        assert!(!HnswIndex::should_use_plain_scan(
+            HnswSearchStrategy::UnfilteredGraph
         ));
-        assert!(!index.should_use_plain_scan(
-            HnswSearchFilter::predicate(&large_filter, &[]),
-            &policy,
+        assert!(!HnswIndex::should_use_plain_scan(
             HnswSearchStrategy::AdaptiveFilteredGraph
         ));
     }
@@ -3096,9 +3433,15 @@ mod tests {
     fn exact_scan_lane_planner_splits_postings_without_materializing_row_ids() {
         let first = RoaringBitmap::from_iter(0..10_000);
         let second = RoaringBitmap::from_iter(20_000..50_000);
-        let postings = [Arc::new(first), Arc::new(second)];
+        let postings = [
+            crate::index::ExactOrdinalPosting::new(0, Arc::new(first)),
+            crate::index::ExactOrdinalPosting::new(1, Arc::new(second)),
+        ];
         let lanes = HnswIndex::plan_exact_scan_lanes(
-            ExactRowPartitions::DisjointPostings(&postings),
+            ExactRowPartitions::OrdinalPostings {
+                column_id: 7,
+                postings: &postings,
+            },
             40_000,
             3,
         )

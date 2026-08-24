@@ -299,6 +299,14 @@ fn search_metric_data_from_snapshot(snapshot: &StorageMetricsSnapshot) -> Vec<Se
             snapshot.search_hnsw_exact_segment_searches_total,
         ),
         (
+            "search_hnsw_predicate_covering_segment_scans_total",
+            snapshot.search_hnsw_predicate_covering_segment_scans_total,
+        ),
+        (
+            "search_hnsw_deferred_beam_admission_segment_searches_total",
+            snapshot.search_hnsw_deferred_beam_admission_segment_searches_total,
+        ),
+        (
             "search_hnsw_unfiltered_graph_segment_searches_total",
             snapshot.search_hnsw_unfiltered_graph_segment_searches_total,
         ),

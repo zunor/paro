@@ -6,8 +6,8 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{
-    HnswSearchFilter, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, ScoredPoint,
-    SearchParams,
+    HnswQueryWideStrategy, HnswSearchFilter, HnswSearchPolicy, HnswSearchResult,
+    HnswSearchStrategy, HnswSegmentSearchInput, ScoredPoint, SearchParams,
 };
 use crate::index::ExactRowSet;
 use crate::index::{collect_predicate_columns, IndexEvaluator, PredicateResult, PredicateTree};
@@ -96,11 +96,21 @@ impl Segment {
             (false, Some(row_set)) => HnswSearchFilter::Visibility(row_set),
         };
         let matching_rows = filter.row_set().map_or(self.num_rows(), ExactRowSet::len);
-        let strategy =
-            HnswSearchStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
+        let index = self
+            .open_hnsw_index(column_id)?
+            .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
+        let query_strategy =
+            HnswQueryWideStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
+        let strategy = query_strategy.for_segment(HnswSegmentSearchInput {
+            filter_kind: filter.kind(),
+            matching_rows,
+            total_rows: self.num_rows(),
+            effective_ef: policy.effective_ef(top_k, params.ef),
+            level0_degree: index.build_contract.m0 as usize,
+        });
         let budget = crate::search::ResourceBudget::default();
-        self.vector_search_with_filter_strategy(
-            column_id, query, top_k, params, filter, policy, strategy, &budget,
+        index.search_one_with_policy_strategy(
+            query, top_k, params, filter, policy, strategy, &budget,
         )
     }
 
@@ -127,7 +137,9 @@ impl Segment {
                     points: Vec::new(),
                     scored_points: 0,
                     outcome: crate::index::hnsw::HnswSearchOutcome::new(
-                        crate::index::hnsw::HnswSearchPath::ExactScan,
+                        crate::index::hnsw::HnswSearchPath::ExactScan(
+                            crate::index::hnsw::HnswExactScanKind::BaseVectors,
+                        ),
                     ),
                 });
             }

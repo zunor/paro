@@ -7,7 +7,8 @@
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
-    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
+    estimate_filtered_search_strategy, HnswDistanceCostModel, HnswFilteredSearchStrategy,
+    HnswSearchPolicy,
 };
 use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
@@ -88,7 +89,8 @@ impl VectorScanCostModel {
     /// graph score normally follows an unpredictable edge to a random vector.
     /// The policy threshold is calibrated in those physical units rather than
     /// pretending both distance evaluations cost the same.
-    const SEQUENTIAL_VECTOR_SCAN_FACTOR: f64 = 0.125;
+    const SEQUENTIAL_VECTOR_SCAN_FACTOR: f64 =
+        1.0 / HnswDistanceCostModel::SEQUENTIAL_SCORES_PER_RANDOM_SCORE as f64;
     const REFERENCE_VECTOR_DIMENSION: f64 = 128.0;
     /// A scalar comparison is one lane of the reference 128D sequential vector
     /// score. Bitmap emission is modeled separately below, so this coefficient

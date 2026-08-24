@@ -543,6 +543,32 @@ impl HnswInlineThreshold {
             .saturating_add(entry_points)
     }
 
+    /// Durable covering layout for exact filtered distance scans. Each
+    /// configured filter column stores one row-id and one vector copy per
+    /// point in scalar-block order; ordinal/block metadata is bounded by one
+    /// additional u32 per point.
+    pub fn estimate_filter_scan_layout_bytes(
+        vector_count: u64,
+        dimension: u32,
+        filter_columns: usize,
+    ) -> u64 {
+        let columns = filter_columns as u64;
+        if columns == 0 {
+            return 0;
+        }
+        let vector_bytes = vector_count
+            .saturating_mul(u64::from(dimension.max(1)))
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+        let row_and_ordinal_bytes = vector_count
+            .saturating_mul(2)
+            .saturating_mul(std::mem::size_of::<u32>() as u64);
+        columns.saturating_mul(
+            vector_bytes
+                .saturating_add(row_and_ordinal_bytes)
+                .saturating_add(64),
+        )
+    }
+
     /// Mutable graph-builder resident estimate. This belongs only to runtime
     /// admission/accounting and must not determine the durable segment shape.
     fn estimate_builder_graph_memory_bytes(vector_count: u64, m: u32) -> u64 {
@@ -612,7 +638,11 @@ impl HnswInlineThreshold {
             .div_ceil(u64::from(filter_m.max(2)) - 1)
             .saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
         let block_membership = vector_count.saturating_mul(std::mem::size_of::<u32>() as u64);
-        let local_vectors = max_block_rows
+        // The retained covering layout owns one vector copy for every point.
+        // Building the current predicate-local graph also needs a temporary
+        // row-id-ordered block copy because scan order must not perturb graph
+        // topology. Both coexist at the block build peak.
+        let graph_order_block_vectors = max_block_rows
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
         let local_visited = max_block_rows.saturating_mul(build_width.max(1) as u64);
@@ -624,7 +654,12 @@ impl HnswInlineThreshold {
                 max_block_rows,
                 filter_m,
             ))
-            .saturating_add(local_vectors)
+            .saturating_add(Self::estimate_filter_scan_layout_bytes(
+                vector_count,
+                dimension,
+                filter_columns,
+            ))
+            .saturating_add(graph_order_block_vectors)
             .saturating_add(local_visited)
     }
 }
@@ -672,6 +707,11 @@ impl HnswInlineBuildEstimate {
                     config.filter_columns.len(),
                     config.filter_block_rows,
                     config.filter_m,
+                ))
+                .saturating_add(HnswInlineThreshold::estimate_filter_scan_layout_bytes(
+                    vector_count,
+                    dimension,
+                    config.filter_columns.len(),
                 ))
                 .saturating_add(metric_preprocessing_bytes);
         let estimated_build_peak_memory_bytes =

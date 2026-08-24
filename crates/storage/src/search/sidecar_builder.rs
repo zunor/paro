@@ -24,7 +24,8 @@ use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::TailMutationKind;
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
-    HnswBuilder, HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract,
+    HnswBuilder, HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks,
+    HnswFilterTopologyContract,
 };
 use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
@@ -427,10 +428,16 @@ fn build_hnsw_filter_blocks(
         .map(|(column_id, logical_type, collector)| {
             Ok(HnswFilterColumnBlocks {
                 column_id,
-                blocks: collector.ordered_hnsw_filter_blocks(
-                    &logical_type,
-                    topology.target_block_rows as usize,
-                )?,
+                blocks: collector
+                    .ordered_hnsw_filter_blocks(&logical_type, topology.target_block_rows as usize)?
+                    .into_iter()
+                    .map(|block| HnswFilterBlock {
+                        dictionary_ordinals: block.dictionary_ordinals,
+                        ordinal_row_counts: block.ordinal_row_counts,
+                        ordinal_fingerprints: block.ordinal_fingerprints,
+                        point_ids: block.row_ids,
+                    })
+                    .collect(),
             })
         })
         .collect::<Result<Vec<_>>>()
@@ -708,7 +715,7 @@ mod tests {
         let mut points = blocks.columns[0]
             .blocks
             .iter()
-            .flat_map(|block| block.iter().copied())
+            .flat_map(|block| block.point_ids.iter().copied())
             .collect::<Vec<_>>();
         points.sort_unstable();
         assert_eq!(points, (0..rows).collect::<Vec<_>>());

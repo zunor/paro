@@ -5,7 +5,9 @@
 //!
 //! Runtime search statistics (non-persistent).
 
-use crate::index::hnsw::{HnswSearchOutcome, HnswSearchPath};
+use crate::index::hnsw::{
+    HnswExactScanKind, HnswPredicateAdmissionMode, HnswSearchOutcome, HnswSearchPath,
+};
 
 const SELECTIVITY_BUCKETS: [f64; 7] = [0.01, 0.05, 0.1, 0.25, 0.5, 0.75, 0.9];
 const BATCH_SIZE_BUCKETS: [usize; 6] = [1, 2, 4, 8, 16, 32];
@@ -27,6 +29,8 @@ pub struct SearchTelemetry {
     /// paths. Non-HNSW users leave this counter at zero.
     pub hnsw_scored_points: u64,
     pub hnsw_exact_scan_count: u64,
+    pub hnsw_predicate_covering_scan_count: u64,
+    pub hnsw_deferred_beam_admission_count: u64,
     pub hnsw_unfiltered_graph_count: u64,
     pub hnsw_masked_graph_count: u64,
     pub hnsw_adaptive_graph_count: u64,
@@ -45,6 +49,8 @@ impl Default for SearchTelemetry {
             filter_selectivity_histogram: None,
             hnsw_scored_points: 0,
             hnsw_exact_scan_count: 0,
+            hnsw_predicate_covering_scan_count: 0,
+            hnsw_deferred_beam_admission_count: 0,
             hnsw_unfiltered_graph_count: 0,
             hnsw_masked_graph_count: 0,
             hnsw_adaptive_graph_count: 0,
@@ -102,8 +108,11 @@ impl SearchTelemetry {
     pub fn record_hnsw_work(&mut self, scored_points: u64, outcome: HnswSearchOutcome) {
         self.hnsw_scored_points = self.hnsw_scored_points.saturating_add(scored_points);
         match outcome.path {
-            HnswSearchPath::ExactScan => {
-                self.hnsw_exact_scan_count = self.hnsw_exact_scan_count.saturating_add(1)
+            HnswSearchPath::ExactScan(kind) => {
+                self.hnsw_exact_scan_count = self.hnsw_exact_scan_count.saturating_add(1);
+                self.hnsw_predicate_covering_scan_count = self
+                    .hnsw_predicate_covering_scan_count
+                    .saturating_add(u64::from(kind == HnswExactScanKind::PredicateCovering));
             }
             HnswSearchPath::UnfilteredGraph => {
                 self.hnsw_unfiltered_graph_count =
@@ -116,15 +125,24 @@ impl SearchTelemetry {
                 self.hnsw_adaptive_graph_count = self.hnsw_adaptive_graph_count.saturating_add(1)
             }
         }
+        self.hnsw_deferred_beam_admission_count = self
+            .hnsw_deferred_beam_admission_count
+            .saturating_add(u64::from(
+                outcome.predicate_admission == HnswPredicateAdmissionMode::DeferredGlobalBeam,
+            ));
         self.hnsw_predicate_refinement_count = self
             .hnsw_predicate_refinement_count
             .saturating_add(u64::from(outcome.predicate_refined));
         self.hnsw_predicate_topology_count = self
             .hnsw_predicate_topology_count
             .saturating_add(u64::from(outcome.predicate_topology_used));
+        if outcome.exact_fallback == Some(HnswExactScanKind::PredicateCovering) {
+            self.hnsw_predicate_covering_scan_count =
+                self.hnsw_predicate_covering_scan_count.saturating_add(1);
+        }
         self.hnsw_exact_fallback_count = self
             .hnsw_exact_fallback_count
-            .saturating_add(u64::from(outcome.exact_fallback));
+            .saturating_add(u64::from(outcome.exact_fallback.is_some()));
     }
 }
 

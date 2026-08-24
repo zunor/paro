@@ -15,7 +15,9 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-use crate::index::hnsw::{HnswSearchOutcome, HnswSearchPath};
+use crate::index::hnsw::{
+    HnswExactScanKind, HnswPredicateAdmissionMode, HnswSearchOutcome, HnswSearchPath,
+};
 use crate::search::{SearchIndexKind, SEARCH_BUILD_LATENCY_BUCKETS_US, SEARCH_LATENCY_BUCKETS_US};
 
 pub const SEARCH_ROW_FETCH_LATENCY_BUCKET_COUNT: usize = SEARCH_LATENCY_BUCKETS_US.len() + 1;
@@ -411,6 +413,8 @@ pub struct StorageMetricsSnapshot {
     pub search_row_fetch_by_key: Vec<SearchRowFetchMetricsByKey>,
     pub search_hnsw_scored_points_total: u64,
     pub search_hnsw_exact_segment_searches_total: u64,
+    pub search_hnsw_predicate_covering_segment_scans_total: u64,
+    pub search_hnsw_deferred_beam_admission_segment_searches_total: u64,
     pub search_hnsw_unfiltered_graph_segment_searches_total: u64,
     pub search_hnsw_masked_graph_segment_searches_total: u64,
     pub search_hnsw_adaptive_graph_segment_searches_total: u64,
@@ -522,6 +526,8 @@ pub struct StorageMetrics {
     search_row_fetch_by_key: Mutex<BTreeMap<SearchRowFetchMetricKey, SearchRowFetchMetricCounters>>,
     search_hnsw_scored_points_total: AtomicU64,
     search_hnsw_exact_segment_searches_total: AtomicU64,
+    search_hnsw_predicate_covering_segment_scans_total: AtomicU64,
+    search_hnsw_deferred_beam_admission_segment_searches_total: AtomicU64,
     search_hnsw_unfiltered_graph_segment_searches_total: AtomicU64,
     search_hnsw_masked_graph_segment_searches_total: AtomicU64,
     search_hnsw_adaptive_graph_segment_searches_total: AtomicU64,
@@ -1183,17 +1189,33 @@ impl StorageMetrics {
     pub fn record_search_hnsw_work(&self, scored_points: u64, outcome: HnswSearchOutcome) {
         self.search_hnsw_scored_points_total
             .fetch_add(scored_points, Ordering::Relaxed);
-        match outcome.path {
-            HnswSearchPath::ExactScan => &self.search_hnsw_exact_segment_searches_total,
+        let graph_counter = match outcome.path {
+            HnswSearchPath::ExactScan(kind) => {
+                self.search_hnsw_exact_segment_searches_total
+                    .fetch_add(1, Ordering::Relaxed);
+                if kind == HnswExactScanKind::PredicateCovering {
+                    self.search_hnsw_predicate_covering_segment_scans_total
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                None
+            }
             HnswSearchPath::UnfilteredGraph => {
-                &self.search_hnsw_unfiltered_graph_segment_searches_total
+                Some(&self.search_hnsw_unfiltered_graph_segment_searches_total)
             }
-            HnswSearchPath::MaskedGraph => &self.search_hnsw_masked_graph_segment_searches_total,
+            HnswSearchPath::MaskedGraph => {
+                Some(&self.search_hnsw_masked_graph_segment_searches_total)
+            }
             HnswSearchPath::AdaptiveGraph => {
-                &self.search_hnsw_adaptive_graph_segment_searches_total
+                Some(&self.search_hnsw_adaptive_graph_segment_searches_total)
             }
+        };
+        if let Some(counter) = graph_counter {
+            counter.fetch_add(1, Ordering::Relaxed);
         }
-        .fetch_add(1, Ordering::Relaxed);
+        if outcome.predicate_admission == HnswPredicateAdmissionMode::DeferredGlobalBeam {
+            self.search_hnsw_deferred_beam_admission_segment_searches_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
         if outcome.predicate_refined {
             self.search_hnsw_predicate_refined_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
@@ -1202,7 +1224,11 @@ impl StorageMetrics {
             self.search_hnsw_predicate_topology_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if outcome.exact_fallback {
+        if outcome.exact_fallback == Some(HnswExactScanKind::PredicateCovering) {
+            self.search_hnsw_predicate_covering_segment_scans_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        if outcome.exact_fallback.is_some() {
             self.search_hnsw_exact_fallback_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
         }
@@ -1460,6 +1486,12 @@ impl StorageMetrics {
             search_hnsw_exact_segment_searches_total: self
                 .search_hnsw_exact_segment_searches_total
                 .load(Ordering::Relaxed),
+            search_hnsw_predicate_covering_segment_scans_total: self
+                .search_hnsw_predicate_covering_segment_scans_total
+                .load(Ordering::Relaxed),
+            search_hnsw_deferred_beam_admission_segment_searches_total: self
+                .search_hnsw_deferred_beam_admission_segment_searches_total
+                .load(Ordering::Relaxed),
             search_hnsw_unfiltered_graph_segment_searches_total: self
                 .search_hnsw_unfiltered_graph_segment_searches_total
                 .load(Ordering::Relaxed),
@@ -1613,6 +1645,10 @@ impl StorageMetrics {
             .store(0, Ordering::Relaxed);
         self.search_hnsw_exact_segment_searches_total
             .store(0, Ordering::Relaxed);
+        self.search_hnsw_predicate_covering_segment_scans_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_deferred_beam_admission_segment_searches_total
+            .store(0, Ordering::Relaxed);
         self.search_hnsw_unfiltered_graph_segment_searches_total
             .store(0, Ordering::Relaxed);
         self.search_hnsw_masked_graph_segment_searches_total
@@ -1744,9 +1780,10 @@ mod tests {
         m.record_search_hnsw_work(
             123,
             HnswSearchOutcome::new(HnswSearchPath::AdaptiveGraph)
+                .with_predicate_admission(HnswPredicateAdmissionMode::DeferredGlobalBeam)
                 .with_predicate_topology(true)
                 .with_predicate_refinement(true)
-                .with_exact_fallback(),
+                .with_exact_fallback(HnswExactScanKind::PredicateCovering),
         );
         m.add_column_read_by_rowids_page_run_seeks(3);
 
@@ -1769,6 +1806,11 @@ mod tests {
         assert_eq!(snap.delta_writer_commit_ns, 10);
         assert_eq!(snap.search_hnsw_scored_points_total, 123);
         assert_eq!(snap.search_hnsw_adaptive_graph_segment_searches_total, 1);
+        assert_eq!(snap.search_hnsw_predicate_covering_segment_scans_total, 1);
+        assert_eq!(
+            snap.search_hnsw_deferred_beam_admission_segment_searches_total,
+            1
+        );
         assert_eq!(
             snap.search_hnsw_predicate_topology_segment_searches_total,
             1

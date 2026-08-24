@@ -131,6 +131,16 @@ pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
         GLOBAL,
     ),
     SearchMetricDescriptor::counter(
+        "search_hnsw_predicate_covering_segment_scans_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_deferred_beam_admission_segment_searches_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
         "search_hnsw_unfiltered_graph_segment_searches_total",
         SearchMetricUnit::Count,
         GLOBAL,

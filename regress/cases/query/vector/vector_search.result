@@ -62,6 +62,7 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     build_seed = 7
     plain_scan_threshold = 0
     filtered_plain_scan_threshold = 8
+    filter_columns = 'id,bucket'
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
     inline_max_dimension = 3;
@@ -112,7 +113,9 @@ PROJECTION  (rows=2)
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
+    Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -133,7 +136,9 @@ PROJECTION  (rows=2)
     Pushed Predicate: id = 1
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 1
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
+    Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -154,7 +159,9 @@ PROJECTION  (rows=2)
     Pushed Predicate: id <= 9
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 9
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
+    Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 SELECT id FROM indexed_items
 WHERE id <= 9
@@ -184,18 +191,21 @@ id
 2
 
 PREPARE vector_topk(VECTOR(3)) AS
-    SELECT id FROM indexed_items ORDER BY emb <-> $1 LIMIT 2;
+    SELECT emb <-> $1 AS dist
+    FROM indexed_items
+    ORDER BY emb <-> $1
+    LIMIT 2;
 PREPARE
 
 EXECUTE vector_topk('[1.0, 1.0, 1.0]');
-id
-1976
-1742
+dist
+0.000000
+0.000000
 
 EXECUTE vector_topk('[2.0, 2.0, 2.0]');
-id
-1976
-1742
+dist
+1.732051
+1.732051
 
 DEALLOCATE vector_topk;
 DEALLOCATE
@@ -236,7 +246,9 @@ PROJECTION  (rows=2)
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
+    Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 DEALLOCATE filtered_vector_topk;
 DEALLOCATE

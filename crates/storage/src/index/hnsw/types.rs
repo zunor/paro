@@ -33,7 +33,12 @@ pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
-pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 3;
+pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 9 stores each scalar dictionary posting as an exact contiguous run
+/// inside its covering block. Exact scans no longer over-read neighboring
+/// ordinals or need a heuristic fallback to random base-vector gathers.
+/// Version 8 adds a scalar-block covering vector layout. Exact predicate scans
+/// read sequential artifact ranges instead of gathering base-column rows.
 /// Version 7 retains every scalar block's hierarchy and tagged entry point.
 /// Filtered navigation can enter each admitted block directly instead of
 /// relying on an ordinary level-0 beam to discover disconnected partitions.
@@ -47,7 +52,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 3;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 7;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 9;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -219,11 +224,28 @@ pub enum HnswQueryWideStrategy {
 /// Executed HNSW path. This is runtime evidence, not the strategy estimated by
 /// the optimizer or printed by plain EXPLAIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswExactScanKind {
+    BaseVectors,
+    PredicateCovering,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswSearchPath {
-    ExactScan,
+    ExactScan(HnswExactScanKind),
     UnfilteredGraph,
     MaskedGraph,
     AdaptiveGraph,
+}
+
+/// Predicate admission work actually performed by a graph search. This is
+/// orthogonal to graph topology and repair: broad predicates can validate the
+/// retained global beam once, while selective/adversarial predicates retain
+/// exact admission during candidate scoring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswPredicateAdmissionMode {
+    NotApplicable,
+    EagerPerCandidate,
+    DeferredGlobalBeam,
 }
 
 /// Mutually consistent runtime outcome for one segment/query search. Keeping
@@ -232,19 +254,26 @@ pub enum HnswSearchPath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSearchOutcome {
     pub path: HnswSearchPath,
+    pub predicate_admission: HnswPredicateAdmissionMode,
     pub predicate_topology_used: bool,
     pub predicate_refined: bool,
-    pub exact_fallback: bool,
+    pub exact_fallback: Option<HnswExactScanKind>,
 }
 
 impl HnswSearchOutcome {
     pub const fn new(path: HnswSearchPath) -> Self {
         Self {
             path,
+            predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
             predicate_topology_used: false,
             predicate_refined: false,
-            exact_fallback: false,
+            exact_fallback: None,
         }
+    }
+
+    pub const fn with_predicate_admission(mut self, admission: HnswPredicateAdmissionMode) -> Self {
+        self.predicate_admission = admission;
+        self
     }
 
     pub const fn with_predicate_topology(mut self, used: bool) -> Self {
@@ -257,8 +286,8 @@ impl HnswSearchOutcome {
         self
     }
 
-    pub const fn with_exact_fallback(mut self) -> Self {
-        self.exact_fallback = true;
+    pub const fn with_exact_fallback(mut self, kind: HnswExactScanKind) -> Self {
+        self.exact_fallback = Some(kind);
         self
     }
 }
@@ -281,41 +310,60 @@ impl HnswSearchResult {
 }
 
 impl HnswSearchStrategy {
-    /// Choose the segment execution contract from exact cardinalities.
-    /// Predicate graph searches are adaptive internally: the graph observes
-    /// the number of admitted points before deciding whether two-hop
-    /// predicate-aware refinement is necessary.
-    pub fn choose(
-        filter_kind: HnswFilterKind,
-        matching_rows: u64,
-        total_rows: u64,
-        policy: HnswSearchPolicy,
-    ) -> Self {
-        let matching_rows = matching_rows.min(total_rows);
+    fn graph_for_filter(filter_kind: HnswFilterKind) -> Self {
         match filter_kind {
-            HnswFilterKind::None => {
-                if total_rows <= policy.plain_scan_threshold as u64 {
-                    Self::ExactScan
-                } else {
-                    Self::UnfilteredGraph
-                }
-            }
-            HnswFilterKind::Visibility => {
-                if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
-                    Self::ExactScan
-                } else {
-                    Self::MaskedGraph
-                }
-            }
-            HnswFilterKind::Predicate => {
-                if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
-                    Self::ExactScan
-                } else {
-                    Self::AdaptiveFilteredGraph
-                }
-            }
+            HnswFilterKind::None => Self::UnfilteredGraph,
+            HnswFilterKind::Visibility => Self::MaskedGraph,
+            HnswFilterKind::Predicate => Self::AdaptiveFilteredGraph,
         }
     }
+}
+
+/// Hardware-independent work units used to lower a query-wide HNSW decision
+/// to one immutable segment.
+///
+/// A sequential vector score reads a contiguous artifact range and is much
+/// cheaper than a graph score, which follows an edge to an effectively random
+/// vector.  Keeping this ratio in the provider model makes the crossover
+/// explicit and lets the optimizer consume the same physical assumption.
+/// The dimension term cancels because both sides score the same vector type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswDistanceCostModel;
+
+impl HnswDistanceCostModel {
+    pub const SEQUENTIAL_SCORES_PER_RANDOM_SCORE: u64 = 8;
+
+    pub const fn sequential_work(candidate_rows: u64) -> u64 {
+        candidate_rows.div_ceil(Self::SEQUENTIAL_SCORES_PER_RANDOM_SCORE)
+    }
+
+    pub fn graph_work(total_rows: u64, effective_ef: usize, level0_degree: usize) -> u64 {
+        let navigation = total_rows.max(1).ilog2() as u64;
+        navigation.saturating_add(
+            (effective_ef.max(1) as u64).saturating_mul(level0_degree.max(1) as u64),
+        )
+    }
+
+    pub fn prefers_exact_scan(
+        candidate_rows: u64,
+        total_rows: u64,
+        effective_ef: usize,
+        level0_degree: usize,
+    ) -> bool {
+        Self::sequential_work(candidate_rows.min(total_rows))
+            <= Self::graph_work(total_rows, effective_ef, level0_degree)
+    }
+}
+
+/// Exact physical inputs needed to choose one segment execution path after
+/// the logical query-wide exact/graph decision has already been made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswSegmentSearchInput {
+    pub filter_kind: HnswFilterKind,
+    pub matching_rows: u64,
+    pub total_rows: u64,
+    pub effective_ef: usize,
+    pub level0_degree: usize,
 }
 
 impl HnswQueryWideStrategy {
@@ -344,17 +392,20 @@ impl HnswQueryWideStrategy {
     /// Lower the query-wide contract to one segment. When the whole query is
     /// not an exact scan, locally tiny segments may still choose exact scoring;
     /// doing so is exact and avoids wasting graph setup on a small tail.
-    pub fn for_segment(
-        self,
-        filter_kind: HnswFilterKind,
-        matching_rows: u64,
-        total_rows: u64,
-        policy: HnswSearchPolicy,
-    ) -> HnswSearchStrategy {
+    pub fn for_segment(self, input: HnswSegmentSearchInput) -> HnswSearchStrategy {
         match self {
             Self::ExactScan => HnswSearchStrategy::ExactScan,
             Self::SegmentAdaptive => {
-                HnswSearchStrategy::choose(filter_kind, matching_rows, total_rows, policy)
+                if HnswDistanceCostModel::prefers_exact_scan(
+                    input.matching_rows,
+                    input.total_rows,
+                    input.effective_ef,
+                    input.level0_degree,
+                ) {
+                    HnswSearchStrategy::ExactScan
+                } else {
+                    HnswSearchStrategy::graph_for_filter(input.filter_kind)
+                }
             }
         }
     }
@@ -919,16 +970,13 @@ mod tests {
     }
 
     #[test]
-    fn runtime_strategy_is_exact_or_adaptive_without_estimate_driven_cliffs() {
-        let policy = HnswSearchPolicy::default();
-        assert_eq!(
-            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_000, 10_000_000, policy,),
-            HnswSearchStrategy::ExactScan
-        );
-        assert_eq!(
-            HnswSearchStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
-            HnswSearchStrategy::AdaptiveFilteredGraph
-        );
+    fn segment_cost_compares_sequential_scoring_with_random_graph_work() {
+        assert!(HnswDistanceCostModel::prefers_exact_scan(
+            20_000, 2_000_000, 128, 32,
+        ));
+        assert!(!HnswDistanceCostModel::prefers_exact_scan(
+            84_800, 169_600, 128, 32,
+        ));
     }
 
     #[test]
@@ -947,12 +995,13 @@ mod tests {
             [(3_000, 2_000_000), (10_000, 7_000_000), (5_000, 1_000_000)]
         {
             assert_eq!(
-                query_strategy.for_segment(
-                    HnswFilterKind::Predicate,
+                query_strategy.for_segment(HnswSegmentSearchInput {
+                    filter_kind: HnswFilterKind::Predicate,
                     matching_rows,
-                    segment_rows,
-                    policy,
-                ),
+                    total_rows: segment_rows,
+                    effective_ef: 100,
+                    level0_degree: 32,
+                },),
                 HnswSearchStrategy::ExactScan
             );
         }
@@ -961,11 +1010,23 @@ mod tests {
             HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 1_000_000, 10_000_000, policy);
         assert_eq!(adaptive, HnswQueryWideStrategy::SegmentAdaptive);
         assert_eq!(
-            adaptive.for_segment(HnswFilterKind::Predicate, 10_000, 1_000_000, policy),
+            adaptive.for_segment(HnswSegmentSearchInput {
+                filter_kind: HnswFilterKind::Predicate,
+                matching_rows: 10_000,
+                total_rows: 1_000_000,
+                effective_ef: 100,
+                level0_degree: 32,
+            }),
             HnswSearchStrategy::ExactScan
         );
         assert_eq!(
-            adaptive.for_segment(HnswFilterKind::Predicate, 100_000, 1_000_000, policy),
+            adaptive.for_segment(HnswSegmentSearchInput {
+                filter_kind: HnswFilterKind::Predicate,
+                matching_rows: 100_000,
+                total_rows: 1_000_000,
+                effective_ef: 100,
+                level0_degree: 32,
+            }),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );
     }

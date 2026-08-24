@@ -10,7 +10,8 @@ use super::entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
 use super::graph_links::GraphLinks;
 use super::search_context::{FixedLengthPriorityQueue, SearchContext};
 use super::types::{
-    required_filtered_admissions, HnswM, PointOffset, ScoredPoint, SearchAlgorithm,
+    required_filtered_admissions, HnswM, HnswPredicateAdmissionMode, PointOffset, ScoredPoint,
+    SearchAlgorithm,
 };
 use super::visited_pool::VisitedPool;
 use super::VectorScorer;
@@ -47,6 +48,7 @@ pub struct GraphLayers {
 /// cardinality or latency.
 pub(crate) struct GraphSearchResult {
     pub(crate) points: Vec<ScoredPoint>,
+    pub(crate) predicate_admission: HnswPredicateAdmissionMode,
     pub(crate) predicate_topology_used: bool,
     pub(crate) predicate_refined: bool,
 }
@@ -127,6 +129,7 @@ impl GraphLayers {
         if top == 0 {
             return Ok(GraphSearchResult {
                 points: Vec::new(),
+                predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
                 predicate_topology_used: false,
                 predicate_refined: false,
             });
@@ -135,6 +138,7 @@ impl GraphLayers {
         let Some(entry_point) = self.select_entry_point(random_entry_point) else {
             return Ok(GraphSearchResult {
                 points: Vec::new(),
+                predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
                 predicate_topology_used: false,
                 predicate_refined: false,
             });
@@ -175,6 +179,7 @@ impl GraphLayers {
             return Ok((0..scorers.len())
                 .map(|_| GraphSearchResult {
                     points: Vec::new(),
+                    predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
                     predicate_topology_used: false,
                     predicate_refined: false,
                 })
@@ -202,6 +207,7 @@ impl GraphLayers {
                 )?),
                 None => results.push(GraphSearchResult {
                     points: Vec::new(),
+                    predicate_admission: HnswPredicateAdmissionMode::NotApplicable,
                     predicate_topology_used: false,
                     predicate_refined: false,
                 }),
@@ -250,70 +256,73 @@ impl GraphLayers {
         work: &SearchWorkBudget,
     ) -> Result<GraphSearchResult> {
         let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, work)?;
-        let (mut points, predicate_topology_used, predicate_refined) = match algorithm {
-            SearchAlgorithm::Hnsw => (
-                self.search_on_level(zero_level_entry, ef, scorer, work)?,
-                false,
-                false,
-            ),
-            SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => {
-                let adaptive = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
-                match filter {
-                    None => self.search_masked_topk(
-                        zero_level_entry,
-                        top,
-                        ef,
-                        scorer,
-                        |_| true,
-                        adaptive,
-                        predicate_partition_seeds,
-                        predicate_columns,
-                        use_predicate_topology,
-                        work,
-                    )?,
-                    Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
-                        zero_level_entry,
-                        top,
-                        ef,
-                        scorer,
-                        |row_id| bitmap.contains(row_id),
-                        adaptive,
-                        predicate_partition_seeds,
-                        predicate_columns,
-                        use_predicate_topology,
-                        work,
-                    )?,
-                    Some(ExactRowAdmission::Ordinal {
-                        row_ordinals,
-                        accepted_ordinals,
-                        accepts_null,
-                    }) => self.search_masked_topk(
-                        zero_level_entry,
-                        top,
-                        ef,
-                        scorer,
-                        |row_id| {
-                            row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
-                                if *ordinal == u16::MAX {
-                                    return accepts_null;
-                                }
-                                accepted_ordinals
-                                    .get(*ordinal as usize / 64)
-                                    .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
-                            })
-                        },
-                        adaptive,
-                        predicate_partition_seeds,
-                        predicate_columns,
-                        use_predicate_topology,
-                        work,
-                    )?,
+        let (mut points, predicate_admission, predicate_topology_used, predicate_refined) =
+            match algorithm {
+                SearchAlgorithm::Hnsw => (
+                    self.search_on_level(zero_level_entry, ef, scorer, work)?,
+                    HnswPredicateAdmissionMode::NotApplicable,
+                    false,
+                    false,
+                ),
+                SearchAlgorithm::MaskedTopK | SearchAlgorithm::AdaptiveFilteredTopK => {
+                    let adaptive = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
+                    match filter {
+                        None => self.search_masked_topk(
+                            zero_level_entry,
+                            top,
+                            ef,
+                            scorer,
+                            |_| true,
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            use_predicate_topology,
+                            work,
+                        )?,
+                        Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
+                            zero_level_entry,
+                            top,
+                            ef,
+                            scorer,
+                            |row_id| bitmap.contains(row_id),
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            use_predicate_topology,
+                            work,
+                        )?,
+                        Some(ExactRowAdmission::Ordinal {
+                            row_ordinals,
+                            accepted_ordinals,
+                            accepts_null,
+                        }) => self.search_masked_topk(
+                            zero_level_entry,
+                            top,
+                            ef,
+                            scorer,
+                            |row_id| {
+                                row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
+                                    if *ordinal == u16::MAX {
+                                        return accepts_null;
+                                    }
+                                    accepted_ordinals
+                                        .get(*ordinal as usize / 64)
+                                        .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
+                                })
+                            },
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            use_predicate_topology,
+                            work,
+                        )?,
+                    }
                 }
-            }
-        };
+            };
         points.truncate(top);
         Ok(GraphSearchResult {
             points,
+            predicate_admission,
             predicate_topology_used,
             predicate_refined,
         })
@@ -415,7 +424,7 @@ impl GraphLayers {
         predicate_columns: &[u32],
         use_predicate_topology: bool,
         work: &SearchWorkBudget,
-    ) -> Result<(Vec<ScoredPoint>, bool, bool)>
+    ) -> Result<(Vec<ScoredPoint>, HnswPredicateAdmissionMode, bool, bool)>
     where
         F: Fn(PointOffset) -> bool,
     {
@@ -429,6 +438,46 @@ impl GraphLayers {
         } else {
             ef
         };
+
+        // Broad predicates do not need membership checks and a second Top-K
+        // heap for every scored graph neighbor. First navigate a completely
+        // ordinary HNSW beam, then apply exact admission only to the retained
+        // global beam. If it contains the required local Top-K headroom, its
+        // admitted prefix is provably identical to the best admitted points
+        // among every phase-one score: every discarded point is worse than
+        // the global beam floor. This decision is based on observed results,
+        // not a selectivity estimate.
+        //
+        // An underfilled or non-local beam falls through to the existing eager
+        // admission traversal and predicate repair. The retry is deliberate:
+        // it preserves the complete admitted seed window for adversarially
+        // correlated predicates without allocating an ungoverned trace of all
+        // phase-one scores on the optimistic path.
+        if adaptive_predicate_refinement && !use_predicate_topology {
+            let mut seeds = self.search_on_level(entry_point, routing_ef, scorer, work)?;
+            let phase_one_floor = seeds.last().map_or(f32::MIN, |point| point.score);
+            let admission_capacity = seeds.len();
+            seeds.retain(|point| admits(point.idx));
+            let admission_window_full =
+                admission_capacity == routing_ef && seeds.len() == admission_capacity;
+            let should_retry = should_refine_predicate(
+                top,
+                admission_capacity,
+                seeds.len(),
+                admission_window_full,
+                seeds.get(top.saturating_sub(1)).map(|point| point.score),
+                phase_one_floor,
+            );
+            if seeds.len() >= top && !should_retry {
+                return Ok((
+                    seeds,
+                    HnswPredicateAdmissionMode::DeferredGlobalBeam,
+                    false,
+                    false,
+                ));
+            }
+        }
+
         let mut visited = self.visited_pool.get(self.links.num_points());
         let mut context = SearchContext::new(entry_point, routing_ef);
         // Preserve the routing beam's admitted candidates as diverse local
@@ -471,7 +520,12 @@ impl GraphLayers {
         // unfiltered beam catches geometry/predicate anti-correlation: one
         // nearby match plus K-1 distant matches must not suppress refinement.
         if !adaptive_predicate_refinement {
-            return Ok((seeds, false, false));
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                false,
+                false,
+            ));
         }
 
         // A persisted predicate-local topology is the primary filtered search
@@ -501,7 +555,12 @@ impl GraphLayers {
             (seeds, false, false)
         };
         if topology_window_full {
-            return Ok((seeds, predicate_topology_used, false));
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
         }
 
         let should_refine = should_refine_predicate(
@@ -515,13 +574,23 @@ impl GraphLayers {
             phase_one_floor,
         );
         if !should_refine {
-            return Ok((seeds, predicate_topology_used, false));
+            return Ok((
+                seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
         }
 
         let Some((&first, remaining)) = seeds.split_first() else {
             // No refinement was executed. The caller observes underfill and
             // performs the exact row-set fallback.
-            return Ok((Vec::new(), predicate_topology_used, false));
+            return Ok((
+                Vec::new(),
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                predicate_topology_used,
+                false,
+            ));
         };
 
         // Phase one already scored every point in `visited`. A matching point
@@ -589,6 +658,7 @@ impl GraphLayers {
 
         Ok((
             context.nearest.into_sorted_vec(),
+            HnswPredicateAdmissionMode::EagerPerCandidate,
             predicate_topology_used,
             true,
         ))

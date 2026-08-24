@@ -9,7 +9,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use roaring::RoaringBitmap;
+use seahash::SeaHasher;
 use std::collections::BTreeMap;
+use std::hash::Hasher;
 use std::io::Cursor;
 use std::sync::Arc;
 
@@ -50,6 +52,41 @@ pub struct BitmapIndexWriter {
     has_null: bool,
     /// Null bitmap
     null_bitmap: RoaringBitmap,
+}
+
+/// Value-boundary-preserving scalar block used by predicate-local vector
+/// artifacts. Dictionary ordinals retain the bitmap artifact's physical
+/// identity even though blocks themselves are ordered by SQL semantics.
+#[derive(Debug, Clone)]
+pub struct OrderedBitmapBlock {
+    pub dictionary_ordinals: Box<[u32]>,
+    /// Row cardinality of each ordinal run in `row_ids`. Runs are laid out in
+    /// the same SQL-scalar order as `dictionary_ordinals`, while row ids inside
+    /// one run retain their posting order.
+    pub ordinal_row_counts: Box<[u32]>,
+    pub ordinal_fingerprints: Box<[u64]>,
+    pub row_ids: Box<[u32]>,
+}
+
+/// Stable identity for one immutable segment-local posting.
+///
+/// The byte contract is part of the HNSW predicate-scan artifact format. Any
+/// change must bump that format version: covering scans compare this identity
+/// with the scalar bitmap index before trusting the persisted row range.
+pub(crate) fn posting_fingerprint_rows(
+    row_count: u64,
+    row_ids: impl IntoIterator<Item = u32>,
+) -> u64 {
+    let mut hasher = SeaHasher::new();
+    hasher.write(&row_count.to_le_bytes());
+    for row_id in row_ids {
+        hasher.write(&row_id.to_le_bytes());
+    }
+    hasher.finish()
+}
+
+pub(crate) fn posting_fingerprint(posting: &RoaringBitmap) -> u64 {
+    posting_fingerprint_rows(posting.len(), posting.iter())
 }
 
 impl BitmapIndexWriter {
@@ -123,10 +160,10 @@ impl BitmapIndexWriter {
         &self,
         logical_type: &LogicalType,
         target_rows: usize,
-    ) -> Result<Vec<Box<[u32]>>> {
-        let mut entries = self.value_to_rows.iter().collect::<Vec<_>>();
+    ) -> Result<Vec<OrderedBitmapBlock>> {
+        let mut entries = self.value_to_rows.iter().enumerate().collect::<Vec<_>>();
         let sort_error = std::cell::RefCell::new(None);
-        entries.sort_by(|(left, _), (right, _)| {
+        entries.sort_by(|(_, (left, _)), (_, (right, _))| {
             match crate::index::predicate::compare_bytes(logical_type, left, right) {
                 Ok(ordering) => ordering,
                 Err(error) => {
@@ -145,25 +182,58 @@ impl BitmapIndexWriter {
         let target_rows = target_rows.max(1);
         let mut blocks = Vec::new();
         let mut current = Vec::new();
-        for (_, posting) in entries {
+        let mut current_ordinals = Vec::new();
+        let mut current_counts = Vec::new();
+        let mut current_fingerprints = Vec::new();
+        for (ordinal, (_, posting)) in entries {
             if !current.is_empty() && current.len() >= target_rows {
-                current.sort_unstable();
-                blocks.push(std::mem::take(&mut current).into_boxed_slice());
+                blocks.push(OrderedBitmapBlock {
+                    dictionary_ordinals: std::mem::take(&mut current_ordinals).into_boxed_slice(),
+                    ordinal_row_counts: std::mem::take(&mut current_counts).into_boxed_slice(),
+                    ordinal_fingerprints: std::mem::take(&mut current_fingerprints)
+                        .into_boxed_slice(),
+                    row_ids: std::mem::take(&mut current).into_boxed_slice(),
+                });
             }
+            current_ordinals.push(u32::try_from(ordinal).map_err(|_| {
+                paro_error::configuration_limit_exceeded(
+                    "bitmap dictionary exceeds the u32 ordinal domain",
+                )
+            })?);
+            current_counts.push(u32::try_from(posting.len()).map_err(|_| {
+                paro_error::configuration_limit_exceeded(
+                    "bitmap posting cardinality exceeds the u32 row-id domain",
+                )
+            })?);
+            current_fingerprints.push(posting_fingerprint(posting));
             current.reserve(posting.len() as usize);
             current.extend(posting.iter());
         }
         if !current.is_empty() {
-            current.sort_unstable();
-            blocks.push(current.into_boxed_slice());
+            blocks.push(OrderedBitmapBlock {
+                dictionary_ordinals: current_ordinals.into_boxed_slice(),
+                ordinal_row_counts: current_counts.into_boxed_slice(),
+                ordinal_fingerprints: current_fingerprints.into_boxed_slice(),
+                row_ids: current.into_boxed_slice(),
+            });
         }
         if !self.null_bitmap.is_empty() {
-            blocks.push(
-                self.null_bitmap
+            blocks.push(OrderedBitmapBlock {
+                dictionary_ordinals: vec![u32::MAX].into_boxed_slice(),
+                ordinal_row_counts: vec![u32::try_from(self.null_bitmap.len()).map_err(|_| {
+                    paro_error::configuration_limit_exceeded(
+                        "bitmap NULL posting exceeds the u32 row-id domain",
+                    )
+                })?]
+                .into_boxed_slice(),
+                ordinal_fingerprints: vec![posting_fingerprint(&self.null_bitmap)]
+                    .into_boxed_slice(),
+                row_ids: self
+                    .null_bitmap
                     .iter()
                     .collect::<Vec<_>>()
                     .into_boxed_slice(),
-            );
+            });
         }
         Ok(blocks)
     }
@@ -254,7 +324,9 @@ pub struct BitmapIndexReader {
     /// lookup instead of materializing a query-wide union bitmap.
     row_ordinals: Option<Arc<[u16]>>,
     bitmap_cardinalities: Vec<u64>,
+    bitmap_fingerprints: Vec<u64>,
     null_cardinality: u64,
+    null_fingerprint: u64,
 }
 
 impl BitmapIndexReader {
@@ -350,11 +422,13 @@ impl BitmapIndexReader {
         let supports_ordinals = num_values < u16::MAX as usize;
         let mut row_ordinals = supports_ordinals.then(Vec::<u16>::new);
         let mut bitmap_cardinalities = Vec::with_capacity(serialized_bitmaps.len());
+        let mut bitmap_fingerprints = Vec::with_capacity(serialized_bitmaps.len());
         let mut bitmaps = Vec::with_capacity(serialized_bitmaps.len());
         let mut covered = RoaringBitmap::new();
         for (ordinal, bitmap) in serialized_bitmaps.iter().enumerate() {
             let posting = deserialize_bitmap_exact(bitmap)?;
             bitmap_cardinalities.push(posting.len());
+            bitmap_fingerprints.push(posting_fingerprint(&posting));
             if !covered.is_disjoint(&posting) {
                 return Err(paro_error::data_corrupted(
                     "BitmapIndexReader: row occurs in multiple postings",
@@ -377,6 +451,7 @@ impl BitmapIndexReader {
             .map(deserialize_bitmap_exact)
             .transpose()?;
         let null_cardinality = null_posting.as_ref().map_or(0, RoaringBitmap::len);
+        let null_fingerprint = null_posting.as_ref().map_or(0, posting_fingerprint);
         if let Some(posting) = null_posting.as_ref() {
             if !covered.is_disjoint(posting) {
                 return Err(paro_error::data_corrupted(
@@ -414,7 +489,9 @@ impl BitmapIndexReader {
             null_bitmap: null_posting.map(Arc::new),
             row_ordinals: row_ordinals.map(Arc::from),
             bitmap_cardinalities,
+            bitmap_fingerprints,
             null_cardinality,
+            null_fingerprint,
         })
     }
 
@@ -459,8 +536,16 @@ impl BitmapIndexReader {
         self.bitmap_cardinalities.get(ordinal).copied()
     }
 
+    pub(crate) fn bitmap_fingerprint(&self, ordinal: usize) -> Option<u64> {
+        self.bitmap_fingerprints.get(ordinal).copied()
+    }
+
     pub(crate) fn null_cardinality(&self) -> u64 {
         self.null_cardinality
+    }
+
+    pub(crate) fn null_fingerprint(&self) -> u64 {
+        self.null_fingerprint
     }
 
     pub(crate) fn bitmap(&self, ordinal: usize) -> Option<Arc<RoaringBitmap>> {
@@ -542,6 +627,7 @@ impl BitmapIndexReader {
                 .as_ref()
                 .map_or(0, |ordinals| ordinals.len() * std::mem::size_of::<u16>())
             + self.bitmap_cardinalities.len() * std::mem::size_of::<u64>()
+            + self.bitmap_fingerprints.len() * std::mem::size_of::<u64>()
     }
 }
 
@@ -718,6 +804,30 @@ mod tests {
         assert!(bitmap.contains(2)); // c
         assert!(bitmap.contains(3)); // d
         assert!(!bitmap.contains(4)); // e
+    }
+
+    #[test]
+    fn hnsw_filter_blocks_keep_each_dictionary_posting_contiguous() {
+        let mut writer = BitmapIndexWriter::new();
+        writer.add_value(b"b");
+        writer.add_value(b"a");
+        writer.add_value(b"b");
+        writer.add_value(b"a");
+
+        let blocks = writer
+            .ordered_hnsw_filter_blocks(&LogicalType::Varchar, 4)
+            .unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].dictionary_ordinals.as_ref(), &[0, 1]);
+        assert_eq!(blocks[0].ordinal_row_counts.as_ref(), &[2, 2]);
+        assert_eq!(
+            blocks[0].ordinal_fingerprints.as_ref(),
+            &[
+                posting_fingerprint(&RoaringBitmap::from_iter([1, 3])),
+                posting_fingerprint(&RoaringBitmap::from_iter([0, 2])),
+            ]
+        );
+        assert_eq!(blocks[0].row_ids.as_ref(), &[1, 3, 0, 2]);
     }
 
     #[test]

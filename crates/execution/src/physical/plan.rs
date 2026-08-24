@@ -978,14 +978,6 @@ fn push_dense_search_filter_properties(
         }
     }
 
-    // Runtime prepares exact segment row sets, sums their logical cardinality,
-    // and makes one query-wide decision. EXPLAIN describes that contract
-    // rather than predicting a path from a plan-time estimate.
-    let strategy = format!(
-        "query-wide runtime choice: exact row-set distance scan at <= {} total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with exact admission, hierarchical scalar-block topology for sparse compatible predicates, observed two-hop repair, and exact fallback",
-        spec.search_policy.filtered_plain_scan_threshold
-    );
-    push_string_property(properties, "Filtered Strategy", strategy);
     let predicate_columns = paro_storage::index::collect_predicate_columns(
         spec.predicate
             .as_ref()
@@ -1000,7 +992,28 @@ fn push_dense_search_filter_properties(
         .filter(|column| predicate_columns.contains(column))
         .map(|column| table_column_name(spec.table.as_ref(), column as usize))
         .collect::<Vec<_>>();
+    // Runtime prepares exact segment row sets, sums their logical cardinality,
+    // and makes one query-wide decision. EXPLAIN describes that contract
+    // rather than predicting a path from a plan-time estimate.
+    let exact_scan = if accelerated_columns.is_empty() {
+        "exact row-set distance scan"
+    } else {
+        "exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates"
+    };
+    let strategy = format!(
+        "query-wide runtime choice: {exact_scan} at <= {} total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback",
+        spec.search_policy.filtered_plain_scan_threshold
+    );
+    push_string_property(properties, "Filtered Strategy", strategy);
     if !accelerated_columns.is_empty() {
+        push_string_property(
+            properties,
+            "Exact Filter Scan",
+            format!(
+                "covering scalar-block vector ranges available for compatible single-column ordinal predicates on {}; base vector pages are not gathered",
+                accelerated_columns.join(", ")
+            ),
+        );
         push_string_property(
             properties,
             "Predicate Topology",

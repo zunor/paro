@@ -33,7 +33,9 @@ use crate::index::hnsw::{
     HnswBuildContract, HnswBuildStopCheck, HnswBuilder, HnswFilterBlocks, InMemoryVectorStorage,
     VectorStorage,
 };
-use crate::index::{BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions};
+use crate::index::{
+    BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions, OrderedBitmapBlock,
+};
 use crate::rowset::encoding::{
     get_encoding_registry, BinaryDictPageBuilder, BinaryPlainPageBuilder, BitShufflePageBuilder,
     FieldType, PlainPageBuilder, RlePageBuilder,
@@ -403,7 +405,7 @@ pub trait ColumnWriter: Send {
     /// Snapshot ordered scalar blocks for a predicate-local HNSW topology.
     /// Non-scalar writers and columns not admitted by the HNSW contract return
     /// `None`.
-    fn hnsw_filter_blocks(&self, _target_rows: usize) -> Result<Option<Vec<Box<[u32]>>>> {
+    fn hnsw_filter_blocks(&self, _target_rows: usize) -> Result<Option<Vec<OrderedBitmapBlock>>> {
         Ok(None)
     }
 
@@ -1405,7 +1407,7 @@ impl<W: DataWriter + 'static> ColumnWriter for ScalarColumnWriter<W> {
         self.writer.get_data()
     }
 
-    fn hnsw_filter_blocks(&self, target_rows: usize) -> Result<Option<Vec<Box<[u32]>>>> {
+    fn hnsw_filter_blocks(&self, target_rows: usize) -> Result<Option<Vec<OrderedBitmapBlock>>> {
         let Some(index) = self
             .bitmap_index
             .as_ref()

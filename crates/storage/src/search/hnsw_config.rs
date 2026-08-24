@@ -26,9 +26,9 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 5 adds explicit predicate-topology columns and durable block/degree
-/// parameters. Existing HNSW artifacts must be rebuilt.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 5;
+/// Version 7 makes scalar dictionary postings exact contiguous covering runs.
+/// Existing HNSW definitions and artifacts must be rebuilt.
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

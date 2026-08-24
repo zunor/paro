@@ -34,5 +34,10 @@
 mod bitmap_index;
 mod bound_index;
 
-pub use bitmap_index::{BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType};
+#[cfg(test)]
+pub(crate) use bitmap_index::posting_fingerprint;
+pub(crate) use bitmap_index::posting_fingerprint_rows;
+pub use bitmap_index::{
+    BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType, OrderedBitmapBlock,
+};
 pub use bound_index::BitmapIndex;

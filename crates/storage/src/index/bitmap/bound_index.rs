@@ -19,8 +19,8 @@ use crate::index::bound_index::BoundIndex;
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
-    ColumnId, ExactRowSet, Index, IndexAppendInfo, IndexBufferInfo, IndexConstraintType,
-    IndexStorageInfo, OrdinalRowSet,
+    ColumnId, ExactOrdinalPosting, ExactRowSet, Index, IndexAppendInfo, IndexBufferInfo,
+    IndexConstraintType, IndexStorageInfo, OrdinalRowSet,
 };
 
 use super::{BitmapIndexReader, BitmapIndexWriter};
@@ -312,14 +312,23 @@ impl BitmapIndex {
         let mut postings = Vec::new();
         for ordinal in accepted.iter() {
             cardinality = cardinality.saturating_add(self.reader.bitmap_cardinality(ordinal)?);
-            postings.push(self.reader.bitmap(ordinal)?);
+            postings.push(ExactOrdinalPosting::from_index(
+                u16::try_from(ordinal).ok()?,
+                self.reader.bitmap(ordinal)?,
+                self.reader.bitmap_fingerprint(ordinal)?,
+            ));
         }
         if accepts_null {
             if let Some(posting) = self.reader.null_bitmap() {
-                postings.push(posting);
+                postings.push(ExactOrdinalPosting::from_index(
+                    u16::MAX,
+                    posting,
+                    self.reader.null_fingerprint(),
+                ));
             }
         }
         Some(Arc::new(OrdinalRowSet::new(
+            self.column_ids[0],
             row_ordinals,
             accepted.into_words(),
             accepts_null,

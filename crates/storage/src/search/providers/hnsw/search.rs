@@ -8,7 +8,7 @@ use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
     HnswFilterKind, HnswIndex, HnswQueryWideStrategy, HnswSearchFilter, HnswSearchPolicy,
-    HnswSearchStrategy, PreparedQuery,
+    HnswSearchStrategy, HnswSegmentSearchInput, PreparedQuery,
 };
 use crate::index::ExactRowSet;
 use crate::index::MmapVectorStorage;
@@ -216,6 +216,8 @@ impl VectorSearchCursor {
             rows.saturating_add(segment.segment.num_rows())
         });
         let parallelism_slots = budget.parallelism_slots.max(1);
+        let effective_ef = self.search_policy.effective_ef(self.k, self.params.ef);
+        let level0_degree = self.expected_build_contract.m0 as usize;
 
         // Predicate cardinality is a logical query property, not a segment
         // property. Prepare exact row sets in parallel, retain them under the
@@ -274,7 +276,14 @@ impl VectorSearchCursor {
                         filters[index].row_set.as_ref(),
                         &predicate_columns,
                     );
-                    self.dispatch_segment_search(segment, query_wide_strategy, filter, budget)
+                    self.dispatch_segment_search(
+                        segment,
+                        query_wide_strategy,
+                        filter,
+                        effective_ef,
+                        level0_degree,
+                        budget,
+                    )
                 },
             )?,
             None => dispatch_segments(
@@ -294,7 +303,14 @@ impl VectorSearchCursor {
                         None => HnswSearchFilter::None,
                         Some(row_set) => HnswSearchFilter::Visibility(row_set),
                     };
-                    self.dispatch_segment_search(segment, query_wide_strategy, filter, budget)
+                    self.dispatch_segment_search(
+                        segment,
+                        query_wide_strategy,
+                        filter,
+                        effective_ef,
+                        level0_degree,
+                        budget,
+                    )
                 },
             )?,
         };
@@ -333,17 +349,20 @@ impl VectorSearchCursor {
         segment: &VisibleSegment,
         query_wide_strategy: HnswQueryWideStrategy,
         filter: HnswSearchFilter<'_>,
+        effective_ef: usize,
+        level0_degree: usize,
         budget: &ResourceBudget,
     ) -> Result<SegmentDispatchResult<(Vec<RankedRow>, bool, Option<String>)>> {
         let matching_rows = filter
             .row_set()
             .map_or(segment.segment.num_rows(), ExactRowSet::len);
-        let search_strategy = query_wide_strategy.for_segment(
-            filter.kind(),
+        let search_strategy = query_wide_strategy.for_segment(HnswSegmentSearchInput {
+            filter_kind: filter.kind(),
             matching_rows,
-            segment.segment.num_rows(),
-            self.search_policy,
-        );
+            total_rows: segment.segment.num_rows(),
+            effective_ef,
+            level0_degree,
+        });
         let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
         let degraded_reason = degraded
             .then(|| segment.segment.hnsw_rebuild_reason(self.storage_col_id))

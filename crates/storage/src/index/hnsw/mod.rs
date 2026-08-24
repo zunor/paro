@@ -20,6 +20,7 @@ pub mod healer;
 pub mod hnsw_builder;
 pub mod links_container;
 pub mod persistence;
+mod predicate_scan;
 pub mod scorer;
 pub mod search_context;
 pub mod types;
@@ -43,9 +44,10 @@ pub(crate) use hnsw_builder::hnsw_build_thread_count;
 pub use hnsw_builder::{configure_hnsw_build_threads, HnswBuildStopCheck, HnswBuilder};
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub use persistence::{
-    hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswFilterBlocks,
+    hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswFilterBlock, HnswFilterBlocks,
     HnswFilterColumnBlocks, HnswIndex,
 };
+pub use predicate_scan::PredicateScanLayout;
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;

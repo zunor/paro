@@ -35,7 +35,7 @@ use super::segment_format::{ColumnMeta, SegmentFooter};
 #[cfg(test)]
 use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::index::hnsw::{HnswBuildContract, HnswBuildStopCheck};
-use crate::index::hnsw::{HnswFilterBlocks, HnswFilterColumnBlocks};
+use crate::index::hnsw::{HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
 use crate::rowset::encoding::FieldType;
@@ -743,7 +743,15 @@ impl SegmentWriter {
                     })?;
                 columns.push(HnswFilterColumnBlocks {
                     column_id: filter_column_id,
-                    blocks: column_blocks,
+                    blocks: column_blocks
+                        .into_iter()
+                        .map(|block| HnswFilterBlock {
+                            dictionary_ordinals: block.dictionary_ordinals,
+                            ordinal_row_counts: block.ordinal_row_counts,
+                            ordinal_fingerprints: block.ordinal_fingerprints,
+                            point_ids: block.row_ids,
+                        })
+                        .collect(),
                 });
             }
             let vector_writer = self

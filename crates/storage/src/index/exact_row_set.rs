@@ -15,6 +15,50 @@ use std::sync::Arc;
 use paro_common::error::Result;
 use roaring::RoaringBitmap;
 
+use crate::tablet::ColumnId;
+
+/// One immutable scalar-dictionary posting. `ordinal` is the physical
+/// dictionary identity shared by the complete bitmap artifact and any
+/// covering vector-scan layout built from that artifact.
+#[derive(Debug, Clone)]
+pub struct ExactOrdinalPosting {
+    ordinal: u16,
+    rows: Arc<RoaringBitmap>,
+    fingerprint: u64,
+}
+
+impl ExactOrdinalPosting {
+    #[cfg(test)]
+    pub(crate) fn new(ordinal: u16, rows: Arc<RoaringBitmap>) -> Self {
+        let fingerprint = crate::index::bitmap::posting_fingerprint(&rows);
+        Self {
+            ordinal,
+            rows,
+            fingerprint,
+        }
+    }
+
+    pub(crate) fn from_index(ordinal: u16, rows: Arc<RoaringBitmap>, fingerprint: u64) -> Self {
+        Self {
+            ordinal,
+            rows,
+            fingerprint,
+        }
+    }
+
+    pub fn ordinal(&self) -> u16 {
+        self.ordinal
+    }
+
+    pub fn rows(&self) -> &RoaringBitmap {
+        &self.rows
+    }
+
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+}
+
 /// Borrowed admission kernel selected once at the graph-search boundary.
 ///
 /// Exact row sets remain extensible as owned query objects, but HNSW must not
@@ -33,21 +77,24 @@ pub enum ExactRowAdmission<'a> {
 
 /// Borrowed physical partitions of an exact row set.
 ///
-/// `DisjointPostings` is stronger than a generic iterator: every bitmap owns
+/// `OrdinalPostings` is stronger than a generic iterator: every bitmap owns
 /// a disjoint subset of the segment-local row-id domain. Exact distance scans
 /// may therefore score the postings independently and merge only their Top-K
 /// heaps, without materializing or sorting a query-sized candidate array.
 #[derive(Debug, Clone, Copy)]
 pub enum ExactRowPartitions<'a> {
     Single(&'a RoaringBitmap),
-    DisjointPostings(&'a [Arc<RoaringBitmap>]),
+    OrdinalPostings {
+        column_id: ColumnId,
+        postings: &'a [ExactOrdinalPosting],
+    },
 }
 
 impl ExactRowPartitions<'_> {
     pub fn len(self) -> usize {
         match self {
             Self::Single(_) => 1,
-            Self::DisjointPostings(postings) => postings.len(),
+            Self::OrdinalPostings { postings, .. } => postings.len(),
         }
     }
 
@@ -223,6 +270,7 @@ impl ExactRowSet for RoaringBitmap {
 /// row plus a query-specific accepted-ordinal bit set.
 #[derive(Debug)]
 pub struct OrdinalRowSet {
+    column_id: ColumnId,
     row_ordinals: Arc<[u16]>,
     accepted_ordinals: Box<[u64]>,
     accepts_null: bool,
@@ -230,18 +278,20 @@ pub struct OrdinalRowSet {
     /// Accepted dictionary postings are disjoint by the bitmap artifact
     /// completeness contract. Keeping shared decoded postings lets exact scans
     /// enumerate candidates without deserializing or unioning them per query.
-    postings: Box<[Arc<RoaringBitmap>]>,
+    postings: Box<[ExactOrdinalPosting]>,
 }
 
 impl OrdinalRowSet {
     pub(crate) fn new(
+        column_id: ColumnId,
         row_ordinals: Arc<[u16]>,
         accepted_ordinals: Box<[u64]>,
         accepts_null: bool,
         cardinality: u64,
-        postings: Box<[Arc<RoaringBitmap>]>,
+        postings: Box<[ExactOrdinalPosting]>,
     ) -> Self {
         Self {
+            column_id,
             row_ordinals,
             accepted_ordinals,
             accepts_null,
@@ -278,14 +328,14 @@ impl ExactRowSet for OrdinalRowSet {
     fn materialize(&self) -> RoaringBitmap {
         let mut bitmap = RoaringBitmap::new();
         for posting in &self.postings {
-            bitmap |= posting.as_ref();
+            bitmap |= posting.rows();
         }
         bitmap
     }
 
     fn try_for_each(&self, visitor: &mut dyn FnMut(u32) -> Result<()>) -> Result<()> {
         for posting in &self.postings {
-            for row_id in posting.iter() {
+            for row_id in posting.rows().iter() {
                 visitor(row_id)?;
             }
         }
@@ -297,7 +347,10 @@ impl ExactRowSet for OrdinalRowSet {
         batch: &mut [u32],
         visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
     ) -> Result<()> {
-        let row_ids = self.postings.iter().flat_map(|posting| posting.iter());
+        let row_ids = self
+            .postings
+            .iter()
+            .flat_map(|posting| posting.rows().iter());
         visit_row_ids_in_batches(row_ids, batch, visitor)
     }
 
@@ -308,20 +361,23 @@ impl ExactRowSet for OrdinalRowSet {
         let count = self.postings.len().min(limit);
         for slot in 0..count {
             let partition = slot.saturating_mul(self.postings.len()) / count;
-            if let Some(row_id) = self.postings[partition].iter().next() {
+            if let Some(row_id) = self.postings[partition].rows().iter().next() {
                 seeds.push(row_id);
             }
         }
     }
 
     fn physical_partitions(&self) -> ExactRowPartitions<'_> {
-        ExactRowPartitions::DisjointPostings(&self.postings)
+        ExactRowPartitions::OrdinalPostings {
+            column_id: self.column_id,
+            postings: &self.postings,
+        }
     }
 
     fn query_retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.accepted_ordinals.len() * std::mem::size_of::<u64>())
-            .saturating_add(self.postings.len() * std::mem::size_of::<Arc<RoaringBitmap>>())
+            .saturating_add(self.postings.len() * std::mem::size_of::<ExactOrdinalPosting>())
     }
 
     fn admission(&self) -> ExactRowAdmission<'_> {
@@ -365,11 +421,16 @@ mod tests {
         let first = Arc::new(RoaringBitmap::from_iter([1, 3, 5]));
         let second = Arc::new(RoaringBitmap::from_iter([8, 13]));
         let rows = OrdinalRowSet::new(
+            7,
             Arc::from([0_u16; 16]),
             vec![1].into_boxed_slice(),
             false,
             5,
-            vec![first, second].into_boxed_slice(),
+            vec![
+                ExactOrdinalPosting::new(0, first),
+                ExactOrdinalPosting::new(1, second),
+            ]
+            .into_boxed_slice(),
         );
         let mut batch = [0; 4];
         let mut batches = Vec::new();
@@ -385,12 +446,13 @@ mod tests {
     #[test]
     fn ordinal_partition_seeds_cover_disjoint_postings_and_sample_when_bounded() {
         let postings = [
-            Arc::new(RoaringBitmap::from_iter([1, 2])),
-            Arc::new(RoaringBitmap::from_iter([10, 11])),
-            Arc::new(RoaringBitmap::from_iter([20, 21])),
-            Arc::new(RoaringBitmap::from_iter([30, 31])),
+            ExactOrdinalPosting::new(0, Arc::new(RoaringBitmap::from_iter([1, 2]))),
+            ExactOrdinalPosting::new(1, Arc::new(RoaringBitmap::from_iter([10, 11]))),
+            ExactOrdinalPosting::new(2, Arc::new(RoaringBitmap::from_iter([20, 21]))),
+            ExactOrdinalPosting::new(3, Arc::new(RoaringBitmap::from_iter([30, 31]))),
         ];
         let rows = OrdinalRowSet::new(
+            7,
             Arc::from([0_u16; 32]),
             vec![1].into_boxed_slice(),
             false,

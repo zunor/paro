@@ -56,7 +56,12 @@ impl HnswIndexStatistics {
             .cosine_inverse_norms()
             .map(|norms| norms.len() as u64 * std::mem::size_of::<f32>() as u64)
             .unwrap_or(0);
-        let graph_size_bytes = graph_links_size + entry_points_size + metric_preprocessing_size;
+        let predicate_scan_size = index
+            .predicate_scan
+            .as_ref()
+            .map_or(0, |layout| layout.serialized_size_bytes() as u64);
+        let graph_size_bytes =
+            graph_links_size + entry_points_size + metric_preprocessing_size + predicate_scan_size;
         let storage_size_bytes =
             num_vectors as u64 * dim as u64 * std::mem::size_of::<f32>() as u64;
 

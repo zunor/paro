@@ -233,6 +233,69 @@ impl<'a> VectorScorer<'a> {
             .map(|(&idx, &score)| ScoredPoint { idx, score })
     }
 
+    /// Score global point identities from an alternate row-major covering
+    /// layout. `local_points` address rows in `vectors`; `global_points`
+    /// preserve table/HNSW identity for metric metadata and returned Top-K.
+    pub(crate) fn score_covering_points<'b>(
+        &'b mut self,
+        global_points: &'b [PointOffset],
+        local_points: &'b [PointOffset],
+        vectors: &'b [f32],
+    ) -> impl Iterator<Item = ScoredPoint> + 'b {
+        assert_eq!(global_points.len(), local_points.len());
+        assert_eq!(vectors.len() % self.dimension, 0);
+        self.scores_buffer.resize(global_points.len(), 0.0);
+        self.scored_points.set(
+            self.scored_points
+                .get()
+                .saturating_add(global_points.len() as u64),
+        );
+        let query = self.query.as_slice();
+        match self.kernel {
+            ScoringKernel::Cosine(norms) => {
+                for (position, (&global_point, &local_point)) in
+                    global_points.iter().zip(local_points.iter()).enumerate()
+                {
+                    let start = local_point as usize * self.dimension;
+                    self.scores_buffer[position] =
+                        distance::dot_product(query, &vectors[start..start + self.dimension])
+                            * norms.value(global_point);
+                }
+            }
+            ScoringKernel::Euclidean => {
+                distance::l2_squared_batch_indexed(
+                    query,
+                    vectors,
+                    self.dimension,
+                    local_points,
+                    &mut self.scores_buffer,
+                );
+                for score in &mut self.scores_buffer {
+                    *score = -*score;
+                }
+            }
+            ScoringKernel::DotProduct => {
+                for (position, &local_point) in local_points.iter().enumerate() {
+                    let start = local_point as usize * self.dimension;
+                    self.scores_buffer[position] =
+                        distance::dot_product(query, &vectors[start..start + self.dimension]);
+                }
+            }
+            ScoringKernel::Manhattan => {
+                for (position, &local_point) in local_points.iter().enumerate() {
+                    let start = local_point as usize * self.dimension;
+                    self.scores_buffer[position] =
+                        -distance::l1_distance(query, &vectors[start..start + self.dimension]);
+                }
+            }
+        }
+        let scores = &self.scores_buffer;
+        global_points
+            .iter()
+            .zip(scores.iter())
+            .map(|(&idx, &score)| ScoredPoint { idx, score })
+    }
+
     /// Score points with optional filtering and optional limit.
     pub fn score_points<'b>(
         &'b mut self,

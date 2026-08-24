@@ -72,7 +72,7 @@ pub use bound_index::{BoundIndex, DeltaIndexType, IndexAppendInfo, IndexAppendMo
 pub(crate) use bound_index::{PredicateIndexBinding, SegmentLocalComplete};
 pub use evaluator::IndexEvaluator;
 pub(crate) use exact_row_set::OrdinalRowSet;
-pub use exact_row_set::{ExactRowAdmission, ExactRowPartitions, ExactRowSet};
+pub use exact_row_set::{ExactOrdinalPosting, ExactRowAdmission, ExactRowPartitions, ExactRowSet};
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
 pub(crate) use fixed_membership::{
     FixedMembershipKind, FixedMembershipSet, FixedMembershipValue, FixedMembershipView,
@@ -113,7 +113,9 @@ pub use predicate_result::{
 
 // Re-export column indexes
 pub use bitmap::BitmapIndex;
-pub use bitmap::{BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType};
+pub use bitmap::{
+    BitmapIndexIterator, BitmapIndexReader, BitmapIndexWriter, BitmapType, OrderedBitmapBlock,
+};
 pub use bloom::BloomFilterIndex;
 pub use bloom::{
     BloomFilter, BloomFilterAlgorithm, BloomFilterIndexReader, BloomFilterIndexWriter,

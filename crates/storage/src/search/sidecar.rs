@@ -231,6 +231,8 @@ pub struct SidecarPackageWriter {
 }
 
 impl SidecarPackageWriter {
+    const ARTIFACT_ALIGNMENT: u64 = 64;
+
     fn create(table_data_dir: PathBuf, file_id: ArtifactFileId) -> Result<Self> {
         let final_path = table_data_dir.join(SidecarArtifactStore::package_relative_path(file_id));
         if final_path.exists() {
@@ -292,10 +294,30 @@ impl SidecarPackageWriter {
         let len = u64::try_from(bytes.len()).map_err(|_| {
             paro_error::invalid_input("search sidecar artifact length does not fit in u64")
         })?;
-        let offset = self.offset;
         let file = self.file.as_mut().ok_or_else(|| {
             paro_error::internal("cannot append to finalized search sidecar package")
         })?;
+        let offset = self
+            .offset
+            .checked_add(Self::ARTIFACT_ALIGNMENT - 1)
+            .map(|value| value / Self::ARTIFACT_ALIGNMENT * Self::ARTIFACT_ALIGNMENT)
+            .ok_or_else(|| paro_error::out_of_range("search sidecar artifact alignment"))?;
+        let padding = usize::try_from(offset - self.offset).map_err(|_| {
+            paro_error::out_of_range("search sidecar artifact padding exceeds usize")
+        })?;
+        if padding != 0 {
+            const ZEROES: [u8; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize] =
+                [0; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize];
+            file.write_all(&ZEROES[..padding]).map_err(|err| {
+                paro_error::io_error(format!(
+                    "align search sidecar artifact {}:{}+{}: {}",
+                    self.staging_path.display(),
+                    self.offset,
+                    padding,
+                    err
+                ))
+            })?;
+        }
         file.write_all(bytes).map_err(|err| {
             paro_error::io_error(format!(
                 "write search sidecar artifact {}:{}+{}: {}",
@@ -305,7 +327,7 @@ impl SidecarPackageWriter {
                 err
             ))
         })?;
-        self.offset = self.offset.saturating_add(len);
+        self.offset = offset.saturating_add(len);
         Ok(ArtifactLocation::SidecarArtifactFile {
             file_id: self.file_id,
             offset,
@@ -597,7 +619,7 @@ mod tests {
         let staging_path = writer.staging_path().to_path_buf();
         let final_path = writer.final_path().to_path_buf();
 
-        assert_eq!(writer.bytes_written(), 15);
+        assert_eq!(writer.bytes_written(), 74);
         assert!(staging_path.exists());
         writer.finalize().unwrap();
         assert!(final_path.exists());
@@ -626,7 +648,7 @@ mod tests {
                 assert_eq!(store.package_path(*first_file), final_path);
                 assert_eq!(*first_offset, 0);
                 assert_eq!(*first_len, 5);
-                assert_eq!(*second_offset, 5);
+                assert_eq!(*second_offset, SidecarPackageWriter::ARTIFACT_ALIGNMENT);
                 assert_eq!(*second_len, 10);
                 assert!(!SidecarArtifactStore::package_relative_path(file_id).is_absolute());
             }
@@ -804,6 +826,6 @@ mod tests {
         assert_eq!(series.counters.cache_misses_total, 2);
         assert_eq!(series.counters.cache_hits_total, 1);
         assert_eq!(series.counters.open_count_total, 1);
-        assert_eq!(series.counters.mmap_bytes, 20);
+        assert_eq!(series.counters.mmap_bytes, 79);
     }
 }
