@@ -136,6 +136,21 @@ pub(crate) struct SearchView {
 }
 
 impl SearchView {
+    pub(crate) fn hnsw_index_statistics(
+        &self,
+        column_id: ColumnId,
+    ) -> Option<crate::statistics::HnswIndexStatistics> {
+        self.definitions.values().find_map(|state| {
+            let capability = state.capability.as_ref()?;
+            if capability.kind != SearchIndexKind::Hnsw
+                || !state.definition.column_ids.contains(&column_id)
+            {
+                return None;
+            }
+            capability.generation_stats.hnsw_index_statistics()
+        })
+    }
+
     pub(crate) fn capability(
         &self,
         kind: SearchIndexKind,

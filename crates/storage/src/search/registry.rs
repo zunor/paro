@@ -317,6 +317,14 @@ impl SearchIndexRegistry {
         self.view.load().hnsw_search_policy(column_id, distance)
     }
 
+    pub(crate) fn hnsw_index_statistics(
+        &self,
+        column_id: ColumnId,
+    ) -> Option<crate::statistics::HnswIndexStatistics> {
+        self.ensure_fresh();
+        self.view.load().hnsw_index_statistics(column_id)
+    }
+
     pub(crate) fn hnsw_filter_topology(
         &self,
         column_id: ColumnId,
@@ -3487,6 +3495,11 @@ mod tests {
         assert_eq!(recovered_capability.definition_id, seed_definition_id);
         assert!(recovered_capability.coverage.is_complete());
         assert_eq!(recovered_capability.generation_stats.artifact_count, 1);
+        let recovered_stats = reopened
+            .hnsw_index_statistics(1)
+            .expect("recovered generation HNSW statistics");
+        assert_eq!(recovered_stats.num_indexed_vectors, 2);
+        assert_eq!(recovered_stats.dimension, 4);
         {
             let current = reopened.search_registry().view.load();
             let seed_state = current

@@ -77,6 +77,14 @@ impl TableHandle {
 
     /// Aggregate HNSW index statistics across visible rowsets.
     pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
+        // The immutable generation manifest is the physical source of truth:
+        // a generation-owned sidecar spans several segments and deliberately
+        // has no segment-local statistics entry. Inline-only low-level paths
+        // retain the segment aggregation below as a construction fallback
+        // when no generation has been published yet.
+        if let Some(stats) = self.search_registry.hnsw_index_statistics(column_id) {
+            return Some(stats);
+        }
         let visible = self.max_version();
         let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
 

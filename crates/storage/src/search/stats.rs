@@ -432,6 +432,25 @@ impl Default for HnswProviderStats {
 }
 
 impl HnswProviderStats {
+    /// Reconstruct the optimizer/runtime statistics image carried by the
+    /// generation manifest. Sidecar artifacts do not belong to any one base
+    /// segment, so segment-local statistics cannot represent this object.
+    pub fn index_statistics(&self) -> Option<HnswIndexStatistics> {
+        Some(HnswIndexStatistics {
+            num_indexed_vectors: usize::try_from(self.vector_count).ok()?,
+            dimension: usize::try_from(self.dimension).ok()?,
+            max_level: usize::try_from(self.max_level).ok()?,
+            m: usize::try_from(self.m).ok()?,
+            ef_construction: usize::try_from(self.ef_construction).ok()?,
+            graph_size_bytes: self.graph_memory_bytes,
+            storage_size_bytes: self.vector_storage_bytes,
+            total_graph_links: self.total_graph_links,
+            level0_graph_links: self.level0_graph_links,
+            max_level0_degree: self.max_level0_degree,
+            avg_level0_degree: self.avg_level0_degree,
+        })
+    }
+
     pub fn merge_assign(&mut self, incoming: &Self) {
         if self.dimension == 0 {
             self.dimension = incoming.dimension;
@@ -611,6 +630,10 @@ impl GenerationStats {
 
     pub fn hnsw_provider_stats(&self) -> Option<&HnswProviderStats> {
         self.provider_stats.as_ref()?.as_hnsw()
+    }
+
+    pub fn hnsw_index_statistics(&self) -> Option<HnswIndexStatistics> {
+        self.hnsw_provider_stats()?.index_statistics()
     }
 
     pub fn fulltext_global_stats(&self) -> Option<GlobalFullTextStats> {
@@ -1115,6 +1138,14 @@ mod tests {
         assert_eq!(hnsw.vector_count, 5);
         assert_eq!(hnsw.dimension, 64);
         assert_eq!(hnsw.estimated_total_memory_bytes(), 3328);
+        let index = stats
+            .hnsw_index_statistics()
+            .expect("generation HNSW index statistics");
+        assert_eq!(index.num_indexed_vectors, 5);
+        assert_eq!(index.dimension, 64);
+        assert_eq!(index.graph_size_bytes, 2048);
+        assert_eq!(index.storage_size_bytes, 1280);
+        assert!((index.avg_level0_degree - 11.2).abs() < 1e-6);
         assert!(stats.fulltext_provider_stats().is_none());
         assert!(stats.sparse_provider_stats().is_none());
     }
