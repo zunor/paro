@@ -101,7 +101,11 @@ impl<'a> VectorScorer<'a> {
             DistanceMetric::Manhattan => ScoringKernel::Manhattan,
         };
         let dimension = vector_storage.vector_dim();
-        let vectors = vector_storage.flat_vectors();
+        let vectors = vector_storage.contiguous_vectors().ok_or_else(|| {
+            paro_common::error::data_corrupted(
+                "HNSW query artifact does not expose a contiguous vector layout",
+            )
+        })?;
         let expected_values = vector_storage
             .num_vectors()
             .checked_mul(dimension)

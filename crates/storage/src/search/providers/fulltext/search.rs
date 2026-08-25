@@ -376,9 +376,6 @@ fn open_sidecar_fulltext_index(
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
         },
-        rowset_id: visible_segment.rowset_id,
-        segment_id: visible_segment.segment_id,
-        column_id,
     };
     runtime.get_or_try_open_decoded(request, |cached| {
         FullTextIndex::deserialize(cached.bytes()).map(Some)

@@ -244,7 +244,10 @@ fn segment_artifact(
         column_id,
         kind: definition.kind,
         provider_variant: definition.config_fingerprint as u32,
-        artifact_format_version: 1,
+        artifact_format_version: match definition.kind {
+            SearchIndexKind::Hnsw => crate::index::hnsw::HNSW_ARTIFACT_FORMAT_VERSION,
+            SearchIndexKind::Sparse | SearchIndexKind::FullText => 1,
+        },
         location: ArtifactLocation::Inline {
             page: SegmentPagePointer {
                 rowset_id,

@@ -7,10 +7,14 @@ previous artifacts. Recreate every HNSW/vector index from its
 The rebuild is required because the durable contract now:
 
 - stores only immutable graph-construction fields, separate from search policy;
-- uses the fixed-width HNSW artifact envelope version 9, with distance owned
-  solely by the build contract, no JSON in the open path, and an authenticated
-  hierarchy of 4 KiB payload checksums, 4 KiB checksum pages, and a compact
-  root directory for lazy random-access integrity verification;
+- uses the fixed-width, self-contained HNSW artifact envelope version 10. The
+  artifact owns its canonical dense-vector region as well as its graph,
+  predicate covering layout, metric preprocessing and statistics, so one
+  generation partition may cover several base segments without borrowing any
+  segment-local vector storage. Distance remains owned solely by the build
+  contract; there is no JSON in the open path. An authenticated hierarchy of
+  4 KiB payload checksums, 4 KiB checksum pages, and a compact root directory
+  protects lazy random access;
 - uses the version-2 hybrid CSR graph layout;
 - uses search manifest v2 (`json-debug-v2` and `binary-v2`), where every
   artifact carries canonical, generation-owned multi-segment coverage and its
@@ -21,6 +25,9 @@ The rebuild is required because the durable contract now:
   barrier publication, exact predicate-local covering runs, and the full
   configured construction beam on every graph layer;
 - persists per-point cosine inverse norms inside the HNSW artifact;
+- streams generation-owned sidecar envelopes directly into their aligned
+  package range. Construction no longer concatenates all source vectors or a
+  second complete serialized artifact in heap memory;
 - stores inline HNSW pages without block compression so graph links, inverse
   norms, and predicate topology open directly over the immutable segment mmap
   instead of pinning one page-cache allocation per segment. Inline and sidecar

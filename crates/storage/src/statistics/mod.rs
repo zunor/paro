@@ -43,7 +43,7 @@ pub use list_stats::{ListChildStats, ListStats, ListStatsData};
 pub use numeric_stats::{NumericStats, NumericStatsData, NumericValueUnion};
 pub use search_telemetry::{FullTextSearchTelemetry, HnswBatchTelemetry, SearchTelemetry};
 pub use segment_statistics::SegmentStatistics;
-pub(crate) use stats_trailer::{append_stats_trailer, split_stats_trailer};
+pub(crate) use stats_trailer::{append_stats_trailer, split_stats_trailer, write_stats_trailer};
 pub use string_stats::{StringStats, StringStatsData, MAX_STRING_MINMAX_SIZE};
 pub use struct_stats::StructStats;
 pub use table_statistics::{TableStatistics, TableStatisticsLock};

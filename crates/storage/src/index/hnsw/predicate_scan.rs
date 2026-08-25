@@ -9,6 +9,7 @@
 //! sequential artifact reads. The layout remains an HNSW artifact: table pages
 //! keep the SQL values and physical row order supplied by the writer.
 
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -594,52 +595,58 @@ impl PredicateScanLayout {
     }
 
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
-        let mut data = vec![0; PREDICATE_SCAN_HEADER_LEN];
-        data[0..4].copy_from_slice(&PREDICATE_SCAN_MAGIC);
-        data[4..8].copy_from_slice(&PREDICATE_SCAN_VERSION.to_le_bytes());
-        data[8..12].copy_from_slice(&(PREDICATE_SCAN_HEADER_LEN as u32).to_le_bytes());
-        data[12..16].copy_from_slice(
+        let mut data = Vec::with_capacity(self.serialized_len);
+        self.serialize_into(&mut data)?;
+        Ok(data)
+    }
+
+    pub(crate) fn serialize_into<W: Write>(&self, mut writer: W) -> Result<()> {
+        let metadata_len = Self::metadata_len(&self.columns)?;
+        let mut metadata = vec![0; PREDICATE_SCAN_HEADER_LEN];
+        metadata[0..4].copy_from_slice(&PREDICATE_SCAN_MAGIC);
+        metadata[4..8].copy_from_slice(&PREDICATE_SCAN_VERSION.to_le_bytes());
+        metadata[8..12].copy_from_slice(&(PREDICATE_SCAN_HEADER_LEN as u32).to_le_bytes());
+        metadata[12..16].copy_from_slice(
             &u32::try_from(self.dimension)
                 .map_err(|_| paro_error::out_of_range("predicate scan dimension exceeds u32"))?
                 .to_le_bytes(),
         );
-        data[16..20].copy_from_slice(
+        metadata[16..20].copy_from_slice(
             &u32::try_from(self.columns.len())
                 .map_err(|_| paro_error::out_of_range("predicate scan column count exceeds u32"))?
                 .to_le_bytes(),
         );
-        data[24..32].copy_from_slice(&(self.point_count as u64).to_le_bytes());
+        metadata[24..32].copy_from_slice(&(self.point_count as u64).to_le_bytes());
 
-        let metadata_len = Self::metadata_len(&self.columns)?;
-        data[32..40].copy_from_slice(&(metadata_len as u64).to_le_bytes());
-        data[40..48].copy_from_slice(&(self.serialized_len as u64).to_le_bytes());
+        metadata[32..40].copy_from_slice(&(metadata_len as u64).to_le_bytes());
+        metadata[40..48].copy_from_slice(&(self.serialized_len as u64).to_le_bytes());
 
         let mut payload_offset = metadata_len;
         for column in &self.columns {
-            data.extend_from_slice(&column.column_id.to_le_bytes());
-            data.extend_from_slice(
+            metadata.extend_from_slice(&column.column_id.to_le_bytes());
+            metadata.extend_from_slice(
                 &u32::try_from(column.ordinal_ranges.len())
                     .map_err(|_| {
                         paro_error::out_of_range("predicate scan ordinal count exceeds u32")
                     })?
                     .to_le_bytes(),
             );
-            data.extend_from_slice(
+            metadata.extend_from_slice(
                 &u32::try_from(column.blocks.len())
                     .map_err(|_| {
                         paro_error::out_of_range("predicate scan block count exceeds u32")
                     })?
                     .to_le_bytes(),
             );
-            data.extend_from_slice(&column.null_range.block_id.to_le_bytes());
-            data.extend_from_slice(&column.null_range.row_start.to_le_bytes());
-            data.extend_from_slice(&column.null_range.row_count.to_le_bytes());
-            data.extend_from_slice(&column.null_range.fingerprint.to_le_bytes());
+            metadata.extend_from_slice(&column.null_range.block_id.to_le_bytes());
+            metadata.extend_from_slice(&column.null_range.row_start.to_le_bytes());
+            metadata.extend_from_slice(&column.null_range.row_count.to_le_bytes());
+            metadata.extend_from_slice(&column.null_range.fingerprint.to_le_bytes());
             for range in column.ordinal_ranges.iter() {
-                data.extend_from_slice(&range.block_id.to_le_bytes());
-                data.extend_from_slice(&range.row_start.to_le_bytes());
-                data.extend_from_slice(&range.row_count.to_le_bytes());
-                data.extend_from_slice(&range.fingerprint.to_le_bytes());
+                metadata.extend_from_slice(&range.block_id.to_le_bytes());
+                metadata.extend_from_slice(&range.row_start.to_le_bytes());
+                metadata.extend_from_slice(&range.row_count.to_le_bytes());
+                metadata.extend_from_slice(&range.fingerprint.to_le_bytes());
             }
             for block in column.blocks.iter() {
                 let rows = block.rows();
@@ -657,38 +664,53 @@ impl PredicateScanLayout {
                 payload_offset = vectors_offset
                     .checked_add(vector_bytes)
                     .ok_or_else(|| paro_error::out_of_range("predicate scan vector payload"))?;
-                data.extend_from_slice(
+                metadata.extend_from_slice(
                     &u32::try_from(rows)
                         .map_err(|_| {
                             paro_error::out_of_range("predicate scan block rows exceed u32")
                         })?
                         .to_le_bytes(),
                 );
-                data.extend_from_slice(&0_u32.to_le_bytes());
-                data.extend_from_slice(&(row_ids_offset as u64).to_le_bytes());
-                data.extend_from_slice(&(vectors_offset as u64).to_le_bytes());
+                metadata.extend_from_slice(&0_u32.to_le_bytes());
+                metadata.extend_from_slice(&(row_ids_offset as u64).to_le_bytes());
+                metadata.extend_from_slice(&(vectors_offset as u64).to_le_bytes());
             }
         }
-        data.resize(metadata_len, 0);
+        metadata.resize(metadata_len, 0);
+        writer.write_all(&metadata)?;
+        let mut written = metadata.len();
         for column in &self.columns {
             for block_id in 0..column.blocks.len() {
                 let block = self.block_ref(column, block_id)?;
-                for row_id in block.row_ids() {
-                    data.extend_from_slice(&row_id.to_le_bytes());
+                #[cfg(target_endian = "little")]
+                {
+                    writer.write_all(bytemuck::cast_slice(block.row_ids()))?;
+                    writer.write_all(bytemuck::cast_slice(block.vectors()))?;
                 }
-                for value in block.vectors() {
-                    data.extend_from_slice(&value.to_le_bytes());
+                #[cfg(not(target_endian = "little"))]
+                {
+                    for row_id in block.row_ids() {
+                        writer.write_all(&row_id.to_le_bytes())?;
+                    }
+                    for value in block.vectors() {
+                        writer.write_all(&value.to_le_bytes())?;
+                    }
                 }
+                written = written
+                    .checked_add(block.row_ids().len() * std::mem::size_of::<PointOffset>())
+                    .and_then(|bytes| {
+                        bytes.checked_add(block.vectors().len() * std::mem::size_of::<f32>())
+                    })
+                    .ok_or_else(|| paro_error::out_of_range("predicate scan length overflow"))?;
             }
         }
-        if data.len() != self.serialized_len {
+        if written != self.serialized_len {
             return Err(paro_error::internal(format!(
                 "predicate scan encoder produced {} bytes, expected {}",
-                data.len(),
-                self.serialized_len
+                written, self.serialized_len
             )));
         }
-        Ok(data)
+        Ok(())
     }
 
     #[cfg(test)]

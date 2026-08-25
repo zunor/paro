@@ -547,7 +547,7 @@ impl SearchIndexRegistry {
                 .collect(),
             snapshot_version: self.tablet.max_version(),
         };
-        let estimate = builder.estimate_cost(&input);
+        let estimate = builder.estimate_cost(&input)?;
         let result = builder.build(
             input,
             &BuildBudget {
@@ -625,7 +625,7 @@ impl SearchIndexRegistry {
                 .collect(),
             snapshot_version: self.tablet.max_version(),
         };
-        let estimate = builder.estimate_cost(&input);
+        let estimate = builder.estimate_cost(&input)?;
         let result = builder.build(
             input,
             &BuildBudget {
@@ -5535,7 +5535,7 @@ mod tests {
     }
 
     #[test]
-    fn hnsw_tail_pending_maintenance_sweep_consumes_request_and_publishes_artifact() {
+    fn hnsw_tail_pending_maintenance_publishes_and_queries_one_multi_segment_partition() {
         let root = TempDir::new().unwrap();
         let table = create_table_without_default_indexes(
             root.path(),
@@ -5566,6 +5566,12 @@ mod tests {
                 2,
             )]))
             .unwrap();
+        table
+            .append(&test_chunk_from_vectors(vec![test_embedding_vector(
+                &[vec![2.0, 0.0], vec![0.0, 2.0]],
+                2,
+            )]))
+            .unwrap();
 
         {
             let current = table.search_registry().view.load();
@@ -5575,12 +5581,12 @@ mod tests {
                 .and_then(|state| state.manifest.as_ref())
                 .expect("tail-pending manifest");
             assert!(manifest.artifacts.artifacts.is_empty());
-            assert_eq!(manifest.tail_pending_entries.len(), 1);
+            assert_eq!(manifest.tail_pending_entries.len(), 2);
         }
 
         let report = table.search_registry().maintenance_sweep().unwrap();
         assert_eq!(report.definitions_updated, 1);
-        assert_eq!(report.catch_up_rowsets, 1);
+        assert_eq!(report.catch_up_rowsets, 2);
         let definition_report = report
             .definitions
             .iter()
@@ -5607,18 +5613,23 @@ mod tests {
             artifact.location,
             ArtifactLocation::SidecarArtifactFile { .. }
         ));
+        assert_eq!(artifact.coverage.segments().len(), 2);
+        assert_eq!(artifact.coverage.row_count(), 4);
         let provider_stats = manifest
             .root
             .generation_stats
             .hnsw_provider_stats()
             .expect("hnsw provider stats");
-        assert_eq!(provider_stats.vector_count, 2);
+        assert_eq!(provider_stats.vector_count, 4);
         assert_eq!(provider_stats.dimension, 2);
 
         let delta_entries = load_manifest_delta_entries(&table, 94);
         assert!(delta_entries
             .iter()
             .any(|entry| matches!(entry, ManifestDeltaEntry::CoverTail(TailEntryId(1)))));
+        assert!(delta_entries
+            .iter()
+            .any(|entry| matches!(entry, ManifestDeltaEntry::CoverTail(TailEntryId(2)))));
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
             ManifestDeltaEntry::AddArtifact(artifact) if artifact.kind == SearchIndexKind::Hnsw
@@ -5626,25 +5637,26 @@ mod tests {
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
             ManifestDeltaEntry::StatsDelta(SearchStatsDelta::Hnsw(delta))
-                if delta.vector_count == 2 && delta.dimension == 2
+                if delta.vector_count == 4 && delta.dimension == 2
         )));
 
         let rowsets = table
             .tablet()
             .capture_consistent_rowsets(table.max_version())
             .unwrap();
-        let segment = rowsets[0].segments()[0].clone();
-        assert!(
-            segment.hnsw_index(0).is_none(),
-            "HNSW TailOnly catch-up must not patch published segment footers"
-        );
+        for rowset in &rowsets {
+            assert!(
+                rowset.segments()[0].hnsw_index(0).is_none(),
+                "HNSW TailOnly catch-up must not patch published segment footers"
+            );
+        }
 
         let opened = table
             .open_vector_search_cursor(
                 0,
                 &[1.0, 0.0],
                 DistanceMetric::Euclidean,
-                2,
+                4,
                 SearchParams::default(),
                 None,
                 table.max_version(),
@@ -5657,11 +5669,23 @@ mod tests {
             preferred_bytes: 1 << 20,
         };
         let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 16, 2);
-        let mut returned = 0usize;
+        let mut returned = BTreeSet::new();
         while let SearchBatchState::Ready(batch) = cursor.next_batch(&batch, &mut budget).unwrap() {
-            returned += batch.len();
+            returned.extend(
+                batch
+                    .rows
+                    .into_iter()
+                    .map(|row| (row.rowset_id, row.segment_id, row.row_offset.get())),
+            );
         }
-        assert_eq!(returned, 2);
+        assert_eq!(returned.len(), 4);
+        assert_eq!(
+            returned
+                .iter()
+                .map(|(rowset_id, _, _)| *rowset_id)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([1, 2])
+        );
     }
 
     #[test]

@@ -6,7 +6,8 @@
 //! Save, load, serialize, and search HNSW indexes.
 
 use super::artifact_integrity::{
-    append_integrity_table, ArtifactIntegrity, ArtifactIntegrityBacking, IntegrityDescriptor,
+    append_integrity_table_streaming, ArtifactIntegrity, ArtifactIntegrityBacking,
+    IntegrityDescriptor,
 };
 use super::entry_points::EntryPoints;
 use super::graph::GraphLayers;
@@ -16,7 +17,9 @@ use super::predicate_scan::{
     PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
 };
 use super::search_context::FixedLengthPriorityQueue;
-use super::vector_storage::{CosineInverseNorms, IndexedVectorStorage, VectorStorage};
+use super::vector_storage::{
+    ArtifactVectorStorage, CosineInverseNorms, IndexedVectorStorage, VectorStorage,
+};
 use super::visited_pool::VisitedPool;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
@@ -32,7 +35,7 @@ use crate::metrics::storage_metrics;
 use crate::search::segment_dispatch::map_search_tasks;
 use crate::search::{ResourceBudget, SearchWorkBudget};
 use crate::statistics::{
-    append_stats_trailer, split_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics,
+    split_stats_trailer, write_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics,
     SearchTelemetry,
 };
 use bytes::Bytes;
@@ -43,21 +46,27 @@ use rayon::prelude::*;
 #[cfg(test)]
 use roaring::RoaringBitmap;
 use std::fs;
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 9;
-pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 176;
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 10;
+const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
+pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 192;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
-const HNSW_PRIMARY_COUNT_FIELD: usize = 56;
-const HNSW_EXTRA_COUNT_FIELD: usize = 60;
-const HNSW_INTEGRITY_OFFSET_FIELD: usize = 144;
-const HNSW_INTEGRITY_LEN_FIELD: usize = 152;
-const HNSW_ARTIFACT_LEN_FIELD: usize = 160;
-const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 168;
-const HNSW_HEADER_CHECKSUM_FIELD: usize = 172;
+const HNSW_VECTOR_COUNT_FIELD: usize = 56;
+const HNSW_VECTOR_DIM_FIELD: usize = 64;
+const HNSW_VECTOR_ENCODING_FIELD: usize = 68;
+const HNSW_PRIMARY_COUNT_FIELD: usize = 72;
+const HNSW_EXTRA_COUNT_FIELD: usize = 76;
+const HNSW_INTEGRITY_OFFSET_FIELD: usize = 160;
+const HNSW_INTEGRITY_LEN_FIELD: usize = 168;
+const HNSW_ARTIFACT_LEN_FIELD: usize = 176;
+const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 184;
+const HNSW_HEADER_CHECKSUM_FIELD: usize = 188;
+const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
 const MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy)]
@@ -289,6 +298,9 @@ fn decode_build_contract(header: &[u8]) -> Result<(HnswBuildContract, usize)> {
     };
     // Skip counts that precede the filter-topology contract.
     take_artifact_bytes(header, &mut offset, 8, "inverse norm count")?;
+    take_artifact_bytes(header, &mut offset, 8, "vector count")?;
+    take_artifact_bytes(header, &mut offset, 4, "vector dimension")?;
+    take_artifact_bytes(header, &mut offset, 4, "vector encoding")?;
     take_artifact_bytes(header, &mut offset, 4, "primary entry point count")?;
     take_artifact_bytes(header, &mut offset, 4, "extra entry point count")?;
     let filter_version = read_u32(&mut offset, "filter-topology version")?;
@@ -331,12 +343,42 @@ const fn distance_tag(distance: DistanceMetric) -> u8 {
     }
 }
 
-fn append_entry_points(data: &mut Vec<u8>, entries: &[super::EntryPoint]) -> Result<()> {
+fn write_f32_slice<W: Write>(writer: &mut W, values: &[f32]) -> Result<()> {
+    #[cfg(target_endian = "little")]
+    {
+        writer.write_all(bytemuck::cast_slice(values))?;
+    }
+    #[cfg(not(target_endian = "little"))]
+    {
+        write_f32_iter(writer, values.iter().copied())?;
+    }
+    Ok(())
+}
+
+fn write_f32_iter<W: Write>(writer: &mut W, values: impl Iterator<Item = f32>) -> Result<()> {
+    const BUFFER_VALUES: usize = 16 * 1024;
+    let mut buffer = vec![0u8; BUFFER_VALUES * std::mem::size_of::<f32>()];
+    let mut count = 0usize;
+    for value in values {
+        buffer[count * 4..count * 4 + 4].copy_from_slice(&value.to_le_bytes());
+        count += 1;
+        if count == BUFFER_VALUES {
+            writer.write_all(&buffer)?;
+            count = 0;
+        }
+    }
+    if count != 0 {
+        writer.write_all(&buffer[..count * std::mem::size_of::<f32>()])?;
+    }
+    Ok(())
+}
+
+fn append_entry_points<W: Write>(mut writer: W, entries: &[super::EntryPoint]) -> Result<()> {
     for entry in entries {
-        data.extend_from_slice(&entry.point_id.to_le_bytes());
+        writer.write_all(&entry.point_id.to_le_bytes())?;
         let level = u32::try_from(entry.level)
             .map_err(|_| error::out_of_range("HNSW entry-point level exceeds u32"))?;
-        data.extend_from_slice(&level.to_le_bytes());
+        writer.write_all(&level.to_le_bytes())?;
     }
     Ok(())
 }
@@ -373,15 +415,15 @@ fn read_entry_points(
 }
 
 fn append_predicate_entry_points(
-    data: &mut Vec<u8>,
+    mut writer: impl Write,
     entries: &[super::PredicateEntryPoint],
 ) -> Result<()> {
     for entry in entries {
-        data.extend_from_slice(&entry.column_id.to_le_bytes());
-        data.extend_from_slice(&entry.point_id.to_le_bytes());
+        writer.write_all(&entry.column_id.to_le_bytes())?;
+        writer.write_all(&entry.point_id.to_le_bytes())?;
         let level = u32::try_from(entry.level)
             .map_err(|_| error::out_of_range("HNSW predicate entry-point level exceeds u32"))?;
-        data.extend_from_slice(&level.to_le_bytes());
+        writer.write_all(&level.to_le_bytes())?;
     }
     Ok(())
 }
@@ -488,6 +530,46 @@ impl HnswArtifactBacking {
                 })?,
                 len,
             ),
+        }
+    }
+
+    fn vector_storage(
+        &self,
+        offset: usize,
+        len: usize,
+        dimension: usize,
+        count: usize,
+    ) -> Result<Arc<dyn VectorStorage>> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| error::data_corrupted("HNSW vector artifact range overflow"))?;
+        match self {
+            Self::Bytes(bytes) => {
+                let vector_bytes = bytes.get(offset..end).ok_or_else(|| {
+                    error::data_corrupted("HNSW vector artifact range exceeds byte backing")
+                })?;
+                ArtifactVectorStorage::from_bytes(vector_bytes, dimension, count)
+            }
+            Self::Mmap {
+                mmap,
+                offset: artifact_offset,
+                len: artifact_len,
+            } => {
+                if end > *artifact_len {
+                    return Err(error::data_corrupted(
+                        "HNSW vector artifact range exceeds mmap backing",
+                    ));
+                }
+                ArtifactVectorStorage::from_mmap_range(
+                    Arc::clone(mmap),
+                    artifact_offset.checked_add(offset).ok_or_else(|| {
+                        error::data_corrupted("HNSW vector artifact offset overflow")
+                    })?,
+                    len,
+                    dimension,
+                    count,
+                )
+            }
         }
     }
 
@@ -629,7 +711,7 @@ impl HnswIndex {
 
     /// Read the statistics embedded in a newly serialized HNSW artifact.
     ///
-    /// The integrity table follows the statistics trailer in artifact v9, so
+    /// The integrity table follows the statistics trailer in artifact v10, so
     /// generic "trailer at end of buffer" parsing is no longer valid. Writers
     /// use the artifact's authenticated fixed header to find the protected
     /// payload boundary instead of duplicating the envelope layout.
@@ -1196,6 +1278,20 @@ impl HnswIndex {
 
     /// Serialize HNSW index to a byte vector for embedding in segments.
     pub fn serialize(&self) -> Result<Vec<u8>> {
+        let mut cursor = Cursor::new(Vec::new());
+        self.serialize_into_seekable(&mut cursor, 0)?;
+        Ok(cursor.into_inner())
+    }
+
+    /// Stream one self-contained HNSW envelope into an already positioned
+    /// seekable artifact file. Only compact metadata/checksum tables are kept
+    /// in memory; vector, predicate-scan, and graph payloads are written from
+    /// their immutable source regions.
+    pub(crate) fn serialize_into_seekable<RW: Read + Write + Seek>(
+        &self,
+        writer: &mut RW,
+        artifact_start: u64,
+    ) -> Result<u64> {
         // Inline and sidecar generations are published from this envelope.
         // Run the expensive semantic verifier here, while the freshly built
         // graph is hot, instead of imposing O(E) work on every open.
@@ -1204,7 +1300,7 @@ impl HnswIndex {
             self.build_contract.filter_topology.is_enabled(),
             self.predicate_scan.as_ref(),
         ) {
-            (true, Some(layout)) => Some(layout.serialize()?),
+            (true, Some(layout)) => Some(layout),
             (false, None) => None,
             (true, None) => {
                 return Err(error::data_corrupted(
@@ -1217,123 +1313,154 @@ impl HnswIndex {
                 ))
             }
         };
-        let mut data = Vec::new();
-
-        data.extend_from_slice(&HNSW_ARTIFACT_MAGIC);
-        data.extend_from_slice(&HNSW_ARTIFACT_VERSION.to_le_bytes());
-        data.extend_from_slice(&(HNSW_ARTIFACT_HEADER_LEN as u32).to_le_bytes());
-        data.extend_from_slice(&self.build_contract.version.to_le_bytes());
-        data.extend_from_slice(&self.build_contract.m.to_le_bytes());
-        data.extend_from_slice(&self.build_contract.m0.to_le_bytes());
-        data.extend_from_slice(&self.build_contract.ef_construct.to_le_bytes());
-        data.push(distance_tag(self.build_contract.distance));
-        data.extend_from_slice(&[0; 3]);
-        data.extend_from_slice(&self.build_contract.build_seed.to_le_bytes());
-        data.extend_from_slice(&self.build_contract.proposal_wave_size.to_le_bytes());
-        data.extend_from_slice(&self.build_contract.warmup_point_count.to_le_bytes());
+        let predicate_scan_len =
+            predicate_scan.map_or(0, PredicateScanLayout::serialized_size_bytes);
+        let mut header = Vec::with_capacity(HNSW_ARTIFACT_HEADER_LEN);
+        header.extend_from_slice(&HNSW_ARTIFACT_MAGIC);
+        header.extend_from_slice(&HNSW_ARTIFACT_VERSION.to_le_bytes());
+        header.extend_from_slice(&(HNSW_ARTIFACT_HEADER_LEN as u32).to_le_bytes());
+        header.extend_from_slice(&self.build_contract.version.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.m.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.m0.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.ef_construct.to_le_bytes());
+        header.push(distance_tag(self.build_contract.distance));
+        header.extend_from_slice(&[0; 3]);
+        header.extend_from_slice(&self.build_contract.build_seed.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.proposal_wave_size.to_le_bytes());
+        header.extend_from_slice(&self.build_contract.warmup_point_count.to_le_bytes());
         let norm_count = self
             .vector_storage
             .cosine_inverse_norms()
             .map_or(0, CosineInverseNorms::len);
         let norms = self.vector_storage.cosine_inverse_norms();
-        data.extend_from_slice(&(norm_count as u64).to_le_bytes());
+        header.extend_from_slice(&(norm_count as u64).to_le_bytes());
+        let vector_count = u64::try_from(self.vector_storage.num_vectors())
+            .map_err(|_| error::out_of_range("HNSW vector count exceeds u64"))?;
+        let vector_dim = u32::try_from(self.vector_storage.vector_dim())
+            .map_err(|_| error::out_of_range("HNSW vector dimension exceeds u32"))?;
+        header.extend_from_slice(&vector_count.to_le_bytes());
+        header.extend_from_slice(&vector_dim.to_le_bytes());
+        header.extend_from_slice(&HNSW_VECTOR_ENCODING_F32_LE.to_le_bytes());
         let primary_count = u32::try_from(self.graph.entry_points.entry_points.len())
             .map_err(|_| error::out_of_range("too many HNSW primary entry points"))?;
         let extra_count = u32::try_from(self.graph.entry_points.extra_entry_points.len())
             .map_err(|_| error::out_of_range("too many HNSW extra entry points"))?;
-        data.extend_from_slice(&primary_count.to_le_bytes());
-        data.extend_from_slice(&extra_count.to_le_bytes());
+        header.extend_from_slice(&primary_count.to_le_bytes());
+        header.extend_from_slice(&extra_count.to_le_bytes());
         let filter_topology = self.build_contract.filter_topology;
-        data.extend_from_slice(&filter_topology.version.to_le_bytes());
-        data.extend_from_slice(&filter_topology.column_count.to_le_bytes());
+        header.extend_from_slice(&filter_topology.version.to_le_bytes());
+        header.extend_from_slice(&filter_topology.column_count.to_le_bytes());
         for column_id in filter_topology.column_ids {
-            data.extend_from_slice(&column_id.to_le_bytes());
+            header.extend_from_slice(&column_id.to_le_bytes());
         }
-        data.extend_from_slice(&filter_topology.target_block_rows.to_le_bytes());
-        data.extend_from_slice(&filter_topology.m.to_le_bytes());
+        header.extend_from_slice(&filter_topology.target_block_rows.to_le_bytes());
+        header.extend_from_slice(&filter_topology.m.to_le_bytes());
         let base_graph_len = self.graph.links.serialized_size_bytes();
         let predicate_graph_len = self
             .graph
             .predicate_links
             .as_ref()
             .map_or(0, GraphLinks::serialized_size_bytes);
-        data.extend_from_slice(&base_graph_len.to_le_bytes());
-        data.extend_from_slice(&predicate_graph_len.to_le_bytes());
+        header.extend_from_slice(&base_graph_len.to_le_bytes());
+        header.extend_from_slice(&predicate_graph_len.to_le_bytes());
         let predicate_entry_count = u64::try_from(self.graph.predicate_entry_points.len())
             .map_err(|_| error::out_of_range("too many HNSW predicate entry points"))?;
-        data.extend_from_slice(&predicate_entry_count.to_le_bytes());
-        let predicate_scan_len = predicate_scan.as_ref().map_or(0, Vec::len);
-        data.extend_from_slice(
+        header.extend_from_slice(&predicate_entry_count.to_le_bytes());
+        header.extend_from_slice(
             &u64::try_from(predicate_scan_len)
                 .map_err(|_| error::out_of_range("HNSW predicate scan length exceeds u64"))?
                 .to_le_bytes(),
         );
-        // Filled after the complete protected payload and its integrity table
-        // have been serialized.
-        data.extend_from_slice(&[0; 32]);
-        debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
+        header.extend_from_slice(&[0; 32]);
+        debug_assert_eq!(header.len(), HNSW_ARTIFACT_HEADER_LEN);
 
+        writer.seek(SeekFrom::Start(artifact_start))?;
+        writer.write_all(&header)?;
+        self.vector_storage
+            .try_for_each_contiguous_chunk(&mut |vectors| write_f32_slice(writer, vectors))?;
         if let Some(norms) = norms {
-            for norm in norms.iter() {
-                data.extend_from_slice(&norm.to_le_bytes());
-            }
+            write_f32_iter(writer, norms.iter())?;
         }
 
-        append_entry_points(&mut data, &self.graph.entry_points.entry_points)?;
-        append_entry_points(&mut data, &self.graph.entry_points.extra_entry_points)?;
-        append_predicate_entry_points(&mut data, &self.graph.predicate_entry_points)?;
+        append_entry_points(&mut *writer, &self.graph.entry_points.entry_points)?;
+        append_entry_points(&mut *writer, &self.graph.entry_points.extra_entry_points)?;
+        append_predicate_entry_points(&mut *writer, &self.graph.predicate_entry_points)?;
 
-        let predicate_scan_offset = aligned_offset(data.len(), 8)?;
-        data.resize(predicate_scan_offset, 0);
+        let relative_position = usize::try_from(
+            writer
+                .stream_position()?
+                .checked_sub(artifact_start)
+                .ok_or_else(|| error::internal("HNSW writer moved before artifact start"))?,
+        )
+        .map_err(|_| error::out_of_range("HNSW artifact position exceeds usize"))?;
+        let predicate_scan_offset = aligned_offset(relative_position, 8)?;
+        writer.write_all(&[0; 8][..predicate_scan_offset - relative_position])?;
         if let Some(predicate_scan) = predicate_scan {
-            data.extend_from_slice(&predicate_scan);
+            predicate_scan.serialize_into(&mut *writer)?;
         }
 
-        // Serialize graph links in binary form.
-        self.graph.links.serialize(&mut data)?;
+        self.graph.links.serialize(&mut *writer)?;
         if let Some(predicate_links) = &self.graph.predicate_links {
-            predicate_links.serialize(&mut data)?;
+            predicate_links.serialize(&mut *writer)?;
         }
 
-        // Append statistics trailer.
         let stats = HnswIndexStatistics::collect(self)?;
-        append_stats_trailer(&mut data, &stats.to_bytes())?;
-
-        let integrity = append_integrity_table(&mut data, HNSW_ARTIFACT_HEADER_LEN)?;
-        data[HNSW_INTEGRITY_OFFSET_FIELD..HNSW_INTEGRITY_OFFSET_FIELD + 8].copy_from_slice(
+        write_stats_trailer(&mut *writer, &stats.to_bytes())?;
+        let protected_end = usize::try_from(
+            writer
+                .stream_position()?
+                .checked_sub(artifact_start)
+                .ok_or_else(|| error::internal("HNSW writer moved before artifact start"))?,
+        )
+        .map_err(|_| error::out_of_range("HNSW artifact position exceeds usize"))?;
+        let integrity = append_integrity_table_streaming(
+            writer,
+            artifact_start,
+            HNSW_ARTIFACT_HEADER_LEN,
+            protected_end,
+        )?;
+        header[HNSW_INTEGRITY_OFFSET_FIELD..HNSW_INTEGRITY_OFFSET_FIELD + 8].copy_from_slice(
             &u64::try_from(integrity.offset)
                 .map_err(|_| error::out_of_range("HNSW integrity offset exceeds u64"))?
                 .to_le_bytes(),
         );
-        data[HNSW_INTEGRITY_LEN_FIELD..HNSW_INTEGRITY_LEN_FIELD + 8].copy_from_slice(
+        header[HNSW_INTEGRITY_LEN_FIELD..HNSW_INTEGRITY_LEN_FIELD + 8].copy_from_slice(
             &u64::try_from(integrity.len)
                 .map_err(|_| error::out_of_range("HNSW integrity length exceeds u64"))?
                 .to_le_bytes(),
         );
-        data[HNSW_ARTIFACT_LEN_FIELD..HNSW_ARTIFACT_LEN_FIELD + 8].copy_from_slice(
+        header[HNSW_ARTIFACT_LEN_FIELD..HNSW_ARTIFACT_LEN_FIELD + 8].copy_from_slice(
             &u64::try_from(integrity.artifact_len)
                 .map_err(|_| error::out_of_range("HNSW artifact length exceeds u64"))?
                 .to_le_bytes(),
         );
-        data[HNSW_INTEGRITY_CHECKSUM_FIELD..HNSW_INTEGRITY_CHECKSUM_FIELD + 4]
+        header[HNSW_INTEGRITY_CHECKSUM_FIELD..HNSW_INTEGRITY_CHECKSUM_FIELD + 4]
             .copy_from_slice(&integrity.checksum.to_le_bytes());
-        let header_checksum = crc32c::crc32c(&data[..HNSW_HEADER_CHECKSUM_FIELD]);
-        data[HNSW_HEADER_CHECKSUM_FIELD..HNSW_HEADER_CHECKSUM_FIELD + 4]
+        let header_checksum = crc32c::crc32c(&header[..HNSW_HEADER_CHECKSUM_FIELD]);
+        header[HNSW_HEADER_CHECKSUM_FIELD..HNSW_HEADER_CHECKSUM_FIELD + 4]
             .copy_from_slice(&header_checksum.to_le_bytes());
-
-        Ok(data)
+        writer.seek(SeekFrom::Start(artifact_start))?;
+        writer.write_all(&header)?;
+        let artifact_len = u64::try_from(integrity.artifact_len)
+            .map_err(|_| error::out_of_range("HNSW artifact length exceeds u64"))?;
+        writer.seek(SeekFrom::Start(
+            artifact_start
+                .checked_add(artifact_len)
+                .ok_or_else(|| error::out_of_range("HNSW artifact end offset overflow"))?,
+        ))?;
+        Ok(artifact_len)
     }
 
     /// Deserialize HNSW index from a byte buffer.
-    pub fn deserialize(data: &[u8], vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
-        Self::deserialize_bytes(Bytes::copy_from_slice(data), vector_storage)
+    pub fn deserialize(data: &[u8]) -> Result<Self> {
+        Self::deserialize_bytes(Bytes::copy_from_slice(data))
     }
 
     /// Deserialize an inline artifact while retaining its owned byte backing.
     /// Graph links and cosine norms become immutable slices of that backing,
     /// so open does not allocate memory proportional to the graph size.
-    pub fn deserialize_bytes(data: Bytes, vector_storage: Arc<dyn VectorStorage>) -> Result<Self> {
-        Self::deserialize_backing(HnswArtifactBacking::Bytes(data), vector_storage)
+    pub fn deserialize_bytes(data: Bytes) -> Result<Self> {
+        Self::deserialize_backing(HnswArtifactBacking::Bytes(data))
     }
 
     /// Deserialize a sidecar artifact directly over its package mmap.
@@ -1341,7 +1468,6 @@ impl HnswIndex {
         mmap: Arc<Mmap>,
         artifact_offset: usize,
         artifact_len: usize,
-        vector_storage: Arc<dyn VectorStorage>,
     ) -> Result<Self> {
         let end = artifact_offset
             .checked_add(artifact_len)
@@ -1351,20 +1477,14 @@ impl HnswIndex {
                 "HNSW artifact mmap range exceeds package length",
             ));
         }
-        Self::deserialize_backing(
-            HnswArtifactBacking::Mmap {
-                mmap,
-                offset: artifact_offset,
-                len: artifact_len,
-            },
-            vector_storage,
-        )
+        Self::deserialize_backing(HnswArtifactBacking::Mmap {
+            mmap,
+            offset: artifact_offset,
+            len: artifact_len,
+        })
     }
 
-    fn deserialize_backing(
-        backing: HnswArtifactBacking,
-        vector_storage: Arc<dyn VectorStorage>,
-    ) -> Result<Self> {
+    fn deserialize_backing(backing: HnswArtifactBacking) -> Result<Self> {
         let data = backing.as_bytes();
         let header = current_artifact_header(data)?;
         let expected_header_checksum = u32::from_le_bytes(
@@ -1386,6 +1506,28 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW inverse norm count exceeds usize"))?;
+        let vector_count = usize::try_from(u64::from_le_bytes(
+            header[HNSW_VECTOR_COUNT_FIELD..HNSW_VECTOR_COUNT_FIELD + 8]
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW vector count exceeds usize"))?;
+        let vector_dim = usize::try_from(u32::from_le_bytes(
+            header[HNSW_VECTOR_DIM_FIELD..HNSW_VECTOR_DIM_FIELD + 4]
+                .try_into()
+                .expect("u32 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW vector dimension exceeds usize"))?;
+        let vector_encoding = u32::from_le_bytes(
+            header[HNSW_VECTOR_ENCODING_FIELD..HNSW_VECTOR_ENCODING_FIELD + 4]
+                .try_into()
+                .expect("u32 width"),
+        );
+        if vector_encoding != HNSW_VECTOR_ENCODING_F32_LE {
+            return Err(error::data_corrupted(format!(
+                "unsupported HNSW vector encoding {vector_encoding}"
+            )));
+        }
         let primary_count = u32::from_le_bytes(
             header[HNSW_PRIMARY_COUNT_FIELD..HNSW_PRIMARY_COUNT_FIELD + 4]
                 .try_into()
@@ -1472,6 +1614,10 @@ impl HnswIndex {
             ));
         }
         let distance = build_contract.distance;
+        let vector_bytes = vector_count
+            .checked_mul(vector_dim)
+            .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| error::data_corrupted("HNSW vector byte length overflow"))?;
         let norm_bytes = norm_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
@@ -1486,10 +1632,15 @@ impl HnswIndex {
             .ok_or_else(|| error::data_corrupted("HNSW entry metadata length overflow"))?;
         integrity.verify_range(
             HNSW_ARTIFACT_HEADER_LEN,
-            norm_bytes
-                .checked_add(entry_bytes)
+            vector_bytes
+                .checked_add(norm_bytes)
+                .and_then(|bytes| bytes.checked_add(entry_bytes))
                 .ok_or_else(|| error::data_corrupted("HNSW metadata length overflow"))?,
         )?;
+        let vector_start = offset;
+        take_artifact_bytes(data, &mut offset, vector_bytes, "embedded vectors")?;
+        let vector_storage =
+            backing.vector_storage(vector_start, vector_bytes, vector_dim, vector_count)?;
         let norm_start = offset;
         take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?;
         let inverse_norms = backing.inverse_norms(norm_start, norm_bytes)?;
@@ -1505,6 +1656,11 @@ impl HnswIndex {
             }
         };
 
+        /*
+         * Vector and metric metadata are now entirely artifact-owned. Keep
+         * entry-point parsing after that ownership boundary so no caller can
+         * accidentally pair a graph with unrelated base-segment vectors.
+         */
         let entry_points = EntryPoints {
             entry_points: read_entry_points(data, &mut offset, primary_count)?,
             extra_entry_points: read_entry_points(data, &mut offset, extra_count)?,
@@ -2936,7 +3092,7 @@ mod tests {
         }));
 
         let artifact = index.serialize().unwrap();
-        let restored = HnswIndex::deserialize(&artifact, make_storage(&vectors)).unwrap();
+        let restored = HnswIndex::deserialize(&artifact).unwrap();
         assert_eq!(
             restored.graph.predicate_entry_points,
             index.graph.predicate_entry_points
@@ -3397,7 +3553,7 @@ mod tests {
         let before = index.search_one(&[5.0], 1, &params, None).unwrap();
 
         let data = index.serialize().unwrap();
-        let loaded = HnswIndex::deserialize(&data, storage).unwrap();
+        let loaded = HnswIndex::deserialize(&data).unwrap();
         let after = loaded.search_one(&[5.0], 1, &params, None).unwrap();
 
         assert_eq!(before[0].idx, after[0].idx);
@@ -3416,7 +3572,7 @@ mod tests {
 
         let mut legacy = bytes.clone();
         legacy[0] = 0;
-        assert!(HnswIndex::deserialize(&legacy, make_storage(&vectors))
+        assert!(HnswIndex::deserialize(&legacy)
             .err()
             .expect("legacy envelope must fail")
             .to_string()
@@ -3424,7 +3580,7 @@ mod tests {
 
         let mut unknown = bytes;
         unknown[4..8].copy_from_slice(&(HNSW_ARTIFACT_VERSION + 1).to_le_bytes());
-        assert!(HnswIndex::deserialize(&unknown, make_storage(&vectors))
+        assert!(HnswIndex::deserialize(&unknown)
             .err()
             .expect("unknown envelope version must fail")
             .to_string()
@@ -3448,7 +3604,7 @@ mod tests {
                 HNSW_BUILD_CONTRACT_VERSION - 1
             )
         );
-        let error = HnswIndex::deserialize(&bytes, make_storage(&vectors))
+        let error = HnswIndex::deserialize(&bytes)
             .err()
             .expect("stale topology algorithm must require rebuild");
         assert!(error.to_string().contains("build contract version"));
@@ -3471,7 +3627,7 @@ mod tests {
         assert_eq!(norms.value(2), 1.0);
 
         let bytes = index.serialize().unwrap();
-        let restored = HnswIndex::deserialize(&bytes, make_storage(&vectors)).unwrap();
+        let restored = HnswIndex::deserialize(&bytes).unwrap();
         assert!(restored.graph.links.is_bytes_backed());
         assert!(restored
             .vector_storage
@@ -3495,7 +3651,7 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_mmap_range_keeps_graph_and_norms_zero_copy() {
+    fn sidecar_mmap_range_keeps_vectors_graph_and_norms_zero_copy() {
         let vectors = vec![vec![3.0, 4.0], vec![1.0, 0.0], vec![0.0, 1.0]];
         let storage: Arc<dyn VectorStorage> = make_storage(&vectors);
         let index = HnswIndex::build(
@@ -3504,7 +3660,7 @@ mod tests {
             DistanceMetric::Cosine,
         );
         let artifact = index.serialize().unwrap();
-        let prefix_len = 19;
+        let prefix_len = HNSW_ARTIFACT_ALIGNMENT;
         let mut package = vec![0xA5; prefix_len];
         package.extend_from_slice(&artifact);
         package.extend_from_slice(&[0x5A; 11]);
@@ -3514,15 +3670,41 @@ mod tests {
         fs::write(&package_path, package).unwrap();
         let file = fs::File::open(package_path).unwrap();
         let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).unwrap() });
-        let restored =
-            HnswIndex::deserialize_mmap_range(mmap, prefix_len, artifact.len(), storage).unwrap();
+        let restored = HnswIndex::deserialize_mmap_range(mmap, prefix_len, artifact.len()).unwrap();
 
         assert!(restored.graph.links.is_mmap_backed());
+        assert!(restored.vector_storage.is_mmap_backed());
         assert!(restored
             .vector_storage
             .cosine_inverse_norms()
             .expect("cosine norms")
             .is_mmap_backed());
+    }
+
+    #[test]
+    fn seekable_envelope_writer_is_byte_identical_at_nonzero_offset() {
+        let vectors = vec![vec![3.0, 4.0], vec![1.0, 0.0], vec![0.0, 1.0]];
+        let index = HnswIndex::build(
+            make_storage(&vectors),
+            HnswConfig::new(8, 32),
+            DistanceMetric::Cosine,
+        );
+        let expected = index.serialize().unwrap();
+        let artifact_start = 64u64;
+        let mut cursor = Cursor::new(Vec::new());
+        let len = index
+            .serialize_into_seekable(&mut cursor, artifact_start)
+            .unwrap();
+
+        assert_eq!(len as usize, expected.len());
+        assert_eq!(
+            &cursor.get_ref()[artifact_start as usize..artifact_start as usize + len as usize],
+            expected.as_slice()
+        );
+        HnswIndex::deserialize(
+            &cursor.get_ref()[artifact_start as usize..artifact_start as usize + len as usize],
+        )
+        .unwrap();
     }
 
     #[test]

@@ -4,6 +4,7 @@
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
+use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -272,6 +273,7 @@ impl SidecarPackageWriter {
 
         let staging_path = staging_path_for(&final_path);
         let file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&staging_path)
@@ -348,6 +350,56 @@ impl SidecarPackageWriter {
             offset,
             len,
             checksum: seahash::hash(bytes),
+        })
+    }
+
+    pub(crate) fn append_streamed_artifact(
+        &mut self,
+        write_artifact: impl FnOnce(&mut File, u64) -> Result<()>,
+    ) -> Result<ArtifactLocation> {
+        let file = self.file.as_mut().ok_or_else(|| {
+            paro_error::internal("cannot append to finalized search sidecar package")
+        })?;
+        let offset = self
+            .offset
+            .checked_add(Self::ARTIFACT_ALIGNMENT - 1)
+            .map(|value| value / Self::ARTIFACT_ALIGNMENT * Self::ARTIFACT_ALIGNMENT)
+            .ok_or_else(|| paro_error::out_of_range("search sidecar artifact alignment"))?;
+        let padding = usize::try_from(offset - self.offset).map_err(|_| {
+            paro_error::out_of_range("search sidecar artifact padding exceeds usize")
+        })?;
+        if padding != 0 {
+            const ZEROES: [u8; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize] =
+                [0; SidecarPackageWriter::ARTIFACT_ALIGNMENT as usize];
+            file.seek(SeekFrom::Start(self.offset))?;
+            file.write_all(&ZEROES[..padding])?;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        write_artifact(file, offset)?;
+        let end = file.stream_position()?;
+        let len = end.checked_sub(offset).ok_or_else(|| {
+            paro_error::internal("streamed search sidecar writer moved before artifact start")
+        })?;
+
+        file.seek(SeekFrom::Start(offset))?;
+        let mut remaining = len;
+        let mut hasher = seahash::SeaHasher::new();
+        let mut buffer = vec![0u8; 64 * 1024];
+        while remaining != 0 {
+            let read_len = usize::try_from(remaining.min(buffer.len() as u64))
+                .map_err(|_| paro_error::out_of_range("sidecar hash chunk exceeds usize"))?;
+            file.read_exact(&mut buffer[..read_len])?;
+            hasher.write(&buffer[..read_len]);
+            remaining -= read_len as u64;
+        }
+        let checksum = hasher.finish();
+        file.seek(SeekFrom::Start(end))?;
+        self.offset = end;
+        Ok(ArtifactLocation::SidecarArtifactFile {
+            file_id: self.file_id,
+            offset,
+            len,
+            checksum,
         })
     }
 
@@ -440,9 +492,6 @@ pub struct SidecarReaderCacheKey {
 pub struct DecodedSidecarArtifactKey {
     pub sidecar: SidecarReaderCacheKey,
     pub provider: SearchIndexKind,
-    pub rowset_id: u64,
-    pub segment_id: u32,
-    pub column_id: u32,
 }
 
 /// One immutable provider reader lookup.
@@ -454,9 +503,6 @@ pub struct DecodedSidecarArtifactKey {
 #[derive(Debug, Clone, Copy)]
 pub struct DecodedSidecarReaderRequest<'a> {
     pub sidecar: SidecarReaderRequest<'a>,
-    pub rowset_id: u64,
-    pub segment_id: u32,
-    pub column_id: u32,
 }
 
 impl DecodedSidecarReaderRequest<'_> {
@@ -468,9 +514,6 @@ impl DecodedSidecarReaderRequest<'_> {
                 self.sidecar.integrity,
             )?,
             provider: self.sidecar.provider,
-            rowset_id: self.rowset_id,
-            segment_id: self.segment_id,
-            column_id: self.column_id,
         })
     }
 }
@@ -909,6 +952,43 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_package_writer_streams_aligned_artifact_and_derives_its_length() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let store = SidecarArtifactStore::new(temp_dir.path());
+        let file_id = SidecarArtifactStore::default_shard_file_id(8, 4);
+        let mut writer = store.create_package_writer(file_id).unwrap();
+        writer.append_artifact(b"prefix").unwrap();
+        let expected = (0..128 * 1024 + 17)
+            .map(|position| (position % 251) as u8)
+            .collect::<Vec<_>>();
+
+        let location = writer
+            .append_streamed_artifact(|file, offset| {
+                assert_eq!(file.stream_position().unwrap(), offset);
+                for chunk in expected.chunks(4093) {
+                    file.write_all(chunk)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        writer.finalize().unwrap();
+
+        let ArtifactLocation::SidecarArtifactFile {
+            offset,
+            len,
+            checksum,
+            ..
+        } = location
+        else {
+            panic!("expected streamed sidecar location");
+        };
+        assert_eq!(offset % SidecarPackageWriter::ARTIFACT_ALIGNMENT, 0);
+        assert_eq!(len, expected.len() as u64);
+        assert_eq!(checksum, seahash::hash(&expected));
+        assert_eq!(store.read_artifact(&location).unwrap(), expected);
+    }
+
+    #[test]
     fn sidecar_package_writer_drop_cleans_staging_without_final_package() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let store = SidecarArtifactStore::new(temp_dir.path());
@@ -1028,6 +1108,7 @@ mod tests {
     fn reader_runtime_reuses_typed_reader_and_evicts_with_physical_package() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        const TEST_CODEC: &str = "test-typed-reader-cache";
         let _metrics_guard = crate::metrics::storage_metrics_test_guard();
         storage_metrics().reset_for_tests();
         let temp_dir = tempfile::TempDir::new().unwrap();
@@ -1043,12 +1124,9 @@ mod tests {
                 location: &location,
                 artifact_format_version: 3,
                 provider: SearchIndexKind::Hnsw,
-                codec: SIDECAR_PACKAGE_CODEC,
+                codec: TEST_CODEC,
                 integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
             },
-            rowset_id: 41,
-            segment_id: 2,
-            column_id: 5,
         };
         let builds = AtomicUsize::new(0);
         let first = runtime
@@ -1076,8 +1154,7 @@ mod tests {
             .search_sidecar_reader_by_key
             .iter()
             .find(|series| {
-                series.key.provider == SearchIndexKind::Hnsw
-                    && series.key.codec == SIDECAR_PACKAGE_CODEC
+                series.key.provider == SearchIndexKind::Hnsw && series.key.codec == TEST_CODEC
             })
             .expect("typed reader physical-cache metrics");
         assert_eq!(series.counters.format_dispatch_total, 1);

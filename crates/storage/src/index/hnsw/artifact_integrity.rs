@@ -13,6 +13,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::{io::Read, io::Seek, io::SeekFrom, io::Write};
 
 use bytes::Bytes;
 use memmap2::Mmap;
@@ -497,6 +498,7 @@ impl ArtifactIntegrity {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn append_integrity_table(
     data: &mut Vec<u8>,
     protected_start: usize,
@@ -571,11 +573,133 @@ pub(crate) fn append_integrity_table(
     })
 }
 
+/// Append the integrity hierarchy without retaining the protected artifact in
+/// memory. The writer already contains one artifact at `artifact_start`; the
+/// protected range and returned descriptor are artifact-relative.
+pub(crate) fn append_integrity_table_streaming<RW: Read + Write + Seek>(
+    writer: &mut RW,
+    artifact_start: u64,
+    protected_start: usize,
+    protected_end: usize,
+) -> Result<IntegrityDescriptor> {
+    if protected_start > protected_end {
+        return Err(paro_error::internal(
+            "HNSW integrity protected range is inverted",
+        ));
+    }
+    let protected_len = protected_end - protected_start;
+    let chunk_count = protected_len.div_ceil(INTEGRITY_CHUNK_BYTES);
+    let mut checksums = Vec::with_capacity(chunk_count);
+    let mut chunk = vec![0u8; INTEGRITY_CHUNK_BYTES];
+    for chunk_index in 0..chunk_count {
+        let relative = protected_start
+            .checked_add(chunk_index.saturating_mul(INTEGRITY_CHUNK_BYTES))
+            .ok_or_else(|| paro_error::out_of_range("HNSW integrity chunk offset overflow"))?;
+        let len = INTEGRITY_CHUNK_BYTES.min(protected_end - relative);
+        writer.seek(SeekFrom::Start(
+            artifact_start
+                .checked_add(relative as u64)
+                .ok_or_else(|| paro_error::out_of_range("HNSW artifact offset overflow"))?,
+        ))?;
+        writer.read_exact(&mut chunk[..len])?;
+        checksums.push(crc32c::crc32c(&chunk[..len]));
+    }
+
+    let checksum_len = checksums
+        .len()
+        .checked_mul(INTEGRITY_CHECKSUM_BYTES)
+        .ok_or_else(|| paro_error::out_of_range("HNSW checksum table exceeds usize"))?;
+    let directory_count = checksum_len.div_ceil(INTEGRITY_CHECKSUM_PAGE_BYTES);
+    let directory_len = directory_count
+        .checked_mul(INTEGRITY_CHECKSUM_BYTES)
+        .ok_or_else(|| paro_error::out_of_range("HNSW integrity directory exceeds usize"))?;
+    let table_len = INTEGRITY_HEADER_LEN
+        .checked_add(checksum_len)
+        .and_then(|len| len.checked_add(directory_len))
+        .and_then(|len| len.checked_add(INTEGRITY_FOOTER_LEN))
+        .ok_or_else(|| paro_error::out_of_range("HNSW integrity table exceeds usize"))?;
+    let mut table = Vec::with_capacity(table_len);
+    table.extend_from_slice(&INTEGRITY_MAGIC.to_le_bytes());
+    table.extend_from_slice(&INTEGRITY_VERSION.to_le_bytes());
+    table.extend_from_slice(&(INTEGRITY_CHUNK_BYTES as u32).to_le_bytes());
+    table.extend_from_slice(&0u32.to_le_bytes());
+    table.extend_from_slice(
+        &u64::try_from(protected_start)
+            .map_err(|_| paro_error::out_of_range("HNSW protected offset exceeds u64"))?
+            .to_le_bytes(),
+    );
+    table.extend_from_slice(
+        &u64::try_from(protected_len)
+            .map_err(|_| paro_error::out_of_range("HNSW protected length exceeds u64"))?
+            .to_le_bytes(),
+    );
+    for checksum in checksums {
+        table.extend_from_slice(&checksum.to_le_bytes());
+    }
+    let directory_offset = table.len();
+    let checksum_offset = INTEGRITY_HEADER_LEN;
+    let checksum_end = checksum_offset + checksum_len;
+    for page in 0..directory_count {
+        let start = checksum_offset + page * INTEGRITY_CHECKSUM_PAGE_BYTES;
+        let end = start
+            .saturating_add(INTEGRITY_CHECKSUM_PAGE_BYTES)
+            .min(checksum_end);
+        table.extend_from_slice(&crc32c::crc32c(&table[start..end]).to_le_bytes());
+    }
+    table.extend_from_slice(&INTEGRITY_FOOTER_MAGIC.to_le_bytes());
+    table.extend_from_slice(&(INTEGRITY_CHECKSUM_PAGE_BYTES as u32).to_le_bytes());
+    table.extend_from_slice(
+        &u64::try_from(directory_count)
+            .map_err(|_| paro_error::out_of_range("HNSW integrity directory exceeds u64"))?
+            .to_le_bytes(),
+    );
+    debug_assert_eq!(table.len(), table_len);
+    let checksum = integrity_root_checksum(&table, directory_offset)?;
+    writer.seek(SeekFrom::Start(
+        artifact_start
+            .checked_add(protected_end as u64)
+            .ok_or_else(|| paro_error::out_of_range("HNSW artifact end offset overflow"))?,
+    ))?;
+    writer.write_all(&table)?;
+    Ok(IntegrityDescriptor {
+        offset: protected_end,
+        len: table.len(),
+        checksum,
+        artifact_len: protected_end
+            .checked_add(table.len())
+            .ok_or_else(|| paro_error::out_of_range("HNSW artifact length overflow"))?,
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
     use std::thread;
 
     use super::*;
+
+    #[test]
+    fn streaming_integrity_encoding_matches_in_memory_encoding() {
+        let payload = (0..INTEGRITY_CHUNK_BYTES * 3 + 17)
+            .map(|value| (value % 251) as u8)
+            .collect::<Vec<_>>();
+        let mut expected = payload.clone();
+        let expected_descriptor = append_integrity_table(&mut expected, 13).unwrap();
+
+        let mut cursor = Cursor::new(payload);
+        let payload_len = cursor.get_ref().len();
+        let actual_descriptor =
+            append_integrity_table_streaming(&mut cursor, 0, 13, payload_len).unwrap();
+
+        assert_eq!(actual_descriptor.offset, expected_descriptor.offset);
+        assert_eq!(actual_descriptor.len, expected_descriptor.len);
+        assert_eq!(actual_descriptor.checksum, expected_descriptor.checksum);
+        assert_eq!(
+            actual_descriptor.artifact_len,
+            expected_descriptor.artifact_len
+        );
+        assert_eq!(cursor.into_inner(), expected);
+    }
 
     #[test]
     fn verifies_only_touched_chunks_and_remembers_corruption() {

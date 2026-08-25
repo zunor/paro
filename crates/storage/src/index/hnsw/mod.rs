@@ -47,12 +47,13 @@ pub use links_container::{ItemsBuffer, LinksContainer};
 pub(crate) use persistence::{hnsw_artifact_build_contract, HNSW_ARTIFACT_HEADER_LEN};
 pub use persistence::{
     hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswFilterBlock, HnswFilterBlocks,
-    HnswFilterColumnBlocks, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
+    HnswFilterColumnBlocks, HnswIndex, HNSW_ARTIFACT_ALIGNMENT, HNSW_ARTIFACT_FORMAT_VERSION,
 };
 pub use predicate_scan::PredicateScanLayout;
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;
+pub(crate) use vector_storage::PartitionedVectorStorage;
 pub use vector_storage::{
     InMemoryVectorStorage, IndexedVectorStorage, MmapVectorStorage, SharedVectorStorage,
     VectorStorage,

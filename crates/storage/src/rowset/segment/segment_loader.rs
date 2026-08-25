@@ -12,12 +12,9 @@ use crate::index::hnsw::{
     hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
 };
 use crate::index::sparse::SparseVectorIndex;
-use crate::index::{
-    BitmapIndex, BloomFilterIndex, IndexConstraintType, MmapVectorStorage, PageRange,
-};
+use crate::index::{BitmapIndex, BloomFilterIndex, IndexConstraintType, PageRange};
 use crate::metrics::storage_metrics;
 use crate::rowset::column::OrdinalIndexReader;
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{CompressionType, PageFooter, PageIO, PagePointer, PageReadOptions};
 use crate::rowset::page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 use crate::rowset::segment_statistics::SegmentStatistics;
@@ -421,14 +418,12 @@ impl Segment {
                 ))
             })?;
 
-            let dim = if let LogicalType::Array(_, d) = col.logical_type {
-                d
-            } else {
+            if !matches!(col.logical_type, LogicalType::Array(_, _)) {
                 return Err(paro_error::data_corrupted(format!(
                     "HNSW index on non-vector column {} with type {:?}",
                     meta.column_id, col.logical_type
                 )));
-            };
+            }
 
             indexes.insert(
                 meta.column_id,
@@ -436,10 +431,6 @@ impl Segment {
                     page_pointer: meta
                         .hnsw_index_pointer
                         .expect("HNSW pointer checked by filter"),
-                    vector_data_offset: meta.data_page_pointer.offset
-                        + PLAIN_PAGE_HEADER_SIZE as u64,
-                    vector_data_len: meta.num_rows * dim as u64 * std::mem::size_of::<f32>() as u64,
-                    dimension: dim,
                     state: Mutex::new(DeferredHnswState::Unloaded),
                 }),
             );
@@ -482,7 +473,7 @@ impl Segment {
             let page = mmap.get(page_start..page_end).ok_or_else(|| {
                 paro_error::data_corrupted("inline HNSW page exceeds segment file")
             })?;
-            // HNSW v9 authenticates its fixed header and compact checksum
+            // HNSW v10 authenticates its fixed header and compact checksum
             // directory at open, then authenticates checksum pages and graph
             // chunks immediately before use.
             // Re-running the generic whole-page CRC here would fault every
@@ -510,17 +501,10 @@ impl Segment {
                     return Ok(None);
                 }
             }
-            let vector_storage = Arc::new(MmapVectorStorage::open_range(
-                &self.file_path,
-                deferred.vector_data_offset,
-                deferred.vector_data_len,
-                deferred.dimension,
-            )?);
             let index = Arc::new(HnswIndex::deserialize_mmap_range(
                 mmap,
                 page_start,
                 artifact_len,
-                vector_storage,
             )?);
             let statistics = index.persisted_statistics().cloned().ok_or_else(|| {
                 paro_error::data_corrupted("HNSW artifact is missing persisted statistics")

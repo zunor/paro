@@ -4,6 +4,7 @@
 //! Stats trailer helpers for persisting optional statistics blobs.
 
 use paro_common::error::{self as paro_error, Result};
+use std::io::Write;
 
 pub(crate) const STATS_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"STAT");
 
@@ -11,14 +12,18 @@ pub(crate) const STATS_TRAILER_MAGIC: u32 = u32::from_le_bytes(*b"STAT");
 ///
 /// Layout: [stats bytes][len:u32][magic:u32]
 pub(crate) fn append_stats_trailer(buf: &mut Vec<u8>, stats_bytes: &[u8]) -> Result<()> {
+    write_stats_trailer(buf, stats_bytes)
+}
+
+pub(crate) fn write_stats_trailer<W: Write>(mut writer: W, stats_bytes: &[u8]) -> Result<()> {
     if stats_bytes.is_empty() {
         return Ok(());
     }
     let len = u32::try_from(stats_bytes.len())
         .map_err(|_| paro_error::out_of_range("stats trailer too large"))?;
-    buf.extend_from_slice(stats_bytes);
-    buf.extend_from_slice(&len.to_le_bytes());
-    buf.extend_from_slice(&STATS_TRAILER_MAGIC.to_le_bytes());
+    writer.write_all(stats_bytes)?;
+    writer.write_all(&len.to_le_bytes())?;
+    writer.write_all(&STATS_TRAILER_MAGIC.to_le_bytes())?;
     Ok(())
 }
 

@@ -174,7 +174,7 @@ impl fmt::Debug for SearchInlineBuilderSet {
 }
 
 pub trait SidecarArtifactBuilder: Send + Sync {
-    fn estimate_cost(&self, input: &SidecarBuildInput) -> CostEstimate;
+    fn estimate_cost(&self, input: &SidecarBuildInput) -> Result<CostEstimate>;
 
     fn build(
         &self,

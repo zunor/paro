@@ -10,7 +10,8 @@
 //! few thousand candidates. This interface keeps exactness while allowing an
 //! index-native membership representation.
 
-use std::sync::Arc;
+use std::ops::Range;
+use std::sync::{Arc, OnceLock};
 
 use paro_common::error::Result;
 use roaring::RoaringBitmap;
@@ -73,6 +74,8 @@ pub enum ExactRowAdmission<'a> {
         accepted_ordinals: &'a [u64],
         accepts_null: bool,
     },
+    Dense(u32),
+    Partitioned(&'a PartitionExactRowSet),
 }
 
 /// Borrowed physical partitions of an exact row set.
@@ -120,6 +123,8 @@ impl ExactRowAdmission<'_> {
                     .get(*ordinal as usize / 64)
                     .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
             }),
+            Self::Dense(domain_len) => row_id < domain_len,
+            Self::Partitioned(row_set) => row_set.contains(row_id),
         }
     }
 }
@@ -198,6 +203,213 @@ pub trait ExactRowSet: std::fmt::Debug + Send + Sync {
     /// deliberately separate from [`Self::contains`]: generic consumers may
     /// use the trait method, while HNSW resolves dynamic dispatch once.
     fn admission(&self) -> ExactRowAdmission<'_>;
+}
+
+/// Exact all-row membership without materializing a dense bitmap.
+#[derive(Debug)]
+pub struct DenseRowSet {
+    domain_len: u32,
+    materialized: OnceLock<RoaringBitmap>,
+}
+
+impl DenseRowSet {
+    pub fn new(domain_len: u32) -> Self {
+        Self {
+            domain_len,
+            materialized: OnceLock::new(),
+        }
+    }
+
+    fn materialized(&self) -> &RoaringBitmap {
+        self.materialized.get_or_init(|| {
+            let mut rows = RoaringBitmap::new();
+            rows.insert_range(0..self.domain_len);
+            rows
+        })
+    }
+}
+
+impl ExactRowSet for DenseRowSet {
+    fn len(&self) -> u64 {
+        u64::from(self.domain_len)
+    }
+
+    fn contains(&self, row_id: u32) -> bool {
+        row_id < self.domain_len
+    }
+
+    fn domain_len(&self) -> usize {
+        self.domain_len as usize
+    }
+
+    fn materialize(&self) -> RoaringBitmap {
+        self.materialized().clone()
+    }
+
+    fn try_for_each(&self, visitor: &mut dyn FnMut(u32) -> Result<()>) -> Result<()> {
+        for row_id in 0..self.domain_len {
+            visitor(row_id)?;
+        }
+        Ok(())
+    }
+
+    fn append_partition_seeds(&self, limit: usize, seeds: &mut Vec<u32>) {
+        if limit == 0 || self.domain_len == 0 {
+            return;
+        }
+        let count = (self.domain_len as usize).min(limit);
+        for slot in 0..count {
+            seeds.push(((slot as u64 * u64::from(self.domain_len)) / count as u64) as u32);
+        }
+    }
+
+    fn physical_partitions(&self) -> ExactRowPartitions<'_> {
+        ExactRowPartitions::Single(self.materialized())
+    }
+
+    fn query_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+    }
+
+    fn admission(&self) -> ExactRowAdmission<'_> {
+        ExactRowAdmission::Dense(self.domain_len)
+    }
+}
+
+#[derive(Debug)]
+struct PartitionExactRowSetPart {
+    range: Range<u32>,
+    row_set: Arc<dyn ExactRowSet>,
+}
+
+/// Exact membership over a canonical concatenation of segment-local domains.
+///
+/// Graph navigation resolves membership through the constituent row sets
+/// without building a query-wide bitmap. Exact-scan paths materialize the
+/// shifted union lazily and at most once.
+#[derive(Debug)]
+pub struct PartitionExactRowSet {
+    parts: Box<[PartitionExactRowSetPart]>,
+    cardinality: u64,
+    domain_len: u32,
+    materialized: OnceLock<RoaringBitmap>,
+}
+
+impl PartitionExactRowSet {
+    pub fn try_new(parts: Vec<(Range<u32>, Arc<dyn ExactRowSet>)>) -> Result<Self> {
+        if parts.is_empty() {
+            return Err(paro_common::error::invalid_input(
+                "partition exact row set must contain at least one domain",
+            ));
+        }
+        let mut expected_start = 0u32;
+        let mut cardinality = 0u64;
+        let mut validated = Vec::with_capacity(parts.len());
+        for (range, row_set) in parts {
+            if range.start != expected_start || range.start >= range.end {
+                return Err(paro_common::error::invalid_input(
+                    "partition exact row-set domains must be non-empty and contiguous",
+                ));
+            }
+            let domain_rows = (range.end - range.start) as usize;
+            if row_set.domain_len() > domain_rows {
+                return Err(paro_common::error::data_corrupted(format!(
+                    "segment exact row-set domain {} exceeds partition span {domain_rows}",
+                    row_set.domain_len()
+                )));
+            }
+            cardinality = cardinality.checked_add(row_set.len()).ok_or_else(|| {
+                paro_common::error::out_of_range("partition exact row-set cardinality overflow")
+            })?;
+            expected_start = range.end;
+            validated.push(PartitionExactRowSetPart { range, row_set });
+        }
+        Ok(Self {
+            parts: validated.into_boxed_slice(),
+            cardinality,
+            domain_len: expected_start,
+            materialized: OnceLock::new(),
+        })
+    }
+
+    fn part_for(&self, row_id: u32) -> Option<&PartitionExactRowSetPart> {
+        let position = self.parts.partition_point(|part| part.range.end <= row_id);
+        self.parts
+            .get(position)
+            .filter(|part| part.range.contains(&row_id))
+    }
+
+    fn materialized(&self) -> &RoaringBitmap {
+        self.materialized.get_or_init(|| {
+            let mut rows = RoaringBitmap::new();
+            for part in &self.parts {
+                for row_id in part.row_set.materialize() {
+                    rows.insert(part.range.start + row_id);
+                }
+            }
+            rows
+        })
+    }
+}
+
+impl ExactRowSet for PartitionExactRowSet {
+    fn len(&self) -> u64 {
+        self.cardinality
+    }
+
+    fn contains(&self, row_id: u32) -> bool {
+        self.part_for(row_id)
+            .is_some_and(|part| part.row_set.contains(row_id - part.range.start))
+    }
+
+    fn domain_len(&self) -> usize {
+        self.domain_len as usize
+    }
+
+    fn materialize(&self) -> RoaringBitmap {
+        self.materialized().clone()
+    }
+
+    fn try_for_each(&self, visitor: &mut dyn FnMut(u32) -> Result<()>) -> Result<()> {
+        for part in &self.parts {
+            part.row_set
+                .try_for_each(&mut |row_id| visitor(part.range.start + row_id))?;
+        }
+        Ok(())
+    }
+
+    fn append_partition_seeds(&self, limit: usize, seeds: &mut Vec<u32>) {
+        if limit == 0 {
+            return;
+        }
+        let per_part = limit.div_ceil(self.parts.len()).max(1);
+        for part in &self.parts {
+            if seeds.len() >= limit {
+                break;
+            }
+            let mut local = Vec::new();
+            part.row_set
+                .append_partition_seeds(per_part.min(limit - seeds.len()), &mut local);
+            seeds.extend(local.into_iter().map(|row_id| part.range.start + row_id));
+        }
+        seeds.truncate(limit);
+    }
+
+    fn physical_partitions(&self) -> ExactRowPartitions<'_> {
+        ExactRowPartitions::Single(self.materialized())
+    }
+
+    fn query_retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>().saturating_add(
+            self.parts
+                .len()
+                .saturating_mul(std::mem::size_of::<PartitionExactRowSetPart>()),
+        )
+    }
+
+    fn admission(&self) -> ExactRowAdmission<'_> {
+        ExactRowAdmission::Partitioned(self)
+    }
 }
 
 impl ExactRowSet for RoaringBitmap {
@@ -475,5 +687,41 @@ mod tests {
             panic!("empty scratch must not invoke the visitor")
         })
         .unwrap();
+    }
+
+    #[test]
+    fn partition_row_set_translates_segment_local_domains_without_unioning() {
+        let first: Arc<dyn ExactRowSet> = Arc::new(RoaringBitmap::from_iter([0_u32, 3, 7]));
+        let second: Arc<dyn ExactRowSet> = Arc::new(DenseRowSet::new(4));
+        let rows = PartitionExactRowSet::try_new(vec![(0..8, first), (8..12, second)]).unwrap();
+
+        assert_eq!(rows.len(), 7);
+        assert_eq!(rows.domain_len(), 12);
+        assert!(rows.contains(0));
+        assert!(rows.contains(7));
+        assert!(rows.contains(8));
+        assert!(rows.contains(11));
+        assert!(!rows.contains(4));
+        assert!(!rows.contains(12));
+        assert!(rows.admission().contains(11));
+
+        let mut visited = Vec::new();
+        rows.try_for_each(&mut |row_id| {
+            visited.push(row_id);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(visited, vec![0, 3, 7, 8, 9, 10, 11]);
+        assert_eq!(
+            rows.materialize(),
+            RoaringBitmap::from_iter([0_u32, 3, 7, 8, 9, 10, 11])
+        );
+    }
+
+    #[test]
+    fn partition_row_set_rejects_gaps_and_oversized_local_domains() {
+        let dense: Arc<dyn ExactRowSet> = Arc::new(DenseRowSet::new(4));
+        assert!(PartitionExactRowSet::try_new(vec![(1..5, Arc::clone(&dense))]).is_err());
+        assert!(PartitionExactRowSet::try_new(vec![(0..3, dense)]).is_err());
     }
 }

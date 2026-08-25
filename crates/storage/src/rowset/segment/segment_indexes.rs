@@ -42,9 +42,6 @@ pub(super) enum DeferredHnswState {
 /// format corruption remains an error at that capability boundary.
 pub(super) struct DeferredHnswIndex {
     pub(super) page_pointer: PagePointer,
-    pub(super) vector_data_offset: u64,
-    pub(super) vector_data_len: u64,
-    pub(super) dimension: usize,
     pub(super) state: Mutex<DeferredHnswState>,
 }
 

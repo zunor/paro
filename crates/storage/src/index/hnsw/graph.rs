@@ -316,6 +316,20 @@ impl GraphLayers {
                             use_predicate_topology,
                             work,
                         )?,
+                        Some(admission @ ExactRowAdmission::Dense(_))
+                        | Some(admission @ ExactRowAdmission::Partitioned(_)) => self
+                            .search_masked_topk(
+                                zero_level_entry,
+                                top,
+                                ef,
+                                scorer,
+                                |row_id| admission.contains(row_id),
+                                adaptive,
+                                predicate_partition_seeds,
+                                predicate_columns,
+                                use_predicate_topology,
+                                work,
+                            )?,
                     }
                 }
             };
