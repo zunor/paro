@@ -15,7 +15,9 @@ use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 
 use super::artifact::ArtifactLocation;
-use super::capability::{ArtifactSegmentRef, CoverageState, SearchArtifactRef};
+use super::capability::{
+    CoverageState, SearchArtifactRef, SearchIndexKind, SearchPartitionCoverage,
+};
 use super::cursor::GenerationArtifactSet;
 use super::inline_sink::SearchStatsDelta;
 mod binary;
@@ -50,15 +52,20 @@ pub(crate) struct ManifestCodecKind {
 }
 
 impl ManifestCodecKind {
-    pub(crate) const JSON_DEBUG_V1: Self = Self {
+    pub(crate) const JSON_DEBUG_V2: Self = Self {
         family: ManifestCodecFamily::JsonDebug,
-        version: 1,
+        version: 2,
+    };
+
+    pub(crate) const BINARY_V2: Self = Self {
+        family: ManifestCodecFamily::Binary,
+        version: 2,
     };
 
     pub(crate) const fn metric_label(self) -> &'static str {
         match (self.family, self.version) {
-            (ManifestCodecFamily::JsonDebug, 1) => "json-debug-v1",
-            (ManifestCodecFamily::Binary, 1) => "binary-v1",
+            (ManifestCodecFamily::JsonDebug, 2) => "json-debug-v2",
+            (ManifestCodecFamily::Binary, 2) => "binary-v2",
             _ => "unknown",
         }
     }
@@ -99,7 +106,7 @@ pub(crate) struct GenerationManifestRoot {
 
 impl GenerationManifestRoot {
     pub(crate) fn recompute_checksum(&mut self) -> Result<()> {
-        self.recompute_checksum_for_codec_and_state(ManifestCodecKind::JSON_DEBUG_V1, None)
+        self.recompute_checksum_for_codec_and_state(ManifestCodecKind::JSON_DEBUG_V2, None)
     }
 
     fn recompute_checksum_for_codec_and_state(
@@ -109,14 +116,14 @@ impl GenerationManifestRoot {
     ) -> Result<()> {
         self.checksum = 0;
         let bytes = match codec {
-            ManifestCodecKind::JSON_DEBUG_V1 => serde_json::to_vec(self).map_err(|err| {
+            ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec(self).map_err(|err| {
                 paro_error::serialization_error(format!(
                     "serialize generation manifest root: {err}"
                 ))
             })?,
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 1,
+                version: 2,
             } => encode_binary_root_fragment(self, materialized_state)?,
             other => {
                 return Err(paro_error::not_supported(format!(
@@ -175,7 +182,7 @@ impl ManifestDelta {
 #[serde(tag = "op", content = "payload", rename_all = "snake_case")]
 pub(crate) enum ManifestDeltaEntry {
     AddArtifact(SearchArtifactRef),
-    RemoveArtifact(ArtifactSegmentRef),
+    RemoveArtifact(SearchPartitionCoverage),
     UpsertTail(TailPendingEntry),
     CoverTail(TailEntryId),
     StatsDelta(SearchStatsDelta),
@@ -231,6 +238,8 @@ struct MaterializedManifestState {
     tail_pending_entries: Vec<TailPendingEntry>,
 }
 
+type ArtifactManifestKey = (SearchPartitionCoverage, u32, SearchIndexKind, u32);
+
 pub(crate) struct ManifestStore {
     table_data_dir: PathBuf,
     codec_kind: ManifestCodecKind,
@@ -238,7 +247,7 @@ pub(crate) struct ManifestStore {
 
 impl ManifestStore {
     pub(crate) fn new(table_data_dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V1)
+        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V2)
     }
 
     pub(crate) fn new_with_codec(
@@ -412,7 +421,13 @@ impl ManifestStore {
     ) -> Result<Option<LoadedManifest>> {
         let started_at = Instant::now();
         let (root, embedded_state) = self.read_root_fragment(&root_path)?;
-        if self.codec_kind == ManifestCodecKind::JSON_DEBUG_V1 {
+        if root.definition_id != definition_id {
+            return Err(paro_error::data_corrupted(format!(
+                "search manifest root definition {} does not match directory {definition_id}",
+                root.definition_id
+            )));
+        }
+        if self.codec_kind == ManifestCodecKind::JSON_DEBUG_V2 {
             let mut verified = root.clone();
             let expected_checksum = verified.checksum;
             verified.recompute_checksum_for_codec_and_state(self.codec_kind, None)?;
@@ -471,10 +486,17 @@ impl ManifestStore {
         root: GenerationManifestRoot,
         artifacts: GenerationArtifactSet,
         tail_pending_entries: Vec<TailPendingEntry>,
-    ) -> LoadedManifest {
+    ) -> Result<LoadedManifest> {
+        if root.definition_id != definition_id {
+            return Err(paro_error::data_corrupted(format!(
+                "search manifest root definition {} does not match directory {definition_id}",
+                root.definition_id
+            )));
+        }
+        artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         let definition_dir = self.definition_dir(definition_id);
         let root_path = self.root_path_for_file(definition_id, &Self::root_file_name(&root));
-        LoadedManifest {
+        Ok(LoadedManifest {
             root_path,
             shard_paths: root
                 .shard_files
@@ -494,7 +516,7 @@ impl ManifestStore {
             root,
             artifacts: Arc::new(artifacts),
             tail_pending_entries,
-        }
+        })
     }
 
     fn load_materialized_state(
@@ -518,7 +540,7 @@ impl ManifestStore {
             )?;
             return self.materialized_state_from_shard(definition_id, root, state);
         }
-        let mut artifact_map = BTreeMap::<(u64, u32, u32), SearchArtifactRef>::new();
+        let mut artifact_map = BTreeMap::<ArtifactManifestKey, SearchArtifactRef>::new();
         let mut tail_map = BTreeMap::<TailEntryId, TailPendingEntry>::new();
 
         for shard_file in &root.shard_files {
@@ -527,6 +549,7 @@ impl ManifestStore {
                 shard_file.codec,
             )?;
             for artifact in shard.artifact_refs {
+                artifact.validate()?;
                 artifact_map.insert(artifact_key(&artifact), artifact);
             }
             for entry in shard.tail_pending_entries {
@@ -542,12 +565,11 @@ impl ManifestStore {
             for entry in delta.entries {
                 match entry {
                     ManifestDeltaEntry::AddArtifact(artifact) => {
+                        artifact.validate()?;
                         artifact_map.insert(artifact_key(&artifact), artifact);
                     }
                     ManifestDeltaEntry::RemoveArtifact(removed) => {
-                        artifact_map.retain(|(rowset_id, segment_id, _), _| {
-                            *rowset_id != removed.rowset_id || *segment_id != removed.segment_id
-                        });
+                        artifact_map.retain(|(coverage, _, _, _), _| coverage != &removed);
                     }
                     ManifestDeltaEntry::UpsertTail(tail_entry) => {
                         upsert_tail_entry(definition_id, &mut tail_map, tail_entry)?;
@@ -563,10 +585,10 @@ impl ManifestStore {
         let artifact_map =
             self.filter_missing_sidecar_artifacts(definition_id, root, artifact_map, &mut tail_map);
 
+        let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
+        artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         Ok(MaterializedManifestState {
-            artifacts: GenerationArtifactSet {
-                artifacts: artifact_map.into_values().collect(),
-            },
+            artifacts,
             tail_pending_entries: tail_map.into_values().collect(),
         })
     }
@@ -577,20 +599,23 @@ impl ManifestStore {
         root: &GenerationManifestRoot,
         state: ManifestShard,
     ) -> Result<MaterializedManifestState> {
+        for artifact in &state.artifact_refs {
+            artifact.validate()?;
+        }
         if state.artifact_refs.iter().all(|artifact| {
             !matches!(
                 artifact.location,
                 ArtifactLocation::SidecarArtifactFile { .. }
             )
         }) {
+            let artifacts = GenerationArtifactSet::try_new(state.artifact_refs)?;
+            artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
             return Ok(MaterializedManifestState {
-                artifacts: GenerationArtifactSet {
-                    artifacts: state.artifact_refs,
-                },
+                artifacts,
                 tail_pending_entries: state.tail_pending_entries,
             });
         }
-        let mut artifact_map = BTreeMap::<(u64, u32, u32), SearchArtifactRef>::new();
+        let mut artifact_map = BTreeMap::<ArtifactManifestKey, SearchArtifactRef>::new();
         let mut tail_map = BTreeMap::<TailEntryId, TailPendingEntry>::new();
         for artifact in state.artifact_refs {
             artifact_map.insert(artifact_key(&artifact), artifact);
@@ -600,10 +625,10 @@ impl ManifestStore {
         }
         let artifact_map =
             self.filter_missing_sidecar_artifacts(definition_id, root, artifact_map, &mut tail_map);
+        let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
+        artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
         Ok(MaterializedManifestState {
-            artifacts: GenerationArtifactSet {
-                artifacts: artifact_map.into_values().collect(),
-            },
+            artifacts,
             tail_pending_entries: tail_map.into_values().collect(),
         })
     }
@@ -612,9 +637,9 @@ impl ManifestStore {
         &self,
         definition_id: u64,
         root: &GenerationManifestRoot,
-        artifact_map: BTreeMap<(u64, u32, u32), SearchArtifactRef>,
+        artifact_map: BTreeMap<ArtifactManifestKey, SearchArtifactRef>,
         tail_map: &mut BTreeMap<TailEntryId, TailPendingEntry>,
-    ) -> BTreeMap<(u64, u32, u32), SearchArtifactRef> {
+    ) -> BTreeMap<ArtifactManifestKey, SearchArtifactRef> {
         let mut next_recovery_tail_id = root.next_tail_entry_id.0.max(1);
         let mut retained = BTreeMap::new();
         for (key, artifact) in artifact_map {
@@ -623,32 +648,46 @@ impl ManifestStore {
                 continue;
             }
 
-            let entry_id = loop {
-                let candidate = TailEntryId(next_recovery_tail_id);
-                next_recovery_tail_id = next_recovery_tail_id.saturating_add(1);
-                if !tail_map.contains_key(&candidate) {
-                    break candidate;
-                }
-            };
             tracing::warn!(
                 definition_id,
                 generation_id = root.generation_id,
-                rowset_id = artifact.segment.rowset_id,
-                segment_id = artifact.segment.segment_id,
+                covered_segments = artifact.coverage.segments().len(),
                 "search manifest references a missing sidecar artifact; degrading artifact to tail-pending recovery entry"
             );
-            tail_map.insert(
-                entry_id,
-                TailPendingEntry {
+            let mut recovery_by_rowset = BTreeMap::<u64, (Vec<u32>, u64)>::new();
+            for span in artifact.coverage.segments() {
+                let entry = recovery_by_rowset
+                    .entry(span.segment.rowset_id)
+                    .or_default();
+                entry.0.push(span.segment.segment_id);
+                entry.1 = entry.1.saturating_add(span.row_count);
+            }
+            for (rowset_id, (segment_ids, row_count)) in recovery_by_rowset {
+                let entry_id = loop {
+                    let candidate = TailEntryId(next_recovery_tail_id);
+                    next_recovery_tail_id = next_recovery_tail_id.saturating_add(1);
+                    if !tail_map.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
+                let byte_count = artifact
+                    .stats
+                    .bytes_on_disk
+                    .saturating_mul(row_count)
+                    .div_ceil(artifact.stats.row_count.max(1));
+                tail_map.insert(
                     entry_id,
-                    rowset_id: artifact.segment.rowset_id,
-                    segment_ids: vec![artifact.segment.segment_id],
-                    mutation: TailMutationKind::Append,
-                    row_count: artifact.stats.row_count.max(1),
-                    byte_count: artifact.stats.bytes_on_disk,
-                    row_image_ref: Some(TailRowImageRef::WholeRowset),
-                },
-            );
+                    TailPendingEntry {
+                        entry_id,
+                        rowset_id,
+                        segment_ids,
+                        mutation: TailMutationKind::Append,
+                        row_count,
+                        byte_count,
+                        row_image_ref: Some(TailRowImageRef::WholeRowset),
+                    },
+                );
+            }
         }
         retained
     }
@@ -846,14 +885,14 @@ impl ManifestStore {
             })?;
         }
         let bytes = match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V1 => serde_json::to_vec_pretty(root).map_err(|err| {
+            ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec_pretty(root).map_err(|err| {
                 paro_error::serialization_error(format!(
                     "serialize search manifest root fragment: {err}"
                 ))
             })?,
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 1,
+                version: 2,
             } => encode_binary_root_fragment(root, embedded_state)?,
             other => {
                 return Err(paro_error::not_supported(format!(
@@ -893,7 +932,7 @@ impl ManifestStore {
         })?;
         storage_metrics().add_search_manifest_open_bytes(self.codec_label(), bytes.len() as u64);
         match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V1 => {
+            ManifestCodecKind::JSON_DEBUG_V2 => {
                 let root = serde_json::from_slice(&bytes).map_err(|err| {
                     paro_error::serialization_error(format!(
                         "deserialize search manifest root fragment: {err}"
@@ -903,7 +942,7 @@ impl ManifestStore {
             }
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 1,
+                version: 2,
             } => decode_binary_root_fragment(&bytes),
             other => Err(paro_error::not_supported(format!(
                 "unsupported search manifest codec {:?}",
@@ -930,12 +969,12 @@ fn encode_manifest_fragment<T: Serialize + BinaryManifestFragment>(
     value: &T,
 ) -> Result<Vec<u8>> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V1 => serde_json::to_vec_pretty(value).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V2 => serde_json::to_vec_pretty(value).map_err(|err| {
             paro_error::serialization_error(format!("serialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 1,
+            version: 2,
         } => encode_binary_manifest_fragment(value),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1053,12 +1092,12 @@ fn decode_manifest_fragment<T: for<'de> Deserialize<'de> + BinaryManifestFragmen
     bytes: &[u8],
 ) -> Result<T> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V1 => serde_json::from_slice(bytes).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V2 => serde_json::from_slice(bytes).map_err(|err| {
             paro_error::serialization_error(format!("deserialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 1,
+            version: 2,
         } => decode_binary_manifest_fragment(bytes),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1072,11 +1111,12 @@ fn elapsed_micros_since(started_at: Instant) -> u64 {
     micros.min(u128::from(u64::MAX)) as u64
 }
 
-fn artifact_key(artifact: &SearchArtifactRef) -> (u64, u32, u32) {
+fn artifact_key(artifact: &SearchArtifactRef) -> ArtifactManifestKey {
     (
-        artifact.segment.rowset_id,
-        artifact.segment.segment_id,
+        artifact.coverage.clone(),
         artifact.column_id,
+        artifact.kind,
+        artifact.provider_variant,
     )
 }
 
@@ -1110,13 +1150,15 @@ fn upsert_tail_entry(
 mod tests {
     use super::{
         decode_manifest_fragment, encode_manifest_fragment, GenerationManifestRoot,
-        ManifestCodecFamily, ManifestCodecKind, ManifestDelta, ManifestDeltaEntry, ManifestFileRef,
-        ManifestShard, ManifestStore, DELTA_COUNT_HARD_LIMIT, DELTA_COUNT_SOFT_LIMIT,
+        ManifestCodecKind, ManifestDelta, ManifestDeltaEntry, ManifestFileRef, ManifestShard,
+        ManifestStore, DELTA_COUNT_HARD_LIMIT, DELTA_COUNT_SOFT_LIMIT,
     };
     use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
     use crate::search::capability::{
         ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexKind,
+        SearchPartitionCoverage,
     };
+    use crate::search::cursor::GenerationArtifactSet;
     use crate::search::inline_sink::{FullTextStatsDelta, SearchStatsDelta};
     use crate::search::stats::{
         ExecutionModes, FullTextProviderStats, GenerationMaintenanceState, GenerationStats,
@@ -1129,10 +1171,16 @@ mod tests {
     fn manifest_delta_entries_are_typed_and_round_trip() {
         let delta = ManifestDelta::new(vec![
             ManifestDeltaEntry::AddArtifact(sample_artifact(10, 2)),
-            ManifestDeltaEntry::RemoveArtifact(ArtifactSegmentRef {
-                rowset_id: 9,
-                segment_id: 1,
-            }),
+            ManifestDeltaEntry::RemoveArtifact(
+                SearchPartitionCoverage::singleton(
+                    ArtifactSegmentRef {
+                        rowset_id: 9,
+                        segment_id: 1,
+                    },
+                    100,
+                )
+                .unwrap(),
+            ),
             ManifestDeltaEntry::UpsertTail(sample_tail_entry(7, 12, 0)),
             ManifestDeltaEntry::CoverTail(TailEntryId(42)),
             ManifestDeltaEntry::StatsDelta(SearchStatsDelta::FullText(FullTextStatsDelta {
@@ -1150,6 +1198,34 @@ mod tests {
         let decoded: ManifestDelta =
             serde_json::from_str(&encoded).expect("deserialize typed delta");
         assert_eq!(decoded, delta);
+    }
+
+    #[test]
+    fn generation_artifact_set_rejects_overlapping_partition_coverage() {
+        let first = sample_artifact(10, 2);
+        let duplicate = first.clone();
+
+        let error = GenerationArtifactSet::try_new(vec![first, duplicate])
+            .expect_err("overlapping partitions must not publish");
+        assert!(error.to_string().contains("overlapping partitions"));
+    }
+
+    #[test]
+    fn generation_artifact_set_rejects_mixed_provider_and_root_identities() {
+        let first = sample_artifact(10, 2);
+        let mut mixed_provider = sample_artifact(11, 0);
+        mixed_provider.kind = SearchIndexKind::Sparse;
+        mixed_provider.provider_variant = 2;
+
+        let error = GenerationArtifactSet::try_new(vec![first.clone(), mixed_provider])
+            .expect_err("one generation cannot mix providers");
+        assert!(error.to_string().contains("provider kind"));
+
+        let set = GenerationArtifactSet::try_new(vec![first]).unwrap();
+        let error = set
+            .validate_for_generation(999, 11)
+            .expect_err("artifact identity must match its manifest root");
+        assert!(error.to_string().contains("does not belong"));
     }
 
     #[test]
@@ -1191,27 +1267,24 @@ mod tests {
     }
 
     #[test]
-    fn manifest_codec_dispatch_round_trips_json_and_binary_v1() {
+    fn manifest_codec_dispatch_round_trips_json_and_binary_v2() {
         let delta = ManifestDelta::new(vec![
             ManifestDeltaEntry::AddArtifact(sample_artifact(10, 0)),
             ManifestDeltaEntry::UpsertTail(sample_tail_entry(1, 10, 0)),
         ]);
         let json_bytes =
-            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V1, &delta).unwrap();
+            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V2, &delta).unwrap();
         let decoded_json: ManifestDelta =
-            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V1, &json_bytes).unwrap();
+            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V2, &json_bytes).unwrap();
         assert_eq!(decoded_json, delta);
 
-        let binary_v1 = ManifestCodecKind {
-            family: ManifestCodecFamily::Binary,
-            version: 1,
-        };
-        let binary_bytes = encode_manifest_fragment(binary_v1, &delta).unwrap();
+        let binary_v2 = ManifestCodecKind::BINARY_V2;
+        let binary_bytes = encode_manifest_fragment(binary_v2, &delta).unwrap();
         assert!(!binary_bytes.starts_with(b"{"));
         let decoded_binary: ManifestDelta =
-            decode_manifest_fragment(binary_v1, &binary_bytes).unwrap();
+            decode_manifest_fragment(binary_v2, &binary_bytes).unwrap();
         assert_eq!(decoded_binary, delta);
-        assert_eq!(binary_v1.metric_label(), "binary-v1");
+        assert_eq!(binary_v2.metric_label(), "binary-v2");
     }
 
     #[test]
@@ -1225,7 +1298,7 @@ mod tests {
                 1,
                 1,
                 &ManifestShard {
-                    artifact_refs: vec![sample_artifact(1, 0)],
+                    artifact_refs: vec![sample_artifact_for_generation(definition_id, 1, 1, 0)],
                     tail_pending_entries: Vec::new(),
                 },
             )
@@ -1237,10 +1310,14 @@ mod tests {
                 2,
                 0,
                 &ManifestDelta::new(vec![ManifestDeltaEntry::RemoveArtifact(
-                    ArtifactSegmentRef {
-                        rowset_id: 1,
-                        segment_id: 0,
-                    },
+                    SearchPartitionCoverage::singleton(
+                        ArtifactSegmentRef {
+                            rowset_id: 1,
+                            segment_id: 0,
+                        },
+                        100,
+                    )
+                    .unwrap(),
                 )]),
             )
             .expect("write delta");
@@ -1254,7 +1331,7 @@ mod tests {
             root_json["shard_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
         );
-        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 1);
+        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 2);
         assert_eq!(
             root_json["recent_delta_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
@@ -1264,11 +1341,7 @@ mod tests {
     #[test]
     fn binary_manifest_root_embeds_query_open_state() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let binary_v1 = ManifestCodecKind {
-            family: ManifestCodecFamily::Binary,
-            version: 1,
-        };
-        let store = ManifestStore::new_with_codec(temp_dir.path(), binary_v1);
+        let store = ManifestStore::new_with_codec(temp_dir.path(), ManifestCodecKind::BINARY_V2);
         let definition_id = 88;
         let shard_ref = store
             .write_shard(
@@ -1276,7 +1349,7 @@ mod tests {
                 1,
                 1,
                 &ManifestShard {
-                    artifact_refs: vec![sample_artifact(1, 0)],
+                    artifact_refs: vec![sample_artifact_for_generation(definition_id, 1, 1, 0)],
                     tail_pending_entries: vec![sample_tail_entry(1, 1, 0)],
                 },
             )
@@ -1297,7 +1370,7 @@ mod tests {
         let root_path = store.write_root(definition_id, &root).unwrap();
 
         let bytes = std::fs::read(&root_path).unwrap();
-        assert!(bytes.starts_with(b"PMB1"));
+        assert!(bytes.starts_with(b"PMB2"));
         let loaded = store
             .load_manifest(definition_id)
             .unwrap()
@@ -1324,7 +1397,7 @@ mod tests {
                 1,
                 1,
                 &ManifestShard {
-                    artifact_refs: vec![sample_artifact(1, 0)],
+                    artifact_refs: vec![sample_artifact_for_generation(definition_id, 1, 1, 0)],
                     tail_pending_entries: Vec::new(),
                 },
             )
@@ -1429,7 +1502,7 @@ mod tests {
                 1,
                 1,
                 &ManifestShard {
-                    artifact_refs: vec![sample_artifact(1, 0)],
+                    artifact_refs: vec![sample_artifact_for_generation(definition_id, 1, 1, 0)],
                     tail_pending_entries: vec![sample_tail_entry(1, 1, 0)],
                 },
             )
@@ -1445,7 +1518,12 @@ mod tests {
                         2,
                         ordinal,
                         &ManifestDelta::new(vec![
-                            ManifestDeltaEntry::AddArtifact(sample_artifact(rowset_id, 0)),
+                            ManifestDeltaEntry::AddArtifact(sample_artifact_for_generation(
+                                definition_id,
+                                1,
+                                rowset_id,
+                                0,
+                            )),
                             ManifestDeltaEntry::UpsertTail(sample_tail_entry(
                                 2 + ordinal as u64,
                                 rowset_id,
@@ -1501,7 +1579,14 @@ mod tests {
             let base_rowset_id = shard_idx * artifacts_per_shard;
             let shard = ManifestShard {
                 artifact_refs: (0..artifacts_per_shard)
-                    .map(|offset| sample_artifact(base_rowset_id + offset + 1, 0))
+                    .map(|offset| {
+                        sample_artifact_for_generation(
+                            definition_id,
+                            1,
+                            base_rowset_id + offset + 1,
+                            0,
+                        )
+                    })
                     .collect(),
                 tail_pending_entries: Vec::new(),
             };
@@ -1563,10 +1648,14 @@ mod tests {
         SearchArtifactRef {
             definition_id: 7,
             generation_id: 11,
-            segment: ArtifactSegmentRef {
-                rowset_id,
-                segment_id,
-            },
+            coverage: SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id,
+                    segment_id,
+                },
+                100,
+            )
+            .unwrap(),
             column_id: 3,
             kind: SearchIndexKind::FullText,
             provider_variant: 1,
@@ -1588,6 +1677,18 @@ mod tests {
             },
             checksum: 99,
         }
+    }
+
+    fn sample_artifact_for_generation(
+        definition_id: u64,
+        generation_id: u64,
+        rowset_id: u64,
+        segment_id: u32,
+    ) -> SearchArtifactRef {
+        let mut artifact = sample_artifact(rowset_id, segment_id);
+        artifact.definition_id = definition_id;
+        artifact.generation_id = generation_id;
+        artifact
     }
 
     fn sample_tail_entry(entry_id: u64, rowset_id: u64, segment_id: u32) -> TailPendingEntry {

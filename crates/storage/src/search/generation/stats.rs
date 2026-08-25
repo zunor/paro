@@ -19,8 +19,11 @@ pub(crate) fn generation_stats_from_artifacts(
     let mut stats = empty_generation_stats_for_definition(definition)?;
     let mut indexed_segments = BTreeSet::new();
     for artifact in artifacts {
-        if indexed_segments.insert((artifact.segment.rowset_id, artifact.segment.segment_id)) {
-            stats.indexed_rows = stats.indexed_rows.saturating_add(artifact.stats.row_count);
+        artifact.validate()?;
+        for span in artifact.coverage.segments() {
+            if indexed_segments.insert(span.segment) {
+                stats.indexed_rows = stats.indexed_rows.saturating_add(span.row_count);
+            }
         }
         stats.artifact_count = stats.artifact_count.saturating_add(1);
         if let Some(provider_stats) = artifact.stats.provider_stats.as_ref().cloned() {

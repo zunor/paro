@@ -11,7 +11,9 @@ use bytes::Bytes;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 
-use super::capability::{ArtifactSegmentRef, SearchArtifactRef, SearchIndexKind};
+use super::capability::{
+    ArtifactSegmentRef, SearchArtifactRef, SearchIndexKind, SearchPartitionCoverage,
+};
 use super::inline_sink::{
     BuildBudget, CostEstimate, FlushSearchMode, InlineArtifactBlob, InlineArtifactBuilder,
     MaintenanceBenefit, MaintenanceCost, SegmentChunkInput, SegmentFlushCtx,
@@ -128,7 +130,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                         *segment_id,
                         blob,
                         location,
-                    ));
+                    )?);
                 }
             }
         }
@@ -636,16 +638,19 @@ fn sidecar_ref_from_blob(
     segment_id: u32,
     blob: InlineArtifactBlob,
     location: super::artifact::ArtifactLocation,
-) -> SearchArtifactRef {
+) -> Result<SearchArtifactRef> {
     let bytes_on_disk = blob.bytes.len() as u64;
     let provider_stats = blob.stats.provider_stats.clone();
-    SearchArtifactRef {
+    let artifact = SearchArtifactRef {
         definition_id: blob.definition_id,
         generation_id: blob.generation_id,
-        segment: ArtifactSegmentRef {
-            rowset_id,
-            segment_id,
-        },
+        coverage: SearchPartitionCoverage::singleton(
+            ArtifactSegmentRef {
+                rowset_id,
+                segment_id,
+            },
+            blob.stats.row_count,
+        )?,
         column_id: blob.column_id,
         kind: blob.kind,
         provider_variant: definition.config_fingerprint as u32,
@@ -657,7 +662,9 @@ fn sidecar_ref_from_blob(
             provider_stats,
         },
         checksum: blob.checksum,
-    }
+    };
+    artifact.validate()?;
+    Ok(artifact)
 }
 
 #[cfg(test)]

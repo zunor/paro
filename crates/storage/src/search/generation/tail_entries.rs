@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
 
-use super::super::capability::SearchIndexDefinition;
+use super::super::capability::{SearchArtifactRef, SearchIndexDefinition};
 use super::super::manifest::LoadedManifest;
 use super::super::tail::{TailEntryId, TailMutationKind, TailPendingEntry, TailRowImageRef};
 
@@ -31,6 +31,23 @@ pub(crate) fn tail_entry_is_covered_by_artifacts(
             current_artifact_keys.contains(&key) || snapshot_artifact_keys.contains(&key)
         })
     })
+}
+
+pub(crate) fn artifact_segment_column_keys<'a>(
+    artifacts: impl IntoIterator<Item = &'a SearchArtifactRef>,
+) -> BTreeSet<(RowsetId, u32, ColumnId)> {
+    artifacts
+        .into_iter()
+        .flat_map(|artifact| {
+            artifact.coverage.segments().iter().map(|span| {
+                (
+                    span.segment.rowset_id,
+                    span.segment.segment_id,
+                    artifact.column_id,
+                )
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn assign_tail_entry_ids_for_full_snapshot(

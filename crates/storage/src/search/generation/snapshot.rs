@@ -15,6 +15,7 @@ use super::view::{coverage_for_definition, execution_modes_for_definition};
 use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
 use crate::search::capability::{
     ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexDefinition, SearchIndexKind,
+    SearchPartitionCoverage,
 };
 use crate::search::lifecycle::publisher::inline_artifact_checksum;
 use crate::search::stats::{
@@ -230,13 +231,16 @@ fn segment_artifact(
         pointer.size,
     );
 
-    Ok(Some(SearchArtifactRef {
+    let artifact = SearchArtifactRef {
         definition_id: definition.definition_id,
         generation_id: 0,
-        segment: ArtifactSegmentRef {
-            rowset_id,
-            segment_id,
-        },
+        coverage: SearchPartitionCoverage::singleton(
+            ArtifactSegmentRef {
+                rowset_id,
+                segment_id,
+            },
+            segment.num_rows(),
+        )?,
         column_id,
         kind: definition.kind,
         provider_variant: definition.config_fingerprint as u32,
@@ -257,7 +261,9 @@ fn segment_artifact(
             provider_stats,
         },
         checksum,
-    }))
+    };
+    artifact.validate()?;
+    Ok(Some(artifact))
 }
 
 fn rowset_tail_entry(

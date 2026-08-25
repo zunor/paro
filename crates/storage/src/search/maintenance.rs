@@ -221,7 +221,7 @@ mod tests {
                 recent_delta_files: (0..recent_delta_count)
                     .map(|ordinal| ManifestFileRef {
                         file_name: format!("delta_{ordinal}.json"),
-                        codec: ManifestCodecKind::JSON_DEBUG_V1,
+                        codec: ManifestCodecKind::JSON_DEBUG_V2,
                     })
                     .collect(),
                 materialized_state_file: None,

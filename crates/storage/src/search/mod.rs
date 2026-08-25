@@ -39,10 +39,11 @@ pub use budget::{
     SearchMemoryReservation, SearchWorkBudget,
 };
 pub use capability::{
-    ArtifactSegmentRef, CapabilityToken, CoverageState, SearchArtifactRef, SearchCapability,
-    SearchCapabilityState, SearchDefinitionOrigin, SearchFreshnessPolicy, SearchGeneration,
-    SearchIndexDefinition, SearchIndexKind, SearchNotQueryableReason, SearchPlanCandidate,
-    SearchTailSummary, SequentialCapability,
+    ArtifactPointRef, ArtifactSegmentRef, ArtifactSegmentSpan, CapabilityToken, CoverageState,
+    SearchArtifactRef, SearchCapability, SearchCapabilityState, SearchDefinitionOrigin,
+    SearchFreshnessPolicy, SearchGeneration, SearchIndexDefinition, SearchIndexKind,
+    SearchNotQueryableReason, SearchPartitionCoverage, SearchPlanCandidate, SearchTailSummary,
+    SequentialCapability,
 };
 pub use cursor::{
     CandidateBatch, GenerationArtifactSet, GenerationReadLease, GenerationReadSnapshot,

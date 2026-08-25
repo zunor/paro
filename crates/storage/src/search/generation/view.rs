@@ -260,8 +260,12 @@ impl SearchView {
                     manifest.artifacts.artifacts.iter().any(|artifact| {
                         artifact.kind == kind
                             && artifact.column_id == column_id
-                            && artifact.segment.rowset_id == rowset_id
-                            && artifact.segment.segment_id == segment_id
+                            && artifact.coverage.contains_segment(
+                                super::super::capability::ArtifactSegmentRef {
+                                    rowset_id,
+                                    segment_id,
+                                },
+                            )
                     })
                 })
         })
@@ -400,6 +404,13 @@ pub(crate) fn generation_read_snapshot(
         provider_config: Arc::new(state.definition.provider_config.clone()),
         hnsw_provider_config: state.hnsw_provider_config.clone(),
         artifacts,
+        tail_pending_entries: Arc::from(
+            state
+                .manifest
+                .as_ref()
+                .map(|manifest| manifest.tail_pending_entries.clone())
+                .unwrap_or_default(),
+        ),
     }))
 }
 

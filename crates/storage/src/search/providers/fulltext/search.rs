@@ -376,8 +376,8 @@ fn open_sidecar_fulltext_index(
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
         },
-        rowset_id: artifact.segment.rowset_id,
-        segment_id: artifact.segment.segment_id,
+        rowset_id: visible_segment.rowset_id,
+        segment_id: visible_segment.segment_id,
         column_id,
     };
     runtime.get_or_try_open_decoded(request, |cached| {
@@ -962,10 +962,14 @@ mod tests {
         let artifact = SearchArtifactRef {
             definition_id: 7,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id: visible_segment.rowset_id,
-                segment_id: visible_segment.segment_id,
-            },
+            coverage: crate::search::SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id: visible_segment.rowset_id,
+                    segment_id: visible_segment.segment_id,
+                },
+                2,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::FullText,
             provider_variant: 1,
@@ -992,6 +996,7 @@ mod tests {
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(

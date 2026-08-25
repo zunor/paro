@@ -12,6 +12,10 @@ The rebuild is required because the durable contract now:
   hierarchy of 4 KiB payload checksums, 4 KiB checksum pages, and a compact
   root directory for lazy random-access integrity verification;
 - uses the version-2 hybrid CSR graph layout;
+- uses search manifest v2 (`json-debug-v2` and `binary-v2`), where every
+  artifact carries canonical, generation-owned multi-segment coverage and its
+  deterministic local point-id mapping; old single-segment manifest images
+  are rejected;
 - requires HNSW provider-config version 10 and build-contract version 10, which
   select deterministic frozen-wave construction, keyed Feistel point ordering,
   barrier publication, exact predicate-local covering runs, and the full
@@ -44,6 +48,11 @@ that search capability is used.
 
 Paro does not infer missing fields, translate the previous graph format, or
 silently rebuild an index during a foreground query.
+
+Search manifest v2 is shared by every search provider. FullText and Sparse
+search definitions must also be recreated before starting the new binary;
+their provider artifacts may be unchanged internally, but their old manifest
+images do not encode generation-owned partition coverage.
 
 FullText and Sparse definitions also gained strict provider-config version 1
 in the same release. Recreate catalog definitions that still use unversioned

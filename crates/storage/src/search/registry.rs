@@ -35,8 +35,8 @@ use super::generation::stats::{
     generation_stats_from_artifacts, stats_deltas_from_generation_stats,
 };
 use super::generation::tail_entries::{
-    assign_tail_entry_ids, assign_tail_entry_ids_for_full_snapshot, tail_entry_already_live,
-    tail_entry_is_covered_by_artifacts,
+    artifact_segment_column_keys, assign_tail_entry_ids, assign_tail_entry_ids_for_full_snapshot,
+    tail_entry_already_live, tail_entry_is_covered_by_artifacts,
 };
 use super::generation::view::{
     coverage_for_definition, execution_modes_for_definition, generation_read_snapshot,
@@ -63,7 +63,9 @@ use super::manifest::{
 use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::stats::MaintenancePriority;
-use super::tail::{TailEntryId, TailMutationKind, TailPendingSet};
+use super::tail::{
+    TailEntryId, TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
+};
 use super::write_path::SearchWriteContext;
 
 const REQUIRED_FRESHNESS_WAIT_SWEEPS: usize = 32;
@@ -560,7 +562,13 @@ impl SearchIndexRegistry {
         let touched = result
             .artifact_refs
             .iter()
-            .map(|artifact| artifact.segment.rowset_id)
+            .flat_map(|artifact| {
+                artifact
+                    .coverage
+                    .segments()
+                    .iter()
+                    .map(|span| span.segment.rowset_id)
+            })
             .collect::<BTreeSet<_>>()
             .len();
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
@@ -632,7 +640,13 @@ impl SearchIndexRegistry {
         let touched = result
             .artifact_refs
             .iter()
-            .map(|artifact| artifact.segment.rowset_id)
+            .flat_map(|artifact| {
+                artifact
+                    .coverage
+                    .segments()
+                    .iter()
+                    .map(|span| span.segment.rowset_id)
+            })
             .collect::<BTreeSet<_>>()
             .len();
         let sidecar_file_ids = sidecar_file_ids_for_artifacts(&result.artifact_refs);
@@ -1181,7 +1195,13 @@ impl SearchIndexRegistry {
                 .artifacts
                 .artifacts
                 .iter()
-                .map(|artifact| artifact.segment.rowset_id)
+                .flat_map(|artifact| {
+                    artifact
+                        .coverage
+                        .segments()
+                        .iter()
+                        .map(|span| span.segment.rowset_id)
+                })
                 .collect::<BTreeSet<_>>();
             let known_tail_rowset_ids = manifest
                 .tail_pending_entries
@@ -1310,12 +1330,16 @@ impl SearchIndexRegistry {
             recent_delta_files: Vec::new(),
             materialized_state_file: None,
         };
+        let generation_artifacts = GenerationArtifactSet::try_new(assign_generation_id(
+            snapshot.artifacts.clone(),
+            generation_id,
+        ))?;
         let shard_name = self.manifests.write_shard(
             definition_id,
             generation_id,
             root.root_version,
             &ManifestShard {
-                artifact_refs: assign_generation_id(snapshot.artifacts.clone(), generation_id),
+                artifact_refs: generation_artifacts.artifacts.clone(),
                 tail_pending_entries: snapshot.tail_pending.entries.clone(),
             },
         )?;
@@ -1347,9 +1371,7 @@ impl SearchIndexRegistry {
             delta_paths: Vec::new(),
             materialized_state_path: None,
             embedded_materialized_state: false,
-            artifacts: Arc::new(GenerationArtifactSet {
-                artifacts: assign_generation_id(snapshot.artifacts, generation_id),
-            }),
+            artifacts: Arc::new(generation_artifacts),
             tail_pending_entries: snapshot.tail_pending.entries,
         };
 
@@ -1406,7 +1428,6 @@ impl SearchIndexRegistry {
             added_artifacts.extend(rowset_snapshot.artifacts);
             added_tail_entries.extend(rowset_snapshot.tail_entries.entries);
         }
-
         let definition_id = state.definition.definition_id;
         let generation = state
             .generation
@@ -1481,7 +1502,7 @@ impl SearchIndexRegistry {
             root,
             artifacts,
             tail_pending_entries,
-        );
+        )?;
         let mut next_state = state.clone();
         if retire_old_manifest {
             self.retire_manifest_replaced_by(
@@ -1531,12 +1552,12 @@ impl SearchIndexRegistry {
             .artifacts
             .artifacts
             .iter()
-            .filter(|artifact| removed_rowset_ids.contains(&artifact.segment.rowset_id))
+            .filter(|artifact| artifact.coverage.intersects_rowsets(&removed_rowset_ids))
             .cloned()
             .collect::<Vec<_>>();
-        let removed_segments = removed_artifacts
+        let removed_partitions = removed_artifacts
             .iter()
-            .map(|artifact| artifact.segment)
+            .map(|artifact| artifact.coverage.clone())
             .collect::<BTreeSet<_>>();
         let covered_tail_ids = current_manifest
             .tail_pending_entries
@@ -1557,6 +1578,10 @@ impl SearchIndexRegistry {
             added_artifacts.extend(rowset_snapshot.artifacts);
             added_tail_entries.extend(rowset_snapshot.tail_entries.entries);
         }
+        added_tail_entries.extend(surviving_partition_tail_entries(
+            &removed_artifacts,
+            &removed_rowset_ids,
+        ));
 
         let mut root = current_manifest.root.clone();
         root.root_version = root.root_version.saturating_add(1);
@@ -1583,7 +1608,7 @@ impl SearchIndexRegistry {
                 .artifacts
                 .artifacts
                 .iter()
-                .filter(|artifact| !removed_rowset_ids.contains(&artifact.segment.rowset_id))
+                .filter(|artifact| !artifact.coverage.intersects_rowsets(&removed_rowset_ids))
                 .cloned()
                 .collect(),
         };
@@ -1618,9 +1643,9 @@ impl SearchIndexRegistry {
 
         let mut delta_entries = Vec::new();
         delta_entries.extend(
-            removed_segments
+            removed_partitions
                 .iter()
-                .copied()
+                .cloned()
                 .map(ManifestDeltaEntry::RemoveArtifact),
         );
         delta_entries.extend(
@@ -1673,7 +1698,7 @@ impl SearchIndexRegistry {
             root,
             artifacts,
             tail_pending_entries,
-        );
+        )?;
         let mut next_state = state.clone();
         if retire_old_manifest {
             self.retire_manifest_replaced_by(
@@ -1713,16 +1738,9 @@ impl SearchIndexRegistry {
         let definition_id = state.definition.definition_id;
 
         added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
-        let current_artifact_keys = current_manifest
-            .artifacts
-            .artifacts
-            .iter()
-            .map(search_artifact_key)
-            .collect::<BTreeSet<_>>();
-        let added_artifact_keys = added_artifacts
-            .iter()
-            .map(search_artifact_key)
-            .collect::<BTreeSet<_>>();
+        let current_artifact_keys =
+            artifact_segment_column_keys(current_manifest.artifacts.artifacts.iter());
+        let added_artifact_keys = artifact_segment_column_keys(added_artifacts.iter());
         let covered_tail_ids = current_manifest
             .tail_pending_entries
             .iter()
@@ -1824,7 +1842,7 @@ impl SearchIndexRegistry {
             root,
             artifacts,
             std::mem::take(&mut tail_pending_entries),
-        );
+        )?;
         let mut next_state = state.clone();
         self.retire_manifest_replaced_by(state.definition.kind, state.manifest.as_ref(), &loaded);
         next_state = next_state.with_manifest(loaded);
@@ -1901,7 +1919,7 @@ impl SearchIndexRegistry {
             root,
             artifacts,
             current_manifest.tail_pending_entries.clone(),
-        );
+        )?;
         let mut next_state = state.clone();
         self.retire_manifest_replaced_by(state.definition.kind, state.manifest.as_ref(), &loaded);
         next_state = next_state.with_manifest(loaded);
@@ -1941,6 +1959,8 @@ impl SearchIndexRegistry {
             .iter()
             .map(search_artifact_key)
             .collect::<BTreeSet<_>>();
+        let current_segment_column_keys =
+            artifact_segment_column_keys(current_manifest.artifacts.artifacts.iter());
         let mut processed_rowsets = BTreeSet::new();
         let mut covered_tail_ids = Vec::new();
         let mut added_artifacts = Vec::new();
@@ -1964,11 +1984,7 @@ impl SearchIndexRegistry {
                 rowset_snapshots.insert(entry.rowset_id, snapshot.clone());
                 snapshot
             };
-            let snapshot_artifact_keys = snapshot
-                .artifacts
-                .iter()
-                .map(search_artifact_key)
-                .collect::<BTreeSet<_>>();
+            let snapshot_artifact_keys = artifact_segment_column_keys(snapshot.artifacts.iter());
             let covered_ids_for_rowset = current_manifest
                 .tail_pending_entries
                 .iter()
@@ -1978,7 +1994,7 @@ impl SearchIndexRegistry {
                         && tail_entry_is_covered_by_artifacts(
                             &state.definition,
                             tail_entry,
-                            &artifact_keys,
+                            &current_segment_column_keys,
                             &snapshot_artifact_keys,
                         )
                 })
@@ -2114,7 +2130,7 @@ impl SearchIndexRegistry {
             root,
             artifacts,
             tail_pending_entries,
-        );
+        )?;
         let mut next_state = state.clone();
         if retire_old_manifest {
             self.retire_manifest_replaced_by(
@@ -2361,6 +2377,58 @@ fn elapsed_micros_since(started_at: Instant) -> u64 {
     micros.min(u128::from(u64::MAX)) as u64
 }
 
+/// Invalidating a multi-segment search partition because one source rowset was
+/// compacted also removes its still-visible spans. Keep those spans in the
+/// exact tail until search compaction publishes a replacement partition;
+/// otherwise an atomic table-compaction publish could create a coverage hole.
+fn surviving_partition_tail_entries(
+    removed_artifacts: &[SearchArtifactRef],
+    removed_rowset_ids: &BTreeSet<RowsetId>,
+) -> Vec<TailPendingEntry> {
+    let mut spans = BTreeMap::<(RowsetId, u32), (u64, u64)>::new();
+    for artifact in removed_artifacts {
+        for span in artifact.coverage.segments() {
+            if removed_rowset_ids.contains(&span.segment.rowset_id) {
+                continue;
+            }
+            let bytes = artifact
+                .stats
+                .bytes_on_disk
+                .saturating_mul(span.row_count)
+                .div_ceil(artifact.stats.row_count.max(1));
+            spans
+                .entry((span.segment.rowset_id, span.segment.segment_id))
+                .and_modify(|current| {
+                    current.0 = current.0.max(span.row_count);
+                    current.1 = current.1.max(bytes);
+                })
+                .or_insert((span.row_count, bytes));
+        }
+    }
+
+    let mut rowsets = BTreeMap::<RowsetId, (Vec<u32>, u64, u64)>::new();
+    for ((rowset_id, segment_id), (row_count, byte_count)) in spans {
+        let entry = rowsets.entry(rowset_id).or_default();
+        entry.0.push(segment_id);
+        entry.1 = entry.1.saturating_add(row_count);
+        entry.2 = entry.2.saturating_add(byte_count);
+    }
+    rowsets
+        .into_iter()
+        .map(
+            |(rowset_id, (segment_ids, row_count, byte_count))| TailPendingEntry {
+                entry_id: TailEntryId::UNASSIGNED,
+                rowset_id,
+                segment_ids,
+                mutation: TailMutationKind::Append,
+                row_count,
+                byte_count,
+                row_image_ref: Some(TailRowImageRef::WholeRowset),
+            },
+        )
+        .collect()
+}
+
 fn manifest_path_bytes(paths: &[PathBuf]) -> u64 {
     paths
         .iter()
@@ -2377,7 +2445,9 @@ mod tests {
     use crate::meta::{FileMetadataStore, GlobalSchemaMap, MetadataStore, TabletMetaManager};
     use crate::rowset::{ColumnData, RowsetWriter, RowsetWriterContext, SparseVector};
     use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
-    use crate::search::capability::ArtifactSegmentRef;
+    use crate::search::capability::{
+        ArtifactSegmentRef, ArtifactSegmentSpan, SearchPartitionCoverage,
+    };
     use crate::search::definition::origin::SCHEMA_SEED_BIT;
     use crate::search::maintenance::ProviderMaintenanceRequest;
     use crate::search::manifest::{ManifestDelta, ManifestDeltaEntry, DELTA_COUNT_SOFT_LIMIT};
@@ -2430,6 +2500,13 @@ mod tests {
         let tablet = Tablet::new(10_001, 10_001, 0, schema, root.join("tablet"), None).unwrap();
         tablet.init().unwrap();
         TableHandle::from_runtime_tablet(tablet, types.to_vec())
+    }
+
+    fn singleton_artifact_segment(artifact: &SearchArtifactRef) -> ArtifactSegmentRef {
+        artifact
+            .coverage
+            .singleton_segment()
+            .expect("test artifact must cover one segment")
     }
 
     fn create_schema_seeded_hnsw_table(
@@ -2597,10 +2674,14 @@ mod tests {
         SearchArtifactRef {
             definition_id,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id,
-                segment_id: 0,
-            },
+            coverage: SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id,
+                    segment_id: 0,
+                },
+                u64::from(total_docs),
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::FullText,
             provider_variant: 1,
@@ -2670,10 +2751,14 @@ mod tests {
         SearchArtifactRef {
             definition_id,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id,
-                segment_id: 0,
-            },
+            coverage: SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id,
+                    segment_id: 0,
+                },
+                row_count,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::Sparse,
             provider_variant: 1,
@@ -2781,10 +2866,14 @@ mod tests {
         SearchArtifactRef {
             definition_id,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id,
-                segment_id: 0,
-            },
+            coverage: SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id,
+                    segment_id: 0,
+                },
+                vector_count,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::Hnsw,
             provider_variant: 1,
@@ -2995,6 +3084,47 @@ mod tests {
         assert_eq!(fulltext.unique_terms, 7);
         assert_eq!(fulltext.total_postings, 15);
         assert_eq!(fulltext.max_posting_list_len, 6);
+    }
+
+    #[test]
+    fn invalidated_partition_preserves_still_visible_spans_as_exact_tail() {
+        let mut artifact = fulltext_test_artifact(91, 1, 4, 8, 4, 8, 10);
+        artifact.coverage = SearchPartitionCoverage::try_new(vec![
+            ArtifactSegmentSpan {
+                segment: ArtifactSegmentRef {
+                    rowset_id: 1,
+                    segment_id: 0,
+                },
+                row_count: 2,
+            },
+            ArtifactSegmentSpan {
+                segment: ArtifactSegmentRef {
+                    rowset_id: 2,
+                    segment_id: 3,
+                },
+                row_count: 2,
+            },
+        ])
+        .unwrap();
+        artifact.location = ArtifactLocation::SidecarArtifactFile {
+            file_id: ArtifactFileId {
+                definition_id: 91,
+                generation_id: 1,
+                package_index: 0,
+            },
+            offset: 0,
+            len: 64,
+            checksum: 7,
+        };
+        artifact.validate().unwrap();
+
+        let tails = surviving_partition_tail_entries(&[artifact], &BTreeSet::from([1]));
+        assert_eq!(tails.len(), 1);
+        assert_eq!(tails[0].rowset_id, 2);
+        assert_eq!(tails[0].segment_ids, vec![3]);
+        assert_eq!(tails[0].row_count, 2);
+        assert_eq!(tails[0].mutation, TailMutationKind::Append);
+        assert_eq!(tails[0].row_image_ref, Some(TailRowImageRef::WholeRowset));
     }
 
     #[test]
@@ -3496,8 +3626,13 @@ mod tests {
             .expect("generation snapshot");
         assert_eq!(snapshot.artifacts.artifacts.len(), 1);
         let artifact = &snapshot.artifacts.artifacts[0];
-        assert_eq!(artifact.segment.rowset_id, 1);
-        assert_eq!(artifact.segment.segment_id, 0);
+        assert_eq!(
+            singleton_artifact_segment(artifact),
+            ArtifactSegmentRef {
+                rowset_id: 1,
+                segment_id: 0,
+            }
+        );
         assert_eq!(artifact.column_id, 0);
         match &artifact.location {
             ArtifactLocation::Inline { page } => {
@@ -3811,7 +3946,10 @@ mod tests {
         let manifest = state.manifest.as_ref().expect("manifest after append");
         assert_eq!(manifest.root.build_snapshot_version, table.max_version());
         assert_eq!(manifest.artifacts.artifacts.len(), 1);
-        assert_eq!(manifest.artifacts.artifacts[0].segment.rowset_id, 1);
+        assert_eq!(
+            singleton_artifact_segment(&manifest.artifacts.artifacts[0]).rowset_id,
+            1
+        );
     }
 
     #[test]
@@ -4002,7 +4140,8 @@ mod tests {
             definition.config_fingerprint
         );
         assert!(manifest.artifacts.artifacts.iter().any(|artifact| {
-            artifact.kind == SearchIndexKind::FullText && artifact.segment.rowset_id > 0
+            artifact.kind == SearchIndexKind::FullText
+                && singleton_artifact_segment(artifact).rowset_id > 0
         }));
     }
 
@@ -4183,8 +4322,10 @@ mod tests {
             entry,
             ManifestDeltaEntry::AddArtifact(artifact)
                 if artifact.kind == SearchIndexKind::FullText
-                    && artifact.segment.rowset_id == 1
-                    && artifact.segment.segment_id == 0
+                    && singleton_artifact_segment(artifact) == (ArtifactSegmentRef {
+                        rowset_id: 1,
+                        segment_id: 0,
+                    })
                     && matches!(artifact.location, ArtifactLocation::SidecarArtifactFile { .. })
         )));
         assert!(delta_entries
@@ -4518,7 +4659,7 @@ mod tests {
             entry,
             ManifestDeltaEntry::AddArtifact(artifact)
                 if artifact.kind == SearchIndexKind::Sparse
-                    && artifact.segment.rowset_id == 1
+                    && singleton_artifact_segment(artifact).rowset_id == 1
                     && matches!(artifact.location, ArtifactLocation::SidecarArtifactFile { .. })
         )));
         assert!(delta_entries
@@ -4871,7 +5012,13 @@ mod tests {
                 .artifacts
                 .artifacts
                 .iter()
-                .map(|artifact| artifact.segment.rowset_id)
+                .flat_map(|artifact| {
+                    artifact
+                        .coverage
+                        .segments()
+                        .iter()
+                        .map(|span| span.segment.rowset_id)
+                })
                 .collect::<BTreeSet<_>>();
             assert_eq!(rowset_ids, BTreeSet::from([1, 2]));
         }
@@ -4885,20 +5032,26 @@ mod tests {
         let delta_entries = load_manifest_delta_entries(&table, 45);
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
-            ManifestDeltaEntry::RemoveArtifact(segment)
-                if segment.rowset_id == 1 && segment.segment_id == 0
+            ManifestDeltaEntry::RemoveArtifact(coverage)
+                if coverage.contains_segment(ArtifactSegmentRef {
+                    rowset_id: 1,
+                    segment_id: 0,
+                })
         )));
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
-            ManifestDeltaEntry::RemoveArtifact(segment)
-                if segment.rowset_id == 2 && segment.segment_id == 0
+            ManifestDeltaEntry::RemoveArtifact(coverage)
+                if coverage.contains_segment(ArtifactSegmentRef {
+                    rowset_id: 2,
+                    segment_id: 0,
+                })
         )));
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
             ManifestDeltaEntry::AddArtifact(artifact)
                 if artifact.kind == SearchIndexKind::FullText
-                    && artifact.segment.rowset_id != 1
-                    && artifact.segment.rowset_id != 2
+                    && singleton_artifact_segment(artifact).rowset_id != 1
+                    && singleton_artifact_segment(artifact).rowset_id != 2
         )));
 
         let current = table.search_registry().view.load();
@@ -4907,11 +5060,9 @@ mod tests {
             .get(&45)
             .and_then(|state| state.manifest.as_ref())
             .expect("manifest after compaction");
-        assert!(manifest
-            .artifacts
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.segment.rowset_id != 1 && artifact.segment.rowset_id != 2));
+        assert!(manifest.artifacts.artifacts.iter().all(|artifact| {
+            !artifact.coverage.contains_rowset(1) && !artifact.coverage.contains_rowset(2)
+        }));
         assert_eq!(manifest.root.generation_stats.indexed_rows, 2);
         assert_eq!(
             manifest
@@ -5031,8 +5182,8 @@ mod tests {
         assert_eq!(manifest.artifacts.artifacts.len(), 1);
         let output_artifact = &manifest.artifacts.artifacts[0];
         assert_eq!(output_artifact.kind, SearchIndexKind::FullText);
-        assert_ne!(output_artifact.segment.rowset_id, 1);
-        assert_ne!(output_artifact.segment.rowset_id, 2);
+        assert_ne!(singleton_artifact_segment(output_artifact).rowset_id, 1);
+        assert_ne!(singleton_artifact_segment(output_artifact).rowset_id, 2);
         assert!(matches!(
             output_artifact.location,
             ArtifactLocation::Inline { .. }
@@ -5049,7 +5200,7 @@ mod tests {
             entry,
             ManifestDeltaEntry::AddArtifact(artifact)
                 if artifact.kind == SearchIndexKind::FullText
-                    && artifact.segment.rowset_id == output_artifact.segment.rowset_id
+                    && artifact.coverage == output_artifact.coverage
         )));
         assert_eq!(manifest.root.generation_stats.indexed_rows, 2);
         assert_eq!(
@@ -5129,8 +5280,8 @@ mod tests {
         assert_eq!(manifest.artifacts.artifacts.len(), 1);
         let output_artifact = &manifest.artifacts.artifacts[0];
         assert_eq!(output_artifact.kind, SearchIndexKind::Sparse);
-        assert_ne!(output_artifact.segment.rowset_id, 1);
-        assert_ne!(output_artifact.segment.rowset_id, 2);
+        assert_ne!(singleton_artifact_segment(output_artifact).rowset_id, 1);
+        assert_ne!(singleton_artifact_segment(output_artifact).rowset_id, 2);
         assert!(matches!(
             output_artifact.location,
             ArtifactLocation::Inline { .. }
@@ -5147,7 +5298,7 @@ mod tests {
             entry,
             ManifestDeltaEntry::AddArtifact(artifact)
                 if artifact.kind == SearchIndexKind::Sparse
-                    && artifact.segment.rowset_id == output_artifact.segment.rowset_id
+                    && artifact.coverage == output_artifact.coverage
         )));
         assert_eq!(manifest.root.generation_stats.indexed_rows, 2);
         let provider_stats = manifest
@@ -5228,8 +5379,8 @@ mod tests {
             assert!(manifest.tail_pending_entries.is_empty());
             assert_eq!(manifest.artifacts.artifacts.len(), 1);
             let artifact = &manifest.artifacts.artifacts[0];
-            assert_ne!(artifact.segment.rowset_id, 1);
-            assert_ne!(artifact.segment.rowset_id, 2);
+            assert_ne!(singleton_artifact_segment(artifact).rowset_id, 1);
+            assert_ne!(singleton_artifact_segment(artifact).rowset_id, 2);
             let ArtifactLocation::Inline { page } = artifact.location else {
                 panic!("expected inline compaction output artifact");
             };

@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::buffer::PageCache;
@@ -13,7 +13,7 @@ use paro_common::error::{self as paro_error, Result};
 use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 
 use super::budget::{ResourceBudget, SearchBatchConfig};
-use super::capability::{CoverageState, SearchArtifactRef, SearchIndexKind};
+use super::capability::{ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexKind};
 use super::request::NormalizedSearchRequest;
 use super::sidecar::SearchReaderRuntime;
 use super::stats::{
@@ -21,6 +21,7 @@ use super::stats::{
     SearchGenerationId, SearchSourceId, SegmentId, TableId,
 };
 use super::tail::exact_merge::TailWindow;
+use super::tail::{TailMutationKind, TailPendingEntry};
 
 pub use crate::rowset::PhysicalRowRef;
 
@@ -246,6 +247,68 @@ pub struct GenerationArtifactSet {
     pub artifacts: Vec<SearchArtifactRef>,
 }
 
+impl GenerationArtifactSet {
+    pub fn try_new(artifacts: Vec<SearchArtifactRef>) -> Result<Self> {
+        let set = Self { artifacts };
+        set.validate()?;
+        Ok(set)
+    }
+
+    /// Prove that one generation exposes a non-overlapping partition cover for
+    /// each physical search column. Overlap is rejected at publication/open,
+    /// rather than left for providers to resolve with iteration order.
+    pub fn validate(&self) -> Result<()> {
+        let mut generation_identity = None;
+        let mut covered = BTreeMap::<(SearchIndexKind, u32), BTreeSet<_>>::new();
+        for artifact in &self.artifacts {
+            artifact.validate()?;
+            let identity = (
+                artifact.definition_id,
+                artifact.generation_id,
+                artifact.kind,
+                artifact.provider_variant,
+            );
+            if generation_identity.is_some_and(|current| current != identity) {
+                return Err(paro_error::data_corrupted(
+                    "search artifact set mixes definition, generation, provider kind, or provider variant identities",
+                ));
+            }
+            generation_identity = Some(identity);
+            let segments = covered
+                .entry((artifact.kind, artifact.column_id))
+                .or_default();
+            for span in artifact.coverage.segments() {
+                if !segments.insert(span.segment) {
+                    return Err(paro_error::data_corrupted(format!(
+                        "search generation has overlapping partitions for {:?} column {} at segment {}/{}",
+                        artifact.kind,
+                        artifact.column_id,
+                        span.segment.rowset_id,
+                        span.segment.segment_id
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn validate_for_generation(
+        &self,
+        definition_id: SearchDefinitionId,
+        generation_id: SearchGenerationId,
+    ) -> Result<()> {
+        self.validate()?;
+        if self.artifacts.iter().any(|artifact| {
+            artifact.definition_id != definition_id || artifact.generation_id != generation_id
+        }) {
+            return Err(paro_error::data_corrupted(format!(
+                "search artifact set does not belong to definition {definition_id} generation {generation_id}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 pub struct GenerationReadLease {
     pub definition_id: SearchDefinitionId,
@@ -307,6 +370,10 @@ pub struct GenerationReadSnapshot {
     /// Prevalidated HNSW contract. Present iff the generation provider is HNSW.
     pub hnsw_provider_config: Option<Arc<super::HnswProviderConfig>>,
     pub artifacts: Arc<GenerationArtifactSet>,
+    /// Exact physical tail identity published with the generation manifest.
+    /// Counts in `coverage` are observability/admission summaries; query
+    /// correctness and resource governance use these immutable entries.
+    pub tail_pending_entries: Arc<[TailPendingEntry]>,
 }
 
 #[derive(Debug, Clone)]
@@ -321,6 +388,7 @@ pub struct SearchReadSnapshot {
     pub reader_runtime: Arc<SearchReaderRuntime>,
     derived_lag_lease: Option<Arc<DerivedLagLease>>,
     overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
+    tail_segments: BTreeSet<ArtifactSegmentRef>,
     tail_window: TailWindow,
 }
 
@@ -333,10 +401,25 @@ impl SearchReadSnapshot {
         generation_lease: Arc<GenerationReadLease>,
         reader_runtime: Arc<SearchReaderRuntime>,
     ) -> Self {
+        let tail_segments = generation
+            .tail_pending_entries
+            .iter()
+            .filter(|entry| entry.mutation != TailMutationKind::Delete)
+            .flat_map(|entry| {
+                entry
+                    .segment_ids
+                    .iter()
+                    .map(|segment_id| ArtifactSegmentRef {
+                        rowset_id: entry.rowset_id,
+                        segment_id: *segment_id,
+                    })
+            })
+            .collect::<BTreeSet<_>>();
         let tail_window = TailWindow::from_segments(
             generation.indexed_through_ts,
             table.visible_version,
             table_lease.visible_segments(),
+            &tail_segments,
             |rowset_id| table_lease.is_overlay_rowset(rowset_id),
         );
         Self {
@@ -348,6 +431,7 @@ impl SearchReadSnapshot {
             reader_runtime,
             derived_lag_lease: None,
             overlay_delete_vectors: None,
+            tail_segments,
             tail_window,
         }
     }
@@ -391,13 +475,22 @@ impl SearchReadSnapshot {
         self.generation.artifacts.artifacts.iter().find(|artifact| {
             artifact.kind == kind
                 && artifact.column_id == column_id
-                && artifact.segment.rowset_id == segment.rowset_id
-                && artifact.segment.segment_id == segment.segment_id
+                && artifact.coverage.singleton_segment()
+                    == Some(super::capability::ArtifactSegmentRef {
+                        rowset_id: segment.rowset_id,
+                        segment_id: segment.segment_id,
+                    })
         })
     }
 
     pub(crate) fn is_tail_segment(&self, segment: &VisibleSegment) -> bool {
         if self.table_lease.is_overlay_rowset(segment.rowset_id) {
+            return true;
+        }
+        if self.tail_segments.contains(&ArtifactSegmentRef {
+            rowset_id: segment.rowset_id,
+            segment_id: segment.segment_id,
+        }) {
             return true;
         }
         let rowset_end = segment.rowset.end_version();
@@ -622,6 +715,7 @@ mod tests {
             provider_config: Arc::new(serde_json::Value::Null),
             hnsw_provider_config: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
 

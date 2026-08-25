@@ -590,8 +590,8 @@ fn open_sidecar_hnsw_index(
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
         },
-        rowset_id: artifact.segment.rowset_id,
-        segment_id: artifact.segment.segment_id,
+        rowset_id: visible_segment.rowset_id,
+        segment_id: visible_segment.segment_id,
         column_id,
     };
     runtime.get_or_try_open_decoded(request, |cached| {

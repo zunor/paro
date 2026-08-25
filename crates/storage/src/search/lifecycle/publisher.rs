@@ -9,7 +9,7 @@ use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
 
 use super::super::artifact::{ArtifactFileId, ArtifactLocation};
-use super::super::capability::{SearchArtifactRef, SearchIndexKind};
+use super::super::capability::{SearchArtifactRef, SearchIndexKind, SearchPartitionCoverage};
 use super::super::cursor::GenerationArtifactSet;
 use super::super::manifest::LoadedManifest;
 use super::super::sidecar::SidecarArtifactStore;
@@ -68,11 +68,14 @@ pub(crate) fn replace_artifacts(
     GenerationArtifactSet { artifacts }
 }
 
-pub(crate) fn search_artifact_key(artifact: &SearchArtifactRef) -> (RowsetId, u32, ColumnId) {
+pub(crate) fn search_artifact_key(
+    artifact: &SearchArtifactRef,
+) -> (SearchPartitionCoverage, ColumnId, SearchIndexKind, u32) {
     (
-        artifact.segment.rowset_id,
-        artifact.segment.segment_id,
+        artifact.coverage.clone(),
         artifact.column_id,
+        artifact.kind,
+        artifact.provider_variant,
     )
 }
 

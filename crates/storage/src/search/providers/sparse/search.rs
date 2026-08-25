@@ -164,8 +164,8 @@ fn open_sidecar_sparse_index(
             codec: SIDECAR_PACKAGE_CODEC,
             integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
         },
-        rowset_id: artifact.segment.rowset_id,
-        segment_id: artifact.segment.segment_id,
+        rowset_id: visible_segment.rowset_id,
+        segment_id: visible_segment.segment_id,
         column_id,
     };
     runtime.get_or_try_open_decoded(request, |cached| {
@@ -449,10 +449,14 @@ mod tests {
         let artifact = SearchArtifactRef {
             definition_id: 8,
             generation_id: 1,
-            segment: ArtifactSegmentRef {
-                rowset_id: visible_segment.rowset_id,
-                segment_id: visible_segment.segment_id,
-            },
+            coverage: crate::search::SearchPartitionCoverage::singleton(
+                ArtifactSegmentRef {
+                    rowset_id: visible_segment.rowset_id,
+                    segment_id: visible_segment.segment_id,
+                },
+                2,
+            )
+            .unwrap(),
             column_id: 0,
             kind: SearchIndexKind::Sparse,
             provider_variant: 1,
@@ -479,6 +483,7 @@ mod tests {
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: vec![artifact],
             }),
+            tail_pending_entries: Arc::from([]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(
@@ -541,6 +546,10 @@ mod tests {
             &crate::search::SearchReadOptions::ungoverned(),
         )
         .expect("open table lease");
+        let visible_segment = table_lease
+            .visible_segments()
+            .first()
+            .expect("visible segment");
         let generation = GenerationReadSnapshot {
             definition_id: 9,
             generation_id: 1,
@@ -560,6 +569,15 @@ mod tests {
             artifacts: Arc::new(GenerationArtifactSet {
                 artifacts: Vec::new(),
             }),
+            tail_pending_entries: Arc::from([crate::search::TailPendingEntry {
+                entry_id: crate::search::TailEntryId(1),
+                rowset_id: visible_segment.rowset_id,
+                segment_ids: vec![visible_segment.segment_id],
+                mutation: crate::search::TailMutationKind::Append,
+                row_count: 2,
+                byte_count: visible_segment.segment.file_size(),
+                row_image_ref: Some(crate::search::TailRowImageRef::WholeRowset),
+            }]),
         };
         let generation_lease = GenerationReadLease::from_snapshot(&generation);
         let snapshot = SearchReadSnapshot::new(
@@ -572,6 +590,7 @@ mod tests {
                 table.tablet().data_dir().clone(),
             ))),
         );
+        assert_eq!(snapshot.tail_window().committed_rows, 2);
         let query = SparseVector::new(vec![1], vec![1.0]).unwrap();
         let opened = SparseSearchProvider::new(table.tablet(), 0, &query, 10, None)
             .open(snapshot)

@@ -3,7 +3,7 @@
 
 //! Query-time exact tail merge admission for deferred derived search state.
 
-use crate::search::capability::{CoverageState, SearchIndexKind};
+use crate::search::capability::{ArtifactSegmentRef, CoverageState, SearchIndexKind};
 use crate::search::cursor::{PhysicalRowRef, SearchReadSnapshot, VisibleSegment};
 use paro_common::error::{self as paro_error, Result};
 
@@ -28,6 +28,7 @@ impl TailWindow {
         indexed_through_ts: u64,
         visible_version: i64,
         segments: &[VisibleSegment],
+        manifest_tail_segments: &std::collections::BTreeSet<ArtifactSegmentRef>,
         is_overlay_rowset: impl Fn(crate::rowset::RowsetId) -> bool,
     ) -> Self {
         use std::collections::HashSet;
@@ -55,12 +56,15 @@ impl TailWindow {
                 continue;
             }
 
+            let explicitly_pending = manifest_tail_segments.contains(&ArtifactSegmentRef {
+                rowset_id,
+                segment_id: segment.segment_id,
+            });
             let rowset_end = segment.rowset.end_version();
-            if rowset_end < 0 {
-                continue;
-            }
-            let rowset_end = rowset_end as u64;
-            if rowset_end > indexed_through_ts && rowset_end <= target_ts {
+            let newer_than_generation = rowset_end >= 0
+                && (rowset_end as u64) > indexed_through_ts
+                && (rowset_end as u64) <= target_ts;
+            if explicitly_pending || newer_than_generation {
                 window.committed_rows = window.committed_rows.saturating_add(rows);
                 window.committed_segments = window.committed_segments.saturating_add(1);
                 if committed_rowsets.insert(rowset_id) {

@@ -1,7 +1,8 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use serde::{Deserialize, Serialize};
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::rowset::RowsetId;
@@ -104,11 +105,163 @@ pub struct ArtifactSegmentRef {
     pub segment_id: SegmentId,
 }
 
+/// One immutable storage segment covered by a search partition.
+///
+/// `row_count` defines the segment's point-id range inside the partition. The
+/// partition-local point domain is the concatenation of spans in canonical
+/// physical-address order; future multi-segment artifacts can therefore map a
+/// point back to a physical row without consulting mutable table layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ArtifactSegmentSpan {
+    pub segment: ArtifactSegmentRef,
+    pub row_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArtifactPointRef {
+    pub segment: ArtifactSegmentRef,
+    pub row_offset: u32,
+}
+
+/// Generation-owned physical coverage of one immutable search artifact.
+///
+/// Coverage is deliberately not a single `ArtifactSegmentRef`. Search
+/// partitions are allowed to span multiple base segments so background search
+/// compaction can publish a coarse HNSW graph without rewriting table data.
+/// Spans are strictly ordered and non-empty, making the local point-id mapping
+/// deterministic and giving manifests a canonical artifact identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct SearchPartitionCoverage {
+    segments: Box<[ArtifactSegmentSpan]>,
+}
+
+#[derive(Deserialize)]
+struct SearchPartitionCoverageImage {
+    segments: Vec<ArtifactSegmentSpan>,
+}
+
+impl<'de> Deserialize<'de> for SearchPartitionCoverage {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let image = SearchPartitionCoverageImage::deserialize(deserializer)?;
+        Self::try_new(image.segments).map_err(D::Error::custom)
+    }
+}
+
+impl SearchPartitionCoverage {
+    pub fn try_new(segments: Vec<ArtifactSegmentSpan>) -> paro_common::error::Result<Self> {
+        if segments.is_empty() {
+            return Err(paro_common::error::invalid_input(
+                "search partition coverage must contain at least one segment",
+            ));
+        }
+        let mut total_rows = 0u64;
+        let mut previous = None;
+        for span in &segments {
+            if span.row_count == 0 {
+                return Err(paro_common::error::invalid_input(format!(
+                    "search partition segment {}/{} has zero rows",
+                    span.segment.rowset_id, span.segment.segment_id
+                )));
+            }
+            if previous.is_some_and(|previous| previous >= span.segment) {
+                return Err(paro_common::error::invalid_input(
+                    "search partition segments must be unique and strictly ordered",
+                ));
+            }
+            previous = Some(span.segment);
+            total_rows = total_rows.checked_add(span.row_count).ok_or_else(|| {
+                paro_common::error::out_of_range("search partition row count overflow")
+            })?;
+        }
+        if total_rows > u64::from(u32::MAX) {
+            return Err(paro_common::error::out_of_range(format!(
+                "search partition has {total_rows} rows, exceeding the u32 point-id domain"
+            )));
+        }
+        Ok(Self {
+            segments: segments.into_boxed_slice(),
+        })
+    }
+
+    pub fn singleton(
+        segment: ArtifactSegmentRef,
+        row_count: u64,
+    ) -> paro_common::error::Result<Self> {
+        Self::try_new(vec![ArtifactSegmentSpan { segment, row_count }])
+    }
+
+    pub fn segments(&self) -> &[ArtifactSegmentSpan] {
+        &self.segments
+    }
+
+    pub fn row_count(&self) -> u64 {
+        self.segments.iter().map(|span| span.row_count).sum()
+    }
+
+    pub fn singleton_segment(&self) -> Option<ArtifactSegmentRef> {
+        (self.segments.len() == 1).then(|| self.segments[0].segment)
+    }
+
+    pub fn contains_segment(&self, segment: ArtifactSegmentRef) -> bool {
+        self.segments
+            .binary_search_by_key(&segment, |span| span.segment)
+            .is_ok()
+    }
+
+    pub fn contains_rowset(&self, rowset_id: RowsetId) -> bool {
+        self.segments
+            .iter()
+            .any(|span| span.segment.rowset_id == rowset_id)
+    }
+
+    pub fn intersects_rowsets(&self, rowset_ids: &std::collections::BTreeSet<RowsetId>) -> bool {
+        self.segments
+            .iter()
+            .any(|span| rowset_ids.contains(&span.segment.rowset_id))
+    }
+
+    /// Resolve an artifact-local point id into the immutable table row it
+    /// indexes. This translation runs only for emitted candidates, not during
+    /// graph traversal, so a compact span table is preferable to an O(N)
+    /// per-point mapping artifact.
+    pub fn resolve_point(&self, point_id: u32) -> Option<ArtifactPointRef> {
+        let point_id = u64::from(point_id);
+        let mut base = 0u64;
+        for span in &self.segments {
+            let end = base + span.row_count;
+            if point_id < end {
+                return Some(ArtifactPointRef {
+                    segment: span.segment,
+                    row_offset: u32::try_from(point_id - base).ok()?,
+                });
+            }
+            base = end;
+        }
+        None
+    }
+
+    /// Artifact-local point range assigned to one physical segment.
+    pub fn point_range(&self, segment: ArtifactSegmentRef) -> Option<std::ops::Range<u32>> {
+        let mut base = 0u64;
+        for span in &self.segments {
+            let end = base + span.row_count;
+            if span.segment == segment {
+                return Some(u32::try_from(base).ok()?..u32::try_from(end).ok()?);
+            }
+            base = end;
+        }
+        None
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SearchArtifactRef {
     pub definition_id: SearchDefinitionId,
     pub generation_id: SearchGenerationId,
-    pub segment: ArtifactSegmentRef,
+    pub coverage: SearchPartitionCoverage,
     pub column_id: ColumnId,
     pub kind: SearchIndexKind,
     pub provider_variant: ProviderVariantId,
@@ -116,6 +269,34 @@ pub struct SearchArtifactRef {
     pub location: ArtifactLocation,
     pub stats: SearchArtifactStats,
     pub checksum: u64,
+}
+
+impl SearchArtifactRef {
+    pub fn validate(&self) -> paro_common::error::Result<()> {
+        let covered_rows = self.coverage.row_count();
+        if covered_rows != self.stats.row_count {
+            return Err(paro_common::error::data_corrupted(format!(
+                "search artifact coverage has {covered_rows} rows, stats report {}",
+                self.stats.row_count
+            )));
+        }
+        if let ArtifactLocation::Inline { page } = &self.location {
+            let Some(segment) = self.coverage.singleton_segment() else {
+                return Err(paro_common::error::data_corrupted(
+                    "inline search artifact covers more than one physical segment",
+                ));
+            };
+            if page.rowset_id != segment.rowset_id
+                || page.segment_id != segment.segment_id
+                || page.column_id != self.column_id
+            {
+                return Err(paro_common::error::data_corrupted(
+                    "inline search artifact location does not match its coverage",
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -472,9 +653,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CoverageState, SearchCapability, SearchCapabilityState, SearchFreshnessPolicy,
-        SearchGeneration, SearchIndexDefinition, SearchIndexKind, SearchNotQueryableReason,
-        SearchTailSummary,
+        ArtifactPointRef, ArtifactSegmentRef, ArtifactSegmentSpan, CoverageState, SearchCapability,
+        SearchCapabilityState, SearchFreshnessPolicy, SearchGeneration, SearchIndexDefinition,
+        SearchIndexKind, SearchNotQueryableReason, SearchPartitionCoverage, SearchTailSummary,
     };
     use crate::index::hnsw::DistanceMetric;
     use crate::search::artifact::{ArtifactFileId, ArtifactLocation};
@@ -483,6 +664,57 @@ mod tests {
         SearchProviderStats,
     };
     use crate::search::{HnswInlineConfig, HnswProviderConfig, HNSW_PROVIDER_CONFIG_VERSION};
+
+    #[test]
+    fn partition_coverage_is_canonical_and_maps_local_points() {
+        let first = ArtifactSegmentRef {
+            rowset_id: 3,
+            segment_id: 1,
+        };
+        let second = ArtifactSegmentRef {
+            rowset_id: 7,
+            segment_id: 0,
+        };
+        let coverage = SearchPartitionCoverage::try_new(vec![
+            ArtifactSegmentSpan {
+                segment: first,
+                row_count: 2,
+            },
+            ArtifactSegmentSpan {
+                segment: second,
+                row_count: 3,
+            },
+        ])
+        .unwrap();
+
+        assert_eq!(coverage.row_count(), 5);
+        assert_eq!(coverage.point_range(first), Some(0..2));
+        assert_eq!(coverage.point_range(second), Some(2..5));
+        assert_eq!(
+            coverage.resolve_point(2),
+            Some(ArtifactPointRef {
+                segment: second,
+                row_offset: 0,
+            })
+        );
+        assert_eq!(coverage.resolve_point(4).unwrap().row_offset, 2);
+        assert_eq!(coverage.resolve_point(5), None);
+
+        let encoded = serde_json::to_string(&coverage).unwrap();
+        let decoded: SearchPartitionCoverage = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, coverage);
+        assert!(SearchPartitionCoverage::try_new(vec![
+            ArtifactSegmentSpan {
+                segment: second,
+                row_count: 1,
+            },
+            ArtifactSegmentSpan {
+                segment: first,
+                row_count: 1,
+            },
+        ])
+        .is_err());
+    }
 
     #[test]
     fn coverage_state_knows_exact_tail_merge_contract() {

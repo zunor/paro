@@ -4,15 +4,17 @@
 //! Compact binary codec for search manifest fragments.
 //!
 //! This codec is intentionally explicit instead of serde-driven. Manifest open is
-//! on the search query hot path, so binary-v1 keeps stable field order, small
+//! on the search query hot path, so binary-v2 keeps stable field order, small
 //! enum tags, and little-endian scalar encoding without reflection-style map
-//! dispatch.
+//! dispatch. Binary-v2 stores generation-owned multi-segment partition
+//! coverage for every artifact.
 
 use paro_common::error::{self as paro_error, Result};
 
 use crate::search::artifact::{ArtifactFileId, ArtifactLocation, SegmentPagePointer};
 use crate::search::capability::{
-    ArtifactSegmentRef, CoverageState, SearchArtifactRef, SearchIndexKind,
+    ArtifactSegmentRef, ArtifactSegmentSpan, CoverageState, SearchArtifactRef, SearchIndexKind,
+    SearchPartitionCoverage,
 };
 use crate::search::inline_sink::{
     FullTextStatsDelta, HnswStatsDelta, SearchStatsDelta, SparseStatsDelta,
@@ -30,7 +32,7 @@ use super::{
     ManifestDeltaEntry, ManifestFileRef, ManifestShard,
 };
 
-const MAGIC: &[u8; 4] = b"PMB1";
+const MAGIC: &[u8; 4] = b"PMB2";
 const ROOT_FRAGMENT: u8 = 1;
 const SHARD_FRAGMENT: u8 = 2;
 const DELTA_FRAGMENT: u8 = 3;
@@ -197,7 +199,7 @@ impl<'a> BinaryReader<'a> {
         let actual = self.take(magic.len())?;
         if actual != magic {
             return Err(paro_error::serialization_error(
-                "decode binary search manifest fragment: missing PMB1 magic",
+                "decode binary search manifest fragment: missing PMB2 magic",
             ));
         }
         Ok(())
@@ -810,10 +812,9 @@ fn encode_delta_entry(writer: &mut BinaryWriter, entry: &ManifestDeltaEntry) -> 
             writer.u8(0);
             encode_artifact_ref(writer, artifact)
         }
-        ManifestDeltaEntry::RemoveArtifact(segment) => {
+        ManifestDeltaEntry::RemoveArtifact(coverage) => {
             writer.u8(1);
-            encode_artifact_segment_ref(writer, segment);
-            Ok(())
+            encode_partition_coverage(writer, coverage)
         }
         ManifestDeltaEntry::UpsertTail(entry) => {
             writer.u8(2);
@@ -837,7 +838,7 @@ fn decode_delta_entry(reader: &mut BinaryReader<'_>) -> Result<ManifestDeltaEntr
             reader,
         )?)),
         1 => Ok(ManifestDeltaEntry::RemoveArtifact(
-            decode_artifact_segment_ref(reader)?,
+            decode_partition_coverage(reader)?,
         )),
         2 => Ok(ManifestDeltaEntry::UpsertTail(decode_tail_entry(reader)?)),
         3 => Ok(ManifestDeltaEntry::CoverTail(TailEntryId(reader.u64()?))),
@@ -851,7 +852,7 @@ fn decode_delta_entry(reader: &mut BinaryReader<'_>) -> Result<ManifestDeltaEntr
 fn encode_artifact_ref(writer: &mut BinaryWriter, artifact: &SearchArtifactRef) -> Result<()> {
     writer.u64(artifact.definition_id);
     writer.u64(artifact.generation_id);
-    encode_artifact_segment_ref(writer, &artifact.segment);
+    encode_partition_coverage(writer, &artifact.coverage)?;
     writer.u32(artifact.column_id);
     encode_index_kind(writer, artifact.kind);
     writer.u32(artifact.provider_variant);
@@ -866,7 +867,7 @@ fn decode_artifact_ref(reader: &mut BinaryReader<'_>) -> Result<SearchArtifactRe
     Ok(SearchArtifactRef {
         definition_id: reader.u64()?,
         generation_id: reader.u64()?,
-        segment: decode_artifact_segment_ref(reader)?,
+        coverage: decode_partition_coverage(reader)?,
         column_id: reader.u32()?,
         kind: decode_index_kind(reader)?,
         provider_variant: reader.u32()?,
@@ -886,6 +887,34 @@ fn decode_artifact_segment_ref(reader: &mut BinaryReader<'_>) -> Result<Artifact
     Ok(ArtifactSegmentRef {
         rowset_id: reader.u64()?,
         segment_id: reader.u32()?,
+    })
+}
+
+fn encode_partition_coverage(
+    writer: &mut BinaryWriter,
+    coverage: &SearchPartitionCoverage,
+) -> Result<()> {
+    writer.len(coverage.segments().len())?;
+    for span in coverage.segments() {
+        encode_artifact_segment_ref(writer, &span.segment);
+        writer.u64(span.row_count);
+    }
+    Ok(())
+}
+
+fn decode_partition_coverage(reader: &mut BinaryReader<'_>) -> Result<SearchPartitionCoverage> {
+    let span_count = reader.len()?;
+    let mut spans = Vec::with_capacity(span_count);
+    for _ in 0..span_count {
+        spans.push(ArtifactSegmentSpan {
+            segment: decode_artifact_segment_ref(reader)?,
+            row_count: reader.u64()?,
+        });
+    }
+    SearchPartitionCoverage::try_new(spans).map_err(|err| {
+        paro_error::serialization_error(format!(
+            "decode binary search manifest partition coverage: {err}"
+        ))
     })
 }
 

@@ -34,8 +34,8 @@ use super::maintenance::{
     SearchMaintenanceAction,
 };
 use super::manifest::{
-    GenerationManifestRoot, ManifestCodecFamily, ManifestCodecKind, ManifestDelta,
-    ManifestDeltaEntry, ManifestShard, ManifestStore,
+    GenerationManifestRoot, ManifestCodecKind, ManifestDelta, ManifestDeltaEntry, ManifestShard,
+    ManifestStore,
 };
 use super::row_fetch::{RowFetchMode, SearchRowFetcher};
 use super::stats::{
@@ -64,7 +64,7 @@ impl ManifestOpenBenchConfig {
             entries_per_delta: 1,
             shard_count: 1,
             entries_per_shard: 0,
-            codec: ManifestBenchCodec::JsonDebugV1,
+            codec: ManifestBenchCodec::JsonDebugV2,
         }
     }
 
@@ -82,25 +82,22 @@ impl ManifestOpenBenchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestBenchCodec {
-    JsonDebugV1,
-    BinaryV1,
+    JsonDebugV2,
+    BinaryV2,
 }
 
 impl ManifestBenchCodec {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::JsonDebugV1 => "json-debug-v1",
-            Self::BinaryV1 => "binary-v1",
+            Self::JsonDebugV2 => "json-debug-v2",
+            Self::BinaryV2 => "binary-v2",
         }
     }
 
     const fn manifest_codec(self) -> ManifestCodecKind {
         match self {
-            Self::JsonDebugV1 => ManifestCodecKind::JSON_DEBUG_V1,
-            Self::BinaryV1 => ManifestCodecKind {
-                family: ManifestCodecFamily::Binary,
-                version: 1,
-            },
+            Self::JsonDebugV2 => ManifestCodecKind::JSON_DEBUG_V2,
+            Self::BinaryV2 => ManifestCodecKind::BINARY_V2,
         }
     }
 }
@@ -504,10 +501,14 @@ fn sample_artifact(rowset_id: u64) -> SearchArtifactRef {
     SearchArtifactRef {
         definition_id: 1,
         generation_id: 1,
-        segment: ArtifactSegmentRef {
-            rowset_id,
-            segment_id: 0,
-        },
+        coverage: super::capability::SearchPartitionCoverage::singleton(
+            ArtifactSegmentRef {
+                rowset_id,
+                segment_id: 0,
+            },
+            1,
+        )
+        .expect("sample partition coverage"),
         column_id: 0,
         kind: SearchIndexKind::FullText,
         provider_variant: 1,
