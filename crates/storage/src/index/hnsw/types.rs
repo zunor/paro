@@ -34,6 +34,9 @@ pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 10 applies `ef_construct` on every HNSW layer. Earlier builders
+/// silently narrowed upper-layer construction to M, weakening the sparse
+/// routing hierarchy as graph partitions grew.
 /// Version 9 stores each scalar dictionary posting as an exact contiguous run
 /// inside its covering block. Exact scans no longer over-read neighboring
 /// ordinals or need a heuristic fallback to random base-vector gathers.
@@ -52,7 +55,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 9;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 10;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]

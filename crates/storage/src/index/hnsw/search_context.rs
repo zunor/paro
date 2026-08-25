@@ -27,15 +27,23 @@ impl<T: Ord> FixedLengthPriorityQueue<T> {
         }
     }
 
-    /// Push an element. If the queue is full, it replaces the worst element
-    /// if the new one is better.
-    pub fn push(&mut self, element: T) {
+    /// Retain `element` when it belongs to the bounded best set.
+    ///
+    /// Returning the admission decision lets graph traversal publish a point
+    /// to its expansion frontier without first peeking and comparing the same
+    /// heap a second time.
+    pub fn push(&mut self, element: T) -> bool {
         if self.heap.len() < self.capacity {
             self.heap.push(Reverse(element));
+            true
         } else if let Some(mut worst) = self.heap.peek_mut() {
             if element > worst.0 {
                 *worst = Reverse(element);
+                return true;
             }
+            false
+        } else {
+            false
         }
     }
 
@@ -83,7 +91,7 @@ impl SearchContext {
         let mut nearest = FixedLengthPriorityQueue::new(ef);
         nearest.push(entry_point);
 
-        let mut candidates = BinaryHeap::new();
+        let mut candidates = BinaryHeap::with_capacity(ef);
         candidates.push(entry_point);
 
         Self {
@@ -96,9 +104,7 @@ impl SearchContext {
     ///
     /// If the point is good enough to enter the `nearest` set, it's also added to `candidates`.
     pub fn process_candidate(&mut self, point: ScoredPoint) -> bool {
-        let worst_score = self.lower_bound();
-        if self.nearest.len() < self.nearest.capacity || point.score > worst_score {
-            self.nearest.push(point);
+        if self.nearest.push(point) {
             self.candidates.push(point);
             true
         } else {
@@ -122,10 +128,11 @@ mod tests {
     #[test]
     fn test_fixed_length_queue() {
         let mut q = FixedLengthPriorityQueue::new(3);
-        q.push(ScoredPoint { idx: 1, score: 0.5 });
-        q.push(ScoredPoint { idx: 2, score: 0.8 });
-        q.push(ScoredPoint { idx: 3, score: 0.3 });
-        q.push(ScoredPoint { idx: 4, score: 0.9 }); // Should replace 0.3
+        assert!(q.push(ScoredPoint { idx: 1, score: 0.5 }));
+        assert!(q.push(ScoredPoint { idx: 2, score: 0.8 }));
+        assert!(q.push(ScoredPoint { idx: 3, score: 0.3 }));
+        assert!(q.push(ScoredPoint { idx: 4, score: 0.9 }));
+        assert!(!q.push(ScoredPoint { idx: 5, score: 0.1 }));
 
         let results = q.into_sorted_vec();
         assert_eq!(results.len(), 3);

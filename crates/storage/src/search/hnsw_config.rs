@@ -26,11 +26,12 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 10 uses the configured construction beam on every HNSW layer.
 /// Version 9 binds definitions to the chunk-authenticated HNSW artifact
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 9;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

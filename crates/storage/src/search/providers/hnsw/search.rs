@@ -27,9 +27,7 @@ use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
 use crate::search::row_fetch::snapshot_epoch;
-use crate::search::segment_dispatch::{
-    dispatch_segments, install_search_pool, map_segments, SegmentDispatchResult,
-};
+use crate::search::segment_dispatch::{dispatch_segments, map_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
     DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
     SIDECAR_PACKAGE_CODEC,
@@ -206,21 +204,6 @@ impl std::fmt::Debug for VectorSearchCursor {
 
 impl VectorSearchCursor {
     fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
-        if budget.parallelism_slots > 1 {
-            return install_search_pool(budget.parallelism_slots, || {
-                self.build_ranked_rows_in_dispatch_context(budget)
-            });
-        }
-        self.build_ranked_rows_in_dispatch_context(budget)
-    }
-
-    /// Execute predicate preparation and segment search under one pool
-    /// installation. Filtered search has a cardinality barrier between these
-    /// phases, but the barrier must not imply a second cross-thread handoff.
-    fn build_ranked_rows_in_dispatch_context(
-        &self,
-        budget: &ResourceBudget,
-    ) -> Result<Vec<RankedRow>> {
         let started_at = Instant::now();
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::Hnsw,

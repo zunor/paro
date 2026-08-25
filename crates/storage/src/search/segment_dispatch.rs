@@ -2,11 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, RwLock};
 use std::time::Instant;
 
 use paro_common::error::{self as paro_error, Result};
-use rayon::prelude::*;
 use rayon::ThreadPool;
 
 use super::capability::SearchIndexKind;
@@ -76,51 +76,101 @@ where
     T: Send,
     F: Fn((usize, &VisibleSegment)) -> Result<T> + Send + Sync,
 {
-    if parallelism_slots > 1 && !segments.is_empty() {
-        install_search_pool(parallelism_slots, || {
-            segments
-                .par_iter()
-                .enumerate()
-                .map(execute)
-                .collect::<Result<Vec<_>>>()
-        })
-    } else {
-        segments.iter().enumerate().map(execute).collect()
-    }
+    map_search_tasks(segments, parallelism_slots, |index, segment| {
+        execute((index, segment))
+    })
 }
 
-/// Run provider work in the process-level search pool selected by the query's
-/// execution grant.
+/// Map borrowed search work in deterministic input order while keeping the
+/// calling query thread as one execution lane.
 ///
-/// This is the shared nesting boundary for segment dispatch and finer-grained
-/// provider partitions. Rayon can work-steal nested jobs in the same pool, so
-/// a query never creates a private executor or oversubscribes the granted
-/// width when one large segment exposes more parallel work than its siblings.
-pub(crate) fn install_search_pool<T, F>(parallelism_slots: usize, execute: F) -> Result<T>
+/// The process pool owns only `parallelism_slots - 1` workers. `in_place_scope`
+/// executes one lane on the query thread and lends the remaining work to those
+/// workers, so a grant of four means four runnable lanes rather than four
+/// Rayon workers plus a blocked executor thread. Nested exact-scan phases use
+/// the same registry and remain work-stealable without oversubscription.
+pub(crate) fn map_search_tasks<I, T, F>(
+    items: &[I],
+    parallelism_slots: usize,
+    execute: F,
+) -> Result<Vec<T>>
 where
+    I: Sync,
     T: Send,
-    F: FnOnce() -> Result<T> + Send,
+    F: Fn(usize, &I) -> Result<T> + Sync,
 {
-    let pool = dispatch_pool(parallelism_slots.max(1))?;
-    if pool.current_thread_index().is_some() {
-        execute()
-    } else {
-        pool.install(execute)
+    if items.is_empty() {
+        return Ok(Vec::new());
     }
+    let lane_count = parallelism_slots.max(1).min(items.len());
+    if lane_count == 1 {
+        return items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| execute(index, item))
+            .collect();
+    }
+
+    let pool = dispatch_pool(parallelism_slots.max(1))?;
+    // Reserve the first item for the query thread. Without this reservation a
+    // newly-awakened worker can consume a short queue before the caller gets
+    // scheduled, turning the caller back into a waiter and exceeding the
+    // execution grant by one runnable thread.
+    let next = AtomicUsize::new(1);
+    let results = (0..items.len())
+        .map(|_| Mutex::new(None))
+        .collect::<Vec<Mutex<Option<Result<T>>>>>();
+    let execute_index = |index: usize| {
+        let result = execute(index, &items[index]);
+        *results[index]
+            .lock()
+            .expect("search task result lock poisoned") = Some(result);
+    };
+    let run_lane = || loop {
+        let index = next.fetch_add(1, Ordering::Relaxed);
+        if index >= items.len() {
+            break;
+        }
+        execute_index(index);
+    };
+
+    pool.in_place_scope(|scope| {
+        for _ in 1..lane_count {
+            let run_lane = &run_lane;
+            scope.spawn(move |_| run_lane());
+        }
+        execute_index(0);
+        run_lane();
+    });
+
+    results
+        .into_iter()
+        .enumerate()
+        .map(|(index, result)| {
+            result
+                .into_inner()
+                .map_err(|_| paro_error::internal("search task result lock poisoned"))?
+                .ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "search task {index} completed without publishing a result"
+                    ))
+                })?
+        })
+        .collect()
 }
 
-fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {
+fn dispatch_pool(parallelism_slots: usize) -> Result<Arc<ThreadPool>> {
     if let Some(pool) = SEGMENT_DISPATCH_POOLS
         .read()
         .map_err(|_| paro_error::internal("read segment dispatch pool cache"))?
-        .get(&thread_count)
+        .get(&parallelism_slots)
         .cloned()
     {
         return Ok(pool);
     }
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
-            .num_threads(thread_count.max(1))
+            .num_threads(parallelism_slots.saturating_sub(1).max(1))
             .build()
             .map_err(|err| paro_error::internal(format!("build segment dispatch pool: {err}")))?,
     );
@@ -128,15 +178,16 @@ fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {
         .write()
         .map_err(|_| paro_error::internal("publish segment dispatch pool"))?;
     Ok(guard
-        .entry(thread_count)
+        .entry(parallelism_slots)
         .or_insert_with(|| Arc::clone(&pool))
         .clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dispatch_pool, install_search_pool};
-    use std::sync::Arc;
+    use super::{dispatch_pool, map_search_tasks};
+    use paro_common::error as paro_error;
+    use std::sync::{Arc, Barrier, Mutex};
 
     #[test]
     fn dispatch_pool_is_cached_per_width() {
@@ -146,15 +197,63 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(first.current_num_threads(), 1);
+        assert_eq!(third.current_num_threads(), 2);
     }
 
     #[test]
-    fn nested_phase_reuses_the_current_search_pool_worker() {
-        let (outer, inner) = install_search_pool(2, || {
-            let outer = std::thread::current().id();
-            install_search_pool(2, || Ok((outer, std::thread::current().id())))
+    fn map_search_tasks_preserves_order_and_uses_the_query_thread() {
+        let caller = std::thread::current().id();
+        let observed = Mutex::new(Vec::new());
+        let values = [3usize, 1, 2, 0];
+
+        let mapped = map_search_tasks(&values, 3, |index, value| {
+            observed
+                .lock()
+                .expect("record executing thread")
+                .push((index, std::thread::current().id()));
+            Ok(index * 10 + value)
+        })
+        .expect("map search tasks");
+
+        assert_eq!(mapped, vec![3, 11, 22, 30]);
+        assert!(observed
+            .into_inner()
+            .expect("read executing threads")
+            .contains(&(0, caller)));
+    }
+
+    #[test]
+    fn nested_phase_on_pool_worker_does_not_deadlock() {
+        let barrier = Arc::new(Barrier::new(2));
+        let items = [0usize, 1];
+        let mapped = map_search_tasks(&items, 2, |index, _| {
+            barrier.wait();
+            if index == 1 {
+                let inner = map_search_tasks(&[2usize, 3], 2, |_, value| Ok(*value))?;
+                Ok(inner.into_iter().sum())
+            } else {
+                Ok(1)
+            }
         })
         .expect("nested search phase");
-        assert_eq!(outer, inner);
+
+        assert_eq!(mapped, vec![1, 5]);
+    }
+
+    #[test]
+    fn map_search_tasks_returns_the_first_input_order_error() {
+        let error = map_search_tasks(&[0usize, 1, 2], 3, |index, _| {
+            if index == 1 {
+                Err(paro_error::internal("first ordered failure"))
+            } else if index == 2 {
+                Err(paro_error::internal("later ordered failure"))
+            } else {
+                Ok(index)
+            }
+        })
+        .expect_err("map should fail");
+
+        assert!(error.to_string().contains("first ordered failure"));
     }
 }

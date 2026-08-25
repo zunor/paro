@@ -214,6 +214,13 @@ impl GraphLayersBuilder {
         self.distance_profile.snapshot()
     }
 
+    /// Construction breadth is a graph-wide contract, not a level-specific
+    /// shortcut. Upper layers are sparse routing indexes and need the same
+    /// candidate beam to remain representative as level 0.
+    const fn construction_beam_for_level(&self, _level: usize) -> usize {
+        self.ef_construct
+    }
+
     /// Generate a random level for a new point using geometric distribution.
     pub fn random_layer_for_point(&self, point_id: PointOffset) -> usize {
         let r = DeterministicBuildRng::point_open_unit_f64(self.build_seed, point_id);
@@ -359,13 +366,20 @@ impl GraphLayersBuilder {
         };
 
         for level in (0..=target_level.min(current_level)).rev() {
-            let ef = if level == 0 {
-                self.ef_construct
-            } else {
-                self.hnsw_m.m
-            };
-            let search_results =
-                self.search_on_level(point_id, candidates, level, ef, storage, distance);
+            // `ef_construct` is the construction beam for every HNSW layer.
+            // Narrowing upper layers to M produces cheap but poorly routed
+            // large graphs: their sparse hierarchy is precisely where a wide
+            // beam has the highest leverage on level-0 recall. Keep this
+            // invariant uniform instead of hiding a second build policy behind
+            // the level number.
+            let search_results = self.search_on_level(
+                point_id,
+                candidates,
+                level,
+                self.construction_beam_for_level(level),
+                storage,
+                distance,
+            );
             let m_limit = self.hnsw_m.get_m(level);
             if self.use_heuristic {
                 let mut selected = LinksContainer::with_capacity(m_limit);
@@ -654,5 +668,15 @@ mod tests {
                 .map(|(_, level)| level)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn construction_beam_is_uniform_across_all_layers() {
+        let contract = HnswConfig::new(16, 96).build_contract(DistanceMetric::Euclidean);
+        let builder = GraphLayersBuilder::new_from_contract(1, &contract, true);
+
+        assert_eq!(builder.construction_beam_for_level(0), 96);
+        assert_eq!(builder.construction_beam_for_level(1), 96);
+        assert_eq!(builder.construction_beam_for_level(31), 96);
     }
 }

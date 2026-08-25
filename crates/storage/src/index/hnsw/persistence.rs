@@ -29,7 +29,7 @@ use super::{
 use super::{HnswConfig, HnswQueryWideStrategy, HnswSegmentSearchInput};
 use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::metrics::storage_metrics;
-use crate::search::segment_dispatch::install_search_pool;
+use crate::search::segment_dispatch::map_search_tasks;
 use crate::search::{ResourceBudget, SearchWorkBudget};
 use crate::statistics::{
     append_stats_trailer, split_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics,
@@ -2339,32 +2339,29 @@ impl HnswIndex {
             budget.try_reserve_memory(descriptor_bytes.saturating_add(scorer_scratch_bytes))?;
         let lanes = Self::plan_exact_scan_lanes(partitions, row_count, lane_count)?;
         let prepared_scoring = scorer.prepared_scoring();
-        let results = install_search_pool(budget.parallelism_slots, || {
-            lanes
-                .par_iter()
-                .map(|lane| {
-                    let mut local_scorer = prepared_scoring.scorer();
-                    let mut best = FixedLengthPriorityQueue::new(top_k);
-                    for range in &lane.ranges {
-                        let first = range.posting.select(range.first_rank).ok_or_else(|| {
-                            error::data_corrupted(
-                                "exact row-set posting rank exceeds its cardinality",
-                            )
-                        })?;
-                        self.scan_exact_points_into(
-                            &mut best,
-                            &mut local_scorer,
-                            range.posting.range(first..).take(range.len as usize),
-                            budget.work.as_ref(),
-                        )?;
-                    }
-                    Ok(ExactScanLaneResult {
-                        points: best.into_sorted_vec(),
-                        scored_points: local_scorer.scored_point_count(),
-                    })
+        let results = map_search_tasks(
+            &lanes,
+            budget.parallelism_slots,
+            |_, lane| -> Result<ExactScanLaneResult> {
+                let mut local_scorer = prepared_scoring.scorer();
+                let mut best = FixedLengthPriorityQueue::new(top_k);
+                for range in &lane.ranges {
+                    let first = range.posting.select(range.first_rank).ok_or_else(|| {
+                        error::data_corrupted("exact row-set posting rank exceeds its cardinality")
+                    })?;
+                    self.scan_exact_points_into(
+                        &mut best,
+                        &mut local_scorer,
+                        range.posting.range(first..).take(range.len as usize),
+                        budget.work.as_ref(),
+                    )?;
+                }
+                Ok(ExactScanLaneResult {
+                    points: best.into_sorted_vec(),
+                    scored_points: local_scorer.scored_point_count(),
                 })
-                .collect::<Result<Vec<_>>>()
-        })?;
+            },
+        )?;
 
         let mut best = FixedLengthPriorityQueue::new(top_k);
         let mut scored_points = 0u64;

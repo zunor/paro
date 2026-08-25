@@ -12,9 +12,10 @@ The rebuild is required because the durable contract now:
   hierarchy of 4 KiB payload checksums, 4 KiB checksum pages, and a compact
   root directory for lazy random-access integrity verification;
 - uses the version-2 hybrid CSR graph layout;
-- requires HNSW provider-config version 9 and build-contract version 9, which
+- requires HNSW provider-config version 10 and build-contract version 10, which
   select deterministic frozen-wave construction, keyed Feistel point ordering,
-  barrier publication, and exact predicate-local covering runs;
+  barrier publication, exact predicate-local covering runs, and the full
+  configured construction beam on every graph layer;
 - persists per-point cosine inverse norms inside the HNSW artifact;
 - stores inline HNSW pages without block compression so graph links, inverse
   norms, and predicate topology open directly over the immutable segment mmap
