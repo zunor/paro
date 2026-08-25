@@ -13,7 +13,7 @@
 //! avoid O(n) resets — instead of clearing the vec, we just increment
 //! the counter and compare against it.
 
-use std::sync::RwLock;
+use crossbeam::queue::ArrayQueue;
 
 use super::types::PointOffset;
 
@@ -117,8 +117,7 @@ impl<'a> VisitedListHandle<'a> {
 /// dynamically when the pool is empty.
 #[derive(Debug)]
 pub struct VisitedPool {
-    pool: RwLock<Vec<VisitedList>>,
-    keep_limit: usize,
+    pool: Option<ArrayQueue<VisitedList>>,
 }
 
 impl VisitedPool {
@@ -133,8 +132,10 @@ impl VisitedPool {
     /// visited vector after the historical fixed-size pool filled up.
     pub fn with_keep_limit(keep_limit: usize) -> Self {
         VisitedPool {
-            pool: RwLock::new(Vec::with_capacity(keep_limit)),
-            keep_limit,
+            // ArrayQueue requires a non-zero capacity. Keep the disabled
+            // state explicit instead of allocating a sentinel queue that is
+            // structurally present but semantically unreachable.
+            pool: (keep_limit > 0).then(|| ArrayQueue::new(keep_limit)),
         }
     }
 
@@ -142,7 +143,7 @@ impl VisitedPool {
     ///
     /// The handle is automatically returned when dropped.
     pub fn get(&self, num_points: usize) -> VisitedListHandle<'_> {
-        match self.pool.write().unwrap().pop() {
+        match self.pool.as_ref().and_then(ArrayQueue::pop) {
             None => VisitedListHandle::new(self, VisitedList::new(num_points)),
             Some(data) => {
                 let mut visited_list = VisitedListHandle::new(self, data);
@@ -154,9 +155,11 @@ impl VisitedPool {
     }
 
     fn return_back(&self, data: VisitedList) {
-        let mut pool = self.pool.write().unwrap();
-        if pool.len() < self.keep_limit {
-            pool.push(data);
+        if let Some(pool) = &self.pool {
+            // A concurrent return can fill the bounded queue between the
+            // capacity observation and this push. Dropping that one surplus
+            // workspace is the intended backpressure behavior.
+            let _ = pool.push(data);
         }
     }
 }
@@ -244,5 +247,24 @@ mod tests {
             // After reuse + next_iteration, should be clean
             assert!(!visited.check(3));
         }
+    }
+
+    #[test]
+    fn concurrent_borrowers_observe_logically_cleared_workspaces() {
+        let pool = VisitedPool::with_keep_limit(8);
+        std::thread::scope(|scope| {
+            for worker in 0..8_u32 {
+                let pool = &pool;
+                scope.spawn(move || {
+                    for iteration in 0..256_u32 {
+                        let point = (worker * 257 + iteration) % 4096;
+                        let mut visited = pool.get(4096);
+                        assert!(!visited.check(point));
+                        assert!(!visited.check_and_update_visited(point));
+                        assert!(visited.check(point));
+                    }
+                });
+            }
+        });
     }
 }

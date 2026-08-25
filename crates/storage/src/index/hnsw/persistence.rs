@@ -71,6 +71,7 @@ const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
 #[derive(Debug, Clone, Copy)]
 struct ExactPostingRange<'a> {
     posting: &'a roaring::RoaringBitmap,
+    point_base: PointOffset,
     first_rank: u32,
     len: u32,
 }
@@ -1921,6 +1922,7 @@ impl HnswIndex {
             level0_degree: self.graph.hnsw_m.get_m(0),
             vector_dimension: self.vector_storage.vector_dim(),
             parallelism: 1,
+            exact_scan_cost_class: filter.exact_scan_cost_class(),
         });
         let budget = crate::search::ResourceBudget::default();
         self.search_one_with_policy_strategy(
@@ -2446,15 +2448,24 @@ impl HnswIndex {
         let Some(layout) = self.predicate_scan.as_ref() else {
             return Ok(None);
         };
-        let ExactRowPartitions::OrdinalPostings {
-            column_id,
-            postings,
-        } = row_set.physical_partitions()
-        else {
+        let ranges = match row_set.physical_partitions() {
+            ExactRowPartitions::OrdinalPostings {
+                column_id,
+                postings,
+            } => layout.selected_ranges(column_id, postings)?,
+            ExactRowPartitions::Partitioned(partitioned) => {
+                let Some(column_id) = partitioned.ordinal_column_id() else {
+                    return Ok(None);
+                };
+                layout.selected_partitioned_ranges(column_id, partitioned)?
+            }
+            ExactRowPartitions::Single(_) => return Ok(None),
+        };
+        let Some(ranges) = ranges else {
             return Ok(None);
         };
         let selection_bytes =
-            postings
+            ranges
                 .len()
                 .saturating_mul(
                     std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<
@@ -2462,9 +2473,6 @@ impl HnswIndex {
                     >()),
                 );
         let _selection_reservation = budget.try_reserve_memory(selection_bytes)?;
-        let Some(ranges) = layout.selected_ranges(column_id, postings)? else {
-            return Ok(None);
-        };
         let covered_rows = ranges.iter().try_fold(0u64, |rows, range| {
             rows.checked_add(range.row_ids().len() as u64)
                 .ok_or_else(|| error::data_corrupted("predicate covering cardinality overflow"))
@@ -2698,7 +2706,11 @@ impl HnswIndex {
                     self.scan_exact_points_into(
                         &mut best,
                         &mut local_scorer,
-                        range.posting.range(first..).take(range.len as usize),
+                        range
+                            .posting
+                            .range(first..)
+                            .take(range.len as usize)
+                            .map(|point_id| range.point_base + point_id),
                         budget.work.as_ref(),
                     )?;
                 }
@@ -2733,39 +2745,34 @@ impl HnswIndex {
         let mut lane = 0usize;
         let mut rows_in_lane = 0u64;
         let mut observed_rows = 0u64;
-        let mut append_posting = |posting: &'a roaring::RoaringBitmap| -> Result<()> {
-            let mut first_rank = 0u64;
-            let posting_rows = posting.len();
-            observed_rows = observed_rows.saturating_add(posting_rows);
-            while first_rank < posting_rows {
-                let available = target_rows.saturating_sub(rows_in_lane).max(1);
-                let take = available.min(posting_rows - first_rank);
-                lanes[lane].ranges.push(ExactPostingRange {
-                    posting,
-                    first_rank: u32::try_from(first_rank).map_err(|_| {
-                        error::data_corrupted("exact row-set posting rank exceeds u32")
-                    })?,
-                    len: u32::try_from(take).map_err(|_| {
-                        error::data_corrupted("exact row-set posting range exceeds u32")
-                    })?,
-                });
-                first_rank += take;
-                rows_in_lane += take;
-                if rows_in_lane >= target_rows && lane + 1 < lane_count {
-                    lane += 1;
-                    rows_in_lane = 0;
+        let mut append_posting =
+            |point_base: PointOffset, posting: &'a roaring::RoaringBitmap| -> Result<()> {
+                let mut first_rank = 0u64;
+                let posting_rows = posting.len();
+                observed_rows = observed_rows.saturating_add(posting_rows);
+                while first_rank < posting_rows {
+                    let available = target_rows.saturating_sub(rows_in_lane).max(1);
+                    let take = available.min(posting_rows - first_rank);
+                    lanes[lane].ranges.push(ExactPostingRange {
+                        posting,
+                        point_base,
+                        first_rank: u32::try_from(first_rank).map_err(|_| {
+                            error::data_corrupted("exact row-set posting rank exceeds u32")
+                        })?,
+                        len: u32::try_from(take).map_err(|_| {
+                            error::data_corrupted("exact row-set posting range exceeds u32")
+                        })?,
+                    });
+                    first_rank += take;
+                    rows_in_lane += take;
+                    if rows_in_lane >= target_rows && lane + 1 < lane_count {
+                        lane += 1;
+                        rows_in_lane = 0;
+                    }
                 }
-            }
-            Ok(())
-        };
-        match partitions {
-            ExactRowPartitions::Single(bitmap) => append_posting(bitmap)?,
-            ExactRowPartitions::OrdinalPostings { postings, .. } => {
-                for posting in postings {
-                    append_posting(posting.rows())?;
-                }
-            }
-        }
+                Ok(())
+            };
+        Self::visit_exact_postings(partitions, 0, &mut append_posting)?;
         if observed_rows != row_count {
             return Err(error::data_corrupted(format!(
                 "exact row-set partition cardinality mismatch: expected {row_count}, got {observed_rows}"
@@ -2777,6 +2784,31 @@ impl HnswIndex {
             ));
         }
         Ok(lanes)
+    }
+
+    fn visit_exact_postings<'a>(
+        partitions: ExactRowPartitions<'a>,
+        point_base: PointOffset,
+        visitor: &mut dyn FnMut(PointOffset, &'a roaring::RoaringBitmap) -> Result<()>,
+    ) -> Result<()> {
+        match partitions {
+            ExactRowPartitions::Single(bitmap) => visitor(point_base, bitmap),
+            ExactRowPartitions::OrdinalPostings { postings, .. } => {
+                for posting in postings {
+                    visitor(point_base, posting.rows())?;
+                }
+                Ok(())
+            }
+            ExactRowPartitions::Partitioned(row_set) => {
+                for (part_base, part) in row_set.physical_parts() {
+                    let global_base = point_base.checked_add(part_base).ok_or_else(|| {
+                        error::data_corrupted("exact row-set partition offset overflow")
+                    })?;
+                    Self::visit_exact_postings(part.physical_partitions(), global_base, visitor)?;
+                }
+                Ok(())
+            }
+        }
     }
 
     fn scan_exact_points_into(

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::index::ExactRowSet;
+use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::tablet::ColumnId;
 
 /// Point offset type — identifies a vector within a segment.
@@ -137,6 +137,35 @@ pub enum HnswFilterKind {
     Predicate,
 }
 
+/// Physical locality class used by exact/graph costing.
+///
+/// A predicate covering layout streams a compact row-major vector region;
+/// base-vector execution gathers point ids from postings. Their per-score
+/// costs differ enough that observations from one must never retune the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HnswExactScanCostClass {
+    SequentialCovering,
+    IndexedBase,
+}
+
+impl HnswExactScanCostClass {
+    fn for_partitions(partitions: ExactRowPartitions<'_>) -> Self {
+        match partitions {
+            ExactRowPartitions::OrdinalPostings { .. } => Self::SequentialCovering,
+            ExactRowPartitions::Partitioned(row_set) => {
+                if row_set.physical_parts().all(|(_, part)| {
+                    Self::for_partitions(part.physical_partitions()) == Self::SequentialCovering
+                }) {
+                    Self::SequentialCovering
+                } else {
+                    Self::IndexedBase
+                }
+            }
+            ExactRowPartitions::Single(_) => Self::IndexedBase,
+        }
+    }
+}
+
 impl<'a> HnswSearchFilter<'a> {
     pub fn row_set(self) -> Option<&'a dyn ExactRowSet> {
         match self {
@@ -164,11 +193,19 @@ impl<'a> HnswSearchFilter<'a> {
         }
     }
 
+    pub fn exact_scan_cost_class(self) -> HnswExactScanCostClass {
+        self.row_set()
+            .map_or(HnswExactScanCostClass::SequentialCovering, |row_set| {
+                HnswExactScanCostClass::for_partitions(row_set.physical_partitions())
+            })
+    }
+
     /// Select the predicate-local graph when exact runtime cardinality proves
-    /// that the predicate-induced base graph is below its designed local
-    /// degree. This is a per-segment connectivity decision, not a selectivity
-    /// estimate: broad predicates stay on the connected base HNSW while sparse
-    /// predicates use the denser scalar-block topology.
+    /// that the predicate-induced base graph has expected degree below one.
+    /// This is a per-segment connectivity decision, not a selectivity estimate:
+    /// a base graph that still admits multiple neighbors remains navigable and
+    /// does not need a second physical topology merely because its degree is
+    /// lower than that topology's configured build width.
     pub fn uses_predicate_topology(
         self,
         topology: &HnswFilterTopologyContract,
@@ -183,9 +220,8 @@ impl<'a> HnswSearchFilter<'a> {
                 {
                     return false;
                 }
-                let admitted_degree = row_set.len().saturating_mul(base_level0_degree as u64);
-                let topology_degree = (total_rows as u64).saturating_mul(u64::from(topology.m));
-                admitted_degree < topology_degree
+                let admitted_edges = row_set.len().saturating_mul(base_level0_degree as u64);
+                admitted_edges < total_rows as u64
             }
             Self::None | Self::Visibility(_) => false,
         }
@@ -423,10 +459,6 @@ impl HnswDistanceCostModel {
         ceil_log2.min(HNSW_DISTANCE_PARALLELISM_BUCKETS - 1)
     }
 
-    fn parallelism_bucket_width(parallelism: usize) -> u64 {
-        1u64 << Self::parallelism_bucket(parallelism)
-    }
-
     /// Return the exact number of independently scannable lanes used by the
     /// exact-score executor for this candidate cardinality. Costing and
     /// execution deliberately share this calculation: charging a query for
@@ -454,11 +486,7 @@ impl HnswDistanceCostModel {
             &HNSW_EXACT_DISTANCE_SAMPLES[dimension_bucket][parallelism_bucket],
             &HNSW_GRAPH_DISTANCE_SAMPLES[dimension_bucket],
         )
-        .unwrap_or_else(|| {
-            Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE
-                .saturating_mul(Self::parallelism_bucket_width(parallelism))
-                .min(HNSW_DISTANCE_MAX_RATIO)
-        })
+        .unwrap_or(Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE)
     }
 
     pub fn sequential_work(candidate_rows: u64, dimension: usize, parallelism: usize) -> u64 {
@@ -482,14 +510,25 @@ impl HnswDistanceCostModel {
         level0_degree: usize,
         vector_dimension: usize,
         granted_parallelism: usize,
+        exact_scan_cost_class: HnswExactScanCostClass,
     ) -> bool {
         let exact_parallelism =
             Self::exact_scan_parallelism(candidate_rows.min(total_rows), granted_parallelism);
-        Self::sequential_work(
-            candidate_rows.min(total_rows),
-            vector_dimension,
-            exact_parallelism,
-        ) <= Self::graph_work(total_rows, effective_ef, level0_degree)
+        let exact_work = match exact_scan_cost_class {
+            HnswExactScanCostClass::SequentialCovering => Self::sequential_work(
+                candidate_rows.min(total_rows),
+                vector_dimension,
+                exact_parallelism,
+            ),
+            // Indexed gathers have no proven cold-start parallel speedup. Use
+            // the architecture prior unchanged until this physical class gets
+            // its own observation model; CPU count is admission capacity, not
+            // evidence of linear memory-latency scaling.
+            HnswExactScanCostClass::IndexedBase => candidate_rows
+                .min(total_rows)
+                .div_ceil(Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE),
+        };
+        exact_work <= Self::graph_work(total_rows, effective_ef, level0_degree)
     }
 
     pub(crate) fn observe(
@@ -543,6 +582,7 @@ pub struct HnswSegmentSearchInput {
     pub level0_degree: usize,
     pub vector_dimension: usize,
     pub parallelism: usize,
+    pub exact_scan_cost_class: HnswExactScanCostClass,
 }
 
 impl HnswQueryWideStrategy {
@@ -582,6 +622,7 @@ impl HnswQueryWideStrategy {
                     input.level0_degree,
                     input.vector_dimension,
                     input.parallelism,
+                    input.exact_scan_cost_class,
                 ) {
                     HnswSearchStrategy::ExactScan
                 } else {
@@ -1153,13 +1194,40 @@ mod tests {
     #[test]
     fn segment_cost_compares_sequential_scoring_with_random_graph_work() {
         assert!(HnswDistanceCostModel::prefers_exact_scan(
-            20_000, 2_000_000, 128, 32, 32, 1,
+            20_000,
+            2_000_000,
+            128,
+            32,
+            32,
+            1,
+            HnswExactScanCostClass::IndexedBase,
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            120_000, 169_600, 128, 32, 32, 1,
+            120_000,
+            169_600,
+            128,
+            32,
+            32,
+            1,
+            HnswExactScanCostClass::IndexedBase,
         ));
         assert!(HnswDistanceCostModel::prefers_exact_scan(
-            100_000, 10_000_000, 160, 32, 32, 1,
+            100_000,
+            10_000_000,
+            160,
+            32,
+            32,
+            8,
+            HnswExactScanCostClass::IndexedBase,
+        ));
+        assert!(!HnswDistanceCostModel::prefers_exact_scan(
+            1_000_000,
+            10_000_000,
+            640,
+            32,
+            32,
+            8,
+            HnswExactScanCostClass::IndexedBase,
         ));
     }
 
@@ -1181,7 +1249,6 @@ mod tests {
         assert_eq!(HnswDistanceCostModel::dimension_bucket(32), 5);
         assert_eq!(HnswDistanceCostModel::dimension_bucket(33), 6);
         assert_eq!(HnswDistanceCostModel::parallelism_bucket(3), 2);
-        assert_eq!(HnswDistanceCostModel::parallelism_bucket_width(3), 4);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_767, 8), 1);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_768, 8), 2);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(100_000, 8), 7);
@@ -1211,6 +1278,7 @@ mod tests {
                     level0_degree: 32,
                     vector_dimension: 32,
                     parallelism: 1,
+                    exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
                 },),
                 HnswSearchStrategy::ExactScan
             );
@@ -1228,6 +1296,7 @@ mod tests {
                 level0_degree: 32,
                 vector_dimension: 32,
                 parallelism: 1,
+                exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
             }),
             HnswSearchStrategy::ExactScan
         );
@@ -1240,6 +1309,7 @@ mod tests {
                 level0_degree: 32,
                 vector_dimension: 32,
                 parallelism: 1,
+                exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
             }),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );
@@ -1260,6 +1330,10 @@ mod tests {
 
         let broad_rows = roaring::RoaringBitmap::from_iter(0..50);
         assert!(!HnswSearchFilter::predicate(&broad_rows, &[7])
+            .uses_predicate_topology(&topology, 100, 32));
+
+        let connected_rows = roaring::RoaringBitmap::from_iter(0..4);
+        assert!(!HnswSearchFilter::predicate(&connected_rows, &[7])
             .uses_predicate_topology(&topology, 100, 32));
     }
 }

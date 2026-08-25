@@ -65,6 +65,7 @@ mod index_pointer;
 mod index_storage_info;
 mod index_type;
 mod index_type_set;
+mod partition_directory;
 mod predicate;
 mod predicate_result;
 

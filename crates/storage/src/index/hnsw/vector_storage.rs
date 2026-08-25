@@ -14,6 +14,8 @@ use std::fs::File;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::index::partition_directory::PartitionDirectory;
+
 /// Immutable per-point cosine preprocessing owned by an HNSW artifact.
 ///
 /// Persisted norms deliberately retain their byte backing instead of being
@@ -557,6 +559,7 @@ struct PartitionedVectorStoragePart {
 /// layout.
 pub(crate) struct PartitionedVectorStorage {
     parts: Box<[PartitionedVectorStoragePart]>,
+    part_directory: PartitionDirectory,
     dim: usize,
     count: usize,
 }
@@ -603,8 +606,10 @@ impl PartitionedVectorStorage {
             });
             point_base = point_end;
         }
+        let part_directory = PartitionDirectory::try_new(parts.iter().map(|part| part.range.end))?;
         Ok(Self {
             parts: parts.into_boxed_slice(),
+            part_directory,
             dim,
             count: point_base as usize,
         })
@@ -612,8 +617,9 @@ impl PartitionedVectorStorage {
 
     fn part_for(&self, point_id: u32) -> &PartitionedVectorStoragePart {
         let position = self
-            .parts
-            .partition_point(|part| part.range.end <= point_id);
+            .part_directory
+            .part_for(point_id)
+            .expect("HNSW construction point id exceeds partitioned vector storage");
         self.parts
             .get(position)
             .filter(|part| part.range.contains(&point_id))
@@ -652,3 +658,25 @@ impl VectorStorage for PartitionedVectorStorage {
 
 /// Shared pointer to a VectorStorage.
 pub type SharedVectorStorage = Arc<dyn VectorStorage>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn partitioned_storage_resolves_vectors_across_physical_boundaries() {
+        let first: Arc<dyn VectorStorage> =
+            Arc::new(InMemoryVectorStorage::new(vec![1.0, 2.0, 3.0, 4.0], 2));
+        let second: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+            vec![5.0, 6.0, 7.0, 8.0, 9.0, 10.0],
+            2,
+        ));
+        let storage = PartitionedVectorStorage::try_new(vec![first, second], 2).unwrap();
+
+        assert_eq!(storage.num_vectors(), 5);
+        assert_eq!(storage.get_vector(0), &[1.0, 2.0]);
+        assert_eq!(storage.get_vector(1), &[3.0, 4.0]);
+        assert_eq!(storage.get_vector(2), &[5.0, 6.0]);
+        assert_eq!(storage.get_vector(4), &[9.0, 10.0]);
+    }
+}

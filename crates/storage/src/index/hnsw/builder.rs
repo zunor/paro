@@ -15,7 +15,7 @@ use crate::index::hnsw::search_context::SearchContext;
 use crate::index::hnsw::types::HnswConfig;
 use crate::index::hnsw::types::{HnswBuildContract, HnswM, PointOffset, ScoreType, ScoredPoint};
 use crate::index::hnsw::vector_storage::VectorStorage;
-use crate::index::hnsw::visited_pool::VisitedPool;
+use crate::index::hnsw::visited_pool::{VisitedListHandle, VisitedPool};
 use bitvec::prelude::BitVec;
 use parking_lot::{Mutex, RwLock};
 use rayon::prelude::*;
@@ -364,8 +364,19 @@ impl GraphLayersBuilder {
         } else {
             None
         };
+        // One proposal owns one visited workspace for all hierarchy levels.
+        // The generation counter provides O(1) logical clears between levels;
+        // borrowing from the shared pool per level only adds synchronization
+        // and cannot change the search result.
+        let mut visited = self.visited_pool.get(storage.num_vectors());
+        let mut first_search_level = true;
 
         for level in (0..=target_level.min(current_level)).rev() {
+            if first_search_level {
+                first_search_level = false;
+            } else {
+                visited.next_iteration();
+            }
             // `ef_construct` is the construction beam for every HNSW layer.
             // Narrowing upper layers to M produces cheap but poorly routed
             // large graphs: their sparse hierarchy is precisely where a wide
@@ -379,6 +390,7 @@ impl GraphLayersBuilder {
                 self.construction_beam_for_level(level),
                 storage,
                 distance,
+                &mut visited,
             );
             let m_limit = self.hnsw_m.get_m(level);
             if self.use_heuristic {
@@ -552,8 +564,8 @@ impl GraphLayersBuilder {
         ef: usize,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
+        visited: &mut VisitedListHandle<'_>,
     ) -> Vec<ScoredPoint> {
-        let mut visited = self.visited_pool.get(storage.num_vectors());
         let mut search_context = SearchContext::new(entry_points[0], ef);
 
         visited.check_and_update_visited(entry_points[0].idx);

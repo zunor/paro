@@ -9,6 +9,7 @@
 //! sequential artifact reads. The layout remains an HNSW artifact: table pages
 //! keep the SQL values and physical row order supplied by the writer.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 use paro_common::error::{self as paro_error, Result};
 
-use crate::index::ExactOrdinalPosting;
+use crate::index::{ExactOrdinalPosting, ExactRowPartitions, PartitionExactRowSet};
 
 use super::artifact_integrity::ArtifactIntegrity;
 use super::PointOffset;
@@ -456,15 +457,7 @@ impl PredicateScanLayout {
         };
         let mut ranges = Vec::with_capacity(postings.len());
         for posting in postings {
-            let range = if posting.ordinal() == u16::MAX {
-                column.null_range
-            } else {
-                column
-                    .ordinal_ranges
-                    .get(posting.ordinal() as usize)
-                    .copied()
-                    .unwrap_or(PredicateScanRange::MISSING)
-            };
+            let range = Self::ordinal_range(column, posting.ordinal());
             if range.is_missing() {
                 return Ok(None);
             }
@@ -490,6 +483,97 @@ impl PredicateScanLayout {
             .map(|range| self.range_ref(column, range))
             .collect::<Result<Vec<_>>>()
             .map(Some)
+    }
+
+    /// Select generation-wide covering ranges from a canonical concatenation
+    /// of segment-local ordinal postings.
+    ///
+    /// Dictionary ordinals alone are not a cross-segment identity: a segment
+    /// that omits one value shifts every later ordinal. The generation
+    /// artifact therefore accepts this fast path only after the cardinality
+    /// and fingerprint of each shifted posting union exactly match the
+    /// persisted generation posting. An incompatible segment dictionary is a
+    /// normal physical fallback, not corruption; the caller scans base vectors
+    /// while exact row admission remains authoritative.
+    pub(crate) fn selected_partitioned_ranges<'a>(
+        &'a self,
+        column_id: u32,
+        row_set: &PartitionExactRowSet,
+    ) -> Result<Option<Vec<PredicateScanRangeRef<'a>>>> {
+        let Some(column) = self
+            .columns
+            .iter()
+            .find(|column| column.column_id == column_id)
+        else {
+            return Ok(None);
+        };
+        let mut by_ordinal = BTreeMap::<u16, Vec<(u32, &ExactOrdinalPosting)>>::new();
+        for (point_base, part) in row_set.physical_parts() {
+            let ExactRowPartitions::OrdinalPostings {
+                column_id: part_column_id,
+                postings,
+            } = part.physical_partitions()
+            else {
+                return Ok(None);
+            };
+            if part_column_id != column_id {
+                return Ok(None);
+            }
+            for posting in postings {
+                by_ordinal
+                    .entry(posting.ordinal())
+                    .or_default()
+                    .push((point_base, posting));
+            }
+        }
+
+        let mut ranges = Vec::with_capacity(by_ordinal.len());
+        for (ordinal, parts) in by_ordinal {
+            let range = Self::ordinal_range(column, ordinal);
+            if range.is_missing() {
+                return Ok(None);
+            }
+            let row_count = parts.iter().try_fold(0u64, |count, (_, posting)| {
+                count.checked_add(posting.rows().len()).ok_or_else(|| {
+                    paro_error::data_corrupted("partitioned predicate posting cardinality overflow")
+                })
+            })?;
+            if u64::from(range.row_count) != row_count {
+                return Ok(None);
+            }
+            let fingerprint = crate::index::bitmap::posting_fingerprint_rows(
+                row_count,
+                parts.iter().flat_map(|(point_base, posting)| {
+                    let point_base = *point_base;
+                    posting.rows().iter().map(move |row_id| {
+                        debug_assert!(point_base.checked_add(row_id).is_some());
+                        point_base + row_id
+                    })
+                }),
+            );
+            if fingerprint != range.fingerprint {
+                return Ok(None);
+            }
+            ranges.push(range);
+        }
+        ranges.sort_unstable_by_key(|range| (range.block_id, range.row_start));
+        ranges
+            .into_iter()
+            .map(|range| self.range_ref(column, range))
+            .collect::<Result<Vec<_>>>()
+            .map(Some)
+    }
+
+    fn ordinal_range(column: &PredicateScanColumn, ordinal: u16) -> PredicateScanRange {
+        if ordinal == u16::MAX {
+            column.null_range
+        } else {
+            column
+                .ordinal_ranges
+                .get(ordinal as usize)
+                .copied()
+                .unwrap_or(PredicateScanRange::MISSING)
+        }
     }
 
     fn range_ref<'a>(
@@ -1082,6 +1166,7 @@ impl PredicateScanLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::{ExactRowSet, OrdinalRowSet, PartitionExactRowSet};
     use roaring::RoaringBitmap;
 
     fn build_layout() -> PredicateScanLayout {
@@ -1126,6 +1211,46 @@ mod tests {
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0].row_ids(), &[1, 3]);
         assert_eq!(blocks[0].vectors(), &[1.0, 1.5, 3.0, 3.5]);
+    }
+
+    #[test]
+    fn covering_layout_validates_shifted_partition_posting_unions() {
+        let local_row_ordinals = Arc::from([0_u16, 1]);
+        let first: Arc<dyn ExactRowSet> = Arc::new(OrdinalRowSet::new(
+            7,
+            Arc::clone(&local_row_ordinals),
+            vec![0b10].into_boxed_slice(),
+            false,
+            1,
+            vec![ExactOrdinalPosting::new(
+                1,
+                Arc::new(RoaringBitmap::from_iter([1])),
+            )]
+            .into_boxed_slice(),
+        ));
+        let second: Arc<dyn ExactRowSet> = Arc::new(OrdinalRowSet::new(
+            7,
+            local_row_ordinals,
+            vec![0b10].into_boxed_slice(),
+            false,
+            1,
+            vec![ExactOrdinalPosting::new(
+                1,
+                Arc::new(RoaringBitmap::from_iter([1])),
+            )]
+            .into_boxed_slice(),
+        ));
+        let partitioned =
+            PartitionExactRowSet::try_new(vec![(0..2, first), (2..4, second)]).unwrap();
+
+        let layout = build_layout();
+        let ranges = layout
+            .selected_partitioned_ranges(7, &partitioned)
+            .unwrap()
+            .expect("shifted local postings exactly match the generation posting");
+        assert_eq!(ranges.len(), 1);
+        assert_eq!(ranges[0].row_ids(), &[1, 3]);
+        assert_eq!(ranges[0].vectors(), &[1.0, 1.5, 3.0, 3.5]);
     }
 
     #[test]

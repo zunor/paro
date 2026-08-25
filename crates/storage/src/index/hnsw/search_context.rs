@@ -50,7 +50,10 @@ impl<T: Ord> FixedLengthPriorityQueue<T> {
     /// Convert into a sorted vector (best results first).
     pub fn into_sorted_vec(self) -> Vec<T> {
         let mut vec: Vec<_> = self.heap.into_iter().map(|Reverse(x)| x).collect();
-        vec.sort_by(|a, b| b.cmp(a)); // Descending order (best first)
+        // Heap entries have a total order. Graph traversal de-duplicates point
+        // ids before insertion, so stable ordering has no semantic value and
+        // only adds an allocation-backed merge-sort path to every build point.
+        vec.sort_unstable_by(|a, b| b.cmp(a)); // Descending order (best first)
         vec
     }
 

@@ -448,6 +448,7 @@ impl VectorSearchCursor {
             level0_degree,
             vector_dimension: self.vector_dim,
             parallelism: budget.parallelism_slots,
+            exact_scan_cost_class: filter.exact_scan_cost_class(),
         });
         let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
         let degraded_reason = degraded
@@ -565,6 +566,7 @@ impl VectorSearchCursor {
             level0_degree,
             vector_dimension: self.vector_dim,
             parallelism: budget.parallelism_slots,
+            exact_scan_cost_class: filter.exact_scan_cost_class(),
         });
         let points = index
             .search_one_with_policy_strategy(

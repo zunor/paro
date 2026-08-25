@@ -109,6 +109,7 @@ impl Segment {
             level0_degree: index.build_contract.m0 as usize,
             vector_dimension: index.vector_storage.vector_dim(),
             parallelism: 1,
+            exact_scan_cost_class: filter.exact_scan_cost_class(),
         });
         let budget = crate::search::ResourceBudget::default();
         index.search_one_with_policy_strategy(

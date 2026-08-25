@@ -16,6 +16,7 @@ use std::sync::{Arc, OnceLock};
 use paro_common::error::Result;
 use roaring::RoaringBitmap;
 
+use crate::index::partition_directory::PartitionDirectory;
 use crate::tablet::ColumnId;
 
 /// One immutable scalar-dictionary posting. `ordinal` is the physical
@@ -91,6 +92,13 @@ pub enum ExactRowPartitions<'a> {
         column_id: ColumnId,
         postings: &'a [ExactOrdinalPosting],
     },
+    /// Canonical concatenation of immutable segment-local row sets.
+    ///
+    /// Keeping the partition identity here is essential: generation-owned
+    /// search artifacts can validate the shifted union of segment postings
+    /// against their generation-wide covering layout without first
+    /// materializing a query-sized bitmap.
+    Partitioned(&'a PartitionExactRowSet),
 }
 
 impl ExactRowPartitions<'_> {
@@ -98,6 +106,10 @@ impl ExactRowPartitions<'_> {
         match self {
             Self::Single(_) => 1,
             Self::OrdinalPostings { postings, .. } => postings.len(),
+            Self::Partitioned(row_set) => row_set
+                .physical_parts()
+                .map(|(_, part)| part.physical_partitions().len())
+                .sum(),
         }
     }
 
@@ -282,10 +294,6 @@ struct PartitionExactRowSetPart {
     row_set: Arc<dyn ExactRowSet>,
 }
 
-const PARTITION_ADMISSION_BLOCK_SHIFT: u32 = 12;
-const PARTITION_ADMISSION_BLOCK_ROWS: u32 = 1 << PARTITION_ADMISSION_BLOCK_SHIFT;
-const PARTITION_ADMISSION_MIXED: u32 = u32::MAX;
-
 /// Query-compiled admission kernel for a partition row set.
 ///
 /// Each child trait object is resolved to its concrete admission enum once at
@@ -318,10 +326,7 @@ impl PartitionExactRowAdmission<'_> {
 #[derive(Debug)]
 pub struct PartitionExactRowSet {
     parts: Box<[PartitionExactRowSetPart]>,
-    /// One entry per 4096-point block. Blocks contained by one segment point
-    /// directly at that segment; only blocks crossed by a segment boundary use
-    /// the mixed sentinel and take the cold binary-search fallback.
-    part_directory: Box<[u32]>,
+    part_directory: PartitionDirectory,
     cardinality: u64,
     domain_len: u32,
     materialized: OnceLock<RoaringBitmap>,
@@ -357,34 +362,10 @@ impl PartitionExactRowSet {
             validated.push(PartitionExactRowSetPart { range, row_set });
         }
         let parts = validated.into_boxed_slice();
-        let block_count = usize::try_from(expected_start.div_ceil(PARTITION_ADMISSION_BLOCK_ROWS))
-            .map_err(|_| {
-                paro_common::error::out_of_range("partition admission directory exceeds usize")
-            })?;
-        let mut part_directory = Vec::with_capacity(block_count);
-        for block in 0..block_count {
-            let block_start = u32::try_from(block)
-                .ok()
-                .and_then(|block| block.checked_mul(PARTITION_ADMISSION_BLOCK_ROWS))
-                .ok_or_else(|| {
-                    paro_common::error::out_of_range("partition admission block offset exceeds u32")
-                })?;
-            let block_end = block_start
-                .saturating_add(PARTITION_ADMISSION_BLOCK_ROWS)
-                .min(expected_start);
-            let first = parts.partition_point(|part| part.range.end <= block_start);
-            let last = parts.partition_point(|part| part.range.end <= block_end.saturating_sub(1));
-            part_directory.push(if first == last {
-                u32::try_from(first).map_err(|_| {
-                    paro_common::error::out_of_range("partition admission part count exceeds u32")
-                })?
-            } else {
-                PARTITION_ADMISSION_MIXED
-            });
-        }
+        let part_directory = PartitionDirectory::try_new(parts.iter().map(|part| part.range.end))?;
         Ok(Self {
             parts,
-            part_directory: part_directory.into_boxed_slice(),
+            part_directory,
             cardinality,
             domain_len: expected_start,
             materialized: OnceLock::new(),
@@ -393,16 +374,7 @@ impl PartitionExactRowSet {
 
     #[inline(always)]
     fn part_index_for(&self, row_id: u32) -> Option<(usize, u32)> {
-        if row_id >= self.domain_len {
-            return None;
-        }
-        let block = row_id as usize >> PARTITION_ADMISSION_BLOCK_SHIFT;
-        let directory_entry = *self.part_directory.get(block)?;
-        let position = if directory_entry == PARTITION_ADMISSION_MIXED {
-            self.parts.partition_point(|part| part.range.end <= row_id)
-        } else {
-            directory_entry as usize
-        };
+        let position = self.part_directory.part_for(row_id)?;
         let part = self.parts.get(position)?;
         debug_assert!(part.range.contains(&row_id));
         Some((position, row_id - part.range.start))
@@ -418,6 +390,30 @@ impl PartitionExactRowSet {
             }
             rows
         })
+    }
+
+    pub(crate) fn physical_parts(&self) -> impl Iterator<Item = (u32, &dyn ExactRowSet)> + '_ {
+        self.parts
+            .iter()
+            .map(|part| (part.range.start, part.row_set.as_ref()))
+    }
+
+    pub(crate) fn ordinal_column_id(&self) -> Option<ColumnId> {
+        let mut column_id = None;
+        for (_, part) in self.physical_parts() {
+            let ExactRowPartitions::OrdinalPostings {
+                column_id: part_column_id,
+                ..
+            } = part.physical_partitions()
+            else {
+                return None;
+            };
+            if column_id.is_some_and(|column_id| column_id != part_column_id) {
+                return None;
+            }
+            column_id = Some(part_column_id);
+        }
+        column_id
     }
 }
 
@@ -467,7 +463,7 @@ impl ExactRowSet for PartitionExactRowSet {
     }
 
     fn physical_partitions(&self) -> ExactRowPartitions<'_> {
-        ExactRowPartitions::Single(self.materialized())
+        ExactRowPartitions::Partitioned(self)
     }
 
     fn query_retained_bytes(&self) -> usize {
@@ -478,11 +474,7 @@ impl ExactRowSet for PartitionExactRowSet {
                         .saturating_add(std::mem::size_of::<ExactRowAdmission<'_>>()),
                 ),
             )
-            .saturating_add(
-                self.part_directory
-                    .len()
-                    .saturating_mul(std::mem::size_of::<u32>()),
-            )
+            .saturating_add(self.part_directory.allocated_bytes())
     }
 
     fn admission(&self) -> ExactRowAdmission<'_> {
@@ -790,6 +782,11 @@ mod tests {
         assert!(!rows.contains(4));
         assert!(!rows.contains(12));
         assert!(rows.admission().contains(11));
+        assert!(matches!(
+            rows.physical_partitions(),
+            ExactRowPartitions::Partitioned(_)
+        ));
+        assert!(rows.materialized.get().is_none());
 
         let mut visited = Vec::new();
         rows.try_for_each(&mut |row_id| {
@@ -818,10 +815,6 @@ mod tests {
         let rows = PartitionExactRowSet::try_new(vec![(0..6_000, first), (6_000..12_000, second)])
             .unwrap();
 
-        assert_eq!(
-            rows.part_directory.as_ref(),
-            &[0, PARTITION_ADMISSION_MIXED, 1]
-        );
         assert_eq!(rows.part_index_for(4_095), Some((0, 4_095)));
         assert_eq!(rows.part_index_for(5_999), Some((0, 5_999)));
         assert_eq!(rows.part_index_for(6_000), Some((1, 0)));
