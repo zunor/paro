@@ -119,7 +119,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
-        filter: Option<ExactRowAdmission<'_>>,
+        filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         use_predicate_topology: bool,
@@ -165,7 +165,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorers: &mut [VectorScorer<'_>],
-        filter: Option<ExactRowAdmission<'_>>,
+        filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         use_predicate_topology: bool,
@@ -249,7 +249,7 @@ impl GraphLayers {
         ef: usize,
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
-        filter: Option<ExactRowAdmission<'_>>,
+        filter: Option<&ExactRowAdmission<'_>>,
         predicate_partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         use_predicate_topology: bool,
@@ -303,7 +303,7 @@ impl GraphLayers {
                             |row_id| {
                                 row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
                                     if *ordinal == u16::MAX {
-                                        return accepts_null;
+                                        return *accepts_null;
                                     }
                                     accepted_ordinals
                                         .get(*ordinal as usize / 64)
@@ -316,8 +316,19 @@ impl GraphLayers {
                             use_predicate_topology,
                             work,
                         )?,
-                        Some(admission @ ExactRowAdmission::Dense(_))
-                        | Some(admission @ ExactRowAdmission::Partitioned(_)) => self
+                        Some(ExactRowAdmission::Dense(domain_len)) => self.search_masked_topk(
+                            zero_level_entry,
+                            top,
+                            ef,
+                            scorer,
+                            |row_id| row_id < *domain_len,
+                            adaptive,
+                            predicate_partition_seeds,
+                            predicate_columns,
+                            use_predicate_topology,
+                            work,
+                        )?,
+                        Some(ExactRowAdmission::Partitioned(admission)) => self
                             .search_masked_topk(
                                 zero_level_entry,
                                 top,
@@ -362,6 +373,7 @@ impl GraphLayers {
                 links.clear();
                 self.links
                     .for_each_link(current_point, current_level, |neighbor| {
+                        scorer.prefetch_point(neighbor);
                         links.push(neighbor);
                     })?;
                 work.consume(links.len())?;
@@ -409,6 +421,7 @@ impl GraphLayers {
             neighbors.clear();
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
                 if !visited.check_and_update_visited(neighbor) {
+                    scorer.prefetch_point(neighbor);
                     neighbors.push(neighbor);
                 }
             })?;
@@ -512,6 +525,7 @@ impl GraphLayers {
             neighbors.clear();
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
                 if !visited.check_and_update_visited(neighbor) {
+                    scorer.prefetch_point(neighbor);
                     neighbors.push(neighbor);
                 }
             })?;
@@ -635,6 +649,7 @@ impl GraphLayers {
                 inspected_edges = inspected_edges.saturating_add(1);
                 if admits(neighbor) {
                     if !visited.check_and_update_visited(neighbor) {
+                        scorer.prefetch_point(neighbor);
                         matching_neighbors.push(neighbor);
                     }
                 } else if !bridge_visited.check_and_update_visited(neighbor) {
@@ -658,6 +673,7 @@ impl GraphLayers {
                         && admits(neighbor)
                         && !visited.check_and_update_visited(neighbor)
                     {
+                        scorer.prefetch_point(neighbor);
                         matching_neighbors.push(neighbor);
                     }
                 })?;
@@ -752,12 +768,14 @@ impl GraphLayers {
             predicate_links.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
                 if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
+                    scorer.prefetch_point(neighbor);
                     neighbors.push(neighbor);
                 }
             })?;
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
                 if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
+                    scorer.prefetch_point(neighbor);
                     neighbors.push(neighbor);
                 }
             })?;
@@ -799,6 +817,7 @@ impl GraphLayers {
                 predicate_links.for_each_link(current.idx, level, |neighbor| {
                     inspected_edges = inspected_edges.saturating_add(1);
                     if admits(neighbor) {
+                        scorer.prefetch_point(neighbor);
                         neighbors.push(neighbor);
                     }
                 })?;

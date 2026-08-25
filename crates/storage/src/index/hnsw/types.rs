@@ -9,6 +9,7 @@
 use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::index::ExactRowSet;
 use crate::tablet::ColumnId;
@@ -322,22 +323,149 @@ impl HnswSearchStrategy {
     }
 }
 
-/// Hardware-independent work units used to lower a query-wide HNSW decision
-/// to one immutable segment.
+/// Runtime-calibrated work units used to lower a query-wide HNSW decision to
+/// one immutable search partition.
 ///
-/// A sequential vector score reads a contiguous artifact range and is much
-/// cheaper than a graph score, which follows an edge to an effectively random
-/// vector.  Keeping this ratio in the provider model makes the crossover
-/// explicit and lets the optimizer consume the same physical assumption.
-/// The dimension term cancels because both sides score the same vector type.
+/// A sequential covering score and a random graph score run the same distance
+/// kernel but have very different memory costs. The ratio depends on vector
+/// dimension, CPU cache hierarchy, mmap page size and current architecture;
+/// making it a durable provider constant causes replicas on different
+/// hardware to choose the wrong physical path. A conservative cold-start
+/// prior is therefore refined from completed exact-covering and graph searches
+/// in process-local, dimension-bucketed counters. This calibration affects
+/// performance only: exact row admission and result semantics are unchanged.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswDistanceCostModel;
 
-impl HnswDistanceCostModel {
-    pub const SEQUENTIAL_SCORES_PER_RANDOM_SCORE: u64 = 8;
+const HNSW_DISTANCE_DIMENSION_BUCKETS: usize = 17;
+const HNSW_DISTANCE_PARALLELISM_BUCKETS: usize = 6;
+const HNSW_DISTANCE_MIN_CALIBRATION_SCORES: u64 = 1_024;
+const HNSW_DISTANCE_MIN_RATIO: u64 = 4;
+const HNSW_DISTANCE_MAX_RATIO: u64 = 128;
+pub(crate) const HNSW_MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
-    pub const fn sequential_work(candidate_rows: u64) -> u64 {
-        candidate_rows.div_ceil(Self::SEQUENTIAL_SCORES_PER_RANDOM_SCORE)
+struct HnswDistanceSample {
+    elapsed_ns: AtomicU64,
+    scores: AtomicU64,
+}
+
+impl HnswDistanceSample {
+    const fn new() -> Self {
+        Self {
+            elapsed_ns: AtomicU64::new(0),
+            scores: AtomicU64::new(0),
+        }
+    }
+
+    #[cfg(not(test))]
+    fn record(&self, elapsed_ns: u64, scores: u64) {
+        self.elapsed_ns
+            .fetch_add(elapsed_ns, AtomicOrdering::Relaxed);
+        self.scores.fetch_add(scores, AtomicOrdering::Relaxed);
+    }
+}
+
+fn calibrated_distance_ratio(
+    exact: &HnswDistanceSample,
+    graph: &HnswDistanceSample,
+) -> Option<u64> {
+    let exact_scores = exact.scores.load(AtomicOrdering::Relaxed);
+    let graph_scores = graph.scores.load(AtomicOrdering::Relaxed);
+    if exact_scores < HNSW_DISTANCE_MIN_CALIBRATION_SCORES
+        || graph_scores < HNSW_DISTANCE_MIN_CALIBRATION_SCORES
+    {
+        return None;
+    }
+    let exact_elapsed = exact.elapsed_ns.load(AtomicOrdering::Relaxed);
+    let graph_elapsed = graph.elapsed_ns.load(AtomicOrdering::Relaxed);
+    if exact_elapsed == 0 || graph_elapsed == 0 {
+        return None;
+    }
+    let numerator = u128::from(graph_elapsed).saturating_mul(u128::from(exact_scores));
+    let denominator = u128::from(exact_elapsed).saturating_mul(u128::from(graph_scores));
+    let rounded = numerator
+        .saturating_add(denominator / 2)
+        .checked_div(denominator)?;
+    Some(
+        u64::try_from(rounded)
+            .unwrap_or(u64::MAX)
+            .clamp(HNSW_DISTANCE_MIN_RATIO, HNSW_DISTANCE_MAX_RATIO),
+    )
+}
+
+static HNSW_EXACT_DISTANCE_SAMPLES: [[HnswDistanceSample; HNSW_DISTANCE_PARALLELISM_BUCKETS];
+    HNSW_DISTANCE_DIMENSION_BUCKETS] =
+    [const { [const { HnswDistanceSample::new() }; HNSW_DISTANCE_PARALLELISM_BUCKETS] };
+        HNSW_DISTANCE_DIMENSION_BUCKETS];
+static HNSW_GRAPH_DISTANCE_SAMPLES: [HnswDistanceSample; HNSW_DISTANCE_DIMENSION_BUCKETS] =
+    [const { HnswDistanceSample::new() }; HNSW_DISTANCE_DIMENSION_BUCKETS];
+
+impl HnswDistanceCostModel {
+    /// Cold-start prior. It deliberately favors an exact sequential covering
+    /// scan at the ambiguous crossover; its recall is deterministic and the
+    /// runtime calibration corrects an overly conservative choice after both
+    /// physical paths have produced representative samples.
+    pub const DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE: u64 = 24;
+
+    fn dimension_bucket(dimension: usize) -> usize {
+        if dimension <= 1 {
+            return 0;
+        }
+        let ceil_log2 = usize::BITS as usize - (dimension - 1).leading_zeros() as usize;
+        ceil_log2.min(HNSW_DISTANCE_DIMENSION_BUCKETS - 1)
+    }
+
+    fn parallelism_bucket(parallelism: usize) -> usize {
+        if parallelism <= 1 {
+            return 0;
+        }
+        let ceil_log2 = usize::BITS as usize - (parallelism - 1).leading_zeros() as usize;
+        ceil_log2.min(HNSW_DISTANCE_PARALLELISM_BUCKETS - 1)
+    }
+
+    fn parallelism_bucket_width(parallelism: usize) -> u64 {
+        1u64 << Self::parallelism_bucket(parallelism)
+    }
+
+    /// Return the exact number of independently scannable lanes used by the
+    /// exact-score executor for this candidate cardinality. Costing and
+    /// execution deliberately share this calculation: charging a query for
+    /// every granted CPU slot when its input can only populate one lane makes
+    /// the exact/graph crossover depend on an imaginary speedup.
+    pub(crate) fn exact_scan_parallelism(candidate_rows: u64, granted_parallelism: usize) -> usize {
+        let granted_parallelism = granted_parallelism.max(1);
+        if granted_parallelism == 1
+            || candidate_rows < HNSW_MIN_ROWS_PER_PARALLEL_EXACT_LANE.saturating_mul(2)
+        {
+            return 1;
+        }
+        granted_parallelism
+            .min(
+                usize::try_from(candidate_rows.div_ceil(HNSW_MIN_ROWS_PER_PARALLEL_EXACT_LANE))
+                    .unwrap_or(usize::MAX),
+            )
+            .max(1)
+    }
+
+    pub fn sequential_scores_per_random_score(dimension: usize, parallelism: usize) -> u64 {
+        let dimension_bucket = Self::dimension_bucket(dimension);
+        let parallelism_bucket = Self::parallelism_bucket(parallelism);
+        calibrated_distance_ratio(
+            &HNSW_EXACT_DISTANCE_SAMPLES[dimension_bucket][parallelism_bucket],
+            &HNSW_GRAPH_DISTANCE_SAMPLES[dimension_bucket],
+        )
+        .unwrap_or_else(|| {
+            Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE
+                .saturating_mul(Self::parallelism_bucket_width(parallelism))
+                .min(HNSW_DISTANCE_MAX_RATIO)
+        })
+    }
+
+    pub fn sequential_work(candidate_rows: u64, dimension: usize, parallelism: usize) -> u64 {
+        candidate_rows.div_ceil(Self::sequential_scores_per_random_score(
+            dimension,
+            parallelism,
+        ))
     }
 
     pub fn graph_work(total_rows: u64, effective_ef: usize, level0_degree: usize) -> u64 {
@@ -352,9 +480,55 @@ impl HnswDistanceCostModel {
         total_rows: u64,
         effective_ef: usize,
         level0_degree: usize,
+        vector_dimension: usize,
+        granted_parallelism: usize,
     ) -> bool {
-        Self::sequential_work(candidate_rows.min(total_rows))
-            <= Self::graph_work(total_rows, effective_ef, level0_degree)
+        let exact_parallelism =
+            Self::exact_scan_parallelism(candidate_rows.min(total_rows), granted_parallelism);
+        Self::sequential_work(
+            candidate_rows.min(total_rows),
+            vector_dimension,
+            exact_parallelism,
+        ) <= Self::graph_work(total_rows, effective_ef, level0_degree)
+    }
+
+    pub(crate) fn observe(
+        vector_dimension: usize,
+        elapsed_ns: u64,
+        scored_points: u64,
+        outcome: HnswSearchOutcome,
+        exact_parallelism: usize,
+    ) {
+        if elapsed_ns == 0 || scored_points == 0 || outcome.exact_fallback.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            let _ = (
+                vector_dimension,
+                elapsed_ns,
+                scored_points,
+                outcome,
+                exact_parallelism,
+            );
+        }
+        #[cfg(not(test))]
+        {
+            let dimension_bucket = Self::dimension_bucket(vector_dimension);
+            match outcome.path {
+                HnswSearchPath::ExactScan(HnswExactScanKind::PredicateCovering) => {
+                    HNSW_EXACT_DISTANCE_SAMPLES[dimension_bucket]
+                        [Self::parallelism_bucket(exact_parallelism)]
+                    .record(elapsed_ns, scored_points);
+                }
+                HnswSearchPath::UnfilteredGraph
+                | HnswSearchPath::MaskedGraph
+                | HnswSearchPath::AdaptiveGraph => {
+                    HNSW_GRAPH_DISTANCE_SAMPLES[dimension_bucket].record(elapsed_ns, scored_points);
+                }
+                HnswSearchPath::ExactScan(HnswExactScanKind::BaseVectors) => {}
+            }
+        }
     }
 }
 
@@ -367,6 +541,8 @@ pub struct HnswSegmentSearchInput {
     pub total_rows: u64,
     pub effective_ef: usize,
     pub level0_degree: usize,
+    pub vector_dimension: usize,
+    pub parallelism: usize,
 }
 
 impl HnswQueryWideStrategy {
@@ -404,6 +580,8 @@ impl HnswQueryWideStrategy {
                     input.total_rows,
                     input.effective_ef,
                     input.level0_degree,
+                    input.vector_dimension,
+                    input.parallelism,
                 ) {
                     HnswSearchStrategy::ExactScan
                 } else {
@@ -975,11 +1153,38 @@ mod tests {
     #[test]
     fn segment_cost_compares_sequential_scoring_with_random_graph_work() {
         assert!(HnswDistanceCostModel::prefers_exact_scan(
-            20_000, 2_000_000, 128, 32,
+            20_000, 2_000_000, 128, 32, 32, 1,
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            84_800, 169_600, 128, 32,
+            120_000, 169_600, 128, 32, 32, 1,
         ));
+        assert!(HnswDistanceCostModel::prefers_exact_scan(
+            100_000, 10_000_000, 160, 32, 32, 1,
+        ));
+    }
+
+    #[test]
+    fn distance_cost_calibration_derives_and_bounds_the_observed_ratio() {
+        let exact = HnswDistanceSample::new();
+        exact.elapsed_ns.store(100_000, AtomicOrdering::Relaxed);
+        exact.scores.store(10_000, AtomicOrdering::Relaxed);
+        let graph = HnswDistanceSample::new();
+        graph.elapsed_ns.store(480_000, AtomicOrdering::Relaxed);
+        graph.scores.store(2_000, AtomicOrdering::Relaxed);
+        assert_eq!(calibrated_distance_ratio(&exact, &graph), Some(24));
+
+        graph.elapsed_ns.store(u64::MAX, AtomicOrdering::Relaxed);
+        assert_eq!(
+            calibrated_distance_ratio(&exact, &graph),
+            Some(HNSW_DISTANCE_MAX_RATIO)
+        );
+        assert_eq!(HnswDistanceCostModel::dimension_bucket(32), 5);
+        assert_eq!(HnswDistanceCostModel::dimension_bucket(33), 6);
+        assert_eq!(HnswDistanceCostModel::parallelism_bucket(3), 2);
+        assert_eq!(HnswDistanceCostModel::parallelism_bucket_width(3), 4);
+        assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_767, 8), 1);
+        assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_768, 8), 2);
+        assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(100_000, 8), 7);
     }
 
     #[test]
@@ -1004,6 +1209,8 @@ mod tests {
                     total_rows: segment_rows,
                     effective_ef: 100,
                     level0_degree: 32,
+                    vector_dimension: 32,
+                    parallelism: 1,
                 },),
                 HnswSearchStrategy::ExactScan
             );
@@ -1019,6 +1226,8 @@ mod tests {
                 total_rows: 1_000_000,
                 effective_ef: 100,
                 level0_degree: 32,
+                vector_dimension: 32,
+                parallelism: 1,
             }),
             HnswSearchStrategy::ExactScan
         );
@@ -1029,6 +1238,8 @@ mod tests {
                 total_rows: 1_000_000,
                 effective_ef: 100,
                 level0_degree: 32,
+                vector_dimension: 32,
+                parallelism: 1,
             }),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );

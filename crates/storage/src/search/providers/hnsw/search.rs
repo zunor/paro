@@ -446,6 +446,8 @@ impl VectorSearchCursor {
             total_rows: segment.segment.num_rows(),
             effective_ef,
             level0_degree,
+            vector_dimension: self.vector_dim,
+            parallelism: budget.parallelism_slots,
         });
         let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
         let degraded_reason = degraded
@@ -561,6 +563,8 @@ impl VectorSearchCursor {
             total_rows: artifact.coverage.row_count(),
             effective_ef,
             level0_degree,
+            vector_dimension: self.vector_dim,
+            parallelism: budget.parallelism_slots,
         });
         let points = index
             .search_one_with_policy_strategy(

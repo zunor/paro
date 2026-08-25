@@ -66,7 +66,7 @@ impl ExactOrdinalPosting {
 /// pay one virtual call for every inspected edge. Matching on this enum before
 /// entering the graph loop lets the compiler monomorphize the hot membership
 /// test for each physical representation.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 pub enum ExactRowAdmission<'a> {
     Roaring(&'a RoaringBitmap),
     Ordinal {
@@ -75,7 +75,7 @@ pub enum ExactRowAdmission<'a> {
         accepts_null: bool,
     },
     Dense(u32),
-    Partitioned(&'a PartitionExactRowSet),
+    Partitioned(PartitionExactRowAdmission<'a>),
 }
 
 /// Borrowed physical partitions of an exact row set.
@@ -108,7 +108,7 @@ impl ExactRowPartitions<'_> {
 
 impl ExactRowAdmission<'_> {
     #[inline(always)]
-    pub fn contains(self, row_id: u32) -> bool {
+    pub fn contains(&self, row_id: u32) -> bool {
         match self {
             Self::Roaring(bitmap) => bitmap.contains(row_id),
             Self::Ordinal {
@@ -117,14 +117,14 @@ impl ExactRowAdmission<'_> {
                 accepts_null,
             } => row_ordinals.get(row_id as usize).is_some_and(|ordinal| {
                 if *ordinal == u16::MAX {
-                    return accepts_null;
+                    return *accepts_null;
                 }
                 accepted_ordinals
                     .get(*ordinal as usize / 64)
                     .is_some_and(|word| word & (1_u64 << (*ordinal % 64)) != 0)
             }),
-            Self::Dense(domain_len) => row_id < domain_len,
-            Self::Partitioned(row_set) => row_set.contains(row_id),
+            Self::Dense(domain_len) => row_id < *domain_len,
+            Self::Partitioned(admission) => admission.contains(row_id),
         }
     }
 }
@@ -282,6 +282,34 @@ struct PartitionExactRowSetPart {
     row_set: Arc<dyn ExactRowSet>,
 }
 
+const PARTITION_ADMISSION_BLOCK_SHIFT: u32 = 12;
+const PARTITION_ADMISSION_BLOCK_ROWS: u32 = 1 << PARTITION_ADMISSION_BLOCK_SHIFT;
+const PARTITION_ADMISSION_MIXED: u32 = u32::MAX;
+
+/// Query-compiled admission kernel for a partition row set.
+///
+/// Each child trait object is resolved to its concrete admission enum once at
+/// the search boundary. Candidate probes then use the parent's block directory
+/// and an enum match; they never binary-search segment ranges or call an
+/// `ExactRowSet` virtual method in the graph loop.
+#[derive(Debug)]
+pub struct PartitionExactRowAdmission<'a> {
+    row_set: &'a PartitionExactRowSet,
+    parts: Box<[ExactRowAdmission<'a>]>,
+}
+
+impl PartitionExactRowAdmission<'_> {
+    #[inline(always)]
+    pub(crate) fn contains(&self, row_id: u32) -> bool {
+        let Some((part_index, local_row_id)) = self.row_set.part_index_for(row_id) else {
+            return false;
+        };
+        self.parts
+            .get(part_index)
+            .is_some_and(|part| part.contains(local_row_id))
+    }
+}
+
 /// Exact membership over a canonical concatenation of segment-local domains.
 ///
 /// Graph navigation resolves membership through the constituent row sets
@@ -290,6 +318,10 @@ struct PartitionExactRowSetPart {
 #[derive(Debug)]
 pub struct PartitionExactRowSet {
     parts: Box<[PartitionExactRowSetPart]>,
+    /// One entry per 4096-point block. Blocks contained by one segment point
+    /// directly at that segment; only blocks crossed by a segment boundary use
+    /// the mixed sentinel and take the cold binary-search fallback.
+    part_directory: Box<[u32]>,
     cardinality: u64,
     domain_len: u32,
     materialized: OnceLock<RoaringBitmap>,
@@ -324,19 +356,56 @@ impl PartitionExactRowSet {
             expected_start = range.end;
             validated.push(PartitionExactRowSetPart { range, row_set });
         }
+        let parts = validated.into_boxed_slice();
+        let block_count = usize::try_from(expected_start.div_ceil(PARTITION_ADMISSION_BLOCK_ROWS))
+            .map_err(|_| {
+                paro_common::error::out_of_range("partition admission directory exceeds usize")
+            })?;
+        let mut part_directory = Vec::with_capacity(block_count);
+        for block in 0..block_count {
+            let block_start = u32::try_from(block)
+                .ok()
+                .and_then(|block| block.checked_mul(PARTITION_ADMISSION_BLOCK_ROWS))
+                .ok_or_else(|| {
+                    paro_common::error::out_of_range("partition admission block offset exceeds u32")
+                })?;
+            let block_end = block_start
+                .saturating_add(PARTITION_ADMISSION_BLOCK_ROWS)
+                .min(expected_start);
+            let first = parts.partition_point(|part| part.range.end <= block_start);
+            let last = parts.partition_point(|part| part.range.end <= block_end.saturating_sub(1));
+            part_directory.push(if first == last {
+                u32::try_from(first).map_err(|_| {
+                    paro_common::error::out_of_range("partition admission part count exceeds u32")
+                })?
+            } else {
+                PARTITION_ADMISSION_MIXED
+            });
+        }
         Ok(Self {
-            parts: validated.into_boxed_slice(),
+            parts,
+            part_directory: part_directory.into_boxed_slice(),
             cardinality,
             domain_len: expected_start,
             materialized: OnceLock::new(),
         })
     }
 
-    fn part_for(&self, row_id: u32) -> Option<&PartitionExactRowSetPart> {
-        let position = self.parts.partition_point(|part| part.range.end <= row_id);
-        self.parts
-            .get(position)
-            .filter(|part| part.range.contains(&row_id))
+    #[inline(always)]
+    fn part_index_for(&self, row_id: u32) -> Option<(usize, u32)> {
+        if row_id >= self.domain_len {
+            return None;
+        }
+        let block = row_id as usize >> PARTITION_ADMISSION_BLOCK_SHIFT;
+        let directory_entry = *self.part_directory.get(block)?;
+        let position = if directory_entry == PARTITION_ADMISSION_MIXED {
+            self.parts.partition_point(|part| part.range.end <= row_id)
+        } else {
+            directory_entry as usize
+        };
+        let part = self.parts.get(position)?;
+        debug_assert!(part.range.contains(&row_id));
+        Some((position, row_id - part.range.start))
     }
 
     fn materialized(&self) -> &RoaringBitmap {
@@ -358,8 +427,10 @@ impl ExactRowSet for PartitionExactRowSet {
     }
 
     fn contains(&self, row_id: u32) -> bool {
-        self.part_for(row_id)
-            .is_some_and(|part| part.row_set.contains(row_id - part.range.start))
+        self.part_index_for(row_id)
+            .is_some_and(|(part_index, local_row_id)| {
+                self.parts[part_index].row_set.contains(local_row_id)
+            })
     }
 
     fn domain_len(&self) -> usize {
@@ -400,15 +471,30 @@ impl ExactRowSet for PartitionExactRowSet {
     }
 
     fn query_retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>().saturating_add(
-            self.parts
-                .len()
-                .saturating_mul(std::mem::size_of::<PartitionExactRowSetPart>()),
-        )
+        std::mem::size_of::<Self>()
+            .saturating_add(
+                self.parts.len().saturating_mul(
+                    std::mem::size_of::<PartitionExactRowSetPart>()
+                        .saturating_add(std::mem::size_of::<ExactRowAdmission<'_>>()),
+                ),
+            )
+            .saturating_add(
+                self.part_directory
+                    .len()
+                    .saturating_mul(std::mem::size_of::<u32>()),
+            )
     }
 
     fn admission(&self) -> ExactRowAdmission<'_> {
-        ExactRowAdmission::Partitioned(self)
+        ExactRowAdmission::Partitioned(PartitionExactRowAdmission {
+            row_set: self,
+            parts: self
+                .parts
+                .iter()
+                .map(|part| part.row_set.admission())
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        })
     }
 }
 
@@ -723,5 +809,28 @@ mod tests {
         let dense: Arc<dyn ExactRowSet> = Arc::new(DenseRowSet::new(4));
         assert!(PartitionExactRowSet::try_new(vec![(1..5, Arc::clone(&dense))]).is_err());
         assert!(PartitionExactRowSet::try_new(vec![(0..3, dense)]).is_err());
+    }
+
+    #[test]
+    fn partition_admission_directory_uses_direct_blocks_and_boundary_fallbacks() {
+        let first: Arc<dyn ExactRowSet> = Arc::new(DenseRowSet::new(6_000));
+        let second: Arc<dyn ExactRowSet> = Arc::new(DenseRowSet::new(6_000));
+        let rows = PartitionExactRowSet::try_new(vec![(0..6_000, first), (6_000..12_000, second)])
+            .unwrap();
+
+        assert_eq!(
+            rows.part_directory.as_ref(),
+            &[0, PARTITION_ADMISSION_MIXED, 1]
+        );
+        assert_eq!(rows.part_index_for(4_095), Some((0, 4_095)));
+        assert_eq!(rows.part_index_for(5_999), Some((0, 5_999)));
+        assert_eq!(rows.part_index_for(6_000), Some((1, 0)));
+        assert_eq!(rows.part_index_for(11_999), Some((1, 5_999)));
+        assert_eq!(rows.part_index_for(12_000), None);
+
+        let admission = rows.admission();
+        assert!(admission.contains(5_999));
+        assert!(admission.contains(6_000));
+        assert!(!admission.contains(12_000));
     }
 }

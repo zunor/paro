@@ -85,18 +85,7 @@ fn clamp_selectivity(value: f64) -> f64 {
 pub struct VectorScanCostModel;
 
 impl VectorScanCostModel {
-    /// Sequential vector pages are SIMD-friendly and cache-linear, while a
-    /// graph score normally follows an unpredictable edge to a random vector.
-    /// The policy threshold is calibrated in those physical units rather than
-    /// pretending both distance evaluations cost the same.
-    const SEQUENTIAL_VECTOR_SCAN_FACTOR: f64 =
-        1.0 / HnswDistanceCostModel::SEQUENTIAL_SCORES_PER_RANDOM_SCORE as f64;
     const REFERENCE_VECTOR_DIMENSION: f64 = 128.0;
-    /// A scalar comparison is one lane of the reference 128D sequential vector
-    /// score. Bitmap emission is modeled separately below, so this coefficient
-    /// is derived rather than being a second independently invented constant.
-    const SEQUENTIAL_SCALAR_SCAN_FACTOR: f64 =
-        Self::SEQUENTIAL_VECTOR_SCAN_FACTOR / Self::REFERENCE_VECTOR_DIMENSION;
 
     /// Estimate the provider-owned dense Top-K source, including its exact
     /// filtered fallback. A selective predicate does not force the generic
@@ -128,6 +117,18 @@ impl VectorScanCostModel {
         let effective_ef = policy.effective_ef(k, ef);
         let ef_val = effective_ef as f64;
         let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
+        // Planning consumes the same process-local hardware calibration as
+        // execution. The optimizer models one execution lane because the
+        // scheduler grant is not known at this boundary; runtime may lower an
+        // HNSW source to a wider exact scan without changing result semantics.
+        let sequential_vector_scan_factor = 1.0
+            / HnswDistanceCostModel::sequential_scores_per_random_score(stats.dimension, 1) as f64;
+        // A scalar comparison is one lane of the reference 128D sequential
+        // vector score. Bitmap emission is modeled separately below, so this
+        // coefficient remains derived rather than becoming another unrelated
+        // threshold.
+        let sequential_scalar_scan_factor =
+            sequential_vector_scan_factor / Self::REFERENCE_VECTOR_DIMENSION;
         let scored_points = ef_val * stats.avg_level0_degree.max(1.0) as f64;
         let raw_graph_cost = (log_n + scored_points) * dim_factor;
         let graph_cost = raw_graph_cost;
@@ -144,14 +145,14 @@ impl VectorScanCostModel {
                 let scanned_fraction = scanned_rows as f64 / represented_rows;
                 log_n
                     + candidate_rows / u64::BITS as f64
-                    + n * scanned_fraction * Self::SEQUENTIAL_SCALAR_SCAN_FACTOR
+                    + n * scanned_fraction * sequential_scalar_scan_factor
             }
             Some(ExactFilterMaterialization::ColumnScan) => {
-                n * Self::SEQUENTIAL_SCALAR_SCAN_FACTOR + candidate_rows / u64::BITS as f64
+                n * sequential_scalar_scan_factor + candidate_rows / u64::BITS as f64
             }
         };
         let exact_scan_cost =
-            (candidate_rows * dim_factor * Self::SEQUENTIAL_VECTOR_SCAN_FACTOR).max(1.0);
+            (candidate_rows * dim_factor * sequential_vector_scan_factor).max(1.0);
 
         if candidate_rows <= exact_threshold {
             return bitmap_cost + exact_scan_cost;

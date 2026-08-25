@@ -107,6 +107,8 @@ impl Segment {
             total_rows: self.num_rows(),
             effective_ef: policy.effective_ef(top_k, params.ef),
             level0_degree: index.build_contract.m0 as usize,
+            vector_dimension: index.vector_storage.vector_dim(),
+            parallelism: 1,
         });
         let budget = crate::search::ResourceBudget::default();
         index.search_one_with_policy_strategy(

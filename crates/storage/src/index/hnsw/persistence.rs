@@ -23,10 +23,10 @@ use super::vector_storage::{
 use super::visited_pool::VisitedPool;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswExactScanKind, HnswFilterTopologyContract, HnswSearchFilter, HnswSearchOutcome,
-    HnswSearchPath, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy, PointOffset,
-    PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm, SearchParams, VectorScorer,
-    HNSW_BUILD_CONTRACT_VERSION,
+    HnswDistanceCostModel, HnswExactScanKind, HnswFilterTopologyContract, HnswSearchFilter,
+    HnswSearchOutcome, HnswSearchPath, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy,
+    PointOffset, PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm, SearchParams,
+    VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
 #[cfg(test)]
 use super::{HnswConfig, HnswQueryWideStrategy, HnswSegmentSearchInput};
@@ -67,7 +67,6 @@ const HNSW_ARTIFACT_LEN_FIELD: usize = 176;
 const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 184;
 const HNSW_HEADER_CHECKSUM_FIELD: usize = 188;
 const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
-const MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy)]
 struct ExactPostingRange<'a> {
@@ -85,6 +84,18 @@ struct ExactScanLane<'a> {
 struct ExactScanLaneResult {
     points: Vec<ScoredPoint>,
     scored_points: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CoveringScanRange<'a> {
+    range: super::predicate_scan::PredicateScanRangeRef<'a>,
+    first_row: usize,
+    len: usize,
+}
+
+#[derive(Debug, Default)]
+struct CoveringScanLane<'a> {
+    ranges: Vec<CoveringScanRange<'a>>,
 }
 
 struct ExactScanResult {
@@ -1816,12 +1827,13 @@ impl HnswIndex {
                     .expect("predicate topology requires an exact row set")
                     .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
             }
+            let admission = filter_row_set.map(ExactRowSet::admission);
             let graph_result = self.graph.search_one(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorer,
-                filter_row_set.map(ExactRowSet::admission),
+                admission.as_ref(),
                 &predicate_partition_seeds,
                 filter.predicate_columns(),
                 use_predicate_topology,
@@ -1856,7 +1868,18 @@ impl HnswIndex {
 
         let scored_points = scorer.scored_point_count();
 
-        let elapsed_us = start.elapsed().as_micros() as u64;
+        let elapsed = start.elapsed();
+        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        HnswDistanceCostModel::observe(
+            self.vector_storage.vector_dim(),
+            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+            scored_points,
+            outcome,
+            HnswDistanceCostModel::exact_scan_parallelism(
+                post_filter_count,
+                budget.parallelism_slots,
+            ),
+        );
         let mut telemetry = self.single_telemetry.lock().unwrap();
         telemetry.record(elapsed_us, pre_filter_count, post_filter_count);
         telemetry.record_hnsw_work(scored_points, outcome);
@@ -1896,6 +1919,8 @@ impl HnswIndex {
             total_rows: self.graph.num_points() as u64,
             effective_ef: policy.effective_ef(top_k, params.ef),
             level0_degree: self.graph.hnsw_m.get_m(0),
+            vector_dimension: self.vector_storage.vector_dim(),
+            parallelism: 1,
         });
         let budget = crate::search::ResourceBudget::default();
         self.search_one_with_policy_strategy(
@@ -1990,12 +2015,13 @@ impl HnswIndex {
                     .expect("predicate topology requires an exact row set")
                     .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
             }
+            let admission = filter_row_set.map(ExactRowSet::admission);
             let results = self.graph.search_many(
                 top_k,
                 ef,
                 algorithm,
                 &mut scorers,
-                filter_row_set.map(ExactRowSet::admission),
+                admission.as_ref(),
                 &predicate_partition_seeds,
                 filter.predicate_columns(),
                 use_predicate_topology,
@@ -2036,7 +2062,24 @@ impl HnswIndex {
             }
         }
 
-        let elapsed_us = start.elapsed().as_micros() as u64;
+        let elapsed = start.elapsed();
+        let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        if let Some(first) = results.first() {
+            let same_physical_path = results.iter().all(|result| {
+                result.outcome.path == first.outcome.path && result.outcome.exact_fallback.is_none()
+            });
+            if same_physical_path {
+                HnswDistanceCostModel::observe(
+                    self.vector_storage.vector_dim(),
+                    elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
+                    results.iter().fold(0u64, |total, result| {
+                        total.saturating_add(result.scored_points)
+                    }),
+                    first.outcome,
+                    1,
+                );
+            }
+        }
         self.batch_telemetry
             .lock()
             .unwrap()
@@ -2354,8 +2397,10 @@ impl HnswIndex {
                         kind: HnswExactScanKind::PredicateCovering,
                     });
                 }
-                if row_set.len() >= MIN_ROWS_PER_PARALLEL_EXACT_LANE.saturating_mul(2)
-                    && budget.parallelism_slots > 1
+                if HnswDistanceCostModel::exact_scan_parallelism(
+                    row_set.len(),
+                    budget.parallelism_slots,
+                ) > 1
                 {
                     let points = self.parallel_plain_scan(
                         top_k,
@@ -2420,41 +2465,192 @@ impl HnswIndex {
         let Some(ranges) = layout.selected_ranges(column_id, postings)? else {
             return Ok(None);
         };
-        const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
-        let mut best = FixedLengthPriorityQueue::new(top_k);
-        let mut local_points = [0; SCORE_BATCH];
-        let mut covered_rows = 0u64;
-        for range in ranges {
-            let row_ids = range.row_ids();
-            let vectors = range.vectors();
-            let mut position = 0usize;
-            while position < row_ids.len() {
-                let end = position.saturating_add(SCORE_BATCH).min(row_ids.len());
-                budget.work.check_and_consume(end - position)?;
-                let rows = &row_ids[position..end];
-                for (slot, &row_id) in rows.iter().enumerate() {
-                    if row_id as usize >= self.graph.num_points() {
-                        return Err(error::data_corrupted(
-                            "predicate covering scan row id exceeds graph cardinality",
-                        ));
-                    }
-                    local_points[slot] = (position + slot) as PointOffset;
-                }
-                let len = rows.len();
-                covered_rows = covered_rows.saturating_add(len as u64);
-                for point in scorer.score_covering_points(rows, &local_points[..len], vectors) {
-                    best.push(point);
-                }
-                position = end;
-            }
-        }
+        let covered_rows = ranges.iter().try_fold(0u64, |rows, range| {
+            rows.checked_add(range.row_ids().len() as u64)
+                .ok_or_else(|| error::data_corrupted("predicate covering cardinality overflow"))
+        })?;
         if covered_rows != row_set.len() {
             return Err(error::data_corrupted(format!(
                 "predicate covering scan covered {covered_rows} exact rows, expected {}",
                 row_set.len()
             )));
         }
+        if HnswDistanceCostModel::exact_scan_parallelism(covered_rows, budget.parallelism_slots) > 1
+        {
+            return self
+                .parallel_covering_plain_scan(top_k, scorer, &ranges, covered_rows, budget)
+                .map(Some);
+        }
+
+        let mut best = FixedLengthPriorityQueue::new(top_k);
+        for range in ranges {
+            self.scan_covering_range_into(
+                &mut best,
+                scorer,
+                CoveringScanRange {
+                    first_row: 0,
+                    len: range.row_ids().len(),
+                    range,
+                },
+                budget.work.as_ref(),
+            )?;
+        }
         Ok(Some(best.into_sorted_vec()))
+    }
+
+    fn parallel_covering_plain_scan(
+        &self,
+        top_k: usize,
+        scorer: &mut VectorScorer,
+        ranges: &[super::predicate_scan::PredicateScanRangeRef<'_>],
+        row_count: u64,
+        budget: &ResourceBudget,
+    ) -> Result<Vec<ScoredPoint>> {
+        let lane_count =
+            HnswDistanceCostModel::exact_scan_parallelism(row_count, budget.parallelism_slots);
+        debug_assert!(lane_count > 1);
+        // Splitting a source range at lane boundaries creates at most one
+        // additional descriptor per boundary. Reserve before allocating the
+        // lane vectors so memory governance remains the construction gate.
+        let descriptor_count = ranges.len().saturating_add(lane_count - 1);
+        let descriptor_bytes = descriptor_count
+            .saturating_mul(std::mem::size_of::<CoveringScanRange<'_>>())
+            .saturating_add(lane_count.saturating_mul(std::mem::size_of::<CoveringScanLane<'_>>()));
+        let scorer_scratch_bytes = lane_count.saturating_mul(
+            crate::index::hnsw::batch_scorer::BATCH_SIZE
+                .saturating_mul(std::mem::size_of::<ScoreType>())
+                .saturating_add(
+                    top_k
+                        .saturating_mul(std::mem::size_of::<ScoredPoint>())
+                        .saturating_mul(2),
+                ),
+        );
+        let _reservation =
+            budget.try_reserve_memory(descriptor_bytes.saturating_add(scorer_scratch_bytes))?;
+        let lanes = Self::plan_covering_scan_lanes(ranges, row_count, lane_count)?;
+        let prepared_scoring = scorer.prepared_scoring();
+        let results = map_search_tasks(
+            &lanes,
+            budget.parallelism_slots,
+            |_, lane| -> Result<ExactScanLaneResult> {
+                let mut local_scorer = prepared_scoring.scorer();
+                let mut best = FixedLengthPriorityQueue::new(top_k);
+                for range in &lane.ranges {
+                    self.scan_covering_range_into(
+                        &mut best,
+                        &mut local_scorer,
+                        *range,
+                        budget.work.as_ref(),
+                    )?;
+                }
+                Ok(ExactScanLaneResult {
+                    points: best.into_sorted_vec(),
+                    scored_points: local_scorer.scored_point_count(),
+                })
+            },
+        )?;
+
+        let mut best = FixedLengthPriorityQueue::new(top_k);
+        let mut scored_points = 0u64;
+        for result in results {
+            scored_points = scored_points.saturating_add(result.scored_points);
+            for point in result.points {
+                best.push(point);
+            }
+        }
+        scorer.add_scored_point_count(scored_points);
+        Ok(best.into_sorted_vec())
+    }
+
+    fn plan_covering_scan_lanes<'a>(
+        ranges: &[super::predicate_scan::PredicateScanRangeRef<'a>],
+        row_count: u64,
+        lane_count: usize,
+    ) -> Result<Vec<CoveringScanLane<'a>>> {
+        let mut lanes = (0..lane_count)
+            .map(|_| CoveringScanLane::default())
+            .collect::<Vec<_>>();
+        let target_rows = row_count.div_ceil(lane_count as u64);
+        let mut lane = 0usize;
+        let mut rows_in_lane = 0u64;
+        let mut observed_rows = 0u64;
+        for &range in ranges {
+            let mut first_row = 0usize;
+            let range_rows = range.row_ids().len();
+            observed_rows = observed_rows.saturating_add(range_rows as u64);
+            while first_row < range_rows {
+                let available = target_rows.saturating_sub(rows_in_lane).max(1);
+                let take = usize::try_from(available.min((range_rows - first_row) as u64))
+                    .map_err(|_| error::out_of_range("covering scan lane size exceeds usize"))?;
+                lanes[lane].ranges.push(CoveringScanRange {
+                    range,
+                    first_row,
+                    len: take,
+                });
+                first_row += take;
+                rows_in_lane = rows_in_lane.saturating_add(take as u64);
+                if rows_in_lane >= target_rows && lane + 1 < lane_count {
+                    lane += 1;
+                    rows_in_lane = 0;
+                }
+            }
+        }
+        if observed_rows != row_count {
+            return Err(error::data_corrupted(format!(
+                "covering scan lane cardinality mismatch: expected {row_count}, got {observed_rows}"
+            )));
+        }
+        if lanes.iter().any(|lane| lane.ranges.is_empty()) {
+            return Err(error::internal(
+                "covering scan lane planner produced an empty worker lane",
+            ));
+        }
+        Ok(lanes)
+    }
+
+    fn scan_covering_range_into(
+        &self,
+        best: &mut FixedLengthPriorityQueue<ScoredPoint>,
+        scorer: &mut VectorScorer,
+        range: CoveringScanRange<'_>,
+        work: &SearchWorkBudget,
+    ) -> Result<()> {
+        const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
+        let end_row = range
+            .first_row
+            .checked_add(range.len)
+            .ok_or_else(|| error::data_corrupted("predicate covering row range overflow"))?;
+        let row_ids = range
+            .range
+            .row_ids()
+            .get(range.first_row..end_row)
+            .ok_or_else(|| error::data_corrupted("predicate covering row range exceeds block"))?;
+        let dimension = self.vector_storage.vector_dim();
+        let vector_start = range
+            .first_row
+            .checked_mul(dimension)
+            .ok_or_else(|| error::data_corrupted("predicate covering vector range overflow"))?;
+        let vector_end = end_row
+            .checked_mul(dimension)
+            .ok_or_else(|| error::data_corrupted("predicate covering vector range overflow"))?;
+        let vectors = range
+            .range
+            .vectors()
+            .get(vector_start..vector_end)
+            .ok_or_else(|| {
+                error::data_corrupted("predicate covering vector range exceeds block")
+            })?;
+
+        for (rows, vectors) in row_ids
+            .chunks(SCORE_BATCH)
+            .zip(vectors.chunks(SCORE_BATCH.saturating_mul(dimension)))
+        {
+            work.check_and_consume(rows.len())?;
+            for point in scorer.score_covering_contiguous(rows, vectors) {
+                best.push(point);
+            }
+        }
+        Ok(())
     }
 
     fn parallel_plain_scan(
@@ -2465,14 +2661,8 @@ impl HnswIndex {
         row_count: u64,
         budget: &ResourceBudget,
     ) -> Result<Vec<ScoredPoint>> {
-        let lane_count = budget
-            .parallelism_slots
-            .max(1)
-            .min(
-                usize::try_from(row_count.div_ceil(MIN_ROWS_PER_PARALLEL_EXACT_LANE))
-                    .unwrap_or(usize::MAX),
-            )
-            .max(1);
+        let lane_count =
+            HnswDistanceCostModel::exact_scan_parallelism(row_count, budget.parallelism_slots);
         debug_assert!(lane_count > 1);
         debug_assert!(!partitions.is_empty());
 
@@ -2658,6 +2848,48 @@ mod tests {
             .iter()
             .map(|query| distance.prepare(query))
             .collect()
+    }
+
+    #[test]
+    fn covering_scan_lane_planner_splits_one_large_contiguous_run_without_gaps() {
+        const ROWS: u32 = 40_000;
+        let posting = Arc::new(RoaringBitmap::from_iter(0..ROWS));
+        let layout = PredicateScanLayout::from_build_columns(
+            1,
+            ROWS as usize,
+            vec![PredicateScanBuildColumn {
+                column_id: 7,
+                blocks: vec![PredicateScanBuildBlock {
+                    dictionary_ordinals: vec![0].into_boxed_slice(),
+                    ordinal_row_counts: vec![ROWS].into_boxed_slice(),
+                    ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(&posting)]
+                        .into_boxed_slice(),
+                    row_ids: (0..ROWS).collect::<Vec<_>>().into_boxed_slice(),
+                    vectors: vec![0.0; ROWS as usize].into(),
+                }],
+            }],
+        )
+        .unwrap();
+        let exact_postings = [crate::index::ExactOrdinalPosting::new(0, posting)];
+        let ranges = layout.selected_ranges(7, &exact_postings).unwrap().unwrap();
+        let lanes = HnswIndex::plan_covering_scan_lanes(&ranges, u64::from(ROWS), 3).unwrap();
+
+        assert_eq!(lanes.len(), 3);
+        assert!(lanes.iter().all(|lane| !lane.ranges.is_empty()));
+        assert_eq!(
+            lanes
+                .iter()
+                .flat_map(|lane| lane.ranges.iter())
+                .map(|range| range.len)
+                .sum::<usize>(),
+            ROWS as usize
+        );
+        let starts = lanes
+            .iter()
+            .flat_map(|lane| lane.ranges.iter())
+            .map(|range| range.first_row)
+            .collect::<Vec<_>>();
+        assert_eq!(starts, vec![0, 13_334, 26_668]);
     }
 
     fn make_sift_like_vectors(

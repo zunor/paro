@@ -146,6 +146,13 @@ impl<'a> VectorScorer<'a> {
         (self.vectors, self.dimension)
     }
 
+    /// Schedule the leading vector cache lines while graph-link and visited
+    /// processing still has useful independent work to perform.
+    #[inline(always)]
+    pub(crate) fn prefetch_point(&self, point_id: PointOffset) {
+        distance::prefetch_vector_read(self.vector(point_id));
+    }
+
     pub fn scored_point_count(&self) -> u64 {
         self.scored_points.get()
     }
@@ -237,17 +244,18 @@ impl<'a> VectorScorer<'a> {
             .map(|(&idx, &score)| ScoredPoint { idx, score })
     }
 
-    /// Score global point identities from an alternate row-major covering
-    /// layout. `local_points` address rows in `vectors`; `global_points`
-    /// preserve table/HNSW identity for metric metadata and returned Top-K.
-    pub(crate) fn score_covering_points<'b>(
+    /// Score global point identities from a contiguous alternate row-major
+    /// covering layout. `global_points` preserve table/HNSW identity for
+    /// metric metadata and returned Top-K; row `i` is stored at vector row `i`.
+    pub(crate) fn score_covering_contiguous<'b>(
         &'b mut self,
         global_points: &'b [PointOffset],
-        local_points: &'b [PointOffset],
         vectors: &'b [f32],
     ) -> impl Iterator<Item = ScoredPoint> + 'b {
-        assert_eq!(global_points.len(), local_points.len());
-        assert_eq!(vectors.len() % self.dimension, 0);
+        assert_eq!(
+            vectors.len(),
+            global_points.len().saturating_mul(self.dimension)
+        );
         self.scores_buffer.resize(global_points.len(), 0.0);
         self.scored_points.set(
             self.scored_points
@@ -257,21 +265,20 @@ impl<'a> VectorScorer<'a> {
         let query = self.query.as_slice();
         match self.kernel {
             ScoringKernel::Cosine(norms) => {
-                for (position, (&global_point, &local_point)) in
-                    global_points.iter().zip(local_points.iter()).enumerate()
+                for ((score, &global_point), vector) in self
+                    .scores_buffer
+                    .iter_mut()
+                    .zip(global_points.iter())
+                    .zip(vectors.chunks_exact(self.dimension))
                 {
-                    let start = local_point as usize * self.dimension;
-                    self.scores_buffer[position] =
-                        distance::dot_product(query, &vectors[start..start + self.dimension])
-                            * norms.value(global_point);
+                    *score = distance::dot_product(query, vector) * norms.value(global_point);
                 }
             }
             ScoringKernel::Euclidean => {
-                distance::l2_squared_batch_indexed(
+                distance::l2_squared_batch_contiguous(
                     query,
                     vectors,
                     self.dimension,
-                    local_points,
                     &mut self.scores_buffer,
                 );
                 for score in &mut self.scores_buffer {
@@ -279,17 +286,21 @@ impl<'a> VectorScorer<'a> {
                 }
             }
             ScoringKernel::DotProduct => {
-                for (position, &local_point) in local_points.iter().enumerate() {
-                    let start = local_point as usize * self.dimension;
-                    self.scores_buffer[position] =
-                        distance::dot_product(query, &vectors[start..start + self.dimension]);
+                for (score, vector) in self
+                    .scores_buffer
+                    .iter_mut()
+                    .zip(vectors.chunks_exact(self.dimension))
+                {
+                    *score = distance::dot_product(query, vector);
                 }
             }
             ScoringKernel::Manhattan => {
-                for (position, &local_point) in local_points.iter().enumerate() {
-                    let start = local_point as usize * self.dimension;
-                    self.scores_buffer[position] =
-                        -distance::l1_distance(query, &vectors[start..start + self.dimension]);
+                for (score, vector) in self
+                    .scores_buffer
+                    .iter_mut()
+                    .zip(vectors.chunks_exact(self.dimension))
+                {
+                    *score = -distance::l1_distance(query, vector);
                 }
             }
         }
