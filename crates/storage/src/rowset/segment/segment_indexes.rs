@@ -5,18 +5,23 @@ use super::segment::Segment;
 use super::segment_format::{ColumnMeta, SegmentFooter};
 use crate::index::art::ART;
 use crate::index::fulltext::text_index::FullTextIndex;
+use crate::index::hnsw::{
+    hnsw_artifact_build_contract, HnswBuildContract, HNSW_ARTIFACT_HEADER_LEN,
+};
 use crate::index::sparse::SparseVectorIndex;
 use crate::index::{
     BitmapIndex, BloomFilterIndex, BoundIndex, HnswIndex, PredicateIndexBinding,
     SegmentLocalComplete,
 };
-use crate::rowset::page::{CompressionType, PagePointer};
+use crate::rowset::page::PagePointer;
 use crate::statistics::{
     FullTextIndexStatistics, HnswIndexStatistics, IndexStatistics, IndexType,
     SegmentIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::ColumnId;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex, RwLock};
 
 pub(super) enum DeferredHnswState {
@@ -37,7 +42,6 @@ pub(super) enum DeferredHnswState {
 /// format corruption remains an error at that capability boundary.
 pub(super) struct DeferredHnswIndex {
     pub(super) page_pointer: PagePointer,
-    pub(super) compression: CompressionType,
     pub(super) vector_data_offset: u64,
     pub(super) vector_data_len: u64,
     pub(super) dimension: usize,
@@ -48,15 +52,19 @@ pub(super) struct DeferredHnswIndex {
 pub struct SegmentPredicateIndexes {
     pub(super) bloom_filters: HashMap<ColumnId, Arc<BloomFilterIndex>>,
     pub(super) bitmap_indexes: HashMap<ColumnId, Arc<BitmapIndex>>,
-    /// One catalog scalar index can expose ordered ART and low-cardinality
-    /// bitmap representations. They share one completeness credential and are
+    /// One catalog scalar index selects one physical representation per
+    /// immutable segment. The access path and its completeness credential are
     /// published/replaced atomically under a single lock.
     pub(super) runtime_scalar_indexes: RwLock<HashMap<ColumnId, ScalarAccessPaths>>,
 }
 
+pub(crate) enum RuntimeScalarIndex {
+    Art(Arc<ART>),
+    Bitmap(Arc<BitmapIndex>),
+}
+
 pub(super) struct ScalarAccessPaths {
-    art: Arc<ART>,
-    bitmap: Option<Arc<BitmapIndex>>,
+    index: RuntimeScalarIndex,
     completeness: SegmentLocalComplete,
 }
 
@@ -69,19 +77,20 @@ impl SegmentPredicateIndexes {
         self.runtime_scalar_indexes
             .read()
             .ok()
-            .and_then(|guard| {
-                guard
-                    .get(&column_id)
-                    .and_then(|paths| paths.bitmap.as_ref().cloned())
+            .and_then(|guard| match &guard.get(&column_id)?.index {
+                RuntimeScalarIndex::Bitmap(index) => Some(Arc::clone(index)),
+                RuntimeScalarIndex::Art(_) => None,
             })
             .or_else(|| self.bitmap_indexes.get(&column_id).cloned())
     }
 
     pub fn art_index(&self, column_id: ColumnId) -> Option<Arc<ART>> {
-        self.runtime_scalar_indexes
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(&column_id).map(|paths| Arc::clone(&paths.art)))
+        self.runtime_scalar_indexes.read().ok().and_then(|guard| {
+            match &guard.get(&column_id)?.index {
+                RuntimeScalarIndex::Art(index) => Some(Arc::clone(index)),
+                RuntimeScalarIndex::Bitmap(_) => None,
+            }
+        })
     }
 
     fn has_complete_scalar_index(&self, column_id: ColumnId, segment_rows: u64) -> bool {
@@ -103,7 +112,7 @@ impl SegmentPredicateIndexes {
                 .saturating_add(
                     self.runtime_scalar_indexes
                         .read()
-                        .map(|guard| guard.len().saturating_mul(2))
+                        .map(|guard| guard.len())
                         .unwrap_or(0),
                 ),
         );
@@ -127,14 +136,12 @@ impl SegmentPredicateIndexes {
                         paths.completeness.row_count()
                     )));
                 }
-                if let Some(bitmap) = &paths.bitmap {
-                    results.push(PredicateIndexBinding::complete_scalar(
-                        Arc::clone(bitmap) as Arc<dyn BoundIndex>,
-                        paths.completeness,
-                    ));
-                }
+                let index: Arc<dyn BoundIndex> = match &paths.index {
+                    RuntimeScalarIndex::Art(index) => Arc::clone(index) as Arc<dyn BoundIndex>,
+                    RuntimeScalarIndex::Bitmap(index) => Arc::clone(index) as Arc<dyn BoundIndex>,
+                };
                 results.push(PredicateIndexBinding::complete_scalar(
-                    Arc::clone(&paths.art) as Arc<dyn BoundIndex>,
+                    index,
                     paths.completeness,
                 ));
             }
@@ -282,6 +289,32 @@ impl Segment {
         self.indexes.search.hnsw_indexes.contains_key(&column_id)
     }
 
+    /// Read only the authenticated fixed header of an inline HNSW artifact.
+    /// This is the physical-identity check used by generation coverage: a
+    /// page pointer alone does not prove that the page belongs to the current
+    /// artifact format or to the definition's build contract.
+    pub(crate) fn hnsw_artifact_matches_contract(
+        &self,
+        column_id: ColumnId,
+        expected: &HnswBuildContract,
+    ) -> paro_common::error::Result<bool> {
+        let Some(deferred) = self.indexes.search.hnsw_indexes.get(&column_id) else {
+            return Ok(false);
+        };
+        if deferred.page_pointer.size as usize <= HNSW_ARTIFACT_HEADER_LEN {
+            return Err(paro_common::error::data_corrupted(
+                "inline HNSW page is too small for its fixed header",
+            ));
+        }
+        let mut file = File::open(self.file_path()).map_err(paro_common::error::io)?;
+        file.seek(SeekFrom::Start(deferred.page_pointer.offset))
+            .map_err(paro_common::error::io)?;
+        let mut header = [0_u8; HNSW_ARTIFACT_HEADER_LEN];
+        file.read_exact(&mut header)
+            .map_err(paro_common::error::io)?;
+        Ok(hnsw_artifact_build_contract(&header)?.is_some_and(|actual| actual == *expected))
+    }
+
     /// Materialize the HNSW capability on first use.
     pub fn open_hnsw_index(
         &self,
@@ -384,27 +417,28 @@ impl Segment {
         self.indexes.predicate.art_index(column_id)
     }
 
-    pub(crate) fn has_complete_scalar_index(&self, column_id: ColumnId) -> bool {
+    /// Whether this immutable segment has one exact scalar access path whose
+    /// completeness credential covers every row. Callers must not infer
+    /// coverage from a concrete ART/bitmap representation: representation is
+    /// selected per segment and may change after recovery or compaction.
+    pub fn has_complete_scalar_index(&self, column_id: ColumnId) -> bool {
         self.indexes
             .predicate
             .has_complete_scalar_index(column_id, self.num_rows())
     }
 
-    /// Atomically publish every physical representation of one complete
-    /// segment-local scalar index.
+    /// Atomically publish one complete segment-local scalar access path.
     pub(crate) fn register_runtime_scalar_index(
         &self,
         column_id: ColumnId,
-        art: Arc<ART>,
-        bitmap: Option<Arc<BitmapIndex>>,
+        index: RuntimeScalarIndex,
         completeness: SegmentLocalComplete,
     ) {
         if let Ok(mut guard) = self.indexes.predicate.runtime_scalar_indexes.write() {
             guard.insert(
                 column_id,
                 ScalarAccessPaths {
-                    art,
-                    bitmap,
+                    index,
                     completeness,
                 },
             );

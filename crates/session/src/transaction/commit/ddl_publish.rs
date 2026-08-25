@@ -313,6 +313,9 @@ impl IndexBackfillPublishTask {
         }
 
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
+        if Self::search_kind(self.info.index_type).is_some() {
+            storage.materialize_search_generation(self.entry.base.base.object_id.raw())?;
+        }
         let coverage = self.recompute_coverage(storage.as_ref())?;
         self.entry.mark_ready_with_coverage(coverage);
         Ok(())

@@ -11,8 +11,8 @@ use std::time::Instant;
 use divan::{black_box, Bencher};
 use paro_storage::metrics::storage_metrics;
 use paro_storage::search::{
-    SearchIndexKind, SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest,
-    SIDECAR_PACKAGE_CODEC,
+    SearchIndexKind, SidecarArtifactStore, SidecarIntegrityPolicy, SidecarReaderCache,
+    SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 use tempfile::TempDir;
 
@@ -87,6 +87,7 @@ impl SidecarOpenFixture {
                     artifact_format_version: 1,
                     provider: SearchIndexKind::FullText,
                     codec: SIDECAR_PACKAGE_CODEC,
+                    integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
                 })
                 .expect("open sidecar artifact");
             bytes ^= artifact.bytes().len();

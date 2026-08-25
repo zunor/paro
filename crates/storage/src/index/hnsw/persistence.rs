@@ -5,6 +5,9 @@
 //!
 //! Save, load, serialize, and search HNSW indexes.
 
+use super::artifact_integrity::{
+    append_integrity_table, ArtifactIntegrity, ArtifactIntegrityBacking, IntegrityDescriptor,
+};
 use super::entry_points::EntryPoints;
 use super::graph::GraphLayers;
 use super::graph_links::GraphLinks;
@@ -29,7 +32,8 @@ use crate::metrics::storage_metrics;
 use crate::search::segment_dispatch::install_search_pool;
 use crate::search::{ResourceBudget, SearchWorkBudget};
 use crate::statistics::{
-    append_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics, SearchTelemetry,
+    append_stats_trailer, split_stats_trailer, HnswBatchTelemetry, HnswIndexStatistics,
+    SearchTelemetry,
 };
 use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
@@ -44,8 +48,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-const HNSW_ARTIFACT_VERSION: u32 = 7;
-const HNSW_ARTIFACT_HEADER_LEN: usize = 144;
+const HNSW_ARTIFACT_VERSION: u32 = 9;
+pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 176;
+const HNSW_NORM_COUNT_FIELD: usize = 48;
+const HNSW_PRIMARY_COUNT_FIELD: usize = 56;
+const HNSW_EXTRA_COUNT_FIELD: usize = 60;
+const HNSW_INTEGRITY_OFFSET_FIELD: usize = 144;
+const HNSW_INTEGRITY_LEN_FIELD: usize = 152;
+const HNSW_ARTIFACT_LEN_FIELD: usize = 160;
+const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 168;
+const HNSW_HEADER_CHECKSUM_FIELD: usize = 172;
 const MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +82,11 @@ struct ExactScanResult {
     points: Vec<ScoredPoint>,
     kind: HnswExactScanKind,
 }
+
+/// Durable byte alignment for an mmap-backed HNSW envelope. Every nested
+/// typed region is aligned relative to the envelope, so its file offset must
+/// preserve the same base alignment.
+pub const HNSW_ARTIFACT_ALIGNMENT: usize = 8;
 
 fn aligned_offset(offset: usize, alignment: usize) -> Result<usize> {
     offset
@@ -207,6 +224,102 @@ pub fn hnsw_artifact_compatibility(data: &[u8]) -> Result<HnswArtifactCompatibil
         ));
     }
     Ok(HnswArtifactCompatibility::Current)
+}
+
+fn current_artifact_header(data: &[u8]) -> Result<&[u8]> {
+    match hnsw_artifact_compatibility(data)? {
+        HnswArtifactCompatibility::Current => {}
+        compatibility => {
+            return Err(error::artifact_not_ready(
+                compatibility
+                    .rebuild_reason()
+                    .expect("non-current compatibility has a reason"),
+            ));
+        }
+    }
+    let header = data.get(..HNSW_ARTIFACT_HEADER_LEN).ok_or_else(|| {
+        error::data_corrupted("HNSW artifact is truncated inside its fixed header")
+    })?;
+    let expected = u32::from_le_bytes(
+        header[HNSW_HEADER_CHECKSUM_FIELD..HNSW_HEADER_CHECKSUM_FIELD + 4]
+            .try_into()
+            .expect("header checksum width"),
+    );
+    if crc32c::crc32c(&header[..HNSW_HEADER_CHECKSUM_FIELD]) != expected {
+        return Err(error::data_corrupted(
+            "HNSW artifact fixed header checksum mismatch",
+        ));
+    }
+    Ok(header)
+}
+
+fn decode_build_contract(header: &[u8]) -> Result<(HnswBuildContract, usize)> {
+    let mut offset = 12;
+    let read_u32 = |offset: &mut usize, field| -> Result<u32> {
+        Ok(u32::from_le_bytes(
+            take_artifact_bytes(header, offset, 4, field)?
+                .try_into()
+                .expect("u32 width"),
+        ))
+    };
+    let mut contract = HnswBuildContract {
+        version: read_u32(&mut offset, "build contract version")?,
+        m: read_u32(&mut offset, "m")?,
+        m0: read_u32(&mut offset, "m0")?,
+        ef_construct: read_u32(&mut offset, "ef_construct")?,
+        distance: {
+            let tag = take_artifact_bytes(header, &mut offset, 1, "distance")?[0];
+            DistanceMetric::from_u8(tag)
+                .ok_or_else(|| error::data_corrupted(format!("unknown HNSW distance tag {tag}")))?
+        },
+        build_seed: {
+            let padding = take_artifact_bytes(header, &mut offset, 3, "distance padding")?;
+            if padding != [0, 0, 0] {
+                return Err(error::data_corrupted("HNSW distance padding must be zero"));
+            }
+            u64::from_le_bytes(
+                take_artifact_bytes(header, &mut offset, 8, "build seed")?
+                    .try_into()
+                    .expect("u64 width"),
+            )
+        },
+        proposal_wave_size: read_u32(&mut offset, "proposal wave size")?,
+        warmup_point_count: read_u32(&mut offset, "warm-up point count")?,
+        filter_topology: HnswFilterTopologyContract::default(),
+    };
+    // Skip counts that precede the filter-topology contract.
+    take_artifact_bytes(header, &mut offset, 8, "inverse norm count")?;
+    take_artifact_bytes(header, &mut offset, 4, "primary entry point count")?;
+    take_artifact_bytes(header, &mut offset, 4, "extra entry point count")?;
+    let filter_version = read_u32(&mut offset, "filter-topology version")?;
+    let filter_column_count = read_u32(&mut offset, "filter column count")?;
+    let mut filter_column_ids = [0; super::MAX_HNSW_FILTER_COLUMNS];
+    for column_id in &mut filter_column_ids {
+        *column_id = read_u32(&mut offset, "filter column id")?;
+    }
+    contract.filter_topology = HnswFilterTopologyContract {
+        version: filter_version,
+        column_count: filter_column_count,
+        column_ids: filter_column_ids,
+        target_block_rows: read_u32(&mut offset, "filter block rows")?,
+        m: read_u32(&mut offset, "filter m")?,
+    };
+    contract.validate()?;
+    Ok((contract, offset))
+}
+
+/// Inspect the authenticated fixed header without touching graph payload
+/// pages. `None` means the artifact is structurally recognizable but belongs
+/// to an unsupported artifact/build-contract generation and must be rebuilt.
+pub(crate) fn hnsw_artifact_build_contract(data: &[u8]) -> Result<Option<HnswBuildContract>> {
+    if !matches!(
+        hnsw_artifact_compatibility(data)?,
+        HnswArtifactCompatibility::Current
+    ) {
+        return Ok(None);
+    }
+    let (contract, _) = decode_build_contract(current_artifact_header(data)?)?;
+    Ok(Some(contract))
 }
 
 const fn distance_tag(distance: DistanceMetric) -> u8 {
@@ -350,6 +463,17 @@ impl HnswArtifactBacking {
         }
     }
 
+    fn integrity_backing(&self) -> ArtifactIntegrityBacking {
+        match self {
+            Self::Bytes(bytes) => ArtifactIntegrityBacking::Bytes(bytes.clone()),
+            Self::Mmap { mmap, offset, len } => ArtifactIntegrityBacking::Mmap {
+                mmap: Arc::clone(mmap),
+                offset: *offset,
+                len: *len,
+            },
+        }
+    }
+
     fn inverse_norms(&self, offset: usize, len: usize) -> Result<CosineInverseNorms> {
         match self {
             Self::Bytes(bytes) => CosineInverseNorms::from_bytes(bytes.slice(offset..offset + len)),
@@ -367,7 +491,12 @@ impl HnswArtifactBacking {
         }
     }
 
-    fn graph_links(&self, offset: usize, len: usize) -> Result<GraphLinks> {
+    fn graph_links(
+        &self,
+        offset: usize,
+        len: usize,
+        integrity: Arc<ArtifactIntegrity>,
+    ) -> Result<GraphLinks> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| error::data_corrupted("HNSW graph artifact range overflow"))?;
@@ -378,13 +507,17 @@ impl HnswArtifactBacking {
                         "HNSW graph artifact range exceeds byte backing",
                     ));
                 }
-                GraphLinks::deserialize_bytes(bytes.slice(offset..end))
+                GraphLinks::deserialize_bytes_with_integrity(
+                    bytes.slice(offset..end),
+                    integrity,
+                    offset,
+                )
             }
             Self::Mmap {
                 mmap,
                 offset: artifact_offset,
                 len: artifact_len,
-            } => GraphLinks::deserialize_mmap_range(
+            } => GraphLinks::deserialize_mmap_range_with_integrity(
                 Arc::clone(mmap),
                 artifact_offset
                     .checked_add(offset)
@@ -396,11 +529,18 @@ impl HnswArtifactBacking {
                         "HNSW graph artifact range exceeds mmap backing",
                     ));
                 },
+                integrity,
+                offset,
             ),
         }
     }
 
-    fn predicate_scan(&self, offset: usize, len: usize) -> Result<PredicateScanLayout> {
+    fn predicate_scan(
+        &self,
+        offset: usize,
+        len: usize,
+        integrity: Arc<ArtifactIntegrity>,
+    ) -> Result<PredicateScanLayout> {
         let end = offset
             .checked_add(len)
             .ok_or_else(|| error::data_corrupted("HNSW predicate scan range overflow"))?;
@@ -411,13 +551,17 @@ impl HnswArtifactBacking {
                         "HNSW predicate scan range exceeds byte backing",
                     ));
                 }
-                PredicateScanLayout::deserialize_bytes(bytes.slice(offset..end))
+                PredicateScanLayout::deserialize_bytes_with_integrity(
+                    bytes.slice(offset..end),
+                    integrity,
+                    offset,
+                )
             }
             Self::Mmap {
                 mmap,
                 offset: artifact_offset,
                 len: artifact_len,
-            } => PredicateScanLayout::deserialize_mmap_range(
+            } => PredicateScanLayout::deserialize_mmap_range_with_integrity(
                 Arc::clone(mmap),
                 artifact_offset.checked_add(offset).ok_or_else(|| {
                     error::data_corrupted("HNSW predicate scan mmap offset overflow")
@@ -429,6 +573,8 @@ impl HnswArtifactBacking {
                         "HNSW predicate scan range exceeds mmap backing",
                     ));
                 },
+                integrity,
+                offset,
             ),
         }
     }
@@ -440,6 +586,8 @@ pub struct HnswIndex {
     pub graph: GraphLayers,
     pub vector_storage: Arc<dyn VectorStorage>,
     pub(crate) predicate_scan: Option<PredicateScanLayout>,
+    persisted_statistics: Option<HnswIndexStatistics>,
+    _artifact_integrity: Option<Arc<ArtifactIntegrity>>,
     single_telemetry: Mutex<SearchTelemetry>,
     batch_telemetry: Mutex<HnswBatchTelemetry>,
 }
@@ -475,6 +623,33 @@ struct BuiltPredicateGraph {
 }
 
 impl HnswIndex {
+    pub(crate) fn persisted_statistics(&self) -> Option<&HnswIndexStatistics> {
+        self.persisted_statistics.as_ref()
+    }
+
+    /// Read the statistics embedded in a newly serialized HNSW artifact.
+    ///
+    /// The integrity table follows the statistics trailer in artifact v9, so
+    /// generic "trailer at end of buffer" parsing is no longer valid. Writers
+    /// use the artifact's authenticated fixed header to find the protected
+    /// payload boundary instead of duplicating the envelope layout.
+    pub(crate) fn serialized_statistics(data: &[u8]) -> Result<HnswIndexStatistics> {
+        let header = current_artifact_header(data)?;
+        let integrity_offset = usize::try_from(u64::from_le_bytes(
+            header[HNSW_INTEGRITY_OFFSET_FIELD..HNSW_INTEGRITY_OFFSET_FIELD + 8]
+                .try_into()
+                .expect("integrity offset width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW integrity offset exceeds usize"))?;
+        let payload = data.get(..integrity_offset).ok_or_else(|| {
+            error::data_corrupted("HNSW statistics boundary exceeds artifact length")
+        })?;
+        let (statistics, _) = split_stats_trailer(payload);
+        HnswIndexStatistics::from_bytes(statistics.ok_or_else(|| {
+            error::data_corrupted("HNSW artifact is missing its statistics trailer")
+        })?)
+    }
+
     pub fn try_new(
         build_contract: HnswBuildContract,
         graph: GraphLayers,
@@ -497,6 +672,8 @@ impl HnswIndex {
             graph,
             vector_storage,
             predicate_scan,
+            persisted_statistics: None,
+            _artifact_integrity: None,
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
         };
@@ -797,7 +974,7 @@ impl HnswIndex {
                 )?;
                 for (local_point, &global_point) in point_ids.iter().enumerate() {
                     let local_point = local_point as PointOffset;
-                    let levels = local.graph.links.num_levels(local_point);
+                    let levels = local.graph.links.num_levels(local_point)?;
                     let global_levels = &mut merged[global_point as usize];
                     if global_levels.len() < levels {
                         global_levels.resize_with(levels, Vec::new);
@@ -808,7 +985,7 @@ impl HnswIndex {
                             .links
                             .for_each_link(local_point, level, |local_neighbor| {
                                 global_links.push(point_ids[local_neighbor as usize]);
-                            });
+                            })?;
                     }
                 }
                 for entry in &local.graph.entry_points.entry_points {
@@ -857,7 +1034,7 @@ impl HnswIndex {
                         links.push(neighbor);
                         added += 1;
                     }
-                });
+                })?;
             }
         }
 
@@ -1091,6 +1268,9 @@ impl HnswIndex {
                 .map_err(|_| error::out_of_range("HNSW predicate scan length exceeds u64"))?
                 .to_le_bytes(),
         );
+        // Filled after the complete protected payload and its integrity table
+        // have been serialized.
+        data.extend_from_slice(&[0; 32]);
         debug_assert_eq!(data.len(), HNSW_ARTIFACT_HEADER_LEN);
 
         if let Some(norms) = norms {
@@ -1116,8 +1296,30 @@ impl HnswIndex {
         }
 
         // Append statistics trailer.
-        let stats = HnswIndexStatistics::collect(self);
+        let stats = HnswIndexStatistics::collect(self)?;
         append_stats_trailer(&mut data, &stats.to_bytes())?;
+
+        let integrity = append_integrity_table(&mut data, HNSW_ARTIFACT_HEADER_LEN)?;
+        data[HNSW_INTEGRITY_OFFSET_FIELD..HNSW_INTEGRITY_OFFSET_FIELD + 8].copy_from_slice(
+            &u64::try_from(integrity.offset)
+                .map_err(|_| error::out_of_range("HNSW integrity offset exceeds u64"))?
+                .to_le_bytes(),
+        );
+        data[HNSW_INTEGRITY_LEN_FIELD..HNSW_INTEGRITY_LEN_FIELD + 8].copy_from_slice(
+            &u64::try_from(integrity.len)
+                .map_err(|_| error::out_of_range("HNSW integrity length exceeds u64"))?
+                .to_le_bytes(),
+        );
+        data[HNSW_ARTIFACT_LEN_FIELD..HNSW_ARTIFACT_LEN_FIELD + 8].copy_from_slice(
+            &u64::try_from(integrity.artifact_len)
+                .map_err(|_| error::out_of_range("HNSW artifact length exceeds u64"))?
+                .to_le_bytes(),
+        );
+        data[HNSW_INTEGRITY_CHECKSUM_FIELD..HNSW_INTEGRITY_CHECKSUM_FIELD + 4]
+            .copy_from_slice(&integrity.checksum.to_le_bytes());
+        let header_checksum = crc32c::crc32c(&data[..HNSW_HEADER_CHECKSUM_FIELD]);
+        data[HNSW_HEADER_CHECKSUM_FIELD..HNSW_HEADER_CHECKSUM_FIELD + 4]
+            .copy_from_slice(&header_checksum.to_le_bytes());
 
         Ok(data)
     }
@@ -1164,28 +1366,13 @@ impl HnswIndex {
         vector_storage: Arc<dyn VectorStorage>,
     ) -> Result<Self> {
         let data = backing.as_bytes();
-        match hnsw_artifact_compatibility(data)? {
-            HnswArtifactCompatibility::Current => {}
-            compatibility => {
-                return Err(error::artifact_not_ready(
-                    compatibility
-                        .rebuild_reason()
-                        .expect("non-current compatibility has a reason"),
-                ))
-            }
-        }
-
-        let mut offset = 8;
-        let header_len = u32::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 4, "header length")?
+        let header = current_artifact_header(data)?;
+        let expected_header_checksum = u32::from_le_bytes(
+            header[HNSW_HEADER_CHECKSUM_FIELD..HNSW_HEADER_CHECKSUM_FIELD + 4]
                 .try_into()
-                .expect("u32 width"),
-        ) as usize;
-        if header_len != HNSW_ARTIFACT_HEADER_LEN {
-            return Err(error::data_corrupted(format!(
-                "invalid HNSW artifact header length {header_len}, expected {HNSW_ARTIFACT_HEADER_LEN}"
-            )));
-        }
+                .expect("header checksum width"),
+        );
+        let (build_contract, mut offset) = decode_build_contract(header)?;
         let read_u32 = |data: &[u8], offset: &mut usize, field| -> Result<u32> {
             Ok(u32::from_le_bytes(
                 take_artifact_bytes(data, offset, 4, field)?
@@ -1193,53 +1380,22 @@ impl HnswIndex {
                     .expect("u32 width"),
             ))
         };
-        let mut build_contract = HnswBuildContract {
-            version: read_u32(data, &mut offset, "build contract version")?,
-            m: read_u32(data, &mut offset, "m")?,
-            m0: read_u32(data, &mut offset, "m0")?,
-            ef_construct: read_u32(data, &mut offset, "ef_construct")?,
-            distance: {
-                let tag = take_artifact_bytes(data, &mut offset, 1, "distance")?[0];
-                DistanceMetric::from_u8(tag).ok_or_else(|| {
-                    error::data_corrupted(format!("unknown HNSW distance tag {tag}"))
-                })?
-            },
-            build_seed: {
-                let padding = take_artifact_bytes(data, &mut offset, 3, "distance padding")?;
-                if padding != [0, 0, 0] {
-                    return Err(error::data_corrupted("HNSW distance padding must be zero"));
-                }
-                u64::from_le_bytes(
-                    take_artifact_bytes(data, &mut offset, 8, "build seed")?
-                        .try_into()
-                        .expect("u64 width"),
-                )
-            },
-            proposal_wave_size: read_u32(data, &mut offset, "proposal wave size")?,
-            warmup_point_count: read_u32(data, &mut offset, "warm-up point count")?,
-            filter_topology: Default::default(),
-        };
         let norm_count = usize::try_from(u64::from_le_bytes(
-            take_artifact_bytes(data, &mut offset, 8, "inverse norm count")?
+            header[HNSW_NORM_COUNT_FIELD..HNSW_NORM_COUNT_FIELD + 8]
                 .try_into()
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW inverse norm count exceeds usize"))?;
-        let primary_count = read_u32(data, &mut offset, "primary entry point count")? as usize;
-        let extra_count = read_u32(data, &mut offset, "extra entry point count")? as usize;
-        let filter_version = read_u32(data, &mut offset, "filter-topology version")?;
-        let filter_column_count = read_u32(data, &mut offset, "filter column count")?;
-        let mut filter_column_ids = [0; super::MAX_HNSW_FILTER_COLUMNS];
-        for column_id in &mut filter_column_ids {
-            *column_id = read_u32(data, &mut offset, "filter column id")?;
-        }
-        build_contract.filter_topology = HnswFilterTopologyContract {
-            version: filter_version,
-            column_count: filter_column_count,
-            column_ids: filter_column_ids,
-            target_block_rows: read_u32(data, &mut offset, "filter block rows")?,
-            m: read_u32(data, &mut offset, "filter m")?,
-        };
+        let primary_count = u32::from_le_bytes(
+            header[HNSW_PRIMARY_COUNT_FIELD..HNSW_PRIMARY_COUNT_FIELD + 4]
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
+        let extra_count = u32::from_le_bytes(
+            header[HNSW_EXTRA_COUNT_FIELD..HNSW_EXTRA_COUNT_FIELD + 4]
+                .try_into()
+                .expect("u32 width"),
+        ) as usize;
         let base_graph_len = usize::try_from(u64::from_le_bytes(
             take_artifact_bytes(data, &mut offset, 8, "base graph length")?
                 .try_into()
@@ -1264,7 +1420,41 @@ impl HnswIndex {
                 .expect("u64 width"),
         ))
         .map_err(|_| error::data_corrupted("HNSW predicate scan length exceeds usize"))?;
+        let integrity_offset = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "integrity table offset")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW integrity offset exceeds usize"))?;
+        let integrity_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "integrity table length")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW integrity length exceeds usize"))?;
+        let artifact_len = usize::try_from(u64::from_le_bytes(
+            take_artifact_bytes(data, &mut offset, 8, "artifact length")?
+                .try_into()
+                .expect("u64 width"),
+        ))
+        .map_err(|_| error::data_corrupted("HNSW artifact length exceeds usize"))?;
+        let integrity_checksum = read_u32(data, &mut offset, "integrity table checksum")?;
+        let header_checksum = read_u32(data, &mut offset, "header checksum")?;
+        if header_checksum != expected_header_checksum {
+            return Err(error::data_corrupted(
+                "HNSW header checksum field changed while decoding",
+            ));
+        }
         debug_assert_eq!(offset, HNSW_ARTIFACT_HEADER_LEN);
+        let integrity = ArtifactIntegrity::open(
+            backing.integrity_backing(),
+            IntegrityDescriptor {
+                offset: integrity_offset,
+                len: integrity_len,
+                checksum: integrity_checksum,
+                artifact_len,
+            },
+        )?;
         build_contract.validate()?;
         if build_contract.filter_topology.is_enabled() != (predicate_graph_len != 0) {
             return Err(error::data_corrupted(
@@ -1285,6 +1475,21 @@ impl HnswIndex {
         let norm_bytes = norm_count
             .checked_mul(std::mem::size_of::<f32>())
             .ok_or_else(|| error::data_corrupted("HNSW inverse norm byte length overflow"))?;
+        let entry_bytes = primary_count
+            .checked_add(extra_count)
+            .and_then(|count| count.checked_mul(2 * std::mem::size_of::<u32>()))
+            .and_then(|bytes| {
+                predicate_entry_count
+                    .checked_mul(3 * std::mem::size_of::<u32>())
+                    .and_then(|predicate_bytes| bytes.checked_add(predicate_bytes))
+            })
+            .ok_or_else(|| error::data_corrupted("HNSW entry metadata length overflow"))?;
+        integrity.verify_range(
+            HNSW_ARTIFACT_HEADER_LEN,
+            norm_bytes
+                .checked_add(entry_bytes)
+                .ok_or_else(|| error::data_corrupted("HNSW metadata length overflow"))?,
+        )?;
         let norm_start = offset;
         take_artifact_bytes(data, &mut offset, norm_bytes, "inverse norms")?;
         let inverse_norms = backing.inverse_norms(norm_start, norm_bytes)?;
@@ -1319,7 +1524,8 @@ impl HnswIndex {
         let predicate_scan = if predicate_scan_len == 0 {
             None
         } else {
-            let layout = backing.predicate_scan(offset, predicate_scan_len)?;
+            let layout =
+                backing.predicate_scan(offset, predicate_scan_len, Arc::clone(&integrity))?;
             offset = offset
                 .checked_add(predicate_scan_len)
                 .ok_or_else(|| error::data_corrupted("HNSW predicate scan offset overflow"))?;
@@ -1328,15 +1534,39 @@ impl HnswIndex {
 
         // Deserialize base and predicate-local graph links from exact envelope
         // ranges. Statistics bytes are never exposed to either graph parser.
-        let links = backing.graph_links(offset, base_graph_len)?;
+        let links = backing.graph_links(offset, base_graph_len, Arc::clone(&integrity))?;
         offset = offset
             .checked_add(base_graph_len)
             .ok_or_else(|| error::data_corrupted("HNSW base graph offset overflow"))?;
         let predicate_links = if predicate_graph_len == 0 {
             None
         } else {
-            Some(backing.graph_links(offset, predicate_graph_len)?)
+            let links = backing.graph_links(offset, predicate_graph_len, Arc::clone(&integrity))?;
+            offset = offset
+                .checked_add(predicate_graph_len)
+                .ok_or_else(|| error::data_corrupted("HNSW predicate graph offset overflow"))?;
+            Some(links)
         };
+
+        if integrity_offset < 8 {
+            return Err(error::data_corrupted(
+                "HNSW integrity table leaves no statistics trailer",
+            ));
+        }
+        integrity.verify_range(integrity_offset - 8, 8)?;
+        let (statistics_bytes, graph_payload) = split_stats_trailer(&data[..integrity_offset]);
+        let statistics_bytes = statistics_bytes.ok_or_else(|| {
+            error::data_corrupted("HNSW artifact is missing its statistics trailer")
+        })?;
+        if graph_payload.len() != offset {
+            return Err(error::data_corrupted(format!(
+                "HNSW payload length mismatch: graph ends at {offset}, statistics begin at {}",
+                graph_payload.len()
+            )));
+        }
+        let statistics_start = graph_payload.len();
+        integrity.verify_range(statistics_start, integrity_offset - statistics_start)?;
+        let persisted_statistics = HnswIndexStatistics::from_bytes(statistics_bytes)?;
 
         let graph = match predicate_links {
             Some(predicate_links) => GraphLayers::new_with_predicate_links(
@@ -1355,7 +1585,15 @@ impl HnswIndex {
             ),
         };
 
-        Self::try_new_with_predicate_scan(build_contract, graph, vector_storage, predicate_scan)
+        let mut index = Self::try_new_with_predicate_scan(
+            build_contract,
+            graph,
+            vector_storage,
+            predicate_scan,
+        )?;
+        index.persisted_statistics = Some(persisted_statistics);
+        index._artifact_integrity = Some(integrity);
+        Ok(index)
     }
 
     /// Perform a vector search under the caller's active query policy.
@@ -1792,7 +2030,7 @@ impl HnswIndex {
                     self.vector_storage.num_vectors()
                 )));
             }
-            if entry.level >= self.graph.links.num_levels(entry.point_id) {
+            if entry.level >= self.graph.links.num_levels(entry.point_id)? {
                 return Err(error::data_corrupted(format!(
                     "HNSW entry point {} level {} exceeds its graph levels",
                     entry.point_id, entry.level
@@ -1846,7 +2084,7 @@ impl HnswIndex {
                     self.vector_storage.num_vectors()
                 )));
             }
-            if entry.level >= predicate_links.num_levels(entry.point_id) {
+            if entry.level >= predicate_links.num_levels(entry.point_id)? {
                 return Err(error::data_corrupted(format!(
                     "HNSW predicate entry point {} level {} exceeds its graph levels",
                     entry.point_id, entry.level
@@ -2422,7 +2660,8 @@ mod tests {
             index
                 .graph
                 .links
-                .for_each_link(point_id, 0, |neighbor| neighbors.push(neighbor));
+                .for_each_link(point_id, 0, |neighbor| neighbors.push(neighbor))
+                .unwrap();
 
             for (candidate_pos, &candidate) in neighbors.iter().enumerate() {
                 total += 1;
@@ -2696,7 +2935,7 @@ mod tests {
                     .graph
                     .predicate_links
                     .as_ref()
-                    .is_some_and(|links| entry.level < links.num_levels(entry.point_id))
+                    .is_some_and(|links| entry.level < links.num_levels(entry.point_id).unwrap())
         }));
 
         let artifact = index.serialize().unwrap();

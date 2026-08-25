@@ -18,6 +18,7 @@ use paro_common::error::{self as paro_error, Result};
 
 use crate::index::ExactOrdinalPosting;
 
+use super::artifact_integrity::ArtifactIntegrity;
 use super::PointOffset;
 
 const PREDICATE_SCAN_MAGIC: [u8; 4] = *b"HPSC";
@@ -119,7 +120,27 @@ pub struct PredicateScanLayout {
     point_count: usize,
     columns: Box<[PredicateScanColumn]>,
     backing: Option<PredicateScanBacking>,
+    integrity: Option<PredicateIntegrityRange>,
     serialized_len: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PredicateIntegrityRange {
+    verifier: Arc<ArtifactIntegrity>,
+    artifact_offset: usize,
+}
+
+impl PredicateIntegrityRange {
+    fn verify(&self, local_offset: usize, len: usize) -> Result<()> {
+        self.verifier.verify_range(
+            self.artifact_offset
+                .checked_add(local_offset)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted("predicate scan integrity range overflow")
+                })?,
+            len,
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -411,6 +432,7 @@ impl PredicateScanLayout {
             point_count,
             columns: built_columns.into_boxed_slice(),
             backing: None,
+            integrity: None,
             serialized_len,
         })
     }
@@ -546,6 +568,10 @@ impl PredicateScanLayout {
                 let vector_bytes = bytes.get(*vectors_offset..vectors_end).ok_or_else(|| {
                     paro_error::data_corrupted("predicate scan vector range exceeds backing")
                 })?;
+                if let Some(integrity) = &self.integrity {
+                    integrity.verify(*row_ids_offset, row_ids_end - *row_ids_offset)?;
+                    integrity.verify(*vectors_offset, vectors_end - *vectors_offset)?;
+                }
                 #[cfg(target_endian = "little")]
                 {
                     let row_ids = bytemuck::try_cast_slice(row_bytes).map_err(|_| {
@@ -665,8 +691,23 @@ impl PredicateScanLayout {
         Ok(data)
     }
 
+    #[cfg(test)]
     pub(crate) fn deserialize_bytes(bytes: Bytes) -> Result<Self> {
-        Self::deserialize_backing(PredicateScanBacking::Bytes(bytes))
+        Self::deserialize_backing(PredicateScanBacking::Bytes(bytes), None)
+    }
+
+    pub(crate) fn deserialize_bytes_with_integrity(
+        bytes: Bytes,
+        verifier: Arc<ArtifactIntegrity>,
+        artifact_offset: usize,
+    ) -> Result<Self> {
+        Self::deserialize_backing(
+            PredicateScanBacking::Bytes(bytes),
+            Some(PredicateIntegrityRange {
+                verifier,
+                artifact_offset,
+            }),
+        )
     }
 
     pub(crate) fn deserialize_mmap_range(
@@ -682,7 +723,31 @@ impl PredicateScanLayout {
                 "predicate scan mmap range exceeds backing",
             ));
         }
-        Self::deserialize_backing(PredicateScanBacking::Mmap { mmap, offset, len })
+        Self::deserialize_backing(PredicateScanBacking::Mmap { mmap, offset, len }, None)
+    }
+
+    pub(crate) fn deserialize_mmap_range_with_integrity(
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+        verifier: Arc<ArtifactIntegrity>,
+        artifact_offset: usize,
+    ) -> Result<Self> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| paro_error::data_corrupted("predicate scan mmap range overflow"))?;
+        if end > mmap.len() {
+            return Err(paro_error::data_corrupted(
+                "predicate scan mmap range exceeds backing",
+            ));
+        }
+        Self::deserialize_backing(
+            PredicateScanBacking::Mmap { mmap, offset, len },
+            Some(PredicateIntegrityRange {
+                verifier,
+                artifact_offset,
+            }),
+        )
     }
 
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
@@ -696,8 +761,14 @@ impl PredicateScanLayout {
         Self::deserialize_mmap_range(mmap, 0, len)
     }
 
-    fn deserialize_backing(backing: PredicateScanBacking) -> Result<Self> {
+    fn deserialize_backing(
+        backing: PredicateScanBacking,
+        integrity: Option<PredicateIntegrityRange>,
+    ) -> Result<Self> {
         let bytes = backing.as_bytes();
+        if let Some(integrity) = &integrity {
+            integrity.verify(0, PREDICATE_SCAN_HEADER_LEN)?;
+        }
         if bytes.len() < PREDICATE_SCAN_HEADER_LEN || bytes[0..4] != PREDICATE_SCAN_MAGIC {
             return Err(paro_error::data_corrupted(
                 "predicate scan artifact has an invalid header",
@@ -746,6 +817,9 @@ impl PredicateScanLayout {
             return Err(paro_error::data_corrupted(
                 "predicate scan artifact lengths are inconsistent",
             ));
+        }
+        if let Some(integrity) = &integrity {
+            integrity.verify(0, metadata_len)?;
         }
         let mut cursor = PREDICATE_SCAN_HEADER_LEN;
         let mut payload_cursor = metadata_len;
@@ -931,6 +1005,7 @@ impl PredicateScanLayout {
             point_count,
             columns: columns.into_boxed_slice(),
             backing: Some(backing),
+            integrity,
             serialized_len,
         })
     }

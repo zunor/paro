@@ -31,7 +31,7 @@
 use crate::codec::physical_layout::fixed_row_width;
 use crate::index::hnsw::{
     HnswBuildContract, HnswBuildStopCheck, HnswBuilder, HnswFilterBlocks, InMemoryVectorStorage,
-    VectorStorage,
+    VectorStorage, HNSW_ARTIFACT_ALIGNMENT,
 };
 use crate::index::{
     BitmapIndexWriter, BloomFilterIndexWriter, BloomFilterOptions, OrderedBitmapBlock,
@@ -1559,20 +1559,21 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             hnsw_builder.build(Arc::new(storage), build_contract)?
         };
 
-        let statistics = HnswIndexStatistics::collect(&index);
+        let statistics = HnswIndexStatistics::collect(&index)?;
         let index_data = index.serialize()?;
         let footer = PageFooter::Index(IndexPageFooter {
             num_entries: index.graph.links.num_points() as u32,
             page_type: IndexPageType::Leaf,
         });
 
-        let codec_ref = self.codec.as_deref();
-        let ptr = PageIO::compress_and_write_page(
-            codec_ref,
-            self.opts.min_space_saving,
+        // The artifact contains typed mmap regions whose relative alignment is
+        // guaranteed by its encoder. Preserve that alignment in the segment
+        // and keep the envelope plain so its bytes remain directly addressable.
+        let ptr = PageIO::write_mmap_page(
             &mut self.writer,
             &index_data,
             &footer,
+            HNSW_ARTIFACT_ALIGNMENT,
         )?;
 
         Ok(Some((ptr, statistics)))

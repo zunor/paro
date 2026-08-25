@@ -2157,7 +2157,7 @@ fn art_index_build_and_remove_tracks_visible_segments() {
         .all(|(_, segment)| segment.art_index(0).is_some()));
     assert!(after_build
         .iter()
-        .all(|(_, segment)| segment.bitmap_index(0).is_some()));
+        .all(|(_, segment)| segment.bitmap_index(0).is_none()));
 
     table.release_art_index("test_idx", 0).unwrap();
     assert!(table.declared_art_columns().is_empty());
@@ -2170,6 +2170,38 @@ fn art_index_build_and_remove_tracks_visible_segments() {
     assert!(after_remove
         .iter()
         .all(|(_, segment)| segment.bitmap_index(0).is_none()));
+}
+
+#[test]
+fn declared_scalar_index_selects_one_dense_posting_representation() {
+    let table = create_table(&[LogicalType::Integer]);
+    let values = (0..128).map(|value| value % 2).collect::<Vec<i32>>();
+    table
+        .append(&test_chunk_from_vectors(vec![test_i32_vector(&values)]))
+        .unwrap();
+
+    table.install_art_index("dense_idx", 0).unwrap();
+    let segments = table.collect_segments(table.max_version()).unwrap();
+    assert!(segments
+        .iter()
+        .all(|(_, segment)| segment.art_index(0).is_none()));
+    assert!(segments
+        .iter()
+        .all(|(_, segment)| segment.bitmap_index(0).is_some()));
+
+    for (_, segment) in segments {
+        let result = segment
+            .bitmap_index(0)
+            .unwrap()
+            .evaluate_predicate(&Predicate::Eq {
+                column_id: 0,
+                value: Value::Integer(1),
+            });
+        let PredicateResult::Bitmap(rows) = result else {
+            panic!("dense scalar access path must return an exact posting bitmap");
+        };
+        assert_eq!(rows.len(), segment.num_rows() / 2);
+    }
 }
 
 #[test]

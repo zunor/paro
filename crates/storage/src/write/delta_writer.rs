@@ -443,12 +443,18 @@ impl DeltaWriter {
         Ok(())
     }
 
-    pub(crate) fn estimated_peak_memory_bytes(&self) -> u64 {
+    /// Bytes retained by transaction-owned mutable input.
+    ///
+    /// HNSW seal/build memory is deliberately absent: the active segment's
+    /// `AdmissionLease` has already reserved that future peak process-wide.
+    /// Charging the same reservation to this transaction's spill waterline
+    /// would convert a transient build estimate into durable graph boundaries.
+    pub(crate) fn retained_memory_bytes(&self) -> u64 {
         let memtable_bytes = self.memtable.stats().bytes as u64;
         let segment_bytes = self
             .rowset_writer
             .as_ref()
-            .map_or(0, RowsetWriter::estimated_peak_memory_bytes);
+            .map_or(0, RowsetWriter::retained_input_bytes);
         memtable_bytes.saturating_add(segment_bytes)
     }
 

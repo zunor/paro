@@ -90,8 +90,9 @@ pub use request::{
     ProjectionSpec, SearchIntent, SearchRequestMode, SparseIntent,
 };
 pub use sidecar::{
-    SidecarArtifactStore, SidecarCachedArtifact, SidecarMappedPackage, SidecarPackageWriter,
-    SidecarReaderCache, SidecarReaderCacheKey, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    DecodedSidecarArtifactKey, SearchReaderRuntime, SidecarArtifactStore, SidecarCachedArtifact,
+    SidecarIntegrityPolicy, SidecarMappedPackage, SidecarPackageWriter, SidecarReaderCache,
+    SidecarReaderCacheKey, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
 pub use stats::{
     BuildEpoch, BuildWatermarks, CatchUpBacklogTier, ConfigFingerprint, ExecutionModes,

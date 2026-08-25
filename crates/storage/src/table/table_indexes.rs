@@ -177,6 +177,13 @@ impl TableHandle {
         self.search_registry.generation_coverage(definition_id)
     }
 
+    pub fn materialize_search_generation(
+        &self,
+        definition_id: u64,
+    ) -> Result<SearchGenerationCoverage> {
+        self.search_registry.materialize_definition(definition_id)
+    }
+
     pub fn bootstrap_search_generations(&self) -> Result<SearchBootstrapReport> {
         self.search_registry.bootstrap_migration()
     }

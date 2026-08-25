@@ -15,6 +15,7 @@ use super::vector_storage::VectorStorage;
 use super::visited_pool::VisitedPool;
 use super::DistanceMetric;
 use parking_lot::RwLock;
+use paro_common::error::Result;
 
 type LockedLinkContainer = RwLock<LinksContainer>;
 type LockedLayersContainer = Vec<LockedLinkContainer>;
@@ -56,19 +57,19 @@ impl<'a> GraphLayersHealer<'a> {
         graph_layers: &GraphLayers,
         old_to_new: &'a [Option<PointOffset>],
         ef_construct: usize,
-    ) -> Self {
+    ) -> Result<Self> {
         let mut to_heal = Vec::new();
         let mut links_layers = Vec::with_capacity(graph_layers.links.num_points());
 
         for point_idx in 0..graph_layers.links.num_points() {
             let point_id = point_idx as PointOffset;
-            let num_levels = graph_layers.links.num_levels(point_id);
+            let num_levels = graph_layers.links.num_levels(point_id)?;
             let mut point_layers = Vec::with_capacity(num_levels);
 
             for level in 0..num_levels {
                 let level_m = graph_layers.hnsw_m.get_m(level);
                 let mut container = LinksContainer::with_capacity(level_m);
-                if let Some(level_links) = graph_layers.links.links_on_level(point_id, level) {
+                if let Some(level_links) = graph_layers.links.links_on_level(point_id, level)? {
                     container.fill_from(level_links.iter().copied().take(level_m));
                 }
 
@@ -90,14 +91,14 @@ impl<'a> GraphLayersHealer<'a> {
             links_layers.push(point_layers);
         }
 
-        Self {
+        Ok(Self {
             links_layers,
             to_heal,
             old_to_new,
             hnsw_m: graph_layers.hnsw_m,
             ef_construct,
             visited_pool: VisitedPool::new(),
-        }
+        })
     }
 
     fn point_deleted(&self, point: PointOffset) -> bool {
@@ -432,12 +433,16 @@ mod tests {
 
         let mut adjacency = vec![Vec::<usize>::new(); n];
         for point_id in 0..n as PointOffset {
-            index.graph.links.for_each_link(point_id, 0, |neighbor| {
-                let a = point_id as usize;
-                let b = neighbor as usize;
-                adjacency[a].push(b);
-                adjacency[b].push(a);
-            });
+            index
+                .graph
+                .links
+                .for_each_link(point_id, 0, |neighbor| {
+                    let a = point_id as usize;
+                    let b = neighbor as usize;
+                    adjacency[a].push(b);
+                    adjacency[b].push(a);
+                })
+                .unwrap();
         }
 
         let mut visited = vec![false; n];
@@ -516,7 +521,7 @@ mod tests {
                 .collect::<Vec<_>>();
             let survivor_levels = survivors_old
                 .iter()
-                .map(|&old_idx| base_index.graph.links.point_level(old_idx))
+                .map(|&old_idx| base_index.graph.links.point_level(old_idx).unwrap())
                 .collect::<Vec<_>>();
             let survivor_queries = make_sift_like_queries(seed + 1000, &survivor_vectors, 64, 0.02);
 
@@ -527,11 +532,15 @@ mod tests {
                 GraphLayersBuilder::new_with_heuristic(survivor_vectors.len(), &config, true);
             for &old_idx in &survivors_old {
                 let new_idx = old_to_new[old_idx as usize].expect("survivor must be remapped");
-                healed_builder.set_levels(new_idx, base_index.graph.links.point_level(old_idx));
+                healed_builder.set_levels(
+                    new_idx,
+                    base_index.graph.links.point_level(old_idx).unwrap(),
+                );
             }
 
             let mut healer =
-                GraphLayersHealer::new(&base_index.graph, &old_to_new, config.ef_construct);
+                GraphLayersHealer::new(&base_index.graph, &old_to_new, config.ef_construct)
+                    .unwrap();
             assert!(
                 healer.pending_count() > 0,
                 "expected non-empty repair set for delete ratio {ratio}"

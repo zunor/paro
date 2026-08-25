@@ -105,8 +105,11 @@ pub struct EvictionResult {
 pub struct BufferPool {
     /// Maximum memory limit in bytes
     max_memory: AtomicUsize,
-    /// Serializes memory limit updates.
-    limit_lock: Mutex<()>,
+    /// Serializes physical admission, reload, and memory-limit changes. The
+    /// limit check and resident-byte publication must be one operation: a
+    /// check-then-fetch_add sequence lets parallel cold-page loads all observe
+    /// the same headroom and oversubscribe the process-wide ceiling.
+    admission_lock: Mutex<()>,
     /// Current memory usage in bytes
     used_memory: AtomicUsize,
     /// Next block ID to assign
@@ -169,7 +172,7 @@ impl BufferPool {
 
         Self {
             max_memory: AtomicUsize::new(max_memory),
-            limit_lock: Mutex::new(()),
+            admission_lock: Mutex::new(()),
             used_memory: AtomicUsize::new(0),
             next_block_id: AtomicI64::new(1),
             blocks: RwLock::new(HashMap::new()),
@@ -396,7 +399,7 @@ impl BufferPool {
     ///
     /// Follows an "evict + set + verify + rollback" pattern.
     pub fn set_memory_limit(&self, limit: usize) -> Result<()> {
-        let _limit_guard = self.limit_lock.lock().unwrap();
+        let _admission_guard = self.admission_lock.lock().unwrap();
 
         if limit != 0 {
             let precheck = self.evict_blocks(MemoryTag::Extension, 0, limit, None);
@@ -659,10 +662,11 @@ impl BufferPool {
         can_destroy: bool,
     ) -> Result<BufferHandle> {
         let size = if size == 0 { DEFAULT_BLOCK_SIZE } else { size };
+        let _admission_guard = self.admission_lock.lock().unwrap();
 
         // Check memory limit and try eviction if needed
         // EvictBlocksOrThrow is called before allocation
-        self.ensure_memory_available(size)?;
+        self.ensure_memory_available(tag, size)?;
 
         // Generate new block ID
         let block_id = self.next_block_id.fetch_add(1, Ordering::Relaxed);
@@ -737,7 +741,16 @@ impl BufferPool {
             return Ok(BufferHandle::with_pool(block, pool_weak));
         }
 
-        // Slow path: block needs to be loaded
+        // Slow-path admission and publication are serialized with new block
+        // allocation and memory-limit changes.
+        let _admission_guard = self.admission_lock.lock().unwrap();
+        if block.is_loaded() {
+            block.pin();
+            block.set_lru_timestamp(current_timestamp_ms());
+            self.stats.pins.fetch_add(1, Ordering::Relaxed);
+            let pool_weak = self.weak_self.read().unwrap().clone();
+            return Ok(BufferHandle::with_pool(block, pool_weak));
+        }
 
         // Get required memory for loading
         let required_memory = block.size();
@@ -1087,7 +1100,7 @@ impl BufferPool {
     ///
     /// # Returns
     /// Ok(()) if memory is available or eviction succeeded, Err otherwise
-    fn ensure_memory_available(&self, required: usize) -> Result<()> {
+    fn ensure_memory_available(&self, tag: MemoryTag, required: usize) -> Result<()> {
         let max_memory = self.max_memory();
         if max_memory == 0 {
             return Ok(()); // Unlimited memory
@@ -1118,8 +1131,12 @@ impl BufferPool {
 
         // Eviction failed or didn't free enough memory
         Err(paro_error::out_of_memory(format!(
-            "Failed to allocate {} bytes (used: {}/{}, need to free: {})",
-            required, current_used, max_memory, memory_to_free
+            "Failed to allocate {} bytes for {} (used: {}/{}, need to free: {})",
+            required,
+            tag.name(),
+            current_used,
+            max_memory,
+            memory_to_free
         )))
     }
 

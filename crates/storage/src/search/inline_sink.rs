@@ -613,6 +613,34 @@ impl HnswInlineThreshold {
             .saturating_add(build_frontier)
     }
 
+    /// Complete runtime peak for one durable HNSW build contract.
+    ///
+    /// Admission and write-buffer pressure relief must call this shared
+    /// function. Reconstructing only the base-graph estimate at either call
+    /// site silently drops metric preprocessing and predicate-topology state.
+    pub fn estimate_contract_build_peak_memory_bytes(
+        vector_count: u64,
+        dimension: u32,
+        contract: &crate::index::hnsw::HnswBuildContract,
+        build_width: usize,
+    ) -> u64 {
+        let metric_preprocessing_bytes =
+            if contract.distance == crate::index::hnsw::DistanceMetric::Cosine {
+                vector_count.saturating_mul(std::mem::size_of::<f32>() as u64)
+            } else {
+                0
+            };
+        Self::estimate_build_peak_memory_bytes(vector_count, dimension, contract.m, build_width)
+            .saturating_add(Self::estimate_filter_build_peak_memory_bytes(
+                vector_count,
+                dimension,
+                contract.filter_topology.columns().len(),
+                contract.filter_topology.m,
+                build_width,
+            ))
+            .saturating_add(metric_preprocessing_bytes)
+    }
+
     fn estimate_filter_build_peak_memory_bytes(
         vector_count: u64,
         dimension: u32,
@@ -715,22 +743,12 @@ impl HnswInlineBuildEstimate {
                 ))
                 .saturating_add(metric_preprocessing_bytes);
         let estimated_build_peak_memory_bytes =
-            HnswInlineThreshold::estimate_build_peak_memory_bytes(
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
                 vector_count,
                 dimension,
-                config.m,
+                &config.build_contract(),
                 crate::index::hnsw::hnsw_build_thread_count(),
-            )
-            .saturating_add(
-                HnswInlineThreshold::estimate_filter_build_peak_memory_bytes(
-                    vector_count,
-                    dimension,
-                    config.filter_columns.len(),
-                    config.filter_m,
-                    crate::index::hnsw::hnsw_build_thread_count(),
-                ),
-            )
-            .saturating_add(metric_preprocessing_bytes);
+            );
         Ok(Some(Self {
             vector_count,
             dimension,
@@ -897,6 +915,9 @@ mod tests {
                 "build_seed": 1,
                 "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
+                "filter_columns": [],
+                "filter_block_rows": crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                "filter_m": crate::search::DEFAULT_HNSW_FILTER_M,
                 "inline_threshold": {
                     "enabled": true,
                     "max_vector_count": 128,
@@ -923,6 +944,32 @@ mod tests {
             .expect("hnsw estimate");
         assert_eq!(estimate.threshold, threshold);
         assert!(!estimate.allows_inline());
+        assert_eq!(
+            estimate.estimated_build_peak_memory_bytes,
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+                16,
+                4,
+                &provider.build_contract(),
+                crate::index::hnsw::hnsw_build_thread_count(),
+            )
+        );
+        let mut filtered_contract = provider.build_contract();
+        filtered_contract.filter_topology =
+            crate::index::hnsw::HnswFilterTopologyContract::from_columns(
+                &[7],
+                crate::search::DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+                crate::search::DEFAULT_HNSW_FILTER_M,
+            )
+            .unwrap();
+        assert!(
+            HnswInlineThreshold::estimate_contract_build_peak_memory_bytes(
+                16,
+                4,
+                &filtered_contract,
+                crate::index::hnsw::hnsw_build_thread_count(),
+            ) > estimate.estimated_build_peak_memory_bytes,
+            "predicate topology must be present in the shared build peak"
+        );
 
         let roomy = HnswInlineBuildEstimate {
             threshold: HnswInlineThreshold {

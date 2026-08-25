@@ -37,9 +37,9 @@ use super::segment::{
 use crate::metrics::{storage_metrics, SearchInlineBuildMetricKey};
 use crate::search::{
     AdmissionDecision, AdmissionGrant, FlushSearchMode, HnswInlineBuildEstimate,
-    HnswInlineThreshold, InlineAdmissionRequest, InlineArtifactBuildResult, MaintenanceCost,
-    SearchAdmission, SearchIndexKind, SearchInlineBuilderEntry, SearchInlineBuilderSet,
-    SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint,
+    InlineAdmissionRequest, InlineArtifactBuildResult, MaintenanceCost, SearchAdmission,
+    SearchIndexKind, SearchInlineBuilderEntry, SearchInlineBuilderSet, SegmentChunkInput,
+    SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint,
 };
 use crate::tablet::{ColumnId, TabletSchemaRef, Version};
 use paro_common::error::{self as paro_error, Result};
@@ -776,40 +776,6 @@ impl RowsetWriter {
             })
     }
 
-    /// Conservative peak for sealing the active segment, including immutable
-    /// source batches and admitted HNSW construction state. Build-time graph
-    /// memory is transient, but must be visible before a flush starts rather
-    /// than discovered after the allocator has already committed it.
-    pub fn estimated_peak_memory_bytes(&self) -> u64 {
-        let retained_input = self.retained_input_bytes();
-        let rows = self.current_segment_rows();
-        let hnsw_build_peak =
-            self.current_hnsw_indexes
-                .iter()
-                .fold(0_u64, |total, (column_id, options)| {
-                    let dimension = self
-                        .context
-                        .schema
-                        .column_by_id(*column_id)
-                        .and_then(|column| match &column.logical_type {
-                            LogicalType::Array(child, dimension)
-                                if matches!(child.as_ref(), LogicalType::Float) =>
-                            {
-                                u32::try_from(*dimension).ok()
-                            }
-                            _ => None,
-                        })
-                        .unwrap_or(0);
-                    total.saturating_add(HnswInlineThreshold::estimate_build_peak_memory_bytes(
-                        rows,
-                        dimension,
-                        options.build_contract.m,
-                        crate::index::hnsw::hnsw_build_thread_count(),
-                    ))
-                });
-        retained_input.saturating_add(hnsw_build_peak)
-    }
-
     /// Check if the writer has been finalized
     pub fn is_finalized(&self) -> bool {
         self.finalized
@@ -996,9 +962,14 @@ impl RowsetWriter {
                     self.context.schema.columns(),
                 )?;
                 let admitted_rows = initial_hnsw.map_or(row_count_estimate, |estimate| {
+                    // RowsetWriter seals only between chunks; it never splits
+                    // one logical input batch. Admission must therefore cover
+                    // at least the current indivisible chunk even when the
+                    // derived segment target is smaller.
                     self.context
                         .segment_row_limit
                         .effective(Some(estimate.max_segment_vector_count()))
+                        .max(row_count_estimate)
                 });
                 let hnsw_inline = if initial_hnsw.is_some() {
                     hnsw_inline_build_estimate(entry, admitted_rows, self.context.schema.columns())?

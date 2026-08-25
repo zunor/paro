@@ -142,6 +142,7 @@ impl TableHandle {
             generation,
             table_lease,
             generation_lease,
+            self.search_registry.reader_runtime(),
         )
         .with_derived_lag_lease(derived_lag_lease)
         .with_overlay_delete_vectors(overlay.and_then(TxnOverlayReader::delete_vectors));

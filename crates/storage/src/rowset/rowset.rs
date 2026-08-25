@@ -195,10 +195,13 @@ impl Rowset {
     /// * `segments` - Pre-created segments
     pub fn create_with_segments(
         schema: TabletSchemaRef,
-        rowset_meta: RowsetMeta,
+        mut rowset_meta: RowsetMeta,
         rowset_path: impl Into<PathBuf>,
         segments: Vec<SegmentSharedPtr>,
     ) -> Result<Self> {
+        rowset_meta.set_num_segments(u32::try_from(segments.len()).map_err(|_| {
+            paro_error::configuration_limit_exceeded("rowset segment count exceeds u32")
+        })?);
         let rowset_path = rowset_path.into();
         let initial_state = rowset_meta.rowset_state();
 
@@ -254,12 +257,63 @@ impl Rowset {
 
     /// Get number of segments
     pub fn num_segments(&self) -> u32 {
-        self.segments.read().unwrap().len() as u32
+        self.rowset_meta.read().unwrap().num_segments()
     }
 
     /// Get total disk size
     pub fn total_disk_size(&self) -> u64 {
         self.rowset_meta.read().unwrap().total_disk_size()
+    }
+
+    /// Memory retained directly by this immutable rowset handle.
+    ///
+    /// Durable segment bytes deliberately do not belong in this value. They
+    /// are already owned by the rowset directory and can be reopened lazily;
+    /// transaction memory governance is concerned with loaded structural
+    /// views and column readers that this handle keeps alive. Provider-owned
+    /// index memory has its own admission/runtime accounting.
+    pub fn retained_memory_bytes(&self) -> u64 {
+        fn segment_bytes(segments: &[SegmentSharedPtr]) -> u64 {
+            segments.iter().fold(0_u64, |total, segment| {
+                total.saturating_add(u64::try_from(segment.mem_usage()).unwrap_or(u64::MAX))
+            })
+        }
+
+        let fixed = u64::try_from(std::mem::size_of::<Self>())
+            .unwrap_or(u64::MAX)
+            .saturating_add(u64::try_from(self.rowset_path.capacity()).unwrap_or(u64::MAX));
+        let segments = self.segments.read().unwrap();
+        let base = u64::try_from(segments.capacity())
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(std::mem::size_of::<SegmentSharedPtr>()).unwrap_or(u64::MAX),
+            )
+            .saturating_add(segment_bytes(&segments));
+        drop(segments);
+
+        let views = self.segment_read_views.read().unwrap();
+        let runtime_views = views.iter().fold(0_u64, |total, view| {
+            total
+                .saturating_add(
+                    u64::try_from(std::mem::size_of::<SegmentReadView>()).unwrap_or(u64::MAX),
+                )
+                .saturating_add(
+                    u64::try_from(view.segments.capacity())
+                        .unwrap_or(u64::MAX)
+                        .saturating_mul(
+                            u64::try_from(std::mem::size_of::<SegmentSharedPtr>())
+                                .unwrap_or(u64::MAX),
+                        ),
+                )
+                .saturating_add(segment_bytes(&view.segments))
+        });
+        fixed.saturating_add(base).saturating_add(runtime_views)
+    }
+
+    #[inline]
+    #[cfg(test)]
+    pub(crate) fn has_loaded_segments(&self) -> bool {
+        *self.segments_loaded.read().unwrap()
     }
 
     /// Get data disk size
@@ -680,6 +734,7 @@ impl Rowset {
     /// This unloads segments from memory but does not delete files.
     pub fn close(&self) -> Result<()> {
         let mut loaded = self.segments_loaded.write().unwrap();
+        self.segment_read_views.write().unwrap().clear();
         let mut segments = self.segments.write().unwrap();
         segments.clear();
         *loaded = false;
@@ -1296,6 +1351,42 @@ mod tests {
             reopened_weak.upgrade().is_some(),
             "the rowset retains each governed runtime so readers and caches survive across queries"
         );
+    }
+
+    #[test]
+    fn close_evicts_owned_segment_views_and_reopens_from_durable_state() {
+        let schema = create_test_schema();
+        let tmp = tempfile::tempdir().unwrap();
+        let rowset_dir = tmp.path().join("rowset");
+        std::fs::create_dir_all(&rowset_dir).unwrap();
+        create_segment_with_path(&schema, 0, 3, rowset_dir.join("0.dat"));
+
+        let meta = RowsetMetaBuilder::with_id(1, 100, Version::singleton(0))
+            .num_rows(3)
+            .num_segments(1)
+            .state(RowsetState::Committed)
+            .build();
+        let rowset = Rowset::create(schema, meta, rowset_dir).unwrap();
+        let cache = Arc::new(PageCache::new(BufferPool::new_arc(1024 * 1024)));
+        rowset
+            .open_segment_view(
+                SegmentOptions::default()
+                    .with_page_cache(cache)
+                    .with_cache_decoded(true),
+            )
+            .unwrap();
+        let loaded_bytes = rowset.retained_memory_bytes();
+        assert!(rowset.has_loaded_segments());
+
+        rowset.close().unwrap();
+        assert!(!rowset.has_loaded_segments());
+        assert!(rowset.segments().is_empty());
+        assert!(rowset.retained_memory_bytes() < loaded_bytes);
+
+        let reopened = rowset.open_segment_view(SegmentOptions::default()).unwrap();
+        assert_eq!(reopened.len(), 1);
+        assert_eq!(reopened[0].num_rows(), 3);
+        assert!(rowset.has_loaded_segments());
     }
 
     #[test]

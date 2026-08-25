@@ -69,6 +69,45 @@ impl PageReadOptions {
 pub struct PageIO;
 
 impl PageIO {
+    /// Advance `writer` to the next power-of-two byte boundary.
+    ///
+    /// Padding lives outside every page envelope, so callers must invoke this
+    /// before obtaining the [`PagePointer`] for a page whose body is consumed
+    /// through typed mmap views.
+    pub fn write_alignment_padding<W: Write + Seek>(
+        writer: &mut W,
+        alignment: usize,
+    ) -> Result<usize> {
+        if !alignment.is_power_of_two() {
+            return Err(paro_error::invalid_input(format!(
+                "page alignment must be a non-zero power of two, got {alignment}"
+            )));
+        }
+
+        let position = writer.stream_position()?;
+        let alignment = alignment as u64;
+        let padding = ((alignment - position % alignment) % alignment) as usize;
+        if padding != 0 {
+            writer.write_all(&vec![0_u8; padding])?;
+        }
+        Ok(padding)
+    }
+
+    /// Write a plain page whose body remains directly addressable through an
+    /// mmap. This is the only supported writer for durable typed page bodies:
+    /// it couples base alignment and the absence of compression in one API.
+    pub fn write_mmap_page<W: Write + Seek>(
+        writer: &mut W,
+        body: &[u8],
+        footer: &PageFooter,
+        alignment: usize,
+    ) -> Result<PagePointer> {
+        Self::write_alignment_padding(writer, alignment)?;
+        let uncompressed_size = u32::try_from(body.len())
+            .map_err(|_| paro_error::out_of_range("mmap page body exceeds u32 width"))?;
+        Self::write_page(writer, body, footer, uncompressed_size)
+    }
+
     /// Read raw page bytes from file.
     pub fn read_page_bytes<R: Read + Seek>(
         reader: &mut R,
@@ -322,6 +361,40 @@ mod tests {
             format_version: 2,
             null_encoding: NullEncoding::BitShuffle,
         })
+    }
+
+    #[test]
+    fn alignment_padding_preserves_page_pointer_boundary() {
+        let mut buffer = Cursor::new(vec![1_u8, 2, 3]);
+        buffer.set_position(3);
+
+        assert_eq!(PageIO::write_alignment_padding(&mut buffer, 8).unwrap(), 5);
+        let ptr = PageIO::write_page(
+            &mut buffer,
+            b"aligned",
+            &create_test_footer(),
+            b"aligned".len() as u32,
+        )
+        .unwrap();
+
+        assert_eq!(ptr.offset, 8);
+        assert_eq!(&buffer.get_ref()[3..8], &[0_u8; 5]);
+        assert!(PageIO::write_alignment_padding(&mut buffer, 3).is_err());
+    }
+
+    #[test]
+    fn mmap_page_is_plain_and_aligned_by_construction() {
+        let mut buffer = Cursor::new(vec![1_u8, 2, 3]);
+        buffer.set_position(3);
+        let body = b"directly-addressable";
+
+        let ptr = PageIO::write_mmap_page(&mut buffer, body, &create_test_footer(), 8).unwrap();
+        assert_eq!(ptr.offset, 8);
+        let page = &buffer.get_ref()[ptr.offset as usize..][..ptr.size as usize];
+        let (_, uncompressed_size, body_size) = PageIO::parse_page_footer(page, true).unwrap();
+        assert_eq!(uncompressed_size as usize, body.len());
+        assert_eq!(body_size, body.len());
+        assert_eq!(&page[..body_size], body);
     }
 
     #[test]

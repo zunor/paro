@@ -239,7 +239,10 @@ pub(crate) fn estimate_tail_exact_merge_cost(
             continue;
         }
         let rows = segment.segment.num_rows();
-        if segment_has_provider_artifact(kind, segment, column_id) {
+        if snapshot
+            .artifact_for_segment(kind, column_id, segment)
+            .is_some()
+        {
             indexed_rows = indexed_rows.saturating_add(rows);
         } else {
             exact_rows = exact_rows.saturating_add(rows);
@@ -299,18 +302,6 @@ pub(crate) fn estimate_tail_exact_merge_cost(
 
 fn coverage_allows_tail_exact_merge(coverage: &CoverageState) -> bool {
     coverage.supports_exact_tail_merge()
-}
-
-fn segment_has_provider_artifact(
-    kind: SearchIndexKind,
-    segment: &VisibleSegment,
-    column_id: u32,
-) -> bool {
-    match kind {
-        SearchIndexKind::Hnsw => segment.segment.has_hnsw_artifact(column_id),
-        SearchIndexKind::Sparse => segment.segment.sparse_index(column_id).is_some(),
-        SearchIndexKind::FullText => segment.segment.fulltext_index(column_id).is_some(),
-    }
 }
 
 #[cfg(test)]

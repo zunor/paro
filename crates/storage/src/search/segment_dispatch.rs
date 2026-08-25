@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
-use std::sync::{Arc, LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, RwLock};
 use std::time::Instant;
 
 use paro_common::error::{self as paro_error, Result};
@@ -13,8 +13,8 @@ use super::capability::SearchIndexKind;
 use super::cursor::VisibleSegment;
 use super::telemetry::{SearchTelemetryCollector, SegmentTelemetryEvent};
 
-static SEGMENT_DISPATCH_POOLS: LazyLock<Mutex<HashMap<usize, Arc<ThreadPool>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static SEGMENT_DISPATCH_POOLS: LazyLock<RwLock<HashMap<usize, Arc<ThreadPool>>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug)]
 pub(crate) struct SegmentDispatchResult<T> {
@@ -101,15 +101,22 @@ where
     T: Send,
     F: FnOnce() -> Result<T> + Send,
 {
-    dispatch_pool(parallelism_slots.max(1))?.install(execute)
+    let pool = dispatch_pool(parallelism_slots.max(1))?;
+    if pool.current_thread_index().is_some() {
+        execute()
+    } else {
+        pool.install(execute)
+    }
 }
 
 fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {
-    let mut guard = SEGMENT_DISPATCH_POOLS
-        .lock()
-        .map_err(|_| paro_error::internal("lock segment dispatch pool cache"))?;
-    if let Some(pool) = guard.get(&thread_count) {
-        return Ok(Arc::clone(pool));
+    if let Some(pool) = SEGMENT_DISPATCH_POOLS
+        .read()
+        .map_err(|_| paro_error::internal("read segment dispatch pool cache"))?
+        .get(&thread_count)
+        .cloned()
+    {
+        return Ok(pool);
     }
     let pool = Arc::new(
         rayon::ThreadPoolBuilder::new()
@@ -117,13 +124,18 @@ fn dispatch_pool(thread_count: usize) -> Result<Arc<ThreadPool>> {
             .build()
             .map_err(|err| paro_error::internal(format!("build segment dispatch pool: {err}")))?,
     );
-    guard.insert(thread_count, Arc::clone(&pool));
-    Ok(pool)
+    let mut guard = SEGMENT_DISPATCH_POOLS
+        .write()
+        .map_err(|_| paro_error::internal("publish segment dispatch pool"))?;
+    Ok(guard
+        .entry(thread_count)
+        .or_insert_with(|| Arc::clone(&pool))
+        .clone())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::dispatch_pool;
+    use super::{dispatch_pool, install_search_pool};
     use std::sync::Arc;
 
     #[test]
@@ -134,5 +146,15 @@ mod tests {
 
         assert!(Arc::ptr_eq(&first, &second));
         assert!(!Arc::ptr_eq(&first, &third));
+    }
+
+    #[test]
+    fn nested_phase_reuses_the_current_search_pool_worker() {
+        let (outer, inner) = install_search_pool(2, || {
+            let outer = std::thread::current().id();
+            install_search_pool(2, || Ok((outer, std::thread::current().id())))
+        })
+        .expect("nested search phase");
+        assert_eq!(outer, inner);
     }
 }

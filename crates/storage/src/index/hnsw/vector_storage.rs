@@ -51,6 +51,13 @@ impl CosineInverseNorms {
                 "HNSW cosine norm mmap range exceeds package length",
             ));
         }
+        #[cfg(unix)]
+        {
+            // Norms follow graph point ids and are read in the same random
+            // order. This is an access hint only; unsupported kernels must
+            // never make a valid index unavailable.
+            let _ = mmap.advise_range(memmap2::Advice::Random, offset, len);
+        }
         Ok(Self::Mmap { mmap, offset, len })
     }
 
@@ -307,6 +314,13 @@ impl MmapVectorStorage {
                 .len(size as usize)
                 .map(&file)?
         };
+        #[cfg(unix)]
+        {
+            // HNSW point lookups are intentionally non-sequential. Prevent
+            // the kernel from turning a small beam into large speculative
+            // readahead over the base vector artifact.
+            let _ = mmap.advise(memmap2::Advice::Random);
+        }
 
         let vector_bytes = dim * std::mem::size_of::<f32>();
         debug_assert_eq!(

@@ -1,12 +1,11 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{HnswBuildContract, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage};
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{
-    BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
-    PageIO, PagePointer, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
+use super::{
+    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage, HNSW_ARTIFACT_ALIGNMENT,
 };
+use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
+use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{SegmentFooter, SegmentSharedPtr};
 use crate::rowset::RowsetSharedPtr;
 use crate::statistics::HnswIndexStatistics;
@@ -76,7 +75,6 @@ struct HnswBuildResult {
 #[derive(Debug)]
 struct PendingHnswPage {
     column_id: ColumnId,
-    compression: CompressionType,
     num_entries: u32,
     index_data: Vec<u8>,
     statistics: HnswIndexStatistics,
@@ -248,12 +246,7 @@ impl HnswBuildTask {
 
             let mut built_columns = 0usize;
             for page in pending_pages {
-                let ptr = append_hnsw_page(
-                    &mut file,
-                    page.compression,
-                    &page.index_data,
-                    page.num_entries,
-                )?;
+                let ptr = append_hnsw_page(&mut file, &page.index_data, page.num_entries)?;
 
                 let target = footer
                     .column_metas
@@ -373,44 +366,23 @@ fn build_hnsw_page_data(
         job.dim,
     )?);
     let index = hnsw_builder.build(vector_storage, job.build_contract)?;
-    let statistics = HnswIndexStatistics::collect(&index);
+    let statistics = HnswIndexStatistics::collect(&index)?;
     let index_data = index.serialize()?;
     Ok(Some(PendingHnswPage {
         column_id: job.column_id,
-        compression: col_meta.compression,
         num_entries: index.graph.links.num_points() as u32,
         index_data,
         statistics,
     }))
 }
 
-fn append_hnsw_page(
-    file: &mut File,
-    compression: CompressionType,
-    index_data: &[u8],
-    num_entries: u32,
-) -> Result<PagePointer> {
+fn append_hnsw_page(file: &mut File, index_data: &[u8], num_entries: u32) -> Result<PagePointer> {
     let footer = PageFooter::Index(IndexPageFooter {
         num_entries,
         page_type: IndexPageType::Leaf,
     });
     file.seek(SeekFrom::End(0)).map_err(paro_error::io)?;
-    let codec = compression_codec(compression);
-    PageIO::compress_and_write_page(
-        codec.as_deref(),
-        DEFAULT_MIN_SPACE_SAVING,
-        file,
-        index_data,
-        &footer,
-    )
-}
-
-fn compression_codec(compression: CompressionType) -> Option<Box<dyn BlockCompressionCodec>> {
-    match compression {
-        CompressionType::None => None,
-        CompressionType::Lz4 => Some(Box::new(Lz4Codec)),
-        CompressionType::Zstd => Some(Box::new(ZstdCodec::default())),
-    }
+    PageIO::write_mmap_page(file, index_data, &footer, HNSW_ARTIFACT_ALIGNMENT)
 }
 
 fn collect_segment_job(

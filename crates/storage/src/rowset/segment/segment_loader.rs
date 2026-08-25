@@ -8,7 +8,9 @@ use super::segment_indexes::{
     SegmentPredicateIndexes, SegmentSearchIndexes,
 };
 use crate::index::fulltext::text_index::FullTextIndex;
-use crate::index::hnsw::{hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex};
+use crate::index::hnsw::{
+    hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
+};
 use crate::index::sparse::SparseVectorIndex;
 use crate::index::{
     BitmapIndex, BloomFilterIndex, IndexConstraintType, MmapVectorStorage, PageRange,
@@ -16,13 +18,14 @@ use crate::index::{
 use crate::metrics::storage_metrics;
 use crate::rowset::column::OrdinalIndexReader;
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{CompressionType, PagePointer, PageReadOptions};
+use crate::rowset::page::{CompressionType, PageFooter, PageIO, PagePointer, PageReadOptions};
 use crate::rowset::page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 use crate::rowset::segment_statistics::SegmentStatistics;
 use crate::statistics::{
     split_stats_trailer, FullTextIndexStatistics, HnswIndexStatistics, SparseIndexStatistics,
 };
 use crate::tablet::{ColumnId, TabletSchemaRef};
+use memmap2::MmapOptions;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::types::LogicalType;
 use std::collections::HashMap;
@@ -433,7 +436,6 @@ impl Segment {
                     page_pointer: meta
                         .hnsw_index_pointer
                         .expect("HNSW pointer checked by filter"),
-                    compression: meta.compression,
                     vector_data_offset: meta.data_page_pointer.offset
                         + PLAIN_PAGE_HEADER_SIZE as u64,
                     vector_data_len: meta.num_rows * dim as u64 * std::mem::size_of::<f32>() as u64,
@@ -463,12 +465,41 @@ impl Segment {
         }
 
         let mut load = || -> Result<Option<(Arc<HnswIndex>, HnswIndexStatistics)>> {
-            let mut file = self.shared_file_reader()?;
-            let options = PageReadOptions::new(deferred.page_pointer)
-                .with_verify_checksum(self.options.verify_checksum)
-                .with_codec(deferred.compression);
-            let (body, _, _) = self.page_reader.read_page(&mut file, &options)?;
-            match hnsw_artifact_compatibility(&body)? {
+            let file = File::open(&self.file_path).map_err(paro_error::io)?;
+            // SAFETY: the segment file is immutable after publication and the
+            // mapping is retained by every view derived from the HNSW index.
+            let mmap = Arc::new(unsafe { MmapOptions::new().map(&file).map_err(paro_error::io)? });
+            let page_start = usize::try_from(deferred.page_pointer.offset)
+                .map_err(|_| paro_error::data_corrupted("inline HNSW page offset exceeds usize"))?;
+            if page_start % HNSW_ARTIFACT_ALIGNMENT != 0 {
+                return Err(paro_error::data_corrupted(format!(
+                    "inline HNSW page offset {page_start} is not aligned to {HNSW_ARTIFACT_ALIGNMENT} bytes"
+                )));
+            }
+            let page_end = page_start
+                .checked_add(deferred.page_pointer.size as usize)
+                .ok_or_else(|| paro_error::data_corrupted("inline HNSW page range overflow"))?;
+            let page = mmap.get(page_start..page_end).ok_or_else(|| {
+                paro_error::data_corrupted("inline HNSW page exceeds segment file")
+            })?;
+            // HNSW v9 authenticates its fixed header and compact checksum
+            // directory at open, then authenticates checksum pages and graph
+            // chunks immediately before use.
+            // Re-running the generic whole-page CRC here would fault every
+            // page of a multi-gigabyte random-access artifact and defeat mmap.
+            let (footer, uncompressed_size, artifact_len) = PageIO::parse_page_footer(page, false)?;
+            if !matches!(footer, PageFooter::Index(_)) {
+                return Err(paro_error::data_corrupted(
+                    "inline HNSW artifact is not stored in an index page",
+                ));
+            }
+            if artifact_len != uncompressed_size as usize {
+                return Err(paro_error::artifact_not_ready(
+                    "compressed inline HNSW artifacts are unsupported; rebuild the vector index",
+                ));
+            }
+            let artifact = &mmap[page_start..page_start + artifact_len];
+            match hnsw_artifact_compatibility(artifact)? {
                 HnswArtifactCompatibility::Current => {}
                 compatibility => {
                     *state = DeferredHnswState::Unsupported {
@@ -485,12 +516,15 @@ impl Segment {
                 deferred.vector_data_len,
                 deferred.dimension,
             )?);
-            let persisted_statistics = split_stats_trailer(body.as_ref())
-                .0
-                .and_then(|bytes| HnswIndexStatistics::from_bytes(bytes).ok());
-            let index = Arc::new(HnswIndex::deserialize_bytes(body, vector_storage)?);
-            let statistics = persisted_statistics
-                .unwrap_or_else(|| HnswIndexStatistics::collect(index.as_ref()));
+            let index = Arc::new(HnswIndex::deserialize_mmap_range(
+                mmap,
+                page_start,
+                artifact_len,
+                vector_storage,
+            )?);
+            let statistics = index.persisted_statistics().cloned().ok_or_else(|| {
+                paro_error::data_corrupted("HNSW artifact is missing persisted statistics")
+            })?;
             Ok(Some((index, statistics)))
         };
 

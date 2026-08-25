@@ -17,7 +17,8 @@ use crate::search::providers::sparse::row_image::decode_sparse_runtime_value;
 use crate::search::row_fetch::snapshot_epoch;
 use crate::search::segment_dispatch::{dispatch_segments, SegmentDispatchResult};
 use crate::search::sidecar::{
-    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
+    SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -77,12 +78,11 @@ impl SparseSearchProvider {
             },
         )?;
 
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         Ok(OpenedSearchCursor {
             snapshot: snapshot.clone(),
             cursor: Box::new(SparseSearchCursor {
-                sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                    self.tablet.data_dir().clone(),
-                ))),
+                reader_runtime,
                 snapshot,
                 tablet: self.tablet,
                 storage_col_id: self.column_id as u32,
@@ -117,7 +117,7 @@ enum SparseCursorState {
 }
 
 struct SparseSearchCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     storage_col_id: u32,
@@ -140,10 +140,10 @@ impl std::fmt::Debug for SparseSearchCursor {
 
 fn open_sidecar_sparse_index(
     snapshot: &SearchReadSnapshot,
-    cache: &SidecarReaderCache,
+    runtime: &SearchReaderRuntime,
     visible_segment: &VisibleSegment,
     column_id: u32,
-) -> Result<Option<SparseVectorIndex>> {
+) -> Result<Option<Arc<SparseVectorIndex>>> {
     let Some(artifact) =
         snapshot.artifact_for_segment(SearchIndexKind::Sparse, column_id, visible_segment)
     else {
@@ -156,13 +156,21 @@ fn open_sidecar_sparse_index(
         return Ok(None);
     }
 
-    let cached = cache.open(SidecarReaderRequest {
-        location: &artifact.location,
-        artifact_format_version: artifact.artifact_format_version,
-        provider: SearchIndexKind::Sparse,
-        codec: SIDECAR_PACKAGE_CODEC,
-    })?;
-    SparseVectorIndex::deserialize(cached.bytes()).map(Some)
+    let request = DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Sparse,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::EnvelopeChecksum,
+        },
+        rowset_id: artifact.segment.rowset_id,
+        segment_id: artifact.segment.segment_id,
+        column_id,
+    };
+    runtime.get_or_try_open_decoded(request, |cached| {
+        SparseVectorIndex::deserialize(cached.bytes()).map(Some)
+    })
 }
 
 fn sparse_ranked_rows_from_points(
@@ -272,7 +280,7 @@ impl SparseSearchCursor {
         }
         if let Some(index) = open_sidecar_sparse_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             visible_segment,
             self.storage_col_id,
         )? {
@@ -375,6 +383,7 @@ mod tests {
     };
     use crate::search::providers::sparse::row_image::encode_sparse_row_image;
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats, SearchArtifactStats};
+    use crate::search::{SearchReaderRuntime, SidecarArtifactStore};
     use crate::table::table_factory::TableFactory;
     use crate::test_utils::{test_allocator, test_chunk_from_vectors};
     use paro_common::runtime_value::Value;
@@ -478,6 +487,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         );
 
         let opened = SparseSearchProvider::new(table.tablet(), 0, &query, 10, None)
@@ -556,6 +568,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         );
         let query = SparseVector::new(vec![1], vec![1.0]).unwrap();
         let opened = SparseSearchProvider::new(table.tablet(), 0, &query, 10, None)

@@ -35,7 +35,7 @@ WHERE column_name IN ('id', 'title')
 ORDER BY column_name, segment_id;
 column_name	num_rows	null_count	distinct_count	has_fulltext_index
 id	3	0	3	false
-title	3	1	2	false
+title	3	1	2	true
 
 SELECT name, enabled, invocation_count >= 0 AS has_invocations
 FROM paro_optimizers()

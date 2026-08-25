@@ -46,6 +46,7 @@ pub use page::{
 pub use page_reader::{PageReader, PageReaderContext, PageReaderOptions};
 pub use partial_row::{load_base_rowids, load_base_rowids_for_offsets, save_base_rowids};
 pub use row_id::{BatchRowOrdinal, PhysicalRowRef, SegmentRowId};
+pub(crate) use segment::RuntimeScalarIndex;
 
 // Re-export encoding types
 pub use encoding::{

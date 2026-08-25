@@ -90,7 +90,7 @@ pub(crate) fn restore_search_registry_definitions(catalog: &Arc<ParoCatalog>) {
     }
 }
 
-fn runtime_art_index_coverage(
+fn runtime_scalar_index_coverage(
     storage: &TableHandle,
     column_id: u32,
 ) -> error::Result<IndexCoverage> {
@@ -99,7 +99,7 @@ fn runtime_art_index_coverage(
     let visible_segment_count = segments.len();
     let indexed_segment_count = segments
         .iter()
-        .filter(|(_, segment)| segment.art_index(column_id).is_some())
+        .filter(|(_, segment)| segment.has_complete_scalar_index(column_id))
         .count();
 
     Ok(IndexCoverage::from_counts(
@@ -175,7 +175,7 @@ pub(crate) fn restore_runtime_art_indexes(catalog: &Arc<ParoCatalog>) {
                 continue;
             }
 
-            match runtime_art_index_coverage(storage.as_ref(), column_id) {
+            match runtime_scalar_index_coverage(storage.as_ref(), column_id) {
                 Ok(coverage) if coverage.is_complete() => {
                     index.mark_ready_with_coverage(Some(coverage));
                 }

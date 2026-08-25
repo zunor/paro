@@ -80,7 +80,7 @@ PROJECTION  (rows=1)
     Column: content
     Mode: Filter
     Pushed Predicate: category = 'tech'
-    Filter Pushdown: storage-level exact per-segment bitmap (no residual FILTER)
+    Filter Pushdown: exact segment row set materialized by column scan; no residual filter
     Cardinality: [0, 1, 1]
     Output Schema: public.search_opt_docs.id INTEGER, public.search_opt_docs.category VARCHAR, public.search_opt_docs.content VARCHAR
 

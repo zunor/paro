@@ -34,7 +34,9 @@ use super::segment::{Segment, SegmentOptions};
 use super::segment_format::{ColumnMeta, SegmentFooter};
 #[cfg(test)]
 use crate::index::hnsw::{DistanceMetric, HnswConfig};
-use crate::index::hnsw::{HnswBuildContract, HnswBuildStopCheck};
+use crate::index::hnsw::{
+    HnswBuildContract, HnswBuildStopCheck, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
+};
 use crate::index::hnsw::{HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks};
 use crate::index::short_key::{ShortKeyFooter, ShortKeyIndexBuilder};
 use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
@@ -45,7 +47,6 @@ use crate::rowset::page::{
 };
 use crate::rowset::segment_statistics::{ColumnSegmentStatistics, SegmentStatistics};
 use crate::rowset::RowsetId;
-use crate::statistics::{split_stats_trailer, HnswIndexStatistics};
 use crate::tablet::{ColumnId, TabletColumn, TabletSchemaRef};
 use bytes::{Bytes, BytesMut};
 use paro_common::error::{self as paro_error, Result};
@@ -899,21 +900,27 @@ impl SegmentWriter {
                     page.kind, page.column_id, self.segment_id
                 )));
             }
-            let pointer = write_index_page(
-                &mut self.file_writer,
-                meta.compression,
-                page.bytes,
-                num_entries,
-            )?;
+            let pointer = if page.kind == SegmentInlineIndexKind::Hnsw {
+                // HNSW artifacts are immutable random-access structures. The
+                // mmap page writer couples their alignment and plain encoding
+                // so neither can drift independently at another call site.
+                write_mmap_index_page(
+                    &mut self.file_writer,
+                    page.bytes,
+                    num_entries,
+                    HNSW_ARTIFACT_ALIGNMENT,
+                )?
+            } else {
+                write_index_page(
+                    &mut self.file_writer,
+                    meta.compression,
+                    page.bytes,
+                    num_entries,
+                )?
+            };
             set_inline_index_pointer(meta, page.kind, pointer);
             if page.kind == SegmentInlineIndexKind::Hnsw {
-                let stats_bytes = split_stats_trailer(page.bytes).0.ok_or_else(|| {
-                    paro_error::data_corrupted(format!(
-                        "HNSW inline artifact for column {} has no statistics trailer",
-                        page.column_id
-                    ))
-                })?;
-                meta.hnsw_index_statistics = Some(HnswIndexStatistics::from_bytes(stats_bytes)?);
+                meta.hnsw_index_statistics = Some(HnswIndex::serialized_statistics(page.bytes)?);
             }
         }
         Ok(())
@@ -1008,6 +1015,19 @@ fn write_index_page<W: Write + Seek>(
             &footer,
         ),
     }
+}
+
+fn write_mmap_index_page<W: Write + Seek>(
+    writer: &mut W,
+    body: &[u8],
+    num_entries: u32,
+    alignment: usize,
+) -> Result<PagePointer> {
+    let footer = PageFooter::Index(IndexPageFooter {
+        num_entries,
+        page_type: IndexPageType::Leaf,
+    });
+    PageIO::write_mmap_page(writer, body, &footer, alignment)
 }
 
 /// Builder for creating SegmentWriter with fluent API
@@ -1406,18 +1426,24 @@ mod tests {
         let mut local_edge_count = 0;
         let mut cross_block_edge_count = 0;
         for point in 0..rows {
-            predicate_links.for_each_link(point, 0, |neighbor| {
-                if point % 4 == neighbor % 4 {
-                    local_edge_count += 1;
-                } else {
-                    let mut is_base_edge = false;
-                    index.graph.links.for_each_link(point, 0, |base_neighbor| {
-                        is_base_edge |= base_neighbor == neighbor;
-                    });
-                    assert!(is_base_edge, "cross-block routing must reuse a base edge");
-                    cross_block_edge_count += 1;
-                }
-            });
+            predicate_links
+                .for_each_link(point, 0, |neighbor| {
+                    if point % 4 == neighbor % 4 {
+                        local_edge_count += 1;
+                    } else {
+                        let mut is_base_edge = false;
+                        index
+                            .graph
+                            .links
+                            .for_each_link(point, 0, |base_neighbor| {
+                                is_base_edge |= base_neighbor == neighbor;
+                            })
+                            .unwrap();
+                        assert!(is_base_edge, "cross-block routing must reuse a base edge");
+                        cross_block_edge_count += 1;
+                    }
+                })
+                .unwrap();
         }
         assert!(local_edge_count > 0);
         assert!(cross_block_edge_count > 0);

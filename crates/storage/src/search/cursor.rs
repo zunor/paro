@@ -15,6 +15,7 @@ use paro_transaction::{DerivedLagLease, RetentionLeaseInfo};
 use super::budget::{ResourceBudget, SearchBatchConfig};
 use super::capability::{CoverageState, SearchArtifactRef, SearchIndexKind};
 use super::request::NormalizedSearchRequest;
+use super::sidecar::SearchReaderRuntime;
 use super::stats::{
     BuildEpoch, GenerationMaintenanceState, GenerationStats, SearchDefinitionId,
     SearchGenerationId, SearchSourceId, SegmentId, TableId,
@@ -315,6 +316,9 @@ pub struct SearchReadSnapshot {
     pub generation: GenerationReadSnapshot,
     pub table_lease: Arc<TableReadLease>,
     pub generation_lease: Arc<GenerationReadLease>,
+    /// Table-scoped owner for immutable provider readers. Cursors borrow this
+    /// runtime so mmap/decoder state survives individual query lifetimes.
+    pub reader_runtime: Arc<SearchReaderRuntime>,
     derived_lag_lease: Option<Arc<DerivedLagLease>>,
     overlay_delete_vectors: Option<Arc<OverlayDeleteVectorMap>>,
     tail_window: TailWindow,
@@ -327,6 +331,7 @@ impl SearchReadSnapshot {
         generation: GenerationReadSnapshot,
         table_lease: Arc<TableReadLease>,
         generation_lease: Arc<GenerationReadLease>,
+        reader_runtime: Arc<SearchReaderRuntime>,
     ) -> Self {
         let tail_window = TailWindow::from_segments(
             generation.indexed_through_ts,
@@ -340,6 +345,7 @@ impl SearchReadSnapshot {
             generation,
             table_lease,
             generation_lease,
+            reader_runtime,
             derived_lag_lease: None,
             overlay_delete_vectors: None,
             tail_window,
@@ -549,6 +555,7 @@ mod tests {
     };
     use crate::search::capability::{CoverageState, SearchIndexKind};
     use crate::search::stats::{GenerationMaintenanceState, GenerationStats};
+    use crate::search::{SearchReaderRuntime, SidecarArtifactStore};
     use crate::table::table_factory::TableFactory;
     use paro_common::types::LogicalType;
     use paro_transaction::{CommitTs, RetentionLeaseKind, RetentionRegistry};
@@ -631,6 +638,9 @@ mod tests {
             generation,
             table_lease,
             generation_lease,
+            Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+                table.tablet().data_dir().clone(),
+            ))),
         )
         .with_derived_lag_lease(Some(derived_lag_lease));
         assert_eq!(snapshot.table_lease.table_id, table.tablet_id());

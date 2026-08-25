@@ -7,6 +7,7 @@
 //!
 //! Adapted for Paro's storage engine.
 
+mod artifact_integrity;
 pub mod batch_scorer;
 pub mod build_cache;
 pub mod build_task;
@@ -43,9 +44,10 @@ pub use healer::GraphLayersHealer;
 pub(crate) use hnsw_builder::hnsw_build_thread_count;
 pub use hnsw_builder::{configure_hnsw_build_threads, HnswBuildStopCheck, HnswBuilder};
 pub use links_container::{ItemsBuffer, LinksContainer};
+pub(crate) use persistence::{hnsw_artifact_build_contract, HNSW_ARTIFACT_HEADER_LEN};
 pub use persistence::{
     hnsw_artifact_compatibility, HnswArtifactCompatibility, HnswFilterBlock, HnswFilterBlocks,
-    HnswFilterColumnBlocks, HnswIndex,
+    HnswFilterColumnBlocks, HnswIndex, HNSW_ARTIFACT_ALIGNMENT,
 };
 pub use predicate_scan::PredicateScanLayout;
 pub use scorer::VectorScorer;

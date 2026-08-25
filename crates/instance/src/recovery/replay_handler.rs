@@ -1728,6 +1728,76 @@ mod tests {
     }
 
     #[test]
+    fn test_restore_runtime_art_indexes_accepts_complete_bitmap_representation() {
+        let catalog = Arc::new(ParoCatalog::new("test".to_string()));
+        catalog.initialize(false);
+        ensure_main_schema(&catalog);
+
+        let storage = Arc::new(create_table(&[LogicalType::Integer]));
+        let columns = vec![ColumnDefinition::new(
+            "bucket".to_string(),
+            LogicalType::Integer,
+        )];
+        install_committed_table(&catalog, "main", "events", columns, Arc::clone(&storage));
+
+        let values = (0..128).map(|value| value % 2).collect::<Vec<i32>>();
+        let insert = paro_common::test_utils::test_chunk_from_vectors(vec![
+            paro_common::test_utils::test_i32_vector(&values),
+        ]);
+        storage.append(&insert).unwrap();
+
+        let txn = CatalogSnapshot::read_only(u64::MAX);
+        let schema = catalog.get_schema(&txn, "main").unwrap();
+        let table_entry = schema
+            .get_table(txn.transaction_id, txn.start_time, "events")
+            .expect("events table should exist");
+        let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+            panic!("expected table entry");
+        };
+        let info = CreateIndexInfo::new(
+            "main".to_string(),
+            "events".to_string(),
+            "idx_events_bucket".to_string(),
+            vec![LogicalIndex::new(0)],
+            vec![LogicalType::Integer],
+        )
+        .with_index_type(IndexType::ART)
+        .with_build_state(IndexBuildState::Building);
+        let entry = Arc::new(CatalogEntryEnum::Index(Arc::new(IndexCatalogEntry::new(
+            info,
+            table.base.base.object_id.raw(),
+            0,
+            catalog.name().to_string(),
+            catalog.object_id_allocator().allocate(),
+        ))));
+        schema
+            .collection(CatalogType::Index)
+            .expect("index collection")
+            .install_committed(entry, InstallMode::RejectExisting)
+            .unwrap();
+
+        restore_runtime_art_indexes(&catalog);
+
+        let entry = schema
+            .get_index(txn.transaction_id, txn.start_time, "idx_events_bucket")
+            .expect("index should exist");
+        let CatalogEntryEnum::Index(index) = entry.as_ref() else {
+            panic!("expected index entry");
+        };
+        assert_eq!(index.build_state(), IndexBuildState::Ready);
+        assert!(index
+            .coverage()
+            .is_some_and(|coverage| coverage.is_complete()));
+        assert!(storage
+            .collect_segments(storage.max_version())
+            .unwrap()
+            .iter()
+            .all(|(_, segment)| segment.art_index(0).is_none()
+                && segment.bitmap_index(0).is_some()
+                && segment.has_complete_scalar_index(0)));
+    }
+
+    #[test]
     fn test_restore_runtime_art_indexes_marks_failed_on_missing_column() {
         let catalog = Arc::new(ParoCatalog::new("test".to_string()));
         catalog.initialize(false);

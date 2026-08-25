@@ -23,7 +23,7 @@ use rand::{thread_rng, Rng};
 /// Maximum ordinary-graph beam used to discover predicate-topology entry
 /// seeds.  Filtered result quality is owned by the independent predicate beam;
 /// routing wider than this only repeats distance work on the base graph.
-const PREDICATE_ROUTING_EF: usize = 64;
+const PREDICATE_ROUTING_EF: usize = 32;
 
 /// Read-only HNSW graph layers.
 pub struct GraphLayers {
@@ -349,7 +349,7 @@ impl GraphLayers {
                 self.links
                     .for_each_link(current_point, current_level, |neighbor| {
                         links.push(neighbor);
-                    });
+                    })?;
                 work.consume(links.len())?;
 
                 for scored in
@@ -397,7 +397,7 @@ impl GraphLayers {
                 if !visited.check_and_update_visited(neighbor) {
                     neighbors.push(neighbor);
                 }
-            });
+            })?;
             work.consume(neighbors.len())?;
 
             for sp in scorer.score_points_unfiltered(&neighbors) {
@@ -500,7 +500,7 @@ impl GraphLayers {
                 if !visited.check_and_update_visited(neighbor) {
                     neighbors.push(neighbor);
                 }
-            });
+            })?;
             work.consume(neighbors.len())?;
 
             for point in scorer.score_points_unfiltered(&neighbors) {
@@ -626,7 +626,7 @@ impl GraphLayers {
                 } else if !bridge_visited.check_and_update_visited(neighbor) {
                     bridge_neighbors.push(neighbor);
                 }
-            });
+            })?;
             work.consume(inspected_edges)?;
 
             // ACORN-1-style bridge expansion: non-matching direct neighbors
@@ -646,7 +646,7 @@ impl GraphLayers {
                     {
                         matching_neighbors.push(neighbor);
                     }
-                });
+                })?;
                 work.consume(bridge_edges)?;
             }
 
@@ -740,13 +740,13 @@ impl GraphLayers {
                 if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
                     neighbors.push(neighbor);
                 }
-            });
+            })?;
             self.links.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
                 if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
                     neighbors.push(neighbor);
                 }
-            });
+            })?;
             work.consume(inspected_edges)?;
             for point in scorer.score_points_unfiltered(&neighbors) {
                 context.process_candidate(point);
@@ -787,7 +787,7 @@ impl GraphLayers {
                     if admits(neighbor) {
                         neighbors.push(neighbor);
                     }
-                });
+                })?;
                 work.consume(inspected_edges)?;
                 for candidate in scorer.score_points_unfiltered(&neighbors) {
                     if candidate.score > current.score {

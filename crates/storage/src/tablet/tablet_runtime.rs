@@ -2139,6 +2139,7 @@ impl Tablet {
     }
 
     fn row_locations_for_rowset(rowset: &Rowset) -> Result<Vec<PhysicalRowRef>> {
+        rowset.load()?;
         let mut out = Vec::with_capacity(rowset.num_rows() as usize);
         for seg in rowset.segments() {
             let num_rows = seg.num_rows() as u32;

@@ -850,7 +850,7 @@ impl Transaction {
     }
 
     fn discard_pending_rowset(pending: PendingRowset) {
-        if let Some(artifact) = &pending.spilled_artifact {
+        if let Some(artifact) = &pending.staged_artifact {
             artifact.abandon_and_remove();
         } else {
             let _ = std::fs::remove_dir_all(&pending.rowset_path);
@@ -930,7 +930,7 @@ impl Transaction {
                         .tablet
                         .rowset_commit(commit_version, pending.rowset.clone())?;
                 }
-                if let Some(artifact) = &pending.spilled_artifact {
+                if let Some(artifact) = &pending.staged_artifact {
                     artifact.mark_committed_descriptor_written();
                 }
             }
@@ -1784,7 +1784,7 @@ mod tests {
     }
 
     #[test]
-    fn test_txn_overlay_reader_reads_spilled_rowset() {
+    fn test_txn_overlay_reader_reopens_evicted_rowset() {
         let _spill_guard = reset_spill_for_test();
         let table = create_table(&[LogicalType::Integer]);
         let txn = Arc::new(Transaction::new(9605, txn_start_after_table(&table)));
@@ -1805,8 +1805,11 @@ mod tests {
             .expect("build spilled overlay")
             .expect("overlay should exist");
 
-        assert_eq!(overlay.rowsets().len(), 0);
-        assert_eq!(overlay.spilled_artifacts().len(), 1);
+        assert_eq!(overlay.rowsets().len(), 1);
+        assert!(
+            !overlay.rowsets()[0].has_loaded_segments(),
+            "memory governance should evict the rowset read state without changing overlay identity"
+        );
         assert_eq!(
             collect_rows_i32_with_view(&table, &view1),
             vec![11, 12, 13, 14]

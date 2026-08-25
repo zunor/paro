@@ -4,6 +4,13 @@
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Minimum exact vector payload needed to amortize a cross-thread segment
+/// phase. This is expressed as physical bytes rather than rows so the same
+/// scheduling rule scales with vector dimension. Graph traversal remains
+/// parallel because its random navigation latency is not proportional to the
+/// number of predicate matches.
+const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
+
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
@@ -20,9 +27,12 @@ use crate::search::cursor::{
     OpenedSearchCursor, SearchBatchState, SearchCursor, SearchReadSnapshot, VisibleSegment,
 };
 use crate::search::row_fetch::snapshot_epoch;
-use crate::search::segment_dispatch::{dispatch_segments, map_segments, SegmentDispatchResult};
+use crate::search::segment_dispatch::{
+    dispatch_segments, install_search_pool, map_segments, SegmentDispatchResult,
+};
 use crate::search::sidecar::{
-    SidecarArtifactStore, SidecarReaderCache, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
+    DecodedSidecarReaderRequest, SearchReaderRuntime, SidecarIntegrityPolicy, SidecarReaderRequest,
+    SIDECAR_PACKAGE_CODEC,
 };
 use crate::search::tail::exact_merge::{ensure_tail_exact_merge_budget, TailExactMergeQueryShape};
 use crate::search::tail_merge::{resolve_logical_rows, visible_row_ids};
@@ -120,10 +130,9 @@ impl VectorSearchProvider {
         let prepared_query = distance.prepare(&self.query);
         let expected_build_contract = provider_config.build_contract();
         let search_policy = provider_config.search_policy();
+        let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         let cursor = VectorSearchCursor {
-            sidecar_cache: Arc::new(SidecarReaderCache::new(SidecarArtifactStore::new(
-                self.tablet.data_dir().clone(),
-            ))),
+            reader_runtime,
             snapshot: snapshot.clone(),
             tablet: self.tablet,
             query: self.query,
@@ -167,7 +176,7 @@ enum VectorCursorState {
 }
 
 struct VectorSearchCursor {
-    sidecar_cache: Arc<SidecarReaderCache>,
+    reader_runtime: Arc<SearchReaderRuntime>,
     snapshot: SearchReadSnapshot,
     tablet: TabletRef,
     query: Vec<f32>,
@@ -197,6 +206,21 @@ impl std::fmt::Debug for VectorSearchCursor {
 
 impl VectorSearchCursor {
     fn build_ranked_rows(&self, budget: &ResourceBudget) -> Result<Vec<RankedRow>> {
+        if budget.parallelism_slots > 1 {
+            return install_search_pool(budget.parallelism_slots, || {
+                self.build_ranked_rows_in_dispatch_context(budget)
+            });
+        }
+        self.build_ranked_rows_in_dispatch_context(budget)
+    }
+
+    /// Execute predicate preparation and segment search under one pool
+    /// installation. Filtered search has a cardinality barrier between these
+    /// phases, but the barrier must not imply a second cross-thread handoff.
+    fn build_ranked_rows_in_dispatch_context(
+        &self,
+        budget: &ResourceBudget,
+    ) -> Result<Vec<RankedRow>> {
         let started_at = Instant::now();
         self.telemetry.record_generation(GenerationTelemetryEvent {
             kind: SearchIndexKind::Hnsw,
@@ -248,12 +272,15 @@ impl VectorSearchCursor {
                 )
             })
             .transpose()?;
-        let query_wide_strategy = match &prepared_predicate_filters {
-            Some(filters) => HnswQueryWideStrategy::choose(
+        let predicate_matching_rows = prepared_predicate_filters.as_ref().map(|filters| {
+            filters.iter().fold(0u64, |rows, filter| {
+                rows.saturating_add(filter.row_set.len())
+            })
+        });
+        let query_wide_strategy = match predicate_matching_rows {
+            Some(matching_rows) => HnswQueryWideStrategy::choose(
                 HnswFilterKind::Predicate,
-                filters.iter().fold(0u64, |rows, filter| {
-                    rows.saturating_add(filter.row_set.len())
-                }),
+                matching_rows,
                 total_rows,
                 self.search_policy,
             ),
@@ -264,12 +291,18 @@ impl VectorSearchCursor {
                 self.search_policy,
             ),
         };
+        let search_parallelism_slots = exact_search_parallelism_slots(
+            parallelism_slots,
+            query_wide_strategy,
+            predicate_matching_rows.unwrap_or(total_rows),
+            self.vector_dim,
+        );
 
         let per_segment = match &prepared_predicate_filters {
             Some(filters) => dispatch_segments(
                 SearchIndexKind::Hnsw,
                 visible_segments,
-                parallelism_slots,
+                search_parallelism_slots,
                 self.telemetry.as_ref(),
                 |index, segment| {
                     let filter = HnswSearchFilter::predicate(
@@ -289,7 +322,7 @@ impl VectorSearchCursor {
             None => dispatch_segments(
                 SearchIndexKind::Hnsw,
                 visible_segments,
-                parallelism_slots,
+                search_parallelism_slots,
                 self.telemetry.as_ref(),
                 |_, segment| {
                     let filter_row_set = segment
@@ -432,12 +465,12 @@ impl VectorSearchCursor {
 
         if let Some(index) = open_sidecar_hnsw_index(
             &self.snapshot,
-            self.sidecar_cache.as_ref(),
+            self.reader_runtime.as_ref(),
             visible_segment,
             self.storage_col_id,
             self.vector_dim,
         )? {
-            validate_hnsw_index_contract(&index, &self.expected_build_contract)?;
+            validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             if filter.row_set().is_some_and(ExactRowSet::is_empty) {
                 return Ok((Vec::new(), false));
             }
@@ -517,6 +550,26 @@ impl VectorSearchCursor {
     }
 }
 
+fn exact_search_parallelism_slots(
+    granted_slots: usize,
+    strategy: HnswQueryWideStrategy,
+    matching_rows: u64,
+    vector_dim: usize,
+) -> usize {
+    let granted_slots = granted_slots.max(1);
+    if granted_slots == 1 || strategy != HnswQueryWideStrategy::ExactScan {
+        return granted_slots;
+    }
+    let vector_bytes = matching_rows
+        .saturating_mul(vector_dim as u64)
+        .saturating_mul(std::mem::size_of::<f32>() as u64);
+    if vector_bytes < MIN_PARALLEL_EXACT_VECTOR_BYTES {
+        1
+    } else {
+        granted_slots
+    }
+}
+
 fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract) -> Result<()> {
     if index.build_contract != *expected {
         return Err(paro_error::data_corrupted(format!(
@@ -529,11 +582,11 @@ fn validate_hnsw_index_contract(index: &HnswIndex, expected: &HnswBuildContract)
 
 fn open_sidecar_hnsw_index(
     snapshot: &SearchReadSnapshot,
-    cache: &SidecarReaderCache,
+    runtime: &SearchReaderRuntime,
     visible_segment: &VisibleSegment,
     column_id: u32,
     vector_dim: usize,
-) -> Result<Option<HnswIndex>> {
+) -> Result<Option<Arc<HnswIndex>>> {
     let Some(artifact) =
         snapshot.artifact_for_segment(SearchIndexKind::Hnsw, column_id, visible_segment)
     else {
@@ -546,35 +599,43 @@ fn open_sidecar_hnsw_index(
         return Ok(None);
     }
 
-    let column_meta = visible_segment
-        .segment
-        .get_column_meta(column_id)
-        .ok_or_else(|| {
-            paro_error::column_not_found(format!(
-                "column {} not found in segment {}",
-                column_id, visible_segment.segment_id
-            ))
-        })?;
-    let vector_storage = Arc::new(MmapVectorStorage::open_range(
-        visible_segment.segment.file_path(),
-        column_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-        column_meta.num_rows * vector_dim as u64 * std::mem::size_of::<f32>() as u64,
-        vector_dim,
-    )?);
-    let cached = cache.open(SidecarReaderRequest {
-        location: &artifact.location,
-        artifact_format_version: artifact.artifact_format_version,
-        provider: SearchIndexKind::Hnsw,
-        codec: SIDECAR_PACKAGE_CODEC,
-    })?;
-    if !matches!(
-        hnsw_artifact_compatibility(cached.bytes())?,
-        HnswArtifactCompatibility::Current
-    ) {
-        return Ok(None);
-    }
-    let (mmap, offset, len) = cached.mmap_range();
-    HnswIndex::deserialize_mmap_range(mmap, offset, len, vector_storage).map(Some)
+    let request = DecodedSidecarReaderRequest {
+        sidecar: SidecarReaderRequest {
+            location: &artifact.location,
+            artifact_format_version: artifact.artifact_format_version,
+            provider: SearchIndexKind::Hnsw,
+            codec: SIDECAR_PACKAGE_CODEC,
+            integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
+        },
+        rowset_id: artifact.segment.rowset_id,
+        segment_id: artifact.segment.segment_id,
+        column_id,
+    };
+    runtime.get_or_try_open_decoded(request, |cached| {
+        if !matches!(
+            hnsw_artifact_compatibility(cached.bytes())?,
+            HnswArtifactCompatibility::Current
+        ) {
+            return Ok(None);
+        }
+        let column_meta = visible_segment
+            .segment
+            .get_column_meta(column_id)
+            .ok_or_else(|| {
+                paro_error::column_not_found(format!(
+                    "column {} not found in segment {}",
+                    column_id, visible_segment.segment_id
+                ))
+            })?;
+        let vector_storage = Arc::new(MmapVectorStorage::open_range(
+            visible_segment.segment.file_path(),
+            column_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
+            column_meta.num_rows * vector_dim as u64 * std::mem::size_of::<f32>() as u64,
+            vector_dim,
+        )?);
+        let (mmap, offset, len) = cached.mmap_range();
+        HnswIndex::deserialize_mmap_range(mmap, offset, len, vector_storage).map(Some)
+    })
 }
 
 fn hnsw_ranked_rows_from_points(
@@ -675,6 +736,34 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exact_segment_dispatch_requires_enough_vector_work() {
+        let rows_below_two_mib_at_32d =
+            MIN_PARALLEL_EXACT_VECTOR_BYTES / (32 * std::mem::size_of::<f32>() as u64) - 1;
+        assert_eq!(
+            exact_search_parallelism_slots(
+                8,
+                HnswQueryWideStrategy::ExactScan,
+                rows_below_two_mib_at_32d,
+                32,
+            ),
+            1
+        );
+        assert_eq!(
+            exact_search_parallelism_slots(
+                8,
+                HnswQueryWideStrategy::ExactScan,
+                rows_below_two_mib_at_32d + 1,
+                32,
+            ),
+            8
+        );
+        assert_eq!(
+            exact_search_parallelism_slots(8, HnswQueryWideStrategy::SegmentAdaptive, 1, 32,),
+            8
+        );
+    }
 
     #[test]
     fn unfiltered_plain_scan_threshold_is_query_wide() {

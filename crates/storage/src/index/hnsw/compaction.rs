@@ -10,13 +10,10 @@ use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
     DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswBuildContract,
     HnswIndex, IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
-    HNSW_BUILD_CONTRACT_VERSION,
+    HNSW_ARTIFACT_ALIGNMENT, HNSW_BUILD_CONTRACT_VERSION,
 };
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
-use crate::rowset::page::{
-    BlockCompressionCodec, CompressionType, IndexPageFooter, IndexPageType, Lz4Codec, PageFooter,
-    PageIO, PagePointer, ZstdCodec, DEFAULT_MIN_SPACE_SAVING,
-};
+use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
 use crate::statistics::HnswIndexStatistics;
@@ -193,7 +190,7 @@ impl HnswIndexRebuilder {
                 .unwrap_or(&[]);
             let rebuilt_index =
                 Self::build_segment_index(output_storage, *indexed_col, old_candidates)?;
-            let ptr = Self::write_hnsw_page(&mut file, &rebuilt_index, col_meta.compression)?;
+            let ptr = Self::write_hnsw_page(&mut file, &rebuilt_index)?;
 
             let target = &mut footer.column_metas[meta_idx];
             let previous_size = target
@@ -201,7 +198,7 @@ impl HnswIndexRebuilder {
                 .map(|p| p.size as u64)
                 .unwrap_or_default();
             target.hnsw_index_pointer = Some(ptr);
-            target.hnsw_index_statistics = Some(HnswIndexStatistics::collect(&rebuilt_index));
+            target.hnsw_index_statistics = Some(HnswIndexStatistics::collect(&rebuilt_index)?);
             target.total_mem_footprint = target
                 .total_mem_footprint
                 .saturating_sub(previous_size)
@@ -267,9 +264,10 @@ impl HnswIndexRebuilder {
 
         for (new_id, old_id_opt) in new_to_old.iter().enumerate() {
             let point_id = new_id as PointOffset;
-            let level = old_id_opt
-                .map(|old_id| best_old_index.graph.links.point_level(old_id))
-                .unwrap_or_else(|| builder.random_layer_for_point(point_id));
+            let level = match old_id_opt {
+                Some(old_id) => best_old_index.graph.links.point_level(*old_id)?,
+                None => builder.random_layer_for_point(point_id),
+            };
             builder.set_levels(point_id, level);
         }
 
@@ -277,7 +275,7 @@ impl HnswIndexRebuilder {
             &best_old_index.graph,
             &old_to_new,
             indexed_col.build_contract.ef_construct as usize,
-        );
+        )?;
         healer.heal(
             best_old_index.vector_storage.as_ref(),
             indexed_col.build_contract.distance,
@@ -435,11 +433,7 @@ impl HnswIndexRebuilder {
         SegmentFooter::deserialize(&footer_bytes)
     }
 
-    fn write_hnsw_page(
-        file: &mut File,
-        index: &HnswIndex,
-        compression: CompressionType,
-    ) -> Result<PagePointer> {
+    fn write_hnsw_page(file: &mut File, index: &HnswIndex) -> Result<PagePointer> {
         let index_data = index.serialize()?;
         let footer = PageFooter::Index(IndexPageFooter {
             num_entries: index.graph.links.num_points() as u32,
@@ -447,22 +441,7 @@ impl HnswIndexRebuilder {
         });
 
         file.seek(SeekFrom::End(0)).map_err(paro_error::io)?;
-        let codec = Self::compression_codec(compression);
-        PageIO::compress_and_write_page(
-            codec.as_deref(),
-            DEFAULT_MIN_SPACE_SAVING,
-            file,
-            &index_data,
-            &footer,
-        )
-    }
-
-    fn compression_codec(compression: CompressionType) -> Option<Box<dyn BlockCompressionCodec>> {
-        match compression {
-            CompressionType::None => None,
-            CompressionType::Lz4 => Some(Box::new(Lz4Codec)),
-            CompressionType::Zstd => Some(Box::new(ZstdCodec::default())),
-        }
+        PageIO::write_mmap_page(file, &index_data, &footer, HNSW_ARTIFACT_ALIGNMENT)
     }
 
     fn validate_compaction_indexes(

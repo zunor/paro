@@ -183,7 +183,8 @@ fn segment_artifact(
 
     let pointer = match definition.kind {
         SearchIndexKind::Hnsw => {
-            if !segment.has_hnsw_artifact(column_id) {
+            let expected = definition.hnsw_provider_config()?.build_contract();
+            if !segment.hnsw_artifact_matches_contract(column_id, &expected)? {
                 return Ok(None);
             }
             segment

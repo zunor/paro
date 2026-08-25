@@ -332,7 +332,7 @@ fn build_hnsw_segment_sidecar_artifact(
     )?;
     let bytes = index.serialize()?;
     let checksum = seahash::hash(&bytes);
-    let provider_stats = HnswProviderStats::from(&HnswIndexStatistics::collect(&index));
+    let provider_stats = HnswProviderStats::from(&HnswIndexStatistics::collect(&index)?);
     let bytes_on_disk = bytes.len() as u64;
 
     Ok(super::inline_sink::InlineArtifactBuildResult {

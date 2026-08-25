@@ -15,7 +15,7 @@ use crate::rowset::{RowsetId, RowsetSharedPtr};
 use crate::tablet::{ColumnId, RowsetPublishObserver, TabletId, TabletRef};
 use paro_common::error::{self as paro_error, Result};
 
-use super::artifact::{ArtifactGcContext, ArtifactLocation, GcDecision};
+use super::artifact::{ArtifactFileId, ArtifactGcContext, ArtifactLocation, GcDecision};
 use super::capability::{
     CapabilityToken, SearchArtifactRef, SearchCapability, SearchDefinitionOrigin,
     SearchIndexDefinition, SearchIndexKind,
@@ -60,7 +60,7 @@ use super::manifest::{
     GenerationManifestRoot, LoadedManifest, ManifestDelta, ManifestDeltaEntry, ManifestShard,
     ManifestStore,
 };
-use super::sidecar::SidecarArtifactStore;
+use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::stats::MaintenancePriority;
 use super::tail::{TailEntryId, TailMutationKind, TailPendingSet};
@@ -73,6 +73,7 @@ const DEFINITION_LOCK_SHARDS: usize = 64;
 struct RetiredManifest {
     provider: SearchIndexKind,
     artifacts: Arc<GenerationArtifactSet>,
+    sidecar_file_ids: BTreeSet<ArtifactFileId>,
     paths: Vec<PathBuf>,
     retired_at: Instant,
 }
@@ -90,6 +91,9 @@ pub(crate) struct SearchIndexRegistry {
     /// shards in ascending order before taking `view_write_lock`.
     definition_locks: [Mutex<()>; DEFINITION_LOCK_SHARDS],
     retired: Mutex<Vec<RetiredManifest>>,
+    /// Long-lived mmap and decoded-reader owner. Query cursors borrow this
+    /// runtime; generation retirement performs lease-safe physical eviction.
+    reader_runtime: Arc<SearchReaderRuntime>,
     maintenance_scheduler: Arc<MaintenanceScheduler>,
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
 }
@@ -162,6 +166,9 @@ impl RowsetPublishObserver for SearchIndexRegistry {
 
 impl SearchIndexRegistry {
     pub(crate) fn new(tablet: TabletRef) -> Self {
+        let reader_runtime = Arc::new(SearchReaderRuntime::new(SidecarArtifactStore::new(
+            tablet.data_dir().clone(),
+        )));
         let registry = Self {
             manifests: ManifestStore::new(tablet.data_dir().to_path_buf()),
             tablet,
@@ -170,6 +177,7 @@ impl SearchIndexRegistry {
             lifecycle_lock: Mutex::new(()),
             definition_locks: std::array::from_fn(|_| Mutex::new(())),
             retired: Mutex::new(Vec::new()),
+            reader_runtime,
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
             hnsw_task_scheduler: RwLock::new(None),
         };
@@ -186,6 +194,10 @@ impl SearchIndexRegistry {
 
     pub(crate) fn bind_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
         *self.hnsw_task_scheduler.write().unwrap() = scheduler;
+    }
+
+    pub(crate) fn reader_runtime(&self) -> Arc<SearchReaderRuntime> {
+        Arc::clone(&self.reader_runtime)
     }
 
     fn hnsw_task_scheduler(&self) -> Option<Arc<TaskScheduler>> {
@@ -437,6 +449,48 @@ impl SearchIndexRegistry {
             return Ok(None);
         };
         Ok(search_generation_coverage_for_state(state))
+    }
+
+    /// Materialize one catalog definition through the same admission and
+    /// publication path used by background maintenance. CREATE INDEX calls
+    /// this before declaring the catalog entry ready: a visible definition
+    /// with permanently incomplete physical coverage is not a built index.
+    pub(crate) fn materialize_definition(
+        &self,
+        definition_id: u64,
+    ) -> Result<SearchGenerationCoverage> {
+        let mut previous = self.generation_coverage(definition_id)?.ok_or_else(|| {
+            paro_error::artifact_not_ready(format!(
+                "search definition {definition_id} has no materialized generation"
+            ))
+        })?;
+        while !previous.is_complete() {
+            let report = self.maintenance_sweep()?;
+            let next = self.generation_coverage(definition_id)?.ok_or_else(|| {
+                paro_error::artifact_not_ready(format!(
+                    "search definition {definition_id} disappeared while materializing"
+                ))
+            })?;
+            if next == previous {
+                let decision = report
+                    .definitions
+                    .iter()
+                    .find(|definition| definition.definition_id == definition_id)
+                    .map(|definition| {
+                        format!(
+                            "action={:?}, admission={:?}",
+                            definition.action, definition.admission
+                        )
+                    })
+                    .unwrap_or_else(|| "no maintenance decision".to_string());
+                return Err(paro_error::artifact_not_ready(format!(
+                    "search definition {definition_id} made no materialization progress ({}/{}, {decision})",
+                    next.indexed_segment_count, next.visible_segment_count
+                )));
+            }
+            previous = next;
+        }
+        Ok(previous)
     }
 
     pub(crate) fn catch_up_definition(&self, definition_id: u64) -> Result<usize> {
@@ -2195,11 +2249,27 @@ impl SearchIndexRegistry {
         if paths.is_empty() {
             return;
         }
+        let retired_path_set = paths.iter().cloned().collect::<BTreeSet<_>>();
+        let store = SidecarArtifactStore::new(self.tablet.data_dir().clone());
+        let sidecar_file_ids = manifest
+            .artifacts
+            .artifacts
+            .iter()
+            .filter_map(|artifact| match artifact.location {
+                ArtifactLocation::SidecarArtifactFile { file_id, .. }
+                    if retired_path_set.contains(&store.package_path(file_id)) =>
+                {
+                    Some(file_id)
+                }
+                _ => None,
+            })
+            .collect();
         let bytes = manifest_path_bytes(&paths);
         storage_metrics().record_search_generation_retired(provider, bytes);
         let retired = RetiredManifest {
             provider,
             artifacts: manifest.artifacts.clone(),
+            sidecar_file_ids,
             paths,
             retired_at: Instant::now(),
         };
@@ -2232,6 +2302,8 @@ impl SearchIndexRegistry {
                 "lease_released",
                 delay_us,
             );
+            self.reader_runtime
+                .evict_packages(&retired.sidecar_file_ids);
             self.manifests.remove_paths(&retired.paths);
         }
     }
@@ -3588,6 +3660,56 @@ mod tests {
                 .unwrap(),
             OpenSearchCursorResult::Opened(_)
         ));
+    }
+
+    #[test]
+    fn explicit_materialization_does_not_publish_incomplete_definition_as_ready() {
+        let root = TempDir::new().unwrap();
+        let table = create_table_with_root(root.path(), &[LogicalType::Varchar]);
+        table
+            .append(&test_chunk_from_vectors(vec![test_string_vector(&[
+                "create index backfills visible rows",
+            ])]))
+            .unwrap();
+
+        let provider_config = json!({"version": 1, "config": "simple"});
+        let definition = SearchIndexDefinition {
+            definition_id: 49,
+            table_id: table.tablet_id(),
+            name: "docs_fts_materialized".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![0],
+            expression: Some("to_tsvector('simple', col_0)".to_string()),
+            freshness_policy: SearchFreshnessPolicy::default_for_kind(SearchIndexKind::FullText),
+            config_fingerprint: SearchIndexDefinition::compute_config_fingerprint(
+                SearchIndexKind::FullText,
+                &[0],
+                Some("to_tsvector('simple', col_0)"),
+                &provider_config,
+            ),
+            provider_config,
+        };
+        table.register_search_definition(definition).unwrap();
+        assert!(!table
+            .search_generation_coverage(49)
+            .unwrap()
+            .expect("coverage before materialization")
+            .is_complete());
+
+        let coverage = table.search_registry().materialize_definition(49).unwrap();
+        assert!(coverage.is_complete());
+        assert_eq!(
+            coverage.indexed_segment_count,
+            coverage.visible_segment_count
+        );
+        let current = table.search_registry().view.load();
+        let manifest = current
+            .definitions
+            .get(&49)
+            .and_then(|state| state.manifest.as_ref())
+            .expect("manifest after explicit materialization");
+        assert!(manifest.tail_pending_entries.is_empty());
+        assert_eq!(manifest.artifacts.artifacts.len(), 1);
     }
 
     #[test]
