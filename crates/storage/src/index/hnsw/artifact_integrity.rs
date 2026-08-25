@@ -11,7 +11,7 @@
 //! pages and payload chunks are then authenticated once, immediately before
 //! their bytes become typed graph/scan views.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::{io::Read, io::Seek, io::SeekFrom, io::Write};
 
@@ -169,9 +169,15 @@ pub(crate) struct ArtifactIntegrity {
     directory_offset: usize,
     payload_states: PackedVerificationStates,
     checksum_page_states: PackedVerificationStates,
+    full_payload_state: AtomicU8,
 }
 
 impl ArtifactIntegrity {
+    #[inline(always)]
+    pub(crate) fn is_fully_verified(&self) -> bool {
+        self.full_payload_state.load(Ordering::Acquire) == CHUNK_VALID
+    }
+
     pub(crate) fn open(
         backing: ArtifactIntegrityBacking,
         descriptor: IntegrityDescriptor,
@@ -284,6 +290,7 @@ impl ArtifactIntegrity {
             directory_offset,
             payload_states: PackedVerificationStates::new(chunk_count),
             checksum_page_states: PackedVerificationStates::new(directory_count),
+            full_payload_state: AtomicU8::new(CHUNK_UNVERIFIED),
         }))
     }
 
@@ -307,11 +314,69 @@ impl ArtifactIntegrity {
                 self.protected_start
             )));
         }
+        match self.full_payload_state.load(Ordering::Acquire) {
+            CHUNK_VALID => return Ok(()),
+            CHUNK_CORRUPT => {
+                return Err(paro_error::data_corrupted(
+                    "HNSW artifact payload failed background integrity verification",
+                ))
+            }
+            CHUNK_UNVERIFIED | CHUNK_VERIFYING => {}
+            _ => unreachable!("HNSW full-payload integrity state is invalid"),
+        }
         let first = (offset - self.protected_start) / INTEGRITY_CHUNK_BYTES;
         let last = (end - 1 - self.protected_start) / INTEGRITY_CHUNK_BYTES;
         for chunk in first..=last {
-            self.verify_chunk(chunk)?;
+            if let Err(error) = self.verify_chunk(chunk) {
+                self.full_payload_state
+                    .store(CHUNK_CORRUPT, Ordering::Release);
+                return Err(error);
+            }
         }
+        Ok(())
+    }
+
+    /// Sequentially authenticate the complete immutable payload once. The
+    /// caller runs this outside query execution; after success, random graph
+    /// reads reduce to one acquire load instead of per-chunk division and
+    /// packed-state lookup. Lazy range verification remains active while this
+    /// pass is in progress, so first use never waits for the sweeper.
+    pub(crate) fn verify_all(&self) -> Result<()> {
+        loop {
+            match self.full_payload_state.compare_exchange(
+                CHUNK_UNVERIFIED,
+                CHUNK_VERIFYING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(CHUNK_VALID) => return Ok(()),
+                Err(CHUNK_CORRUPT) => {
+                    return Err(paro_error::data_corrupted(
+                        "HNSW artifact payload failed background integrity verification",
+                    ))
+                }
+                Err(CHUNK_VERIFYING) => {
+                    std::thread::yield_now();
+                }
+                Err(_) => unreachable!("HNSW full-payload integrity state is invalid"),
+            }
+        }
+
+        for chunk in 0..self.payload_states.count {
+            if let Err(error) = self.verify_chunk(chunk) {
+                self.full_payload_state
+                    .store(CHUNK_CORRUPT, Ordering::Release);
+                return Err(error);
+            }
+        }
+        if self.full_payload_state.load(Ordering::Acquire) == CHUNK_CORRUPT {
+            return Err(paro_error::data_corrupted(
+                "HNSW artifact payload failed background integrity verification",
+            ));
+        }
+        self.full_payload_state
+            .store(CHUNK_VALID, Ordering::Release);
         Ok(())
     }
 
@@ -731,6 +796,28 @@ mod tests {
         assert!(corrupted.verify_range(INTEGRITY_CHUNK_BYTES, 8).is_err());
         assert!(corrupted.verify_range(INTEGRITY_CHUNK_BYTES, 8).is_err());
         assert_eq!(corrupted.payload_states.load(1).unwrap(), CHUNK_CORRUPT);
+    }
+
+    #[test]
+    fn full_verification_publishes_one_global_fast_path_without_weakening_bounds() {
+        let mut data = vec![9_u8; INTEGRITY_CHUNK_BYTES * 3 + 17];
+        let descriptor = append_integrity_table(&mut data, 0).unwrap();
+        let integrity = ArtifactIntegrity::open(
+            ArtifactIntegrityBacking::Bytes(Bytes::from(data)),
+            descriptor,
+        )
+        .unwrap();
+
+        integrity.verify_all().unwrap();
+        assert_eq!(
+            integrity.full_payload_state.load(Ordering::Acquire),
+            CHUNK_VALID
+        );
+        assert_eq!(integrity.verified_chunk_count(), integrity.chunk_count());
+        integrity.verify_range(7, 11).unwrap();
+        assert!(integrity
+            .verify_range(descriptor.offset.saturating_add(1), 1)
+            .is_err());
     }
 
     #[test]

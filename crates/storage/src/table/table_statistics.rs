@@ -75,64 +75,15 @@ impl TableHandle {
         result
     }
 
-    /// Aggregate HNSW index statistics across visible rowsets.
-    pub fn hnsw_index_statistics(&self, column_id: ColumnId) -> Option<HnswIndexStatistics> {
-        // The immutable generation manifest is the physical source of truth:
-        // a generation-owned sidecar spans several segments and deliberately
-        // has no segment-local statistics entry. Inline-only low-level paths
-        // retain the segment aggregation below as a construction fallback
-        // when no generation has been published yet.
-        if let Some(stats) = self.search_registry.hnsw_index_statistics(column_id) {
-            return Some(stats);
-        }
-        let visible = self.max_version();
-        let rowsets = self.tablet().capture_consistent_rowsets(visible).ok()?;
-
-        let mut agg: Option<HnswIndexStatistics> = None;
-        for rowset in rowsets {
-            if rowset.load().is_err() {
-                continue;
-            }
-            for segment in rowset.segments() {
-                let Some(stats) = segment.hnsw_index_statistics(column_id) else {
-                    continue;
-                };
-                agg = Some(match agg {
-                    None => stats.clone(),
-                    Some(mut merged) => {
-                        merged.num_indexed_vectors = merged
-                            .num_indexed_vectors
-                            .saturating_add(stats.num_indexed_vectors);
-                        merged.dimension = merged.dimension.max(stats.dimension);
-                        merged.max_level = merged.max_level.max(stats.max_level);
-                        merged.m = merged.m.max(stats.m);
-                        merged.ef_construction = merged.ef_construction.max(stats.ef_construction);
-                        merged.graph_size_bytes = merged
-                            .graph_size_bytes
-                            .saturating_add(stats.graph_size_bytes);
-                        merged.storage_size_bytes = merged
-                            .storage_size_bytes
-                            .saturating_add(stats.storage_size_bytes);
-                        merged.total_graph_links = merged
-                            .total_graph_links
-                            .saturating_add(stats.total_graph_links);
-                        merged.level0_graph_links = merged
-                            .level0_graph_links
-                            .saturating_add(stats.level0_graph_links);
-                        merged.max_level0_degree =
-                            merged.max_level0_degree.max(stats.max_level0_degree);
-                        merged.avg_level0_degree = if merged.num_indexed_vectors == 0 {
-                            0.0
-                        } else {
-                            merged.level0_graph_links as f32 / merged.num_indexed_vectors as f32
-                        };
-                        merged
-                    }
-                });
-            }
-        }
-
-        agg
+    /// Statistics for one explicitly selected immutable HNSW generation.
+    /// Definition identity is required: column id alone is ambiguous when
+    /// multiple metrics or replacement definitions coexist.
+    pub fn hnsw_generation_statistics(
+        &self,
+        definition_id: u64,
+    ) -> paro_common::error::Result<Option<HnswIndexStatistics>> {
+        self.search_registry
+            .hnsw_generation_statistics(definition_id)
     }
 
     /// Aggregate sparse vector index statistics across visible rowsets.

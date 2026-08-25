@@ -19,8 +19,8 @@ use crate::index::bound_index::BoundIndex;
 use crate::index::predicate::{compare_bytes, value_to_bytes, Predicate};
 use crate::index::predicate_result::PredicateResult;
 use crate::index::{
-    ColumnId, ExactOrdinalPosting, ExactRowSet, Index, IndexAppendInfo, IndexBufferInfo,
-    IndexConstraintType, IndexStorageInfo, OrdinalRowSet,
+    ColumnId, ExactOrdinalPosting, ExactRowSet, ExactScalarKey, Index, IndexAppendInfo,
+    IndexBufferInfo, IndexConstraintType, IndexStorageInfo, OrdinalRowSet,
 };
 
 use super::{BitmapIndexReader, BitmapIndexWriter};
@@ -107,6 +107,9 @@ pub struct BitmapIndex {
     /// fixed-width encodings are not lexicographically ordered, so range
     /// predicates must use this typed access path rather than byte order.
     ordered_ordinals: Box<[usize]>,
+    /// Complete immutable posting catalog shared by every query-compiled
+    /// ordinal selection. Queries own only their accepted-ordinal bit set.
+    posting_catalog: Arc<[ExactOrdinalPosting]>,
     index_data: Bytes,
 }
 
@@ -149,6 +152,36 @@ impl BitmapIndex {
         if let Some(error) = sort_error.into_inner() {
             return Err(error.context("sort bitmap dictionary by SQL scalar semantics"));
         }
+        let mut posting_catalog = Vec::with_capacity(
+            reader
+                .num_values()
+                .saturating_add(usize::from(reader.has_null())),
+        );
+        for ordinal in 0..reader.num_values() {
+            posting_catalog.push(ExactOrdinalPosting::from_index(
+                u16::try_from(ordinal).map_err(|_| {
+                    paro_error::configuration_limit_exceeded(
+                        "bitmap dictionary exceeds exact ordinal width",
+                    )
+                })?,
+                ExactScalarKey::Value(
+                    reader
+                        .get_dict_value(ordinal)
+                        .expect("bitmap dictionary ordinal validated")
+                        .clone(),
+                ),
+                reader
+                    .bitmap(ordinal)
+                    .expect("bitmap posting ordinal validated"),
+            ));
+        }
+        if let Some(posting) = reader.null_bitmap() {
+            posting_catalog.push(ExactOrdinalPosting::from_index(
+                u16::MAX,
+                ExactScalarKey::Null,
+                posting,
+            ));
+        }
         Ok(Self {
             name: name.into(),
             constraint_type,
@@ -156,6 +189,7 @@ impl BitmapIndex {
             logical_types,
             reader,
             ordered_ordinals: ordered_ordinals.into_boxed_slice(),
+            posting_catalog: Arc::from(posting_catalog),
             index_data,
         })
     }
@@ -309,31 +343,16 @@ impl BitmapIndex {
         } else {
             0
         };
-        let mut postings = Vec::new();
         for ordinal in accepted.iter() {
             cardinality = cardinality.saturating_add(self.reader.bitmap_cardinality(ordinal)?);
-            postings.push(ExactOrdinalPosting::from_index(
-                u16::try_from(ordinal).ok()?,
-                self.reader.bitmap(ordinal)?,
-                self.reader.bitmap_fingerprint(ordinal)?,
-            ));
         }
-        if accepts_null {
-            if let Some(posting) = self.reader.null_bitmap() {
-                postings.push(ExactOrdinalPosting::from_index(
-                    u16::MAX,
-                    posting,
-                    self.reader.null_fingerprint(),
-                ));
-            }
-        }
-        Some(Arc::new(OrdinalRowSet::new(
+        Some(Arc::new(OrdinalRowSet::new_shared(
             self.column_ids[0],
             row_ordinals,
             accepted.into_words(),
             accepts_null,
             cardinality,
-            postings.into_boxed_slice(),
+            Arc::clone(&self.posting_catalog),
         )))
     }
 

@@ -9,7 +9,6 @@
 use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::tablet::ColumnId;
@@ -33,6 +32,19 @@ pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
+/// Deterministic deployment profile: one random graph score costs as much as
+/// this many scores over the sequential predicate-covering layout.
+pub const DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE: u32 = 24;
+/// Deterministic deployment profile for batched point-id gathers from base
+/// vector storage. It is independent from the covering-layout value so the two
+/// physical classes can be calibrated and pinned separately.
+pub const DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE: u32 = 24;
+/// Deterministic graph-work profile. HNSW level-0 neighborhoods overlap, so
+/// one unit of `ef` scores fewer unique points than the maximum degree. The
+/// runtime caps this value by the immutable generation's observed average
+/// degree; deployments may pin a measured value without process-local timing
+/// feedback changing plans.
+pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// Version 10 applies `ef_construct` on every HNSW layer. Earlier builders
@@ -82,11 +94,14 @@ impl PartialOrd for ScoredPoint {
 }
 
 impl Ord for ScoredPoint {
+    #[inline(always)]
     fn cmp(&self, other: &Self) -> Ordering {
-        // Compare by score (for use in BinaryHeap — max-heap by score)
-        match self.score.partial_cmp(&other.score) {
-            Some(Ordering::Equal) | None => self.idx.cmp(&other.idx),
-            Some(ord) => ord,
+        // `total_cmp` gives the heap a real total order even if corrupted or
+        // extension-provided vector data produces NaN. Falling back to point
+        // id for every unordered pair is not transitive and violates `Ord`.
+        match self.score.total_cmp(&other.score) {
+            Ordering::Equal => self.idx.cmp(&other.idx),
+            ordering => ordering,
         }
     }
 }
@@ -137,32 +152,75 @@ pub enum HnswFilterKind {
     Predicate,
 }
 
-/// Physical locality class used by exact/graph costing.
+/// Physical work owned by one exact scan.
 ///
-/// A predicate covering layout streams a compact row-major vector region;
-/// base-vector execution gathers point ids from postings. Their per-score
-/// costs differ enough that observations from one must never retune the other.
+/// A generation may contain both predicate-covering parts and freshly flushed
+/// base-vector parts. Keeping both row counts avoids an all-or-nothing plan
+/// cliff when one small tail segment has not acquired its covering artifact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HnswExactScanCostClass {
-    SequentialCovering,
-    IndexedBase,
+pub struct HnswExactScanWorkload {
+    pub sequential_rows: u64,
+    pub indexed_base_rows: u64,
 }
 
-impl HnswExactScanCostClass {
-    fn for_partitions(partitions: ExactRowPartitions<'_>) -> Self {
-        match partitions {
-            ExactRowPartitions::OrdinalPostings { .. } => Self::SequentialCovering,
-            ExactRowPartitions::Partitioned(row_set) => {
-                if row_set.physical_parts().all(|(_, part)| {
-                    Self::for_partitions(part.physical_partitions()) == Self::SequentialCovering
-                }) {
-                    Self::SequentialCovering
-                } else {
-                    Self::IndexedBase
+impl HnswExactScanWorkload {
+    pub const fn sequential(rows: u64) -> Self {
+        Self {
+            sequential_rows: rows,
+            indexed_base_rows: 0,
+        }
+    }
+
+    pub const fn indexed_base(rows: u64) -> Self {
+        Self {
+            sequential_rows: 0,
+            indexed_base_rows: rows,
+        }
+    }
+
+    pub const fn total_rows(self) -> u64 {
+        self.sequential_rows.saturating_add(self.indexed_base_rows)
+    }
+
+    fn for_partitions(
+        partitions: ExactRowPartitions<'_>,
+        has_covering_column: impl Fn(ColumnId) -> bool,
+    ) -> Self {
+        let mut workload = Self::sequential(0);
+        let mut pending = vec![partitions];
+        while let Some(partition) = pending.pop() {
+            match partition {
+                ExactRowPartitions::Dense(rows) => {
+                    workload.sequential_rows =
+                        workload.sequential_rows.saturating_add(u64::from(rows));
+                }
+                ExactRowPartitions::OrdinalSelection(row_set) => {
+                    // The complete scalar index established this cardinality
+                    // while compiling the ordinal selection. Re-summing every
+                    // selected posting here turns a cost-class lookup into
+                    // O(dictionary cardinality) work on every query.
+                    let rows = row_set.len();
+                    if has_covering_column(row_set.column_id()) {
+                        workload.sequential_rows = workload.sequential_rows.saturating_add(rows);
+                    } else {
+                        workload.indexed_base_rows =
+                            workload.indexed_base_rows.saturating_add(rows);
+                    }
+                }
+                ExactRowPartitions::Partitioned(row_set) => {
+                    pending.extend(
+                        row_set
+                            .physical_parts()
+                            .map(|(_, part)| part.physical_partitions()),
+                    );
+                }
+                ExactRowPartitions::Single(bitmap) => {
+                    workload.indexed_base_rows =
+                        workload.indexed_base_rows.saturating_add(bitmap.len());
                 }
             }
-            ExactRowPartitions::Single(_) => Self::IndexedBase,
         }
+        workload
     }
 }
 
@@ -193,36 +251,33 @@ impl<'a> HnswSearchFilter<'a> {
         }
     }
 
-    pub fn exact_scan_cost_class(self) -> HnswExactScanCostClass {
-        self.row_set()
-            .map_or(HnswExactScanCostClass::SequentialCovering, |row_set| {
-                HnswExactScanCostClass::for_partitions(row_set.physical_partitions())
-            })
+    pub fn exact_scan_workload(
+        self,
+        total_rows: u64,
+        has_covering_column: impl Fn(ColumnId) -> bool,
+    ) -> HnswExactScanWorkload {
+        self.row_set().map_or_else(
+            || HnswExactScanWorkload::sequential(total_rows),
+            |row_set| {
+                HnswExactScanWorkload::for_partitions(
+                    row_set.physical_partitions(),
+                    has_covering_column,
+                )
+            },
+        )
     }
 
-    /// Select the predicate-local graph when exact runtime cardinality proves
-    /// that the predicate-induced base graph has expected degree below one.
-    /// This is a per-segment connectivity decision, not a selectivity estimate:
-    /// a base graph that still admits multiple neighbors remains navigable and
-    /// does not need a second physical topology merely because its degree is
-    /// lower than that topology's configured build width.
-    pub fn uses_predicate_topology(
-        self,
-        topology: &HnswFilterTopologyContract,
-        total_rows: usize,
-        base_level0_degree: usize,
-    ) -> bool {
+    /// Whether the durable artifact contains a predicate-local topology for
+    /// at least one referenced scalar column. Cardinality alone cannot decide
+    /// whether that topology is useful: correlated predicates may disconnect
+    /// a broad subset while an independent selective predicate remains locally
+    /// navigable. The graph executor therefore consumes this as availability
+    /// and decides from observed phase-one admission/locality.
+    pub fn predicate_topology_available(self, topology: &HnswFilterTopologyContract) -> bool {
         match self {
-            Self::Predicate { row_set, columns } => {
-                if !columns
-                    .iter()
-                    .any(|column| topology.columns().contains(column))
-                {
-                    return false;
-                }
-                let admitted_edges = row_set.len().saturating_mul(base_level0_degree as u64);
-                admitted_edges < total_rows as u64
-            }
+            Self::Predicate { columns, .. } => columns
+                .iter()
+                .any(|column| topology.columns().contains(column)),
             Self::None | Self::Visibility(_) => false,
         }
     }
@@ -267,6 +322,15 @@ pub enum HnswQueryWideStrategy {
 pub enum HnswExactScanKind {
     BaseVectors,
     PredicateCovering,
+    /// One exact query combined generation-covering ranges with base-vector
+    /// ranges from partitions that have not acquired the covering layout yet.
+    Hybrid,
+}
+
+impl HnswExactScanKind {
+    pub const fn uses_predicate_covering(self) -> bool {
+        matches!(self, Self::PredicateCovering | Self::Hybrid)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -359,106 +423,39 @@ impl HnswSearchStrategy {
     }
 }
 
-/// Runtime-calibrated work units used to lower a query-wide HNSW decision to
-/// one immutable search partition.
+/// Immutable relative costs used to lower a query-wide HNSW decision to one
+/// physical search partition.
 ///
-/// A sequential covering score and a random graph score run the same distance
-/// kernel but have very different memory costs. The ratio depends on vector
-/// dimension, CPU cache hierarchy, mmap page size and current architecture;
-/// making it a durable provider constant causes replicas on different
-/// hardware to choose the wrong physical path. A conservative cold-start
-/// prior is therefore refined from completed exact-covering and graph searches
-/// in process-local, dimension-bucketed counters. This calibration affects
-/// performance only: exact row admission and result semantics are unchanged.
+/// Timing history must not silently alter query plans: it makes replicas and
+/// EXPLAIN disagree, lets unrelated tables contaminate one another, and never
+/// forgets cold-start samples. A deployment may benchmark and pin all three
+/// values in the search definition; all readers of that definition then make
+/// the same decision until the policy is explicitly changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswDistanceCostProfile {
+    pub sequential_covering_scores_per_random_score: u32,
+    pub indexed_base_scores_per_random_score: u32,
+    pub graph_scored_points_per_ef: u32,
+}
+
+impl Default for HnswDistanceCostProfile {
+    fn default() -> Self {
+        Self {
+            sequential_covering_scores_per_random_score:
+                DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+            indexed_base_scores_per_random_score: DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+        }
+    }
+}
+
+/// Deterministic work-unit conversion shared by optimizer and execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswDistanceCostModel;
 
-const HNSW_DISTANCE_DIMENSION_BUCKETS: usize = 17;
-const HNSW_DISTANCE_PARALLELISM_BUCKETS: usize = 6;
-const HNSW_DISTANCE_MIN_CALIBRATION_SCORES: u64 = 1_024;
-const HNSW_DISTANCE_MIN_RATIO: u64 = 4;
-const HNSW_DISTANCE_MAX_RATIO: u64 = 128;
 pub(crate) const HNSW_MIN_ROWS_PER_PARALLEL_EXACT_LANE: u64 = 16_384;
 
-struct HnswDistanceSample {
-    elapsed_ns: AtomicU64,
-    scores: AtomicU64,
-}
-
-impl HnswDistanceSample {
-    const fn new() -> Self {
-        Self {
-            elapsed_ns: AtomicU64::new(0),
-            scores: AtomicU64::new(0),
-        }
-    }
-
-    #[cfg(not(test))]
-    fn record(&self, elapsed_ns: u64, scores: u64) {
-        self.elapsed_ns
-            .fetch_add(elapsed_ns, AtomicOrdering::Relaxed);
-        self.scores.fetch_add(scores, AtomicOrdering::Relaxed);
-    }
-}
-
-fn calibrated_distance_ratio(
-    exact: &HnswDistanceSample,
-    graph: &HnswDistanceSample,
-) -> Option<u64> {
-    let exact_scores = exact.scores.load(AtomicOrdering::Relaxed);
-    let graph_scores = graph.scores.load(AtomicOrdering::Relaxed);
-    if exact_scores < HNSW_DISTANCE_MIN_CALIBRATION_SCORES
-        || graph_scores < HNSW_DISTANCE_MIN_CALIBRATION_SCORES
-    {
-        return None;
-    }
-    let exact_elapsed = exact.elapsed_ns.load(AtomicOrdering::Relaxed);
-    let graph_elapsed = graph.elapsed_ns.load(AtomicOrdering::Relaxed);
-    if exact_elapsed == 0 || graph_elapsed == 0 {
-        return None;
-    }
-    let numerator = u128::from(graph_elapsed).saturating_mul(u128::from(exact_scores));
-    let denominator = u128::from(exact_elapsed).saturating_mul(u128::from(graph_scores));
-    let rounded = numerator
-        .saturating_add(denominator / 2)
-        .checked_div(denominator)?;
-    Some(
-        u64::try_from(rounded)
-            .unwrap_or(u64::MAX)
-            .clamp(HNSW_DISTANCE_MIN_RATIO, HNSW_DISTANCE_MAX_RATIO),
-    )
-}
-
-static HNSW_EXACT_DISTANCE_SAMPLES: [[HnswDistanceSample; HNSW_DISTANCE_PARALLELISM_BUCKETS];
-    HNSW_DISTANCE_DIMENSION_BUCKETS] =
-    [const { [const { HnswDistanceSample::new() }; HNSW_DISTANCE_PARALLELISM_BUCKETS] };
-        HNSW_DISTANCE_DIMENSION_BUCKETS];
-static HNSW_GRAPH_DISTANCE_SAMPLES: [HnswDistanceSample; HNSW_DISTANCE_DIMENSION_BUCKETS] =
-    [const { HnswDistanceSample::new() }; HNSW_DISTANCE_DIMENSION_BUCKETS];
-
 impl HnswDistanceCostModel {
-    /// Cold-start prior. It deliberately favors an exact sequential covering
-    /// scan at the ambiguous crossover; its recall is deterministic and the
-    /// runtime calibration corrects an overly conservative choice after both
-    /// physical paths have produced representative samples.
-    pub const DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE: u64 = 24;
-
-    fn dimension_bucket(dimension: usize) -> usize {
-        if dimension <= 1 {
-            return 0;
-        }
-        let ceil_log2 = usize::BITS as usize - (dimension - 1).leading_zeros() as usize;
-        ceil_log2.min(HNSW_DISTANCE_DIMENSION_BUCKETS - 1)
-    }
-
-    fn parallelism_bucket(parallelism: usize) -> usize {
-        if parallelism <= 1 {
-            return 0;
-        }
-        let ceil_log2 = usize::BITS as usize - (parallelism - 1).leading_zeros() as usize;
-        ceil_log2.min(HNSW_DISTANCE_PARALLELISM_BUCKETS - 1)
-    }
-
     /// Return the exact number of independently scannable lanes used by the
     /// exact-score executor for this candidate cardinality. Costing and
     /// execution deliberately share this calculation: charging a query for
@@ -479,27 +476,29 @@ impl HnswDistanceCostModel {
             .max(1)
     }
 
-    pub fn sequential_scores_per_random_score(dimension: usize, parallelism: usize) -> u64 {
-        let dimension_bucket = Self::dimension_bucket(dimension);
-        let parallelism_bucket = Self::parallelism_bucket(parallelism);
-        calibrated_distance_ratio(
-            &HNSW_EXACT_DISTANCE_SAMPLES[dimension_bucket][parallelism_bucket],
-            &HNSW_GRAPH_DISTANCE_SAMPLES[dimension_bucket],
-        )
-        .unwrap_or(Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE)
+    pub fn exact_work(workload: HnswExactScanWorkload, profile: HnswDistanceCostProfile) -> u64 {
+        workload
+            .sequential_rows
+            .div_ceil(u64::from(
+                profile.sequential_covering_scores_per_random_score.max(1),
+            ))
+            .saturating_add(workload.indexed_base_rows.div_ceil(u64::from(
+                profile.indexed_base_scores_per_random_score.max(1),
+            )))
     }
 
-    pub fn sequential_work(candidate_rows: u64, dimension: usize, parallelism: usize) -> u64 {
-        candidate_rows.div_ceil(Self::sequential_scores_per_random_score(
-            dimension,
-            parallelism,
-        ))
-    }
-
-    pub fn graph_work(total_rows: u64, effective_ef: usize, level0_degree: usize) -> u64 {
+    pub fn graph_work(
+        total_rows: u64,
+        effective_ef: usize,
+        level0_degree: usize,
+        cost_profile: HnswDistanceCostProfile,
+    ) -> u64 {
         let navigation = total_rows.max(1).ilog2() as u64;
+        let unique_scores_per_ef = level0_degree
+            .max(1)
+            .min(cost_profile.graph_scored_points_per_ef.max(1) as usize);
         navigation.saturating_add(
-            (effective_ef.max(1) as u64).saturating_mul(level0_degree.max(1) as u64),
+            (effective_ef.max(1) as u64).saturating_mul(unique_scores_per_ef as u64),
         )
     }
 
@@ -510,64 +509,20 @@ impl HnswDistanceCostModel {
         level0_degree: usize,
         vector_dimension: usize,
         granted_parallelism: usize,
-        exact_scan_cost_class: HnswExactScanCostClass,
+        exact_scan_workload: HnswExactScanWorkload,
+        cost_profile: HnswDistanceCostProfile,
     ) -> bool {
-        let exact_parallelism =
-            Self::exact_scan_parallelism(candidate_rows.min(total_rows), granted_parallelism);
-        let exact_work = match exact_scan_cost_class {
-            HnswExactScanCostClass::SequentialCovering => Self::sequential_work(
-                candidate_rows.min(total_rows),
-                vector_dimension,
-                exact_parallelism,
-            ),
-            // Indexed gathers have no proven cold-start parallel speedup. Use
-            // the architecture prior unchanged until this physical class gets
-            // its own observation model; CPU count is admission capacity, not
-            // evidence of linear memory-latency scaling.
-            HnswExactScanCostClass::IndexedBase => candidate_rows
-                .min(total_rows)
-                .div_ceil(Self::DEFAULT_SEQUENTIAL_SCORES_PER_RANDOM_SCORE),
-        };
-        exact_work <= Self::graph_work(total_rows, effective_ef, level0_degree)
-    }
-
-    pub(crate) fn observe(
-        vector_dimension: usize,
-        elapsed_ns: u64,
-        scored_points: u64,
-        outcome: HnswSearchOutcome,
-        exact_parallelism: usize,
-    ) {
-        if elapsed_ns == 0 || scored_points == 0 || outcome.exact_fallback.is_some() {
-            return;
-        }
-        #[cfg(test)]
-        {
-            let _ = (
-                vector_dimension,
-                elapsed_ns,
-                scored_points,
-                outcome,
-                exact_parallelism,
-            );
-        }
-        #[cfg(not(test))]
-        {
-            let dimension_bucket = Self::dimension_bucket(vector_dimension);
-            match outcome.path {
-                HnswSearchPath::ExactScan(HnswExactScanKind::PredicateCovering) => {
-                    HNSW_EXACT_DISTANCE_SAMPLES[dimension_bucket]
-                        [Self::parallelism_bucket(exact_parallelism)]
-                    .record(elapsed_ns, scored_points);
-                }
-                HnswSearchPath::UnfilteredGraph
-                | HnswSearchPath::MaskedGraph
-                | HnswSearchPath::AdaptiveGraph => {
-                    HNSW_GRAPH_DISTANCE_SAMPLES[dimension_bucket].record(elapsed_ns, scored_points);
-                }
-                HnswSearchPath::ExactScan(HnswExactScanKind::BaseVectors) => {}
-            }
-        }
+        // The profile is measured for the complete physical executor, which
+        // already includes its admitted lane width. Dividing by CPU slots a
+        // second time would invent linear memory-bandwidth scaling and causes
+        // wide scans to win on high-core machines without evidence.
+        let _execution_shape = (vector_dimension, granted_parallelism);
+        debug_assert_eq!(
+            exact_scan_workload.total_rows(),
+            candidate_rows.min(total_rows)
+        );
+        let exact_work = Self::exact_work(exact_scan_workload, cost_profile);
+        exact_work <= Self::graph_work(total_rows, effective_ef, level0_degree, cost_profile)
     }
 }
 
@@ -582,7 +537,8 @@ pub struct HnswSegmentSearchInput {
     pub level0_degree: usize,
     pub vector_dimension: usize,
     pub parallelism: usize,
-    pub exact_scan_cost_class: HnswExactScanCostClass,
+    pub exact_scan_workload: HnswExactScanWorkload,
+    pub cost_profile: HnswDistanceCostProfile,
 }
 
 impl HnswQueryWideStrategy {
@@ -622,7 +578,8 @@ impl HnswQueryWideStrategy {
                     input.level0_degree,
                     input.vector_dimension,
                     input.parallelism,
-                    input.exact_scan_cost_class,
+                    input.exact_scan_workload,
+                    input.cost_profile,
                 ) {
                     HnswSearchStrategy::ExactScan
                 } else {
@@ -908,6 +865,7 @@ pub struct HnswSearchPolicy {
     pub ef_search: usize,
     pub plain_scan_threshold: usize,
     pub filtered_plain_scan_threshold: usize,
+    pub distance_cost: HnswDistanceCostProfile,
 }
 
 impl Default for HnswSearchPolicy {
@@ -916,6 +874,7 @@ impl Default for HnswSearchPolicy {
             ef_search: DEFAULT_HNSW_EF_SEARCH as usize,
             plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
             filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
+            distance_cost: HnswDistanceCostProfile::default(),
         }
     }
 }
@@ -1029,6 +988,13 @@ impl HnswConfig {
             ef_search: self.ef,
             plain_scan_threshold: self.plain_scan_threshold,
             filtered_plain_scan_threshold: self.filtered_plain_scan_threshold,
+            distance_cost: HnswDistanceCostProfile {
+                sequential_covering_scores_per_random_score:
+                    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+                indexed_base_scores_per_random_score:
+                    DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            },
         }
     }
 }
@@ -1200,7 +1166,8 @@ mod tests {
             32,
             32,
             1,
-            HnswExactScanCostClass::IndexedBase,
+            HnswExactScanWorkload::indexed_base(20_000),
+            HnswDistanceCostProfile::default(),
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
             120_000,
@@ -1209,16 +1176,34 @@ mod tests {
             32,
             32,
             1,
-            HnswExactScanCostClass::IndexedBase,
+            HnswExactScanWorkload::indexed_base(120_000),
+            HnswDistanceCostProfile::default(),
         ));
-        assert!(HnswDistanceCostModel::prefers_exact_scan(
+        assert_eq!(
+            HnswDistanceCostModel::exact_work(
+                HnswExactScanWorkload::indexed_base(100_000),
+                HnswDistanceCostProfile::default(),
+            ),
+            4_167
+        );
+        assert_eq!(
+            HnswDistanceCostModel::graph_work(
+                10_000_000,
+                160,
+                32,
+                HnswDistanceCostProfile::default(),
+            ),
+            3_863
+        );
+        assert!(!HnswDistanceCostModel::prefers_exact_scan(
             100_000,
             10_000_000,
             160,
             32,
             32,
             8,
-            HnswExactScanCostClass::IndexedBase,
+            HnswExactScanWorkload::indexed_base(100_000),
+            HnswDistanceCostProfile::default(),
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
             1_000_000,
@@ -1227,28 +1212,65 @@ mod tests {
             32,
             32,
             8,
-            HnswExactScanCostClass::IndexedBase,
+            HnswExactScanWorkload::indexed_base(1_000_000),
+            HnswDistanceCostProfile::default(),
         ));
     }
 
     #[test]
-    fn distance_cost_calibration_derives_and_bounds_the_observed_ratio() {
-        let exact = HnswDistanceSample::new();
-        exact.elapsed_ns.store(100_000, AtomicOrdering::Relaxed);
-        exact.scores.store(10_000, AtomicOrdering::Relaxed);
-        let graph = HnswDistanceSample::new();
-        graph.elapsed_ns.store(480_000, AtomicOrdering::Relaxed);
-        graph.scores.store(2_000, AtomicOrdering::Relaxed);
-        assert_eq!(calibrated_distance_ratio(&exact, &graph), Some(24));
-
-        graph.elapsed_ns.store(u64::MAX, AtomicOrdering::Relaxed);
+    fn graph_cost_caps_generation_degree_by_unique_scores_per_ef() {
+        let profile = HnswDistanceCostProfile::default();
+        assert!(!HnswDistanceCostModel::prefers_exact_scan(
+            5_000_000,
+            10_000_000,
+            8_192,
+            29,
+            32,
+            10,
+            HnswExactScanWorkload::sequential(5_000_000),
+            profile,
+        ));
+        assert!(HnswDistanceCostModel::prefers_exact_scan(
+            1_000_000,
+            10_000_000,
+            8_192,
+            29,
+            32,
+            10,
+            HnswExactScanWorkload::sequential(1_000_000),
+            profile,
+        ));
         assert_eq!(
-            calibrated_distance_ratio(&exact, &graph),
-            Some(HNSW_DISTANCE_MAX_RATIO)
+            HnswDistanceCostModel::graph_work(10_000_000, 8_192, 29, profile),
+            196_631
         );
-        assert_eq!(HnswDistanceCostModel::dimension_bucket(32), 5);
-        assert_eq!(HnswDistanceCostModel::dimension_bucket(33), 6);
-        assert_eq!(HnswDistanceCostModel::parallelism_bucket(3), 2);
+    }
+
+    #[test]
+    fn distance_cost_profile_is_explicit_and_physical_class_specific() {
+        let profile = HnswDistanceCostProfile {
+            sequential_covering_scores_per_random_score: 32,
+            indexed_base_scores_per_random_score: 8,
+            graph_scored_points_per_ef: 24,
+        };
+        assert_eq!(
+            HnswDistanceCostModel::exact_work(HnswExactScanWorkload::sequential(32_000), profile),
+            1_000
+        );
+        assert_eq!(
+            HnswDistanceCostModel::exact_work(HnswExactScanWorkload::indexed_base(32_000), profile,),
+            4_000
+        );
+        assert_eq!(
+            HnswDistanceCostModel::exact_work(
+                HnswExactScanWorkload {
+                    sequential_rows: 24_000,
+                    indexed_base_rows: 8_000,
+                },
+                profile,
+            ),
+            1_750
+        );
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_767, 8), 1);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(32_768, 8), 2);
         assert_eq!(HnswDistanceCostModel::exact_scan_parallelism(100_000, 8), 7);
@@ -1278,7 +1300,8 @@ mod tests {
                     level0_degree: 32,
                     vector_dimension: 32,
                     parallelism: 1,
-                    exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
+                    exact_scan_workload: HnswExactScanWorkload::indexed_base(matching_rows),
+                    cost_profile: policy.distance_cost,
                 },),
                 HnswSearchStrategy::ExactScan
             );
@@ -1296,7 +1319,8 @@ mod tests {
                 level0_degree: 32,
                 vector_dimension: 32,
                 parallelism: 1,
-                exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
+                exact_scan_workload: HnswExactScanWorkload::indexed_base(10_000),
+                cost_profile: policy.distance_cost,
             }),
             HnswSearchStrategy::ExactScan
         );
@@ -1309,31 +1333,29 @@ mod tests {
                 level0_degree: 32,
                 vector_dimension: 32,
                 parallelism: 1,
-                exact_scan_cost_class: HnswExactScanCostClass::IndexedBase,
+                exact_scan_workload: HnswExactScanWorkload::indexed_base(100_000),
+                cost_profile: policy.distance_cost,
             }),
             HnswSearchStrategy::AdaptiveFilteredGraph
         );
     }
 
     #[test]
-    fn predicate_topology_is_selected_only_for_configured_predicate_columns() {
+    fn predicate_topology_availability_depends_on_contract_not_selectivity() {
         let rows = roaring::RoaringBitmap::from_iter([1, 2, 3]);
         let topology = HnswFilterTopologyContract::from_columns(&[4, 7], 20_000, 8).unwrap();
 
-        assert!(
-            HnswSearchFilter::predicate(&rows, &[7]).uses_predicate_topology(&topology, 100, 32)
-        );
-        assert!(
-            !HnswSearchFilter::predicate(&rows, &[8]).uses_predicate_topology(&topology, 100, 32)
-        );
-        assert!(!HnswSearchFilter::Visibility(&rows).uses_predicate_topology(&topology, 100, 32));
+        assert!(HnswSearchFilter::predicate(&rows, &[7]).predicate_topology_available(&topology));
+        assert!(!HnswSearchFilter::predicate(&rows, &[8]).predicate_topology_available(&topology));
+        assert!(!HnswSearchFilter::Visibility(&rows).predicate_topology_available(&topology));
 
         let broad_rows = roaring::RoaringBitmap::from_iter(0..50);
-        assert!(!HnswSearchFilter::predicate(&broad_rows, &[7])
-            .uses_predicate_topology(&topology, 100, 32));
+        assert!(
+            HnswSearchFilter::predicate(&broad_rows, &[7]).predicate_topology_available(&topology)
+        );
 
         let connected_rows = roaring::RoaringBitmap::from_iter(0..4);
-        assert!(!HnswSearchFilter::predicate(&connected_rows, &[7])
-            .uses_predicate_topology(&topology, 100, 32));
+        assert!(HnswSearchFilter::predicate(&connected_rows, &[7])
+            .predicate_topology_available(&topology));
     }
 }

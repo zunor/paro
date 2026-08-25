@@ -1193,7 +1193,7 @@ impl StorageMetrics {
             HnswSearchPath::ExactScan(kind) => {
                 self.search_hnsw_exact_segment_searches_total
                     .fetch_add(1, Ordering::Relaxed);
-                if kind == HnswExactScanKind::PredicateCovering {
+                if kind.uses_predicate_covering() {
                     self.search_hnsw_predicate_covering_segment_scans_total
                         .fetch_add(1, Ordering::Relaxed);
                 }
@@ -1224,7 +1224,10 @@ impl StorageMetrics {
             self.search_hnsw_predicate_topology_segment_searches_total
                 .fetch_add(1, Ordering::Relaxed);
         }
-        if outcome.exact_fallback == Some(HnswExactScanKind::PredicateCovering) {
+        if outcome
+            .exact_fallback
+            .is_some_and(HnswExactScanKind::uses_predicate_covering)
+        {
             self.search_hnsw_predicate_covering_segment_scans_total
                 .fetch_add(1, Ordering::Relaxed);
         }

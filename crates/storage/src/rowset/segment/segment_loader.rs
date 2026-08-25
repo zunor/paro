@@ -506,6 +506,7 @@ impl Segment {
                 page_start,
                 artifact_len,
             )?);
+            HnswIndex::schedule_background_integrity_verification(&index);
             let statistics = index.persisted_statistics().cloned().ok_or_else(|| {
                 paro_error::data_corrupted("HNSW artifact is missing persisted statistics")
             })?;

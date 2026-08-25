@@ -1599,6 +1599,7 @@ mod tests {
             is_unique: false,
             if_not_exists: false,
             fulltext_config: None,
+            provider_config_json: "{}".to_string(),
         };
         handler
             .replay_create_index("main", "idx_users_id", &payload, 42)
@@ -1616,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn test_catalog_replay_create_index_metadata_only_ready() {
+    fn test_catalog_replay_create_index_preserves_provider_config() {
         let catalog = Arc::new(ParoCatalog::new("test".to_string()));
         catalog.initialize(false);
         ensure_main_schema(&catalog);
@@ -1638,6 +1639,9 @@ mod tests {
             is_unique: false,
             if_not_exists: false,
             fulltext_config: None,
+            // Replay is an opaque transport boundary. Provider validation is
+            // performed when the search definition is registered.
+            provider_config_json: r#"{"marker":"preserved"}"#.to_string(),
         };
         handler
             .replay_create_index("main", "idx_users_hnsw", &payload, 42)
@@ -1652,6 +1656,10 @@ mod tests {
         assert_eq!(index.build_state(), IndexBuildState::Ready);
         assert_eq!(index.base.base.object_id.raw(), 43);
         assert_eq!(index.failure_reason(), None);
+        assert_eq!(
+            index.provider_config,
+            serde_json::json!({"marker": "preserved"})
+        );
     }
 
     #[test]
@@ -2420,6 +2428,7 @@ mod tests {
                         is_unique: false,
                         if_not_exists: false,
                         fulltext_config: None,
+                        provider_config_json: "{}".to_string(),
                     }),
                 },
                 DdlChangeRecord {
@@ -2702,6 +2711,7 @@ mod tests {
             is_unique: false,
             if_not_exists: false,
             fulltext_config: None,
+            provider_config_json: "{}".to_string(),
         };
         handler
             .replay_create_index("main", "idx_users_id", &payload, 42)

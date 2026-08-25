@@ -8,8 +8,8 @@
 //! - Memory tagged for tracking (e.g., hash tables, sorting)
 
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicI32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, AtomicPtr, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 
 use paro_common::allocator::{Allocator, MemoryTag};
 use paro_common::error::{self as paro_error, Result};
@@ -58,10 +58,16 @@ pub struct BlockHandle {
     state: AtomicU8,
     /// Number of active pins (readers)
     pin_count: AtomicI32,
+    /// Serializes the two lifecycle transitions that cannot be expressed by
+    /// independent `state` and `pin_count` atomics: publishing a pin against a
+    /// loaded allocation, and detaching an unpinned allocation for eviction.
+    lifecycle: Mutex<()>,
     /// Allocated memory size
     size: usize,
-    /// Pointer to allocated memory
-    buffer: Option<NonNull<u8>>,
+    /// Atomically published allocation address. Lifecycle transitions remain
+    /// serialized by `lifecycle`; pinned readers only need an acquire load and
+    /// never contend on that mutex.
+    buffer: AtomicPtr<u8>,
     /// Allocator for memory management
     allocator: Arc<dyn Allocator>,
     /// Whether this block can be evicted when unpinned
@@ -88,7 +94,7 @@ impl std::fmt::Debug for BlockHandle {
             .field("state", &self.state)
             .field("pin_count", &self.pin_count)
             .field("size", &self.size)
-            .field("buffer", &self.buffer)
+            .field("buffer", &self.buffer.load(Ordering::Acquire))
             .field("can_destroy", &self.can_destroy)
             .field("buffer_type", &self.buffer_type)
             .field("eviction_seq_num", &self.eviction_seq_num)
@@ -97,12 +103,6 @@ impl std::fmt::Debug for BlockHandle {
             .finish()
     }
 }
-
-// SAFETY: BlockHandle is Send/Sync because:
-// - Atomics are inherently thread-safe
-// - Buffer access is protected by pin_count semantics
-unsafe impl Send for BlockHandle {}
-unsafe impl Sync for BlockHandle {}
 
 impl BlockHandle {
     /// Create a new unloaded block handle.
@@ -120,7 +120,8 @@ impl BlockHandle {
             state: AtomicU8::new(BlockState::Unloaded as u8),
             pin_count: AtomicI32::new(0),
             size,
-            buffer: None,
+            lifecycle: Mutex::new(()),
+            buffer: AtomicPtr::new(std::ptr::null_mut()),
             allocator,
             can_destroy,
             buffer_type,
@@ -154,7 +155,8 @@ impl BlockHandle {
             state: AtomicU8::new(BlockState::Loaded as u8),
             pin_count: AtomicI32::new(1), // Start pinned
             size,
-            buffer: Some(ptr),
+            lifecycle: Mutex::new(()),
+            buffer: AtomicPtr::new(ptr.as_ptr()),
             allocator,
             can_destroy,
             buffer_type,
@@ -212,13 +214,25 @@ impl BlockHandle {
         self.pin_count() > 0
     }
 
+    /// Try to publish one pin against the current loaded allocation.
+    ///
+    /// The lifecycle lock closes the check-then-pin race with eviction. A
+    /// caller that observes `None` must load the block before retrying.
+    pub(crate) fn try_pin(&self) -> Option<i32> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        if self.state() != BlockState::Loaded {
+            return None;
+        }
+        Some(self.pin_count.fetch_add(1, Ordering::AcqRel) + 1)
+    }
+
     /// Increment pin count. Returns new count.
     ///
     /// # Panics
-    /// Panics if block is not loaded.
+    /// Panics if block is not loaded. Buffer-pool callers should use
+    /// [`Self::try_pin`] when eviction may race with acquisition.
     pub fn pin(&self) -> i32 {
-        debug_assert!(self.is_loaded(), "Cannot pin unloaded block");
-        self.pin_count.fetch_add(1, Ordering::AcqRel) + 1
+        self.try_pin().expect("Cannot pin unloaded block")
     }
 
     /// Decrement pin count. Returns new count.
@@ -314,7 +328,7 @@ impl BlockHandle {
     /// Caller must ensure block is pinned before accessing.
     #[inline]
     pub fn data_ptr(&self) -> Option<*mut u8> {
-        self.buffer.map(|p| p.as_ptr())
+        NonNull::new(self.buffer.load(Ordering::Acquire)).map(NonNull::as_ptr)
     }
 
     /// Get data as a mutable slice.
@@ -326,7 +340,7 @@ impl BlockHandle {
     #[inline]
     #[allow(clippy::mut_from_ref)] // Interior mutability via raw pointer is intentional
     pub unsafe fn data_mut(&self) -> Option<&mut [u8]> {
-        self.buffer
+        NonNull::new(self.buffer.load(Ordering::Acquire))
             .map(|p| std::slice::from_raw_parts_mut(p.as_ptr(), self.size))
     }
 
@@ -336,7 +350,7 @@ impl BlockHandle {
     /// Caller must ensure block is pinned.
     #[inline]
     pub unsafe fn data(&self) -> Option<&[u8]> {
-        self.buffer
+        NonNull::new(self.buffer.load(Ordering::Acquire))
             .map(|p| std::slice::from_raw_parts(p.as_ptr(), self.size))
     }
 
@@ -378,40 +392,49 @@ impl BlockHandle {
     /// # Panics
     /// Panics if the block cannot be unloaded (has active readers or other constraints).
     pub fn unload_and_take_block<F>(
-        &mut self,
+        &self,
         has_temp_directory: bool,
         mut write_to_temp_file: F,
     ) -> Result<Option<Vec<u8>>>
     where
         F: FnMut(BlockId, &[u8]) -> Result<()>,
     {
+        let _lifecycle = self.lifecycle.lock().unwrap();
         if self.state() == BlockState::Unloaded {
             // Already unloaded: nothing to do
             return Ok(None);
         }
 
-        if !self.can_unload_check(has_temp_directory) {
+        // A queue node is only a hint. A pin may have been published after the
+        // node was dequeued, so eligibility must be rechecked while holding the
+        // same lifecycle lock used by `try_pin`.
+        if self.pin_count() > 0 || !self.can_destroy {
+            return Ok(None);
+        }
+        if self.must_write_to_disk() && !has_temp_directory {
             return Err(paro_error::internal(format!(
-                "Cannot unload block {}: has_temp_directory={}, state={:?}, pin_count={}",
-                self.block_id,
-                has_temp_directory,
-                self.state(),
-                self.pin_count()
+                "Cannot unload block {} without a temporary directory",
+                self.block_id
             )));
         }
 
+        let buffer = self.buffer.load(Ordering::Acquire);
         // If this is a temporary block that must be persisted, write it to disk
         if self.must_write_to_disk() {
-            if let Some(ptr) = self.buffer {
-                // SAFETY: We have exclusive access via &mut self
+            if let Some(ptr) = NonNull::new(buffer) {
+                // SAFETY: The lifecycle lock excludes pin publication and the
+                // zero pin count proves no reader can retain this allocation.
                 let data = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.size) };
                 write_to_temp_file(self.block_id, data)?;
             }
         }
 
         // Take ownership of the buffer
-        let buffer = if let Some(ptr) = self.buffer.take() {
-            // SAFETY: We have exclusive access and are taking ownership
+        let detached = if let Some(ptr) =
+            NonNull::new(self.buffer.swap(std::ptr::null_mut(), Ordering::AcqRel))
+        {
+            // SAFETY: The lifecycle lock and zero pin count give exclusive
+            // ownership while the allocation is copied and released.
             let data = unsafe { std::slice::from_raw_parts(ptr.as_ptr(), self.size) };
             let vec = data.to_vec();
             // Free the original allocation
@@ -425,14 +448,14 @@ impl BlockHandle {
         self.state
             .store(BlockState::Unloaded as u8, Ordering::Release);
 
-        Ok(buffer)
+        Ok(detached)
     }
 
     /// Unload the block (deallocate memory).
     ///
     /// This is a convenience wrapper around `unload_and_take_block` that
     /// discards the buffer instead of returning it.
-    pub fn unload<F>(&mut self, has_temp_directory: bool, write_to_temp_file: F) -> Result<()>
+    pub fn unload<F>(&self, has_temp_directory: bool, write_to_temp_file: F) -> Result<()>
     where
         F: FnMut(BlockId, &[u8]) -> Result<()>,
     {
@@ -465,28 +488,38 @@ impl BlockHandle {
             std::ptr::copy_nonoverlapping(buffer.as_ptr(), ptr, self.size);
         }
 
-        // Store the buffer pointer
-        // SAFETY: We just allocated this memory and have exclusive access
-        let non_null = unsafe { NonNull::new_unchecked(ptr) };
+        // SAFETY: The allocator returned a valid allocation of `self.size`.
+        self.install_buffer(unsafe { NonNull::new_unchecked(ptr) })
+    }
 
-        // Use atomic operations to safely update the buffer pointer
-        // Note: This is a simplified approach. In a production system, we might need
-        // more sophisticated synchronization.
-        let old_buffer = unsafe {
-            // Cast to *mut Option<NonNull<u8>> to update atomically
-            let buffer_ptr = &self.buffer as *const Option<NonNull<u8>> as *mut Option<NonNull<u8>>;
-            std::ptr::replace(buffer_ptr, Some(non_null))
-        };
+    /// Reconstruct an evicted scratch block directly in its final allocation.
+    /// This avoids a temporary `Vec` plus a second full-size copy for large
+    /// query workspaces.
+    pub(crate) fn reconstruct_zeroed(&self) -> Result<()> {
+        let ptr = self.allocator.allocate_zeroed(self.size)?;
+        // SAFETY: The allocator returned a valid zeroed allocation of
+        // `self.size`, owned exclusively by this unloaded block.
+        self.install_buffer(unsafe { NonNull::new_unchecked(ptr) })
+    }
 
-        // Free old buffer if it exists
-        if let Some(old_ptr) = old_buffer {
-            self.allocator.free(old_ptr.as_ptr(), self.size);
+    fn install_buffer(&self, non_null: NonNull<u8>) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().unwrap();
+        if self.state() != BlockState::Unloaded
+            || !self.buffer.load(Ordering::Acquire).is_null()
+            || self.pin_count() != 0
+        {
+            self.allocator.free(non_null.as_ptr(), self.size);
+            return Err(paro_error::internal(format!(
+                "cannot install allocation into loaded block {}",
+                self.block_id
+            )));
         }
+        self.buffer.store(non_null.as_ptr(), Ordering::Release);
 
-        // Mark as loaded
+        // Publish the pointer before the loaded state. `try_pin` takes the same
+        // lifecycle lock and therefore cannot observe a half-published block.
         self.state
             .store(BlockState::Loaded as u8, Ordering::Release);
-
         Ok(())
     }
 }
@@ -494,7 +527,7 @@ impl BlockHandle {
 impl Drop for BlockHandle {
     fn drop(&mut self) {
         // Deallocate buffer if still loaded
-        if let Some(ptr) = self.buffer.take() {
+        if let Some(ptr) = NonNull::new(*self.buffer.get_mut()) {
             self.allocator.free(ptr.as_ptr(), self.size);
         }
     }
@@ -593,7 +626,7 @@ mod tests {
 
     #[test]
     fn test_unload() {
-        let mut handle = BlockHandle::allocate(
+        let handle = BlockHandle::allocate(
             1,
             MemoryTag::InMemoryTable,
             1024,
@@ -619,7 +652,7 @@ mod tests {
 
     #[test]
     fn test_unload_and_take_block() {
-        let mut handle = BlockHandle::allocate(
+        let handle = BlockHandle::allocate(
             1,
             MemoryTag::InMemoryTable,
             1024,
@@ -656,7 +689,7 @@ mod tests {
 
     #[test]
     fn test_unload_with_temp_file_write() {
-        let mut handle = BlockHandle::allocate(
+        let handle = BlockHandle::allocate(
             1,
             MemoryTag::OrderBy,
             1024,

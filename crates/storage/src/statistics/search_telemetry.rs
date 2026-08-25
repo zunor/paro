@@ -112,7 +112,7 @@ impl SearchTelemetry {
                 self.hnsw_exact_scan_count = self.hnsw_exact_scan_count.saturating_add(1);
                 self.hnsw_predicate_covering_scan_count = self
                     .hnsw_predicate_covering_scan_count
-                    .saturating_add(u64::from(kind == HnswExactScanKind::PredicateCovering));
+                    .saturating_add(u64::from(kind.uses_predicate_covering()));
             }
             HnswSearchPath::UnfilteredGraph => {
                 self.hnsw_unfiltered_graph_count =
@@ -136,7 +136,10 @@ impl SearchTelemetry {
         self.hnsw_predicate_topology_count = self
             .hnsw_predicate_topology_count
             .saturating_add(u64::from(outcome.predicate_topology_used));
-        if outcome.exact_fallback == Some(HnswExactScanKind::PredicateCovering) {
+        if outcome
+            .exact_fallback
+            .is_some_and(HnswExactScanKind::uses_predicate_covering)
+        {
             self.hnsw_predicate_covering_scan_count =
                 self.hnsw_predicate_covering_scan_count.saturating_add(1);
         }

@@ -151,7 +151,7 @@ impl PhysicalPlanGenerator {
             LogicalOperator::Limit(limit) => self.lower_limit(limit)?,
             LogicalOperator::Order(order) => self.lower_order(order)?,
             LogicalOperator::TopN(topn) => self.lower_topn(topn)?,
-            LogicalOperator::SearchScan(scan) => self.lower_search_scan(scan)?,
+            LogicalOperator::SearchScan(scan) => self.lower_search_scan(scan, logical)?,
             LogicalOperator::Aggregate(aggregate) => self.lower_aggregate(aggregate)?,
             LogicalOperator::Distinct(distinct) => self.lower_distinct(distinct)?,
             LogicalOperator::Join(join) => {

@@ -114,7 +114,7 @@ impl SearchOptimizer {
             if !capability.is_queryable() {
                 return Ok(None);
             }
-            let Some(stats) = storage.hnsw_index_statistics(intent.column_id) else {
+            let Some(stats) = capability.generation_stats.hnsw_index_statistics()? else {
                 return Ok(None);
             };
             let Some(search_policy) =

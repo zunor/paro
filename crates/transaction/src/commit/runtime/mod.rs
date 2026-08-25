@@ -74,8 +74,8 @@ impl CommitRuntime {
         let finalize_hooks = CommitFinalizeStageHooks {
             on_submission: {
                 let completions = Arc::clone(&completions);
-                Arc::new(move |submission, ack_policy| {
-                    completions.mark_publish_submitted(submission.commit_ts, ack_policy);
+                Arc::new(move |submission, _ack_policy| {
+                    completions.mark_publish_submitted(submission.commit_ts);
                 })
             },
             on_registered: {
@@ -1064,6 +1064,36 @@ mod tests {
         assert_eq!(journal.appended.lock().unwrap()[0].len(), 1);
         assert_eq!(runtime.inner.completions.slot_count(), 0);
         runtime.finalize_stage().force_shutdown();
+    }
+
+    #[test]
+    fn completion_preserves_durable_only_ack_when_publish_completes_before_submit_hook() {
+        let completions = CommitCompletionRegistry::default();
+        let completion = completions.allocate();
+        let handle = recovery_handle(1, CommitTs::new(1), 64);
+        completions.mark_durable(completion, handle, CommitAckPolicy::DurableOnlyAsync);
+
+        // Some apply runtimes may invoke the completion callback inline from
+        // submit. The submission hook still owns acknowledgement policy.
+        completions.mark_published(CommitTs::new(1));
+        completions.mark_publish_submitted(CommitTs::new(1));
+
+        let outcome = completions.wait(completion).unwrap();
+        assert_eq!(outcome.ack, CommitRuntimeAck::DurableOnly);
+    }
+
+    #[test]
+    fn completion_joins_publish_and_submit_events_in_either_order() {
+        let completions = CommitCompletionRegistry::default();
+        let completion = completions.allocate();
+        let handle = recovery_handle(1, CommitTs::new(1), 64);
+        completions.mark_durable(completion, handle, CommitAckPolicy::RequiredPublished);
+
+        completions.mark_published(CommitTs::new(1));
+        completions.mark_publish_submitted(CommitTs::new(1));
+
+        let outcome = completions.wait(completion).unwrap();
+        assert_eq!(outcome.ack, CommitRuntimeAck::Published);
     }
 
     #[test]

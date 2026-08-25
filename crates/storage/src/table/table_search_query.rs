@@ -136,13 +136,15 @@ impl TableHandle {
                 read_options,
             )?
         };
+        let reader_runtime = self.search_registry.reader_runtime();
+        reader_runtime.bind_buffer_pool(read_options.buffer_pool())?;
         let snapshot = SearchReadSnapshot::new(
             table_snapshot,
             kind,
             generation,
             table_lease,
             generation_lease,
-            self.search_registry.reader_runtime(),
+            reader_runtime,
         )
         .with_derived_lag_lease(derived_lag_lease)
         .with_overlay_delete_vectors(overlay.and_then(TxnOverlayReader::delete_vectors));

@@ -358,6 +358,7 @@ impl PhysicalPlanGenerator {
     pub(crate) fn lower_search_scan(
         &mut self,
         scan: &LogicalSearchScan,
+        logical: &LogicalPlan,
     ) -> Result<(PhysicalNodeKind, Vec<PhysicalPlanNodeId>)> {
         let table =
             scan.get.get_table().cloned().ok_or_else(|| {
@@ -374,40 +375,74 @@ impl PhysicalPlanGenerator {
                 Vec::new(),
             ));
         }
-        let (projected_columns, emit_score) = direct_search_projection(scan)?;
-        let output_names = align_output_names(
+        let projection = lower_search_projection(scan)?;
+        let final_output_names = align_output_names(
             scan.output_names.clone(),
             scan.get_types().len(),
             "search scan output",
         )?
         .into_boxed_slice();
-        let output_types = scan.get_types().into_boxed_slice();
+        let final_output_types = scan.get_types().into_boxed_slice();
+        let (source_output_names, source_output_types) = if projection.is_identity {
+            (final_output_names.clone(), final_output_types.clone())
+        } else {
+            (
+                projection.source_output_names.clone(),
+                projection.source_output_types.clone(),
+            )
+        };
         let source = search_source_spec_for_candidate(
             table.clone(),
             candidate,
             scan,
             predicate,
-            projected_columns,
-            emit_score,
-            output_names.clone(),
-            output_types.clone(),
+            projection.projected_columns,
+            true,
+            source_output_names.clone(),
+            source_output_types.clone(),
         )?;
 
-        if matches!(scan.decision, SearchDecision::Adaptive { .. }) {
-            return Ok((
-                PhysicalNodeKind::AdaptiveSearch(AdaptiveSearchSpec {
-                    table,
-                    request: scan.request.clone(),
-                    decision: scan.decision.clone(),
-                    selected: Box::new(source),
-                    output_names,
-                    output_types,
-                }),
-                Vec::new(),
-            ));
+        let source_kind = if matches!(scan.decision, SearchDecision::Adaptive { .. }) {
+            PhysicalNodeKind::AdaptiveSearch(AdaptiveSearchSpec {
+                table,
+                request: scan.request.clone(),
+                decision: scan.decision.clone(),
+                selected: Box::new(source),
+                output_names: source_output_names.clone(),
+                output_types: source_output_types.clone(),
+            })
+        } else {
+            physical_search_source_kind(source)
+        };
+
+        if projection.is_identity {
+            return Ok((source_kind, Vec::new()));
         }
 
-        Ok((physical_search_source_kind(source), Vec::new()))
+        let source_output = RowType::with_identities(
+            source_output_names.to_vec(),
+            source_output_types.to_vec(),
+            source_output_names
+                .iter()
+                .cloned()
+                .map(ColumnIdentity::internal_named)
+                .collect(),
+        );
+        let source_id = self.push_node(
+            source_kind,
+            source_output,
+            Vec::new(),
+            OperatorLabel::new(logical.id, "SEARCH_SOURCE"),
+            logical.stats.estimated_cardinality,
+        );
+        Ok((
+            PhysicalNodeKind::Project(ProjectSpec {
+                expressions: projection.expressions,
+                output_names: final_output_names,
+                visible_count: scan.output_names.len().min(scan.projections.len()),
+            }),
+            vec![source_id],
+        ))
     }
 
     pub(crate) fn lower_order(
@@ -498,35 +533,166 @@ fn search_scan_predicate(
     Ok((predicate_tree, residual))
 }
 
-fn direct_search_projection(scan: &LogicalSearchScan) -> Result<(Box<[usize]>, bool)> {
-    if scan.score_projection_index + 1 != scan.projections.len() {
-        return Err(paro_error::internal(
-            "search source requires the score projection to be the final output column",
-        ));
+struct SearchProjectionLowering {
+    projected_columns: Box<[usize]>,
+    source_output_names: Box<[String]>,
+    source_output_types: Box<[LogicalType]>,
+    expressions: Box<[Expression]>,
+    is_identity: bool,
+}
+
+/// Lower the absorbed SQL projection against a minimal search-source schema.
+///
+/// A search provider owns row admission, ranking, and materialization of base
+/// columns. It must not grow a second expression evaluator merely because the
+/// ordered score is also used inside a visible expression. The source emits
+/// each referenced stored column once followed by the canonical raw score;
+/// ordinary projection evaluates every derived value above it. The common
+/// `base columns..., score` shape remains an identity and avoids that operator.
+fn lower_search_projection(scan: &LogicalSearchScan) -> Result<SearchProjectionLowering> {
+    let mut source_indexes = Vec::new();
+    for expression in &scan.projections {
+        collect_search_projection_sources(
+            expression,
+            &scan.score_expression,
+            &scan.get,
+            &mut source_indexes,
+        )?;
     }
 
-    let mut projected_columns = Vec::with_capacity(scan.projections.len().saturating_sub(1));
-    for (idx, expr) in scan.projections.iter().enumerate() {
-        if idx == scan.score_projection_index {
-            continue;
-        }
-        let column_id = direct_projection_column(expr, &scan.get).ok_or_else(|| {
+    let score_index = source_indexes.len();
+    let mut expressions = scan.projections.clone();
+    for expression in &mut expressions {
+        rebase_search_projection(
+            expression,
+            &scan.score_expression,
+            &scan.get,
+            &source_indexes,
+            score_index,
+        )?;
+    }
+
+    let mut projected_columns = Vec::with_capacity(source_indexes.len());
+    let mut source_output_names = Vec::with_capacity(source_indexes.len() + 1);
+    let mut source_output_types = Vec::with_capacity(source_indexes.len() + 1);
+    for source_index in source_indexes {
+        let column_id = scan.get.stored_column(source_index).ok_or_else(|| {
             paro_error::internal(
-                "search source can only lower direct base-column projections before score",
+                "search projection references a Get output that is not a stored column",
             )
         })?;
         projected_columns.push(column_id);
+        source_output_names.push(
+            scan.get
+                .names
+                .get(source_index)
+                .cloned()
+                .ok_or_else(|| paro_error::internal("search source name is out of bounds"))?,
+        );
+        source_output_types.push(
+            scan.get
+                .returned_types
+                .get(source_index)
+                .cloned()
+                .ok_or_else(|| paro_error::internal("search source type is out of bounds"))?,
+        );
     }
-    Ok((projected_columns.into_boxed_slice(), true))
+    source_output_names.push("__search_score".to_string());
+    source_output_types.push(scan.score_expression.return_type());
+
+    let is_identity = expressions.len() == source_output_types.len()
+        && expressions.iter().enumerate().all(|(index, expression)| {
+            matches!(expression, Expression::Reference(reference) if reference.index == index)
+                && expression.return_type() == source_output_types[index]
+        });
+
+    Ok(SearchProjectionLowering {
+        projected_columns: projected_columns.into_boxed_slice(),
+        source_output_names: source_output_names.into_boxed_slice(),
+        source_output_types: source_output_types.into_boxed_slice(),
+        expressions: expressions.into_boxed_slice(),
+        is_identity,
+    })
 }
 
-fn direct_projection_column(expr: &Expression, get: &Get) -> Option<usize> {
-    let source_index = match expr {
-        Expression::Reference(reference) => reference.index,
-        Expression::ColumnRef(column) => column.binding.column_index,
-        _ => return None,
-    };
-    get.stored_column(source_index)
+fn collect_search_projection_sources(
+    expression: &Expression,
+    score_expression: &Expression,
+    get: &Get,
+    source_indexes: &mut Vec<usize>,
+) -> Result<()> {
+    if expression.equals(score_expression) {
+        return Ok(());
+    }
+    if let Some(source_index) = search_projection_source_index(expression, get)? {
+        if get.stored_column(source_index).is_none() {
+            return Err(paro_error::internal(
+                "search projection references a Get output that is not a stored column",
+            ));
+        }
+        if !source_indexes.contains(&source_index) {
+            source_indexes.push(source_index);
+        }
+        return Ok(());
+    }
+
+    let mut result = Ok(());
+    ExpressionIterator::enumerate_children(expression, |child| {
+        if result.is_ok() {
+            result =
+                collect_search_projection_sources(child, score_expression, get, source_indexes);
+        }
+    });
+    result
+}
+
+fn rebase_search_projection(
+    expression: &mut Expression,
+    score_expression: &Expression,
+    get: &Get,
+    source_indexes: &[usize],
+    score_index: usize,
+) -> Result<()> {
+    if expression.equals(score_expression) {
+        *expression = Expression::Reference(ReferenceExpression::new(
+            score_index,
+            score_expression.return_type(),
+        ));
+        return Ok(());
+    }
+    if let Some(source_index) = search_projection_source_index(expression, get)? {
+        let rebased = source_indexes
+            .iter()
+            .position(|candidate| *candidate == source_index)
+            .ok_or_else(|| {
+                paro_error::internal("search projection source was not collected before rebasing")
+            })?;
+        *expression =
+            Expression::Reference(ReferenceExpression::new(rebased, expression.return_type()));
+        return Ok(());
+    }
+
+    let mut result = Ok(());
+    ExpressionIterator::enumerate_children_mut(expression, |child| {
+        if result.is_ok() {
+            result =
+                rebase_search_projection(child, score_expression, get, source_indexes, score_index);
+        }
+    });
+    result
+}
+
+fn search_projection_source_index(expression: &Expression, get: &Get) -> Result<Option<usize>> {
+    match expression {
+        Expression::Reference(reference) => Ok(Some(reference.index)),
+        Expression::ColumnRef(column) if column.binding.table_index == get.table_index => {
+            Ok(Some(column.binding.column_index))
+        }
+        Expression::ColumnRef(_) => Err(paro_error::internal(
+            "search projection references a column outside its base table",
+        )),
+        _ => Ok(None),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -557,11 +723,12 @@ fn search_source_spec_for_candidate(
                         "queryable HNSW candidate is missing its validated search policy",
                     )
                 })?;
-            let avg_level0_degree = table
-                .storage
-                .as_ref()
-                .and_then(|storage| storage.hnsw_index_statistics(intent.column_id))
-                .map_or(0.0, |stats| stats.avg_level0_degree);
+            let avg_level0_degree = match table.storage.as_ref() {
+                Some(storage) => storage
+                    .hnsw_generation_statistics(candidate.token.definition_id)?
+                    .map_or(0.0, |stats| stats.avg_level0_degree),
+                None => 0.0,
+            };
             let filter_topology = table
                 .storage
                 .as_ref()

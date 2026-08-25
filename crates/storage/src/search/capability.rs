@@ -4,7 +4,11 @@
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
+use std::cmp::Ordering;
+use std::hash::{Hash, Hasher};
+use std::sync::Arc;
 
+use crate::index::PartitionDirectory;
 use crate::rowset::RowsetId;
 use crate::tablet::ColumnId;
 
@@ -130,9 +134,37 @@ pub struct ArtifactPointRef {
 /// compaction can publish a coarse HNSW graph without rewriting table data.
 /// Spans are strictly ordered and non-empty, making the local point-id mapping
 /// deterministic and giving manifests a canonical artifact identity.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct SearchPartitionCoverage {
     segments: Box<[ArtifactSegmentSpan]>,
+    #[serde(skip)]
+    partition_directory: Arc<PartitionDirectory>,
+}
+
+impl PartialEq for SearchPartitionCoverage {
+    fn eq(&self, other: &Self) -> bool {
+        self.segments == other.segments
+    }
+}
+
+impl Eq for SearchPartitionCoverage {}
+
+impl PartialOrd for SearchPartitionCoverage {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SearchPartitionCoverage {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.segments.cmp(&other.segments)
+    }
+}
+
+impl Hash for SearchPartitionCoverage {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.segments.hash(state);
+    }
 }
 
 #[derive(Deserialize)]
@@ -158,6 +190,7 @@ impl SearchPartitionCoverage {
             ));
         }
         let mut total_rows = 0u64;
+        let mut partition_ends = Vec::with_capacity(segments.len());
         let mut previous = None;
         for span in &segments {
             if span.row_count == 0 {
@@ -175,6 +208,9 @@ impl SearchPartitionCoverage {
             total_rows = total_rows.checked_add(span.row_count).ok_or_else(|| {
                 paro_common::error::out_of_range("search partition row count overflow")
             })?;
+            partition_ends.push(u32::try_from(total_rows).map_err(|_| {
+                paro_common::error::out_of_range("search partition exceeds the u32 point-id domain")
+            })?);
         }
         if total_rows > u64::from(u32::MAX) {
             return Err(paro_common::error::out_of_range(format!(
@@ -183,6 +219,7 @@ impl SearchPartitionCoverage {
         }
         Ok(Self {
             segments: segments.into_boxed_slice(),
+            partition_directory: Arc::new(PartitionDirectory::try_new(partition_ends)?),
         })
     }
 
@@ -199,6 +236,10 @@ impl SearchPartitionCoverage {
 
     pub fn row_count(&self) -> u64 {
         self.segments.iter().map(|span| span.row_count).sum()
+    }
+
+    pub(crate) fn partition_directory(&self) -> Arc<PartitionDirectory> {
+        Arc::clone(&self.partition_directory)
     }
 
     pub fn singleton_segment(&self) -> Option<ArtifactSegmentRef> {
@@ -863,6 +904,11 @@ mod tests {
             ef_search: 64,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
+            sequential_covering_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+            indexed_base_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
             build_seed: 7,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -881,6 +927,7 @@ mod tests {
         let mut policy_tuned = base.clone();
         policy_tuned.ef_search = 240;
         policy_tuned.plain_scan_threshold = 20_000;
+        policy_tuned.graph_scored_points_per_ef = 20;
         policy_tuned.inline_threshold.max_vector_count = 8_192;
 
         let fingerprint = |config: &HnswProviderConfig| {

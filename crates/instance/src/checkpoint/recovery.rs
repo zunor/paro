@@ -663,6 +663,10 @@ mod tests {
             )
             .with_index_type(IndexType::FullText)
             .with_fulltext_options(LogicalIndex::new(0), "simple")
+            .with_provider_config(serde_json::json!({
+                "version": paro_storage::search::FULLTEXT_PROVIDER_CONFIG_VERSION,
+                "config": "simple"
+            }))
             .with_build_state(IndexBuildState::Building),
             docs_table.object_id().raw(),
             0,

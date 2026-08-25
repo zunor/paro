@@ -136,19 +136,22 @@ pub(crate) struct SearchView {
 }
 
 impl SearchView {
-    pub(crate) fn hnsw_index_statistics(
+    pub(crate) fn hnsw_generation_statistics(
         &self,
-        column_id: ColumnId,
-    ) -> Option<crate::statistics::HnswIndexStatistics> {
-        self.definitions.values().find_map(|state| {
-            let capability = state.capability.as_ref()?;
-            if capability.kind != SearchIndexKind::Hnsw
-                || !state.definition.column_ids.contains(&column_id)
-            {
-                return None;
-            }
-            capability.generation_stats.hnsw_index_statistics()
-        })
+        definition_id: u64,
+    ) -> Result<Option<crate::statistics::HnswIndexStatistics>> {
+        let Some(state) = self.definitions.get(&definition_id) else {
+            return Ok(None);
+        };
+        let Some(capability) = state.capability.as_ref() else {
+            return Ok(None);
+        };
+        if capability.kind != SearchIndexKind::Hnsw {
+            return Err(paro_error::invalid_input(format!(
+                "search definition {definition_id} is not HNSW"
+            )));
+        }
+        capability.generation_stats.hnsw_index_statistics()
     }
 
     pub(crate) fn capability(

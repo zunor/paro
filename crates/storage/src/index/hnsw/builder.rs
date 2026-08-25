@@ -15,9 +15,10 @@ use crate::index::hnsw::search_context::SearchContext;
 use crate::index::hnsw::types::HnswConfig;
 use crate::index::hnsw::types::{HnswBuildContract, HnswM, PointOffset, ScoreType, ScoredPoint};
 use crate::index::hnsw::vector_storage::VectorStorage;
-use crate::index::hnsw::visited_pool::{VisitedListHandle, VisitedPool};
+use crate::index::hnsw::visited_pool::{BuildVisitedListHandle, BuildVisitedPool};
 use bitvec::prelude::BitVec;
 use parking_lot::{Mutex, RwLock};
+use paro_common::error::Result;
 use rayon::prelude::*;
 use std::cmp::max;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -96,7 +97,7 @@ pub struct GraphLayersBuilder {
     /// Entry points for search
     entry_points: Mutex<EntryPoints>,
     /// Pool of visited lists for search
-    visited_pool: VisitedPool,
+    visited_pool: BuildVisitedPool,
     /// HNSW M parameters (m and m0)
     hnsw_m: HnswM,
     /// Number of neighbors to consider during construction
@@ -184,7 +185,7 @@ impl GraphLayersBuilder {
         Self {
             links_layers,
             entry_points: Mutex::new(EntryPoints::new()),
-            visited_pool: VisitedPool::with_keep_limit(visited_capacity),
+            visited_pool: BuildVisitedPool::with_keep_limit(num_points, visited_capacity),
             hnsw_m,
             ef_construct: contract.ef_construct as usize,
             level_factor,
@@ -308,10 +309,11 @@ impl GraphLayersBuilder {
         point_id: PointOffset,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-    ) {
+    ) -> Result<()> {
         let entry_points = self.snapshot_entry_points();
-        let proposal = self.propose_new_point(point_id, &entry_points, storage, distance);
+        let proposal = self.propose_new_point(point_id, &entry_points, storage, distance)?;
         self.publish_frozen_wave(vec![proposal], storage, distance, false);
+        Ok(())
     }
 
     /// Compute one point's outgoing links against the currently published graph.
@@ -325,13 +327,13 @@ impl GraphLayersBuilder {
         entry_points: &EntryPoints,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-    ) -> FrozenPointProposal {
+    ) -> Result<FrozenPointProposal> {
         let target_level = self.get_point_level(point_id);
         let Some(entry_point) = entry_points.get_entry_point(|_| true) else {
-            return FrozenPointProposal {
+            return Ok(FrozenPointProposal {
                 point_id,
                 links_by_level: vec![Vec::new(); target_level + 1],
-            };
+            });
         };
 
         let mut current_point = entry_point.point_id;
@@ -368,7 +370,8 @@ impl GraphLayersBuilder {
         // The generation counter provides O(1) logical clears between levels;
         // borrowing from the shared pool per level only adds synchronization
         // and cannot change the search result.
-        let mut visited = self.visited_pool.get(storage.num_vectors());
+        debug_assert_eq!(storage.num_vectors(), self.links_layers.len());
+        let mut visited = self.visited_pool.get()?;
         let mut first_search_level = true;
 
         for level in (0..=target_level.min(current_level)).rev() {
@@ -419,10 +422,10 @@ impl GraphLayersBuilder {
             candidates = search_results;
         }
 
-        FrozenPointProposal {
+        Ok(FrozenPointProposal {
             point_id,
             links_by_level,
-        }
+        })
     }
 
     /// Publish a wave of proposals computed from one frozen topology.
@@ -564,7 +567,7 @@ impl GraphLayersBuilder {
         ef: usize,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-        visited: &mut VisitedListHandle<'_>,
+        visited: &mut BuildVisitedListHandle<'_>,
     ) -> Vec<ScoredPoint> {
         let mut search_context = SearchContext::new(entry_points[0], ef);
 

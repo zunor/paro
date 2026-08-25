@@ -569,7 +569,7 @@ mod tests {
         fs::create_dir_all(spill_manifest.parent().expect("spill manifest parent"))
             .expect("create spill manifest dir");
         let spill_record = serde_json::json!({
-            "record_version": 1,
+            "record_version": 2,
             "artifact_id": 0,
             "sequence": 0,
             "kind": "rowset",
@@ -581,7 +581,8 @@ mod tests {
             "rowset_id": rowset_id,
             "path": spill_rowset.display().to_string(),
             "row_count": 1,
-            "bytes": 1
+            "artifact_bytes": 1,
+            "admitted_bytes": 1
         });
         fs::write(&spill_manifest, format!("{spill_record}\n")).expect("write spill manifest");
         (spill_rowset, spill_manifest)

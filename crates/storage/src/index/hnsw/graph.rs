@@ -7,7 +7,7 @@
 //! standard HNSW and exact-bitmap filtered Top-K search.
 
 use super::entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
-use super::graph_links::GraphLinks;
+use super::graph_links::{GraphLinks, GraphLinksReadView};
 use super::search_context::{FixedLengthPriorityQueue, SearchContext};
 use super::types::{
     required_filtered_admissions, HnswM, HnswPredicateAdmissionMode, PointOffset, ScoredPoint,
@@ -15,8 +15,8 @@ use super::types::{
 };
 use super::visited_pool::VisitedPool;
 use super::VectorScorer;
-use crate::index::ExactRowAdmission;
-use crate::search::SearchWorkBudget;
+use crate::index::{ExactRowAdmission, ExactRowSet};
+use crate::search::{ResourceBudget, SearchMemoryReservation, SearchWorkBudget};
 use paro_common::error::{self as paro_error, Result};
 use rand::{thread_rng, Rng};
 
@@ -53,6 +53,57 @@ pub(crate) struct GraphSearchResult {
     pub(crate) predicate_refined: bool,
 }
 
+/// Lazily materialized witnesses for predicate-topology partitions.
+///
+/// Broad predicates normally finish on the ordinary global beam and never
+/// enter the predicate topology. Building these witnesses eagerly made that
+/// optimistic path traverse every physical posting and allocate a query Vec
+/// for data it could not consume. The source owns its memory grant and caches
+/// the deterministic witnesses so batched queries pay at most once, exactly
+/// when adaptive refinement first requests them.
+pub(crate) struct PredicatePartitionSeeds<'a> {
+    row_set: Option<&'a dyn ExactRowSet>,
+    limit: usize,
+    seeds: Option<Vec<PointOffset>>,
+    _reservation: Option<SearchMemoryReservation>,
+}
+
+impl<'a> PredicatePartitionSeeds<'a> {
+    pub(crate) fn new(row_set: Option<&'a dyn ExactRowSet>, limit: usize) -> Self {
+        Self {
+            row_set,
+            limit,
+            seeds: None,
+            _reservation: None,
+        }
+    }
+
+    fn materialize(&mut self, budget: &ResourceBudget) -> Result<&[PointOffset]> {
+        if self.seeds.is_none() {
+            let capacity = usize::from(self.row_set.is_some()).saturating_mul(self.limit);
+            let reservation = budget
+                .try_reserve_memory(capacity.saturating_mul(std::mem::size_of::<PointOffset>()))?;
+            let mut seeds = Vec::new();
+            seeds.try_reserve_exact(capacity).map_err(|_| {
+                paro_error::out_of_memory(format!(
+                    "allocate {capacity} HNSW predicate partition seeds"
+                ))
+            })?;
+            if let Some(row_set) = self.row_set {
+                row_set.append_partition_seeds(self.limit, &mut seeds);
+            }
+            self._reservation = Some(reservation);
+            self.seeds = Some(seeds);
+        }
+        Ok(self.seeds.as_deref().unwrap_or_default())
+    }
+
+    #[cfg(test)]
+    fn is_materialized(&self) -> bool {
+        self.seeds.is_some()
+    }
+}
+
 fn should_refine_predicate(
     top: usize,
     admission_capacity: usize,
@@ -73,12 +124,8 @@ fn should_refine_predicate(
 }
 
 impl GraphLayers {
-    pub fn new(
-        links: GraphLinks,
-        entry_points: EntryPoints,
-        visited_pool: VisitedPool,
-        hnsw_m: HnswM,
-    ) -> Self {
+    pub fn new(links: GraphLinks, entry_points: EntryPoints, hnsw_m: HnswM) -> Self {
+        let visited_pool = VisitedPool::new(links.num_points());
         Self {
             links,
             predicate_links: None,
@@ -94,7 +141,6 @@ impl GraphLayers {
         predicate_links: GraphLinks,
         predicate_entry_points: Box<[PredicateEntryPoint]>,
         entry_points: EntryPoints,
-        visited_pool: VisitedPool,
         hnsw_m: HnswM,
     ) -> Self {
         assert_eq!(
@@ -102,6 +148,7 @@ impl GraphLayers {
             predicate_links.num_points(),
             "predicate-local graph cardinality must match the base graph"
         );
+        let visited_pool = VisitedPool::new(links.num_points());
         Self {
             links,
             predicate_links: Some(predicate_links),
@@ -112,6 +159,16 @@ impl GraphLayers {
         }
     }
 
+    /// Route reusable query workspaces through the instance buffer pool. The
+    /// graph topology remains immutable; only the physical owner of scratch
+    /// visited markers is bound here.
+    pub fn bind_search_buffer_pool(
+        &self,
+        buffer_pool: std::sync::Arc<crate::buffer::BufferPool>,
+    ) -> Result<()> {
+        self.visited_pool.bind_buffer_pool(buffer_pool)
+    }
+
     /// Primary search entry point for a single query.
     pub(crate) fn search_one(
         &self,
@@ -120,11 +177,11 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
         filter: Option<&ExactRowAdmission<'_>>,
-        predicate_partition_seeds: &[PointOffset],
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
-        use_predicate_topology: bool,
+        predicate_topology_available: bool,
         random_entry_point: bool,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<GraphSearchResult> {
         if top == 0 {
             return Ok(GraphSearchResult {
@@ -153,8 +210,8 @@ impl GraphLayers {
             filter,
             predicate_partition_seeds,
             predicate_columns,
-            use_predicate_topology,
-            work,
+            predicate_topology_available,
+            budget,
         )
     }
 
@@ -166,11 +223,11 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorers: &mut [VectorScorer<'_>],
         filter: Option<&ExactRowAdmission<'_>>,
-        predicate_partition_seeds: &[PointOffset],
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
-        use_predicate_topology: bool,
+        predicate_topology_available: bool,
         random_entry_point: bool,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<Vec<GraphSearchResult>> {
         if scorers.is_empty() {
             return Ok(Vec::new());
@@ -202,8 +259,8 @@ impl GraphLayers {
                     filter,
                     predicate_partition_seeds,
                     predicate_columns,
-                    use_predicate_topology,
-                    work,
+                    predicate_topology_available,
+                    budget,
                 )?),
                 None => results.push(GraphSearchResult {
                     points: Vec::new(),
@@ -250,16 +307,22 @@ impl GraphLayers {
         algorithm: SearchAlgorithm,
         scorer: &mut VectorScorer<'_>,
         filter: Option<&ExactRowAdmission<'_>>,
-        predicate_partition_seeds: &[PointOffset],
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
-        use_predicate_topology: bool,
-        work: &SearchWorkBudget,
+        predicate_topology_available: bool,
+        budget: &ResourceBudget,
     ) -> Result<GraphSearchResult> {
-        let zero_level_entry = self.descend_to_zero_level(entry_point, scorer, work)?;
+        // Authentication state belongs to this complete logical graph read.
+        // Snapshot it once so a fully verified sidecar never reloads integrity
+        // state for every expanded candidate.
+        let links = self.links.search_view(scorer.point_count())?;
+        let zero_level_entry =
+            self.descend_to_zero_level(links, entry_point, scorer, budget.work.as_ref())?;
         let (mut points, predicate_admission, predicate_topology_used, predicate_refined) =
             match algorithm {
                 SearchAlgorithm::Hnsw => (
-                    self.search_on_level(zero_level_entry, ef, scorer, work)?,
+                    self.search_on_level(links, zero_level_entry, ef, scorer, budget)?
+                        .into_top_sorted_vec(top),
                     HnswPredicateAdmissionMode::NotApplicable,
                     false,
                     false,
@@ -268,6 +331,7 @@ impl GraphLayers {
                     let adaptive = algorithm == SearchAlgorithm::AdaptiveFilteredTopK;
                     match filter {
                         None => self.search_masked_topk(
+                            links,
                             zero_level_entry,
                             top,
                             ef,
@@ -276,10 +340,11 @@ impl GraphLayers {
                             adaptive,
                             predicate_partition_seeds,
                             predicate_columns,
-                            use_predicate_topology,
-                            work,
+                            predicate_topology_available,
+                            budget,
                         )?,
                         Some(ExactRowAdmission::Roaring(bitmap)) => self.search_masked_topk(
+                            links,
                             zero_level_entry,
                             top,
                             ef,
@@ -288,14 +353,15 @@ impl GraphLayers {
                             adaptive,
                             predicate_partition_seeds,
                             predicate_columns,
-                            use_predicate_topology,
-                            work,
+                            predicate_topology_available,
+                            budget,
                         )?,
                         Some(ExactRowAdmission::Ordinal {
                             row_ordinals,
                             accepted_ordinals,
                             accepts_null,
                         }) => self.search_masked_topk(
+                            links,
                             zero_level_entry,
                             top,
                             ef,
@@ -313,10 +379,11 @@ impl GraphLayers {
                             adaptive,
                             predicate_partition_seeds,
                             predicate_columns,
-                            use_predicate_topology,
-                            work,
+                            predicate_topology_available,
+                            budget,
                         )?,
                         Some(ExactRowAdmission::Dense(domain_len)) => self.search_masked_topk(
+                            links,
                             zero_level_entry,
                             top,
                             ef,
@@ -325,11 +392,12 @@ impl GraphLayers {
                             adaptive,
                             predicate_partition_seeds,
                             predicate_columns,
-                            use_predicate_topology,
-                            work,
+                            predicate_topology_available,
+                            budget,
                         )?,
                         Some(ExactRowAdmission::Partitioned(admission)) => self
                             .search_masked_topk(
+                                links,
                                 zero_level_entry,
                                 top,
                                 ef,
@@ -338,8 +406,8 @@ impl GraphLayers {
                                 adaptive,
                                 predicate_partition_seeds,
                                 predicate_columns,
-                                use_predicate_topology,
-                                work,
+                                predicate_topology_available,
+                                budget,
                             )?,
                     }
                 }
@@ -356,6 +424,7 @@ impl GraphLayers {
     /// Greedy descent from the selected entry point to level 0 for one query.
     fn descend_to_zero_level(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: EntryPoint,
         scorer: &mut VectorScorer<'_>,
         work: &SearchWorkBudget,
@@ -371,11 +440,10 @@ impl GraphLayers {
                 work.check_and_consume(1)?;
                 changed = false;
                 links.clear();
-                self.links
-                    .for_each_link(current_point, current_level, |neighbor| {
-                        scorer.prefetch_point(neighbor);
-                        links.push(neighbor);
-                    })?;
+                links_view.for_each_link(current_point, current_level, |neighbor| {
+                    scorer.prefetch_graph_point(neighbor);
+                    links.push(neighbor.offset());
+                })?;
                 work.consume(links.len())?;
 
                 for scored in
@@ -401,12 +469,16 @@ impl GraphLayers {
     /// deliberately absent from navigation.
     fn search_on_level(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
         ef: usize,
         scorer: &mut VectorScorer,
-        work: &SearchWorkBudget,
-    ) -> Result<Vec<ScoredPoint>> {
-        let mut visited = self.visited_pool.get(self.links.num_points());
+        budget: &ResourceBudget,
+    ) -> Result<FixedLengthPriorityQueue<ScoredPoint>> {
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
         let mut context = SearchContext::new(entry_point, ef);
         let mut neighbors = Vec::with_capacity(self.hnsw_m.get_m(0));
 
@@ -419,20 +491,22 @@ impl GraphLayers {
             }
 
             neighbors.clear();
-            self.links.for_each_link(candidate.idx, 0, |neighbor| {
-                if !visited.check_and_update_visited(neighbor) {
-                    scorer.prefetch_point(neighbor);
-                    neighbors.push(neighbor);
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor.offset());
                 }
             })?;
             work.consume(neighbors.len())?;
 
             for sp in scorer.score_points_unfiltered(&neighbors) {
-                context.process_candidate(sp);
+                if context.process_candidate(sp) {
+                    links_view.prefetch_level0_record(sp.idx);
+                }
             }
         }
 
-        Ok(context.nearest.into_sorted_vec())
+        Ok(context.nearest)
     }
 
     /// Navigate the ordinary graph exactly as an unfiltered query while
@@ -441,16 +515,17 @@ impl GraphLayers {
     /// inverse-selectivity oversampling factor.
     fn search_masked_topk<F>(
         &self,
+        links_view: GraphLinksReadView<'_>,
         entry_point: ScoredPoint,
         top: usize,
         ef: usize,
         scorer: &mut VectorScorer,
         admits: F,
         adaptive_predicate_refinement: bool,
-        predicate_partition_seeds: &[PointOffset],
+        predicate_partition_seeds: &mut PredicatePartitionSeeds<'_>,
         predicate_columns: &[u32],
-        use_predicate_topology: bool,
-        work: &SearchWorkBudget,
+        predicate_topology_available: bool,
+        budget: &ResourceBudget,
     ) -> Result<(Vec<ScoredPoint>, HnswPredicateAdmissionMode, bool, bool)>
     where
         F: Fn(PointOffset) -> bool,
@@ -460,7 +535,7 @@ impl GraphLayers {
         // blocks, so spending the full predicate beam twice is pure duplicate
         // work.  Keep a bounded routing beam when the local topology exists;
         // providers without that topology retain the full ordinary HNSW beam.
-        let routing_ef = if use_predicate_topology {
+        let routing_ef = if predicate_topology_available {
             ef.min(PREDICATE_ROUTING_EF.max(top))
         } else {
             ef
@@ -470,32 +545,42 @@ impl GraphLayers {
         // heap for every scored graph neighbor. First navigate a completely
         // ordinary HNSW beam, then apply exact admission only to the retained
         // global beam. If it contains the required local Top-K headroom, its
-        // admitted prefix is provably identical to the best admitted points
-        // among every phase-one score: every discarded point is worse than
-        // the global beam floor. This decision is based on observed results,
-        // not a selectivity estimate.
+        // admitted prefix is identical to the best admitted points among
+        // those scored in phase one: every discarded scored point is worse
+        // than the global beam floor. This remains approximate because
+        // unvisited graph regions are not constrained by that floor. The
+        // decision is based on observed results, not a selectivity estimate.
         //
         // An underfilled or non-local beam falls through to the existing eager
         // admission traversal and predicate repair. The retry is deliberate:
         // it preserves the complete admitted seed window for adversarially
         // correlated predicates without allocating an ungoverned trace of all
         // phase-one scores on the optimistic path.
-        if adaptive_predicate_refinement && !use_predicate_topology {
-            let mut seeds = self.search_on_level(entry_point, routing_ef, scorer, work)?;
-            let phase_one_floor = seeds.last().map_or(f32::MIN, |point| point.score);
-            let admission_capacity = seeds.len();
+        if adaptive_predicate_refinement {
+            let beam = self.search_on_level(links_view, entry_point, ef, scorer, budget)?;
+            let phase_one_floor = beam.min_element().map_or(f32::MIN, |point| point.score);
+            let admission_capacity = beam.len();
+            let mut seeds = beam.into_unsorted_vec();
             seeds.retain(|point| admits(point.idx));
             let admission_window_full =
-                admission_capacity == routing_ef && seeds.len() == admission_capacity;
+                admission_capacity == ef && seeds.len() == admission_capacity;
+            let kth_score = if top != 0 && seeds.len() >= top {
+                let (_, kth, _) = seeds.select_nth_unstable_by(top - 1, |a, b| b.cmp(a));
+                Some(kth.score)
+            } else {
+                None
+            };
             let should_retry = should_refine_predicate(
                 top,
                 admission_capacity,
                 seeds.len(),
                 admission_window_full,
-                seeds.get(top.saturating_sub(1)).map(|point| point.score),
+                kth_score,
                 phase_one_floor,
             );
             if seeds.len() >= top && !should_retry {
+                seeds.truncate(top);
+                seeds.sort_unstable_by(|a, b| b.cmp(a));
                 return Ok((
                     seeds,
                     HnswPredicateAdmissionMode::DeferredGlobalBeam,
@@ -505,7 +590,10 @@ impl GraphLayers {
             }
         }
 
-        let mut visited = self.visited_pool.get(self.links.num_points());
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
         let mut context = SearchContext::new(entry_point, routing_ef);
         // Preserve the routing beam's admitted candidates as diverse local
         // topology seeds; only the final public result is truncated to K.
@@ -523,10 +611,10 @@ impl GraphLayers {
             }
 
             neighbors.clear();
-            self.links.for_each_link(candidate.idx, 0, |neighbor| {
-                if !visited.check_and_update_visited(neighbor) {
-                    scorer.prefetch_point(neighbor);
-                    neighbors.push(neighbor);
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
+                if !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor.offset());
                 }
             })?;
             work.consume(neighbors.len())?;
@@ -535,7 +623,9 @@ impl GraphLayers {
                 if admits(point.idx) {
                     filtered.push(point);
                 }
-                context.process_candidate(point);
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
+                }
             }
         }
 
@@ -556,27 +646,43 @@ impl GraphLayers {
             ));
         }
 
-        // A persisted predicate-local topology is the primary filtered search
-        // surface, not an underfill repair.  The ordinary HNSW graph above is
-        // deliberately predicate-agnostic and only discovers geometrically
-        // useful entry seeds.  Stopping merely because that graph happened to
-        // admit K rows makes filtered recall depend on the unfiltered beam and
-        // leaves the dedicated topology dormant for broad predicates.
-        //
-        // The predicate topology has its own lower bound and only scores rows
-        // admitted by the exact predicate.  Run it before considering the
-        // generic two-hop repair.  A full local beam is a complete outcome for
-        // this approximate path; an underfilled local beam falls through to
-        // the general graph repair below.
-        let (seeds, predicate_topology_used, topology_window_full) = if use_predicate_topology {
-            let (seeds, full) = self.search_predicate_topology(
+        let should_refine = should_refine_predicate(
+            top,
+            routing_ef.max(top),
+            seeds.len(),
+            filtered_window_full,
+            seeds
+                .get(top.saturating_sub(1).min(seeds.len().saturating_sub(1)))
+                .map(|point| point.score),
+            phase_one_floor,
+        );
+        if !should_refine {
+            return Ok((
                 seeds,
-                predicate_partition_seeds,
+                HnswPredicateAdmissionMode::EagerPerCandidate,
+                false,
+                false,
+            ));
+        }
+
+        // Availability and use are separate contracts. A persisted scalar
+        // topology is entered only after observed base-graph admissions prove
+        // that quantity or locality is insufficient. This keeps broad,
+        // independent predicates on the ordinary beam while still activating
+        // the topology for a broad but geometrically disconnected predicate—
+        // a case no selectivity threshold can identify.
+        let (seeds, predicate_topology_used, topology_window_full) = if predicate_topology_available
+        {
+            let partition_seeds = predicate_partition_seeds.materialize(budget)?;
+            let (seeds, full) = self.search_predicate_topology(
+                links_view,
+                seeds,
+                partition_seeds,
                 predicate_columns,
                 ef,
                 scorer,
                 &admits,
-                work,
+                budget,
             )?;
             (seeds, true, full)
         } else {
@@ -591,7 +697,7 @@ impl GraphLayers {
             ));
         }
 
-        let should_refine = should_refine_predicate(
+        let should_refine_after_topology = should_refine_predicate(
             top,
             routing_ef.max(top),
             seeds.len(),
@@ -601,7 +707,7 @@ impl GraphLayers {
                 .map(|point| point.score),
             phase_one_floor,
         );
-        if !should_refine {
+        if !should_refine_after_topology {
             return Ok((
                 seeds,
                 HnswPredicateAdmissionMode::EagerPerCandidate,
@@ -632,7 +738,8 @@ impl GraphLayers {
         for &seed in remaining {
             context.process_candidate(seed);
         }
-        let mut bridge_visited = self.visited_pool.get(self.links.num_points());
+        let _bridge_reservation = budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut bridge_visited = self.visited_pool.get()?;
         let level0_degree = self.hnsw_m.get_m(0);
         let mut matching_neighbors = Vec::with_capacity(level0_degree.saturating_mul(2));
         let mut bridge_neighbors = Vec::with_capacity(level0_degree);
@@ -645,15 +752,16 @@ impl GraphLayers {
             matching_neighbors.clear();
             bridge_neighbors.clear();
             let mut inspected_edges = 0usize;
-            self.links.for_each_link(candidate.idx, 0, |neighbor| {
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
-                if admits(neighbor) {
-                    if !visited.check_and_update_visited(neighbor) {
-                        scorer.prefetch_point(neighbor);
-                        matching_neighbors.push(neighbor);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) {
+                    if !visited.check_and_update_graph_point(neighbor) {
+                        scorer.prefetch_graph_point(neighbor);
+                        matching_neighbors.push(neighbor_id);
                     }
-                } else if !bridge_visited.check_and_update_visited(neighbor) {
-                    bridge_neighbors.push(neighbor);
+                } else if !bridge_visited.check_and_update_graph_point(neighbor) {
+                    bridge_neighbors.push(neighbor_id);
                 }
             })?;
             work.consume(inspected_edges)?;
@@ -667,14 +775,15 @@ impl GraphLayers {
                 work.check_and_consume(1)?;
                 let limit = matching_neighbors.len().saturating_add(hop_limit);
                 let mut bridge_edges = 0usize;
-                self.links.for_each_link(bridge, 0, |neighbor| {
+                links_view.for_each_link(bridge, 0, |neighbor| {
                     bridge_edges = bridge_edges.saturating_add(1);
+                    let neighbor_id = neighbor.offset();
                     if matching_neighbors.len() < limit
-                        && admits(neighbor)
-                        && !visited.check_and_update_visited(neighbor)
+                        && admits(neighbor_id)
+                        && !visited.check_and_update_graph_point(neighbor)
                     {
-                        scorer.prefetch_point(neighbor);
-                        matching_neighbors.push(neighbor);
+                        scorer.prefetch_graph_point(neighbor);
+                        matching_neighbors.push(neighbor_id);
                     }
                 })?;
                 work.consume(bridge_edges)?;
@@ -682,7 +791,9 @@ impl GraphLayers {
 
             work.consume(matching_neighbors.len())?;
             for point in scorer.score_points_unfiltered(&matching_neighbors) {
-                context.process_candidate(point);
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
+                }
             }
         }
 
@@ -696,19 +807,20 @@ impl GraphLayers {
 
     /// Continue from base-graph predicate seeds over a logical union of the
     /// predicate-local and ordinary level-0 links. The predicate artifact only
-    /// persists links it adds; reusing the base CSR at query time gives the
+    /// persists links it adds; reusing the base adjacency records at query time gives the
     /// same merged-topology semantics without duplicating durable edges.
     /// This beam has its own lower bound and only exact-admitted points are
     /// scored or expanded.
     fn search_predicate_topology<F>(
         &self,
+        links_view: GraphLinksReadView<'_>,
         seeds: Vec<ScoredPoint>,
         partition_seeds: &[PointOffset],
         predicate_columns: &[u32],
         ef: usize,
         scorer: &mut VectorScorer<'_>,
         admits: &F,
-        work: &SearchWorkBudget,
+        budget: &ResourceBudget,
     ) -> Result<(Vec<ScoredPoint>, bool)>
     where
         F: Fn(PointOffset) -> bool,
@@ -718,7 +830,11 @@ impl GraphLayers {
                 "HNSW filter contract selected missing predicate topology",
             ));
         };
-        let mut visited = self.visited_pool.get(self.links.num_points());
+        let predicate_links_view = predicate_links.search_view(scorer.point_count())?;
+        let _visited_reservation =
+            budget.try_reserve_memory(self.visited_pool.workspace_bytes())?;
+        let mut visited = self.visited_pool.get()?;
+        let work = budget.work.as_ref();
         let mut initial = FixedLengthPriorityQueue::new(ef.max(1));
         for seed in seeds {
             if !visited.check_and_update_visited(seed.idx) {
@@ -740,7 +856,7 @@ impl GraphLayers {
                 continue;
             }
             if let Some(seed) =
-                self.descend_predicate_entry(*entry, predicate_links, scorer, admits, work)?
+                self.descend_predicate_entry(*entry, predicate_links_view, scorer, admits, work)?
             {
                 if !visited.check_and_update_visited(seed.idx) {
                     initial.push(seed);
@@ -765,23 +881,27 @@ impl GraphLayers {
             }
             neighbors.clear();
             let mut inspected_edges = 0usize;
-            predicate_links.for_each_link(candidate.idx, 0, |neighbor| {
+            predicate_links_view.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
-                if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
-                    scorer.prefetch_point(neighbor);
-                    neighbors.push(neighbor);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) && !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor_id);
                 }
             })?;
-            self.links.for_each_link(candidate.idx, 0, |neighbor| {
+            links_view.for_each_link(candidate.idx, 0, |neighbor| {
                 inspected_edges = inspected_edges.saturating_add(1);
-                if admits(neighbor) && !visited.check_and_update_visited(neighbor) {
-                    scorer.prefetch_point(neighbor);
-                    neighbors.push(neighbor);
+                let neighbor_id = neighbor.offset();
+                if admits(neighbor_id) && !visited.check_and_update_graph_point(neighbor) {
+                    scorer.prefetch_graph_point(neighbor);
+                    neighbors.push(neighbor_id);
                 }
             })?;
             work.consume(inspected_edges)?;
             for point in scorer.score_points_unfiltered(&neighbors) {
-                context.process_candidate(point);
+                if context.process_candidate(point) {
+                    links_view.prefetch_level0_record(point.idx);
+                }
             }
         }
         let full = context.nearest.is_full();
@@ -791,7 +911,7 @@ impl GraphLayers {
     fn descend_predicate_entry<F>(
         &self,
         entry: PredicateEntryPoint,
-        predicate_links: &GraphLinks,
+        predicate_links_view: GraphLinksReadView<'_>,
         scorer: &mut VectorScorer<'_>,
         admits: &F,
         work: &SearchWorkBudget,
@@ -814,11 +934,12 @@ impl GraphLayers {
                 changed = false;
                 neighbors.clear();
                 let mut inspected_edges = 0usize;
-                predicate_links.for_each_link(current.idx, level, |neighbor| {
+                predicate_links_view.for_each_link(current.idx, level, |neighbor| {
                     inspected_edges = inspected_edges.saturating_add(1);
-                    if admits(neighbor) {
-                        scorer.prefetch_point(neighbor);
-                        neighbors.push(neighbor);
+                    let neighbor_id = neighbor.offset();
+                    if admits(neighbor_id) {
+                        scorer.prefetch_graph_point(neighbor);
+                        neighbors.push(neighbor_id);
                     }
                 })?;
                 work.consume(inspected_edges)?;
@@ -842,6 +963,7 @@ impl GraphLayers {
 mod tests {
     use super::*;
     use crate::index::hnsw::{DistanceMetric, InMemoryVectorStorage};
+    use crate::index::DenseRowSet;
     use rand::{rngs::StdRng, SeedableRng};
 
     fn make_graph(entry_points: EntryPoints) -> GraphLayers {
@@ -853,7 +975,6 @@ mod tests {
                 vec![vec![]],
             ]),
             entry_points,
-            VisitedPool::new(),
             HnswM::new(8),
         )
     }
@@ -952,6 +1073,17 @@ mod tests {
     }
 
     #[test]
+    fn predicate_partition_seeds_materialize_only_on_demand() {
+        let row_set = DenseRowSet::new(100);
+        let mut seeds = PredicatePartitionSeeds::new(Some(&row_set), 4);
+        assert!(!seeds.is_materialized());
+
+        let budget = ResourceBudget::default();
+        assert_eq!(seeds.materialize(&budget).unwrap().len(), 4);
+        assert!(seeds.is_materialized());
+    }
+
+    #[test]
     fn predicate_topology_logically_merges_base_level0_links() {
         let base = GraphLinks::new_from_edges(vec![
             vec![vec![1]],
@@ -970,7 +1102,6 @@ mod tests {
             predicate,
             Box::new([]),
             EntryPoints::default(),
-            VisitedPool::new(),
             HnswM::new(8),
         );
         let storage = InMemoryVectorStorage::new(vec![10.0, 5.0, 0.0, 100.0], 1);
@@ -981,16 +1112,18 @@ mod tests {
             score: scorer.score_point(0),
         };
         let budget = crate::search::ResourceBudget::default();
+        let links_view = graph.links.search_view(scorer.point_count()).unwrap();
 
         let (points, full) = graph
             .search_predicate_topology(
+                links_view,
                 vec![seed],
                 &[],
                 &[],
                 3,
                 &mut scorer,
                 &|point| point <= 2,
-                budget.work.as_ref(),
+                &budget,
             )
             .unwrap();
 

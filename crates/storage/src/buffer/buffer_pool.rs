@@ -219,7 +219,7 @@ impl BufferPool {
     /// Map FileBufferType to eviction queue type index.
     fn file_buffer_type_to_eviction_queue_type_idx(buffer_type: FileBufferType) -> usize {
         match buffer_type {
-            FileBufferType::Block | FileBufferType::ExternalFile => 0, // Evict these first (cheap, just free)
+            FileBufferType::Block | FileBufferType::ExternalFile | FileBufferType::Scratch => 0, // Evict these first (cheap, just free)
             FileBufferType::ManagedBuffer => 1, // Then these (have to write to storage)
             FileBufferType::TinyBuffer => 2,    // Evict tiny buffers last (last resort)
         }
@@ -228,7 +228,11 @@ impl BufferPool {
     /// Map eviction queue type index to FileBufferTypes.
     fn eviction_queue_type_idx_to_file_buffer_types(queue_type_idx: usize) -> Vec<FileBufferType> {
         match queue_type_idx {
-            0 => vec![FileBufferType::Block, FileBufferType::ExternalFile],
+            0 => vec![
+                FileBufferType::Block,
+                FileBufferType::ExternalFile,
+                FileBufferType::Scratch,
+            ],
             1 => vec![FileBufferType::ManagedBuffer],
             2 => vec![FileBufferType::TinyBuffer],
             _ => panic!("Unknown queue type index: {}", queue_type_idx),
@@ -519,6 +523,10 @@ impl BufferPool {
         let block_id = block.block_id();
         let size = block.size();
 
+        if block.buffer_type().is_reconstructible() {
+            block.reconstruct_zeroed()?;
+            return Ok(());
+        }
         if !block.must_write_to_disk() {
             return Err(paro_error::internal(format!(
                 "Block {} cannot be reloaded without temporary spill data",
@@ -727,13 +735,14 @@ impl BufferPool {
             }
         };
 
-        // Fast path: block is already loaded
-        if block.is_loaded() {
+        // Fast path: atomically publish the pin against the loaded allocation.
+        // `is_loaded()` followed by `pin()` is not sufficient here: eviction
+        // may detach the buffer between those two independent observations.
+        if block.try_pin().is_some() {
             // Remove from eviction queue if present
             self.remove_from_eviction_queue(block_id);
 
-            // Pin the block and update LRU timestamp
-            block.pin();
+            // Update LRU timestamp
             block.set_lru_timestamp(current_timestamp_ms());
             self.stats.pins.fetch_add(1, Ordering::Relaxed);
 
@@ -744,8 +753,7 @@ impl BufferPool {
         // Slow-path admission and publication are serialized with new block
         // allocation and memory-limit changes.
         let _admission_guard = self.admission_lock.lock().unwrap();
-        if block.is_loaded() {
-            block.pin();
+        if block.try_pin().is_some() {
             block.set_lru_timestamp(current_timestamp_ms());
             self.stats.pins.fetch_add(1, Ordering::Relaxed);
             let pool_weak = self.weak_self.read().unwrap().clone();
@@ -772,9 +780,8 @@ impl BufferPool {
         }
 
         // Double-check locking: check if another thread loaded the block
-        if block.is_loaded() {
+        if block.try_pin().is_some() {
             // Block was loaded by another thread, just pin it
-            block.pin();
             block.set_lru_timestamp(current_timestamp_ms());
             self.stats.pins.fetch_add(1, Ordering::Relaxed);
             let pool_weak = self.weak_self.read().unwrap().clone();
@@ -947,15 +954,9 @@ impl BufferPool {
                     let block_id = handle.block_id();
                     let blocks = self.blocks.write().unwrap();
                     if let Some(block) = blocks.get(&block_id) {
-                        // Create a temporary mutable reference
-                        // SAFETY: We have exclusive access via the write lock
-                        let block_ptr =
-                            std::sync::Arc::<BlockHandle>::as_ptr(block) as *mut BlockHandle;
-                        let block_mut = unsafe { &mut *block_ptr };
-
                         let block_size = block.size();
                         let block_tag = block.tag();
-                        if let Ok(Some(taken_buffer)) = block_mut
+                        if let Ok(Some(taken_buffer)) = block
                             .unload_and_take_block(has_temp_dir, |bid, data| {
                                 self.write_to_temporary_file(bid, block_tag, data)
                             })
@@ -991,16 +992,14 @@ impl BufferPool {
 
             let blocks = self.blocks.write().unwrap();
             if let Some(block) = blocks.get(&block_id) {
-                let block_ptr = std::sync::Arc::<BlockHandle>::as_ptr(block) as *mut BlockHandle;
-                let block_mut = unsafe { &mut *block_ptr };
-
                 // Unload the block (releases buffer but keeps BlockHandle)
-                let unload_result = block_mut.unload(has_temp_dir, |bid, data| {
+                let was_loaded = block.is_loaded();
+                let unload_result = block.unload(has_temp_dir, |bid, data| {
                     self.write_to_temporary_file(bid, block_tag, data)
                 });
 
                 // Update memory statistics (decrease used_memory)
-                if unload_result.is_ok() && !block.is_loaded() {
+                if was_loaded && unload_result.is_ok() && !block.is_loaded() {
                     self.update_used_memory(block_tag, -(block_size as i64));
                 }
             }

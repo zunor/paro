@@ -65,6 +65,25 @@ struct PreparedSegmentFilter {
     _reservation: Option<SearchMemoryReservation>,
 }
 
+fn generation_level0_degree(
+    generation_stats: &crate::search::GenerationStats,
+    fallback: usize,
+) -> Result<usize> {
+    generation_stats
+        .hnsw_provider_stats()
+        .filter(|stats| stats.vector_count != 0)
+        .map(|stats| {
+            usize::try_from(stats.level0_graph_links.div_ceil(stats.vector_count))
+                .map_err(|_| paro_error::out_of_range("HNSW average level-0 degree exceeds usize"))
+        })
+        .transpose()
+        .map(|degree| {
+            degree
+                .filter(|degree| *degree != 0)
+                .unwrap_or(fallback.max(1))
+        })
+}
+
 impl VectorSearchProvider {
     pub(crate) fn new(
         tablet: TabletRef,
@@ -129,6 +148,10 @@ impl VectorSearchProvider {
         let prepared_query = distance.prepare(&self.query);
         let expected_build_contract = provider_config.build_contract();
         let search_policy = provider_config.search_policy();
+        let level0_degree = generation_level0_degree(
+            &snapshot.generation.generation_stats,
+            expected_build_contract.m0 as usize,
+        )?;
         let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         let cursor = VectorSearchCursor {
             reader_runtime,
@@ -139,6 +162,7 @@ impl VectorSearchProvider {
             k: self.k,
             storage_col_id: self.column_id as u32,
             vector_dim,
+            level0_degree,
             distance,
             expected_build_contract,
             search_policy,
@@ -183,6 +207,11 @@ struct VectorSearchCursor {
     k: usize,
     storage_col_id: u32,
     vector_dim: usize,
+    /// Average degree of the immutable generation topology, rounded up.
+    /// Runtime costing must not substitute the build contract's maximum M0:
+    /// doing so overstates unique graph scores and switches broad filters to
+    /// slower exact scans at high `ef`.
+    level0_degree: usize,
     distance: DistanceMetric,
     expected_build_contract: HnswBuildContract,
     search_policy: HnswSearchPolicy,
@@ -225,7 +254,7 @@ impl VectorSearchCursor {
         });
         let parallelism_slots = budget.parallelism_slots.max(1);
         let effective_ef = self.search_policy.effective_ef(self.k, self.params.ef);
-        let level0_degree = self.expected_build_contract.m0 as usize;
+        let level0_degree = self.level0_degree;
 
         // Exact segment row sets are prepared once and retained at the query
         // boundary. Both singleton and generation-owned partition artifacts
@@ -440,6 +469,14 @@ impl VectorSearchCursor {
         let matching_rows = filter
             .row_set()
             .map_or(segment.segment.num_rows(), ExactRowSet::len);
+        let inline_index = segment.segment.open_hnsw_index(self.storage_col_id)?;
+        if let Some(index) = inline_index.as_ref() {
+            bind_hnsw_search_workspace(index, self.reader_runtime.as_ref())?;
+        }
+        let exact_scan_workload = inline_index.as_ref().map_or_else(
+            || filter.exact_scan_workload(segment.segment.num_rows(), |_| false),
+            |index| index.exact_scan_workload(filter),
+        );
         let search_strategy = query_wide_strategy.for_segment(HnswSegmentSearchInput {
             filter_kind: filter.kind(),
             matching_rows,
@@ -448,7 +485,8 @@ impl VectorSearchCursor {
             level0_degree,
             vector_dimension: self.vector_dim,
             parallelism: budget.parallelism_slots,
-            exact_scan_cost_class: filter.exact_scan_cost_class(),
+            exact_scan_workload,
+            cost_profile: self.search_policy.distance_cost,
         });
         let (rows, degraded) = self.search_segment(segment, search_strategy, filter, budget)?;
         let degraded_reason = degraded
@@ -533,7 +571,11 @@ impl VectorSearchCursor {
                 parts.push((point_base..point_end, row_set));
                 point_base = point_end;
             }
-            let row_set: Arc<dyn ExactRowSet> = Arc::new(PartitionExactRowSet::try_new(parts)?);
+            let row_set: Arc<dyn ExactRowSet> =
+                Arc::new(PartitionExactRowSet::try_new_with_directory(
+                    parts,
+                    artifact.coverage.partition_directory(),
+                )?);
             Some(row_set)
         };
         let _partition_reservation = partition_row_set
@@ -566,7 +608,8 @@ impl VectorSearchCursor {
             level0_degree,
             vector_dimension: self.vector_dim,
             parallelism: budget.parallelism_slots,
-            exact_scan_cost_class: filter.exact_scan_cost_class(),
+            exact_scan_workload: index.exact_scan_workload(filter),
+            cost_profile: self.search_policy.distance_cost,
         });
         let points = index
             .search_one_with_policy_strategy(
@@ -629,6 +672,7 @@ impl VectorSearchCursor {
             .segment
             .open_hnsw_index(self.storage_col_id)?
         {
+            bind_hnsw_search_workspace(&index, self.reader_runtime.as_ref())?;
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
             return visible_segment
                 .segment
@@ -827,7 +871,7 @@ fn open_sidecar_hnsw_artifact(
             integrity: SidecarIntegrityPolicy::SelfValidatingArtifact,
         },
     };
-    runtime.get_or_try_open_decoded(request, |cached| {
+    let index = runtime.get_or_try_open_decoded(request, |cached| {
         if !matches!(
             hnsw_artifact_compatibility(cached.bytes())?,
             HnswArtifactCompatibility::Current
@@ -843,7 +887,19 @@ fn open_sidecar_hnsw_artifact(
             )));
         }
         Ok(Some(index))
-    })
+    })?;
+    if let Some(index) = index.as_ref() {
+        bind_hnsw_search_workspace(index, runtime)?;
+        HnswIndex::schedule_background_integrity_verification(index);
+    }
+    Ok(index)
+}
+
+fn bind_hnsw_search_workspace(index: &Arc<HnswIndex>, runtime: &SearchReaderRuntime) -> Result<()> {
+    if let Some(buffer_pool) = runtime.buffer_pool() {
+        index.bind_search_buffer_pool(buffer_pool)?;
+    }
+    Ok(())
 }
 
 fn hnsw_ranked_rows_from_points(
@@ -944,6 +1000,25 @@ fn validate_query_dim(query: &[f32], vector_dim: usize) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_graph_cost_uses_the_generation_average_degree() {
+        let stats = crate::search::GenerationStats {
+            provider_stats: Some(crate::search::SearchProviderStats::Hnsw(
+                crate::search::stats::HnswProviderStats {
+                    vector_count: 10,
+                    level0_graph_links: 241,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert_eq!(generation_level0_degree(&stats, 32).unwrap(), 25);
+        assert_eq!(
+            generation_level0_degree(&crate::search::GenerationStats::default(), 32).unwrap(),
+            32
+        );
+    }
 
     #[test]
     fn exact_segment_dispatch_requires_enough_vector_work() {

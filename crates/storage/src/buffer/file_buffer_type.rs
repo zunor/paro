@@ -28,6 +28,13 @@ pub enum FileBufferType {
     /// External file block (cheap to evict - just free memory)
     /// Eviction priority: HIGHEST (same as Block)
     ExternalFile = 4,
+
+    /// Reconstructible query/build scratch memory.
+    ///
+    /// Scratch blocks are discarded under pressure and recreated as zeroed
+    /// memory when pinned again. They must never be spilled: their contents
+    /// have no value outside the borrower that currently pins the block.
+    Scratch = 5,
 }
 
 impl FileBufferType {
@@ -39,7 +46,7 @@ impl FileBufferType {
     /// - 2: TINY_BUFFER (evict last)
     pub fn eviction_queue_type_idx(self) -> usize {
         match self {
-            FileBufferType::Block | FileBufferType::ExternalFile => 0,
+            FileBufferType::Block | FileBufferType::ExternalFile | FileBufferType::Scratch => 0,
             FileBufferType::ManagedBuffer => 1,
             FileBufferType::TinyBuffer => 2,
         }
@@ -48,6 +55,11 @@ impl FileBufferType {
     /// Check if this buffer type needs to be written to disk before eviction
     pub fn must_write_to_disk(self) -> bool {
         matches!(self, FileBufferType::ManagedBuffer)
+    }
+
+    /// Whether an evicted block can be reconstructed without durable bytes.
+    pub fn is_reconstructible(self) -> bool {
+        matches!(self, FileBufferType::Scratch)
     }
 
     /// Check if this buffer type supports eviction queue index
@@ -60,7 +72,11 @@ impl FileBufferType {
     /// Get all buffer types for a given queue type index.
     pub fn from_queue_type_idx(queue_type_idx: usize) -> &'static [FileBufferType] {
         match queue_type_idx {
-            0 => &[FileBufferType::Block, FileBufferType::ExternalFile],
+            0 => &[
+                FileBufferType::Block,
+                FileBufferType::ExternalFile,
+                FileBufferType::Scratch,
+            ],
             1 => &[FileBufferType::ManagedBuffer],
             2 => &[FileBufferType::TinyBuffer],
             _ => panic!("Invalid queue type index: {}", queue_type_idx),
@@ -77,6 +93,7 @@ mod tests {
         // Block and ExternalFile have highest priority (evict first)
         assert_eq!(FileBufferType::Block.eviction_queue_type_idx(), 0);
         assert_eq!(FileBufferType::ExternalFile.eviction_queue_type_idx(), 0);
+        assert_eq!(FileBufferType::Scratch.eviction_queue_type_idx(), 0);
 
         // ManagedBuffer has medium priority
         assert_eq!(FileBufferType::ManagedBuffer.eviction_queue_type_idx(), 1);
@@ -91,6 +108,7 @@ mod tests {
         assert!(FileBufferType::ManagedBuffer.must_write_to_disk());
         assert!(!FileBufferType::TinyBuffer.must_write_to_disk());
         assert!(!FileBufferType::ExternalFile.must_write_to_disk());
+        assert!(!FileBufferType::Scratch.must_write_to_disk());
     }
 
     #[test]
@@ -99,14 +117,16 @@ mod tests {
         assert!(FileBufferType::ManagedBuffer.supports_eviction_queue_idx());
         assert!(!FileBufferType::TinyBuffer.supports_eviction_queue_idx());
         assert!(!FileBufferType::ExternalFile.supports_eviction_queue_idx());
+        assert!(!FileBufferType::Scratch.supports_eviction_queue_idx());
     }
 
     #[test]
     fn test_from_queue_type_idx() {
         let types_0 = FileBufferType::from_queue_type_idx(0);
-        assert_eq!(types_0.len(), 2);
+        assert_eq!(types_0.len(), 3);
         assert!(types_0.contains(&FileBufferType::Block));
         assert!(types_0.contains(&FileBufferType::ExternalFile));
+        assert!(types_0.contains(&FileBufferType::Scratch));
 
         let types_1 = FileBufferType::from_queue_type_idx(1);
         assert_eq!(types_1.len(), 1);
@@ -129,5 +149,6 @@ mod tests {
         assert_eq!(FileBufferType::ManagedBuffer as u8, 2);
         assert_eq!(FileBufferType::TinyBuffer as u8, 3);
         assert_eq!(FileBufferType::ExternalFile as u8, 4);
+        assert_eq!(FileBufferType::Scratch as u8, 5);
     }
 }

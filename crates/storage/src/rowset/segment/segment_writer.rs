@@ -748,6 +748,7 @@ impl SegmentWriter {
                         .into_iter()
                         .map(|block| HnswFilterBlock {
                             dictionary_ordinals: block.dictionary_ordinals,
+                            dictionary_values: block.dictionary_values,
                             ordinal_row_counts: block.ordinal_row_counts,
                             ordinal_fingerprints: block.ordinal_fingerprints,
                             point_ids: block.row_ids,

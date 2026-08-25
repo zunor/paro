@@ -19,9 +19,10 @@ use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
     DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD,
-    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_M,
+    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
     DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
-    DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -311,6 +312,9 @@ fn hnsw_provider_config(
         "build_seed",
         "plain_scan_threshold",
         "filtered_plain_scan_threshold",
+        "sequential_covering_scores_per_random_score",
+        "indexed_base_scores_per_random_score",
+        "graph_scored_points_per_ef",
         "filter_columns",
         "filter_block_rows",
         "filter_m",
@@ -368,6 +372,21 @@ fn hnsw_provider_config(
         options,
         "filtered_plain_scan_threshold",
         u64::from(DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD),
+    )?;
+    let sequential_covering_scores_per_random_score = parse_u64_index_option(
+        options,
+        "sequential_covering_scores_per_random_score",
+        u64::from(DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE),
+    )?;
+    let indexed_base_scores_per_random_score = parse_u64_index_option(
+        options,
+        "indexed_base_scores_per_random_score",
+        u64::from(DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE),
+    )?;
+    let graph_scored_points_per_ef = parse_u64_index_option(
+        options,
+        "graph_scored_points_per_ef",
+        u64::from(DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF),
     )?;
     let mut filter_columns = options
         .get("filter_columns")
@@ -475,6 +494,18 @@ fn hnsw_provider_config(
             .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
         filtered_plain_scan_threshold: u32::try_from(filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
+        sequential_covering_scores_per_random_score: u32::try_from(
+            sequential_covering_scores_per_random_score,
+        )
+        .map_err(|_| {
+            paro_error::out_of_range("HNSW sequential_covering_scores_per_random_score")
+        })?,
+        indexed_base_scores_per_random_score: u32::try_from(indexed_base_scores_per_random_score)
+            .map_err(|_| {
+            paro_error::out_of_range("HNSW indexed_base_scores_per_random_score")
+        })?,
+        graph_scored_points_per_ef: u32::try_from(graph_scored_points_per_ef)
+            .map_err(|_| paro_error::out_of_range("HNSW graph_scored_points_per_ef"))?,
         build_seed,
         proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -893,6 +924,7 @@ mod tests {
                 "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
                  m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
                  build_seed = 42 plain_scan_threshold = 20000 \
+                 graph_scored_points_per_ef = 20 \
                  filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
@@ -916,6 +948,7 @@ mod tests {
         );
         assert_eq!(bound.info.provider_config["dimension"], 100);
         assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
+        assert_eq!(bound.info.provider_config["graph_scored_points_per_ef"], 20);
         assert_eq!(
             bound.info.provider_config["filter_columns"],
             serde_json::json!([0])

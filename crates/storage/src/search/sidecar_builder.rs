@@ -595,6 +595,7 @@ fn build_hnsw_filter_blocks_for_segments<'a>(
                     .into_iter()
                     .map(|block| HnswFilterBlock {
                         dictionary_ordinals: block.dictionary_ordinals,
+                        dictionary_values: block.dictionary_values,
                         ordinal_row_counts: block.ordinal_row_counts,
                         ordinal_fingerprints: block.ordinal_fingerprints,
                         point_ids: block.row_ids,
@@ -1004,6 +1005,11 @@ mod tests {
             ef_search: 16,
             plain_scan_threshold: 0,
             filtered_plain_scan_threshold: 0,
+            sequential_covering_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+            indexed_base_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
             build_seed: 17,
             proposal_wave_size: 4,
             warmup_point_count: 4,
@@ -1098,6 +1104,7 @@ mod tests {
                     ef_search: 16,
                     plain_scan_threshold: 0,
                     filtered_plain_scan_threshold: 0,
+                    ..HnswSearchPolicy::default()
                 },
                 HnswSearchStrategy::AdaptiveFilteredGraph,
                 &crate::search::ResourceBudget::default(),

@@ -9,6 +9,7 @@ use std::cell::Cell;
 
 use paro_common::distance;
 
+use super::graph_links::GraphPoint;
 use super::types::{PointOffset, ScoreType, ScoredPoint};
 use super::vector_storage::CosineInverseNorms;
 use super::{DistanceMetric, PreparedQuery, VectorStorage};
@@ -32,6 +33,7 @@ pub(crate) struct PreparedVectorScoring<'a> {
     query: &'a PreparedQuery,
     vectors: &'a [f32],
     dimension: usize,
+    point_count: usize,
     kernel: ScoringKernel<'a>,
 }
 
@@ -41,6 +43,7 @@ impl<'a> PreparedVectorScoring<'a> {
             query: self.query,
             vectors: self.vectors,
             dimension: self.dimension,
+            point_count: self.point_count,
             kernel: self.kernel,
             scores_buffer: Vec::new(),
             scored_points: Cell::new(0),
@@ -70,6 +73,7 @@ pub struct VectorScorer<'a> {
     query: &'a PreparedQuery,
     vectors: &'a [f32],
     dimension: usize,
+    point_count: usize,
     kernel: ScoringKernel<'a>,
     scores_buffer: Vec<ScoreType>,
     scored_points: Cell<u64>,
@@ -122,6 +126,7 @@ impl<'a> VectorScorer<'a> {
             query,
             vectors,
             dimension,
+            point_count: vector_storage.num_vectors(),
             kernel,
             scores_buffer: Vec::new(),
             scored_points: Cell::new(0),
@@ -146,11 +151,26 @@ impl<'a> VectorScorer<'a> {
         (self.vectors, self.dimension)
     }
 
+    pub(crate) fn point_count(&self) -> usize {
+        self.point_count
+    }
+
     /// Schedule the leading vector cache lines while graph-link and visited
     /// processing still has useful independent work to perform.
+    ///
+    /// `GraphPoint` is yielded only by a `GraphLinksReadView` bound to this
+    /// scorer's cardinality. Reusing that capability avoids manufacturing a
+    /// checked vector slice solely to issue non-dereferencing prefetch hints.
     #[inline(always)]
-    pub(crate) fn prefetch_point(&self, point_id: PointOffset) {
-        distance::prefetch_vector_read(self.vector(point_id));
+    pub(crate) fn prefetch_graph_point(&self, point: GraphPoint) {
+        let start = point.index() * self.dimension;
+        // SAFETY: HnswIndex validates graph/vector cardinality at construction,
+        // and `GraphLinks::search_view` repeats that proof at the search
+        // boundary before it can yield `GraphPoint`. The immutable vector
+        // matrix therefore contains this complete row.
+        let vector =
+            unsafe { std::slice::from_raw_parts(self.vectors.as_ptr().add(start), self.dimension) };
+        distance::prefetch_vector_read(vector);
     }
 
     pub fn scored_point_count(&self) -> u64 {
@@ -162,6 +182,7 @@ impl<'a> VectorScorer<'a> {
             query: self.query,
             vectors: self.vectors,
             dimension: self.dimension,
+            point_count: self.point_count,
             kernel: self.kernel,
         }
     }

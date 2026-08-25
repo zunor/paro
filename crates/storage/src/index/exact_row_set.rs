@@ -13,10 +13,11 @@
 use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
+use bytes::Bytes;
 use paro_common::error::Result;
 use roaring::RoaringBitmap;
 
-use crate::index::partition_directory::PartitionDirectory;
+use crate::index::PartitionDirectory;
 use crate::tablet::ColumnId;
 
 /// One immutable scalar-dictionary posting. `ordinal` is the physical
@@ -25,26 +26,44 @@ use crate::tablet::ColumnId;
 #[derive(Debug, Clone)]
 pub struct ExactOrdinalPosting {
     ordinal: u16,
+    scalar_key: ExactScalarKey,
     rows: Arc<RoaringBitmap>,
-    fingerprint: u64,
+}
+
+/// Canonical scalar identity carried from a complete bitmap dictionary into
+/// generation-owned covering scans. Unlike a posting hash, this proves which
+/// SQL value an ordinal represents even when different segments assign that
+/// value different local ordinal numbers.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ExactScalarKey {
+    Value(Bytes),
+    Null,
 }
 
 impl ExactOrdinalPosting {
     #[cfg(test)]
     pub(crate) fn new(ordinal: u16, rows: Arc<RoaringBitmap>) -> Self {
-        let fingerprint = crate::index::bitmap::posting_fingerprint(&rows);
+        let scalar_key = if ordinal == u16::MAX {
+            ExactScalarKey::Null
+        } else {
+            ExactScalarKey::Value(Bytes::copy_from_slice(&ordinal.to_le_bytes()))
+        };
         Self {
             ordinal,
+            scalar_key,
             rows,
-            fingerprint,
         }
     }
 
-    pub(crate) fn from_index(ordinal: u16, rows: Arc<RoaringBitmap>, fingerprint: u64) -> Self {
+    pub(crate) fn from_index(
+        ordinal: u16,
+        scalar_key: ExactScalarKey,
+        rows: Arc<RoaringBitmap>,
+    ) -> Self {
         Self {
             ordinal,
+            scalar_key,
             rows,
-            fingerprint,
         }
     }
 
@@ -56,8 +75,8 @@ impl ExactOrdinalPosting {
         &self.rows
     }
 
-    pub fn fingerprint(&self) -> u64 {
-        self.fingerprint
+    pub fn scalar_key(&self) -> &ExactScalarKey {
+        &self.scalar_key
     }
 }
 
@@ -87,11 +106,13 @@ pub enum ExactRowAdmission<'a> {
 /// heaps, without materializing or sorting a query-sized candidate array.
 #[derive(Debug, Clone, Copy)]
 pub enum ExactRowPartitions<'a> {
+    /// One complete contiguous local domain. Exact scoring can stream the
+    /// corresponding base-vector range without gathering point ids.
+    Dense(u32),
     Single(&'a RoaringBitmap),
-    OrdinalPostings {
-        column_id: ColumnId,
-        postings: &'a [ExactOrdinalPosting],
-    },
+    /// Query selection over an index-owned immutable posting catalog. The
+    /// accepted-ordinal bit set belongs to the query; posting payloads do not.
+    OrdinalSelection(&'a OrdinalRowSet),
     /// Canonical concatenation of immutable segment-local row sets.
     ///
     /// Keeping the partition identity here is essential: generation-owned
@@ -104,8 +125,9 @@ pub enum ExactRowPartitions<'a> {
 impl ExactRowPartitions<'_> {
     pub fn len(self) -> usize {
         match self {
+            Self::Dense(_) => 1,
             Self::Single(_) => 1,
-            Self::OrdinalPostings { postings, .. } => postings.len(),
+            Self::OrdinalSelection(row_set) => row_set.selected_posting_count(),
             Self::Partitioned(row_set) => row_set
                 .physical_parts()
                 .map(|(_, part)| part.physical_partitions().len())
@@ -276,7 +298,7 @@ impl ExactRowSet for DenseRowSet {
     }
 
     fn physical_partitions(&self) -> ExactRowPartitions<'_> {
-        ExactRowPartitions::Single(self.materialized())
+        ExactRowPartitions::Dense(self.domain_len)
     }
 
     fn query_retained_bytes(&self) -> usize {
@@ -326,7 +348,8 @@ impl PartitionExactRowAdmission<'_> {
 #[derive(Debug)]
 pub struct PartitionExactRowSet {
     parts: Box<[PartitionExactRowSetPart]>,
-    part_directory: PartitionDirectory,
+    part_directory: Arc<PartitionDirectory>,
+    directory_owned_by_query: bool,
     cardinality: u64,
     domain_len: u32,
     materialized: OnceLock<RoaringBitmap>,
@@ -334,6 +357,24 @@ pub struct PartitionExactRowSet {
 
 impl PartitionExactRowSet {
     pub fn try_new(parts: Vec<(Range<u32>, Arc<dyn ExactRowSet>)>) -> Result<Self> {
+        Self::try_new_inner(parts, None)
+    }
+
+    /// Bind query-specific exact row sets to the immutable physical layout
+    /// already owned by a generation artifact. Partition boundaries are an
+    /// artifact property; rebuilding their routing directory for every query
+    /// would make query state pay for immutable generation metadata.
+    pub(crate) fn try_new_with_directory(
+        parts: Vec<(Range<u32>, Arc<dyn ExactRowSet>)>,
+        part_directory: Arc<PartitionDirectory>,
+    ) -> Result<Self> {
+        Self::try_new_inner(parts, Some(part_directory))
+    }
+
+    fn try_new_inner(
+        parts: Vec<(Range<u32>, Arc<dyn ExactRowSet>)>,
+        part_directory: Option<Arc<PartitionDirectory>>,
+    ) -> Result<Self> {
         if parts.is_empty() {
             return Err(paro_common::error::invalid_input(
                 "partition exact row set must contain at least one domain",
@@ -362,10 +403,24 @@ impl PartitionExactRowSet {
             validated.push(PartitionExactRowSetPart { range, row_set });
         }
         let parts = validated.into_boxed_slice();
-        let part_directory = PartitionDirectory::try_new(parts.iter().map(|part| part.range.end))?;
+        let directory_owned_by_query = part_directory.is_none();
+        let part_directory = match part_directory {
+            Some(directory) => {
+                if !directory.matches_partition_ends(parts.iter().map(|part| part.range.end)) {
+                    return Err(paro_common::error::data_corrupted(
+                        "partition exact row-set domains differ from artifact coverage",
+                    ));
+                }
+                directory
+            }
+            None => Arc::new(PartitionDirectory::try_new(
+                parts.iter().map(|part| part.range.end),
+            )?),
+        };
         Ok(Self {
             parts,
             part_directory,
+            directory_owned_by_query,
             cardinality,
             domain_len: expected_start,
             materialized: OnceLock::new(),
@@ -392,28 +447,12 @@ impl PartitionExactRowSet {
         })
     }
 
-    pub(crate) fn physical_parts(&self) -> impl Iterator<Item = (u32, &dyn ExactRowSet)> + '_ {
+    pub(crate) fn physical_parts(
+        &self,
+    ) -> impl Iterator<Item = (Range<u32>, &dyn ExactRowSet)> + '_ {
         self.parts
             .iter()
-            .map(|part| (part.range.start, part.row_set.as_ref()))
-    }
-
-    pub(crate) fn ordinal_column_id(&self) -> Option<ColumnId> {
-        let mut column_id = None;
-        for (_, part) in self.physical_parts() {
-            let ExactRowPartitions::OrdinalPostings {
-                column_id: part_column_id,
-                ..
-            } = part.physical_partitions()
-            else {
-                return None;
-            };
-            if column_id.is_some_and(|column_id| column_id != part_column_id) {
-                return None;
-            }
-            column_id = Some(part_column_id);
-        }
-        column_id
+            .map(|part| (part.range.clone(), part.row_set.as_ref()))
     }
 }
 
@@ -474,7 +513,11 @@ impl ExactRowSet for PartitionExactRowSet {
                         .saturating_add(std::mem::size_of::<ExactRowAdmission<'_>>()),
                 ),
             )
-            .saturating_add(self.part_directory.allocated_bytes())
+            .saturating_add(if self.directory_owned_by_query {
+                self.part_directory.allocated_bytes()
+            } else {
+                0
+            })
     }
 
     fn admission(&self) -> ExactRowAdmission<'_> {
@@ -568,10 +611,11 @@ pub struct OrdinalRowSet {
     /// Accepted dictionary postings are disjoint by the bitmap artifact
     /// completeness contract. Keeping shared decoded postings lets exact scans
     /// enumerate candidates without deserializing or unioning them per query.
-    postings: Box<[ExactOrdinalPosting]>,
+    posting_catalog: Arc<[ExactOrdinalPosting]>,
 }
 
 impl OrdinalRowSet {
+    #[cfg(test)]
     pub(crate) fn new(
         column_id: ColumnId,
         row_ordinals: Arc<[u16]>,
@@ -580,13 +624,31 @@ impl OrdinalRowSet {
         cardinality: u64,
         postings: Box<[ExactOrdinalPosting]>,
     ) -> Self {
+        Self::new_shared(
+            column_id,
+            row_ordinals,
+            accepted_ordinals,
+            accepts_null,
+            cardinality,
+            Arc::from(postings),
+        )
+    }
+
+    pub(crate) fn new_shared(
+        column_id: ColumnId,
+        row_ordinals: Arc<[u16]>,
+        accepted_ordinals: Box<[u64]>,
+        accepts_null: bool,
+        cardinality: u64,
+        posting_catalog: Arc<[ExactOrdinalPosting]>,
+    ) -> Self {
         Self {
             column_id,
             row_ordinals,
             accepted_ordinals,
             accepts_null,
             cardinality,
-            postings,
+            posting_catalog,
         }
     }
 
@@ -597,6 +659,22 @@ impl OrdinalRowSet {
         self.accepted_ordinals
             .get(ordinal as usize / 64)
             .is_some_and(|word| word & (1_u64 << (ordinal % 64)) != 0)
+    }
+
+    pub(crate) fn column_id(&self) -> ColumnId {
+        self.column_id
+    }
+
+    pub(crate) fn selected_postings(
+        &self,
+    ) -> impl Iterator<Item = &ExactOrdinalPosting> + Clone + '_ {
+        self.posting_catalog
+            .iter()
+            .filter(|posting| self.accepts_ordinal(posting.ordinal()))
+    }
+
+    pub(crate) fn selected_posting_count(&self) -> usize {
+        self.selected_postings().count()
     }
 }
 
@@ -617,14 +695,14 @@ impl ExactRowSet for OrdinalRowSet {
 
     fn materialize(&self) -> RoaringBitmap {
         let mut bitmap = RoaringBitmap::new();
-        for posting in &self.postings {
+        for posting in self.selected_postings() {
             bitmap |= posting.rows();
         }
         bitmap
     }
 
     fn try_for_each(&self, visitor: &mut dyn FnMut(u32) -> Result<()>) -> Result<()> {
-        for posting in &self.postings {
+        for posting in self.selected_postings() {
             for row_id in posting.rows().iter() {
                 visitor(row_id)?;
             }
@@ -638,36 +716,38 @@ impl ExactRowSet for OrdinalRowSet {
         visitor: &mut dyn FnMut(&[u32]) -> Result<()>,
     ) -> Result<()> {
         let row_ids = self
-            .postings
-            .iter()
+            .selected_postings()
             .flat_map(|posting| posting.rows().iter());
         visit_row_ids_in_batches(row_ids, batch, visitor)
     }
 
     fn append_partition_seeds(&self, limit: usize, seeds: &mut Vec<u32>) {
-        if limit == 0 || self.postings.is_empty() {
+        let posting_count = self.selected_posting_count();
+        if limit == 0 || posting_count == 0 {
             return;
         }
-        let count = self.postings.len().min(limit);
+        let count = posting_count.min(limit);
+        let mut postings = self.selected_postings();
+        let mut next_slot = 0usize;
         for slot in 0..count {
-            let partition = slot.saturating_mul(self.postings.len()) / count;
-            if let Some(row_id) = self.postings[partition].rows().iter().next() {
+            let partition = slot.saturating_mul(posting_count) / count;
+            let Some(posting) = postings.nth(partition.saturating_sub(next_slot)) else {
+                break;
+            };
+            next_slot = partition.saturating_add(1);
+            if let Some(row_id) = posting.rows().iter().next() {
                 seeds.push(row_id);
             }
         }
     }
 
     fn physical_partitions(&self) -> ExactRowPartitions<'_> {
-        ExactRowPartitions::OrdinalPostings {
-            column_id: self.column_id,
-            postings: &self.postings,
-        }
+        ExactRowPartitions::OrdinalSelection(self)
     }
 
     fn query_retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             .saturating_add(self.accepted_ordinals.len() * std::mem::size_of::<u64>())
-            .saturating_add(self.postings.len() * std::mem::size_of::<ExactOrdinalPosting>())
     }
 
     fn admission(&self) -> ExactRowAdmission<'_> {
@@ -713,7 +793,7 @@ mod tests {
         let rows = OrdinalRowSet::new(
             7,
             Arc::from([0_u16; 16]),
-            vec![1].into_boxed_slice(),
+            vec![0b11].into_boxed_slice(),
             false,
             5,
             vec![
@@ -744,7 +824,7 @@ mod tests {
         let rows = OrdinalRowSet::new(
             7,
             Arc::from([0_u16; 32]),
-            vec![1].into_boxed_slice(),
+            vec![0b1111].into_boxed_slice(),
             false,
             8,
             postings.into(),

@@ -741,12 +741,12 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                 IndexType::HNSW => {
                                     let stats = table_entry
                                         .and_then(|table| table.get_storage())
-                                        .and_then(|storage| {
-                                            idx.get_column_ids().first().and_then(|column_id| {
-                                                storage.hnsw_index_statistics(column_id.index)
-                                            })
+                                        .map(|storage| {
+                                            storage.hnsw_generation_statistics(
+                                                idx.base.base.object_id.raw(),
+                                            )
                                         });
-                                    if let Some(stats) = stats {
+                                    if let Some(Ok(Some(stats))) = stats.as_ref() {
                                         entry_count =
                                             stats.num_indexed_vectors.min(i64::MAX as usize) as i64;
                                         json!({
@@ -768,6 +768,14 @@ fn populate_paro_indexes(global_state: &mut dyn GlobalTableFunctionState, ctx: &
                                                     "complete": coverage.is_complete(),
                                                 })
                                             }),
+                                        })
+                                    } else if let Some(Err(error)) = stats {
+                                        json!({
+                                            "column_ids": idx.get_column_ids().iter().map(|column_id| column_id.index).collect::<Vec<_>>(),
+                                            "column_names": column_names,
+                                            "provider_config": &idx.provider_config,
+                                            "statistics_error": error.to_string(),
+                                            "failure_reason": idx.failure_reason(),
                                         })
                                     } else {
                                         json!({

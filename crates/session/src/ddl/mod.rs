@@ -1811,6 +1811,7 @@ impl DdlApplyContext for SessionDdlBridge {
                         .fulltext
                         .as_ref()
                         .map(|binding| binding.config.clone()),
+                    provider_config_json: handle.info.provider_config.to_string(),
                 }),
             },
             profile: DdlExecutionProfile::attach_index_state(),

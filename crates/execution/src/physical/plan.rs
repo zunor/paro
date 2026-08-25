@@ -1001,7 +1001,7 @@ fn push_dense_search_filter_properties(
         "exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates"
     };
     let strategy = format!(
-        "query-wide runtime choice: {exact_scan} at <= {} total matches (segment-shape and machine-width independent); otherwise per-segment predicate-agnostic HNSW navigation with observed deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback",
+        "query-wide runtime choice: {exact_scan} at <= {} total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback",
         spec.search_policy.filtered_plain_scan_threshold
     );
     push_string_property(properties, "Filtered Strategy", strategy);
@@ -1042,6 +1042,21 @@ fn push_vector_search_properties(
         spec.params
             .ef
             .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+    );
+    push_string_property(
+        properties,
+        "Exact/Graph Cost Profile",
+        format!(
+            "covering={} sequential scores/random score, indexed-base={} gathered scores/random score, graph={} unique scores/ef (definition-pinned, capped by generation average level-0 degree={:.2})",
+            spec.search_policy
+                .distance_cost
+                .sequential_covering_scores_per_random_score,
+            spec.search_policy
+                .distance_cost
+                .indexed_base_scores_per_random_score,
+            spec.search_policy.distance_cost.graph_scored_points_per_ef,
+            spec.avg_level0_degree,
+        ),
     );
     push_dense_search_filter_properties(properties, spec);
 }
@@ -1208,11 +1223,7 @@ fn is_search_scan(kind: &PhysicalNodeKind) -> bool {
 fn fallback_cardinality(kind: &PhysicalNodeKind) -> Option<CardinalityEstimate> {
     let rows = match kind {
         PhysicalNodeKind::VectorSearch(spec) => spec
-            .table
-            .storage
-            .as_ref()
-            .and_then(|table| table.hnsw_index_statistics(spec.column_id as u32))
-            .map(|stats| stats.num_indexed_vectors as u64)
+            .estimated_total_rows
             .filter(|rows| *rows > 0)
             .or_else(|| table_row_count(spec.table.as_ref())),
         PhysicalNodeKind::SparseVectorSearch(spec) => spec

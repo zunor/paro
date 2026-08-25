@@ -466,7 +466,7 @@ impl HnswInlineThreshold {
     }
 
     /// Machine-independent resident graph estimate used by the durable inline
-    /// threshold. This models the published hybrid-CSR artifact, not the
+    /// threshold. This models the published fixed-record artifact, not the
     /// mutable builder object graph. Mixing builder containers into this
     /// estimate makes storage segmentation depend on transient implementation
     /// details and multiplies query-time graph work. Runtime worker width must
@@ -477,11 +477,8 @@ impl HnswInlineThreshold {
         let point_bytes = std::mem::size_of::<u32>() as u64;
         let offset_bytes = std::mem::size_of::<u64>() as u64;
         let header_bytes = 64_u64;
-        let offset_tables = vector_count
-            .saturating_add(1)
-            .saturating_mul(offset_bytes)
-            .saturating_mul(2);
-        let level0_links = vector_count
+        let upper_offsets = vector_count.saturating_add(1).saturating_mul(offset_bytes);
+        let level0_records = vector_count
             .saturating_mul(m.saturating_mul(2))
             .saturating_mul(point_bytes);
         // Upper levels are delta-varint encoded. The standard level
@@ -495,8 +492,8 @@ impl HnswInlineThreshold {
                 .div_ceil(upper_denominator),
         );
         header_bytes
-            .saturating_add(offset_tables)
-            .saturating_add(level0_links)
+            .saturating_add(upper_offsets)
+            .saturating_add(level0_records)
             .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
     }
 
@@ -516,13 +513,11 @@ impl HnswInlineThreshold {
             return 0;
         }
         let columns = filter_columns as u64;
-        let offset_tables = vector_count
+        let upper_offsets = vector_count
             .saturating_add(1)
-            .saturating_mul(std::mem::size_of::<u64>() as u64)
-            .saturating_mul(2);
-        let links = vector_count
-            .saturating_mul(columns)
-            .saturating_mul(u64::from(filter_m).saturating_mul(3))
+            .saturating_mul(std::mem::size_of::<u64>() as u64);
+        let level0_records = vector_count
+            .saturating_mul(columns.saturating_mul(u64::from(filter_m).saturating_mul(3)))
             .saturating_mul(std::mem::size_of::<u32>() as u64);
         let m = u64::from(filter_m.max(2));
         let upper_payload_per_point = 1_u64.saturating_add(
@@ -537,8 +532,8 @@ impl HnswInlineThreshold {
             .saturating_mul(columns);
         let entry_points = block_count.saturating_mul(12);
         64_u64
-            .saturating_add(offset_tables)
-            .saturating_add(links)
+            .saturating_add(upper_offsets)
+            .saturating_add(level0_records)
             .saturating_add(vector_count.saturating_mul(upper_payload_per_point))
             .saturating_add(entry_points)
     }
@@ -604,7 +599,9 @@ impl HnswInlineThreshold {
         m: u32,
         build_width: usize,
     ) -> u64 {
-        let visited_lists = vector_count.saturating_mul(build_width.max(1) as u64);
+        let visited_lists = vector_count
+            .saturating_mul(build_width.max(1) as u64)
+            .saturating_mul(std::mem::size_of::<u8>() as u64);
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
@@ -673,7 +670,9 @@ impl HnswInlineThreshold {
         let graph_order_block_vectors = max_block_rows
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
-        let local_visited = max_block_rows.saturating_mul(build_width.max(1) as u64);
+        let local_visited = max_block_rows
+            .saturating_mul(build_width.max(1) as u64)
+            .saturating_mul(std::mem::size_of::<u8>() as u64);
         merged_containers
             .saturating_add(merged_links)
             .saturating_add(upper_level_containers)
@@ -773,11 +772,20 @@ impl HnswInlineBuildEstimate {
     /// Derive a segment limit from both the configured vector-count ceiling
     /// and the graph-memory ceiling instead.
     pub fn max_segment_vector_count(self) -> u64 {
-        let bytes_per_vector = self
-            .estimated_graph_memory_bytes
-            .saturating_add(self.vector_count.saturating_sub(1))
-            / self.vector_count.max(1);
-        let memory_bound = self.threshold.max_graph_memory_bytes / bytes_per_vector.max(1);
+        // Scale the complete estimate instead of first rounding it to a
+        // per-row byte count. The latter can make an estimate reject its own
+        // cardinality when fixed headers leave a remainder (for example,
+        // `estimate(N) / ceil(estimate(N) / N) == N - 1`). Treating fixed
+        // metadata as proportional is conservative for smaller segments and
+        // preserves the important identity at the measured cardinality.
+        let memory_bound = if self.estimated_graph_memory_bytes == 0 {
+            self.threshold.max_vector_count
+        } else {
+            (u128::from(self.threshold.max_graph_memory_bytes)
+                .saturating_mul(u128::from(self.vector_count))
+                / u128::from(self.estimated_graph_memory_bytes))
+            .min(u128::from(u64::MAX)) as u64
+        };
         self.threshold.max_vector_count.min(memory_bound).max(1)
     }
 }
@@ -857,16 +865,20 @@ mod tests {
         let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 1);
         let width_32 = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 32);
 
-        assert_eq!(width_32 - serial, points * 31);
+        assert_eq!(
+            width_32 - serial,
+            points * 31 * std::mem::size_of::<u8>() as u64
+        );
         assert!(builder_graph > graph);
         assert_eq!(
             serial - builder_graph,
-            points + points * 128 * std::mem::size_of::<f32>() as u64
+            points * std::mem::size_of::<u8>() as u64
+                + points * 128 * std::mem::size_of::<f32>() as u64
         );
     }
 
     #[test]
-    fn persisted_csr_budget_does_not_inherit_builder_container_overhead() {
+    fn persisted_fixed_record_budget_does_not_inherit_builder_container_overhead() {
         let points = 1_000_000;
         let resident = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
         let builder = HnswInlineThreshold::estimate_build_peak_memory_bytes(
@@ -912,6 +924,9 @@ mod tests {
                 "ef_search": 64,
                 "plain_scan_threshold": 10_000,
                 "filtered_plain_scan_threshold": 0,
+                "sequential_covering_scores_per_random_score": crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+                "indexed_base_scores_per_random_score": crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
                 "build_seed": 1,
                 "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

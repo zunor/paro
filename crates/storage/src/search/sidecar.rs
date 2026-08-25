@@ -8,7 +8,7 @@ use std::hash::Hasher;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use arc_swap::ArcSwap;
 use memmap2::Mmap;
@@ -698,6 +698,7 @@ pub struct SearchReaderRuntime {
     sidecars: SidecarReaderCache,
     decoded: ArcSwap<BTreeMap<DecodedSidecarArtifactKey, Arc<dyn Any + Send + Sync>>>,
     decoded_update: Mutex<()>,
+    buffer_pool: OnceLock<Arc<crate::buffer::BufferPool>>,
 }
 
 impl std::fmt::Debug for SearchReaderRuntime {
@@ -716,7 +717,45 @@ impl SearchReaderRuntime {
             sidecars: SidecarReaderCache::new(store),
             decoded: ArcSwap::from_pointee(BTreeMap::new()),
             decoded_update: Mutex::new(()),
+            buffer_pool: OnceLock::new(),
         }
+    }
+
+    /// Bind long-lived provider readers to the same process memory governor
+    /// used by ordinary table reads. A table runtime belongs to one instance;
+    /// accepting a different pool later would silently split its accounting.
+    pub(crate) fn bind_buffer_pool(
+        &self,
+        buffer_pool: Option<Arc<crate::buffer::BufferPool>>,
+    ) -> Result<()> {
+        let Some(buffer_pool) = buffer_pool else {
+            return Ok(());
+        };
+        if let Some(existing) = self.buffer_pool.get() {
+            return if Arc::ptr_eq(existing, &buffer_pool) {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "search reader runtime cannot move between buffer pools",
+                ))
+            };
+        }
+        if let Err(buffer_pool) = self.buffer_pool.set(buffer_pool) {
+            if !self
+                .buffer_pool
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(existing, &buffer_pool))
+            {
+                return Err(paro_error::internal(
+                    "concurrent search reader buffer-pool binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn buffer_pool(&self) -> Option<Arc<crate::buffer::BufferPool>> {
+        self.buffer_pool.get().cloned()
     }
 
     pub fn open_sidecar(

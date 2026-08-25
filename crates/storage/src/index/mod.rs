@@ -75,7 +75,7 @@ pub use evaluator::IndexEvaluator;
 pub(crate) use exact_row_set::OrdinalRowSet;
 pub use exact_row_set::{
     DenseRowSet, ExactOrdinalPosting, ExactRowAdmission, ExactRowPartitions, ExactRowSet,
-    PartitionExactRowSet,
+    ExactScalarKey, PartitionExactRowSet,
 };
 pub use fixed_membership::{FixedMembership, FixedMembershipBuildPolicy};
 pub(crate) use fixed_membership::{
@@ -106,6 +106,7 @@ pub use index_type::{
     IndexType, IndexTypeInfo, PlanIndexInput,
 };
 pub use index_type_set::IndexTypeSet;
+pub(crate) use partition_directory::PartitionDirectory;
 pub use predicate::{
     collect_predicate_columns, compare_bytes, supports_ordered_bytes, value_to_bytes, Predicate,
     PredicateComparison, PredicateTree,

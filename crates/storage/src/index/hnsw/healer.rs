@@ -12,7 +12,7 @@ use super::links_container::{ItemsBuffer, LinksContainer};
 use super::search_context::FixedLengthPriorityQueue;
 use super::types::{HnswM, PointOffset, ScoredPoint};
 use super::vector_storage::VectorStorage;
-use super::visited_pool::VisitedPool;
+use super::visited_pool::BuildVisitedPool;
 use super::DistanceMetric;
 use parking_lot::RwLock;
 use paro_common::error::Result;
@@ -49,7 +49,7 @@ pub struct GraphLayersHealer<'a> {
     old_to_new: &'a [Option<PointOffset>],
     hnsw_m: HnswM,
     ef_construct: usize,
-    visited_pool: VisitedPool,
+    visited_pool: BuildVisitedPool,
 }
 
 impl<'a> GraphLayersHealer<'a> {
@@ -91,13 +91,14 @@ impl<'a> GraphLayersHealer<'a> {
             links_layers.push(point_layers);
         }
 
+        let num_points = links_layers.len();
         Ok(Self {
             links_layers,
             to_heal,
             old_to_new,
             hnsw_m: graph_layers.hnsw_m,
             ef_construct,
-            visited_pool: VisitedPool::new(),
+            visited_pool: BuildVisitedPool::new(num_points),
         })
     }
 
@@ -116,15 +117,15 @@ impl<'a> GraphLayersHealer<'a> {
         level: usize,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-    ) -> Vec<ScoredPoint> {
+    ) -> Result<Vec<ScoredPoint>> {
         if self.ef_construct == 0
             || offset as usize >= self.links_layers.len()
             || level >= self.links_layers[offset as usize].len()
         {
-            return Vec::new();
+            return Ok(Vec::new());
         }
 
-        let mut visited = self.visited_pool.get(self.links_layers.len());
+        let mut visited = self.visited_pool.get()?;
         let mut nearest = FixedLengthPriorityQueue::<ScoredPoint>::new(self.ef_construct);
 
         let mut pending = Vec::new();
@@ -173,7 +174,7 @@ impl<'a> GraphLayersHealer<'a> {
             }
         }
 
-        nearest.into_sorted_vec()
+        Ok(nearest.into_sorted_vec())
     }
 
     fn heal_point_on_level(
@@ -182,10 +183,10 @@ impl<'a> GraphLayersHealer<'a> {
         level: usize,
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-    ) {
+    ) -> Result<()> {
         let level_m = self.hnsw_m.get_m(level);
         if level_m == 0 {
-            return;
+            return Ok(());
         }
 
         let mut valid_links = Vec::with_capacity(level_m);
@@ -197,7 +198,7 @@ impl<'a> GraphLayersHealer<'a> {
         );
         valid_links.truncate(level_m);
 
-        let shortcuts = self.search_shortcuts_on_level(offset, level, storage, distance);
+        let shortcuts = self.search_shortcuts_on_level(offset, level, storage, distance)?;
         let mut container = LinksContainer::with_capacity(level_m);
         let scorer = |a: PointOffset, b: PointOffset| score_indexed(storage, distance, a, b);
         container.fill_from_sorted_with_heuristic(
@@ -239,16 +240,18 @@ impl<'a> GraphLayersHealer<'a> {
                 );
             }
         }
+        Ok(())
     }
 
     /// Heal all marked point/level pairs.
-    pub fn heal(&mut self, storage: &dyn VectorStorage, distance: DistanceMetric) {
+    pub fn heal(&mut self, storage: &dyn VectorStorage, distance: DistanceMetric) -> Result<()> {
         for (offset, level) in std::mem::take(&mut self.to_heal) {
             if self.point_deleted(offset) {
                 continue;
             }
-            self.heal_point_on_level(offset, level, storage, distance);
+            self.heal_point_on_level(offset, level, storage, distance)?;
         }
+        Ok(())
     }
 
     /// Save surviving points and repaired links into a pre-allocated builder.
@@ -287,7 +290,7 @@ mod tests {
     use crate::index::hnsw::persistence::HnswIndex;
     use crate::index::hnsw::types::{HnswConfig, SearchParams};
     use crate::index::hnsw::vector_storage::{InMemoryVectorStorage, VectorStorage};
-    use crate::index::hnsw::{IndexedVectorStorage, VisitedPool};
+    use crate::index::hnsw::IndexedVectorStorage;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
     use rand::{Rng, SeedableRng};
@@ -378,10 +381,12 @@ mod tests {
             builder.set_levels(idx as u32, level);
         }
         for i in 0..vectors.len() {
-            builder.insert_single_point(i as u32, storage.as_ref(), distance);
+            builder
+                .insert_single_point(i as u32, storage.as_ref(), distance)
+                .unwrap();
         }
         let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
+        let graph = GraphLayers::new(links, entry_points, (&config).into());
         HnswIndex::new(config, graph, storage, distance)
     }
 
@@ -545,13 +550,14 @@ mod tests {
                 healer.pending_count() > 0,
                 "expected non-empty repair set for delete ratio {ratio}"
             );
-            healer.heal(base_index.vector_storage.as_ref(), distance);
+            healer
+                .heal(base_index.vector_storage.as_ref(), distance)
+                .unwrap();
             healer.save_into_builder(&healed_builder);
 
             let survivor_storage: Arc<dyn VectorStorage> = make_storage(&survivor_vectors);
             let (links, entry_points) = healed_builder.into_graph_data();
-            let healed_graph =
-                GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
+            let healed_graph = GraphLayers::new(links, entry_points, (&config).into());
             let healed = HnswIndex::new(config, healed_graph, survivor_storage, distance);
 
             let search_params = SearchParams {

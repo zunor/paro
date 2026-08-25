@@ -88,6 +88,10 @@ pub struct CreateIndexPayload {
     pub is_unique: bool,
     pub if_not_exists: bool,
     pub fulltext_config: Option<String>,
+    /// Canonical JSON for the versioned provider-owned physical contract.
+    /// Keeping the WAL field opaque preserves the common crate's dependency
+    /// direction while making replay restore the exact catalog definition.
+    pub provider_config_json: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

@@ -7,8 +7,7 @@
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
-    estimate_filtered_search_strategy, HnswDistanceCostModel, HnswFilteredSearchStrategy,
-    HnswSearchPolicy,
+    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
 };
 use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
@@ -117,19 +116,36 @@ impl VectorScanCostModel {
         let effective_ef = policy.effective_ef(k, ef);
         let ef_val = effective_ef as f64;
         let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
-        // Planning consumes the same process-local hardware calibration as
-        // execution. The optimizer models one execution lane because the
-        // scheduler grant is not known at this boundary; runtime may lower an
-        // HNSW source to a wider exact scan without changing result semantics.
+        // Planning and execution consume the same immutable definition-owned
+        // profile. Timing history from this process cannot change EXPLAIN or
+        // make otherwise identical replicas choose different paths.
         let sequential_vector_scan_factor = 1.0
-            / HnswDistanceCostModel::sequential_scores_per_random_score(stats.dimension, 1) as f64;
+            / policy
+                .distance_cost
+                .sequential_covering_scores_per_random_score
+                .max(1) as f64;
+        // Planning cannot assume every predicate part has a generation
+        // covering layout: a fresh tail may still gather base vectors. Use
+        // the conservative indexed-base profile for filtered exact scoring;
+        // runtime has exact per-part physical evidence and applies the
+        // weighted profile without changing result semantics.
+        let filtered_exact_scan_factor = 1.0
+            / policy
+                .distance_cost
+                .indexed_base_scores_per_random_score
+                .max(1) as f64;
         // A scalar comparison is one lane of the reference 128D sequential
         // vector score. Bitmap emission is modeled separately below, so this
         // coefficient remains derived rather than becoming another unrelated
         // threshold.
         let sequential_scalar_scan_factor =
             sequential_vector_scan_factor / Self::REFERENCE_VECTOR_DIMENSION;
-        let scored_points = ef_val * stats.avg_level0_degree.max(1.0) as f64;
+        let scored_points_per_ef = stats
+            .avg_level0_degree
+            .max(1.0)
+            .min(policy.distance_cost.graph_scored_points_per_ef.max(1) as f32)
+            as f64;
+        let scored_points = ef_val * scored_points_per_ef;
         let raw_graph_cost = (log_n + scored_points) * dim_factor;
         let graph_cost = raw_graph_cost;
         let bitmap_cost = match filter_materialization {
@@ -151,8 +167,12 @@ impl VectorScanCostModel {
                 n * sequential_scalar_scan_factor + candidate_rows / u64::BITS as f64
             }
         };
-        let exact_scan_cost =
-            (candidate_rows * dim_factor * sequential_vector_scan_factor).max(1.0);
+        let exact_scan_factor = if filtered {
+            filtered_exact_scan_factor
+        } else {
+            sequential_vector_scan_factor
+        };
+        let exact_scan_cost = (candidate_rows * dim_factor * exact_scan_factor).max(1.0);
 
         if candidate_rows <= exact_threshold {
             return bitmap_cost + exact_scan_cost;
@@ -309,6 +329,7 @@ mod tests {
             ef_search: 40,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
         };
         let cost = VectorScanCostModel::estimate_hnsw_cost(
             &hnsw_stats(20_000, 100),
@@ -332,6 +353,7 @@ mod tests {
             ef_search: 40,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
         let unfiltered =
@@ -354,6 +376,7 @@ mod tests {
             ef_search: 80,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
         let postings = VectorScanCostModel::estimate_hnsw_cost(
@@ -381,6 +404,7 @@ mod tests {
             ef_search: 160,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
         let at_threshold = VectorScanCostModel::estimate_hnsw_cost(
@@ -408,6 +432,7 @@ mod tests {
             ef_search: 80,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 20_000,
+            ..HnswSearchPolicy::default()
         };
         let low = VectorScanCostModel::estimate_hnsw_cost(
             &hnsw_stats(10_000_000, 128),

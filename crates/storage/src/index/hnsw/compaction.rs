@@ -9,7 +9,7 @@ use crate::compaction::plan::types::CompactionPlan;
 use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
     DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswBuildContract,
-    HnswIndex, IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage, VisitedPool,
+    HnswIndex, IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage,
     HNSW_ARTIFACT_ALIGNMENT, HNSW_BUILD_CONTRACT_VERSION,
 };
 use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
@@ -279,7 +279,7 @@ impl HnswIndexRebuilder {
         healer.heal(
             best_old_index.vector_storage.as_ref(),
             indexed_col.build_contract.distance,
-        );
+        )?;
         healer.save_into_builder(&builder);
 
         for (new_id, old_id_opt) in new_to_old.iter().enumerate() {
@@ -291,16 +291,11 @@ impl HnswIndexRebuilder {
                 point_id,
                 output_storage.as_ref(),
                 indexed_col.build_contract.distance,
-            );
+            )?;
         }
 
         let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(
-            links,
-            entry_points,
-            VisitedPool::new(),
-            (&build_contract).into(),
-        );
+        let graph = GraphLayers::new(links, entry_points, (&build_contract).into());
         Ok(Some(HnswIndex::try_new(
             build_contract,
             graph,

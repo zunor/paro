@@ -64,6 +64,10 @@ impl SearchReadOptions {
         }
     }
 
+    pub(crate) fn buffer_pool(&self) -> Option<Arc<crate::buffer::BufferPool>> {
+        self.page_cache.as_ref().map(|cache| cache.buffer_pool())
+    }
+
     fn segment_options(&self) -> SegmentOptions {
         let mut options = SegmentOptions::default().with_cache_decoded(self.cache_decoded);
         if let Some(page_cache) = &self.page_cache {

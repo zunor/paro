@@ -49,6 +49,13 @@ pub(crate) fn schema_seed_definition(
             .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
         filtered_plain_scan_threshold: u32::try_from(defaults.filtered_plain_scan_threshold)
             .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
+        sequential_covering_scores_per_random_score: defaults
+            .distance_cost
+            .sequential_covering_scores_per_random_score,
+        indexed_base_scores_per_random_score: defaults
+            .distance_cost
+            .indexed_base_scores_per_random_score,
+        graph_scored_points_per_ef: defaults.distance_cost.graph_scored_points_per_ef,
         build_seed: DEFAULT_HNSW_BUILD_SEED,
         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,

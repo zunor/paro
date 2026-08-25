@@ -108,6 +108,13 @@ impl PartitionDirectory {
             .saturating_mul(std::mem::size_of::<u32>())
             .saturating_add(self.blocks.len().saturating_mul(std::mem::size_of::<u32>()))
     }
+
+    pub(crate) fn matches_partition_ends(
+        &self,
+        partition_ends: impl IntoIterator<Item = u32>,
+    ) -> bool {
+        self.partition_ends.iter().copied().eq(partition_ends)
+    }
 }
 
 #[cfg(test)]

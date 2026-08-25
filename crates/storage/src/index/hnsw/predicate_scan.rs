@@ -9,7 +9,6 @@
 //! sequential artifact reads. The layout remains an HNSW artifact: table pages
 //! keep the SQL values and physical row order supplied by the writer.
 
-use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,13 +17,13 @@ use bytes::Bytes;
 use memmap2::{Mmap, MmapOptions};
 use paro_common::error::{self as paro_error, Result};
 
-use crate::index::{ExactOrdinalPosting, ExactRowPartitions, PartitionExactRowSet};
+use crate::index::{ExactOrdinalPosting, ExactScalarKey};
 
 use super::artifact_integrity::ArtifactIntegrity;
 use super::PointOffset;
 
 const PREDICATE_SCAN_MAGIC: [u8; 4] = *b"HPSC";
-const PREDICATE_SCAN_VERSION: u32 = 2;
+const PREDICATE_SCAN_VERSION: u32 = 3;
 const PREDICATE_SCAN_HEADER_LEN: usize = 64;
 const COLUMN_HEADER_LEN: usize = 32;
 const ORDINAL_RANGE_LEN: usize = 20;
@@ -34,6 +33,7 @@ const NO_BLOCK: u32 = u32::MAX;
 #[derive(Debug)]
 pub(crate) struct PredicateScanBuildBlock {
     pub(crate) dictionary_ordinals: Box<[u32]>,
+    pub(crate) dictionary_values: Box<[Option<Bytes>]>,
     pub(crate) ordinal_row_counts: Box<[u32]>,
     pub(crate) ordinal_fingerprints: Box<[u64]>,
     pub(crate) row_ids: Box<[PointOffset]>,
@@ -90,6 +90,8 @@ impl PredicateScanBlock {
 #[derive(Debug)]
 struct PredicateScanColumn {
     column_id: u32,
+    /// Canonical encoded dictionary keys in generation ordinal order.
+    ordinal_keys: Box<[Bytes]>,
     ordinal_ranges: Box<[PredicateScanRange]>,
     null_range: PredicateScanRange,
     blocks: Box<[PredicateScanBlock]>,
@@ -133,7 +135,11 @@ struct PredicateIntegrityRange {
 }
 
 impl PredicateIntegrityRange {
+    #[inline(always)]
     fn verify(&self, local_offset: usize, len: usize) -> Result<()> {
+        if self.verifier.is_fully_verified() {
+            return Ok(());
+        }
         self.verifier.verify_range(
             self.artifact_offset
                 .checked_add(local_offset)
@@ -159,9 +165,41 @@ impl<'a> PredicateScanRangeRef<'a> {
     pub(crate) fn vectors(self) -> &'a [f32] {
         self.vectors
     }
+
+    fn restrict_to_point_range(
+        self,
+        dimension: usize,
+        point_range: std::ops::Range<PointOffset>,
+    ) -> Result<Self> {
+        let first = self
+            .row_ids
+            .partition_point(|&row_id| row_id < point_range.start);
+        let end = self
+            .row_ids
+            .partition_point(|&row_id| row_id < point_range.end);
+        let row_ids = self.row_ids.get(first..end).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan point-range slice exceeds row ids")
+        })?;
+        let vector_start = first.checked_mul(dimension).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan point-range vector offset overflow")
+        })?;
+        let vector_end = end.checked_mul(dimension).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan point-range vector offset overflow")
+        })?;
+        let vectors = self.vectors.get(vector_start..vector_end).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan point-range slice exceeds vectors")
+        })?;
+        Ok(Self { row_ids, vectors })
+    }
 }
 
 impl PredicateScanLayout {
+    pub(crate) fn has_column(&self, column_id: u32) -> bool {
+        self.columns
+            .binary_search_by_key(&column_id, |column| column.column_id)
+            .is_ok()
+    }
+
     /// Deep semantic verification used before publication and by explicit
     /// index-integrity tooling. Normal mmap open validates only metadata and
     /// range bounds so it does not fault every covering-vector page.
@@ -286,6 +324,7 @@ impl PredicateScanLayout {
             let mut max_ordinal = None;
             for block in column.blocks.iter() {
                 if block.dictionary_ordinals.len() != block.ordinal_row_counts.len()
+                    || block.dictionary_ordinals.len() != block.dictionary_values.len()
                     || block.dictionary_ordinals.len() != block.ordinal_fingerprints.len()
                     || block.ordinal_row_counts.contains(&0)
                     || block
@@ -316,6 +355,7 @@ impl PredicateScanLayout {
                 PredicateScanRange::MISSING;
                 max_ordinal.map_or(0, |value| value + 1) as usize
             ];
+            let mut ordinal_keys = vec![None; ordinal_ranges.len()];
             let mut null_range = PredicateScanRange::MISSING;
             let mut blocks = Vec::with_capacity(column.blocks.len());
             let mut covered = roaring::RoaringBitmap::new();
@@ -364,10 +404,11 @@ impl PredicateScanLayout {
                 }
                 covered |= rows;
                 let mut row_start = 0u32;
-                for ((ordinal, row_count), fingerprint) in block
+                for (((ordinal, scalar_key), row_count), fingerprint) in block
                     .dictionary_ordinals
                     .iter()
                     .copied()
+                    .zip(block.dictionary_values.iter())
                     .zip(block.ordinal_row_counts.iter().copied())
                     .zip(block.ordinal_fingerprints.iter().copied())
                 {
@@ -378,8 +419,27 @@ impl PredicateScanLayout {
                         fingerprint,
                     };
                     let slot = if ordinal == u32::MAX {
+                        if scalar_key.is_some() {
+                            return Err(paro_error::data_corrupted(
+                                "predicate scan NULL ordinal carries a scalar key",
+                            ));
+                        }
                         &mut null_range
                     } else {
+                        let scalar_key = scalar_key.as_ref().ok_or_else(|| {
+                            paro_error::data_corrupted(
+                                "predicate scan non-NULL ordinal is missing its scalar key",
+                            )
+                        })?;
+                        let key_slot = ordinal_keys.get_mut(ordinal as usize).ok_or_else(|| {
+                            paro_error::data_corrupted("predicate scan scalar-key map overflow")
+                        })?;
+                        if key_slot.replace(scalar_key.clone()).is_some() {
+                            return Err(paro_error::data_corrupted(format!(
+                                "predicate scan column {} repeats scalar key for ordinal {ordinal}",
+                                column.column_id
+                            )));
+                        }
                         ordinal_ranges.get_mut(ordinal as usize).ok_or_else(|| {
                             paro_error::data_corrupted("predicate scan ordinal map overflow")
                         })?
@@ -413,8 +473,27 @@ impl PredicateScanLayout {
                     column.column_id
                 )));
             }
+            let ordinal_keys = ordinal_keys
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "predicate scan column {} has a hole in its scalar-key map",
+                        column.column_id
+                    ))
+                })?;
+            if ordinal_keys
+                .windows(2)
+                .any(|keys| keys[0].as_ref() >= keys[1].as_ref())
+            {
+                return Err(paro_error::data_corrupted(format!(
+                    "predicate scan column {} scalar keys are not strictly ordered",
+                    column.column_id
+                )));
+            }
             built_columns.push(PredicateScanColumn {
                 column_id: column.column_id,
+                ordinal_keys: ordinal_keys.into_boxed_slice(),
                 ordinal_ranges: ordinal_ranges.into_boxed_slice(),
                 null_range,
                 blocks: blocks.into_boxed_slice(),
@@ -443,10 +522,15 @@ impl PredicateScanLayout {
         self.serialized_len
     }
 
-    pub(crate) fn selected_ranges<'a>(
+    /// Resolve one physical segment's scalar postings into generation-owned
+    /// covering ranges. A generation range may contain the same scalar value
+    /// from several segments, so it is sliced structurally by the immutable
+    /// point-id span before cardinality is compared.
+    pub(crate) fn selected_ranges_for_partition<'a, 'p>(
         &'a self,
         column_id: u32,
-        postings: &[ExactOrdinalPosting],
+        point_range: std::ops::Range<PointOffset>,
+        postings: impl IntoIterator<Item = &'p ExactOrdinalPosting>,
     ) -> Result<Option<Vec<PredicateScanRangeRef<'a>>>> {
         let Some(column) = self
             .columns
@@ -455,124 +539,42 @@ impl PredicateScanLayout {
         else {
             return Ok(None);
         };
-        let mut ranges = Vec::with_capacity(postings.len());
+        let mut ranges = Vec::new();
         for posting in postings {
-            let range = Self::ordinal_range(column, posting.ordinal());
+            let range = Self::range_for_scalar_key(column, posting.scalar_key());
             if range.is_missing() {
                 return Ok(None);
             }
-            if u64::from(range.row_count) != posting.rows().len() {
+            let range = self
+                .range_ref(column, range)?
+                .restrict_to_point_range(self.dimension, point_range.clone())?;
+            if range.row_ids().len() as u64 != posting.rows().len() {
                 return Err(paro_error::data_corrupted(format!(
-                    "predicate scan ordinal {} covers {} rows, scalar posting covers {}",
+                    "predicate scan ordinal {} covers {} rows in point range {:?}, scalar posting covers {}",
                     posting.ordinal(),
-                    range.row_count,
+                    range.row_ids().len(),
+                    point_range,
                     posting.rows().len()
                 )));
             }
-            if range.fingerprint != posting.fingerprint() {
-                return Err(paro_error::data_corrupted(format!(
-                    "predicate scan ordinal {} differs from its scalar posting fingerprint",
-                    posting.ordinal()
-                )));
-            }
             ranges.push(range);
         }
-        ranges.sort_unstable_by_key(|range| (range.block_id, range.row_start));
-        ranges
-            .into_iter()
-            .map(|range| self.range_ref(column, range))
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
+        ranges.sort_unstable_by_key(|range| range.row_ids().first().copied().unwrap_or(u32::MAX));
+        Ok(Some(ranges))
     }
 
-    /// Select generation-wide covering ranges from a canonical concatenation
-    /// of segment-local ordinal postings.
-    ///
-    /// Dictionary ordinals alone are not a cross-segment identity: a segment
-    /// that omits one value shifts every later ordinal. The generation
-    /// artifact therefore accepts this fast path only after the cardinality
-    /// and fingerprint of each shifted posting union exactly match the
-    /// persisted generation posting. An incompatible segment dictionary is a
-    /// normal physical fallback, not corruption; the caller scans base vectors
-    /// while exact row admission remains authoritative.
-    pub(crate) fn selected_partitioned_ranges<'a>(
-        &'a self,
-        column_id: u32,
-        row_set: &PartitionExactRowSet,
-    ) -> Result<Option<Vec<PredicateScanRangeRef<'a>>>> {
-        let Some(column) = self
-            .columns
-            .iter()
-            .find(|column| column.column_id == column_id)
-        else {
-            return Ok(None);
-        };
-        let mut by_ordinal = BTreeMap::<u16, Vec<(u32, &ExactOrdinalPosting)>>::new();
-        for (point_base, part) in row_set.physical_parts() {
-            let ExactRowPartitions::OrdinalPostings {
-                column_id: part_column_id,
-                postings,
-            } = part.physical_partitions()
-            else {
-                return Ok(None);
-            };
-            if part_column_id != column_id {
-                return Ok(None);
-            }
-            for posting in postings {
-                by_ordinal
-                    .entry(posting.ordinal())
-                    .or_default()
-                    .push((point_base, posting));
-            }
-        }
-
-        let mut ranges = Vec::with_capacity(by_ordinal.len());
-        for (ordinal, parts) in by_ordinal {
-            let range = Self::ordinal_range(column, ordinal);
-            if range.is_missing() {
-                return Ok(None);
-            }
-            let row_count = parts.iter().try_fold(0u64, |count, (_, posting)| {
-                count.checked_add(posting.rows().len()).ok_or_else(|| {
-                    paro_error::data_corrupted("partitioned predicate posting cardinality overflow")
-                })
-            })?;
-            if u64::from(range.row_count) != row_count {
-                return Ok(None);
-            }
-            let fingerprint = crate::index::bitmap::posting_fingerprint_rows(
-                row_count,
-                parts.iter().flat_map(|(point_base, posting)| {
-                    let point_base = *point_base;
-                    posting.rows().iter().map(move |row_id| {
-                        debug_assert!(point_base.checked_add(row_id).is_some());
-                        point_base + row_id
-                    })
-                }),
-            );
-            if fingerprint != range.fingerprint {
-                return Ok(None);
-            }
-            ranges.push(range);
-        }
-        ranges.sort_unstable_by_key(|range| (range.block_id, range.row_start));
-        ranges
-            .into_iter()
-            .map(|range| self.range_ref(column, range))
-            .collect::<Result<Vec<_>>>()
-            .map(Some)
-    }
-
-    fn ordinal_range(column: &PredicateScanColumn, ordinal: u16) -> PredicateScanRange {
-        if ordinal == u16::MAX {
-            column.null_range
-        } else {
-            column
-                .ordinal_ranges
-                .get(ordinal as usize)
-                .copied()
-                .unwrap_or(PredicateScanRange::MISSING)
+    fn range_for_scalar_key(
+        column: &PredicateScanColumn,
+        scalar_key: &ExactScalarKey,
+    ) -> PredicateScanRange {
+        match scalar_key {
+            ExactScalarKey::Null => column.null_range,
+            ExactScalarKey::Value(value) => column
+                .ordinal_keys
+                .binary_search_by(|candidate| candidate.as_ref().cmp(value.as_ref()))
+                .ok()
+                .and_then(|ordinal| column.ordinal_ranges.get(ordinal).copied())
+                .unwrap_or(PredicateScanRange::MISSING),
         }
     }
 
@@ -726,6 +728,16 @@ impl PredicateScanLayout {
             metadata.extend_from_slice(&column.null_range.row_start.to_le_bytes());
             metadata.extend_from_slice(&column.null_range.row_count.to_le_bytes());
             metadata.extend_from_slice(&column.null_range.fingerprint.to_le_bytes());
+            for key in column.ordinal_keys.iter() {
+                metadata.extend_from_slice(
+                    &u32::try_from(key.len())
+                        .map_err(|_| {
+                            paro_error::out_of_range("predicate scan scalar key length exceeds u32")
+                        })?
+                        .to_le_bytes(),
+                );
+                metadata.extend_from_slice(key);
+            }
             for range in column.ordinal_ranges.iter() {
                 metadata.extend_from_slice(&range.block_id.to_le_bytes());
                 metadata.extend_from_slice(&range.row_start.to_le_bytes());
@@ -954,6 +966,37 @@ impl PredicateScanLayout {
                 fingerprint: read_u64_at(cursor + 24),
             };
             cursor += COLUMN_HEADER_LEN;
+            let mut ordinal_keys = Vec::with_capacity(ordinal_count);
+            for _ in 0..ordinal_count {
+                if cursor + std::mem::size_of::<u32>() > metadata_len {
+                    return Err(paro_error::data_corrupted(
+                        "predicate scan scalar-key length is truncated",
+                    ));
+                }
+                let key_len = read_u32_at(cursor) as usize;
+                cursor += std::mem::size_of::<u32>();
+                let key_end = cursor.checked_add(key_len).ok_or_else(|| {
+                    paro_error::data_corrupted("predicate scan scalar-key range overflow")
+                })?;
+                let key = bytes.get(cursor..key_end).ok_or_else(|| {
+                    paro_error::data_corrupted("predicate scan scalar-key payload is truncated")
+                })?;
+                if key_end > metadata_len {
+                    return Err(paro_error::data_corrupted(
+                        "predicate scan scalar-key payload exceeds metadata",
+                    ));
+                }
+                if ordinal_keys
+                    .last()
+                    .is_some_and(|previous: &Bytes| previous.as_ref() >= key)
+                {
+                    return Err(paro_error::data_corrupted(
+                        "predicate scan scalar keys must be strictly ordered",
+                    ));
+                }
+                ordinal_keys.push(Bytes::copy_from_slice(key));
+                cursor = key_end;
+            }
             let ordinal_bytes = ordinal_count
                 .checked_mul(ORDINAL_RANGE_LEN)
                 .ok_or_else(|| paro_error::data_corrupted("predicate scan ordinal map overflow"))?;
@@ -1093,6 +1136,7 @@ impl PredicateScanLayout {
             }
             columns.push(PredicateScanColumn {
                 column_id,
+                ordinal_keys: ordinal_keys.into_boxed_slice(),
                 ordinal_ranges: ordinal_ranges.into_boxed_slice(),
                 null_range,
                 blocks: blocks.into_boxed_slice(),
@@ -1129,8 +1173,15 @@ impl PredicateScanLayout {
                 .len()
                 .checked_mul(BLOCK_HEADER_LEN)
                 .ok_or_else(|| paro_error::out_of_range("predicate scan metadata length"))?;
+            let scalar_key_bytes = column.ordinal_keys.iter().try_fold(0usize, |bytes, key| {
+                bytes
+                    .checked_add(std::mem::size_of::<u32>())
+                    .and_then(|bytes| bytes.checked_add(key.len()))
+                    .ok_or_else(|| paro_error::out_of_range("predicate scan metadata length"))
+            })?;
             len = len
                 .checked_add(COLUMN_HEADER_LEN)
+                .and_then(|len| len.checked_add(scalar_key_bytes))
                 .and_then(|len| len.checked_add(ordinal_bytes))
                 .and_then(|len| len.checked_add(block_bytes))
                 .ok_or_else(|| paro_error::out_of_range("predicate scan metadata length"))?;
@@ -1166,8 +1217,15 @@ impl PredicateScanLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::{ExactRowSet, OrdinalRowSet, PartitionExactRowSet};
+    use crate::index::{ExactRowPartitions, ExactRowSet, OrdinalRowSet};
     use roaring::RoaringBitmap;
+
+    fn test_dictionary_values(ordinals: &[u16]) -> Box<[Option<Bytes>]> {
+        ordinals
+            .iter()
+            .map(|ordinal| Some(Bytes::copy_from_slice(&ordinal.to_le_bytes())))
+            .collect()
+    }
 
     fn build_layout() -> PredicateScanLayout {
         PredicateScanLayout::from_build_columns(
@@ -1177,6 +1235,7 @@ mod tests {
                 column_id: 7,
                 blocks: vec![PredicateScanBuildBlock {
                     dictionary_ordinals: vec![0, 1].into_boxed_slice(),
+                    dictionary_values: test_dictionary_values(&[0, 1]),
                     ordinal_row_counts: vec![2, 2].into_boxed_slice(),
                     ordinal_fingerprints: vec![
                         crate::index::bitmap::posting_fingerprint(&RoaringBitmap::from_iter([
@@ -1204,7 +1263,7 @@ mod tests {
             Arc::new(RoaringBitmap::from_iter([1, 3])),
         )];
         let blocks = restored
-            .selected_ranges(7, &postings)
+            .selected_ranges_for_partition(7, 0..4, &postings)
             .unwrap()
             .expect("configured ordinal has a covering block");
 
@@ -1240,31 +1299,45 @@ mod tests {
             )]
             .into_boxed_slice(),
         ));
-        let partitioned =
-            PartitionExactRowSet::try_new(vec![(0..2, first), (2..4, second)]).unwrap();
-
         let layout = build_layout();
-        let ranges = layout
-            .selected_partitioned_ranges(7, &partitioned)
+        let ExactRowPartitions::OrdinalSelection(first_selection) = first.physical_partitions()
+        else {
+            panic!("expected ordinal postings")
+        };
+        let ExactRowPartitions::OrdinalSelection(second_selection) = second.physical_partitions()
+        else {
+            panic!("expected ordinal postings")
+        };
+        let first_ranges = layout
+            .selected_ranges_for_partition(7, 0..2, first_selection.selected_postings())
             .unwrap()
-            .expect("shifted local postings exactly match the generation posting");
-        assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0].row_ids(), &[1, 3]);
-        assert_eq!(ranges[0].vectors(), &[1.0, 1.5, 3.0, 3.5]);
+            .expect("first local posting maps into the generation range");
+        let second_ranges = layout
+            .selected_ranges_for_partition(7, 2..4, second_selection.selected_postings())
+            .unwrap()
+            .expect("second local posting maps into the generation range");
+        assert_eq!(first_ranges[0].row_ids(), &[1]);
+        assert_eq!(first_ranges[0].vectors(), &[1.0, 1.5]);
+        assert_eq!(second_ranges[0].row_ids(), &[3]);
+        assert_eq!(second_ranges[0].vectors(), &[3.0, 3.5]);
     }
 
     #[test]
-    fn covering_layout_rejects_a_same_size_but_different_scalar_posting() {
+    fn covering_layout_maps_by_scalar_key_instead_of_segment_ordinal() {
         let restored = PredicateScanLayout::deserialize_bytes(Bytes::from(
             build_layout().serialize().unwrap(),
         ))
         .unwrap();
-        let mismatched = [ExactOrdinalPosting::new(
-            1,
+        let local_ordinal_differs = [ExactOrdinalPosting::from_index(
+            91,
+            ExactScalarKey::Value(Bytes::copy_from_slice(&0_u16.to_le_bytes())),
             Arc::new(RoaringBitmap::from_iter([0, 2])),
         )];
-        let error = restored.selected_ranges(7, &mismatched).unwrap_err();
-        assert!(error.to_string().contains("posting fingerprint"));
+        let ranges = restored
+            .selected_ranges_for_partition(7, 0..4, &local_ordinal_differs)
+            .unwrap()
+            .expect("canonical scalar key maps independently of local ordinal");
+        assert_eq!(ranges[0].row_ids(), &[0, 2]);
     }
 
     #[test]
@@ -1277,6 +1350,7 @@ mod tests {
                 blocks: vec![
                     PredicateScanBuildBlock {
                         dictionary_ordinals: vec![0].into_boxed_slice(),
+                        dictionary_values: test_dictionary_values(&[0]),
                         ordinal_row_counts: vec![2].into_boxed_slice(),
                         ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
                             &RoaringBitmap::from_iter([0, 1]),
@@ -1287,6 +1361,7 @@ mod tests {
                     },
                     PredicateScanBuildBlock {
                         dictionary_ordinals: vec![1].into_boxed_slice(),
+                        dictionary_values: test_dictionary_values(&[1]),
                         ordinal_row_counts: vec![1].into_boxed_slice(),
                         ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
                             &RoaringBitmap::from_iter([1]),

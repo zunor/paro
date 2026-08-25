@@ -317,12 +317,12 @@ impl SearchIndexRegistry {
         self.view.load().hnsw_search_policy(column_id, distance)
     }
 
-    pub(crate) fn hnsw_index_statistics(
+    pub(crate) fn hnsw_generation_statistics(
         &self,
-        column_id: ColumnId,
-    ) -> Option<crate::statistics::HnswIndexStatistics> {
+        definition_id: u64,
+    ) -> Result<Option<crate::statistics::HnswIndexStatistics>> {
         self.ensure_fresh();
-        self.view.load().hnsw_index_statistics(column_id)
+        self.view.load().hnsw_generation_statistics(definition_id)
     }
 
     pub(crate) fn hnsw_filter_topology(
@@ -2817,6 +2817,11 @@ mod tests {
             ef_search: ef_construct as u32,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
+            sequential_covering_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+            indexed_base_scores_per_random_score:
+                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
             build_seed: 1,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -3496,7 +3501,8 @@ mod tests {
         assert!(recovered_capability.coverage.is_complete());
         assert_eq!(recovered_capability.generation_stats.artifact_count, 1);
         let recovered_stats = reopened
-            .hnsw_index_statistics(1)
+            .hnsw_generation_statistics(seed_definition_id)
+            .unwrap()
             .expect("recovered generation HNSW statistics");
         assert_eq!(recovered_stats.num_indexed_vectors, 2);
         assert_eq!(recovered_stats.dimension, 4);

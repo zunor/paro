@@ -13,12 +13,14 @@ use serde_json::Value;
 pub use crate::index::hnsw::types::{
     DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
     DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
-    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_M, DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD,
-    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
+    DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildContract, HnswFilterTopologyContract, HnswSearchPolicy,
-    MAX_HNSW_FILTER_COLUMNS,
+    DistanceMetric, HnswBuildContract, HnswDistanceCostProfile, HnswFilterTopologyContract,
+    HnswSearchPolicy, MAX_HNSW_FILTER_COLUMNS,
 };
 use paro_common::error::{self as paro_error, Result};
 
@@ -26,12 +28,16 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 12 adds a definition-pinned unique graph-score/ef cost calibrated
+/// independently from maximum graph degree.
+/// Version 11 makes exact/graph cost ratios an explicit, reproducible search
+/// policy instead of deriving plans from process-global timing history.
 /// Version 10 uses the configured construction beam on every HNSW layer.
 /// Version 9 binds definitions to the chunk-authenticated HNSW artifact
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 10;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 12;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +61,9 @@ pub struct HnswProviderConfig {
     pub ef_search: u32,
     pub plain_scan_threshold: u32,
     pub filtered_plain_scan_threshold: u32,
+    pub sequential_covering_scores_per_random_score: u32,
+    pub indexed_base_scores_per_random_score: u32,
+    pub graph_scored_points_per_ef: u32,
     pub build_seed: u64,
     pub proposal_wave_size: u32,
     pub warmup_point_count: u32,
@@ -119,6 +128,26 @@ impl HnswProviderConfig {
                 "HNSW ef_search must be between 1 and 1000000, got {}",
                 self.ef_search
             )));
+        }
+        for (name, ratio) in [
+            (
+                "sequential_covering_scores_per_random_score",
+                self.sequential_covering_scores_per_random_score,
+            ),
+            (
+                "indexed_base_scores_per_random_score",
+                self.indexed_base_scores_per_random_score,
+            ),
+            (
+                "graph_scored_points_per_ef",
+                self.graph_scored_points_per_ef,
+            ),
+        ] {
+            if !(1..=1_024).contains(&ratio) {
+                return Err(paro_error::invalid_input(format!(
+                    "HNSW {name} must be between 1 and 1024, got {ratio}"
+                )));
+            }
         }
         if self.filter_columns.len() > MAX_HNSW_FILTER_COLUMNS {
             return Err(paro_error::invalid_input(format!(
@@ -200,6 +229,12 @@ impl HnswProviderConfig {
             ef_search: self.ef_search as usize,
             plain_scan_threshold: self.plain_scan_threshold as usize,
             filtered_plain_scan_threshold: self.filtered_plain_scan_threshold as usize,
+            distance_cost: HnswDistanceCostProfile {
+                sequential_covering_scores_per_random_score: self
+                    .sequential_covering_scores_per_random_score,
+                indexed_base_scores_per_random_score: self.indexed_base_scores_per_random_score,
+                graph_scored_points_per_ef: self.graph_scored_points_per_ef,
+            },
         }
     }
 }
@@ -232,6 +267,10 @@ mod tests {
             ef_search: 100,
             plain_scan_threshold: 10_000,
             filtered_plain_scan_threshold: 0,
+            sequential_covering_scores_per_random_score:
+                DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+            indexed_base_scores_per_random_score: DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+            graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -280,6 +319,7 @@ mod tests {
         tuned.ef_search = 240;
         tuned.plain_scan_threshold = 20_000;
         tuned.filtered_plain_scan_threshold = 128;
+        tuned.graph_scored_points_per_ef = 20;
         tuned.validate().unwrap();
 
         assert_eq!(base.build_contract(), tuned.build_contract());

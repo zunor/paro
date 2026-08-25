@@ -10,23 +10,22 @@ use super::artifact_integrity::{
     IntegrityDescriptor,
 };
 use super::entry_points::EntryPoints;
-use super::graph::GraphLayers;
+use super::graph::{GraphLayers, PredicatePartitionSeeds};
 use super::graph_links::GraphLinks;
 use super::hnsw_builder::hnsw_build_pool;
 use super::predicate_scan::{
     PredicateScanBuildBlock, PredicateScanBuildColumn, PredicateScanLayout,
 };
-use super::search_context::FixedLengthPriorityQueue;
+use super::search_context::ScanTopK;
 use super::vector_storage::{
     ArtifactVectorStorage, CosineInverseNorms, IndexedVectorStorage, VectorStorage,
 };
-use super::visited_pool::VisitedPool;
 use super::{
     BatchScorer, DistanceMetric, GraphLayersBuilder, HnswBuildContract, HnswBuildStopCheck,
-    HnswDistanceCostModel, HnswExactScanKind, HnswFilterTopologyContract, HnswSearchFilter,
-    HnswSearchOutcome, HnswSearchPath, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy,
-    PointOffset, PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm, SearchParams,
-    VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
+    HnswDistanceCostModel, HnswExactScanKind, HnswExactScanWorkload, HnswFilterTopologyContract,
+    HnswSearchFilter, HnswSearchOutcome, HnswSearchPath, HnswSearchPolicy, HnswSearchResult,
+    HnswSearchStrategy, PointOffset, PreparedQuery, ScoreType, ScoredPoint, SearchAlgorithm,
+    SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
 #[cfg(test)]
 use super::{HnswConfig, HnswQueryWideStrategy, HnswSegmentSearchInput};
@@ -48,11 +47,18 @@ use roaring::RoaringBitmap;
 use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
-pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 10;
+/// Version 13 replaces level-0 CSR offsets with fixed-stride adjacency records.
+/// Degree and neighbors now share one mmap stream, so graph expansion no
+/// longer pays an independent random offset-table lookup. Version 11's
+/// canonical predicate dictionary keys remain part of the format. Earlier
+/// graph layouts are intentionally rejected rather than translated at open.
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 13;
 const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
 pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 192;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
@@ -68,19 +74,6 @@ const HNSW_INTEGRITY_CHECKSUM_FIELD: usize = 184;
 const HNSW_HEADER_CHECKSUM_FIELD: usize = 188;
 const HNSW_VECTOR_ENCODING_F32_LE: u32 = 1;
 
-#[derive(Debug, Clone, Copy)]
-struct ExactPostingRange<'a> {
-    posting: &'a roaring::RoaringBitmap,
-    point_base: PointOffset,
-    first_rank: u32,
-    len: u32,
-}
-
-#[derive(Debug, Default)]
-struct ExactScanLane<'a> {
-    ranges: Vec<ExactPostingRange<'a>>,
-}
-
 #[derive(Debug)]
 struct ExactScanLaneResult {
     points: Vec<ScoredPoint>,
@@ -94,9 +87,94 @@ struct CoveringScanRange<'a> {
     len: usize,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ExactPostingRange<'a> {
+    posting: &'a roaring::RoaringBitmap,
+    point_base: PointOffset,
+    first_rank: u32,
+    len: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ExactPhysicalRange<'a> {
+    Covering(CoveringScanRange<'a>),
+    Posting(ExactPostingRange<'a>),
+    Dense { first_point: PointOffset, len: u32 },
+}
+
+impl ExactPhysicalRange<'_> {
+    fn len(self) -> u64 {
+        match self {
+            Self::Covering(range) => range.len as u64,
+            Self::Posting(range) => u64::from(range.len),
+            Self::Dense { len, .. } => u64::from(len),
+        }
+    }
+
+    fn slice(self, first: u64, len: u64) -> Result<Self> {
+        match self {
+            Self::Covering(range) => Ok(Self::Covering(CoveringScanRange {
+                range: range.range,
+                first_row: range
+                    .first_row
+                    .checked_add(usize::try_from(first).map_err(|_| {
+                        error::out_of_range("covering scan slice offset exceeds usize")
+                    })?)
+                    .ok_or_else(|| error::data_corrupted("covering scan slice offset overflow"))?,
+                len: usize::try_from(len)
+                    .map_err(|_| error::out_of_range("covering scan slice exceeds usize"))?,
+            })),
+            Self::Posting(range) => Ok(Self::Posting(ExactPostingRange {
+                posting: range.posting,
+                point_base: range.point_base,
+                first_rank: range
+                    .first_rank
+                    .checked_add(u32::try_from(first).map_err(|_| {
+                        error::out_of_range("posting scan slice offset exceeds u32")
+                    })?)
+                    .ok_or_else(|| error::data_corrupted("posting scan slice offset overflow"))?,
+                len: u32::try_from(len)
+                    .map_err(|_| error::out_of_range("posting scan slice exceeds u32"))?,
+            })),
+            Self::Dense { first_point, .. } => {
+                Ok(Self::Dense {
+                    first_point: first_point
+                        .checked_add(u32::try_from(first).map_err(|_| {
+                            error::out_of_range("dense scan slice offset exceeds u32")
+                        })?)
+                        .ok_or_else(|| error::data_corrupted("dense scan slice offset overflow"))?,
+                    len: u32::try_from(len)
+                        .map_err(|_| error::out_of_range("dense scan slice exceeds u32"))?,
+                })
+            }
+        }
+    }
+}
+
 #[derive(Debug, Default)]
-struct CoveringScanLane<'a> {
-    ranges: Vec<CoveringScanRange<'a>>,
+struct ExactScanLane<'a> {
+    ranges: Vec<ExactPhysicalRange<'a>>,
+}
+
+#[derive(Debug, Default)]
+struct ExactPhysicalScanPlan<'a> {
+    ranges: Vec<ExactPhysicalRange<'a>>,
+    covering_rows: u64,
+    base_rows: u64,
+}
+
+impl ExactPhysicalScanPlan<'_> {
+    fn row_count(&self) -> u64 {
+        self.covering_rows.saturating_add(self.base_rows)
+    }
+
+    fn kind(&self) -> HnswExactScanKind {
+        match (self.covering_rows, self.base_rows) {
+            (0, _) => HnswExactScanKind::BaseVectors,
+            (_, 0) => HnswExactScanKind::PredicateCovering,
+            (_, _) => HnswExactScanKind::Hybrid,
+        }
+    }
 }
 
 struct ExactScanResult {
@@ -682,6 +760,7 @@ pub struct HnswIndex {
     pub(crate) predicate_scan: Option<PredicateScanLayout>,
     persisted_statistics: Option<HnswIndexStatistics>,
     _artifact_integrity: Option<Arc<ArtifactIntegrity>>,
+    integrity_scheduled: AtomicBool,
     single_telemetry: Mutex<SearchTelemetry>,
     batch_telemetry: Mutex<HnswBatchTelemetry>,
 }
@@ -697,6 +776,7 @@ pub struct HnswFilterColumnBlocks {
 #[derive(Debug, Clone)]
 pub struct HnswFilterBlock {
     pub dictionary_ordinals: Box<[u32]>,
+    pub dictionary_values: Box<[Option<bytes::Bytes>]>,
     pub ordinal_row_counts: Box<[u32]>,
     pub ordinal_fingerprints: Box<[u64]>,
     pub point_ids: Box<[PointOffset]>,
@@ -716,7 +796,54 @@ struct BuiltPredicateGraph {
     scan_layout: PredicateScanLayout,
 }
 
+fn hnsw_integrity_sweeper() -> Option<&'static SyncSender<Arc<HnswIndex>>> {
+    static SWEEPER: OnceLock<Option<SyncSender<Arc<HnswIndex>>>> = OnceLock::new();
+    SWEEPER
+        .get_or_init(|| {
+            let (sender, receiver) = sync_channel::<Arc<HnswIndex>>(8);
+            std::thread::Builder::new()
+                .name("paro-hnsw-integrity".to_string())
+                .spawn(move || {
+                    while let Ok(index) = receiver.recv() {
+                        let Some(integrity) = index._artifact_integrity.as_ref() else {
+                            continue;
+                        };
+                        if let Err(error) = integrity.verify_all() {
+                            tracing::error!(
+                                error = %error,
+                                "background HNSW artifact integrity verification failed"
+                            );
+                        }
+                    }
+                })
+                .ok()
+                .map(|_| sender)
+        })
+        .as_ref()
+}
+
 impl HnswIndex {
+    /// Bind transient search workspaces to the instance-wide buffer pool.
+    /// Loaded artifacts may be shared by many cursors, so binding is
+    /// idempotent and rejects accidental cross-instance reuse.
+    pub fn bind_search_buffer_pool(
+        &self,
+        buffer_pool: Arc<crate::buffer::BufferPool>,
+    ) -> Result<()> {
+        self.graph.bind_search_buffer_pool(buffer_pool)
+    }
+
+    pub(crate) fn exact_scan_workload(
+        &self,
+        filter: HnswSearchFilter<'_>,
+    ) -> HnswExactScanWorkload {
+        filter.exact_scan_workload(self.graph.num_points() as u64, |column_id| {
+            self.predicate_scan
+                .as_ref()
+                .is_some_and(|layout| layout.has_column(column_id))
+        })
+    }
+
     pub(crate) fn persisted_statistics(&self) -> Option<&HnswIndexStatistics> {
         self.persisted_statistics.as_ref()
     }
@@ -768,11 +895,34 @@ impl HnswIndex {
             predicate_scan,
             persisted_statistics: None,
             _artifact_integrity: None,
+            integrity_scheduled: AtomicBool::new(false),
             single_telemetry: Mutex::new(SearchTelemetry::default()),
             batch_telemetry: Mutex::new(HnswBatchTelemetry::default()),
         };
         index.validate_artifact_contract()?;
         Ok(index)
+    }
+
+    /// Queue one sequential checksum sweep for an immutable loaded artifact.
+    /// A single process worker bounds I/O concurrency across tables. Queries
+    /// remain correct and non-blocking through lazy range verification until
+    /// the sweep publishes its all-valid state.
+    pub(crate) fn schedule_background_integrity_verification(index: &Arc<Self>) {
+        if index._artifact_integrity.is_none()
+            || index.integrity_scheduled.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let Some(sweeper) = hnsw_integrity_sweeper() else {
+            index.integrity_scheduled.store(false, Ordering::Release);
+            return;
+        };
+        match sweeper.try_send(Arc::clone(index)) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
+                index.integrity_scheduled.store(false, Ordering::Release);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -878,7 +1028,11 @@ impl HnswIndex {
             if stop_check.is_some_and(|check| check.should_stop()) {
                 return Err(error::query_canceled());
             }
-            builder.insert_single_point(point_order.point_at(position), storage.as_ref(), distance);
+            builder.insert_single_point(
+                point_order.point_at(position),
+                storage.as_ref(),
+                distance,
+            )?;
         }
 
         if warmup_end < num_vectors {
@@ -901,7 +1055,7 @@ impl HnswIndex {
                                     distance,
                                 )
                             })
-                            .collect::<Vec<_>>()
+                            .collect::<Result<Vec<_>>>()
                     })
                 } else {
                     (wave_start..wave_end)
@@ -913,8 +1067,8 @@ impl HnswIndex {
                                 distance,
                             )
                         })
-                        .collect::<Vec<_>>()
-                };
+                        .collect::<Result<Vec<_>>>()
+                }?;
                 if let Some(pool) = pool {
                     pool.install(|| {
                         builder.publish_frozen_wave(proposals, storage.as_ref(), distance, true)
@@ -945,18 +1099,12 @@ impl HnswIndex {
                     predicate_graph.links,
                     predicate_graph.entry_points,
                     entry_points,
-                    VisitedPool::new(),
                     (&build_contract).into(),
                 ),
                 Some(predicate_graph.scan_layout),
             ),
             None => (
-                GraphLayers::new(
-                    links,
-                    entry_points,
-                    VisitedPool::new(),
-                    (&build_contract).into(),
-                ),
+                GraphLayers::new(links, entry_points, (&build_contract).into()),
                 None,
             ),
         };
@@ -1002,6 +1150,7 @@ impl HnswIndex {
                 }
                 let scan_block = PredicateScanBuildBlock {
                     dictionary_ordinals: block.dictionary_ordinals,
+                    dictionary_values: block.dictionary_values,
                     ordinal_row_counts: block.ordinal_row_counts,
                     ordinal_fingerprints: block.ordinal_fingerprints,
                     row_ids: block.point_ids,
@@ -1269,18 +1418,12 @@ impl HnswIndex {
                     predicate_links,
                     predicate_entry_points,
                     entry_points,
-                    VisitedPool::new(),
                     (&build_contract).into(),
                 ),
                 Some(scan_layout),
             ),
             None => (
-                GraphLayers::new(
-                    links,
-                    entry_points,
-                    VisitedPool::new(),
-                    (&build_contract).into(),
-                ),
+                GraphLayers::new(links, entry_points, (&build_contract).into()),
                 None,
             ),
         };
@@ -1742,15 +1885,9 @@ impl HnswIndex {
                 predicate_links,
                 predicate_entry_points,
                 entry_points,
-                VisitedPool::new(),
                 (&build_contract).into(),
             ),
-            None => GraphLayers::new(
-                links,
-                entry_points,
-                VisitedPool::new(),
-                (&build_contract).into(),
-            ),
+            None => GraphLayers::new(links, entry_points, (&build_contract).into()),
         };
 
         let mut index = Self::try_new_with_predicate_scan(
@@ -1788,11 +1925,8 @@ impl HnswIndex {
         let start = Instant::now();
         let pre_filter_count = self.graph.num_points() as u64;
         let filter_row_set = filter.row_set();
-        let use_predicate_topology = filter.uses_predicate_topology(
-            &self.build_contract.filter_topology,
-            self.graph.num_points(),
-            self.graph.hnsw_m.get_m(0),
-        );
+        let predicate_topology_available =
+            filter.predicate_topology_available(&self.build_contract.filter_topology);
         let post_filter_count = filter_row_set
             .map(ExactRowSet::len)
             .unwrap_or(pre_filter_count);
@@ -1813,21 +1947,13 @@ impl HnswIndex {
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
             let ef = Self::effective_graph_ef(top_k, params, policy);
-            let seed_limit = ef.saturating_mul(2);
-            let _partition_seed_reservation = use_predicate_topology
-                .then(|| {
-                    budget.try_reserve_memory(
-                        seed_limit.saturating_mul(std::mem::size_of::<PointOffset>()),
-                    )
-                })
-                .transpose()?;
+            let predicate_seed_rows = if predicate_topology_available {
+                Some(filter_row_set.expect("predicate topology requires an exact row set"))
+            } else {
+                None
+            };
             let mut predicate_partition_seeds =
-                Vec::with_capacity(usize::from(use_predicate_topology).saturating_mul(seed_limit));
-            if use_predicate_topology {
-                filter_row_set
-                    .expect("predicate topology requires an exact row set")
-                    .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
-            }
+                PredicatePartitionSeeds::new(predicate_seed_rows, ef.saturating_mul(2));
             let admission = filter_row_set.map(ExactRowSet::admission);
             let graph_result = self.graph.search_one(
                 top_k,
@@ -1835,11 +1961,11 @@ impl HnswIndex {
                 algorithm,
                 &mut scorer,
                 admission.as_ref(),
-                &predicate_partition_seeds,
+                &mut predicate_partition_seeds,
                 filter.predicate_columns(),
-                use_predicate_topology,
+                predicate_topology_available,
                 Self::use_random_entry_point(params),
-                budget.work.as_ref(),
+                budget,
             )?;
             let results = graph_result.points;
             if filter_row_set.is_some()
@@ -1871,16 +1997,6 @@ impl HnswIndex {
 
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        HnswDistanceCostModel::observe(
-            self.vector_storage.vector_dim(),
-            elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
-            scored_points,
-            outcome,
-            HnswDistanceCostModel::exact_scan_parallelism(
-                post_filter_count,
-                budget.parallelism_slots,
-            ),
-        );
         let mut telemetry = self.single_telemetry.lock().unwrap();
         telemetry.record(elapsed_us, pre_filter_count, post_filter_count);
         telemetry.record_hnsw_work(scored_points, outcome);
@@ -1922,7 +2038,8 @@ impl HnswIndex {
             level0_degree: self.graph.hnsw_m.get_m(0),
             vector_dimension: self.vector_storage.vector_dim(),
             parallelism: 1,
-            exact_scan_cost_class: filter.exact_scan_cost_class(),
+            exact_scan_workload: self.exact_scan_workload(filter),
+            cost_profile: policy.distance_cost,
         });
         let budget = crate::search::ResourceBudget::default();
         self.search_one_with_policy_strategy(
@@ -1966,11 +2083,8 @@ impl HnswIndex {
             .collect::<Result<Vec<_>>>()?;
 
         let filter_row_set = filter.row_set();
-        let use_predicate_topology = filter.uses_predicate_topology(
-            &self.build_contract.filter_topology,
-            self.graph.num_points(),
-            self.graph.hnsw_m.get_m(0),
-        );
+        let predicate_topology_available =
+            filter.predicate_topology_available(&self.build_contract.filter_topology);
         let results: Vec<HnswSearchResult> = if Self::should_use_plain_scan(strategy) {
             let batch_scorer = BatchScorer::new(scorers, top_k);
             let num_points = self.graph.num_points() as u32;
@@ -2002,21 +2116,13 @@ impl HnswIndex {
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
             let ef = Self::effective_graph_ef(top_k, params, policy);
-            let seed_limit = ef.saturating_mul(2);
-            let _partition_seed_reservation = use_predicate_topology
-                .then(|| {
-                    budget.try_reserve_memory(
-                        seed_limit.saturating_mul(std::mem::size_of::<PointOffset>()),
-                    )
-                })
-                .transpose()?;
+            let predicate_seed_rows = if predicate_topology_available {
+                Some(filter_row_set.expect("predicate topology requires an exact row set"))
+            } else {
+                None
+            };
             let mut predicate_partition_seeds =
-                Vec::with_capacity(usize::from(use_predicate_topology).saturating_mul(seed_limit));
-            if use_predicate_topology {
-                filter_row_set
-                    .expect("predicate topology requires an exact row set")
-                    .append_partition_seeds(seed_limit, &mut predicate_partition_seeds);
-            }
+                PredicatePartitionSeeds::new(predicate_seed_rows, ef.saturating_mul(2));
             let admission = filter_row_set.map(ExactRowSet::admission);
             let results = self.graph.search_many(
                 top_k,
@@ -2024,11 +2130,11 @@ impl HnswIndex {
                 algorithm,
                 &mut scorers,
                 admission.as_ref(),
-                &predicate_partition_seeds,
+                &mut predicate_partition_seeds,
                 filter.predicate_columns(),
-                use_predicate_topology,
+                predicate_topology_available,
                 Self::use_random_entry_point(params),
-                budget.work.as_ref(),
+                budget,
             )?;
             let expected_rows = self.expected_filtered_rows(top_k, filter_row_set)?;
             results
@@ -2066,22 +2172,6 @@ impl HnswIndex {
 
         let elapsed = start.elapsed();
         let elapsed_us = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
-        if let Some(first) = results.first() {
-            let same_physical_path = results.iter().all(|result| {
-                result.outcome.path == first.outcome.path && result.outcome.exact_fallback.is_none()
-            });
-            if same_physical_path {
-                HnswDistanceCostModel::observe(
-                    self.vector_storage.vector_dim(),
-                    elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
-                    results.iter().fold(0u64, |total, result| {
-                        total.saturating_add(result.scored_points)
-                    }),
-                    first.outcome,
-                    1,
-                );
-            }
-        }
         self.batch_telemetry
             .lock()
             .unwrap()
@@ -2190,6 +2280,13 @@ impl HnswIndex {
                 "HNSW graph cardinality {} differs from vector cardinality {}",
                 self.graph.num_points(),
                 self.vector_storage.num_vectors()
+            )));
+        }
+        if self.graph.links.level0_stride() > self.build_contract.m0 as usize {
+            return Err(error::data_corrupted(format!(
+                "HNSW level-0 record stride {} exceeds build-contract m0 {}",
+                self.graph.links.level0_stride(),
+                self.build_contract.m0
             )));
         }
         match (
@@ -2385,7 +2482,6 @@ impl HnswIndex {
         let num_points = self.graph.num_points() as u32;
         match filter_row_set {
             Some(row_set) => {
-                const SCORE_BATCH: usize = crate::index::hnsw::batch_scorer::BATCH_SIZE;
                 if row_set.domain_len() > self.graph.num_points() {
                     return Err(error::data_corrupted(format!(
                         "HNSW exact row-set domain {} exceeds graph cardinality {}",
@@ -2393,43 +2489,7 @@ impl HnswIndex {
                         self.graph.num_points()
                     )));
                 }
-                if let Some(points) = self.covering_plain_scan(top_k, scorer, row_set, budget)? {
-                    return Ok(ExactScanResult {
-                        points,
-                        kind: HnswExactScanKind::PredicateCovering,
-                    });
-                }
-                if HnswDistanceCostModel::exact_scan_parallelism(
-                    row_set.len(),
-                    budget.parallelism_slots,
-                ) > 1
-                {
-                    let points = self.parallel_plain_scan(
-                        top_k,
-                        scorer,
-                        row_set.physical_partitions(),
-                        row_set.len(),
-                        budget,
-                    )?;
-                    return Ok(ExactScanResult {
-                        points,
-                        kind: HnswExactScanKind::BaseVectors,
-                    });
-                }
-                let mut best = FixedLengthPriorityQueue::new(top_k);
-                let mut chunk = [0; SCORE_BATCH];
-                let mut flush = |chunk: &[PointOffset]| -> Result<()> {
-                    budget.work.check_and_consume(chunk.len())?;
-                    for point in scorer.score_points_unfiltered(chunk) {
-                        best.push(point);
-                    }
-                    Ok(())
-                };
-                row_set.try_for_each_batch(&mut chunk, &mut flush)?;
-                Ok(ExactScanResult {
-                    points: best.into_sorted_vec(),
-                    kind: HnswExactScanKind::BaseVectors,
-                })
+                self.exact_physical_scan(top_k, scorer, row_set, budget)
             }
             None => Ok(ExactScanResult {
                 points: self.plain_scan_iter(top_k, scorer, 0..num_points, budget.work.as_ref())?,
@@ -2438,92 +2498,22 @@ impl HnswIndex {
         }
     }
 
-    fn covering_plain_scan(
+    fn exact_physical_scan(
         &self,
         top_k: usize,
         scorer: &mut VectorScorer,
         row_set: &dyn ExactRowSet,
         budget: &ResourceBudget,
-    ) -> Result<Option<Vec<ScoredPoint>>> {
-        let Some(layout) = self.predicate_scan.as_ref() else {
-            return Ok(None);
-        };
-        let ranges = match row_set.physical_partitions() {
-            ExactRowPartitions::OrdinalPostings {
-                column_id,
-                postings,
-            } => layout.selected_ranges(column_id, postings)?,
-            ExactRowPartitions::Partitioned(partitioned) => {
-                let Some(column_id) = partitioned.ordinal_column_id() else {
-                    return Ok(None);
-                };
-                layout.selected_partitioned_ranges(column_id, partitioned)?
-            }
-            ExactRowPartitions::Single(_) => return Ok(None),
-        };
-        let Some(ranges) = ranges else {
-            return Ok(None);
-        };
-        let selection_bytes =
-            ranges
-                .len()
-                .saturating_mul(
-                    std::mem::size_of::<usize>().saturating_add(std::mem::size_of::<
-                        super::predicate_scan::PredicateScanRangeRef<'_>,
-                    >()),
-                );
-        let _selection_reservation = budget.try_reserve_memory(selection_bytes)?;
-        let covered_rows = ranges.iter().try_fold(0u64, |rows, range| {
-            rows.checked_add(range.row_ids().len() as u64)
-                .ok_or_else(|| error::data_corrupted("predicate covering cardinality overflow"))
-        })?;
-        if covered_rows != row_set.len() {
-            return Err(error::data_corrupted(format!(
-                "predicate covering scan covered {covered_rows} exact rows, expected {}",
-                row_set.len()
-            )));
-        }
-        if HnswDistanceCostModel::exact_scan_parallelism(covered_rows, budget.parallelism_slots) > 1
-        {
-            return self
-                .parallel_covering_plain_scan(top_k, scorer, &ranges, covered_rows, budget)
-                .map(Some);
-        }
-
-        let mut best = FixedLengthPriorityQueue::new(top_k);
-        for range in ranges {
-            self.scan_covering_range_into(
-                &mut best,
-                scorer,
-                CoveringScanRange {
-                    first_row: 0,
-                    len: range.row_ids().len(),
-                    range,
-                },
-                budget.work.as_ref(),
-            )?;
-        }
-        Ok(Some(best.into_sorted_vec()))
-    }
-
-    fn parallel_covering_plain_scan(
-        &self,
-        top_k: usize,
-        scorer: &mut VectorScorer,
-        ranges: &[super::predicate_scan::PredicateScanRangeRef<'_>],
-        row_count: u64,
-        budget: &ResourceBudget,
-    ) -> Result<Vec<ScoredPoint>> {
+    ) -> Result<ExactScanResult> {
+        let row_count = row_set.len();
         let lane_count =
             HnswDistanceCostModel::exact_scan_parallelism(row_count, budget.parallelism_slots);
-        debug_assert!(lane_count > 1);
-        // Splitting a source range at lane boundaries creates at most one
-        // additional descriptor per boundary. Reserve before allocating the
-        // lane vectors so memory governance remains the construction gate.
-        let descriptor_count = ranges.len().saturating_add(lane_count - 1);
+        let source_count = row_set.physical_partitions().len();
+        let descriptor_count = source_count.saturating_add(lane_count.saturating_sub(1));
         let descriptor_bytes = descriptor_count
-            .saturating_mul(std::mem::size_of::<CoveringScanRange<'_>>())
-            .saturating_add(lane_count.saturating_mul(std::mem::size_of::<CoveringScanLane<'_>>()));
+            .saturating_mul(std::mem::size_of::<ExactPhysicalRange<'_>>())
+            .saturating_mul(2)
+            .saturating_add(lane_count.saturating_mul(std::mem::size_of::<ExactScanLane<'_>>()));
         let scorer_scratch_bytes = lane_count.saturating_mul(
             crate::index::hnsw::batch_scorer::BATCH_SIZE
                 .saturating_mul(std::mem::size_of::<ScoreType>())
@@ -2533,23 +2523,56 @@ impl HnswIndex {
                         .saturating_mul(2),
                 ),
         );
-        let _reservation =
+        let _scan_reservation =
             budget.try_reserve_memory(descriptor_bytes.saturating_add(scorer_scratch_bytes))?;
-        let lanes = Self::plan_covering_scan_lanes(ranges, row_count, lane_count)?;
+        let plan = self.plan_exact_physical_scan(row_set)?;
+        let kind = plan.kind();
+        let lanes = Self::plan_exact_scan_lanes(&plan.ranges, row_count, lane_count)?;
         let prepared_scoring = scorer.prepared_scoring();
         let results = map_search_tasks(
             &lanes,
             budget.parallelism_slots,
             |_, lane| -> Result<ExactScanLaneResult> {
                 let mut local_scorer = prepared_scoring.scorer();
-                let mut best = FixedLengthPriorityQueue::new(top_k);
+                let mut best = ScanTopK::new(top_k);
                 for range in &lane.ranges {
-                    self.scan_covering_range_into(
-                        &mut best,
-                        &mut local_scorer,
-                        *range,
-                        budget.work.as_ref(),
-                    )?;
+                    match *range {
+                        ExactPhysicalRange::Covering(range) => self.scan_covering_range_into(
+                            &mut best,
+                            &mut local_scorer,
+                            range,
+                            budget.work.as_ref(),
+                        )?,
+                        ExactPhysicalRange::Posting(range) => {
+                            let first =
+                                range.posting.select(range.first_rank).ok_or_else(|| {
+                                    error::data_corrupted(
+                                        "exact row-set posting rank exceeds its cardinality",
+                                    )
+                                })?;
+                            self.scan_exact_points_into(
+                                &mut best,
+                                &mut local_scorer,
+                                range
+                                    .posting
+                                    .range(first..)
+                                    .take(range.len as usize)
+                                    .map(|point_id| range.point_base + point_id),
+                                budget.work.as_ref(),
+                            )?;
+                        }
+                        ExactPhysicalRange::Dense { first_point, len } => {
+                            let end = first_point.checked_add(len).ok_or_else(|| {
+                                error::data_corrupted("dense exact scan range overflow")
+                            })?;
+                            self.scan_exact_points_into(
+                                &mut best,
+                                &mut local_scorer,
+                                first_point..end,
+                                budget.work.as_ref(),
+                            )?;
+                        }
+                    }
                 }
                 Ok(ExactScanLaneResult {
                     points: best.into_sorted_vec(),
@@ -2558,7 +2581,7 @@ impl HnswIndex {
             },
         )?;
 
-        let mut best = FixedLengthPriorityQueue::new(top_k);
+        let mut best = ScanTopK::new(top_k);
         let mut scored_points = 0u64;
         for result in results {
             scored_points = scored_points.saturating_add(result.scored_points);
@@ -2567,36 +2590,154 @@ impl HnswIndex {
             }
         }
         scorer.add_scored_point_count(scored_points);
-        Ok(best.into_sorted_vec())
+        Ok(ExactScanResult {
+            points: best.into_sorted_vec(),
+            kind,
+        })
     }
 
-    fn plan_covering_scan_lanes<'a>(
-        ranges: &[super::predicate_scan::PredicateScanRangeRef<'a>],
+    fn plan_exact_physical_scan<'a>(
+        &'a self,
+        row_set: &'a dyn ExactRowSet,
+    ) -> Result<ExactPhysicalScanPlan<'a>> {
+        let point_count = u32::try_from(self.graph.num_points())
+            .map_err(|_| error::out_of_range("HNSW point count exceeds u32"))?;
+        let mut pending = vec![(row_set.physical_partitions(), 0..point_count)];
+        let mut plan = ExactPhysicalScanPlan::default();
+        while let Some((partitions, point_range)) = pending.pop() {
+            match partitions {
+                ExactRowPartitions::Dense(rows) => {
+                    let available = point_range.end.saturating_sub(point_range.start);
+                    if rows > available {
+                        return Err(error::data_corrupted(
+                            "dense exact row-set exceeds its physical partition",
+                        ));
+                    }
+                    if rows != 0 {
+                        plan.ranges.push(ExactPhysicalRange::Dense {
+                            first_point: point_range.start,
+                            len: rows,
+                        });
+                        plan.base_rows = plan.base_rows.saturating_add(u64::from(rows));
+                    }
+                }
+                ExactRowPartitions::Single(posting) => {
+                    if !posting.is_empty() {
+                        plan.ranges
+                            .push(ExactPhysicalRange::Posting(ExactPostingRange {
+                                posting,
+                                point_base: point_range.start,
+                                first_rank: 0,
+                                len: u32::try_from(posting.len()).map_err(|_| {
+                                    error::data_corrupted(
+                                        "exact row-set posting cardinality exceeds u32",
+                                    )
+                                })?,
+                            }));
+                        plan.base_rows = plan.base_rows.saturating_add(posting.len());
+                    }
+                }
+                ExactRowPartitions::OrdinalSelection(row_set) => {
+                    let covering = self
+                        .predicate_scan
+                        .as_ref()
+                        .map(|layout| {
+                            layout.selected_ranges_for_partition(
+                                row_set.column_id(),
+                                point_range.clone(),
+                                row_set.selected_postings(),
+                            )
+                        })
+                        .transpose()?
+                        .flatten();
+                    if let Some(ranges) = covering {
+                        for range in ranges {
+                            let rows = range.row_ids().len();
+                            if rows != 0 {
+                                plan.ranges
+                                    .push(ExactPhysicalRange::Covering(CoveringScanRange {
+                                        range,
+                                        first_row: 0,
+                                        len: rows,
+                                    }));
+                                plan.covering_rows = plan.covering_rows.saturating_add(rows as u64);
+                            }
+                        }
+                    } else {
+                        for posting in row_set.selected_postings() {
+                            if posting.rows().is_empty() {
+                                continue;
+                            }
+                            plan.ranges
+                                .push(ExactPhysicalRange::Posting(ExactPostingRange {
+                                    posting: posting.rows(),
+                                    point_base: point_range.start,
+                                    first_rank: 0,
+                                    len: u32::try_from(posting.rows().len()).map_err(|_| {
+                                        error::data_corrupted(
+                                            "exact ordinal posting cardinality exceeds u32",
+                                        )
+                                    })?,
+                                }));
+                            plan.base_rows = plan.base_rows.saturating_add(posting.rows().len());
+                        }
+                    }
+                }
+                ExactRowPartitions::Partitioned(partitioned) => {
+                    let mut parts = partitioned.physical_parts().collect::<Vec<_>>();
+                    for (local_range, part) in parts.drain(..).rev() {
+                        let start = point_range
+                            .start
+                            .checked_add(local_range.start)
+                            .ok_or_else(|| {
+                                error::data_corrupted("exact partition start overflow")
+                            })?;
+                        let end = point_range
+                            .start
+                            .checked_add(local_range.end)
+                            .ok_or_else(|| error::data_corrupted("exact partition end overflow"))?;
+                        if end > point_range.end {
+                            return Err(error::data_corrupted(
+                                "nested exact partition exceeds its parent domain",
+                            ));
+                        }
+                        pending.push((part.physical_partitions(), start..end));
+                    }
+                }
+            }
+        }
+        if plan.row_count() != row_set.len() {
+            return Err(error::data_corrupted(format!(
+                "exact physical scan planned {} rows, expected {}",
+                plan.row_count(),
+                row_set.len()
+            )));
+        }
+        Ok(plan)
+    }
+
+    fn plan_exact_scan_lanes<'a>(
+        ranges: &[ExactPhysicalRange<'a>],
         row_count: u64,
         lane_count: usize,
-    ) -> Result<Vec<CoveringScanLane<'a>>> {
+    ) -> Result<Vec<ExactScanLane<'a>>> {
         let mut lanes = (0..lane_count)
-            .map(|_| CoveringScanLane::default())
+            .map(|_| ExactScanLane::default())
             .collect::<Vec<_>>();
         let target_rows = row_count.div_ceil(lane_count as u64);
         let mut lane = 0usize;
         let mut rows_in_lane = 0u64;
         let mut observed_rows = 0u64;
         for &range in ranges {
-            let mut first_row = 0usize;
-            let range_rows = range.row_ids().len();
-            observed_rows = observed_rows.saturating_add(range_rows as u64);
+            let mut first_row = 0u64;
+            let range_rows = range.len();
+            observed_rows = observed_rows.saturating_add(range_rows);
             while first_row < range_rows {
                 let available = target_rows.saturating_sub(rows_in_lane).max(1);
-                let take = usize::try_from(available.min((range_rows - first_row) as u64))
-                    .map_err(|_| error::out_of_range("covering scan lane size exceeds usize"))?;
-                lanes[lane].ranges.push(CoveringScanRange {
-                    range,
-                    first_row,
-                    len: take,
-                });
+                let take = available.min(range_rows - first_row);
+                lanes[lane].ranges.push(range.slice(first_row, take)?);
                 first_row += take;
-                rows_in_lane = rows_in_lane.saturating_add(take as u64);
+                rows_in_lane = rows_in_lane.saturating_add(take);
                 if rows_in_lane >= target_rows && lane + 1 < lane_count {
                     lane += 1;
                     rows_in_lane = 0;
@@ -2605,12 +2746,12 @@ impl HnswIndex {
         }
         if observed_rows != row_count {
             return Err(error::data_corrupted(format!(
-                "covering scan lane cardinality mismatch: expected {row_count}, got {observed_rows}"
+                "exact scan lane cardinality mismatch: expected {row_count}, got {observed_rows}"
             )));
         }
         if lanes.iter().any(|lane| lane.ranges.is_empty()) {
             return Err(error::internal(
-                "covering scan lane planner produced an empty worker lane",
+                "exact scan lane planner produced an empty worker lane",
             ));
         }
         Ok(lanes)
@@ -2618,7 +2759,7 @@ impl HnswIndex {
 
     fn scan_covering_range_into(
         &self,
-        best: &mut FixedLengthPriorityQueue<ScoredPoint>,
+        best: &mut ScanTopK<ScoredPoint>,
         scorer: &mut VectorScorer,
         range: CoveringScanRange<'_>,
         work: &SearchWorkBudget,
@@ -2661,159 +2802,9 @@ impl HnswIndex {
         Ok(())
     }
 
-    fn parallel_plain_scan(
-        &self,
-        top_k: usize,
-        scorer: &mut VectorScorer,
-        partitions: ExactRowPartitions<'_>,
-        row_count: u64,
-        budget: &ResourceBudget,
-    ) -> Result<Vec<ScoredPoint>> {
-        let lane_count =
-            HnswDistanceCostModel::exact_scan_parallelism(row_count, budget.parallelism_slots);
-        debug_assert!(lane_count > 1);
-        debug_assert!(!partitions.is_empty());
-
-        let partition_count = partitions.len();
-        let descriptor_count = partition_count.saturating_add(lane_count);
-        let descriptor_bytes = descriptor_count
-            .saturating_mul(std::mem::size_of::<ExactPostingRange<'_>>())
-            .saturating_mul(2)
-            .saturating_add(lane_count.saturating_mul(std::mem::size_of::<ExactScanLane<'_>>()));
-        let scorer_scratch_bytes = lane_count.saturating_mul(
-            crate::index::hnsw::batch_scorer::BATCH_SIZE
-                .saturating_mul(std::mem::size_of::<ScoreType>())
-                .saturating_add(
-                    top_k
-                        .saturating_mul(std::mem::size_of::<ScoredPoint>())
-                        .saturating_mul(2),
-                ),
-        );
-        let _reservation =
-            budget.try_reserve_memory(descriptor_bytes.saturating_add(scorer_scratch_bytes))?;
-        let lanes = Self::plan_exact_scan_lanes(partitions, row_count, lane_count)?;
-        let prepared_scoring = scorer.prepared_scoring();
-        let results = map_search_tasks(
-            &lanes,
-            budget.parallelism_slots,
-            |_, lane| -> Result<ExactScanLaneResult> {
-                let mut local_scorer = prepared_scoring.scorer();
-                let mut best = FixedLengthPriorityQueue::new(top_k);
-                for range in &lane.ranges {
-                    let first = range.posting.select(range.first_rank).ok_or_else(|| {
-                        error::data_corrupted("exact row-set posting rank exceeds its cardinality")
-                    })?;
-                    self.scan_exact_points_into(
-                        &mut best,
-                        &mut local_scorer,
-                        range
-                            .posting
-                            .range(first..)
-                            .take(range.len as usize)
-                            .map(|point_id| range.point_base + point_id),
-                        budget.work.as_ref(),
-                    )?;
-                }
-                Ok(ExactScanLaneResult {
-                    points: best.into_sorted_vec(),
-                    scored_points: local_scorer.scored_point_count(),
-                })
-            },
-        )?;
-
-        let mut best = FixedLengthPriorityQueue::new(top_k);
-        let mut scored_points = 0u64;
-        for result in results {
-            scored_points = scored_points.saturating_add(result.scored_points);
-            for point in result.points {
-                best.push(point);
-            }
-        }
-        scorer.add_scored_point_count(scored_points);
-        Ok(best.into_sorted_vec())
-    }
-
-    fn plan_exact_scan_lanes<'a>(
-        partitions: ExactRowPartitions<'a>,
-        row_count: u64,
-        lane_count: usize,
-    ) -> Result<Vec<ExactScanLane<'a>>> {
-        let mut lanes = (0..lane_count)
-            .map(|_| ExactScanLane::default())
-            .collect::<Vec<_>>();
-        let target_rows = row_count.div_ceil(lane_count as u64);
-        let mut lane = 0usize;
-        let mut rows_in_lane = 0u64;
-        let mut observed_rows = 0u64;
-        let mut append_posting =
-            |point_base: PointOffset, posting: &'a roaring::RoaringBitmap| -> Result<()> {
-                let mut first_rank = 0u64;
-                let posting_rows = posting.len();
-                observed_rows = observed_rows.saturating_add(posting_rows);
-                while first_rank < posting_rows {
-                    let available = target_rows.saturating_sub(rows_in_lane).max(1);
-                    let take = available.min(posting_rows - first_rank);
-                    lanes[lane].ranges.push(ExactPostingRange {
-                        posting,
-                        point_base,
-                        first_rank: u32::try_from(first_rank).map_err(|_| {
-                            error::data_corrupted("exact row-set posting rank exceeds u32")
-                        })?,
-                        len: u32::try_from(take).map_err(|_| {
-                            error::data_corrupted("exact row-set posting range exceeds u32")
-                        })?,
-                    });
-                    first_rank += take;
-                    rows_in_lane += take;
-                    if rows_in_lane >= target_rows && lane + 1 < lane_count {
-                        lane += 1;
-                        rows_in_lane = 0;
-                    }
-                }
-                Ok(())
-            };
-        Self::visit_exact_postings(partitions, 0, &mut append_posting)?;
-        if observed_rows != row_count {
-            return Err(error::data_corrupted(format!(
-                "exact row-set partition cardinality mismatch: expected {row_count}, got {observed_rows}"
-            )));
-        }
-        if lanes.iter().any(|lane| lane.ranges.is_empty()) {
-            return Err(error::internal(
-                "exact scan lane planner produced an empty worker lane",
-            ));
-        }
-        Ok(lanes)
-    }
-
-    fn visit_exact_postings<'a>(
-        partitions: ExactRowPartitions<'a>,
-        point_base: PointOffset,
-        visitor: &mut dyn FnMut(PointOffset, &'a roaring::RoaringBitmap) -> Result<()>,
-    ) -> Result<()> {
-        match partitions {
-            ExactRowPartitions::Single(bitmap) => visitor(point_base, bitmap),
-            ExactRowPartitions::OrdinalPostings { postings, .. } => {
-                for posting in postings {
-                    visitor(point_base, posting.rows())?;
-                }
-                Ok(())
-            }
-            ExactRowPartitions::Partitioned(row_set) => {
-                for (part_base, part) in row_set.physical_parts() {
-                    let global_base = point_base.checked_add(part_base).ok_or_else(|| {
-                        error::data_corrupted("exact row-set partition offset overflow")
-                    })?;
-                    Self::visit_exact_postings(part.physical_partitions(), global_base, visitor)?;
-                }
-                Ok(())
-            }
-        }
-    }
-
     fn scan_exact_points_into(
         &self,
-        best: &mut FixedLengthPriorityQueue<ScoredPoint>,
+        best: &mut ScanTopK<ScoredPoint>,
         scorer: &mut VectorScorer,
         point_ids: impl Iterator<Item = PointOffset>,
         work: &SearchWorkBudget,
@@ -2848,7 +2839,7 @@ impl HnswIndex {
         point_ids: impl Iterator<Item = PointOffset>,
         work: &SearchWorkBudget,
     ) -> Result<Vec<ScoredPoint>> {
-        let mut best = FixedLengthPriorityQueue::new(top_k);
+        let mut best = ScanTopK::new(top_k);
         self.scan_exact_points_into(&mut best, scorer, point_ids, work)?;
         Ok(best.into_sorted_vec())
     }
@@ -2882,6 +2873,13 @@ mod tests {
             .collect()
     }
 
+    fn test_dictionary_values(ordinals: &[u16]) -> Box<[Option<Bytes>]> {
+        ordinals
+            .iter()
+            .map(|ordinal| Some(Bytes::copy_from_slice(&ordinal.to_le_bytes())))
+            .collect()
+    }
+
     #[test]
     fn covering_scan_lane_planner_splits_one_large_contiguous_run_without_gaps() {
         const ROWS: u32 = 40_000;
@@ -2893,6 +2891,7 @@ mod tests {
                 column_id: 7,
                 blocks: vec![PredicateScanBuildBlock {
                     dictionary_ordinals: vec![0].into_boxed_slice(),
+                    dictionary_values: test_dictionary_values(&[0]),
                     ordinal_row_counts: vec![ROWS].into_boxed_slice(),
                     ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(&posting)]
                         .into_boxed_slice(),
@@ -2903,8 +2902,21 @@ mod tests {
         )
         .unwrap();
         let exact_postings = [crate::index::ExactOrdinalPosting::new(0, posting)];
-        let ranges = layout.selected_ranges(7, &exact_postings).unwrap().unwrap();
-        let lanes = HnswIndex::plan_covering_scan_lanes(&ranges, u64::from(ROWS), 3).unwrap();
+        let ranges = layout
+            .selected_ranges_for_partition(7, 0..ROWS, &exact_postings)
+            .unwrap()
+            .unwrap();
+        let ranges = ranges
+            .into_iter()
+            .map(|range| {
+                ExactPhysicalRange::Covering(CoveringScanRange {
+                    first_row: 0,
+                    len: range.row_ids().len(),
+                    range,
+                })
+            })
+            .collect::<Vec<_>>();
+        let lanes = HnswIndex::plan_exact_scan_lanes(&ranges, u64::from(ROWS), 3).unwrap();
 
         assert_eq!(lanes.len(), 3);
         assert!(lanes.iter().all(|lane| !lane.ranges.is_empty()));
@@ -2912,14 +2924,17 @@ mod tests {
             lanes
                 .iter()
                 .flat_map(|lane| lane.ranges.iter())
-                .map(|range| range.len)
-                .sum::<usize>(),
-            ROWS as usize
+                .map(|range| range.len())
+                .sum::<u64>(),
+            u64::from(ROWS)
         );
         let starts = lanes
             .iter()
             .flat_map(|lane| lane.ranges.iter())
-            .map(|range| range.first_row)
+            .map(|range| match range {
+                ExactPhysicalRange::Covering(range) => range.first_row,
+                _ => panic!("expected covering range"),
+            })
             .collect::<Vec<_>>();
         assert_eq!(starts, vec![0, 13_334, 26_668]);
     }
@@ -3002,11 +3017,13 @@ mod tests {
         }
 
         for i in 0..vectors.len() {
-            builder.insert_single_point(i as u32, storage.as_ref(), distance);
+            builder
+                .insert_single_point(i as u32, storage.as_ref(), distance)
+                .unwrap();
         }
 
         let (links, entry_points) = builder.into_graph_data();
-        let graph = GraphLayers::new(links, entry_points, VisitedPool::new(), (&config).into());
+        let graph = GraphLayers::new(links, entry_points, (&config).into());
         HnswIndex::new(config, graph, storage, distance)
     }
 
@@ -3272,6 +3289,7 @@ mod tests {
                         column_id: 7,
                         blocks: vec![HnswFilterBlock {
                             dictionary_ordinals: vec![0].into_boxed_slice(),
+                            dictionary_values: test_dictionary_values(&[0]),
                             ordinal_row_counts: vec![3].into_boxed_slice(),
                             ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
                                 &RoaringBitmap::from_iter([0, 1, 2]),
@@ -3300,6 +3318,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 HnswFilterBlock {
                     dictionary_ordinals: vec![block as u32].into_boxed_slice(),
+                    dictionary_values: test_dictionary_values(&[block as u16]),
                     ordinal_row_counts: vec![64].into_boxed_slice(),
                     ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
                         &RoaringBitmap::from_iter(point_ids.iter().copied()),
@@ -3317,6 +3336,7 @@ mod tests {
                     .collect::<Vec<_>>();
                 HnswFilterBlock {
                     dictionary_ordinals: vec![block as u32].into_boxed_slice(),
+                    dictionary_values: test_dictionary_values(&[block as u16]),
                     ordinal_row_counts: vec![64].into_boxed_slice(),
                     ordinal_fingerprints: vec![crate::index::bitmap::posting_fingerprint(
                         &RoaringBitmap::from_iter(point_ids.iter().copied()),
@@ -3422,6 +3442,59 @@ mod tests {
         assert_eq!(exact.scored_points, 128);
         assert_eq!(exact.points[0].idx, 100);
         assert!(exact.points.iter().all(|point| point.idx < 128));
+
+        let covered_part: Arc<dyn ExactRowSet> = Arc::new(crate::index::OrdinalRowSet::new(
+            7,
+            (0..128)
+                .map(|point| (point / 64) as u16)
+                .collect::<Vec<_>>()
+                .into(),
+            vec![0b11].into_boxed_slice(),
+            false,
+            128,
+            vec![
+                crate::index::ExactOrdinalPosting::new(
+                    0,
+                    Arc::new(RoaringBitmap::from_iter(0..64)),
+                ),
+                crate::index::ExactOrdinalPosting::new(
+                    1,
+                    Arc::new(RoaringBitmap::from_iter(64..128)),
+                ),
+            ]
+            .into_boxed_slice(),
+        ));
+        let base_part: Arc<dyn ExactRowSet> = Arc::new(RoaringBitmap::from_iter(0..128));
+        let mixed_rows = crate::index::PartitionExactRowSet::try_new(vec![
+            (0..128, covered_part),
+            (128..256, base_part),
+        ])
+        .unwrap();
+        let mixed_filter = HnswSearchFilter::predicate(&mixed_rows, &[7]);
+        assert_eq!(
+            restored.exact_scan_workload(mixed_filter),
+            HnswExactScanWorkload {
+                sequential_rows: 128,
+                indexed_base_rows: 128,
+            }
+        );
+        let mixed = restored
+            .search_one_with_policy_strategy(
+                &vectors[100],
+                5,
+                &SearchParams::default(),
+                mixed_filter,
+                &HnswSearchPolicy::default(),
+                HnswSearchStrategy::ExactScan,
+                &budget,
+            )
+            .unwrap();
+        assert_eq!(
+            mixed.outcome.path,
+            HnswSearchPath::ExactScan(HnswExactScanKind::Hybrid)
+        );
+        assert_eq!(mixed.scored_points, 256);
+        assert_eq!(mixed.points[0].idx, 100);
     }
 
     #[test]
@@ -3665,6 +3738,7 @@ mod tests {
             ef_search: 96,
             plain_scan_threshold: 0,
             filtered_plain_scan_threshold: 0,
+            ..HnswSearchPolicy::default()
         };
         let budget = crate::search::ResourceBudget::default();
 
@@ -3992,7 +4066,9 @@ mod tests {
         let links = GraphLinks::new_from_edges(vec![vec![vec![1]], vec![vec![0]]]);
         let mut encoded = Vec::new();
         links.serialize(&mut encoded).unwrap();
-        let first_link_offset = 64 + (2 + 1) * std::mem::size_of::<u64>();
+        // GraphLinks v4 starts with a 64-byte header followed immediately by
+        // the first sentinel-terminated fixed link record.
+        let first_link_offset = 64;
         encoded[first_link_offset..first_link_offset + 4].copy_from_slice(&99_u32.to_le_bytes());
         let invalid_links = GraphLinks::deserialize(encoded.as_slice()).unwrap();
         let graph = GraphLayers::new(
@@ -4004,7 +4080,6 @@ mod tests {
                 }],
                 extra_entry_points: Vec::new(),
             },
-            VisitedPool::new(),
             HnswM::new(8),
         );
         let index = HnswIndex::new(
@@ -4119,31 +4194,32 @@ mod tests {
             crate::index::ExactOrdinalPosting::new(0, Arc::new(first)),
             crate::index::ExactOrdinalPosting::new(1, Arc::new(second)),
         ];
-        let lanes = HnswIndex::plan_exact_scan_lanes(
-            ExactRowPartitions::OrdinalPostings {
-                column_id: 7,
-                postings: &postings,
-            },
-            40_000,
-            3,
-        )
-        .unwrap();
+        let ranges = postings
+            .iter()
+            .map(|posting| {
+                ExactPhysicalRange::Posting(ExactPostingRange {
+                    posting: posting.rows(),
+                    point_base: 0,
+                    first_rank: 0,
+                    len: posting.rows().len() as u32,
+                })
+            })
+            .collect::<Vec<_>>();
+        let lanes = HnswIndex::plan_exact_scan_lanes(&ranges, 40_000, 3).unwrap();
 
         assert_eq!(lanes.len(), 3);
         let lane_sizes = lanes
             .iter()
-            .map(|lane| {
-                lane.ranges
-                    .iter()
-                    .map(|range| u64::from(range.len))
-                    .sum::<u64>()
-            })
+            .map(|lane| lane.ranges.iter().map(|range| range.len()).sum::<u64>())
             .collect::<Vec<_>>();
         assert_eq!(lane_sizes, vec![13_334, 13_334, 13_332]);
 
         let mut reconstructed = RoaringBitmap::new();
         for lane in lanes {
             for range in lane.ranges {
+                let ExactPhysicalRange::Posting(range) = range else {
+                    panic!("expected posting range")
+                };
                 let first = range.posting.select(range.first_rank).unwrap();
                 reconstructed.extend(range.posting.range(first..).take(range.len as usize));
             }
@@ -4168,7 +4244,6 @@ mod tests {
                 }],
                 extra_entry_points: Vec::new(),
             },
-            VisitedPool::new(),
             HnswM::new(8),
         );
         let config = HnswConfig::new(8, 32)
