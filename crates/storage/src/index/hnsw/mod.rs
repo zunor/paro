@@ -13,6 +13,7 @@ pub mod build_cache;
 pub mod build_task;
 pub mod builder;
 pub mod compaction;
+pub mod diagnostics;
 pub mod distance;
 pub mod entry_points;
 pub mod graph;
@@ -37,6 +38,10 @@ pub use build_task::{
     HnswColumnBuildConfig,
 };
 pub use builder::GraphLayersBuilder;
+pub use diagnostics::{
+    HnswDegreeSampleSummary, HnswGraphDiagnostics, HnswGraphQualityReport,
+    HnswTruthIndegreeComparison,
+};
 pub use distance::DistanceMetric;
 pub use entry_points::{EntryPoint, EntryPoints, PredicateEntryPoint};
 pub use graph::GraphLayers;

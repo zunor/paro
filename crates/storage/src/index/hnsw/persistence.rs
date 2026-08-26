@@ -2258,6 +2258,18 @@ impl HnswIndex {
         Ok(())
     }
 
+    /// Run an explicit O(N + E) structural qualification scan.
+    ///
+    /// This is deliberately not part of artifact open or ordinary search.
+    /// Callers must supply a governed budget large enough for the retained
+    /// indegree image and temporary reachability/component workspaces.
+    pub fn graph_diagnostics(
+        &self,
+        budget: &ResourceBudget,
+    ) -> Result<super::HnswGraphDiagnostics> {
+        super::HnswGraphDiagnostics::analyze(&self.graph.links, &self.graph.entry_points, budget)
+    }
+
     fn validate_artifact_contract(&self) -> Result<()> {
         self.build_contract.validate()?;
         if self.graph.num_points() != self.vector_storage.num_vectors() {

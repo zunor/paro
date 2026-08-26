@@ -616,10 +616,14 @@ impl GraphLayersBuilder {
         mut left: PointOffset,
         mut right: PointOffset,
     ) -> ScoreType {
-        if left > right {
-            std::mem::swap(&mut left, &mut right);
-        }
         if distance == DistanceMetric::Cosine {
+            // Only cosine consumes point-owned norm factors in a left-
+            // associative multiply. The other finite-valued metrics are
+            // bitwise symmetric, so keep their multi-billion-call build loop
+            // free of a random point-id compare and conditional swap.
+            if left > right {
+                std::mem::swap(&mut left, &mut right);
+            }
             let norms = storage
                 .cosine_inverse_norms()
                 .unwrap_or_else(|| unreachable!("cosine build storage is prepared once"));

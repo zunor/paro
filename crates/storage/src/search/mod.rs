@@ -23,6 +23,7 @@ pub mod maintenance;
 pub mod posting_stream;
 pub mod provider_config;
 pub(crate) mod providers;
+pub mod qualification;
 pub mod request;
 pub mod sidecar;
 pub(crate) mod sidecar_builder;
@@ -85,6 +86,7 @@ pub use provider_config::{
 };
 pub use providers::fulltext::inline::FullTextInlineArtifactBuilder;
 pub use providers::sparse::inline::SparseInlineArtifactBuilder;
+pub use qualification::{qualify_hnsw_generation, HnswGenerationQualification};
 pub use request::{
     analyze_fulltext_query_stats, build_fulltext_query_stats, normalize_fulltext_config,
     DenseVectorQuery, ExactFilterMaterialization, FullTextIntent, FullTextQueryKind,
