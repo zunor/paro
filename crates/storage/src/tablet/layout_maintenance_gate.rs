@@ -3,7 +3,7 @@
 
 //! Coordination between immutable-layout builds and physical rowset rewrites.
 
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use paro_common::error::{self as paro_error, Result};
@@ -42,18 +42,24 @@ impl LayoutMaintenanceGate {
     /// locks are released, and keeps it through physical tablet publication.
     /// This bridges the durable-append/apply window in which SQL locks no
     /// longer protect the rowset layout.
-    pub fn acquire_shared(&self) -> Result<LayoutMaintenanceLease> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| paro_error::internal("layout maintenance gate poisoned"))?;
+    pub fn acquire_shared(&self, should_stop: impl Fn() -> bool) -> Result<LayoutMaintenanceLease> {
+        let mut state = self.lock_state("acquire shared layout lease");
         while state.exclusive_owner.is_some() || state.exclusive_waiters != 0 {
-            state = self
-                .inner
-                .changed
-                .wait(state)
-                .map_err(|_| paro_error::internal("layout maintenance gate poisoned"))?;
+            if should_stop() {
+                return Err(paro_error::query_canceled());
+            }
+            state = match self.inner.changed.wait_timeout(state, CANCEL_POLL_INTERVAL) {
+                Ok(waited) => waited.0,
+                Err(poisoned) => {
+                    tracing::error!(
+                        "recovering poisoned layout maintenance gate while waiting for shared lease"
+                    );
+                    poisoned.into_inner().0
+                }
+            };
+        }
+        if should_stop() {
+            return Err(paro_error::query_canceled());
         }
         state.shared_holders = state.shared_holders.checked_add(1).ok_or_else(|| {
             paro_error::internal("layout maintenance shared-holder count overflow")
@@ -67,11 +73,7 @@ impl LayoutMaintenanceGate {
     /// Compaction is background work and must yield rather than queue behind a
     /// potentially long foreground CREATE INDEX build.
     pub fn try_acquire_shared(&self) -> Result<Option<LayoutMaintenanceLease>> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| paro_error::internal("layout maintenance gate poisoned"))?;
+        let mut state = self.lock_state("try acquire shared layout lease");
         if state.exclusive_owner.is_some() || state.exclusive_waiters != 0 {
             return Ok(None);
         }
@@ -89,11 +91,7 @@ impl LayoutMaintenanceGate {
         owner_id: u64,
         should_stop: impl Fn() -> bool,
     ) -> Result<LayoutMaintenanceLease> {
-        let mut state = self
-            .inner
-            .state
-            .lock()
-            .map_err(|_| paro_error::internal("layout maintenance gate poisoned"))?;
+        let mut state = self.lock_state("acquire exclusive layout lease");
         if state.exclusive_owner == Some(owner_id) {
             state.exclusive_holders = state.exclusive_holders.checked_add(1).ok_or_else(|| {
                 paro_error::internal("layout maintenance exclusive-holder count overflow")
@@ -110,12 +108,15 @@ impl LayoutMaintenanceGate {
                 self.inner.changed.notify_all();
                 return Err(paro_error::query_canceled());
             }
-            let waited = self
-                .inner
-                .changed
-                .wait_timeout(state, CANCEL_POLL_INTERVAL)
-                .map_err(|_| paro_error::internal("layout maintenance gate poisoned"))?;
-            state = waited.0;
+            state = match self.inner.changed.wait_timeout(state, CANCEL_POLL_INTERVAL) {
+                Ok(waited) => waited.0,
+                Err(poisoned) => {
+                    tracing::error!(
+                        "recovering poisoned layout maintenance gate while waiting for exclusive lease"
+                    );
+                    poisoned.into_inner().0
+                }
+            };
         }
         if should_stop() {
             state.exclusive_waiters = state.exclusive_waiters.saturating_sub(1);
@@ -129,6 +130,16 @@ impl LayoutMaintenanceGate {
             inner: Arc::clone(&self.inner),
             mode: LeaseMode::Exclusive { owner_id },
         })
+    }
+
+    fn lock_state(&self, operation: &'static str) -> MutexGuard<'_, GateState> {
+        match self.inner.state.lock() {
+            Ok(state) => state,
+            Err(poisoned) => {
+                tracing::error!(operation, "recovering poisoned layout maintenance gate");
+                poisoned.into_inner()
+            }
+        }
     }
 }
 
@@ -220,6 +231,33 @@ mod tests {
     }
 
     #[test]
+    fn shared_wait_is_cancellable() {
+        let gate = LayoutMaintenanceGate::default();
+        let _exclusive = gate.acquire_exclusive(7, || false).unwrap();
+        let err = gate.acquire_shared(|| true).unwrap_err();
+        assert!(err.is_query_canceled());
+    }
+
+    #[test]
+    fn poisoned_state_is_recovered_consistently() {
+        let gate = LayoutMaintenanceGate::default();
+        let inner = Arc::clone(&gate.inner);
+        let _ = std::thread::spawn(move || {
+            let _state = inner.state.lock().unwrap();
+            panic!("poison gate for recovery test");
+        })
+        .join();
+
+        let lease = gate
+            .try_acquire_shared()
+            .unwrap()
+            .expect("poison recovery must not permanently close the gate");
+        drop(lease);
+        let exclusive = gate.acquire_exclusive(9, || false).unwrap();
+        drop(exclusive);
+    }
+
+    #[test]
     fn exclusive_lease_is_reentrant_for_the_same_transaction_owner() {
         let gate = LayoutMaintenanceGate::default();
         let first = gate.acquire_exclusive(11, || false).unwrap();
@@ -239,7 +277,7 @@ mod tests {
         let admitted_for_thread = Arc::clone(&admitted);
         let gate_for_thread = gate.clone();
         let join = std::thread::spawn(move || {
-            let lease = gate_for_thread.acquire_shared().unwrap();
+            let lease = gate_for_thread.acquire_shared(|| false).unwrap();
             admitted_for_thread.store(true, Ordering::Release);
             lease
         });

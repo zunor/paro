@@ -13,7 +13,9 @@ use crate::effect::{
 use serde::{Deserialize, Serialize};
 
 /// Journal frame schema version used by the binary codec.
-pub const JOURNAL_FORMAT_VERSION: u16 = 5;
+/// Version 6 makes search-generation publication mode explicit and identities
+/// every immutable root revision independently.
+pub const JOURNAL_FORMAT_VERSION: u16 = 6;
 pub const COMMIT_RECORD_VERSION: u16 = 2;
 pub const MAINTENANCE_RECORD_VERSION: u16 = 2;
 pub const JOURNAL_RECORD_METADATA_VERSION: u16 = 1;

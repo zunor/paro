@@ -137,6 +137,19 @@ pub struct SearchGenerationHeadMeta {
     pub root_file_name: String,
 }
 
+/// Physical publication mode for one durable search-generation head.
+///
+/// A newly built generation owns a private directory that must be installed
+/// atomically. Later maintenance revisions append immutable manifest fragments
+/// to the already-installed generation directory and only advance the durable
+/// head. Both modes deliberately share the same tablet mutation so live apply
+/// and recovery enforce one ordering and validation contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SearchGenerationPublication {
+    InstallStaged { staged_ref: ArtifactRef },
+    AdvanceInstalled,
+}
+
 impl SearchGenerationHeadMeta {
     pub(crate) fn stable_artifact_id(definition_id: u64, generation_id: u64) -> u64 {
         stable_search_generation_artifact_id(definition_id, generation_id)
@@ -231,11 +244,12 @@ pub enum TabletMutation {
         retired_inputs: Vec<RetiredRowsetInput>,
         cumulative_point_action: CompactionCumulativePointAction,
     },
-    /// Atomically install one immutable search generation and make its head
-    /// visible in tablet metadata. `generation_ref` always names a fresh,
-    /// generation-qualified directory; publication never overwrites it.
+    /// Atomically make one immutable search-generation revision visible.
+    /// `generation_ref` is generation-qualified. The first revision installs a
+    /// private directory; later revisions advance to already-durable immutable
+    /// manifest fragments without rewriting the directory.
     PublishSearchGeneration {
-        staged_ref: ArtifactRef,
+        publication: SearchGenerationPublication,
         generation_ref: ArtifactRef,
         head: SearchGenerationHeadMeta,
     },
@@ -260,9 +274,11 @@ impl TabletMutation {
             Self::PublishCompaction {
                 output_rowset_id, ..
             } => *output_rowset_id,
-            Self::PublishSearchGeneration { head, .. } => {
-                stable_search_generation_artifact_id(head.definition_id, head.generation_id)
-            }
+            Self::PublishSearchGeneration { head, .. } => stable_search_generation_revision_id(
+                head.definition_id,
+                head.generation_id,
+                head.root_version,
+            ),
             Self::ApplyPrimaryDelete { keys } => stable_hash_keys(keys),
             Self::ApplyDeletePatch { patch, .. } => stable_hash_delete_patch(patch),
         }
@@ -329,6 +345,18 @@ pub(crate) fn stable_search_generation_artifact_id(definition_id: u64, generatio
     let mut hash = StableHasher::new(0x5345_4152_4348_474e);
     hash.write_u64(definition_id);
     hash.write_u64(generation_id);
+    hash.finish()
+}
+
+fn stable_search_generation_revision_id(
+    definition_id: u64,
+    generation_id: u64,
+    root_version: u64,
+) -> u64 {
+    let mut hash = StableHasher::new(0x5345_4152_4348_5256);
+    hash.write_u64(definition_id);
+    hash.write_u64(generation_id);
+    hash.write_u64(root_version);
     hash.finish()
 }
 
@@ -542,6 +570,33 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[test]
+    fn search_generation_mutation_identity_includes_root_revision() {
+        let mutation = |root_version| TabletMutation::PublishSearchGeneration {
+            publication: SearchGenerationPublication::AdvanceInstalled,
+            generation_ref: ArtifactRef {
+                namespace: ArtifactNamespace::SearchGeneration,
+                locator: vec![
+                    "42".to_string(),
+                    "generations".to_string(),
+                    "g7".to_string(),
+                ],
+            },
+            head: SearchGenerationHeadMeta {
+                definition_id: 42,
+                generation_id: 7,
+                root_version,
+                config_fingerprint: 99,
+                root_file_name: format!("manifest_root_g7_v{root_version}.json"),
+            },
+        };
+
+        assert_ne!(
+            mutation(1).stable_artifact_id(),
+            mutation(2).stable_artifact_id()
+        );
     }
 
     #[test]

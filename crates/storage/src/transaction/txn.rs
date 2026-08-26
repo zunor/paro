@@ -1027,6 +1027,7 @@ impl Transaction {
     }
 
     fn acquire_storage_publish_layout_leases(
+        &self,
         pending: &[PendingMutation],
     ) -> Result<Vec<LayoutMaintenanceLease>> {
         let mut tablets = BTreeMap::<u64, TabletRef>::new();
@@ -1042,7 +1043,9 @@ impl Transaction {
         }
         tablets
             .into_values()
-            .map(|tablet| tablet.acquire_storage_publish_layout_lease())
+            .map(|tablet| {
+                tablet.acquire_storage_publish_layout_lease(|| self.is_awaiting_cleanup())
+            })
             .collect()
     }
 
@@ -1054,7 +1057,7 @@ impl Transaction {
         // These leases bridge the later lock-release -> required-apply window,
         // preventing a stable-layout index build from snapshotting ahead of an
         // earlier durable DML commit whose rowset is not published yet.
-        let layout_leases = Self::acquire_storage_publish_layout_leases(&pending)?;
+        let layout_leases = self.acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
 
         let mut data_ops = Vec::new();
@@ -1180,7 +1183,7 @@ impl Transaction {
 
     fn apply_pending_writes(&self, commit_id: u64) -> Result<()> {
         let pending = self.write_buffer.take_mutations()?;
-        let _layout_leases = Self::acquire_storage_publish_layout_leases(&pending)?;
+        let _layout_leases = self.acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
         self.apply_materialized_writes(commit_id, &primary_deletes, &row_id_deletes, rowsets)
     }

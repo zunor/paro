@@ -433,13 +433,74 @@ impl TabletMeta {
         self.search_generation_heads = heads;
     }
 
-    pub fn upsert_search_generation_head(&mut self, head: SearchGenerationHeadMeta) {
+    /// Advance one definition's durable head without permitting an older or
+    /// conflicting revision to replace newer metadata.
+    ///
+    /// The ordering is `(generation_id, root_version)`. A generation change
+    /// may carry a new physical contract fingerprint; revisions within one
+    /// generation may not.
+    pub fn advance_search_generation_head(
+        &mut self,
+        head: SearchGenerationHeadMeta,
+    ) -> Result<bool> {
+        if head.definition_id == 0 || head.generation_id == 0 || head.root_version == 0 {
+            return Err(paro_error::invalid_input(
+                "search generation head requires non-zero identities and root version",
+            ));
+        }
         match self
             .search_generation_heads
             .binary_search_by_key(&head.definition_id, |existing| existing.definition_id)
         {
-            Ok(index) => self.search_generation_heads[index] = head,
-            Err(index) => self.search_generation_heads.insert(index, head),
+            Ok(index) => {
+                let current = &self.search_generation_heads[index];
+                let current_revision = (current.generation_id, current.root_version);
+                let next_revision = (head.generation_id, head.root_version);
+                match next_revision.cmp(&current_revision) {
+                    std::cmp::Ordering::Less => Ok(false),
+                    std::cmp::Ordering::Equal if *current == head => Ok(false),
+                    std::cmp::Ordering::Equal => Err(paro_error::data_corrupted(format!(
+                        "search definition {} has conflicting metadata for generation {} root {}",
+                        head.definition_id, head.generation_id, head.root_version
+                    ))),
+                    std::cmp::Ordering::Greater => {
+                        if current.generation_id == head.generation_id
+                            && current.config_fingerprint != head.config_fingerprint
+                        {
+                            return Err(paro_error::data_corrupted(format!(
+                                "search definition {} changed config fingerprint within generation {}",
+                                head.definition_id, head.generation_id
+                            )));
+                        }
+                        self.search_generation_heads[index] = head;
+                        Ok(true)
+                    }
+                }
+            }
+            Err(index) => {
+                self.search_generation_heads.insert(index, head);
+                Ok(true)
+            }
+        }
+    }
+
+    /// Restore an in-memory value after persistence fails while the tablet
+    /// meta lock is still held. Publication code must use
+    /// `advance_search_generation_head` for every forward transition.
+    pub(crate) fn restore_search_generation_head(
+        &mut self,
+        definition_id: u64,
+        previous: Option<SearchGenerationHeadMeta>,
+    ) {
+        self.remove_search_generation_head(definition_id);
+        if let Some(previous) = previous {
+            match self
+                .search_generation_heads
+                .binary_search_by_key(&previous.definition_id, |head| head.definition_id)
+            {
+                Ok(index) => self.search_generation_heads[index] = previous,
+                Err(index) => self.search_generation_heads.insert(index, previous),
+            }
         }
     }
 
@@ -1180,6 +1241,30 @@ mod tests {
             }]
         );
         assert!(restored.schema().is_some());
+    }
+
+    #[test]
+    fn search_generation_head_advance_is_monotonic_and_contract_safe() {
+        let schema = create_test_schema();
+        let mut meta = TabletMeta::new(1, 100, 1000, schema, "/data").unwrap();
+        let head = |generation_id, root_version, config_fingerprint| SearchGenerationHeadMeta {
+            definition_id: 42,
+            generation_id,
+            root_version,
+            config_fingerprint,
+            root_file_name: format!("manifest_root_g{generation_id}_v{root_version}.json"),
+        };
+
+        assert!(meta.advance_search_generation_head(head(1, 1, 99)).unwrap());
+        assert!(meta.advance_search_generation_head(head(1, 2, 99)).unwrap());
+        assert!(!meta.advance_search_generation_head(head(1, 1, 99)).unwrap());
+        assert_eq!(meta.search_generation_heads()[0], head(1, 2, 99));
+        assert!(meta
+            .advance_search_generation_head(head(1, 3, 100))
+            .is_err());
+        assert!(meta
+            .advance_search_generation_head(head(2, 1, 100))
+            .unwrap());
     }
 
     #[test]

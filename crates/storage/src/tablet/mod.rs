@@ -73,6 +73,7 @@ pub use tablet_reader_params::{
     ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
 };
 pub use tablet_rowid_lookup::TabletRowIdReader;
+pub(crate) use tablet_runtime::SearchGenerationPublishGuard;
 pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
     CheckpointTabletSnapshot, PrimaryIndexUpdate, RetiredGcBarrier, RetiredPendingGcStatus,

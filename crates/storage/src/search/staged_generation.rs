@@ -9,8 +9,9 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use paro_common::ddl::DdlObjectKey;
 use paro_common::effect::{
-    ArtifactRef, SearchGenerationBuildArtifact, SearchGenerationHeadMeta, StagedArtifactDescriptor,
-    StorageCommitOp, TabletApplyOp, TabletMutation,
+    ArtifactRef, SearchGenerationBuildArtifact, SearchGenerationHeadMeta,
+    SearchGenerationPublication, StagedArtifactDescriptor, StorageCommitOp, TabletApplyOp,
+    TabletMutation,
 };
 use paro_common::error::{self as paro_error, Result};
 
@@ -210,7 +211,9 @@ impl StagedSearchGeneration {
 
     pub fn mutation(&self) -> TabletMutation {
         TabletMutation::PublishSearchGeneration {
-            staged_ref: self.staged_ref.clone(),
+            publication: SearchGenerationPublication::InstallStaged {
+                staged_ref: self.staged_ref.clone(),
+            },
             generation_ref: self.generation_ref.clone(),
             head: self.head.clone(),
         }

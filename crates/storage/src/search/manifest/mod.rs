@@ -11,6 +11,7 @@ use std::time::Instant;
 
 use crate::metrics::storage_metrics;
 use crate::tablet::SearchGenerationHeadMeta;
+use paro_common::effect::{ArtifactNamespace, ArtifactRef};
 use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 
@@ -262,6 +263,57 @@ impl ManifestStore {
 
     pub(crate) fn codec_label(&self) -> &'static str {
         self.codec_kind.metric_label()
+    }
+
+    /// Private workspace root for a transaction-owned generation build.
+    /// Keeping this layout next to the final generation layout prevents the
+    /// builder and replay validator from inventing parallel path contracts.
+    pub(crate) fn staged_generation_workspace(
+        &self,
+        txn_id: u64,
+        definition_id: u64,
+        generation_id: SearchGenerationId,
+    ) -> PathBuf {
+        self.table_data_dir
+            .join("_staged")
+            .join("search-generation")
+            .join(format!(
+                "txn-{txn_id}-def-{definition_id}-gen-{generation_id}"
+            ))
+    }
+
+    pub(crate) fn generation_ref(
+        &self,
+        definition_id: u64,
+        generation_id: SearchGenerationId,
+    ) -> Result<ArtifactRef> {
+        ArtifactRef::from_tablet_path(
+            &self.table_data_dir,
+            &self.generation_dir(definition_id, generation_id),
+        )
+    }
+
+    pub(crate) fn validate_staged_generation_ref(
+        &self,
+        staged_ref: &ArtifactRef,
+        head: &SearchGenerationHeadMeta,
+    ) -> Result<()> {
+        let suffix = [
+            "search_registry".to_string(),
+            "definitions".to_string(),
+            head.definition_id.to_string(),
+            "generations".to_string(),
+            format!("g{}", head.generation_id),
+        ];
+        if staged_ref.namespace != ArtifactNamespace::Staged
+            || staged_ref.locator.first().map(String::as_str) != Some("search-generation")
+            || !staged_ref.locator.ends_with(&suffix)
+        {
+            return Err(paro_error::invalid_input(
+                "search generation staging reference does not match its durable identity",
+            ));
+        }
+        Ok(())
     }
 
     /// Stable container for all immutable generations of one definition.
@@ -929,10 +981,7 @@ impl ManifestStore {
         }
 
         let mut root_for_replay = root.clone();
-        let old_state_path = root_for_replay
-            .materialized_state_file
-            .take()
-            .map(|file| definition_dir.join(file.file_name));
+        root_for_replay.materialized_state_file.take();
         let materialized = self.load_materialized_state(definition_id, &root_for_replay, false)?;
         root.root_version = root.root_version.saturating_add(1);
         let shard = ManifestShard {
@@ -942,12 +991,6 @@ impl ManifestStore {
         let shard_name =
             self.write_shard(definition_id, root.generation_id, root.root_version, &shard)?;
         let shard_path = definition_dir.join(&shard_name.file_name);
-        let old_delta_paths = root
-            .recent_delta_files
-            .iter()
-            .map(|file| definition_dir.join(&file.file_name))
-            .collect::<Vec<_>>();
-
         root.shard_files = vec![shard_name];
         root.recent_delta_files.clear();
         root.materialized_state_file = None;
@@ -956,10 +999,9 @@ impl ManifestStore {
             self.remove_paths(&[shard_path]);
             return Err(err);
         }
-        self.remove_paths(&old_delta_paths);
-        if let Some(path) = old_state_path {
-            self.remove_paths(&[path]);
-        }
+        // Old fragments remain reachable by the current durable head until
+        // the new root revision is WAL-published. Retirement is owned by the
+        // post-publication generation GC, never by manifest construction.
 
         if delta_count > DELTA_COUNT_HARD_LIMIT || delta_bytes > DELTA_BYTES_HARD_LIMIT {
             tracing::warn!(
@@ -1689,6 +1731,7 @@ mod tests {
         let mut root = sample_root(definition_id, vec![shard_ref], delta_refs);
         root.recompute_checksum().unwrap();
         store.write_root(definition_id, &root).unwrap();
+        let old_head = store.head_for_root(&root);
 
         store
             .maybe_compact_deltas(definition_id, &mut root)
@@ -1697,7 +1740,11 @@ mod tests {
         assert_eq!(root.recent_delta_files.len(), 0);
         assert_eq!(root.shard_files.len(), 1);
         assert_eq!(root.root_version, 2);
-        assert!(old_delta_paths.iter().all(|path| !path.exists()));
+        assert!(
+            old_delta_paths.iter().all(|path| path.exists()),
+            "manifest construction must not retire files still reachable by the durable head"
+        );
+        assert!(store.load_manifest_for_head(&old_head).unwrap().is_some());
 
         let loaded = store
             .load_manifest(definition_id)

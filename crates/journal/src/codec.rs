@@ -815,7 +815,10 @@ mod tests {
                         root_version,
                         config_fingerprint,
                     )| TabletMutation::PublishSearchGeneration {
-                        staged_ref,
+                        publication:
+                            paro_common::effect::SearchGenerationPublication::InstallStaged {
+                                staged_ref,
+                            },
                         generation_ref,
                         head: SearchGenerationHeadMeta {
                             definition_id,

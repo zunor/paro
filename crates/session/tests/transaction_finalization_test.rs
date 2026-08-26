@@ -14,6 +14,7 @@ use std::any::Any;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use exec_ok::exec_ok;
 use instance_persistent::create_persistent_instance;
@@ -103,6 +104,21 @@ fn query_i64_values(sink: &CollectingSink, col_idx: usize) -> Vec<i64> {
         }
     }
     out
+}
+
+async fn exec_error(session: &mut Session, sink: &mut CollectingSink, sql: &str) -> String {
+    sink.clear();
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        session.execute_simple_query(sql, sink),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("sql timed out: {sql}"));
+    assert!(
+        result.is_err() || sink.has_errors(),
+        "sql should fail: {sql}"
+    );
+    format!("{:?} {:?}", result.err(), sink.errors())
 }
 
 fn assert_txn_counts(
@@ -347,6 +363,69 @@ async fn ddl_commit_paths_write_wal_and_survive_restart() {
 
         let _ = std::fs::remove_dir_all(&base_dir);
     }
+}
+
+#[tokio::test]
+async fn create_vector_index_and_same_table_dml_are_rejected_in_both_orders() {
+    let base_dir = create_unique_test_dir("transaction_finalization", "vector_index_dml_order");
+    let instance = create_persistent_instance(&base_dir);
+    let mut session = Session::new(1, Arc::clone(&instance));
+    let mut sink = CollectingSink::new();
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE TABLE vector_index_dml_order (id INT, emb VECTOR(2))",
+    )
+    .await;
+
+    session
+        .begin_explicit_transaction()
+        .expect("explicit BEGIN should succeed");
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "CREATE VECTOR INDEX idx_vector_index_dml_order ON vector_index_dml_order (emb)",
+    )
+    .await;
+    let ddl_then_dml = exec_error(
+        &mut session,
+        &mut sink,
+        "INSERT INTO vector_index_dml_order VALUES (1, '[1,2]')",
+    )
+    .await;
+    assert!(ddl_then_dml.contains("pending DDL"), "{ddl_then_dml}");
+    session
+        .rollback_transaction()
+        .expect("rollback after rejected DML should release staged generation ownership");
+
+    session
+        .begin_explicit_transaction()
+        .expect("second explicit BEGIN should succeed");
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO vector_index_dml_order VALUES (2, '[2,3]')",
+    )
+    .await;
+    let dml_then_ddl = exec_error(
+        &mut session,
+        &mut sink,
+        "CREATE VECTOR INDEX idx_vector_index_dml_order_2 ON vector_index_dml_order (emb)",
+    )
+    .await;
+    assert!(dml_then_ddl.contains("after DML"), "{dml_then_ddl}");
+    session
+        .rollback_transaction()
+        .expect("rollback after rejected CREATE INDEX should succeed");
+
+    // Both failure paths must release table/layout ownership completely.
+    exec_ok(
+        &mut session,
+        &mut sink,
+        "INSERT INTO vector_index_dml_order VALUES (3, '[3,4]')",
+    )
+    .await;
+    let _ = std::fs::remove_dir_all(base_dir);
 }
 
 #[tokio::test]
