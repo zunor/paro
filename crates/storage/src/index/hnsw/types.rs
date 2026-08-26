@@ -22,29 +22,32 @@ pub const DEFAULT_HNSW_BUILD_SEED: u64 = 0x5041_524f_484e_5357;
 pub const DEFAULT_HNSW_M: u32 = 24;
 pub const DEFAULT_HNSW_EF_CONSTRUCT: u32 = 100;
 pub const DEFAULT_HNSW_EF_SEARCH: u32 = 100;
-pub const DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD: u32 = 10_000;
-/// Filtered searches below this query-wide visible cardinality are exact scans.
-/// The graph path has fixed traversal cost and loses connectivity as the
-/// matching subgraph becomes sparse; 20k 128-dimensional distances remain a
-/// cache-friendly SIMD workload and give deterministic recall.
-pub const DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD: u32 = 20_000;
 pub const DEFAULT_HNSW_PROPOSAL_WAVE_SIZE: u32 = 64;
 pub const DEFAULT_HNSW_WARMUP_POINT_COUNT: u32 = 4_096;
 pub const DEFAULT_HNSW_FILTER_BLOCK_ROWS: u32 = 20_000;
 pub const DEFAULT_HNSW_FILTER_M: u32 = 8;
 /// Deterministic deployment profile: one random graph score costs as much as
 /// this many scores over the sequential predicate-covering layout.
-pub const DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE: u32 = 24;
+pub const DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE: u32 = 14;
 /// Deterministic deployment profile for batched point-id gathers from base
 /// vector storage. It is independent from the covering-layout value so the two
 /// physical classes can be calibrated and pinned separately.
-pub const DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE: u32 = 24;
+pub const DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE: u32 = 1;
 /// Deterministic graph-work profile. HNSW level-0 neighborhoods overlap, so
-/// one unit of `ef` scores fewer unique points than the maximum degree. The
-/// runtime caps this value by the immutable generation's observed average
-/// degree; deployments may pin a measured value without process-local timing
-/// feedback changing plans.
+/// one unit of `ef` can score points across several expanded neighborhoods and
+/// is not bounded by one row's average or maximum degree. Revision 3 uses 24,
+/// measured as 24.7 at high `ef` on the reproducible 10M uniform-32d workload
+/// with M=16, M0=32 and ef_construct=100. Different graph contracts or hardware
+/// should publish an offline calibration instead of mutating process-local
+/// timing state.
 pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
+/// Revision of the built-in, reproducible distance-cost calibration. Changing
+/// a coefficient or the physical-work interpretation requires a new revision
+/// so persisted definitions describe the exact decision surface they use.
+/// Revision 3 calibrates covering/indexed-base work to 14/1, consumes the
+/// graph coefficient directly, and charges the eager-admission retry when the
+/// final deferred beam cannot be expected to hold Top-K headroom.
+pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 3;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// Version 10 applies `ef_construct` on every HNSW layer. Earlier builders
@@ -307,15 +310,6 @@ pub enum HnswSearchStrategy {
     AdaptiveFilteredGraph,
 }
 
-/// Query-wide execution decision derived from exact cardinalities. Segment
-/// boundaries and machine width are physical concerns and must not change
-/// whether the same logical candidate set is scanned exactly.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HnswQueryWideStrategy {
-    ExactScan,
-    SegmentAdaptive,
-}
-
 /// Executed HNSW path. This is runtime evidence, not the strategy estimated by
 /// the optimizer or printed by plain EXPLAIN.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -423,16 +417,39 @@ impl HnswSearchStrategy {
     }
 }
 
-/// Immutable relative costs used to lower a query-wide HNSW decision to one
-/// physical search partition.
+/// Immutable relative costs used to choose a path for one physical HNSW
+/// artifact.
 ///
 /// Timing history must not silently alter query plans: it makes replicas and
 /// EXPLAIN disagree, lets unrelated tables contaminate one another, and never
 /// forgets cold-start samples. A deployment may benchmark and pin all three
 /// values in the search definition; all readers of that definition then make
 /// the same decision until the policy is explicitly changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum HnswDistanceCostProfileSource {
+    /// Repository-owned calibration with stable, versioned coefficients.
+    BuiltIn { revision: u32 },
+    /// Explicit offline calibration. The identifier is supplied by the
+    /// deployment and ties the three coefficients to a reproducible report.
+    OfflineCalibration { calibration_id: u64 },
+}
+
+impl std::fmt::Display for HnswDistanceCostProfileSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuiltIn { revision } => write!(f, "built-in-v{revision}"),
+            Self::OfflineCalibration { calibration_id } => {
+                write!(f, "offline-calibration-{calibration_id}")
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HnswDistanceCostProfile {
+    pub source: HnswDistanceCostProfileSource,
     pub sequential_covering_scores_per_random_score: u32,
     pub indexed_base_scores_per_random_score: u32,
     pub graph_scored_points_per_ef: u32,
@@ -441,6 +458,9 @@ pub struct HnswDistanceCostProfile {
 impl Default for HnswDistanceCostProfile {
     fn default() -> Self {
         Self {
+            source: HnswDistanceCostProfileSource::BuiltIn {
+                revision: HNSW_BUILT_IN_DISTANCE_COST_REVISION,
+            },
             sequential_covering_scores_per_random_score:
                 DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
             indexed_base_scores_per_random_score: DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
@@ -490,109 +510,106 @@ impl HnswDistanceCostModel {
     pub fn graph_work(
         total_rows: u64,
         effective_ef: usize,
-        level0_degree: usize,
         cost_profile: HnswDistanceCostProfile,
     ) -> u64 {
         let navigation = total_rows.max(1).ilog2() as u64;
-        let unique_scores_per_ef = level0_degree
-            .max(1)
-            .min(cost_profile.graph_scored_points_per_ef.max(1) as usize);
         navigation.saturating_add(
-            (effective_ef.max(1) as u64).saturating_mul(unique_scores_per_ef as u64),
+            (effective_ef.max(1) as u64)
+                .saturating_mul(u64::from(cost_profile.graph_scored_points_per_ef.max(1))),
         )
     }
 
-    pub fn prefers_exact_scan(
-        candidate_rows: u64,
+    /// Expected graph passes implied by the executable algorithm, not a
+    /// selectivity threshold. Predicate search first tries exact admission
+    /// from the final unfiltered `ef` beam. If that beam cannot be expected to
+    /// hold Top-K plus the required headroom, execution necessarily retries
+    /// with eager admission/predicate topology. Charging both passes keeps the
+    /// exact-vs-graph crossover aligned with the implementation while leaving
+    /// correctness and the runtime adaptive decision independent of estimates.
+    pub fn graph_passes(
+        filter_kind: HnswFilterKind,
+        matching_rows: u64,
+        total_rows: u64,
+        top_k: usize,
+        effective_ef: usize,
+    ) -> u64 {
+        if filter_kind != HnswFilterKind::Predicate {
+            return 1;
+        }
+        let expected_deferred_admissions =
+            expected_deferred_admissions(matching_rows, total_rows, effective_ef.max(top_k));
+        if expected_deferred_admissions < required_filtered_admissions(top_k) {
+            2
+        } else {
+            1
+        }
+    }
+
+    pub fn graph_work_for_search(input: HnswSegmentSearchInput) -> u64 {
+        Self::graph_work(input.total_rows, input.effective_ef, input.cost_profile).saturating_mul(
+            Self::graph_passes(
+                input.filter_kind,
+                input.matching_rows,
+                input.total_rows,
+                input.top_k,
+                input.effective_ef,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    fn prefers_exact_scan(
         total_rows: u64,
         effective_ef: usize,
-        level0_degree: usize,
-        vector_dimension: usize,
-        granted_parallelism: usize,
         exact_scan_workload: HnswExactScanWorkload,
         cost_profile: HnswDistanceCostProfile,
     ) -> bool {
-        // The profile is measured for the complete physical executor, which
-        // already includes its admitted lane width. Dividing by CPU slots a
-        // second time would invent linear memory-bandwidth scaling and causes
-        // wide scans to win on high-core machines without evidence.
-        let _execution_shape = (vector_dimension, granted_parallelism);
-        debug_assert_eq!(
-            exact_scan_workload.total_rows(),
-            candidate_rows.min(total_rows)
-        );
         let exact_work = Self::exact_work(exact_scan_workload, cost_profile);
-        exact_work <= Self::graph_work(total_rows, effective_ef, level0_degree, cost_profile)
+        exact_work <= Self::graph_work(total_rows, effective_ef, cost_profile)
     }
 }
 
-/// Exact physical inputs needed to choose one segment execution path after
-/// the logical query-wide exact/graph decision has already been made.
+/// Exact physical inputs needed to choose one immutable artifact's execution
+/// path. No query-wide cardinality gate precedes this decision: the artifact's
+/// own covering/base work and graph degree are the complete cost boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSegmentSearchInput {
     pub filter_kind: HnswFilterKind,
     pub matching_rows: u64,
     pub total_rows: u64,
+    pub top_k: usize,
     pub effective_ef: usize,
-    pub level0_degree: usize,
-    pub vector_dimension: usize,
-    pub parallelism: usize,
     pub exact_scan_workload: HnswExactScanWorkload,
     pub cost_profile: HnswDistanceCostProfile,
 }
 
-impl HnswQueryWideStrategy {
-    /// Select exact scanning from the total logical candidate set. Thresholds
-    /// are logical cardinality crossovers measured for the complete query;
-    /// scaling them by CPU count would make replicas choose different paths.
-    pub fn choose(
-        filter_kind: HnswFilterKind,
-        matching_rows: u64,
-        total_rows: u64,
-        policy: HnswSearchPolicy,
-    ) -> Self {
-        let exact_capacity = match filter_kind {
-            HnswFilterKind::None => policy.plain_scan_threshold,
-            HnswFilterKind::Visibility | HnswFilterKind::Predicate => {
-                policy.filtered_plain_scan_threshold
-            }
-        } as u64;
-        if matching_rows.min(total_rows) <= exact_capacity {
+impl HnswSearchStrategy {
+    /// Choose from physical work owned by one immutable artifact. Cardinality
+    /// thresholds are deliberately absent: a fixed row threshold cannot stay
+    /// correct when `ef`, graph degree, covering availability, or hardware
+    /// calibration changes. The definition-pinned cost profile is the single
+    /// decision surface for both small exact scans and graph traversal.
+    pub fn choose(input: HnswSegmentSearchInput) -> Self {
+        // The physical cost contract charges a width-ef traversal at least ef
+        // random scores, while exact scoring of at most ef admitted rows does
+        // no more work under any valid profile. Keep that invariant explicit
+        // instead of relying on today's arithmetic to rediscover it.
+        if input.matching_rows <= input.effective_ef.max(input.top_k) as u64 {
+            return Self::ExactScan;
+        }
+        let exact_work =
+            HnswDistanceCostModel::exact_work(input.exact_scan_workload, input.cost_profile);
+        if exact_work <= HnswDistanceCostModel::graph_work_for_search(input) {
             Self::ExactScan
         } else {
-            Self::SegmentAdaptive
-        }
-    }
-
-    /// Lower the query-wide contract to one segment. When the whole query is
-    /// not an exact scan, locally tiny segments may still choose exact scoring;
-    /// doing so is exact and avoids wasting graph setup on a small tail.
-    pub fn for_segment(self, input: HnswSegmentSearchInput) -> HnswSearchStrategy {
-        match self {
-            Self::ExactScan => HnswSearchStrategy::ExactScan,
-            Self::SegmentAdaptive => {
-                if HnswDistanceCostModel::prefers_exact_scan(
-                    input.matching_rows,
-                    input.total_rows,
-                    input.effective_ef,
-                    input.level0_degree,
-                    input.vector_dimension,
-                    input.parallelism,
-                    input.exact_scan_workload,
-                    input.cost_profile,
-                ) {
-                    HnswSearchStrategy::ExactScan
-                } else {
-                    HnswSearchStrategy::graph_for_filter(input.filter_kind)
-                }
-            }
+            Self::graph_for_filter(input.filter_kind)
         }
     }
 }
 
-/// Shared filtered-search strategy decision used by runtime, costing, and
-/// EXPLAIN. Callers may use exact per-segment cardinalities or planning-time
-/// estimates, but the threshold and selectivity boundaries stay identical.
+/// Shared filtered-search strategy estimate used by costing and EXPLAIN.
+/// Runtime makes the exact-vs-graph choice from artifact-local physical work,
+/// then measures graph admissions before deciding whether to refine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HnswFilteredSearchStrategy {
     ExactScan,
@@ -606,12 +623,18 @@ pub enum HnswFilteredSearchStrategy {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswFilteredSearchDecision {
     pub strategy: HnswFilteredSearchStrategy,
+    /// Number of graph passes implied by the deferred-admission shape. This is
+    /// one for a likely hit and two when execution is expected to retry with
+    /// eager admission/topology.
+    pub expected_graph_passes: u64,
     /// Expected number of unique points scored by connected level-0 search.
     /// Runtime does not trust this estimate; it measures admissions directly.
     pub expected_scored_points: u64,
-    /// Expected predicate-matching points among all scored neighbors, not just
-    /// among the final `ef` beam.
-    pub expected_admitted_points: u64,
+    /// Expected predicate-matching points retained by the final unfiltered
+    /// `ef` beam. This is the admission population available to the cheap
+    /// deferred path; matches scored and discarded outside that beam cannot
+    /// prevent the eager retry.
+    pub expected_deferred_admitted_points: u64,
     /// Minimum expected matching beam population required before predicate
     /// refinement is considered redundant.
     pub required_admitted_points: u64,
@@ -626,38 +649,62 @@ pub fn required_filtered_admissions(top_k: usize) -> u64 {
         .min(u64::MAX as u128) as u64
 }
 
+fn expected_deferred_admissions(matching_rows: u64, total_rows: u64, effective_ef: usize) -> u64 {
+    if total_rows == 0 {
+        return 0;
+    }
+    ((matching_rows.min(total_rows) as u128 * effective_ef as u128) / total_rows as u128)
+        .min(u64::MAX as u128) as u64
+}
+
 /// Estimate the likely adaptive filtered-graph outcome for costing and
 /// EXPLAIN. Execution uses exact cardinalities only to choose exact scan versus
 /// adaptive graph; after graph navigation it decides from the observed number
-/// of admitted points. `avg_level0_degree` therefore cannot cause a correctness
-/// or latency cliff when filters correlate with vector geometry.
+/// of admitted points. The definition-pinned scored-points coefficient is
+/// used directly: average degree is not an upper bound on unique scores per
+/// beam slot, and mixing contract M0 with generation average degree made the
+/// same graph choose different paths depending on its physical envelope.
 pub fn estimate_filtered_search_strategy(
     matching_rows: u64,
     total_rows: u64,
     top_k: usize,
     effective_ef: usize,
-    avg_level0_degree: f32,
     policy: HnswSearchPolicy,
 ) -> HnswFilteredSearchDecision {
     let matching_rows = matching_rows.min(total_rows);
     let effective_ef = effective_ef.max(top_k).max(1);
-    let degree = if avg_level0_degree.is_finite() && avg_level0_degree > 0.0 {
-        avg_level0_degree.ceil() as u64
-    } else {
-        1
-    };
-    let expected_scored_points = (effective_ef as u64).saturating_mul(degree).min(total_rows);
-    let expected_admitted_points = if total_rows == 0 {
-        0
-    } else {
-        ((matching_rows as u128 * expected_scored_points as u128) / total_rows as u128)
-            .min(u64::MAX as u128) as u64
-    };
+    let expected_scored_points = (effective_ef as u64)
+        .saturating_mul(u64::from(
+            policy.distance_cost.graph_scored_points_per_ef.max(1),
+        ))
+        .min(total_rows);
+    let expected_deferred_admitted_points =
+        expected_deferred_admissions(matching_rows, total_rows, effective_ef);
     let required_admitted_points = required_filtered_admissions(top_k);
+    let expected_graph_passes = HnswDistanceCostModel::graph_passes(
+        HnswFilterKind::Predicate,
+        matching_rows,
+        total_rows,
+        top_k,
+        effective_ef,
+    );
 
-    let strategy = if matching_rows <= policy.filtered_plain_scan_threshold as u64 {
+    let search_input = HnswSegmentSearchInput {
+        filter_kind: HnswFilterKind::Predicate,
+        matching_rows,
+        total_rows,
+        top_k,
+        effective_ef,
+        exact_scan_workload: HnswExactScanWorkload::indexed_base(matching_rows),
+        cost_profile: policy.distance_cost,
+    };
+    let strategy = if HnswDistanceCostModel::exact_work(
+        search_input.exact_scan_workload,
+        search_input.cost_profile,
+    ) <= HnswDistanceCostModel::graph_work_for_search(search_input)
+    {
         HnswFilteredSearchStrategy::ExactScan
-    } else if expected_admitted_points >= required_admitted_points {
+    } else if expected_deferred_admitted_points >= required_admitted_points {
         // Connected navigation already expects enough exact-bitmap-admitted
         // candidates to fill Top-K with 50% headroom. Predicate-local
         // refinement would repeat graph work without adding a useful frontier.
@@ -668,8 +715,9 @@ pub fn estimate_filtered_search_strategy(
 
     HnswFilteredSearchDecision {
         strategy,
+        expected_graph_passes,
         expected_scored_points,
-        expected_admitted_points,
+        expected_deferred_admitted_points,
         required_admitted_points,
     }
 }
@@ -764,6 +812,27 @@ impl HnswFilterTopologyContract {
 
     pub fn is_enabled(&self) -> bool {
         self.column_count != 0
+    }
+
+    /// Fixed level-0 capacity of the physically merged predicate graph.
+    ///
+    /// Each configured column contributes at most `2 * m` predicate-local
+    /// links and `m` deterministic cross-block links. Keeping this derivation
+    /// on the durable contract prevents the writer and reader from inventing
+    /// parallel layout formulas.
+    pub fn merged_level0_stride(&self) -> paro_common::error::Result<usize> {
+        self.validate()?;
+        let m = usize::try_from(self.m).map_err(|_| {
+            paro_common::error::data_corrupted("HNSW filter-topology m exceeds usize")
+        })?;
+        let column_count = usize::try_from(self.column_count).map_err(|_| {
+            paro_common::error::data_corrupted("HNSW filter-topology column count exceeds usize")
+        })?;
+        m.checked_mul(3)
+            .and_then(|value| value.checked_mul(column_count))
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted("HNSW predicate level-0 stride exceeds usize")
+            })
     }
 
     pub fn validate(&self) -> paro_common::error::Result<()> {
@@ -863,8 +932,6 @@ impl HnswBuildContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSearchPolicy {
     pub ef_search: usize,
-    pub plain_scan_threshold: usize,
-    pub filtered_plain_scan_threshold: usize,
     pub distance_cost: HnswDistanceCostProfile,
 }
 
@@ -872,8 +939,6 @@ impl Default for HnswSearchPolicy {
     fn default() -> Self {
         Self {
             ef_search: DEFAULT_HNSW_EF_SEARCH as usize,
-            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
-            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
             distance_cost: HnswDistanceCostProfile::default(),
         }
     }
@@ -899,8 +964,6 @@ pub struct HnswConfig {
     /// Larger = more accurate search, more time to build.
     pub ef_construct: usize,
     pub ef: usize,
-    pub plain_scan_threshold: usize,
-    pub filtered_plain_scan_threshold: usize,
     /// Seed for the versioned deterministic construction RNG.
     pub build_seed: u64,
 }
@@ -913,8 +976,6 @@ impl Default for HnswConfig {
             m0: (DEFAULT_HNSW_M * 2) as usize,
             ef_construct: DEFAULT_HNSW_EF_CONSTRUCT as usize,
             ef: DEFAULT_HNSW_EF_SEARCH as usize,
-            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
-            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
         }
     }
@@ -929,22 +990,8 @@ impl HnswConfig {
             m0: m * 2,
             ef_construct,
             ef: ef_construct,
-            plain_scan_threshold: DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD as usize,
-            filtered_plain_scan_threshold: DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize,
             build_seed: DEFAULT_HNSW_BUILD_SEED,
         }
-    }
-
-    /// Create a config with custom plain_scan_threshold.
-    pub fn with_plain_scan_threshold(mut self, threshold: usize) -> Self {
-        self.plain_scan_threshold = threshold;
-        self
-    }
-
-    /// Create a config with custom filtered_plain_scan_threshold.
-    pub fn with_filtered_plain_scan_threshold(mut self, threshold: usize) -> Self {
-        self.filtered_plain_scan_threshold = threshold;
-        self
     }
 
     /// Create a config with custom ef.
@@ -986,9 +1033,10 @@ impl HnswConfig {
     pub const fn search_policy(self) -> HnswSearchPolicy {
         HnswSearchPolicy {
             ef_search: self.ef,
-            plain_scan_threshold: self.plain_scan_threshold,
-            filtered_plain_scan_threshold: self.filtered_plain_scan_threshold,
             distance_cost: HnswDistanceCostProfile {
+                source: HnswDistanceCostProfileSource::BuiltIn {
+                    revision: HNSW_BUILT_IN_DISTANCE_COST_REVISION,
+                },
                 sequential_covering_scores_per_random_score:
                     DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
                 indexed_base_scores_per_random_score:
@@ -1068,11 +1116,6 @@ mod tests {
         assert_eq!(config.m0, 48);
         assert_eq!(config.ef_construct, 100);
         assert_eq!(config.ef, 100);
-        assert_eq!(config.plain_scan_threshold, 10_000);
-        assert_eq!(
-            config.filtered_plain_scan_threshold,
-            DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize
-        );
     }
 
     #[test]
@@ -1082,11 +1125,6 @@ mod tests {
         assert_eq!(config.m0, 16);
         assert_eq!(config.ef_construct, 200);
         assert_eq!(config.ef, 200);
-        assert_eq!(config.plain_scan_threshold, 10_000);
-        assert_eq!(
-            config.filtered_plain_scan_threshold,
-            DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD as usize
-        );
     }
 
     #[test]
@@ -1103,31 +1141,23 @@ mod tests {
     }
 
     #[test]
-    fn filtered_strategy_estimate_uses_scored_neighbors_not_final_beam() {
+    fn filtered_strategy_estimate_models_the_deferred_beam_before_retry() {
         let policy = HnswSearchPolicy::default();
 
-        let exact = estimate_filtered_search_strategy(20_000, 1_000_000, 10, 160, 16.0, policy);
+        let exact = estimate_filtered_search_strategy(1_000, 1_000_000, 10, 160, policy);
         assert_eq!(exact.strategy, HnswFilteredSearchStrategy::ExactScan);
 
-        let masked = estimate_filtered_search_strategy(50_000, 1_000_000, 10, 160, 16.0, policy);
-        assert_eq!(masked.expected_scored_points, 2_560);
-        assert_eq!(masked.expected_admitted_points, 128);
-        assert_eq!(masked.required_admitted_points, 15);
-        assert_eq!(masked.strategy, HnswFilteredSearchStrategy::MaskedTopK);
+        let refined = estimate_filtered_search_strategy(50_000, 1_000_000, 10, 160, policy);
+        assert_eq!(refined.expected_scored_points, 3_840);
+        assert_eq!(refined.expected_deferred_admitted_points, 8);
+        assert_eq!(refined.required_admitted_points, 15);
+        assert_eq!(refined.expected_graph_passes, 2);
+        assert_eq!(refined.strategy, HnswFilteredSearchStrategy::RefinedTopK);
 
-        let no_degree = estimate_filtered_search_strategy(
-            50_000,
-            1_000_000,
-            10,
-            160,
-            0.0,
-            HnswSearchPolicy {
-                filtered_plain_scan_threshold: 0,
-                ..policy
-            },
-        );
-        assert_eq!(no_degree.expected_admitted_points, 8);
-        assert_eq!(no_degree.strategy, HnswFilteredSearchStrategy::RefinedTopK);
+        let masked = estimate_filtered_search_strategy(100_000, 1_000_000, 10, 160, policy);
+        assert_eq!(masked.expected_deferred_admitted_points, 16);
+        assert_eq!(masked.expected_graph_passes, 1);
+        assert_eq!(masked.strategy, HnswFilteredSearchStrategy::MaskedTopK);
     }
 
     #[test]
@@ -1135,47 +1165,37 @@ mod tests {
         let policy = HnswSearchPolicy::default();
         let matching_rows = 10_000;
         let total_rows = 1_000_000;
-        let policy = HnswSearchPolicy {
-            filtered_plain_scan_threshold: 0,
-            ..policy
-        };
+        let policy = HnswSearchPolicy { ..policy };
 
         assert_eq!(
-            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 100, 16.0, policy,)
-                .strategy,
-            HnswFilteredSearchStrategy::MaskedTopK
-        );
-        assert_eq!(
-            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 160, 16.0, policy,)
-                .strategy,
-            HnswFilteredSearchStrategy::MaskedTopK
-        );
-        assert_eq!(
-            estimate_filtered_search_strategy(matching_rows, total_rows, 20, 160, 16.0, policy,)
-                .strategy,
+            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 100, policy).strategy,
             HnswFilteredSearchStrategy::RefinedTopK
+        );
+        assert_eq!(
+            estimate_filtered_search_strategy(matching_rows, total_rows, 10, 160, policy).strategy,
+            HnswFilteredSearchStrategy::RefinedTopK
+        );
+        assert_eq!(
+            estimate_filtered_search_strategy(matching_rows, total_rows, 20, 160, policy).strategy,
+            HnswFilteredSearchStrategy::RefinedTopK
+        );
+        assert_eq!(
+            estimate_filtered_search_strategy(100_000, total_rows, 10, 160, policy).strategy,
+            HnswFilteredSearchStrategy::MaskedTopK
         );
     }
 
     #[test]
     fn segment_cost_compares_sequential_scoring_with_random_graph_work() {
         assert!(HnswDistanceCostModel::prefers_exact_scan(
-            20_000,
             2_000_000,
             128,
-            32,
-            32,
-            1,
-            HnswExactScanWorkload::indexed_base(20_000),
+            HnswExactScanWorkload::sequential(20_000),
             HnswDistanceCostProfile::default(),
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            120_000,
             169_600,
             128,
-            32,
-            32,
-            1,
             HnswExactScanWorkload::indexed_base(120_000),
             HnswDistanceCostProfile::default(),
         ));
@@ -1184,64 +1204,91 @@ mod tests {
                 HnswExactScanWorkload::indexed_base(100_000),
                 HnswDistanceCostProfile::default(),
             ),
-            4_167
+            100_000
         );
         assert_eq!(
-            HnswDistanceCostModel::graph_work(
-                10_000_000,
-                160,
-                32,
-                HnswDistanceCostProfile::default(),
-            ),
+            HnswDistanceCostModel::graph_work(10_000_000, 160, HnswDistanceCostProfile::default(),),
             3_863
         );
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            100_000,
             10_000_000,
             160,
-            32,
-            32,
-            8,
             HnswExactScanWorkload::indexed_base(100_000),
             HnswDistanceCostProfile::default(),
         ));
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            1_000_000,
             10_000_000,
             640,
-            32,
-            32,
-            8,
             HnswExactScanWorkload::indexed_base(1_000_000),
             HnswDistanceCostProfile::default(),
         ));
     }
 
     #[test]
-    fn graph_cost_caps_generation_degree_by_unique_scores_per_ef() {
+    fn predicate_cost_charges_the_deferred_beam_retry() {
+        let profile = HnswDistanceCostProfile::default();
+        let selective = HnswSegmentSearchInput {
+            filter_kind: HnswFilterKind::Predicate,
+            matching_rows: 100_000,
+            total_rows: 10_000_000,
+            top_k: 10,
+            effective_ef: 160,
+            exact_scan_workload: HnswExactScanWorkload::sequential(100_000),
+            cost_profile: profile,
+        };
+        assert_eq!(
+            HnswDistanceCostModel::graph_passes(
+                selective.filter_kind,
+                selective.matching_rows,
+                selective.total_rows,
+                selective.top_k,
+                selective.effective_ef,
+            ),
+            2
+        );
+        assert_eq!(
+            HnswSearchStrategy::choose(selective),
+            HnswSearchStrategy::ExactScan
+        );
+
+        let broad = HnswSegmentSearchInput {
+            matching_rows: 1_000_000,
+            exact_scan_workload: HnswExactScanWorkload::sequential(1_000_000),
+            ..selective
+        };
+        assert_eq!(
+            HnswDistanceCostModel::graph_passes(
+                broad.filter_kind,
+                broad.matching_rows,
+                broad.total_rows,
+                broad.top_k,
+                broad.effective_ef,
+            ),
+            1
+        );
+        assert_eq!(
+            HnswSearchStrategy::choose(broad),
+            HnswSearchStrategy::AdaptiveFilteredGraph
+        );
+    }
+
+    #[test]
+    fn graph_cost_uses_the_definition_pinned_unique_scores_per_ef() {
         let profile = HnswDistanceCostProfile::default();
         assert!(!HnswDistanceCostModel::prefers_exact_scan(
-            5_000_000,
             10_000_000,
             8_192,
-            29,
-            32,
-            10,
             HnswExactScanWorkload::sequential(5_000_000),
             profile,
         ));
         assert!(HnswDistanceCostModel::prefers_exact_scan(
-            1_000_000,
             10_000_000,
             8_192,
-            29,
-            32,
-            10,
             HnswExactScanWorkload::sequential(1_000_000),
             profile,
         ));
         assert_eq!(
-            HnswDistanceCostModel::graph_work(10_000_000, 8_192, 29, profile),
+            HnswDistanceCostModel::graph_work(10_000_000, 8_192, profile),
             196_631
         );
     }
@@ -1249,6 +1296,7 @@ mod tests {
     #[test]
     fn distance_cost_profile_is_explicit_and_physical_class_specific() {
         let profile = HnswDistanceCostProfile {
+            source: HnswDistanceCostProfileSource::OfflineCalibration { calibration_id: 7 },
             sequential_covering_scores_per_random_score: 32,
             indexed_base_scores_per_random_score: 8,
             graph_scored_points_per_ef: 24,
@@ -1277,63 +1325,28 @@ mod tests {
     }
 
     #[test]
-    fn query_wide_exact_strategy_is_independent_of_segment_shape() {
-        let policy = HnswSearchPolicy {
-            filtered_plain_scan_threshold: 20_000,
-            ..HnswSearchPolicy::default()
-        };
-        let query_strategy =
-            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 18_000, 10_000_000, policy);
-        assert_eq!(query_strategy, HnswQueryWideStrategy::ExactScan);
-
-        // The same logical 18k candidates remain exact regardless of how a
-        // compaction partitions those rows across immutable segments.
-        for (matching_rows, segment_rows) in
-            [(3_000, 2_000_000), (10_000, 7_000_000), (5_000, 1_000_000)]
-        {
-            assert_eq!(
-                query_strategy.for_segment(HnswSegmentSearchInput {
-                    filter_kind: HnswFilterKind::Predicate,
-                    matching_rows,
-                    total_rows: segment_rows,
-                    effective_ef: 100,
-                    level0_degree: 32,
-                    vector_dimension: 32,
-                    parallelism: 1,
-                    exact_scan_workload: HnswExactScanWorkload::indexed_base(matching_rows),
-                    cost_profile: policy.distance_cost,
-                },),
-                HnswSearchStrategy::ExactScan
-            );
-        }
-
-        let adaptive =
-            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 1_000_000, 10_000_000, policy);
-        assert_eq!(adaptive, HnswQueryWideStrategy::SegmentAdaptive);
+    fn artifact_strategy_uses_physical_scan_class_without_a_row_threshold() {
+        let policy = HnswSearchPolicy::default();
         assert_eq!(
-            adaptive.for_segment(HnswSegmentSearchInput {
+            HnswSearchStrategy::choose(HnswSegmentSearchInput {
                 filter_kind: HnswFilterKind::Predicate,
                 matching_rows: 10_000,
                 total_rows: 1_000_000,
+                top_k: 10,
                 effective_ef: 100,
-                level0_degree: 32,
-                vector_dimension: 32,
-                parallelism: 1,
-                exact_scan_workload: HnswExactScanWorkload::indexed_base(10_000),
+                exact_scan_workload: HnswExactScanWorkload::sequential(10_000),
                 cost_profile: policy.distance_cost,
             }),
             HnswSearchStrategy::ExactScan
         );
         assert_eq!(
-            adaptive.for_segment(HnswSegmentSearchInput {
+            HnswSearchStrategy::choose(HnswSegmentSearchInput {
                 filter_kind: HnswFilterKind::Predicate,
-                matching_rows: 100_000,
+                matching_rows: 10_000,
                 total_rows: 1_000_000,
+                top_k: 10,
                 effective_ef: 100,
-                level0_degree: 32,
-                vector_dimension: 32,
-                parallelism: 1,
-                exact_scan_workload: HnswExactScanWorkload::indexed_base(100_000),
+                exact_scan_workload: HnswExactScanWorkload::indexed_base(10_000),
                 cost_profile: policy.distance_cost,
             }),
             HnswSearchStrategy::AdaptiveFilteredGraph

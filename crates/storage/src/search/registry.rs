@@ -198,6 +198,13 @@ impl SearchIndexRegistry {
         *self.hnsw_task_scheduler.write().unwrap() = scheduler;
     }
 
+    pub(crate) fn bind_hnsw_integrity_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    ) -> Result<()> {
+        self.reader_runtime.bind_hnsw_integrity_scheduler(scheduler)
+    }
+
     pub(crate) fn reader_runtime(&self) -> Arc<SearchReaderRuntime> {
         Arc::clone(&self.reader_runtime)
     }
@@ -2815,13 +2822,7 @@ mod tests {
             m: m as u32,
             ef_construct: ef_construct as u32,
             ef_search: ef_construct as u32,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
-            sequential_covering_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 1,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

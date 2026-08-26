@@ -866,13 +866,7 @@ mod tests {
             m: 8,
             ef_construct: 64,
             ef_search: 64,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
-            sequential_covering_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

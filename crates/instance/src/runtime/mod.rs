@@ -9,6 +9,7 @@ use paro_external::runtime::host::{ExternalRuntimeHost, PythonRuntimeStatus};
 use paro_function::scalar::cast::CastFunctionSet;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool, PageCache};
+use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_transaction::{CommitDrainWakePool, CommitDrainWakePoolOptions};
 use std::sync::Arc;
 
@@ -32,6 +33,7 @@ pub struct InstanceRuntime {
     page_cache: Arc<PageCache>,
     buffer_manager: Arc<dyn BufferManager>,
     scheduler: Arc<TaskScheduler>,
+    hnsw_integrity_scheduler: Arc<HnswIntegrityScheduler>,
     memory_arbitrator: Arc<MemoryArbitrator>,
     system_reserve: Arc<SystemReserve>,
     connection_registry: Arc<ConnectionRegistry>,
@@ -72,11 +74,14 @@ impl InstanceRuntime {
             python_runtime,
         } = resources;
         let page_cache = Arc::new(PageCache::new(Arc::clone(&buffer_pool)));
+        let hnsw_integrity_scheduler =
+            Arc::new(HnswIntegrityScheduler::new(Arc::clone(&scheduler)));
         Self {
             buffer_pool,
             page_cache,
             buffer_manager,
             scheduler,
+            hnsw_integrity_scheduler,
             memory_arbitrator,
             system_reserve,
             connection_registry,
@@ -106,6 +111,10 @@ impl InstanceRuntime {
 
     pub fn scheduler(&self) -> &Arc<TaskScheduler> {
         &self.scheduler
+    }
+
+    pub fn hnsw_integrity_scheduler(&self) -> &Arc<HnswIntegrityScheduler> {
+        &self.hnsw_integrity_scheduler
     }
 
     pub fn memory_arbitrator(&self) -> &Arc<MemoryArbitrator> {
@@ -157,6 +166,7 @@ impl InstanceRuntime {
             buffer_pool: Arc::clone(&self.buffer_pool),
             buffer_manager: Arc::clone(&self.buffer_manager),
             scheduler: Arc::clone(&self.scheduler),
+            hnsw_integrity_scheduler: Arc::clone(&self.hnsw_integrity_scheduler),
             commit_drain_wake_pool: Arc::clone(&self.commit_drain_wake_pool),
             checkpoint,
             compaction,

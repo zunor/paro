@@ -7,7 +7,7 @@ previous artifacts. Recreate every HNSW/vector index from its
 The rebuild is required because the durable contract now:
 
 - stores only immutable graph-construction fields, separate from search policy;
-- uses the fixed-width, self-contained HNSW artifact envelope version 13. The
+- uses the fixed-width, self-contained HNSW artifact envelope version 14. The
   artifact owns its canonical dense-vector region as well as its graph,
   predicate covering layout, metric preprocessing and statistics, so one
   generation partition may cover several base segments without borrowing any
@@ -15,22 +15,35 @@ The rebuild is required because the durable contract now:
   contract; there is no JSON in the open path. An authenticated hierarchy of
   4 KiB payload checksums, 4 KiB checksum pages, and a compact root directory
   protects lazy random access;
-- uses the version-4 graph layout: every hot level-0 adjacency is one
-  sentinel-terminated fixed-stride link record, while sparse upper levels
-  remain delta-varint encoded. With the standard M0=32 contract the record is
+- uses the version-5 graph layout: every hot level-0 adjacency is one
+  sentinel-terminated, contract-sized fixed-stride link record, while sparse
+  upper levels remain delta-varint encoded. Observed degree can no longer
+  change the artifact width. With the standard M0=32 contract the record is
   exactly two cache lines, removing both the random CSR-offset read and the
   cache-line drift of a separate degree word without decoding at open;
 - uses search manifest v2 (`json-debug-v2` and `binary-v2`), where every
   artifact carries canonical, generation-owned multi-segment coverage and its
   deterministic local point-id mapping; old single-segment manifest images
   are rejected;
-- requires HNSW provider-config version 12 and build-contract version 10, which
+- requires HNSW provider-config version 14 and build-contract version 10, which
   select deterministic frozen-wave construction, keyed Feistel point ordering,
   barrier publication, exact predicate-local covering runs, and the full
   configured construction beam on every graph layer. Exact/graph costing is
   definition-pinned for sequential covering scores, indexed gathers, and
-  unique graph scores per `ef`; runtime caps the graph coefficient by the
-  immutable generation's observed average level-0 degree;
+  unique graph scores per `ef`. The three coefficients form one atomic profile
+  with either a built-in revision or a non-zero offline-calibration id; partial
+  and unlabeled overrides are rejected. The graph coefficient is consumed
+  directly: average level-0 degree is descriptive rather than an upper bound
+  on the number of unique scores produced per beam slot. Built-in
+  distance-cost revision 3 also charges the eager-admission retry when a
+  predicate is not expected to populate the final unfiltered `ef` beam with
+  Top-K headroom; all costing inputs therefore describe executable physical
+  work rather than a cardinality cutoff. The former
+  `plain_scan_threshold` and `filtered_plain_scan_threshold` options have been
+  removed: fixed row cutoffs cannot remain valid across `ef`, graph degree,
+  covering availability, and calibrated hardware costs. Every immutable
+  artifact now compares its actual mixed covering/base exact work directly
+  with graph work;
 - carries the complete provider configuration in CREATE INDEX WAL records, so
   recovery restores the same physical contract instead of reconstructing
   defaults. WAL images written before this field was added are intentionally
@@ -45,6 +58,12 @@ The rebuild is required because the durable contract now:
   HNSW readers validate only metadata at open and authenticate graph chunks
   immediately before first use, rather than faulting the complete artifact for
   a monolithic page/package checksum.
+
+Loaded artifact checksum sweeps run as bounded, low-priority tasks on the
+instance scheduler. They retain only weak generation references, authenticate
+at most 1 MiB before yielding, and expose completion/failure/stale/deferred
+counters. No process-global integrity thread or ungoverned artifact-retention
+queue remains.
 
 Frozen-wave boundaries are durable implementation details rather than SQL
 tuning policy. `proposal_wave_size` and `warmup_point_count` are therefore no
@@ -61,8 +80,10 @@ path on the upgraded binary. `CREATE VECTOR INDEX` now materializes every
 visible segment through the governed maintenance path before the catalog entry
 can become `READY`; an admitted build that makes no coverage progress fails
 explicitly instead of publishing a permanently incomplete index.
-Current-format checksum or structural corruption is still a hard error when
-that search capability is used.
+Current-format checksum or structural corruption fails the operation that
+observes it in the foreground. The rebuildable secondary artifact is then
+quarantined; subsequent searches retain table availability and use exact base
+vectors while integrity failure telemetry identifies the required rebuild.
 
 Paro does not infer missing fields, translate the previous graph format, or
 silently rebuild an index during a foreground query.

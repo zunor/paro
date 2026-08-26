@@ -3,7 +3,10 @@
 
 //! Persistent HNSW adjacency storage.
 //!
-//! Version 4 stores each hot level-0 adjacency as one fixed-stride link record.
+//! Version 5 stores each hot level-0 adjacency as one contract-sized fixed-
+//! stride link record. The writer receives the durable capacity instead of
+//! deriving it from observed data, so one anomalous degree cannot silently
+//! widen every point and the artifact remains self-describing.
 //! Unused slots contain `u32::MAX`, which cannot be a valid point id. For the
 //! standard M0=32 contract a record is exactly 128 bytes: two aligned cache
 //! lines instead of version 3's 132-byte degree-plus-links record that drifted
@@ -22,7 +25,7 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 const GRAPH_LINKS_MAGIC: u32 = u32::from_le_bytes(*b"HGLK");
-const GRAPH_LINKS_VERSION_SENTINEL_LEVEL0_V4: u32 = 4;
+const GRAPH_LINKS_VERSION_CONTRACT_STRIDE_V5: u32 = 5;
 const GRAPH_LINKS_HEADER_LEN: usize = 64;
 const U64_BYTES: usize = std::mem::size_of::<u64>();
 const POINT_BYTES: usize = std::mem::size_of::<PointOffset>();
@@ -59,7 +62,6 @@ pub struct GraphLinks {
     point_count: usize,
     level0_link_count: usize,
     level0_records_offset: usize,
-    level0_record_words: usize,
     level0_stride: usize,
     upper_offsets_offset: usize,
     upper_payload_offset: usize,
@@ -168,7 +170,7 @@ impl NativeLevel0View {
         {
             let records_len = layout
                 .point_count
-                .checked_mul(layout.level0_record_words)?
+                .checked_mul(layout.level0_stride)?
                 .checked_mul(POINT_BYTES)?;
             let records_end = layout.level0_records_offset.checked_add(records_len)?;
             let records = bytemuck::try_cast_slice::<u8, u32>(
@@ -197,7 +199,8 @@ impl NativeLevel0View {
 
 impl Default for GraphLinks {
     fn default() -> Self {
-        Self::new_from_edges(Vec::new())
+        Self::try_new_from_edges(Vec::new(), 0)
+            .expect("empty GraphLinks must satisfy the zero-stride contract")
     }
 }
 
@@ -215,7 +218,6 @@ struct ParsedLayout {
     point_count: usize,
     level0_link_count: usize,
     level0_records_offset: usize,
-    level0_record_words: usize,
     level0_stride: usize,
     upper_offsets_offset: usize,
     upper_payload_offset: usize,
@@ -231,7 +233,7 @@ impl GraphLinks {
         if point >= self.point_count {
             return;
         }
-        let Some(record_word) = point.checked_mul(self.level0_record_words) else {
+        let Some(record_word) = point.checked_mul(self.level0_stride) else {
             return;
         };
         let Some(record_byte) = record_word
@@ -240,7 +242,7 @@ impl GraphLinks {
         else {
             return;
         };
-        let record_bytes = self.level0_record_words.saturating_mul(POINT_BYTES);
+        let record_bytes = self.level0_stride.saturating_mul(POINT_BYTES);
         let Some(bytes) = self
             .data
             .as_bytes()
@@ -251,11 +253,28 @@ impl GraphLinks {
         paro_common::prefetch::read_l1(bytes);
     }
 
-    pub fn new_from_edges(edges: Vec<Vec<Vec<PointOffset>>>) -> Self {
-        let serialized = Self::encode_edges(edges);
+    pub fn try_new_from_edges(
+        edges: Vec<Vec<Vec<PointOffset>>>,
+        level0_stride: usize,
+    ) -> Result<Self> {
+        let serialized = Self::encode_edges(edges, level0_stride)?;
         let layout = Self::parse_layout(&serialized, None)
             .expect("newly encoded GraphLinks layout must be valid");
-        Self::from_data(GraphLinksData::Ram(serialized), layout, None)
+        Ok(Self::from_data(
+            GraphLinksData::Ram(serialized),
+            layout,
+            None,
+        ))
+    }
+
+    #[cfg(test)]
+    pub fn new_from_edges(edges: Vec<Vec<Vec<PointOffset>>>) -> Self {
+        let stride = edges
+            .iter()
+            .map(|levels| levels.first().map_or(0, Vec::len))
+            .max()
+            .unwrap_or(0);
+        Self::try_new_from_edges(edges, stride).expect("test GraphLinks edges must be valid")
     }
 
     fn from_data(
@@ -272,7 +291,6 @@ impl GraphLinks {
             point_count: layout.point_count,
             level0_link_count: layout.level0_link_count,
             level0_records_offset: layout.level0_records_offset,
-            level0_record_words: layout.level0_record_words,
             level0_stride: layout.level0_stride,
             upper_offsets_offset: layout.upper_offsets_offset,
             upper_payload_offset: layout.upper_payload_offset,
@@ -280,23 +298,40 @@ impl GraphLinks {
         }
     }
 
-    fn encode_edges(mut edges: Vec<Vec<Vec<PointOffset>>>) -> Vec<u8> {
+    fn encode_edges(
+        mut edges: Vec<Vec<Vec<PointOffset>>>,
+        level0_stride: usize,
+    ) -> Result<Vec<u8>> {
         let point_count = edges.len();
         let mut upper_offsets = Vec::with_capacity(point_count.saturating_add(1));
         let mut upper_payload = Vec::new();
         upper_offsets.push(0u64);
         let mut level0_link_count = 0usize;
-        let mut level0_stride = 0usize;
 
-        for point_edges in &mut edges {
+        for (point, point_edges) in edges.iter_mut().enumerate() {
             for links in point_edges.iter_mut() {
                 links.sort_unstable();
+                if links.windows(2).any(|pair| pair[0] == pair[1]) {
+                    return Err(paro_error::internal(format!(
+                        "GraphLinks build input contains duplicate neighbors for point {point}"
+                    )));
+                }
+                if let Some(&target) = links.iter().find(|&&target| target as usize >= point_count)
+                {
+                    return Err(paro_error::internal(format!(
+                        "GraphLinks build input target {target} exceeds point count {point_count}"
+                    )));
+                }
             }
             let level0_degree = point_edges.first().map_or(0, Vec::len);
+            if level0_degree > level0_stride {
+                return Err(paro_error::internal(format!(
+                    "GraphLinks level-0 degree {level0_degree} for point {point} exceeds contract stride {level0_stride}"
+                )));
+            }
             level0_link_count = level0_link_count
                 .checked_add(level0_degree)
-                .expect("GraphLinks level-0 link count overflow");
-            level0_stride = level0_stride.max(level0_degree);
+                .ok_or_else(|| paro_error::out_of_range("GraphLinks level-0 link count"))?;
             let num_levels = point_edges.len();
             Self::encode_varint(num_levels as u64, &mut upper_payload);
             for links in point_edges.iter().skip(1) {
@@ -315,37 +350,41 @@ impl GraphLinks {
             upper_offsets.push(upper_payload.len() as u64);
         }
 
-        let level0_record_words = level0_stride;
         let level0_records_bytes = point_count
-            .checked_mul(level0_record_words)
+            .checked_mul(level0_stride)
             .and_then(|words| words.checked_mul(POINT_BYTES))
-            .expect("GraphLinks level-0 record size overflow");
+            .ok_or_else(|| paro_error::out_of_range("GraphLinks level-0 record size"))?;
         let records_end = GRAPH_LINKS_HEADER_LEN
             .checked_add(level0_records_bytes)
-            .expect("GraphLinks level-0 record offset overflow");
+            .ok_or_else(|| paro_error::out_of_range("GraphLinks level-0 record offset"))?;
         let upper_offsets_offset = records_end
             .checked_add(U64_BYTES - 1)
-            .expect("GraphLinks upper offset alignment overflow")
+            .ok_or_else(|| paro_error::out_of_range("GraphLinks upper offset alignment"))?
             & !(U64_BYTES - 1);
         let upper_offsets_bytes = upper_offsets
             .len()
             .checked_mul(U64_BYTES)
-            .expect("GraphLinks upper offset size overflow");
+            .ok_or_else(|| paro_error::out_of_range("GraphLinks upper offset size"))?;
         let serialized_len = upper_offsets_offset
             .checked_add(upper_offsets_bytes)
             .and_then(|len| len.checked_add(upper_payload.len()))
-            .expect("GraphLinks serialized size overflow");
+            .ok_or_else(|| paro_error::out_of_range("GraphLinks serialized size"))?;
 
-        let mut out = Vec::with_capacity(serialized_len);
+        let mut out = Vec::new();
+        out.try_reserve_exact(serialized_len).map_err(|_| {
+            paro_error::out_of_memory(format!(
+                "allocate {serialized_len} bytes for GraphLinks serialization"
+            ))
+        })?;
         out.extend_from_slice(&GRAPH_LINKS_MAGIC.to_le_bytes());
-        out.extend_from_slice(&GRAPH_LINKS_VERSION_SENTINEL_LEVEL0_V4.to_le_bytes());
+        out.extend_from_slice(&GRAPH_LINKS_VERSION_CONTRACT_STRIDE_V5.to_le_bytes());
         out.extend_from_slice(&(point_count as u64).to_le_bytes());
         out.extend_from_slice(&(level0_link_count as u64).to_le_bytes());
         out.extend_from_slice(&(upper_payload.len() as u64).to_le_bytes());
         out.extend_from_slice(&(serialized_len as u64).to_le_bytes());
         out.extend_from_slice(
             &u32::try_from(level0_stride)
-                .expect("GraphLinks level-0 stride exceeds u32")
+                .map_err(|_| paro_error::out_of_range("GraphLinks level-0 stride"))?
                 .to_le_bytes(),
         );
         out.extend_from_slice(&0u32.to_le_bytes());
@@ -368,7 +407,7 @@ impl GraphLinks {
         }
         out.extend_from_slice(&upper_payload);
         debug_assert_eq!(out.len(), serialized_len);
-        out
+        Ok(out)
     }
 
     #[inline]
@@ -446,7 +485,7 @@ impl GraphLinks {
             return Ok(());
         }
         let record_word = point
-            .checked_mul(self.level0_record_words)
+            .checked_mul(self.level0_stride)
             .ok_or_else(|| paro_error::data_corrupted("GraphLinks level-0 record overflow"))?;
         let record_byte = self
             .level0_records_offset
@@ -454,7 +493,7 @@ impl GraphLinks {
                 paro_error::data_corrupted("GraphLinks level-0 byte offset overflow")
             })?)
             .ok_or_else(|| paro_error::data_corrupted("GraphLinks level-0 record overflow"))?;
-        let record_bytes = self.level0_record_words.saturating_mul(POINT_BYTES);
+        let record_bytes = self.level0_stride.saturating_mul(POINT_BYTES);
         if let Some(integrity) = integrity {
             integrity.verify(record_byte, record_bytes)?;
         }
@@ -916,7 +955,7 @@ impl GraphLinks {
     fn parse_layout(bytes: &[u8], integrity: Option<&GraphIntegrityRange>) -> Result<ParsedLayout> {
         if bytes.len() < GRAPH_LINKS_HEADER_LEN {
             return Err(paro_error::data_corrupted(
-                "GraphLinks file too small for version-4 header",
+                "GraphLinks file too small for its fixed header",
             ));
         }
         if let Some(integrity) = integrity {
@@ -929,9 +968,9 @@ impl GraphLinks {
             ));
         }
         let version = Self::read_u32(bytes, 4, "version")?;
-        if version != GRAPH_LINKS_VERSION_SENTINEL_LEVEL0_V4 {
+        if version != GRAPH_LINKS_VERSION_CONTRACT_STRIDE_V5 {
             return Err(paro_error::data_corrupted(format!(
-                "unknown GraphLinks version: {version} (expected {GRAPH_LINKS_VERSION_SENTINEL_LEVEL0_V4})"
+                "unknown GraphLinks version: {version} (expected {GRAPH_LINKS_VERSION_CONTRACT_STRIDE_V5})"
             )));
         }
 
@@ -969,9 +1008,9 @@ impl GraphLinks {
         let offsets_bytes = offsets_count
             .checked_mul(U64_BYTES)
             .ok_or_else(|| paro_error::data_corrupted("GraphLinks offsets size overflow"))?;
-        if point_count == 0 && (level0_stride != 0 || level0_link_count != 0) {
+        if point_count == 0 && level0_link_count != 0 {
             return Err(paro_error::data_corrupted(
-                "empty GraphLinks cannot declare a level-0 stride or links",
+                "empty GraphLinks cannot declare level-0 links",
             ));
         }
         let level0_capacity = point_count
@@ -982,9 +1021,8 @@ impl GraphLinks {
                 "GraphLinks level-0 link count {level0_link_count} exceeds fixed-record capacity {level0_capacity}"
             )));
         }
-        let level0_record_words = level0_stride;
         let level0_records_bytes = point_count
-            .checked_mul(level0_record_words)
+            .checked_mul(level0_stride)
             .and_then(|words| words.checked_mul(POINT_BYTES))
             .ok_or_else(|| paro_error::data_corrupted("GraphLinks level-0 size overflow"))?;
         let level0_records_offset = GRAPH_LINKS_HEADER_LEN;
@@ -1057,7 +1095,6 @@ impl GraphLinks {
             point_count,
             level0_link_count,
             level0_records_offset,
-            level0_record_words,
             level0_stride,
             upper_offsets_offset,
             upper_payload_offset,
@@ -1256,6 +1293,24 @@ impl GraphLinks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn writer_uses_contract_stride_and_rejects_degree_overflow() {
+        let edges = vec![vec![vec![1]], vec![vec![0]]];
+        let links = GraphLinks::try_new_from_edges(edges.clone(), 4).unwrap();
+        assert_eq!(links.level0_stride(), 4);
+
+        let error = GraphLinks::try_new_from_edges(edges, 0).unwrap_err();
+        assert!(error.to_string().contains("exceeds contract stride 0"));
+    }
+
+    #[test]
+    fn writer_rejects_contract_stride_size_overflow() {
+        let error = GraphLinks::try_new_from_edges(vec![vec![Vec::new()]], usize::MAX)
+            .expect_err("an unrepresentable fixed-stride layout must be rejected");
+        assert!(error.to_string().contains("level-0 record size"));
+    }
+
     use crate::index::hnsw::artifact_integrity::{
         append_integrity_table, ArtifactIntegrity, ArtifactIntegrityBacking,
     };
@@ -1284,7 +1339,7 @@ mod tests {
     fn legacy_payload_is_rejected() {
         let bytes = 1u32.to_le_bytes();
         let error = GraphLinks::deserialize(bytes.as_slice()).unwrap_err();
-        assert!(error.to_string().contains("version-4 header"));
+        assert!(error.to_string().contains("fixed header"));
     }
 
     #[test]
@@ -1310,7 +1365,7 @@ mod tests {
         );
         assert_eq!(
             u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            GRAPH_LINKS_VERSION_SENTINEL_LEVEL0_V4
+            GRAPH_LINKS_VERSION_CONTRACT_STRIDE_V5
         );
         let layout = GraphLinks::parse_layout(&bytes, None).unwrap();
         assert_eq!(
@@ -1397,7 +1452,7 @@ mod tests {
         links.serialize(&mut bytes).unwrap();
         let layout = GraphLinks::parse_layout(&bytes, None).unwrap();
         let corrupt = (layout.point_count as u32).to_le_bytes();
-        let offset = layout.level0_records_offset + layout.level0_record_words * POINT_BYTES;
+        let offset = layout.level0_records_offset + layout.level0_stride * POINT_BYTES;
         bytes[offset..offset + POINT_BYTES].copy_from_slice(&corrupt);
 
         let restored = GraphLinks::deserialize(bytes.as_slice()).unwrap();
@@ -1464,7 +1519,7 @@ mod tests {
         let point = POINTS / 2;
         let corrupt_offset = ARTIFACT_HEADER
             + layout.level0_records_offset
-            + point * layout.level0_record_words * POINT_BYTES
+            + point * layout.level0_stride * POINT_BYTES
             + POINT_BYTES;
         artifact[corrupt_offset] ^= 1;
 
@@ -1501,7 +1556,7 @@ mod tests {
 
         let target = POINTS / 2;
         let target_offset =
-            layout.level0_records_offset + target * layout.level0_record_words * POINT_BYTES;
+            layout.level0_records_offset + target * layout.level0_stride * POINT_BYTES;
 
         let mut artifact = vec![0_u8; ARTIFACT_HEADER];
         artifact.extend_from_slice(&graph_bytes);
@@ -1542,7 +1597,7 @@ mod tests {
         let layout = GraphLinks::parse_layout(&graph_bytes, None).unwrap();
         let target = POINTS / 2;
         let target_offset =
-            layout.level0_records_offset + target * layout.level0_record_words * POINT_BYTES;
+            layout.level0_records_offset + target * layout.level0_stride * POINT_BYTES;
         graph_bytes[target_offset..target_offset + POINT_BYTES]
             .copy_from_slice(&(layout.point_count as u32).to_le_bytes());
 

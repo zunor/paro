@@ -12,15 +12,14 @@ use serde_json::Value;
 
 pub use crate::index::hnsw::types::{
     DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
-    DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
-    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
     DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
-    DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
-    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+    DEFAULT_HNSW_WARMUP_POINT_COUNT, HNSW_BUILT_IN_DISTANCE_COST_REVISION,
 };
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildContract, HnswDistanceCostProfile, HnswFilterTopologyContract,
-    HnswSearchPolicy, MAX_HNSW_FILTER_COLUMNS,
+    DistanceMetric, HnswBuildContract, HnswDistanceCostProfile, HnswDistanceCostProfileSource,
+    HnswFilterTopologyContract, HnswSearchPolicy, MAX_HNSW_FILTER_COLUMNS,
 };
 use paro_common::error::{self as paro_error, Result};
 
@@ -28,6 +27,13 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 14 removes cardinality thresholds from search policy. Exact versus
+/// graph selection is now derived exclusively from the definition-pinned
+/// physical cost profile, effective ef, executable graph-pass count, and
+/// exact-scan layout.
+/// Version 13 makes the distance-cost profile an atomic, provenance-bearing
+/// contract. Custom coefficients require a non-zero offline calibration id;
+/// partial overrides and unlabeled tuning are rejected.
 /// Version 12 adds a definition-pinned unique graph-score/ef cost calibrated
 /// independently from maximum graph degree.
 /// Version 11 makes exact/graph cost ratios an explicit, reproducible search
@@ -37,7 +43,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 12;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,11 +65,7 @@ pub struct HnswProviderConfig {
     pub m: u32,
     pub ef_construct: u32,
     pub ef_search: u32,
-    pub plain_scan_threshold: u32,
-    pub filtered_plain_scan_threshold: u32,
-    pub sequential_covering_scores_per_random_score: u32,
-    pub indexed_base_scores_per_random_score: u32,
-    pub graph_scored_points_per_ef: u32,
+    pub distance_cost: HnswDistanceCostProfile,
     pub build_seed: u64,
     pub proposal_wave_size: u32,
     pub warmup_point_count: u32,
@@ -132,21 +134,40 @@ impl HnswProviderConfig {
         for (name, ratio) in [
             (
                 "sequential_covering_scores_per_random_score",
-                self.sequential_covering_scores_per_random_score,
+                self.distance_cost
+                    .sequential_covering_scores_per_random_score,
             ),
             (
                 "indexed_base_scores_per_random_score",
-                self.indexed_base_scores_per_random_score,
+                self.distance_cost.indexed_base_scores_per_random_score,
             ),
             (
                 "graph_scored_points_per_ef",
-                self.graph_scored_points_per_ef,
+                self.distance_cost.graph_scored_points_per_ef,
             ),
         ] {
             if !(1..=1_024).contains(&ratio) {
                 return Err(paro_error::invalid_input(format!(
                     "HNSW {name} must be between 1 and 1024, got {ratio}"
                 )));
+            }
+        }
+        match self.distance_cost.source {
+            HnswDistanceCostProfileSource::BuiltIn { revision } => {
+                if revision != HNSW_BUILT_IN_DISTANCE_COST_REVISION
+                    || self.distance_cost != HnswDistanceCostProfile::default()
+                {
+                    return Err(paro_error::invalid_input(format!(
+                        "HNSW built-in distance-cost profile must exactly match revision {HNSW_BUILT_IN_DISTANCE_COST_REVISION}"
+                    )));
+                }
+            }
+            HnswDistanceCostProfileSource::OfflineCalibration { calibration_id } => {
+                if calibration_id == 0 {
+                    return Err(paro_error::invalid_input(
+                        "HNSW offline distance-cost calibration id must be non-zero",
+                    ));
+                }
             }
         }
         if self.filter_columns.len() > MAX_HNSW_FILTER_COLUMNS {
@@ -227,14 +248,7 @@ impl HnswProviderConfig {
     pub const fn search_policy(&self) -> HnswSearchPolicy {
         HnswSearchPolicy {
             ef_search: self.ef_search as usize,
-            plain_scan_threshold: self.plain_scan_threshold as usize,
-            filtered_plain_scan_threshold: self.filtered_plain_scan_threshold as usize,
-            distance_cost: HnswDistanceCostProfile {
-                sequential_covering_scores_per_random_score: self
-                    .sequential_covering_scores_per_random_score,
-                indexed_base_scores_per_random_score: self.indexed_base_scores_per_random_score,
-                graph_scored_points_per_ef: self.graph_scored_points_per_ef,
-            },
+            distance_cost: self.distance_cost,
         }
     }
 }
@@ -265,12 +279,7 @@ mod tests {
             m: 24,
             ef_construct: 100,
             ef_search: 100,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
-            sequential_covering_scores_per_random_score:
-                DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score: DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-            graph_scored_points_per_ef: DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            distance_cost: HnswDistanceCostProfile::default(),
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -317,13 +326,37 @@ mod tests {
         let base = valid_config();
         let mut tuned = base.clone();
         tuned.ef_search = 240;
-        tuned.plain_scan_threshold = 20_000;
-        tuned.filtered_plain_scan_threshold = 128;
-        tuned.graph_scored_points_per_ef = 20;
+        tuned.distance_cost = HnswDistanceCostProfile {
+            source: HnswDistanceCostProfileSource::OfflineCalibration { calibration_id: 1 },
+            graph_scored_points_per_ef: 20,
+            ..HnswDistanceCostProfile::default()
+        };
         tuned.validate().unwrap();
 
         assert_eq!(base.build_contract(), tuned.build_contract());
         assert_ne!(base.search_policy(), tuned.search_policy());
+    }
+
+    #[test]
+    fn distance_cost_provenance_cannot_mislabel_custom_coefficients() {
+        let mut mislabeled = valid_config();
+        mislabeled.distance_cost.graph_scored_points_per_ef = 20;
+        assert!(mislabeled
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must exactly match revision"));
+
+        let mut unidentified = valid_config();
+        unidentified.distance_cost = HnswDistanceCostProfile {
+            source: HnswDistanceCostProfileSource::OfflineCalibration { calibration_id: 0 },
+            ..HnswDistanceCostProfile::default()
+        };
+        assert!(unidentified
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be non-zero"));
     }
 
     #[test]

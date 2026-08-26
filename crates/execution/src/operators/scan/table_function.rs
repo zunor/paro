@@ -1840,6 +1840,14 @@ fn search_metric_value(
         "search_hnsw_predicate_topology_segment_searches_total" => {
             snapshot.search_hnsw_predicate_topology_segment_searches_total
         }
+        "search_hnsw_integrity_scheduled_total" => snapshot.search_hnsw_integrity_scheduled_total,
+        "search_hnsw_integrity_completed_total" => snapshot.search_hnsw_integrity_completed_total,
+        "search_hnsw_integrity_failed_total" => snapshot.search_hnsw_integrity_failed_total,
+        "search_hnsw_integrity_stale_total" => snapshot.search_hnsw_integrity_stale_total,
+        "search_hnsw_integrity_deferred_total" => snapshot.search_hnsw_integrity_deferred_total,
+        "search_hnsw_integrity_verified_bytes_total" => {
+            snapshot.search_hnsw_integrity_verified_bytes_total
+        }
         "search_row_fetch_batches_total" => snapshot.search_row_fetch_batches_total,
         "search_row_fetch_rows_total" => snapshot.search_row_fetch_rows_total,
         "search_row_fetch_projected_columns_total" => {

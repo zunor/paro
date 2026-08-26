@@ -19,6 +19,7 @@ use paro_common::logging::targets;
 use paro_journal::wal::wal_entry::WalHeaderMetadata;
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::{BufferManager, BufferPool};
+use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_transaction::CommitDrainWakePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -35,6 +36,7 @@ pub struct DatabaseOpenContext {
     pub buffer_pool: Arc<BufferPool>,
     pub buffer_manager: Arc<dyn BufferManager>,
     pub scheduler: Arc<TaskScheduler>,
+    pub hnsw_integrity_scheduler: Arc<HnswIntegrityScheduler>,
     pub commit_drain_wake_pool: Arc<CommitDrainWakePool>,
     pub checkpoint: CheckpointConfigOptions,
     pub compaction: CompactionConfigOptions,
@@ -254,6 +256,7 @@ impl DatabaseOpener {
             },
         ));
         db.bind_task_scheduler(context.scheduler.clone());
+        db.bind_hnsw_integrity_scheduler(Arc::clone(&context.hnsw_integrity_scheduler));
 
         Self::initialize_catalog(db.catalog().as_ref())?;
         tracing::debug!(

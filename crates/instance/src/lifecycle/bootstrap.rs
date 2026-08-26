@@ -44,6 +44,7 @@ impl Instance {
             Arc::clone(registry.object_id_allocator()),
         ));
         system_db.bind_task_scheduler(self.runtime.scheduler().clone());
+        system_db.bind_hnsw_integrity_scheduler(self.runtime.hnsw_integrity_scheduler().clone());
         system_db.initialize().map_err(|e| {
             paro_common::error::internal(format!("Failed to initialize system catalog: {e}"))
         })?;

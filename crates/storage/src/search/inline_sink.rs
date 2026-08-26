@@ -597,11 +597,14 @@ impl HnswInlineThreshold {
         vector_count: u64,
         dimension: u32,
         m: u32,
+        ef_construct: u32,
         build_width: usize,
     ) -> u64 {
-        let visited_lists = vector_count
-            .saturating_mul(build_width.max(1) as u64)
-            .saturating_mul(std::mem::size_of::<u8>() as u64);
+        let expected_visits =
+            u64::from(ef_construct).saturating_mul(u64::from(m).saturating_mul(2));
+        let visited_lists =
+            crate::index::hnsw::build_visited_workspace_bytes(vector_count, expected_visits)
+                .saturating_mul(build_width.max(1) as u64);
         let build_frontier = vector_count
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
@@ -627,15 +630,22 @@ impl HnswInlineThreshold {
             } else {
                 0
             };
-        Self::estimate_build_peak_memory_bytes(vector_count, dimension, contract.m, build_width)
-            .saturating_add(Self::estimate_filter_build_peak_memory_bytes(
-                vector_count,
-                dimension,
-                contract.filter_topology.columns().len(),
-                contract.filter_topology.m,
-                build_width,
-            ))
-            .saturating_add(metric_preprocessing_bytes)
+        Self::estimate_build_peak_memory_bytes(
+            vector_count,
+            dimension,
+            contract.m,
+            contract.ef_construct,
+            build_width,
+        )
+        .saturating_add(Self::estimate_filter_build_peak_memory_bytes(
+            vector_count,
+            dimension,
+            contract.filter_topology.columns().len(),
+            contract.filter_topology.m,
+            contract.ef_construct,
+            build_width,
+        ))
+        .saturating_add(metric_preprocessing_bytes)
     }
 
     fn estimate_filter_build_peak_memory_bytes(
@@ -643,6 +653,7 @@ impl HnswInlineThreshold {
         dimension: u32,
         filter_columns: usize,
         filter_m: u32,
+        ef_construct: u32,
         build_width: usize,
     ) -> u64 {
         if filter_columns == 0 {
@@ -670,9 +681,11 @@ impl HnswInlineThreshold {
         let graph_order_block_vectors = max_block_rows
             .saturating_mul(u64::from(dimension.max(1)))
             .saturating_mul(std::mem::size_of::<f32>() as u64);
-        let local_visited = max_block_rows
-            .saturating_mul(build_width.max(1) as u64)
-            .saturating_mul(std::mem::size_of::<u8>() as u64);
+        let expected_visits =
+            u64::from(ef_construct).saturating_mul(u64::from(filter_m).saturating_mul(2));
+        let local_visited =
+            crate::index::hnsw::build_visited_workspace_bytes(max_block_rows, expected_visits)
+                .saturating_mul(build_width.max(1) as u64);
         merged_containers
             .saturating_add(merged_links)
             .saturating_add(upper_level_containers)
@@ -862,8 +875,9 @@ mod tests {
         let points = 1_000;
         let graph = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
         let builder_graph = HnswInlineThreshold::estimate_builder_graph_memory_bytes(points, 16);
-        let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 1);
-        let width_32 = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 32);
+        let serial = HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 100, 1);
+        let width_32 =
+            HnswInlineThreshold::estimate_build_peak_memory_bytes(points, 128, 16, 100, 32);
 
         assert_eq!(
             width_32 - serial,
@@ -885,6 +899,7 @@ mod tests {
             points,
             32,
             16,
+            100,
             crate::index::hnsw::hnsw_build_thread_count(),
         );
         let estimate = HnswInlineBuildEstimate {
@@ -922,11 +937,15 @@ mod tests {
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
-                "plain_scan_threshold": 10_000,
-                "filtered_plain_scan_threshold": 0,
-                "sequential_covering_scores_per_random_score": crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-                "indexed_base_scores_per_random_score": crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-                "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+                "distance_cost": {
+                    "source": {
+                        "kind": "built_in",
+                        "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
+                    },
+                    "sequential_covering_scores_per_random_score": crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+                    "indexed_base_scores_per_random_score": crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                    "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
+                },
                 "build_seed": 1,
                 "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

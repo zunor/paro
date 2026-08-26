@@ -88,9 +88,8 @@ impl VectorScanCostModel {
 
     /// Estimate the provider-owned dense Top-K source, including its exact
     /// filtered fallback. A selective predicate does not force the generic
-    /// scan + row-fetch + Top-N plan: below the policy threshold the provider
-    /// scores only the exact predicate bitmap, which is both exact and avoids
-    /// materializing the vector column through the row pipeline.
+    /// scan + row-fetch + Top-N plan: the provider compares its physical exact
+    /// row-set workload with the graph passes implied by deferred admission.
     pub fn estimate_hnsw_cost(
         stats: &HnswIndexStatistics,
         k: usize,
@@ -107,11 +106,6 @@ impl VectorScanCostModel {
         } else {
             n
         };
-        let exact_threshold = if filtered {
-            policy.filtered_plain_scan_threshold
-        } else {
-            policy.plain_scan_threshold
-        } as f64;
         let log_n = n.ln().max(1.0);
         let effective_ef = policy.effective_ef(k, ef);
         let ef_val = effective_ef as f64;
@@ -140,11 +134,7 @@ impl VectorScanCostModel {
         // threshold.
         let sequential_scalar_scan_factor =
             sequential_vector_scan_factor / Self::REFERENCE_VECTOR_DIMENSION;
-        let scored_points_per_ef = stats
-            .avg_level0_degree
-            .max(1.0)
-            .min(policy.distance_cost.graph_scored_points_per_ef.max(1) as f32)
-            as f64;
+        let scored_points_per_ef = policy.distance_cost.graph_scored_points_per_ef.max(1) as f64;
         let scored_points = ef_val * scored_points_per_ef;
         let raw_graph_cost = (log_n + scored_points) * dim_factor;
         let graph_cost = raw_graph_cost;
@@ -174,34 +164,25 @@ impl VectorScanCostModel {
         };
         let exact_scan_cost = (candidate_rows * dim_factor * exact_scan_factor).max(1.0);
 
-        if candidate_rows <= exact_threshold {
-            return bitmap_cost + exact_scan_cost;
-        }
-
         if filtered {
-            return bitmap_cost
-                + match estimate_filtered_search_strategy(
-                    candidate_rows as u64,
-                    stats.num_indexed_vectors as u64,
-                    k,
-                    effective_ef,
-                    stats.avg_level0_degree,
-                    policy,
-                )
-                .strategy
-                {
-                    // The exact-cardinality branch above and the shared policy
-                    // use the same threshold, so this state is unreachable.
-                    HnswFilteredSearchStrategy::ExactScan => exact_scan_cost,
-                    HnswFilteredSearchStrategy::MaskedTopK => graph_cost,
-                    // Adaptive refinement reuses the connected traversal's scored
-                    // set and adds bounded two-hop work rather than a second full
-                    // graph generation.
-                    HnswFilteredSearchStrategy::RefinedTopK => graph_cost * 1.5,
-                };
+            let decision = estimate_filtered_search_strategy(
+                candidate_rows as u64,
+                stats.num_indexed_vectors as u64,
+                k,
+                effective_ef,
+                policy,
+            );
+            let search_cost = match decision.strategy {
+                HnswFilteredSearchStrategy::ExactScan => exact_scan_cost,
+                HnswFilteredSearchStrategy::MaskedTopK => graph_cost,
+                HnswFilteredSearchStrategy::RefinedTopK => {
+                    graph_cost * decision.expected_graph_passes as f64
+                }
+            };
+            return bitmap_cost + exact_scan_cost.min(search_cost);
         }
 
-        graph_cost
+        exact_scan_cost.min(graph_cost)
     }
 
     /// Sparse cost: O(|query_nnz| * avg_posting_len)
@@ -327,8 +308,6 @@ mod tests {
     fn selective_filtered_topk_costs_the_provider_exact_path() {
         let policy = HnswSearchPolicy {
             ef_search: 40,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 20_000,
             ..HnswSearchPolicy::default()
         };
         let cost = VectorScanCostModel::estimate_hnsw_cost(
@@ -351,8 +330,6 @@ mod tests {
     fn broad_filtered_graph_cost_includes_bitmap_materialization() {
         let policy = HnswSearchPolicy {
             ef_search: 40,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 20_000,
             ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
@@ -374,8 +351,6 @@ mod tests {
     fn column_scan_bitmap_cost_is_visible_to_the_optimizer() {
         let policy = HnswSearchPolicy {
             ef_search: 80,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 20_000,
             ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
@@ -395,15 +370,24 @@ mod tests {
             policy,
             Some(ExactFilterMaterialization::ColumnScan),
         );
-        assert!(scan > postings * 1.5, "scan={scan}, postings={postings}");
+        let expected_scan_delta = 1_000_000.0
+            / (f64::from(
+                policy
+                    .distance_cost
+                    .sequential_covering_scores_per_random_score,
+            ) * VectorScanCostModel::REFERENCE_VECTOR_DIMENSION)
+            - 1_000_000.0_f64.ln();
+        assert!(scan > postings, "scan={scan}, postings={postings}");
+        assert!(
+            ((scan - postings) - expected_scan_delta).abs() < 1e-9,
+            "scan={scan}, postings={postings}, expected_delta={expected_scan_delta}"
+        );
     }
 
     #[test]
     fn calibrated_exact_to_graph_crossover_is_non_decreasing() {
         let policy = HnswSearchPolicy {
             ef_search: 160,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 20_000,
             ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
@@ -427,11 +411,9 @@ mod tests {
     }
 
     #[test]
-    fn graph_cost_preserves_ef_and_degree_resolution_above_threshold() {
+    fn graph_cost_preserves_ef_resolution_without_a_cardinality_clamp() {
         let policy = HnswSearchPolicy {
             ef_search: 80,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 20_000,
             ..HnswSearchPolicy::default()
         };
         let low = VectorScanCostModel::estimate_hnsw_cost(

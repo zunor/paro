@@ -992,17 +992,17 @@ fn push_dense_search_filter_properties(
         .filter(|column| predicate_columns.contains(column))
         .map(|column| table_column_name(spec.table.as_ref(), column as usize))
         .collect::<Vec<_>>();
-    // Runtime prepares exact segment row sets, sums their logical cardinality,
-    // and makes one query-wide decision. EXPLAIN describes that contract
-    // rather than predicting a path from a plan-time estimate.
+    // Runtime prepares exact segment row sets and lowers every immutable
+    // artifact from its actual physical scan workload. EXPLAIN describes that
+    // contract rather than pretending a plan-time selectivity estimate fixes
+    // the executed path.
     let exact_scan = if accelerated_columns.is_empty() {
         "exact row-set distance scan"
     } else {
         "exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates"
     };
     let strategy = format!(
-        "query-wide runtime choice: {exact_scan} at <= {} total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback",
-        spec.search_policy.filtered_plain_scan_threshold
+        "runtime cost choice per immutable artifact: {exact_scan} is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback"
     );
     push_string_property(properties, "Filtered Strategy", strategy);
     if !accelerated_columns.is_empty() {
@@ -1047,7 +1047,7 @@ fn push_vector_search_properties(
         properties,
         "Exact/Graph Cost Profile",
         format!(
-            "covering={} sequential scores/random score, indexed-base={} gathered scores/random score, graph={} unique scores/ef (definition-pinned, capped by generation average level-0 degree={:.2})",
+            "covering={} sequential scores/random score, indexed-base={} gathered scores/random score, graph={} unique scores/ef (source={}, definition-pinned); observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
             spec.search_policy
                 .distance_cost
                 .sequential_covering_scores_per_random_score,
@@ -1055,6 +1055,7 @@ fn push_vector_search_properties(
                 .distance_cost
                 .indexed_base_scores_per_random_score,
             spec.search_policy.distance_cost.graph_scored_points_per_ef,
+            spec.search_policy.distance_cost.source,
             spec.avg_level0_degree,
         ),
     );

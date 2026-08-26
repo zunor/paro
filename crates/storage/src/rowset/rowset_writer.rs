@@ -2016,14 +2016,18 @@ mod tests {
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
-                "plain_scan_threshold": 10_000,
-                "filtered_plain_scan_threshold": 0,
-                "sequential_covering_scores_per_random_score":
-                    crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-                "indexed_base_scores_per_random_score":
-                    crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-                "graph_scored_points_per_ef":
-                    crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+                "distance_cost": {
+                    "source": {
+                        "kind": "built_in",
+                        "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
+                    },
+                    "sequential_covering_scores_per_random_score":
+                        crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+                    "indexed_base_scores_per_random_score":
+                        crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+                    "graph_scored_points_per_ef":
+                        crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF
+                },
                 "build_seed": 1,
                 "proposal_wave_size": crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                 "warmup_point_count": crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,

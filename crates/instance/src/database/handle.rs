@@ -32,6 +32,7 @@ use paro_journal::{
 use paro_scheduler::scheduler::TaskScheduler;
 use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
+use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_storage::meta::TabletMetaManager;
 use paro_storage::transaction::manager::TransactionManager;
 use paro_transaction::{
@@ -260,6 +261,7 @@ pub struct DatabaseHandle {
     buffer_pool: Arc<BufferPool>,
     storage_manager: RwLock<Option<Box<dyn StorageManager>>>,
     task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
+    hnsw_integrity_scheduler: RwLock<Option<Arc<HnswIntegrityScheduler>>>,
     compaction: CompactionDriver,
     checkpoint_coordinator: CheckpointCoordinator,
     checkpoint_trigger: CheckpointTriggerState,
@@ -337,6 +339,7 @@ impl DatabaseHandle {
             buffer_pool: buffer_pool.clone(),
             storage_manager: RwLock::new(None),
             task_scheduler: RwLock::new(None),
+            hnsw_integrity_scheduler: RwLock::new(None),
             compaction: CompactionDriver::new(
                 buffer_pool,
                 compaction.max_concurrency,
@@ -637,6 +640,11 @@ impl DatabaseHandle {
         self.compaction.bind_scheduler(scheduler);
         self.bind_tablet_runtime_services();
         self.ensure_checkpoint_background_runner();
+    }
+
+    pub fn bind_hnsw_integrity_scheduler(self: &Arc<Self>, scheduler: Arc<HnswIntegrityScheduler>) {
+        *self.hnsw_integrity_scheduler.write() = Some(scheduler);
+        self.bind_tablet_runtime_services();
     }
 
     /// Sync compaction tablet registry with the currently visible catalog tables.
@@ -1328,6 +1336,7 @@ impl DatabaseHandle {
         let journal = self.journal_coordinator();
         let apply_runtime = self.journal_apply_runtime();
         let task_scheduler = self.task_scheduler.read().clone();
+        let hnsw_integrity_scheduler = self.hnsw_integrity_scheduler.read().clone();
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1352,6 +1361,15 @@ impl DatabaseHandle {
                     storage.bind_journal_coordinator(Some(Arc::clone(&journal)));
                     storage.bind_journal_apply_runtime(Some(Arc::clone(&apply_runtime)));
                     storage.bind_search_task_scheduler(task_scheduler.clone());
+                    if let Err(error) =
+                        storage.bind_hnsw_integrity_scheduler(hnsw_integrity_scheduler.clone())
+                    {
+                        tracing::error!(
+                            target: targets::INSTANCE,
+                            error = %error,
+                            "failed to bind HNSW integrity scheduler"
+                        );
+                    }
                 }
             }
         }

@@ -294,7 +294,7 @@ impl HnswIndexRebuilder {
             )?;
         }
 
-        let (links, entry_points) = builder.into_graph_data();
+        let (links, entry_points) = builder.into_graph_data()?;
         let graph = GraphLayers::new(links, entry_points, (&build_contract).into());
         Ok(Some(HnswIndex::try_new(
             build_contract,

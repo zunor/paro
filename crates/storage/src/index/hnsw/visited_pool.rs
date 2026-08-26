@@ -471,48 +471,185 @@ impl VisitedPool {
     }
 }
 
-/// Construction/repair visited state uses a generation array instead of the
-/// compact query bitset. These workloads reset a workspace millions of times
-/// while keeping only a bounded build-pool width alive, so O(1) generation
-/// advances are more important than query-side resident size or eliminating a
-/// periodic sequential wrap reset.
+/// Construction/repair selects a visited representation from the immutable
+/// graph cardinality and expected beam work. A u8 generation array wins while
+/// its once-per-255-reset streaming clear is cheaper than clearing the random
+/// words touched by every beam. At larger graph domains the compact touched-
+/// word backend wins and avoids an O(N) build cliff.
 #[derive(Debug)]
 pub(crate) struct BuildVisitedPool {
     num_points: usize,
+    backend: BuildVisitedBackend,
     pool: Option<ArrayQueue<BuildVisitedList>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildVisitedBackend {
+    Generational,
+    TouchedWords,
+}
+
+impl BuildVisitedBackend {
+    fn choose(num_points: usize, expected_visits: usize) -> Self {
+        Self::choose_u64(num_points as u64, expected_visits as u64)
+    }
+
+    fn choose_u64(num_points: u64, expected_visits: u64) -> Self {
+        let amortized_generation_clear = num_points.div_ceil(u64::from(u8::MAX));
+        let random_word_clear_equivalent = expected_visits
+            .max(1)
+            .saturating_mul(std::mem::size_of::<u64>() as u64)
+            .saturating_mul(RANDOM_CLEAR_COST_RATIO as u64);
+        if amortized_generation_clear <= random_word_clear_equivalent {
+            Self::Generational
+        } else {
+            Self::TouchedWords
+        }
+    }
+}
+
+/// Resident bytes of one build visited workspace chosen by the same physical
+/// crossover used by `BuildVisitedPool`. Build admission must not assume the
+/// u8 backend after the runtime has selected compact touched words for a very
+/// large graph; doing so turns a deliberate scalability improvement into an
+/// avoidable admission cliff.
+pub(crate) fn build_visited_workspace_bytes(num_points: u64, expected_visits: u64) -> u64 {
+    match BuildVisitedBackend::choose_u64(num_points, expected_visits) {
+        BuildVisitedBackend::Generational => num_points,
+        BuildVisitedBackend::TouchedWords => num_points
+            .div_ceil(POINTS_PER_VISITED_WORD as u64)
+            .saturating_mul((std::mem::size_of::<u64>() + std::mem::size_of::<u32>()) as u64),
+    }
+}
+
 #[derive(Debug)]
-struct BuildVisitedList {
-    generations: Box<[u8]>,
-    current_generation: u8,
+enum BuildVisitedList {
+    Generational {
+        generations: Box<[u8]>,
+        current_generation: u8,
+    },
+    TouchedWords {
+        words: Box<[u64]>,
+        touched_words: Box<[u32]>,
+        touched_word_count: usize,
+    },
 }
 
 impl BuildVisitedList {
-    fn new(num_points: usize) -> Result<Self> {
-        let mut generations = Vec::new();
-        generations.try_reserve_exact(num_points).map_err(|_| {
-            paro_error::out_of_memory(format!(
-                "allocate HNSW build visited workspace for {num_points} points"
-            ))
-        })?;
-        generations.resize(num_points, 0);
-        Ok(Self {
-            generations: generations.into_boxed_slice(),
-            current_generation: 0,
-        })
+    fn new(num_points: usize, backend: BuildVisitedBackend) -> Result<Self> {
+        match backend {
+            BuildVisitedBackend::Generational => {
+                let mut generations = Vec::new();
+                generations.try_reserve_exact(num_points).map_err(|_| {
+                    paro_error::out_of_memory(format!(
+                        "allocate HNSW build visited workspace for {num_points} points"
+                    ))
+                })?;
+                generations.resize(num_points, 0);
+                Ok(Self::Generational {
+                    generations: generations.into_boxed_slice(),
+                    current_generation: 0,
+                })
+            }
+            BuildVisitedBackend::TouchedWords => {
+                let word_count = visited_word_count(num_points);
+                let mut words = Vec::new();
+                words.try_reserve_exact(word_count).map_err(|_| {
+                    paro_error::out_of_memory(format!(
+                        "allocate compact HNSW build visited workspace for {num_points} points"
+                    ))
+                })?;
+                words.resize(word_count, 0);
+                let mut touched_words = Vec::new();
+                touched_words.try_reserve_exact(word_count).map_err(|_| {
+                    paro_error::out_of_memory(format!(
+                        "allocate compact HNSW build reset directory for {num_points} points"
+                    ))
+                })?;
+                touched_words.resize(word_count, 0);
+                Ok(Self::TouchedWords {
+                    words: words.into_boxed_slice(),
+                    touched_words: touched_words.into_boxed_slice(),
+                    touched_word_count: 0,
+                })
+            }
+        }
     }
 
     fn advance_generation(&mut self) {
-        if self.current_generation == u8::MAX {
-            // Sequential clearing is deliberately a build-only tradeoff. At a
-            // bounded cadence it trades streaming writes for half the random
-            // generation-array footprint. Query workspaces use a different
-            // compact backend and never pay this reset in a foreground query.
-            self.generations.fill(0);
-            self.current_generation = 1;
-        } else {
-            self.current_generation += 1;
+        match self {
+            Self::Generational {
+                generations,
+                current_generation,
+            } => {
+                if *current_generation == u8::MAX {
+                    generations.fill(0);
+                    *current_generation = 1;
+                } else {
+                    *current_generation += 1;
+                }
+            }
+            Self::TouchedWords {
+                words,
+                touched_words,
+                touched_word_count,
+            } => {
+                if touched_word_count.saturating_mul(RANDOM_CLEAR_COST_RATIO) >= words.len() {
+                    words.fill(0);
+                } else {
+                    for &word in &touched_words[..*touched_word_count] {
+                        words[word as usize] = 0;
+                    }
+                }
+                *touched_word_count = 0;
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn check(&self, point: usize) -> bool {
+        match self {
+            Self::Generational {
+                generations,
+                current_generation,
+            } => generations[point] == *current_generation,
+            Self::TouchedWords { words, .. } => {
+                words[point / POINTS_PER_VISITED_WORD]
+                    & (1_u64 << (point % POINTS_PER_VISITED_WORD))
+                    != 0
+            }
+        }
+    }
+
+    #[inline(always)]
+    fn check_and_update(&mut self, point: usize) -> bool {
+        match self {
+            Self::Generational {
+                generations,
+                current_generation,
+            } => {
+                let was_visited = generations[point] == *current_generation;
+                generations[point] = *current_generation;
+                was_visited
+            }
+            Self::TouchedWords {
+                words,
+                touched_words,
+                touched_word_count,
+            } => {
+                let word_index = point / POINTS_PER_VISITED_WORD;
+                let mask = 1_u64 << (point % POINTS_PER_VISITED_WORD);
+                let value = words[word_index];
+                if value & mask != 0 {
+                    return true;
+                }
+                if value == 0 {
+                    touched_words[*touched_word_count] = word_index as u32;
+                    *touched_word_count += 1;
+                }
+                words[word_index] = value | mask;
+                false
+            }
         }
     }
 }
@@ -524,13 +661,18 @@ pub(crate) struct BuildVisitedListHandle<'a> {
 }
 
 impl BuildVisitedPool {
-    pub(crate) fn new(num_points: usize) -> Self {
-        Self::with_keep_limit(num_points, DEFAULT_POOL_KEEP_LIMIT)
+    pub(crate) fn new(num_points: usize, expected_visits: usize) -> Self {
+        Self::with_keep_limit(num_points, DEFAULT_POOL_KEEP_LIMIT, expected_visits)
     }
 
-    pub(crate) fn with_keep_limit(num_points: usize, keep_limit: usize) -> Self {
+    pub(crate) fn with_keep_limit(
+        num_points: usize,
+        keep_limit: usize,
+        expected_visits: usize,
+    ) -> Self {
         Self {
             num_points,
+            backend: BuildVisitedBackend::choose(num_points, expected_visits),
             pool: (keep_limit > 0).then(|| ArrayQueue::new(keep_limit)),
         }
     }
@@ -538,7 +680,7 @@ impl BuildVisitedPool {
     pub(crate) fn get(&self) -> Result<BuildVisitedListHandle<'_>> {
         let mut visited_list = match self.pool.as_ref().and_then(ArrayQueue::pop) {
             Some(visited_list) => visited_list,
-            None => BuildVisitedList::new(self.num_points)?,
+            None => BuildVisitedList::new(self.num_points, self.backend)?,
         };
         visited_list.advance_generation();
         Ok(BuildVisitedListHandle {
@@ -548,8 +690,11 @@ impl BuildVisitedPool {
     }
 
     #[cfg(test)]
-    const fn workspace_bytes(&self) -> usize {
-        self.num_points.saturating_mul(std::mem::size_of::<u8>())
+    fn workspace_bytes(&self) -> usize {
+        match self.backend {
+            BuildVisitedBackend::Generational => self.num_points,
+            BuildVisitedBackend::TouchedWords => visited_workspace_bytes(self.num_points),
+        }
     }
 
     fn return_back(&self, visited_list: BuildVisitedList) {
@@ -578,24 +723,20 @@ impl BuildVisitedListHandle<'_> {
     pub(crate) fn check(&self, point_id: PointOffset) -> bool {
         let point = point_id as usize;
         assert!(
-            point < self.list().generations.len(),
+            point < self.pool.num_points,
             "HNSW point id exceeds the fixed build visited workspace"
         );
-        self.list().generations[point] == self.list().current_generation
+        self.list().check(point)
     }
 
     #[inline(always)]
     pub(crate) fn check_and_update_visited(&mut self, point_id: PointOffset) -> bool {
         let point = point_id as usize;
-        let current_generation = self.list().current_generation;
         assert!(
-            point < self.list().generations.len(),
+            point < self.pool.num_points,
             "HNSW point id exceeds the fixed build visited workspace"
         );
-        let generation = &mut self.list_mut().generations[point];
-        let was_visited = *generation == current_generation;
-        *generation = current_generation;
-        was_visited
+        self.list_mut().check_and_update(point)
     }
 
     pub(crate) fn next_iteration(&mut self) {
@@ -806,7 +947,7 @@ mod tests {
 
     #[test]
     fn build_generation_workspace_reuses_without_per_iteration_clear() {
-        let pool = BuildVisitedPool::with_keep_limit(128, 1);
+        let pool = BuildVisitedPool::with_keep_limit(128, 1, 64);
         assert_eq!(pool.workspace_bytes(), 128 * std::mem::size_of::<u8>());
         {
             let mut visited = pool.get().unwrap();
@@ -822,12 +963,36 @@ mod tests {
 
     #[test]
     fn build_generation_wrap_performs_complete_reset() {
-        let mut visited = BuildVisitedList {
+        let mut visited = BuildVisitedList::Generational {
             generations: vec![u8::MAX, 7, u8::MAX].into_boxed_slice(),
             current_generation: u8::MAX,
         };
         visited.advance_generation();
-        assert_eq!(visited.current_generation, 1);
-        assert_eq!(&*visited.generations, &[0, 0, 0]);
+        let BuildVisitedList::Generational {
+            generations,
+            current_generation,
+        } = visited
+        else {
+            panic!("expected generational build workspace")
+        };
+        assert_eq!(current_generation, 1);
+        assert_eq!(&*generations, &[0, 0, 0]);
+    }
+
+    #[test]
+    fn build_backend_selection_accounts_for_graph_scale_and_beam_work() {
+        assert_eq!(
+            BuildVisitedBackend::choose(10_000_000, 3_200),
+            BuildVisitedBackend::Generational
+        );
+        assert_eq!(build_visited_workspace_bytes(10_000_000, 3_200), 10_000_000);
+        assert_eq!(
+            BuildVisitedBackend::choose(100_000_000, 3_200),
+            BuildVisitedBackend::TouchedWords
+        );
+        assert_eq!(
+            build_visited_workspace_bytes(100_000_000, 3_200),
+            100_000_000_u64.div_ceil(64) * 12
+        );
     }
 }

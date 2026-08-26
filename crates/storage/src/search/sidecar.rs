@@ -699,6 +699,7 @@ pub struct SearchReaderRuntime {
     decoded: ArcSwap<BTreeMap<DecodedSidecarArtifactKey, Arc<dyn Any + Send + Sync>>>,
     decoded_update: Mutex<()>,
     buffer_pool: OnceLock<Arc<crate::buffer::BufferPool>>,
+    hnsw_integrity_scheduler: OnceLock<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
 }
 
 impl std::fmt::Debug for SearchReaderRuntime {
@@ -718,6 +719,7 @@ impl SearchReaderRuntime {
             decoded: ArcSwap::from_pointee(BTreeMap::new()),
             decoded_update: Mutex::new(()),
             buffer_pool: OnceLock::new(),
+            hnsw_integrity_scheduler: OnceLock::new(),
         }
     }
 
@@ -756,6 +758,45 @@ impl SearchReaderRuntime {
 
     pub(crate) fn buffer_pool(&self) -> Option<Arc<crate::buffer::BufferPool>> {
         self.buffer_pool.get().cloned()
+    }
+
+    pub(crate) fn bind_hnsw_integrity_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    ) -> Result<()> {
+        let Some(scheduler) = scheduler else {
+            return Ok(());
+        };
+        if let Some(existing) = self.hnsw_integrity_scheduler.get() {
+            return if Arc::ptr_eq(existing, &scheduler) {
+                Ok(())
+            } else {
+                Err(paro_error::internal(
+                    "search reader runtime cannot move between HNSW integrity schedulers",
+                ))
+            };
+        }
+        if let Err(scheduler) = self.hnsw_integrity_scheduler.set(scheduler) {
+            if !self
+                .hnsw_integrity_scheduler
+                .get()
+                .is_some_and(|existing| Arc::ptr_eq(existing, &scheduler))
+            {
+                return Err(paro_error::internal(
+                    "concurrent HNSW integrity-scheduler binding",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn schedule_hnsw_integrity_verification(
+        &self,
+        index: &Arc<crate::index::hnsw::HnswIndex>,
+    ) {
+        if let Some(scheduler) = self.hnsw_integrity_scheduler.get() {
+            scheduler.schedule(index);
+        }
     }
 
     pub fn open_sidecar(

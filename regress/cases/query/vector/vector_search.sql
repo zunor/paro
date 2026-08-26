@@ -34,8 +34,10 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_construct = 32
     ef_search = 24
     build_seed = 7
-    plain_scan_threshold = 0
-    filtered_plain_scan_threshold = 8
+    sequential_covering_scores_per_random_score = 1
+    indexed_base_scores_per_random_score = 1
+    graph_scored_points_per_ef = 1
+    distance_cost_calibration_id = 1
     filter_columns = 'id,bucket'
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
@@ -56,19 +58,20 @@ EXPLAIN SELECT id FROM indexed_items
 WHERE bucket = 3
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
--- Keep SQL-level coverage for all adaptive stages. A singleton is an exact
--- bitmap scan, a nine-row range predicts two-hop refinement, and the bucket
--- predicate above predicts masked admission without refinement.
+-- Keep SQL-level coverage for all adaptive stages under an explicitly pinned
+-- test calibration. A singleton is an exact bitmap scan, the 10%-selective
+-- bucket predicts two-hop refinement, and a half-table range predicts masked
+-- admission without refinement.
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
 WHERE id = 1
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
-WHERE id <= 9
+WHERE id <= 1024
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 SELECT id FROM indexed_items
-WHERE id <= 9
+WHERE id <= 1024
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 
 -- A cosine operator must not consume an L2 artifact. Metric mismatch is a

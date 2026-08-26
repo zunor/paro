@@ -19,6 +19,7 @@ pub mod graph;
 pub mod graph_links;
 pub mod healer;
 pub mod hnsw_builder;
+mod integrity_scheduler;
 pub mod links_container;
 pub mod persistence;
 mod predicate_scan;
@@ -43,6 +44,7 @@ pub use graph_links::{GraphLinks, GraphLinksData};
 pub use healer::GraphLayersHealer;
 pub(crate) use hnsw_builder::hnsw_build_thread_count;
 pub use hnsw_builder::{configure_hnsw_build_threads, HnswBuildStopCheck, HnswBuilder};
+pub use integrity_scheduler::HnswIntegrityScheduler;
 pub use links_container::{ItemsBuffer, LinksContainer};
 pub(crate) use persistence::{hnsw_artifact_build_contract, HNSW_ARTIFACT_HEADER_LEN};
 pub use persistence::{
@@ -58,4 +60,5 @@ pub use vector_storage::{
     InMemoryVectorStorage, IndexedVectorStorage, MmapVectorStorage, SharedVectorStorage,
     VectorStorage,
 };
+pub(crate) use visited_pool::build_visited_workspace_bytes;
 pub use visited_pool::{VisitedListHandle, VisitedPool};

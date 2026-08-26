@@ -65,6 +65,14 @@ impl TableHandle {
         self.search_registry.bind_task_scheduler(scheduler);
     }
 
+    pub fn bind_hnsw_integrity_scheduler(
+        &self,
+        scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,
+    ) -> paro_common::error::Result<()> {
+        self.search_registry
+            .bind_hnsw_integrity_scheduler(scheduler)
+    }
+
     pub fn bound_compaction_manager(&self) -> Option<Arc<CompactionManager>> {
         self.compaction_manager
             .read()

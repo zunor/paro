@@ -1003,13 +1003,7 @@ mod tests {
             m: 4,
             ef_construct: 8,
             ef_search: 16,
-            plain_scan_threshold: 0,
-            filtered_plain_scan_threshold: 0,
-            sequential_covering_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 17,
             proposal_wave_size: 4,
             warmup_point_count: 4,
@@ -1102,8 +1096,6 @@ mod tests {
                 HnswSearchFilter::predicate(&admitted, &[0]),
                 &HnswSearchPolicy {
                     ef_search: 16,
-                    plain_scan_threshold: 0,
-                    filtered_plain_scan_threshold: 0,
                     ..HnswSearchPolicy::default()
                 },
                 HnswSearchStrategy::AdaptiveFilteredGraph,

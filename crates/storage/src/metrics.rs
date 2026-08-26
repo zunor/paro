@@ -421,6 +421,12 @@ pub struct StorageMetricsSnapshot {
     pub search_hnsw_predicate_topology_segment_searches_total: u64,
     pub search_hnsw_predicate_refined_segment_searches_total: u64,
     pub search_hnsw_exact_fallback_segment_searches_total: u64,
+    pub search_hnsw_integrity_scheduled_total: u64,
+    pub search_hnsw_integrity_completed_total: u64,
+    pub search_hnsw_integrity_failed_total: u64,
+    pub search_hnsw_integrity_stale_total: u64,
+    pub search_hnsw_integrity_deferred_total: u64,
+    pub search_hnsw_integrity_verified_bytes_total: u64,
     pub column_read_by_rowids_page_run_seeks_total: u64,
     pub txn_spill_bytes: u64,
     pub txn_spill_artifacts: u64,
@@ -534,6 +540,12 @@ pub struct StorageMetrics {
     search_hnsw_predicate_topology_segment_searches_total: AtomicU64,
     search_hnsw_predicate_refined_segment_searches_total: AtomicU64,
     search_hnsw_exact_fallback_segment_searches_total: AtomicU64,
+    search_hnsw_integrity_scheduled_total: AtomicU64,
+    search_hnsw_integrity_completed_total: AtomicU64,
+    search_hnsw_integrity_failed_total: AtomicU64,
+    search_hnsw_integrity_stale_total: AtomicU64,
+    search_hnsw_integrity_deferred_total: AtomicU64,
+    search_hnsw_integrity_verified_bytes_total: AtomicU64,
     column_read_by_rowids_page_run_seeks_total: AtomicU64,
     txn_spill_bytes: AtomicU64,
     txn_spill_artifacts: AtomicU64,
@@ -1237,6 +1249,36 @@ impl StorageMetrics {
         }
     }
 
+    pub fn record_hnsw_integrity_scheduled(&self) {
+        self.search_hnsw_integrity_scheduled_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_completed(&self) {
+        self.search_hnsw_integrity_completed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_failed(&self) {
+        self.search_hnsw_integrity_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_stale(&self) {
+        self.search_hnsw_integrity_stale_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_deferred(&self) {
+        self.search_hnsw_integrity_deferred_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn record_hnsw_integrity_verified_bytes(&self, bytes: u64) {
+        self.search_hnsw_integrity_verified_bytes_total
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
     /// Record page-local span seeks performed by the column-layer random rowid path.
     pub fn add_column_read_by_rowids_page_run_seeks(&self, delta: usize) {
         add_usize_counter(&self.column_read_by_rowids_page_run_seeks_total, delta);
@@ -1513,6 +1555,24 @@ impl StorageMetrics {
             search_hnsw_exact_fallback_segment_searches_total: self
                 .search_hnsw_exact_fallback_segment_searches_total
                 .load(Ordering::Relaxed),
+            search_hnsw_integrity_scheduled_total: self
+                .search_hnsw_integrity_scheduled_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_completed_total: self
+                .search_hnsw_integrity_completed_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_failed_total: self
+                .search_hnsw_integrity_failed_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_stale_total: self
+                .search_hnsw_integrity_stale_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_deferred_total: self
+                .search_hnsw_integrity_deferred_total
+                .load(Ordering::Relaxed),
+            search_hnsw_integrity_verified_bytes_total: self
+                .search_hnsw_integrity_verified_bytes_total
+                .load(Ordering::Relaxed),
             column_read_by_rowids_page_run_seeks_total: self
                 .column_read_by_rowids_page_run_seeks_total
                 .load(Ordering::Relaxed),
@@ -1663,6 +1723,18 @@ impl StorageMetrics {
         self.search_hnsw_predicate_refined_segment_searches_total
             .store(0, Ordering::Relaxed);
         self.search_hnsw_exact_fallback_segment_searches_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_scheduled_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_completed_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_failed_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_stale_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_deferred_total
+            .store(0, Ordering::Relaxed);
+        self.search_hnsw_integrity_verified_bytes_total
             .store(0, Ordering::Relaxed);
         self.column_read_by_rowids_page_run_seeks_total
             .store(0, Ordering::Relaxed);

@@ -117,17 +117,16 @@ impl CommitCompletionRegistry {
         handle: DurableCommitHandle,
         ack_policy: CommitAckPolicy,
     ) {
-        let slot = {
-            let mut state = self.state.lock();
-            let slot = state.slots.get(&completion.slot_id).cloned();
-            if slot.is_some() {
-                let commit_ts = handle.commit_ts().into_raw();
-                state.commit_to_slot.insert(commit_ts, completion.slot_id);
-                state.slot_to_commit.insert(completion.slot_id, commit_ts);
-            }
-            slot
-        };
+        let mut state = self.state.lock();
+        let slot = state.slots.get(&completion.slot_id).cloned();
         if let Some(slot) = slot {
+            let commit_ts = handle.commit_ts().into_raw();
+            state.commit_to_slot.insert(commit_ts, completion.slot_id);
+            state.slot_to_commit.insert(completion.slot_id, commit_ts);
+            // Publish the slot state before releasing the registry lock that
+            // makes commit_ts discoverable. mark_published takes the same lock
+            // to resolve a slot, so it can no longer observe a mapped Queued
+            // state and silently discard an early completion callback.
             slot.set(CommitCompletionState::Durable {
                 handle,
                 ack_policy,
@@ -172,6 +171,9 @@ impl CommitCompletionRegistry {
                     ack_policy,
                     publish_completed: true,
                 },
+                CommitCompletionState::Queued => {
+                    unreachable!("a published commit must not resolve to a queued completion slot")
+                }
                 current => current,
             });
         }

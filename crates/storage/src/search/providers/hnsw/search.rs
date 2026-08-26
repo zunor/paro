@@ -15,8 +15,8 @@ const MIN_PARALLEL_EXACT_VECTOR_BYTES: u64 = 2 * 1024 * 1024;
 use crate::index::hnsw::types::SearchParams;
 use crate::index::hnsw::{
     hnsw_artifact_compatibility, DistanceMetric, HnswArtifactCompatibility, HnswBuildContract,
-    HnswFilterKind, HnswIndex, HnswQueryWideStrategy, HnswSearchFilter, HnswSearchPolicy,
-    HnswSearchStrategy, HnswSegmentSearchInput, PreparedQuery,
+    HnswFilterKind, HnswIndex, HnswSearchFilter, HnswSearchPolicy, HnswSearchStrategy,
+    HnswSegmentSearchInput, PreparedQuery,
 };
 use crate::index::PredicateTree;
 use crate::index::{DenseRowSet, ExactRowSet, PartitionExactRowSet};
@@ -63,25 +63,6 @@ pub(crate) struct VectorSearchProvider {
 struct PreparedSegmentFilter {
     row_set: Option<Arc<dyn ExactRowSet>>,
     _reservation: Option<SearchMemoryReservation>,
-}
-
-fn generation_level0_degree(
-    generation_stats: &crate::search::GenerationStats,
-    fallback: usize,
-) -> Result<usize> {
-    generation_stats
-        .hnsw_provider_stats()
-        .filter(|stats| stats.vector_count != 0)
-        .map(|stats| {
-            usize::try_from(stats.level0_graph_links.div_ceil(stats.vector_count))
-                .map_err(|_| paro_error::out_of_range("HNSW average level-0 degree exceeds usize"))
-        })
-        .transpose()
-        .map(|degree| {
-            degree
-                .filter(|degree| *degree != 0)
-                .unwrap_or(fallback.max(1))
-        })
 }
 
 impl VectorSearchProvider {
@@ -148,10 +129,6 @@ impl VectorSearchProvider {
         let prepared_query = distance.prepare(&self.query);
         let expected_build_contract = provider_config.build_contract();
         let search_policy = provider_config.search_policy();
-        let level0_degree = generation_level0_degree(
-            &snapshot.generation.generation_stats,
-            expected_build_contract.m0 as usize,
-        )?;
         let reader_runtime = Arc::clone(&snapshot.reader_runtime);
         let cursor = VectorSearchCursor {
             reader_runtime,
@@ -162,7 +139,6 @@ impl VectorSearchProvider {
             k: self.k,
             storage_col_id: self.column_id as u32,
             vector_dim,
-            level0_degree,
             distance,
             expected_build_contract,
             search_policy,
@@ -207,11 +183,6 @@ struct VectorSearchCursor {
     k: usize,
     storage_col_id: u32,
     vector_dim: usize,
-    /// Average degree of the immutable generation topology, rounded up.
-    /// Runtime costing must not substitute the build contract's maximum M0:
-    /// doing so overstates unique graph scores and switches broad filters to
-    /// slower exact scans at high `ef`.
-    level0_degree: usize,
     distance: DistanceMetric,
     expected_build_contract: HnswBuildContract,
     search_policy: HnswSearchPolicy,
@@ -254,7 +225,6 @@ impl VectorSearchCursor {
         });
         let parallelism_slots = budget.parallelism_slots.max(1);
         let effective_ef = self.search_policy.effective_ef(self.k, self.params.ef);
-        let level0_degree = self.level0_degree;
 
         // Exact segment row sets are prepared once and retained at the query
         // boundary. Both singleton and generation-owned partition artifacts
@@ -287,23 +257,8 @@ impl VectorSearchCursor {
                 rows.saturating_add(filter.row_set.as_ref().map_or(0, |row_set| row_set.len()))
             })
         });
-        let query_wide_strategy = match predicate_matching_rows {
-            Some(matching_rows) => HnswQueryWideStrategy::choose(
-                HnswFilterKind::Predicate,
-                matching_rows,
-                total_rows,
-                self.search_policy,
-            ),
-            None => HnswQueryWideStrategy::choose(
-                HnswFilterKind::None,
-                total_rows,
-                total_rows,
-                self.search_policy,
-            ),
-        };
         let search_parallelism_slots = exact_search_parallelism_slots(
             parallelism_slots,
-            query_wide_strategy,
             predicate_matching_rows.unwrap_or(total_rows),
             self.vector_dim,
         );
@@ -394,14 +349,7 @@ impl VectorSearchCursor {
                         ))
                     }
                 };
-                self.dispatch_segment_search(
-                    segment,
-                    query_wide_strategy,
-                    filter,
-                    effective_ef,
-                    level0_degree,
-                    budget,
-                )
+                self.dispatch_segment_search(segment, filter, effective_ef, budget)
             },
         )?;
 
@@ -416,9 +364,7 @@ impl VectorSearchCursor {
                     &prepared_filters,
                     predicate.is_some(),
                     &predicate_columns,
-                    query_wide_strategy,
                     effective_ef,
-                    level0_degree,
                     budget,
                 )
             },
@@ -460,16 +406,17 @@ impl VectorSearchCursor {
     fn dispatch_segment_search(
         &self,
         segment: &VisibleSegment,
-        query_wide_strategy: HnswQueryWideStrategy,
         filter: HnswSearchFilter<'_>,
         effective_ef: usize,
-        level0_degree: usize,
         budget: &ResourceBudget,
     ) -> Result<SegmentDispatchResult<(Vec<RankedRow>, bool, Option<String>)>> {
         let matching_rows = filter
             .row_set()
             .map_or(segment.segment.num_rows(), ExactRowSet::len);
-        let inline_index = segment.segment.open_hnsw_index(self.storage_col_id)?;
+        let inline_index = segment
+            .segment
+            .open_hnsw_index(self.storage_col_id)?
+            .filter(|index| !index.integrity_failed());
         if let Some(index) = inline_index.as_ref() {
             bind_hnsw_search_workspace(index, self.reader_runtime.as_ref())?;
         }
@@ -477,14 +424,12 @@ impl VectorSearchCursor {
             || filter.exact_scan_workload(segment.segment.num_rows(), |_| false),
             |index| index.exact_scan_workload(filter),
         );
-        let search_strategy = query_wide_strategy.for_segment(HnswSegmentSearchInput {
+        let search_strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: segment.segment.num_rows(),
+            top_k: self.k,
             effective_ef,
-            level0_degree,
-            vector_dimension: self.vector_dim,
-            parallelism: budget.parallelism_slots,
             exact_scan_workload,
             cost_profile: self.search_policy.distance_cost,
         });
@@ -507,9 +452,7 @@ impl VectorSearchCursor {
         prepared_filters: &[PreparedSegmentFilter],
         has_predicate: bool,
         predicate_columns: &[u32],
-        query_wide_strategy: HnswQueryWideStrategy,
         effective_ef: usize,
-        level0_degree: usize,
         budget: &ResourceBudget,
     ) -> Result<Vec<RankedRow>> {
         let visible_segments = self.snapshot.table_lease.visible_segments();
@@ -600,14 +543,12 @@ impl VectorSearchCursor {
         let matching_rows = filter
             .row_set()
             .map_or(artifact.coverage.row_count(), ExactRowSet::len);
-        let strategy = query_wide_strategy.for_segment(HnswSegmentSearchInput {
+        let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             filter_kind,
             matching_rows,
             total_rows: artifact.coverage.row_count(),
+            top_k: self.k,
             effective_ef,
-            level0_degree,
-            vector_dimension: self.vector_dim,
-            parallelism: budget.parallelism_slots,
             exact_scan_workload: index.exact_scan_workload(filter),
             cost_profile: self.search_policy.distance_cost,
         });
@@ -671,6 +612,7 @@ impl VectorSearchCursor {
         if let Some(index) = visible_segment
             .segment
             .open_hnsw_index(self.storage_col_id)?
+            .filter(|index| !index.integrity_failed())
         {
             bind_hnsw_search_workspace(&index, self.reader_runtime.as_ref())?;
             validate_hnsw_index_contract(index.as_ref(), &self.expected_build_contract)?;
@@ -807,12 +749,11 @@ impl VectorSearchCursor {
 
 fn exact_search_parallelism_slots(
     granted_slots: usize,
-    strategy: HnswQueryWideStrategy,
     matching_rows: u64,
     vector_dim: usize,
 ) -> usize {
     let granted_slots = granted_slots.max(1);
-    if granted_slots == 1 || strategy != HnswQueryWideStrategy::ExactScan {
+    if granted_slots == 1 {
         return granted_slots;
     }
     let vector_bytes = matching_rows
@@ -889,8 +830,14 @@ fn open_sidecar_hnsw_artifact(
         Ok(Some(index))
     })?;
     if let Some(index) = index.as_ref() {
+        if index.integrity_failed() {
+            // Integrity failure quarantines only this rebuildable secondary
+            // artifact. The caller retains the covered base segments and can
+            // execute an exact fallback instead of making the table unreadable
+            // or emitting the same data-corruption error on every query.
+            return Ok(None);
+        }
         bind_hnsw_search_workspace(index, runtime)?;
-        HnswIndex::schedule_background_integrity_verification(index);
     }
     Ok(index)
 }
@@ -899,6 +846,7 @@ fn bind_hnsw_search_workspace(index: &Arc<HnswIndex>, runtime: &SearchReaderRunt
     if let Some(buffer_pool) = runtime.buffer_pool() {
         index.bind_search_buffer_pool(buffer_pool)?;
     }
+    runtime.schedule_hnsw_integrity_verification(index);
     Ok(())
 }
 
@@ -1002,97 +950,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn runtime_graph_cost_uses_the_generation_average_degree() {
-        let stats = crate::search::GenerationStats {
-            provider_stats: Some(crate::search::SearchProviderStats::Hnsw(
-                crate::search::stats::HnswProviderStats {
-                    vector_count: 10,
-                    level0_graph_links: 241,
-                    ..Default::default()
-                },
-            )),
-            ..Default::default()
-        };
-        assert_eq!(generation_level0_degree(&stats, 32).unwrap(), 25);
-        assert_eq!(
-            generation_level0_degree(&crate::search::GenerationStats::default(), 32).unwrap(),
-            32
-        );
-    }
-
-    #[test]
     fn exact_segment_dispatch_requires_enough_vector_work() {
         let rows_below_two_mib_at_32d =
             MIN_PARALLEL_EXACT_VECTOR_BYTES / (32 * std::mem::size_of::<f32>() as u64) - 1;
         assert_eq!(
-            exact_search_parallelism_slots(
-                8,
-                HnswQueryWideStrategy::ExactScan,
-                rows_below_two_mib_at_32d,
-                32,
-            ),
+            exact_search_parallelism_slots(8, rows_below_two_mib_at_32d, 32,),
             1
         );
         assert_eq!(
-            exact_search_parallelism_slots(
-                8,
-                HnswQueryWideStrategy::ExactScan,
-                rows_below_two_mib_at_32d + 1,
-                32,
-            ),
+            exact_search_parallelism_slots(8, rows_below_two_mib_at_32d + 1, 32,),
             8
-        );
-        assert_eq!(
-            exact_search_parallelism_slots(8, HnswQueryWideStrategy::SegmentAdaptive, 1, 32,),
-            8
-        );
-    }
-
-    #[test]
-    fn unfiltered_plain_scan_threshold_is_query_wide() {
-        assert_eq!(
-            HnswQueryWideStrategy::choose(
-                HnswFilterKind::None,
-                10_000,
-                10_000,
-                HnswSearchPolicy {
-                    plain_scan_threshold: 10_000,
-                    ..HnswSearchPolicy::default()
-                },
-            ),
-            HnswQueryWideStrategy::ExactScan
-        );
-        assert_eq!(
-            HnswQueryWideStrategy::choose(
-                HnswFilterKind::None,
-                10_001,
-                10_001,
-                HnswSearchPolicy {
-                    plain_scan_threshold: 10_000,
-                    ..HnswSearchPolicy::default()
-                },
-            ),
-            HnswQueryWideStrategy::SegmentAdaptive
-        );
-    }
-
-    #[test]
-    fn filtered_plain_scan_threshold_is_query_wide() {
-        let policy = HnswSearchPolicy {
-            filtered_plain_scan_threshold: 20_000,
-            ..HnswSearchPolicy::default()
-        };
-        assert_eq!(
-            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 20_000, 10_000_000, policy,),
-            HnswQueryWideStrategy::ExactScan
-        );
-        assert_eq!(
-            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 20_001, 10_000_000, policy,),
-            HnswQueryWideStrategy::SegmentAdaptive
-        );
-        assert_eq!(
-            HnswQueryWideStrategy::choose(HnswFilterKind::Predicate, 500_000, 10_000_000, policy,),
-            HnswQueryWideStrategy::SegmentAdaptive
         );
     }
 }

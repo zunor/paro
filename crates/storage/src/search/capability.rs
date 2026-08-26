@@ -902,13 +902,7 @@ mod tests {
             m: 16,
             ef_construct: 96,
             ef_search: 64,
-            plain_scan_threshold: 10_000,
-            filtered_plain_scan_threshold: 0,
-            sequential_covering_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-            indexed_base_scores_per_random_score:
-                crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
-            graph_scored_points_per_ef: crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+            distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 7,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
             warmup_point_count: crate::search::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -926,8 +920,13 @@ mod tests {
         .unwrap();
         let mut policy_tuned = base.clone();
         policy_tuned.ef_search = 240;
-        policy_tuned.plain_scan_threshold = 20_000;
-        policy_tuned.graph_scored_points_per_ef = 20;
+        policy_tuned.distance_cost = crate::index::hnsw::HnswDistanceCostProfile {
+            source: crate::index::hnsw::HnswDistanceCostProfileSource::OfflineCalibration {
+                calibration_id: 1,
+            },
+            graph_scored_points_per_ef: 20,
+            ..crate::index::hnsw::HnswDistanceCostProfile::default()
+        };
         policy_tuned.inline_threshold.max_vector_count = 8_192;
 
         let fingerprint = |config: &HnswProviderConfig| {
@@ -959,8 +958,6 @@ mod tests {
             "m": 16,
             "ef_construct": 96,
             "ef_search": 64,
-            "plain_scan_threshold": 10000,
-            "filtered_plain_scan_threshold": 0,
             "build_seed": 7,
             "inline_threshold": {
                 "enabled": false,

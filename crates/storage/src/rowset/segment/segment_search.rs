@@ -6,8 +6,8 @@ use crate::index::fulltext::query_parser::ParsedQuery;
 use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::text_index::FullTextScoringStats;
 use crate::index::hnsw::{
-    HnswQueryWideStrategy, HnswSearchFilter, HnswSearchPolicy, HnswSearchResult,
-    HnswSearchStrategy, HnswSegmentSearchInput, ScoredPoint, SearchParams,
+    HnswSearchFilter, HnswSearchPolicy, HnswSearchResult, HnswSearchStrategy,
+    HnswSegmentSearchInput, ScoredPoint, SearchParams,
 };
 use crate::index::ExactRowSet;
 use crate::index::{collect_predicate_columns, IndexEvaluator, PredicateResult, PredicateTree};
@@ -99,16 +99,12 @@ impl Segment {
         let index = self
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
-        let query_strategy =
-            HnswQueryWideStrategy::choose(filter.kind(), matching_rows, self.num_rows(), *policy);
-        let strategy = query_strategy.for_segment(HnswSegmentSearchInput {
+        let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.num_rows(),
+            top_k,
             effective_ef: policy.effective_ef(top_k, params.ef),
-            level0_degree: index.build_contract.m0 as usize,
-            vector_dimension: index.vector_storage.vector_dim(),
-            parallelism: 1,
             exact_scan_workload: index.exact_scan_workload(filter),
             cost_profile: policy.distance_cost,
         });

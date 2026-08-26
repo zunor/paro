@@ -98,7 +98,10 @@ impl<'a> GraphLayersHealer<'a> {
             old_to_new,
             hnsw_m: graph_layers.hnsw_m,
             ef_construct,
-            visited_pool: BuildVisitedPool::new(num_points),
+            visited_pool: BuildVisitedPool::new(
+                num_points,
+                ef_construct.saturating_mul(graph_layers.hnsw_m.m0),
+            ),
         })
     }
 
@@ -385,7 +388,7 @@ mod tests {
                 .insert_single_point(i as u32, storage.as_ref(), distance)
                 .unwrap();
         }
-        let (links, entry_points) = builder.into_graph_data();
+        let (links, entry_points) = builder.into_graph_data().unwrap();
         let graph = GraphLayers::new(links, entry_points, (&config).into());
         HnswIndex::new(config, graph, storage, distance)
     }
@@ -511,9 +514,7 @@ mod tests {
         let dim = 64;
         let distance = DistanceMetric::Euclidean;
         let vectors = make_sift_like_vectors(42, num_vectors, dim, 48);
-        let config = HnswConfig::new(16, 128)
-            .with_plain_scan_threshold(0)
-            .with_ef(160);
+        let config = HnswConfig::new(16, 128).with_ef(160);
         let levels = deterministic_levels(num_vectors, config.m, 77);
         let base_index = build_index_with_levels(&vectors, &levels, config, distance);
 
@@ -556,7 +557,7 @@ mod tests {
             healer.save_into_builder(&healed_builder);
 
             let survivor_storage: Arc<dyn VectorStorage> = make_storage(&survivor_vectors);
-            let (links, entry_points) = healed_builder.into_graph_data();
+            let (links, entry_points) = healed_builder.into_graph_data().unwrap();
             let healed_graph = GraphLayers::new(links, entry_points, (&config).into());
             let healed = HnswIndex::new(config, healed_graph, survivor_storage, distance);
 

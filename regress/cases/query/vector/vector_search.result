@@ -60,8 +60,10 @@ CREATE VECTOR INDEX idx_indexed_items_emb ON indexed_items (emb)
     ef_construct = 32
     ef_search = 24
     build_seed = 7
-    plain_scan_threshold = 0
-    filtered_plain_scan_threshold = 8
+    sequential_covering_scores_per_random_score = 1
+    indexed_base_scores_per_random_score = 1
+    graph_scored_points_per_ef = 1
+    distance_cost_calibration_id = 1
     filter_columns = 'id,bucket'
     inline_max_vector_count = 4096
     inline_max_graph_memory_bytes = 1048576
@@ -93,7 +95,7 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: default
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -111,11 +113,11 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: default
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
     Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
     Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
@@ -135,17 +137,17 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: default
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id = 1
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 1
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
     Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
     Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
-WHERE id <= 9
+WHERE id <= 1024
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 QUERY PLAN
 PROJECTION  (rows=2)
@@ -159,20 +161,20 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: default
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
-    Pushed Predicate: id <= 9
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: id <= 1024
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
-    Filter Rows (estimated): 9
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Filter Rows (estimated): 1024
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
     Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on id; base vector pages are not gathered
     Predicate Topology: available on id: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
 SELECT id FROM indexed_items
-WHERE id <= 9
+WHERE id <= 1024
 ORDER BY emb <-> '[1.0, 1.0, 1.0]' LIMIT 2;
 id
-9
-8
+840
+687
 
 -- @normalize explain_search_ids
 EXPLAIN SELECT id FROM indexed_items
@@ -247,11 +249,11 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: default
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
     Filter Rows (estimated): 205
-    Filtered Strategy: query-wide runtime choice: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates at <= 8 total matches (segment-shape and machine-width independent); otherwise each immutable generation compares exact physical work with graph work using its observed average level-0 degree, then graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
+    Filtered Strategy: runtime cost choice per immutable artifact: exact row-set distance scan using scalar-block covering vector ranges for compatible ordinal predicates is compared with graph work using definition-pinned physical cost coefficients, effective ef, and exact covering/base row counts; graph execution uses predicate-agnostic HNSW navigation with deferred global-beam admission for broad predicates, exact eager admission and hierarchical scalar-block topology for selective predicates, observed two-hop repair, and exact fallback
     Exact Filter Scan: covering scalar-block vector ranges available for compatible single-column ordinal predicates on bucket; base vector pages are not gathered
     Predicate Topology: available on bucket: tagged hierarchical scalar-block HNSW plus bounded vector-aware cross-block routing; every admitted block has a durable entry point and exact row-set admission
 
@@ -275,7 +277,7 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Ef: 37
-    Exact/Graph Cost Profile: covering=24 sequential scores/random score, indexed-base=24 gathered scores/random score, graph=24 unique scores/ef (definition-pinned, capped by generation average level-0 degree=16.00)
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
 id

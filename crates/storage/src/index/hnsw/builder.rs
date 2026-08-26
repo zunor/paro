@@ -185,7 +185,11 @@ impl GraphLayersBuilder {
         Self {
             links_layers,
             entry_points: Mutex::new(EntryPoints::new()),
-            visited_pool: BuildVisitedPool::with_keep_limit(num_points, visited_capacity),
+            visited_pool: BuildVisitedPool::with_keep_limit(
+                num_points,
+                visited_capacity,
+                (contract.ef_construct as usize).saturating_mul(hnsw_m.m0),
+            ),
             hnsw_m,
             ef_construct: contract.ef_construct as usize,
             level_factor,
@@ -639,7 +643,7 @@ impl GraphLayersBuilder {
     }
 
     /// Convert the builder into a flattened `GraphLinks` and `EntryPoints`.
-    pub fn into_graph_data(self) -> (GraphLinks, EntryPoints) {
+    pub fn into_graph_data(self) -> paro_common::error::Result<(GraphLinks, EntryPoints)> {
         let mut flattened_edges = Vec::with_capacity(self.links_layers.len());
         for point_levels in self.links_layers {
             let mut levels = Vec::with_capacity(point_levels.len());
@@ -649,10 +653,10 @@ impl GraphLayersBuilder {
             flattened_edges.push(levels);
         }
 
-        let graph_links = GraphLinks::new_from_edges(flattened_edges);
+        let graph_links = GraphLinks::try_new_from_edges(flattened_edges, self.hnsw_m.m0)?;
         let entry_points = self.entry_points.into_inner();
 
-        (graph_links, entry_points)
+        Ok((graph_links, entry_points))
     }
 }
 

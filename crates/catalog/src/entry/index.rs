@@ -1079,8 +1079,6 @@ mod tests {
             "m": 24,
             "ef_construct": 100,
             "ef_search": 80,
-            "plain_scan_threshold": 10_000,
-            "filtered_plain_scan_threshold": 0,
             "build_seed": 42,
             "inline_threshold": {
                 "enabled": true,

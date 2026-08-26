@@ -28,7 +28,7 @@ use super::{
     SearchParams, VectorScorer, HNSW_BUILD_CONTRACT_VERSION,
 };
 #[cfg(test)]
-use super::{HnswConfig, HnswQueryWideStrategy, HnswSegmentSearchInput};
+use super::{HnswConfig, HnswSegmentSearchInput};
 use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::metrics::storage_metrics;
 use crate::search::segment_dispatch::map_search_tasks;
@@ -48,17 +48,18 @@ use std::fs;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
+/// Version 14 binds every fixed level-0 record to its durable degree capacity;
+/// observed data can no longer change artifact width.
 /// Version 13 replaces level-0 CSR offsets with fixed-stride adjacency records.
 /// Degree and neighbors now share one mmap stream, so graph expansion no
 /// longer pays an independent random offset-table lookup. Version 11's
 /// canonical predicate dictionary keys remain part of the format. Earlier
 /// graph layouts are intentionally rejected rather than translated at open.
-pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 13;
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 14;
 const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
 pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 192;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
@@ -796,32 +797,6 @@ struct BuiltPredicateGraph {
     scan_layout: PredicateScanLayout,
 }
 
-fn hnsw_integrity_sweeper() -> Option<&'static SyncSender<Arc<HnswIndex>>> {
-    static SWEEPER: OnceLock<Option<SyncSender<Arc<HnswIndex>>>> = OnceLock::new();
-    SWEEPER
-        .get_or_init(|| {
-            let (sender, receiver) = sync_channel::<Arc<HnswIndex>>(8);
-            std::thread::Builder::new()
-                .name("paro-hnsw-integrity".to_string())
-                .spawn(move || {
-                    while let Ok(index) = receiver.recv() {
-                        let Some(integrity) = index._artifact_integrity.as_ref() else {
-                            continue;
-                        };
-                        if let Err(error) = integrity.verify_all() {
-                            tracing::error!(
-                                error = %error,
-                                "background HNSW artifact integrity verification failed"
-                            );
-                        }
-                    }
-                })
-                .ok()
-                .map(|_| sender)
-        })
-        .as_ref()
-}
-
 impl HnswIndex {
     /// Bind transient search workspaces to the instance-wide buffer pool.
     /// Loaded artifacts may be shared by many cursors, so binding is
@@ -903,26 +878,31 @@ impl HnswIndex {
         Ok(index)
     }
 
-    /// Queue one sequential checksum sweep for an immutable loaded artifact.
-    /// A single process worker bounds I/O concurrency across tables. Queries
-    /// remain correct and non-blocking through lazy range verification until
-    /// the sweep publishes its all-valid state.
-    pub(crate) fn schedule_background_integrity_verification(index: &Arc<Self>) {
-        if index._artifact_integrity.is_none()
-            || index.integrity_scheduled.swap(true, Ordering::AcqRel)
-        {
-            return;
-        }
-        let Some(sweeper) = hnsw_integrity_sweeper() else {
-            index.integrity_scheduled.store(false, Ordering::Release);
-            return;
-        };
-        match sweeper.try_send(Arc::clone(index)) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
-                index.integrity_scheduled.store(false, Ordering::Release);
-            }
-        }
+    pub(crate) fn artifact_integrity(&self) -> Option<Arc<ArtifactIntegrity>> {
+        self._artifact_integrity.as_ref().map(Arc::clone)
+    }
+
+    /// Whether authenticated bytes have proved this secondary artifact
+    /// corrupt. Callers may quarantine it and fall back to immutable base
+    /// vectors; table readability must not depend on a rebuildable index.
+    pub(crate) fn integrity_failed(&self) -> bool {
+        self._artifact_integrity
+            .as_ref()
+            .is_some_and(|integrity| integrity.is_corrupt())
+    }
+
+    pub(crate) fn try_mark_integrity_scheduled(&self) -> bool {
+        self._artifact_integrity
+            .as_ref()
+            .is_some_and(|integrity| !integrity.is_fully_verified())
+            && self
+                .integrity_scheduled
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    pub(crate) fn clear_integrity_scheduled(&self) {
+        self.integrity_scheduled.store(false, Ordering::Release);
     }
 
     #[cfg(test)]
@@ -1079,7 +1059,7 @@ impl HnswIndex {
             }
         }
 
-        let (links, entry_points) = builder.into_graph_data();
+        let (links, entry_points) = builder.into_graph_data()?;
         let predicate_graph = if build_contract.filter_topology.is_enabled() {
             Some(Self::build_predicate_links(
                 storage.as_ref(),
@@ -1290,7 +1270,14 @@ impl HnswIndex {
         predicate_entry_points
             .sort_unstable_by_key(|entry| (entry.column_id, entry.point_id, entry.level));
         Ok(BuiltPredicateGraph {
-            links: GraphLinks::new_from_edges(merged),
+            // Each configured predicate column contributes at most 2*filter_m
+            // local links plus filter_m deterministic cross-block links. The
+            // merged multi-column graph therefore owns an explicit 3*m*C
+            // capacity; persist that contract, never an observed maximum.
+            links: GraphLinks::try_new_from_edges(
+                merged,
+                build_contract.filter_topology.merged_level0_stride()?,
+            )?,
             entry_points: predicate_entry_points.into_boxed_slice(),
             scan_layout: PredicateScanLayout::from_build_columns(
                 dimension,
@@ -2024,20 +2011,12 @@ impl HnswIndex {
         let matching_rows = filter
             .row_set()
             .map_or(self.graph.num_points() as u64, ExactRowSet::len);
-        let query_strategy = HnswQueryWideStrategy::choose(
-            filter.kind(),
-            matching_rows,
-            self.graph.num_points() as u64,
-            policy,
-        );
-        let strategy = query_strategy.for_segment(HnswSegmentSearchInput {
+        let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.graph.num_points() as u64,
+            top_k,
             effective_ef: policy.effective_ef(top_k, params.ef),
-            level0_degree: self.graph.hnsw_m.get_m(0),
-            vector_dimension: self.vector_storage.vector_dim(),
-            parallelism: 1,
             exact_scan_workload: self.exact_scan_workload(filter),
             cost_profile: policy.distance_cost,
         });
@@ -2217,6 +2196,9 @@ impl HnswIndex {
     /// Explicit deep verifier for recovery/fsck tooling. Normal mmap open only
     /// validates the O(N) layout and checksum boundary.
     pub fn verify_integrity(&self) -> Result<()> {
+        if let Some(integrity) = &self._artifact_integrity {
+            integrity.verify_all()?;
+        }
         self.validate_artifact_contract()?;
         match (
             self.build_contract.distance,
@@ -2282,12 +2264,21 @@ impl HnswIndex {
                 self.vector_storage.num_vectors()
             )));
         }
-        if self.graph.links.level0_stride() > self.build_contract.m0 as usize {
+        if self.graph.links.level0_stride() != self.build_contract.m0 as usize {
             return Err(error::data_corrupted(format!(
-                "HNSW level-0 record stride {} exceeds build-contract m0 {}",
+                "HNSW level-0 record stride {} differs from build-contract m0 {}",
                 self.graph.links.level0_stride(),
                 self.build_contract.m0
             )));
+        }
+        if let Some(predicate_links) = &self.graph.predicate_links {
+            let expected = self.build_contract.filter_topology.merged_level0_stride()?;
+            if predicate_links.level0_stride() != expected {
+                return Err(error::data_corrupted(format!(
+                    "HNSW predicate level-0 record stride {} differs from topology capacity {expected}",
+                    predicate_links.level0_stride()
+                )));
+            }
         }
         match (
             self.build_contract.filter_topology.is_enabled(),
@@ -3022,7 +3013,7 @@ mod tests {
                 .unwrap();
         }
 
-        let (links, entry_points) = builder.into_graph_data();
+        let (links, entry_points) = builder.into_graph_data().unwrap();
         let graph = GraphLayers::new(links, entry_points, (&config).into());
         HnswIndex::new(config, graph, storage, distance)
     }
@@ -3126,7 +3117,7 @@ mod tests {
             vec![2.0, 2.0],
             vec![3.0, 3.0],
         ]);
-        let config = HnswConfig::new(8, 50).with_plain_scan_threshold(0);
+        let config = HnswConfig::new(8, 50);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         assert_eq!(index.graph.num_points(), 4);
@@ -3136,9 +3127,7 @@ mod tests {
     #[test]
     fn build_is_byte_deterministic_for_same_seed() {
         let vectors = make_sift_like_vectors(0xabc, 256, 16, 12);
-        let config = HnswConfig::new(12, 72)
-            .with_plain_scan_threshold(0)
-            .with_build_seed(0x1234_5678_9abc_def0);
+        let config = HnswConfig::new(12, 72).with_build_seed(0x1234_5678_9abc_def0);
         let first = HnswIndex::build(make_storage(&vectors), config, DistanceMetric::Euclidean)
             .serialize()
             .unwrap();
@@ -3223,10 +3212,7 @@ mod tests {
     fn frozen_wave_build_retains_sift_like_recall() {
         let vectors = make_sift_like_vectors(0x123, 2_048, 32, 24);
         let queries = make_sift_like_queries(0x456, &vectors, 64, 0.02);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_filtered_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswBuilder::new()
             .build(
                 make_storage(&vectors),
@@ -3254,9 +3240,7 @@ mod tests {
     #[test]
     fn test_hnsw_search() {
         let storage = make_storage(&[vec![0.0], vec![1.0]]);
-        let config = HnswConfig::new(8, 50)
-            .with_plain_scan_threshold(0)
-            .with_ef(50);
+        let config = HnswConfig::new(8, 50).with_ef(50);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let params = SearchParams {
@@ -3394,7 +3378,6 @@ mod tests {
                 },
                 HnswSearchFilter::predicate(&admitted, &[7]),
                 &HnswSearchPolicy {
-                    filtered_plain_scan_threshold: 0,
                     ..HnswSearchPolicy::default()
                 },
                 HnswSearchStrategy::AdaptiveFilteredGraph,
@@ -3502,9 +3485,7 @@ mod tests {
     fn test_hnsw_search_many_matches_search_one_hnsw_path() {
         let vectors = make_sift_like_vectors(7, 384, 24, 16);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
 
         let mut filter = RoaringBitmap::new();
@@ -3551,9 +3532,7 @@ mod tests {
     fn test_hnsw_search_many_matches_search_one_full_scan_path() {
         let vectors = make_sift_like_vectors(9, 96, 12, 8);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 32)
-            .with_plain_scan_threshold(10_000)
-            .with_ef(64);
+        let config = HnswConfig::new(8, 32).with_ef(64);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let queries = make_sift_like_queries(11, &vectors, 6, 0.01);
@@ -3585,9 +3564,7 @@ mod tests {
     fn test_hnsw_search_many_matches_search_one_full_scan_path_with_filter() {
         let vectors = make_sift_like_vectors(13, 120, 12, 8);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 32)
-            .with_plain_scan_threshold(10_000)
-            .with_ef(64);
+        let config = HnswConfig::new(8, 32).with_ef(64);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let mut filter = RoaringBitmap::new();
@@ -3628,9 +3605,7 @@ mod tests {
     fn test_hnsw_search_many_batch_size_one_matches_search_one() {
         let vectors = make_sift_like_vectors(17, 192, 16, 12);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
 
         let query = make_sift_like_queries(23, &vectors, 1, 0.02)
@@ -3663,9 +3638,7 @@ mod tests {
     fn test_hnsw_filtered_topk_search() {
         let vectors: Vec<Vec<f32>> = (0..10).map(|i| vec![i as f32]).collect();
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 50)
-            .with_plain_scan_threshold(0)
-            .with_ef(50);
+        let config = HnswConfig::new(8, 50).with_ef(50);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let entry_id = index.graph.entry_points.entry_points[0].point_id;
@@ -3724,10 +3697,7 @@ mod tests {
     fn adaptive_filtered_graph_refines_from_observed_admissions() {
         let vectors = make_sift_like_vectors(101, 512, 24, 16);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_filtered_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
         let query = &vectors[7];
         let params = SearchParams {
@@ -3736,8 +3706,6 @@ mod tests {
         };
         let policy = HnswSearchPolicy {
             ef_search: 96,
-            plain_scan_threshold: 0,
-            filtered_plain_scan_threshold: 0,
             ..HnswSearchPolicy::default()
         };
         let budget = crate::search::ResourceBudget::default();
@@ -3800,9 +3768,7 @@ mod tests {
     fn test_hnsw_search_many_matches_search_one_filtered_topk_path() {
         let vectors = make_sift_like_vectors(29, 320, 20, 12);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
 
         let mut filter = RoaringBitmap::new();
@@ -3862,7 +3828,7 @@ mod tests {
     fn test_hnsw_with_delete() {
         let vectors: Vec<Vec<f32>> = (0..5).map(|i| vec![i as f32]).collect();
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 50).with_plain_scan_threshold(100);
+        let config = HnswConfig::new(8, 50);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let mut all = RoaringBitmap::new();
@@ -3881,7 +3847,7 @@ mod tests {
     fn test_hnsw_persistence() {
         let vectors: Vec<Vec<f32>> = (0..6).map(|i| vec![i as f32]).collect();
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 50).with_plain_scan_threshold(100);
+        let config = HnswConfig::new(8, 50);
         let index = HnswIndex::build(storage.clone(), config, DistanceMetric::DotProduct);
 
         let params = SearchParams {
@@ -3953,7 +3919,7 @@ mod tests {
     fn cosine_inverse_norms_are_persisted_with_the_index_artifact() {
         let vectors = vec![vec![3.0, 4.0], vec![0.0, 0.0], vec![1.0, 0.0]];
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(0);
+        let config = HnswConfig::new(8, 32);
         let index = HnswIndex::build(storage, config, DistanceMetric::Cosine);
 
         let norms = index
@@ -4063,10 +4029,10 @@ mod tests {
 
     #[test]
     fn serialize_rejects_semantically_invalid_graph_before_publish() {
-        let links = GraphLinks::new_from_edges(vec![vec![vec![1]], vec![vec![0]]]);
+        let links = GraphLinks::try_new_from_edges(vec![vec![vec![1]], vec![vec![0]]], 16).unwrap();
         let mut encoded = Vec::new();
         links.serialize(&mut encoded).unwrap();
-        // GraphLinks v4 starts with a 64-byte header followed immediately by
+        // GraphLinks v5 starts with a 64-byte header followed immediately by
         // the first sentinel-terminated fixed link record.
         let first_link_offset = 64;
         encoded[first_link_offset..first_link_offset + 4].copy_from_slice(&99_u32.to_le_bytes());
@@ -4099,7 +4065,7 @@ mod tests {
     #[test]
     fn test_hnsw_batch_telemetry_is_separate_from_single_query_telemetry() {
         let storage = make_storage(&[vec![0.0], vec![1.0], vec![2.0], vec![3.0]]);
-        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(100);
+        let config = HnswConfig::new(8, 32);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
         let params = SearchParams::default();
 
@@ -4129,7 +4095,7 @@ mod tests {
     #[test]
     fn test_search_many_prepared_rejects_metric_mismatch() {
         let storage = make_storage(&[vec![0.0, 0.0], vec![1.0, 1.0]]);
-        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(100);
+        let config = HnswConfig::new(8, 32);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let error = index
@@ -4151,7 +4117,7 @@ mod tests {
     #[test]
     fn test_search_many_prepared_rejects_dimension_mismatch() {
         let storage = make_storage(&[vec![0.0, 0.0], vec![1.0, 1.0]]);
-        let config = HnswConfig::new(8, 32).with_plain_scan_threshold(100);
+        let config = HnswConfig::new(8, 32);
         let index = HnswIndex::build(storage, config, DistanceMetric::DotProduct);
 
         let error = index
@@ -4234,7 +4200,7 @@ mod tests {
     fn parallel_exact_scan_merges_lane_topk_and_telemetry() {
         const ROWS: usize = 65_536;
         let vectors = (0..ROWS).map(|row| vec![row as f32]).collect::<Vec<_>>();
-        let links = GraphLinks::new_from_edges(vec![vec![Vec::new()]; ROWS]);
+        let links = GraphLinks::try_new_from_edges(vec![vec![Vec::new()]; ROWS], 16).unwrap();
         let graph = GraphLayers::new(
             links,
             EntryPoints {
@@ -4246,9 +4212,7 @@ mod tests {
             },
             HnswM::new(8),
         );
-        let config = HnswConfig::new(8, 32)
-            .with_plain_scan_threshold(0)
-            .with_filtered_plain_scan_threshold(ROWS);
+        let config = HnswConfig::new(8, 32);
         let policy = config.search_policy();
         let index = HnswIndex::new(
             config,
@@ -4286,10 +4250,7 @@ mod tests {
     fn test_search_many_prepared_matches_search_one_for_large_segment_strong_filter() {
         let vectors = make_sift_like_vectors(43, 320, 20, 16);
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(16, 96)
-            .with_plain_scan_threshold(0)
-            .with_filtered_plain_scan_threshold(16)
-            .with_ef(96);
+        let config = HnswConfig::new(16, 96).with_ef(96);
         let index = HnswIndex::build(storage, config, DistanceMetric::Euclidean);
 
         let mut filter = RoaringBitmap::new();
@@ -4328,7 +4289,7 @@ mod tests {
     fn test_hnsw_directory_load_uses_mmap_graph_and_norms() {
         let vectors: Vec<Vec<f32>> = (0..32).map(|i| vec![i as f32, (i % 7) as f32]).collect();
         let storage = make_storage(&vectors);
-        let config = HnswConfig::new(8, 50).with_plain_scan_threshold(0);
+        let config = HnswConfig::new(8, 50);
         let index = HnswIndex::build(storage.clone(), config, DistanceMetric::Cosine);
 
         let temp_dir = TempDir::new().unwrap();
@@ -4358,9 +4319,7 @@ mod tests {
         let num_vectors = 512;
         let dim = 64;
         let vectors = make_sift_like_vectors(7, num_vectors, dim, 32);
-        let config = HnswConfig::new(8, 64)
-            .with_plain_scan_threshold(0)
-            .with_ef(96);
+        let config = HnswConfig::new(8, 64).with_ef(96);
         let levels = deterministic_levels(num_vectors, config.m, 99);
 
         let no_heuristic =
@@ -4385,9 +4344,7 @@ mod tests {
         let dim = 128;
         let vectors = make_sift_like_vectors(42, num_vectors, dim, 48);
         let queries = make_sift_like_queries(43, &vectors, 100, 0.015);
-        let config = HnswConfig::new(16, 200)
-            .with_plain_scan_threshold(0)
-            .with_ef(200);
+        let config = HnswConfig::new(16, 200).with_ef(200);
         let index = HnswIndex::build(make_storage(&vectors), config, DistanceMetric::Euclidean);
 
         let search_params = SearchParams {

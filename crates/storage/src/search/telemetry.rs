@@ -171,6 +171,36 @@ pub const SEARCH_METRIC_DESCRIPTORS: &[SearchMetricDescriptor] = &[
         GLOBAL,
     ),
     SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_scheduled_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_completed_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_failed_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_stale_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_deferred_total",
+        SearchMetricUnit::Count,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
+        "search_hnsw_integrity_verified_bytes_total",
+        SearchMetricUnit::Bytes,
+        GLOBAL,
+    ),
+    SearchMetricDescriptor::counter(
         "search_inline_build_rows_total",
         SearchMetricUnit::Rows,
         DEFINITION_PROVIDER,

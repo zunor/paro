@@ -18,11 +18,11 @@ use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
-    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD,
-    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
     DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
-    DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
-    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
+    DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -310,11 +310,10 @@ fn hnsw_provider_config(
         "ef_search",
         "distance",
         "build_seed",
-        "plain_scan_threshold",
-        "filtered_plain_scan_threshold",
         "sequential_covering_scores_per_random_score",
         "indexed_base_scores_per_random_score",
         "graph_scored_points_per_ef",
+        "distance_cost_calibration_id",
         "filter_columns",
         "filter_block_rows",
         "filter_m",
@@ -363,31 +362,62 @@ fn hnsw_provider_config(
         ))
     })?;
     let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
-    let plain_scan_threshold = parse_u64_index_option(
-        options,
-        "plain_scan_threshold",
-        u64::from(DEFAULT_HNSW_PLAIN_SCAN_THRESHOLD),
-    )?;
-    let filtered_plain_scan_threshold = parse_u64_index_option(
-        options,
-        "filtered_plain_scan_threshold",
-        u64::from(DEFAULT_HNSW_FILTERED_PLAIN_SCAN_THRESHOLD),
-    )?;
-    let sequential_covering_scores_per_random_score = parse_u64_index_option(
-        options,
+    let cost_option_names = [
         "sequential_covering_scores_per_random_score",
-        u64::from(DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE),
-    )?;
-    let indexed_base_scores_per_random_score = parse_u64_index_option(
-        options,
         "indexed_base_scores_per_random_score",
-        u64::from(DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE),
-    )?;
-    let graph_scored_points_per_ef = parse_u64_index_option(
-        options,
         "graph_scored_points_per_ef",
-        u64::from(DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF),
-    )?;
+    ];
+    let cost_option_count = cost_option_names
+        .iter()
+        .filter(|name| options.contains_key(**name))
+        .count();
+    let calibration_id = options
+        .get("distance_cost_calibration_id")
+        .map(|_| parse_u64_index_option(options, "distance_cost_calibration_id", 0))
+        .transpose()?;
+    let distance_cost = match (cost_option_count, calibration_id) {
+        (0, None) => paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
+        (3, Some(calibration_id)) if calibration_id != 0 => {
+            paro_storage::index::hnsw::HnswDistanceCostProfile {
+                source:
+                    paro_storage::index::hnsw::HnswDistanceCostProfileSource::OfflineCalibration {
+                        calibration_id,
+                    },
+                sequential_covering_scores_per_random_score: u32::try_from(parse_u64_index_option(
+                    options,
+                    "sequential_covering_scores_per_random_score",
+                    u64::from(DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE),
+                )?)
+                .map_err(|_| {
+                    paro_error::out_of_range("HNSW sequential_covering_scores_per_random_score")
+                })?,
+                indexed_base_scores_per_random_score: u32::try_from(parse_u64_index_option(
+                    options,
+                    "indexed_base_scores_per_random_score",
+                    u64::from(DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE),
+                )?)
+                .map_err(|_| {
+                    paro_error::out_of_range("HNSW indexed_base_scores_per_random_score")
+                })?,
+                graph_scored_points_per_ef: u32::try_from(parse_u64_index_option(
+                    options,
+                    "graph_scored_points_per_ef",
+                    u64::from(DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW graph_scored_points_per_ef"))?,
+            }
+        }
+        (3, Some(0)) => {
+            return Err(paro_error::invalid_input(
+                "HNSW distance_cost_calibration_id must be non-zero",
+            ));
+        }
+        _ => {
+            return Err(paro_error::invalid_input(
+                "HNSW distance-cost tuning requires all three cost coefficients and a non-zero distance_cost_calibration_id",
+            ));
+        }
+    };
     let mut filter_columns = options
         .get("filter_columns")
         .map(|value| {
@@ -490,22 +520,7 @@ fn hnsw_provider_config(
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
         ef_search: u32::try_from(ef_search)
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
-        plain_scan_threshold: u32::try_from(plain_scan_threshold)
-            .map_err(|_| paro_error::out_of_range("HNSW plain_scan_threshold"))?,
-        filtered_plain_scan_threshold: u32::try_from(filtered_plain_scan_threshold)
-            .map_err(|_| paro_error::out_of_range("HNSW filtered_plain_scan_threshold"))?,
-        sequential_covering_scores_per_random_score: u32::try_from(
-            sequential_covering_scores_per_random_score,
-        )
-        .map_err(|_| {
-            paro_error::out_of_range("HNSW sequential_covering_scores_per_random_score")
-        })?,
-        indexed_base_scores_per_random_score: u32::try_from(indexed_base_scores_per_random_score)
-            .map_err(|_| {
-            paro_error::out_of_range("HNSW indexed_base_scores_per_random_score")
-        })?,
-        graph_scored_points_per_ef: u32::try_from(graph_scored_points_per_ef)
-            .map_err(|_| paro_error::out_of_range("HNSW graph_scored_points_per_ef"))?,
+        distance_cost,
         build_seed,
         proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
         warmup_point_count: DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -923,8 +938,10 @@ mod tests {
             parse_create_index_stmt(
                 "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
                  m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
-                 build_seed = 42 plain_scan_threshold = 20000 \
-                 graph_scored_points_per_ef = 20 \
+                 build_seed = 42 \
+                 sequential_covering_scores_per_random_score = 14 \
+                 indexed_base_scores_per_random_score = 1 \
+                 graph_scored_points_per_ef = 20 distance_cost_calibration_id = 42 \
                  filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
@@ -947,8 +964,18 @@ mod tests {
             paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION
         );
         assert_eq!(bound.info.provider_config["dimension"], 100);
-        assert_eq!(bound.info.provider_config["plain_scan_threshold"], 20_000);
-        assert_eq!(bound.info.provider_config["graph_scored_points_per_ef"], 20);
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["source"]["kind"],
+            "offline_calibration"
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["source"]["calibration_id"],
+            42
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["graph_scored_points_per_ef"],
+            20
+        );
         assert_eq!(
             bound.info.provider_config["filter_columns"],
             serde_json::json!([0])
@@ -966,6 +993,39 @@ mod tests {
     }
 
     #[test]
+    fn bind_create_hnsw_rejects_partial_or_unidentified_cost_tuning() {
+        let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 32);
+        let mut binder =
+            test_binder_with_public_table("items", &[("embedding", vector_type.clone())]);
+        let partial = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_partial ON items (embedding) \
+                 graph_scored_points_per_ef = 20",
+            ),
+        )
+        .unwrap_err();
+        assert!(partial
+            .to_string()
+            .contains("requires all three cost coefficients"));
+
+        let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
+        let unidentified = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_unidentified ON items (embedding) \
+                 sequential_covering_scores_per_random_score = 14 \
+                 indexed_base_scores_per_random_score = 1 \
+                 graph_scored_points_per_ef = 20",
+            ),
+        )
+        .unwrap_err();
+        assert!(unidentified
+            .to_string()
+            .contains("requires all three cost coefficients"));
+    }
+
+    #[test]
     fn bind_create_hnsw_index_rejects_unknown_or_invalid_options() {
         let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 8);
         let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
@@ -978,6 +1038,18 @@ mod tests {
         )
         .expect_err("unknown HNSW option should fail");
         assert!(unknown.to_string().contains("Unknown HNSW index option"));
+
+        let retired_threshold = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_retired_threshold ON items (embedding) \
+                 filtered_plain_scan_threshold = 20000",
+            ),
+        )
+        .expect_err("retired cardinality threshold should fail instead of becoming a no-op");
+        assert!(retired_threshold
+            .to_string()
+            .contains("Unknown HNSW index option"));
 
         let invalid = bind_create_index(
             &mut binder,
