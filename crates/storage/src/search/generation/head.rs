@@ -9,12 +9,13 @@ use paro_common::effect::{
 };
 use paro_common::error::Result;
 use paro_common::journal::MaintenanceKind;
-use paro_journal::{
-    ApplyRequest, JournalApplyRuntime, MaintenanceAppendContext, TabletApplyPart, WaitMode,
-};
 use std::sync::Arc;
 
-use crate::tablet::{SearchGenerationHeadMeta, SearchGenerationPublishGuard, TabletRef};
+use crate::durable_maintenance::DurableMaintenanceApplyCompletion;
+use crate::tablet::{
+    SearchGenerationHeadMeta, SearchGenerationPublishGuard, SearchGenerationPublishOutcome,
+    TabletRef,
+};
 
 use super::view::SearchDefinitionState;
 use crate::search::manifest::ManifestStore;
@@ -29,37 +30,46 @@ pub(crate) fn head_for_state(
         .map(|manifest| manifests.head_for_root(&manifest.root))
 }
 
-/// Durably publish one already-installed immutable manifest revision.
-///
-/// Manifest fragments are fsynced before this function is called. The WAL
-/// record is therefore the visibility boundary: a crash before append leaves
-/// only unreachable files, while a crash after append is completed by the
-/// same tablet mutation during recovery.
 pub(crate) struct SearchGenerationPublishCompletion {
-    runtime: Option<Arc<JournalApplyRuntime>>,
-    context: Option<MaintenanceAppendContext>,
+    durable: Option<DurableMaintenanceApplyCompletion>,
+    publication_result: Result<SearchGenerationPublishOutcome>,
 }
 
 impl SearchGenerationPublishCompletion {
-    pub(crate) fn finish(self) -> Result<()> {
-        if let (Some(runtime), Some(context)) = (self.runtime, self.context) {
-            runtime.submit(ApplyRequest {
-                lsn: context.lsn,
-                durable_batch_lsn: context.durable_batch_lsn,
-                commit_id: None,
-                wait_mode: WaitMode::Published,
-                catalog_serial: false,
-                catalog_pre: Box::new(|| Ok(())),
-                tablet_parts: Vec::<TabletApplyPart>::new(),
-                descriptor_phase: Box::new(|| Ok(())),
-                catalog_post: Box::new(|| Ok(())),
-                on_published: Box::new(|| Ok(())),
-            })?;
+    pub(crate) fn publication_succeeded(&self) -> bool {
+        matches!(
+            self.publication_result,
+            Ok(SearchGenerationPublishOutcome::Advanced
+                | SearchGenerationPublishOutcome::AlreadyCurrent)
+        )
+    }
+
+    pub(crate) fn finish(mut self) -> Result<()> {
+        if let Some(durable) = self.durable.take() {
+            return durable.finish();
         }
-        Ok(())
+        self.publication_result
+            .clone()
+            .map(|outcome| match outcome {
+                SearchGenerationPublishOutcome::Advanced
+                | SearchGenerationPublishOutcome::AlreadyCurrent => (),
+                SearchGenerationPublishOutcome::Superseded => unreachable!(
+                    "online superseded generation publication is normalized before completion"
+                ),
+                SearchGenerationPublishOutcome::Retired => unreachable!(
+                    "online retired generation publication is normalized before completion"
+                ),
+            })
     }
 }
 
+/// Durably publish one already-installed immutable manifest revision.
+///
+/// Manifest fragments are fsynced before this function is called. Once WAL
+/// append succeeds, the returned owner is armed with an apply request. Normal
+/// callers submit it synchronously after releasing registry locks; unwinding
+/// or an early return submits it asynchronously from `Drop`, so a durable LSN
+/// can never be omitted from the ordered apply runtime.
 pub(crate) fn publish_head_for_state(
     tablet: &TabletRef,
     manifests: &ManifestStore,
@@ -68,17 +78,27 @@ pub(crate) fn publish_head_for_state(
 ) -> Result<SearchGenerationPublishCompletion> {
     let Some(head) = head_for_state(manifests, state) else {
         return Ok(SearchGenerationPublishCompletion {
-            runtime: None,
-            context: None,
+            durable: None,
+            publication_result: Ok(SearchGenerationPublishOutcome::AlreadyCurrent),
         });
     };
+    // The publication guard serializes this check with durable retirement.
+    // Rejecting here is a normal canceled-maintenance outcome and, crucially,
+    // happens before WAL append. Once append succeeds, inability to apply the
+    // record is a fatal storage error rather than a DROP race.
+    if tablet.is_search_definition_retired(head.definition_id) {
+        return Err(paro_common::error::invalid_input(format!(
+            "search definition {} was retired before maintenance publication",
+            head.definition_id
+        )));
+    }
     let mutation = TabletMutation::PublishSearchGeneration {
         publication: SearchGenerationPublication::AdvanceInstalled,
         generation_ref: manifests.generation_ref(head.definition_id, head.generation_id)?,
         head,
     };
     let maintenance_plan = PreparedMaintenancePlan {
-        kind: MaintenanceKind::IndexBackfill,
+        kind: MaintenanceKind::SearchGenerationMaintenance,
         catalog_ops: Vec::new(),
         storage_ops: vec![StorageCommitOp::Tablet(TabletApplyOp {
             tablet_id: tablet.tablet_id(),
@@ -91,14 +111,53 @@ pub(crate) fn publish_head_for_state(
             tablet.prepare_token(tablet.max_version()),
         )],
     };
-    let maintenance_context = tablet
-        .journal_coordinator()
+    let coordinator = tablet.journal_coordinator();
+    let runtime = if coordinator.is_some() {
+        Some(tablet.journal_apply_runtime().ok_or_else(|| {
+            paro_common::error::internal(
+                "search generation maintenance requires a bound journal apply runtime",
+            )
+        })?)
+    } else {
+        None
+    };
+    let maintenance_context = coordinator
         .map(|coordinator| coordinator.submit_maintenance(maintenance_plan))
         .transpose()?;
 
-    tablet.apply_search_generation_publish_guarded(&mutation, guard)?;
+    let publication_result = tablet
+        .apply_search_generation_publish_guarded(&mutation, guard)
+        .and_then(|outcome| match outcome {
+            SearchGenerationPublishOutcome::Advanced
+            | SearchGenerationPublishOutcome::AlreadyCurrent => Ok(outcome),
+            SearchGenerationPublishOutcome::Superseded => Err(paro_common::error::invalid_input(
+                "online search generation publication was superseded by a newer durable head",
+            )),
+            SearchGenerationPublishOutcome::Retired => Err(paro_common::error::invalid_input(
+                "online search generation publication targeted a retired definition",
+            )),
+        });
+    let durable = maintenance_context
+        .map(|context| {
+            let tablet = Arc::clone(tablet);
+            let tablet_id = tablet.tablet_id();
+            let lsn = context.lsn;
+            let completion = DurableMaintenanceApplyCompletion::arm(
+                runtime
+                    .as_ref()
+                    .expect("runtime validated before WAL append")
+                    .clone(),
+                context.lsn,
+                context.durable_batch_lsn,
+                tablet_id,
+                move || tablet.note_applied_lsn(lsn),
+            );
+            completion.record_terminal_result(publication_result.clone().map(|_| ()))?;
+            Ok::<_, paro_common::error::ParoError>(completion)
+        })
+        .transpose()?;
     Ok(SearchGenerationPublishCompletion {
-        runtime: tablet.journal_apply_runtime(),
-        context: maintenance_context,
+        durable,
+        publication_result,
     })
 }

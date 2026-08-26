@@ -25,6 +25,7 @@ use super::sidecar::{
     SIDECAR_PACKAGE_CODEC,
 };
 use super::stats::{SearchDefinitionId, SearchGenerationId};
+use crate::tablet::SearchGenerationHeadMeta;
 
 /// Identity and retained diagnostic image for one generation-owned HNSW
 /// artifact.
@@ -55,10 +56,10 @@ struct OpenedHnswGeneration {
 /// averaging unrelated per-segment reports.
 pub fn qualify_hnsw_generation(
     table_data_dir: &Path,
-    definition_id: SearchDefinitionId,
+    head: &SearchGenerationHeadMeta,
     budget: &ResourceBudget,
 ) -> Result<HnswGenerationQualification> {
-    let opened = open_hnsw_generation(table_data_dir, definition_id)?;
+    let opened = open_hnsw_generation(table_data_dir, head)?;
     let diagnostics = opened.index.graph_diagnostics(budget)?;
 
     Ok(HnswGenerationQualification {
@@ -73,10 +74,11 @@ pub fn qualify_hnsw_generation(
 
 fn open_hnsw_generation(
     table_data_dir: &Path,
-    definition_id: SearchDefinitionId,
+    head: &SearchGenerationHeadMeta,
 ) -> Result<OpenedHnswGeneration> {
+    let definition_id = head.definition_id;
     let manifest = ManifestStore::new(table_data_dir)
-        .load_manifest(definition_id)?
+        .load_manifest_for_head(head)?
         .ok_or_else(|| {
             paro_error::invalid_input(format!(
                 "search definition {definition_id} has no durable generation manifest"
@@ -249,7 +251,8 @@ mod tests {
         manifests.write_root(definition_id, &root).unwrap();
 
         let budget = ResourceBudget::standalone(1 << 20, 1024, 1);
-        let result = qualify_hnsw_generation(directory.path(), definition_id, &budget).unwrap();
+        let head = manifests.head_for_root(&root);
+        let result = qualify_hnsw_generation(directory.path(), &head, &budget).unwrap();
         assert_eq!(result.definition_id, definition_id);
         assert_eq!(result.generation_id, generation_id);
         assert_eq!(result.column_id, 2);

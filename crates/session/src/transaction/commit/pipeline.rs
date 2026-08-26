@@ -5,7 +5,8 @@ use super::super::ddl_changes::{PreparedCatalogOp, TransientCatalogRuntime};
 use super::super::post_commit::PostCommitActions;
 use super::super::session_transaction::FrozenTransaction;
 use super::ddl_publish::{
-    build_apply_descriptor_phase, IndexBackfillPublishTask, StagedGenerationPublishTask,
+    build_apply_descriptor_phase, IndexBackfillPublishTask, SearchGenerationRetirementTask,
+    StagedGenerationPublishTask,
 };
 use super::errors::{
     commit_runtime_error_is_definitely_nondurable, commit_runtime_error_to_paro, CommitFailure,
@@ -244,6 +245,15 @@ impl<'a> CommitPipeline<'a> {
                     });
                 }
             };
+        let search_generation_retirement_tasks = ddl_changes
+            .iter()
+            .filter_map(|change| match change.transient_runtime.as_ref() {
+                Some(TransientCatalogRuntime::RetireSearchGeneration(action)) => {
+                    Some(SearchGenerationRetirementTask::from_action(action))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         if !ddl_storage_ops.is_empty() {
             request.add_participants(vec![storage_descriptor.clone()]);
         }
@@ -396,18 +406,16 @@ impl<'a> CommitPipeline<'a> {
         };
         for task in staged_generation_publish_tasks {
             let tablet_id = task.tablet_id();
-            let publish_commit_id = Arc::clone(&publish_commit_id);
             tablet_parts.push(TabletApplyPart {
                 tablet_id,
-                apply: Box::new(move || {
-                    let commit_id = publish_commit_id.load(Ordering::Acquire);
-                    if commit_id == 0 {
-                        return Err(paro_common::error::internal(
-                            "search generation apply started before commit id assignment",
-                        ));
-                    }
-                    task.apply(commit_id)
-                }),
+                apply: Box::new(move || task.apply()),
+            });
+        }
+        for task in search_generation_retirement_tasks {
+            let tablet_id = task.tablet_id();
+            tablet_parts.push(TabletApplyPart {
+                tablet_id,
+                apply: Box::new(move || task.apply()),
             });
         }
         let catalog_post_request = request.clone();

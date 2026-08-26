@@ -201,7 +201,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
     manifest_bytes: Option<u64>,
 ) -> Result<ManifestOpenBenchSummary> {
     let store = ManifestStore::new_with_codec(table_data_dir, codec.manifest_codec());
-    let Some(manifest) = store.load_manifest(definition_id)? else {
+    let Some(manifest) = store.load_latest_manifest_for_private_workspace(definition_id)? else {
         return Ok(ManifestOpenBenchSummary {
             artifact_count: 0,
             tail_pending_count: 0,
@@ -223,7 +223,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
 
 pub fn manifest_fragment_bytes(table_data_dir: &Path, definition_id: u64) -> Result<u64> {
     let store = ManifestStore::new(table_data_dir);
-    let Some(manifest) = store.load_manifest(definition_id)? else {
+    let Some(manifest) = store.load_latest_manifest_for_private_workspace(definition_id)? else {
         return Ok(0);
     };
     Ok(manifest_path_bytes(&manifest.all_paths()))

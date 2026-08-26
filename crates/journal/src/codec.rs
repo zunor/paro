@@ -713,6 +713,7 @@ mod tests {
         prop_oneof![
             Just(MaintenanceKind::Compaction),
             Just(MaintenanceKind::IndexBackfill),
+            Just(MaintenanceKind::SearchGenerationMaintenance),
             Just(MaintenanceKind::MaterializedViewRefresh),
         ]
     }

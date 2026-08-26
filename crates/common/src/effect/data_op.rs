@@ -253,6 +253,13 @@ pub enum TabletMutation {
         generation_ref: ArtifactRef,
         head: SearchGenerationHeadMeta,
     },
+    /// Permanently fence one catalog search definition from publishing more
+    /// generations on this tablet. Catalog object ids are never reused, so the
+    /// retirement is the durable membership proof that makes delayed
+    /// maintenance records harmless after `DROP INDEX`.
+    RetireSearchGeneration {
+        definition_id: u64,
+    },
 }
 
 impl TabletMutation {
@@ -264,7 +271,8 @@ impl TabletMutation {
             } => Some(*output_rowset_id),
             Self::ApplyPrimaryDelete { .. }
             | Self::ApplyDeletePatch { .. }
-            | Self::PublishSearchGeneration { .. } => None,
+            | Self::PublishSearchGeneration { .. }
+            | Self::RetireSearchGeneration { .. } => None,
         }
     }
 
@@ -279,6 +287,9 @@ impl TabletMutation {
                 head.generation_id,
                 head.root_version,
             ),
+            Self::RetireSearchGeneration { definition_id } => {
+                stable_search_generation_retirement_id(*definition_id)
+            }
             Self::ApplyPrimaryDelete { keys } => stable_hash_keys(keys),
             Self::ApplyDeletePatch { patch, .. } => stable_hash_delete_patch(patch),
         }
@@ -358,6 +369,13 @@ fn stable_search_generation_revision_id(
     hash.write_u64(generation_id);
     hash.write_u64(root_version);
     hash.finish()
+}
+
+fn stable_search_generation_retirement_id(definition_id: u64) -> u64 {
+    const RETIRE_DOMAIN: u64 = 0x7265_7469_7265_7367;
+    let mut hash = RETIRE_DOMAIN;
+    hash ^= definition_id.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    hash.rotate_left(29) ^ 0xa076_1d64_78bd_642f
 }
 
 fn stable_hash_delete_patch(patch: &DeletePatchRef) -> u64 {

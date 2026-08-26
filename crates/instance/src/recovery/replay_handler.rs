@@ -957,7 +957,10 @@ fn apply_recovered_tablet_mutation(
             storage.apply_compaction_publish(mutation)?;
         }
         TabletMutation::PublishSearchGeneration { .. } => {
-            storage.apply_search_generation_publish(mutation)?;
+            storage.replay_search_generation_publish(mutation)?;
+        }
+        TabletMutation::RetireSearchGeneration { .. } => {
+            storage.apply_search_generation_retirement(mutation)?;
         }
     }
 

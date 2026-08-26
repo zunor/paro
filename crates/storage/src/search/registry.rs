@@ -26,7 +26,9 @@ use super::definition::freshness::capability_needs_required_freshness_wait;
 use super::definition::origin::{hnsw_schema_seed_definitions, restored_schema_seed_definition};
 use super::definition::validation::validate_definition;
 use super::generation::coverage::{search_generation_coverage_for_state, SearchGenerationCoverage};
-use super::generation::head::{head_for_state, publish_head_for_state};
+use super::generation::head::{
+    head_for_state, publish_head_for_state, SearchGenerationPublishCompletion,
+};
 use super::generation::maintenance_state::build_maintenance_state;
 use super::generation::snapshot::{
     collect_full_rebuild_tail, collect_rowset_snapshot, collect_visible_snapshot,
@@ -77,6 +79,7 @@ const DEFINITION_LOCK_SHARDS: usize = 64;
 
 #[derive(Debug)]
 struct RetiredManifest {
+    definition_id: u64,
     provider: SearchIndexKind,
     artifacts: Arc<GenerationArtifactSet>,
     sidecar_file_ids: BTreeSet<ArtifactFileId>,
@@ -96,6 +99,10 @@ pub(crate) struct SearchIndexRegistry {
     /// Bounded per-definition exclusion for manifest/head work. Lifecycle code locks
     /// shards in ascending order before taking `view_write_lock`.
     definition_locks: [Mutex<()>; DEFINITION_LOCK_SHARDS],
+    /// Single-flight ownership for expensive snapshot rebuilds. It is separate
+    /// from publication locks so DML can continue while provider work runs.
+    /// No path acquires this lock after a publication lock.
+    definition_build_locks: [Mutex<()>; DEFINITION_LOCK_SHARDS],
     retired: Mutex<Vec<RetiredManifest>>,
     /// Long-lived mmap and decoded-reader owner. Query cursors borrow this
     /// runtime; generation retirement performs lease-safe physical eviction.
@@ -182,6 +189,7 @@ impl SearchIndexRegistry {
             view_write_lock: Mutex::new(()),
             lifecycle_lock: Mutex::new(()),
             definition_locks: std::array::from_fn(|_| Mutex::new(())),
+            definition_build_locks: std::array::from_fn(|_| Mutex::new(())),
             retired: Mutex::new(Vec::new()),
             reader_runtime,
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
@@ -228,7 +236,14 @@ impl SearchIndexRegistry {
         let Some(head) = self.tablet.search_generation_head(definition_id) else {
             return Ok(None);
         };
-        self.manifests.load_manifest_for_head(&head)
+        self.manifests
+            .load_manifest_for_head(&head)?
+            .ok_or_else(|| {
+                paro_error::data_corrupted(format!(
+                    "durable search generation head for definition {definition_id} has no manifest"
+                ))
+            })
+            .map(Some)
     }
 
     pub(crate) fn install_definition(&self, definition: SearchIndexDefinition) -> Result<()> {
@@ -356,7 +371,7 @@ impl SearchIndexRegistry {
             root.recompute_checksum()?;
             staged_manifests.write_root(definition.definition_id, &root)?;
             let loaded = staged_manifests
-                .load_manifest(definition.definition_id)?
+                .load_latest_manifest_for_private_workspace(definition.definition_id)?
                 .ok_or_else(|| paro_error::internal("staged search manifest disappeared"))?;
             if loaded.root != root {
                 return Err(paro_error::data_corrupted(
@@ -416,6 +431,11 @@ impl SearchIndexRegistry {
     }
 
     pub(crate) fn drop_definition(&self, definition_id: u64) -> Result<()> {
+        // Drain any snapshot rebuild that captured this definition before the
+        // durable retirement mutation. The tombstone rejects its publication;
+        // holding the same single-flight lock until view removal guarantees no
+        // live task can outlast the detach transition.
+        let _build_guard = self.lock_definition_build(definition_id);
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let lifecycle_guard = self
             .lifecycle_lock
@@ -818,18 +838,13 @@ impl SearchIndexRegistry {
             &next_state,
             &publication_guard,
         )?;
-        self.publish_definition_state(&latest_state, next_state.clone())?;
-        if let Some(next_manifest) = next_state.manifest.as_ref() {
-            self.retire_manifest_replaced_by(
-                latest_state.definition.kind,
-                latest_state.manifest.as_ref(),
-                next_manifest,
-            );
-        }
+        let view_result =
+            self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
         drop(_guard);
         drop(publication_guard);
         completion.finish()?;
+        view_result?;
         drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
@@ -1096,18 +1111,13 @@ impl SearchIndexRegistry {
             &next_state,
             &publication_guard,
         )?;
-        self.publish_definition_state(&latest_state, next_state.clone())?;
-        if let Some(next_manifest) = next_state.manifest.as_ref() {
-            self.retire_manifest_replaced_by(
-                latest_state.definition.kind,
-                latest_state.manifest.as_ref(),
-                next_manifest,
-            );
-        }
+        let view_result =
+            self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
         drop(latest_state);
         drop(_guard);
         drop(publication_guard);
         completion.finish()?;
+        view_result?;
         drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
@@ -1147,17 +1157,12 @@ impl SearchIndexRegistry {
             &next_state,
             &publication_guard,
         )?;
-        self.publish_definition_state(&state, next_state.clone())?;
-        if let Some(next_manifest) = next_state.manifest.as_ref() {
-            self.retire_manifest_replaced_by(
-                state.definition.kind,
-                state.manifest.as_ref(),
-                next_manifest,
-            );
-        }
+        let view_result =
+            self.publish_durable_revision_state(&state, next_state.clone(), &completion);
         drop(_guard);
         drop(publication_guard);
         completion.finish()?;
+        view_result?;
         record_tail_metrics_for_state(&next_state);
         Ok(true)
     }
@@ -1219,6 +1224,10 @@ impl SearchIndexRegistry {
         definition_id: u64,
         force: bool,
     ) -> Result<Option<SearchCapability>> {
+        let _build_guard = self.lock_definition_build(definition_id);
+        // Snapshot the immutable definition and rowset layout under the short
+        // publication critical section. Provider construction and manifest
+        // materialization happen after both locks are released.
         let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
         let definition_lock = self.definition_lock(definition_id);
         let _guard = definition_lock
@@ -1236,11 +1245,12 @@ impl SearchIndexRegistry {
         // callback updates this derived in-memory view. Reconcile by loading
         // the committed root instead of rebuilding and overwriting the same
         // immutable revision name.
-        if let Some(durable_head) = self.tablet.search_generation_head(definition_id) {
-            if head_for_state(&self.manifests, &state).as_ref() != Some(&durable_head) {
+        let mut durable_head = self.tablet.search_generation_head(definition_id);
+        if let Some(head) = durable_head.as_ref() {
+            if head_for_state(&self.manifests, &state).as_ref() != Some(head) {
                 let loaded = self
                     .manifests
-                    .load_manifest_for_head(&durable_head)?
+                    .load_manifest_for_head(head)?
                     .ok_or_else(|| {
                         paro_error::data_corrupted(format!(
                             "durable search generation head for definition {definition_id} has no manifest"
@@ -1256,6 +1266,7 @@ impl SearchIndexRegistry {
                     );
                 }
                 state = reconciled;
+                durable_head = self.tablet.search_generation_head(definition_id);
             }
         }
 
@@ -1270,26 +1281,59 @@ impl SearchIndexRegistry {
         }
 
         let visible_rowsets = self.tablet.capture_consistent_rowsets(visible_version)?;
+        drop(_guard);
+        drop(publication_guard);
+
         let next_state =
             self.refresh_state_from_snapshot(&state, visible_version, &visible_rowsets, force)?;
+
+        let publication_guard = self.tablet.acquire_search_generation_publish_guard()?;
+        let definition_lock = self.definition_lock(definition_id);
+        let _guard = definition_lock
+            .lock()
+            .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
+        let latest = self.view.load_full();
+        let Some(latest_state) = latest.definitions.get(&definition_id).cloned() else {
+            drop(latest);
+            drop(_guard);
+            drop(publication_guard);
+            self.retire_unpublished_revision(&state, &next_state);
+            drop(next_state);
+            self.sweep_retired();
+            return Ok(None);
+        };
+        drop(latest);
+        let still_current = latest_state.definition == state.definition
+            && latest_state.origin == state.origin
+            && head_for_state(&self.manifests, &latest_state)
+                == head_for_state(&self.manifests, &state)
+            && self.tablet.search_generation_head(definition_id) == durable_head
+            && self.tablet.max_version() == visible_version;
+        if !still_current {
+            let capability = latest_state.capability.clone();
+            drop(latest_state);
+            drop(_guard);
+            drop(publication_guard);
+            self.retire_unpublished_revision(&state, &next_state);
+            drop(next_state);
+            self.sweep_retired();
+            return Ok(capability);
+        }
+
         let completion = publish_head_for_state(
             &self.tablet,
             &self.manifests,
             &next_state,
             &publication_guard,
         )?;
-        self.publish_definition_state(&state, next_state.clone())?;
-        if let Some(next_manifest) = next_state.manifest.as_ref() {
-            self.retire_manifest_replaced_by(
-                state.definition.kind,
-                state.manifest.as_ref(),
-                next_manifest,
-            );
-        }
+        let view_result =
+            self.publish_durable_revision_state(&latest_state, next_state.clone(), &completion);
+        drop(latest_state);
         drop(state);
         drop(_guard);
         drop(publication_guard);
         completion.finish()?;
+        view_result?;
         self.sweep_retired();
         Ok(next_state.capability)
     }
@@ -1415,6 +1459,9 @@ impl SearchIndexRegistry {
             if loaded.root.config_fingerprint == definition.config_fingerprint {
                 state = state.with_manifest(loaded);
                 record_tail_metrics_for_state(&state);
+            } else {
+                state =
+                    state.with_generation_floor(loaded.root.generation_id, loaded.root.build_epoch);
             }
         }
         let removed_seed_states = self.mutate_view(|view| {
@@ -1438,7 +1485,7 @@ impl SearchIndexRegistry {
         drop(lifecycle_guard);
         drop(publication_guard);
         self.sweep_retired();
-        let _ = self.refresh_definition(definition.definition_id);
+        self.refresh_definition(definition.definition_id)?;
         Ok(())
     }
 
@@ -2419,9 +2466,48 @@ impl SearchIndexRegistry {
         }
     }
 
+    fn publish_durable_revision_state(
+        &self,
+        expected: &SearchDefinitionState,
+        next_state: SearchDefinitionState,
+        completion: &SearchGenerationPublishCompletion,
+    ) -> Result<()> {
+        if !completion.publication_succeeded() {
+            return Ok(());
+        }
+        self.publish_definition_state(expected, next_state.clone())?;
+        if let Some(next_manifest) = next_state.manifest.as_ref() {
+            self.retire_manifest_replaced_by(
+                expected.definition.kind,
+                expected.manifest.as_ref(),
+                next_manifest,
+            );
+        }
+        Ok(())
+    }
+
     fn definition_lock(&self, definition_id: u64) -> &Mutex<()> {
         let shard = (definition_id % DEFINITION_LOCK_SHARDS as u64) as usize;
         &self.definition_locks[shard]
+    }
+
+    fn definition_build_lock(&self, definition_id: u64) -> &Mutex<()> {
+        let shard = (definition_id % DEFINITION_LOCK_SHARDS as u64) as usize;
+        &self.definition_build_locks[shard]
+    }
+
+    fn lock_definition_build(&self, definition_id: u64) -> MutexGuard<'_, ()> {
+        match self.definition_build_lock(definition_id).lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    tablet_id = self.tablet.tablet_id(),
+                    definition_id,
+                    "recovering poisoned search definition rebuild lock"
+                );
+                poisoned.into_inner()
+            }
+        }
     }
 
     fn lock_definitions(
@@ -2460,6 +2546,7 @@ impl SearchIndexRegistry {
         let Some(manifest) = manifest else {
             self.manifests
                 .remove_paths(&paths.into_iter().collect::<Vec<_>>());
+            self.manifests.prune_empty_definition_dirs(definition_id);
             return;
         };
         paths.extend(retire_paths_for_manifest(
@@ -2467,6 +2554,31 @@ impl SearchIndexRegistry {
             manifest,
         ));
         self.retire_manifest_paths(provider, manifest, paths.into_iter().collect());
+    }
+
+    fn retire_unpublished_revision(
+        &self,
+        base: &SearchDefinitionState,
+        candidate: &SearchDefinitionState,
+    ) {
+        let Some(candidate_manifest) = candidate.manifest.as_ref() else {
+            return;
+        };
+        let keep_paths = base
+            .manifest
+            .as_ref()
+            .map(|manifest| {
+                retire_paths_for_manifest(&self.tablet.data_dir().clone(), manifest)
+                    .into_iter()
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let retired_paths =
+            retire_paths_for_manifest(&self.tablet.data_dir().clone(), candidate_manifest)
+                .into_iter()
+                .filter(|path| !keep_paths.contains(path))
+                .collect();
+        self.retire_manifest_paths(candidate.definition.kind, candidate_manifest, retired_paths);
     }
 
     fn retire_manifest_replaced_by(
@@ -2515,6 +2627,7 @@ impl SearchIndexRegistry {
         let bytes = manifest_path_bytes(&paths);
         storage_metrics().record_search_generation_retired(provider, bytes);
         let retired = RetiredManifest {
+            definition_id: manifest.root.definition_id,
             provider,
             artifacts: manifest.artifacts.clone(),
             sidecar_file_ids,
@@ -2553,6 +2666,8 @@ impl SearchIndexRegistry {
             self.reader_runtime
                 .evict_packages(&retired.sidecar_file_ids);
             self.manifests.remove_paths(&retired.paths);
+            self.manifests
+                .prune_empty_definition_dirs(retired.definition_id);
         }
     }
 
@@ -2774,6 +2889,7 @@ mod tests {
     use crate::test_utils::*;
     use paro_common::allocator::default_allocator;
     use paro_common::chunk::Chunk;
+    use paro_common::effect::{SearchGenerationPublication, TabletMutation};
     use paro_common::types::LogicalType;
     use paro_common::vector::Vector;
     use paro_scheduler::scheduler::TaskScheduler;
@@ -4547,7 +4663,18 @@ mod tests {
             .search_registry()
             .manifests
             .generation_dir(201, 1)
-            .join("manifest_root_g1_v2.json");
+            .join(format!(
+                "manifest_root_g1_v2_f{}.json",
+                table
+                    .search_registry()
+                    .view
+                    .load()
+                    .definitions
+                    .get(&201)
+                    .unwrap()
+                    .definition
+                    .config_fingerprint
+            ));
         std::fs::create_dir(&failing_sparse_root).unwrap();
 
         let err = table.append(&test_chunk_from_vectors(vec![
@@ -4792,7 +4919,18 @@ mod tests {
             .search_registry()
             .manifests
             .generation_dir(144, 1)
-            .join("manifest_root_g1_v2.json");
+            .join(format!(
+                "manifest_root_g1_v2_f{}.json",
+                table
+                    .search_registry()
+                    .view
+                    .load()
+                    .definitions
+                    .get(&144)
+                    .unwrap()
+                    .definition
+                    .config_fingerprint
+            ));
         std::fs::create_dir(&root_path).unwrap();
 
         let store = SidecarArtifactStore::new(table.tablet().data_dir().clone());
@@ -4808,8 +4946,7 @@ mod tests {
             .catch_up_definition(144)
             .expect_err("root path directory must make manifest root publish fail");
         assert!(
-            err.to_string()
-                .contains("commit search manifest staging fragment"),
+            err.to_string().contains("immutable search manifest root"),
             "{err}"
         );
         assert!(
@@ -5260,11 +5397,12 @@ mod tests {
             ])]))
             .unwrap();
 
-        {
+        let synthetic_head = {
             let current = table.search_registry().view.load();
             let state = current.definitions.get(&47).expect("definition state");
             let manifest = state.manifest.as_ref().expect("manifest");
             let mut root = manifest.root.clone();
+            root.root_version = root.root_version.saturating_add(1);
             let store = &table.search_registry().manifests;
             for ordinal in 0..=DELTA_COUNT_SOFT_LIMIT {
                 let delta_ref = store
@@ -5280,12 +5418,25 @@ mod tests {
             }
             root.recompute_checksum().unwrap();
             store.write_root(47, &root).unwrap();
-        }
+            store.head_for_root(&root)
+        };
+        table
+            .tablet()
+            .apply_search_generation_publish(&TabletMutation::PublishSearchGeneration {
+                publication: SearchGenerationPublication::AdvanceInstalled,
+                generation_ref: table
+                    .search_registry()
+                    .manifests
+                    .generation_ref(47, synthetic_head.generation_id)
+                    .unwrap(),
+                head: synthetic_head.clone(),
+            })
+            .unwrap();
         {
             let loaded = table
                 .search_registry()
                 .manifests
-                .load_manifest(47)
+                .load_manifest_for_head(&synthetic_head)
                 .expect("load synthetic over-soft manifest")
                 .expect("manifest exists");
             table

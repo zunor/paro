@@ -22,6 +22,7 @@ use paro_common::ddl::{
 };
 use paro_common::effect::{
     CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor, StagingArtifactId,
+    StorageCommitOp, TabletApplyOp, TabletMutation,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_context::{
@@ -41,8 +42,8 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use crate::transaction::ddl_changes::{
-    CatalogOpBatch, IndexPostCommitAction, PreparedCatalogOp, TableDropCleanupAction,
-    TransientCatalogRuntime,
+    CatalogOpBatch, IndexPostCommitAction, PreparedCatalogOp, SearchGenerationRetirementAction,
+    TableDropCleanupAction, TransientCatalogRuntime,
 };
 use crate::transaction::index_backfill::{lease_index_backfill, IndexBackfillPlan};
 
@@ -757,15 +758,39 @@ impl SessionDdlBridge {
                         _ => None,
                     })
                     .ok_or_else(|| paro_error::object_not_found("index", &object_ref.name))?;
-                if let Some(table) = schema
+                let table = schema
                     .get_table(self.txn_id, self.start_time, &index.table_name)
                     .and_then(|entry| match entry.as_ref() {
                         CatalogEntryEnum::Table(table) => Some(Arc::clone(table)),
                         _ => None,
                     })
-                {
-                    self.reject_if_table_touched(table.as_ref(), "DROP INDEX")?;
-                }
+                    .ok_or_else(|| paro_error::object_not_found("table", &index.table_name))?;
+                self.reject_if_table_touched(table.as_ref(), "DROP INDEX")?;
+                let retirement = if search_index_kind(index.index_type).is_some() {
+                    let storage = table.get_storage().cloned().ok_or_else(|| {
+                        paro_error::internal(format!(
+                            "table '{}' has no storage for DROP INDEX retirement",
+                            index.table_name
+                        ))
+                    })?;
+                    Some(SearchGenerationRetirementAction {
+                        storage,
+                        definition_id: index.base.base.object_id.raw(),
+                    })
+                } else {
+                    None
+                };
+                let storage_ops = retirement
+                    .as_ref()
+                    .map(|retirement| {
+                        vec![StorageCommitOp::Tablet(TabletApplyOp {
+                            tablet_id: retirement.storage.tablet_id(),
+                            mutations: vec![TabletMutation::RetireSearchGeneration {
+                                definition_id: retirement.definition_id,
+                            }],
+                        })]
+                    })
+                    .unwrap_or_default();
                 let key = DdlObjectKey::new(
                     self.db.name(),
                     Some(schema_name.clone()),
@@ -786,7 +811,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: vec![self.table_key(schema_name, index.table_name.clone())],
                     staged_artifacts: Vec::new(),
-                    storage_ops: Vec::new(),
+                    storage_ops,
                     runtime_transitions: vec![RuntimeTransitionDescriptor::DetachIndexState {
                         index: key,
                         table_name: index.table_name.clone(),
@@ -798,7 +823,8 @@ impl SessionDdlBridge {
                     }],
                     cleanups: Vec::new(),
                     post_commit_hooks: Vec::new(),
-                    transient_runtime: None,
+                    transient_runtime: retirement
+                        .map(TransientCatalogRuntime::RetireSearchGeneration),
                 }))
             }
             CatalogType::Sequence => {

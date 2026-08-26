@@ -121,6 +121,20 @@ impl SearchDefinitionState {
         self
     }
 
+    /// Preserve the durable identity high-water marks when the definition
+    /// contract changes and the previous manifest can no longer be attached to
+    /// this logical state. A replacement must use a fresh generation rather
+    /// than overwrite an immutable `(generation, root revision)` namespace.
+    pub(crate) fn with_generation_floor(
+        mut self,
+        generation_id: SearchGenerationId,
+        build_epoch: u64,
+    ) -> Self {
+        self.next_generation_id = self.next_generation_id.max(generation_id.saturating_add(1));
+        self.next_build_epoch = self.next_build_epoch.max(build_epoch.saturating_add(1));
+        self
+    }
+
     pub(crate) fn manifest_delta_count(&self) -> usize {
         self.manifest
             .as_ref()
@@ -514,5 +528,33 @@ fn tail_backlog_tier_value(tier: CatchUpBacklogTier) -> u64 {
         CatchUpBacklogTier::Healthy => 0,
         CatchUpBacklogTier::Elevated => 1,
         CatchUpBacklogTier::Degraded => 2,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::search::SearchFreshnessPolicy;
+    use serde_json::json;
+
+    #[test]
+    fn changed_contract_starts_after_durable_generation_high_water() {
+        let definition = SearchIndexDefinition {
+            definition_id: 41,
+            table_id: 7,
+            name: "docs_fts".to_string(),
+            kind: SearchIndexKind::FullText,
+            column_ids: vec![0],
+            expression: Some("to_tsvector('simple', col_0)".to_string()),
+            provider_config: json!({"version": 1, "config": "simple"}),
+            freshness_policy: SearchFreshnessPolicy::Required,
+            config_fingerprint: 4242,
+        };
+        let state = SearchDefinitionState::new(definition, SearchDefinitionOrigin::catalog(41))
+            .unwrap()
+            .with_generation_floor(7, 11);
+
+        assert_eq!(state.next_generation_id, 8);
+        assert_eq!(state.next_build_epoch, 12);
     }
 }

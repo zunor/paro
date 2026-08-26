@@ -33,10 +33,16 @@ pub struct TableDropCleanupAction {
     pub move_to_trash: bool,
 }
 
+pub struct SearchGenerationRetirementAction {
+    pub storage: Arc<TableHandle>,
+    pub definition_id: u64,
+}
+
 #[allow(clippy::large_enum_variant)]
 pub enum TransientCatalogRuntime {
     CreateIndex(IndexPostCommitAction),
     DropTable(TableDropCleanupAction),
+    RetireSearchGeneration(SearchGenerationRetirementAction),
 }
 
 pub struct PreparedCatalogOp {

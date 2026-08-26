@@ -22,6 +22,7 @@ pub enum MutationKind {
     ApplyDeletePatch,
     PublishCompaction,
     PublishSearchGeneration,
+    RetireSearchGeneration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -97,6 +98,7 @@ fn mutation_kind(mutation: &TabletMutation) -> MutationKind {
         TabletMutation::ApplyDeletePatch { .. } => MutationKind::ApplyDeletePatch,
         TabletMutation::PublishCompaction { .. } => MutationKind::PublishCompaction,
         TabletMutation::PublishSearchGeneration { .. } => MutationKind::PublishSearchGeneration,
+        TabletMutation::RetireSearchGeneration { .. } => MutationKind::RetireSearchGeneration,
     }
 }
 

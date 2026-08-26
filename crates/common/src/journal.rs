@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 /// Journal frame schema version used by the binary codec.
 /// Version 6 makes search-generation publication mode explicit and identities
 /// every immutable root revision independently.
-pub const JOURNAL_FORMAT_VERSION: u16 = 6;
+pub const JOURNAL_FORMAT_VERSION: u16 = 7;
 pub const COMMIT_RECORD_VERSION: u16 = 2;
 pub const MAINTENANCE_RECORD_VERSION: u16 = 2;
 pub const JOURNAL_RECORD_METADATA_VERSION: u16 = 1;
@@ -107,6 +107,7 @@ impl MaintenanceRecord {
 pub enum MaintenanceKind {
     Compaction,
     IndexBackfill,
+    SearchGenerationMaintenance,
     MaterializedViewRefresh,
 }
 
@@ -388,6 +389,7 @@ pub enum JournalArtifactKind {
     DeletePatch,
     CompactionOutput,
     SearchGeneration,
+    SearchGenerationRetirement,
     ApplyDescriptor,
     BulkLoadRowset,
 }
@@ -400,6 +402,7 @@ impl JournalArtifactKind {
             TabletMutation::ApplyDeletePatch { .. } => Self::DeletePatch,
             TabletMutation::PublishCompaction { .. } => Self::CompactionOutput,
             TabletMutation::PublishSearchGeneration { .. } => Self::SearchGeneration,
+            TabletMutation::RetireSearchGeneration { .. } => Self::SearchGenerationRetirement,
         }
     }
 }

@@ -11,12 +11,16 @@ use std::time::Instant;
 
 use paro_storage::index::hnsw::HnswGraphDiagnostics;
 use paro_storage::search::{qualify_hnsw_generation, ResourceBudget};
+use paro_storage::tablet::SearchGenerationHeadMeta;
 
 const DEFAULT_MEMORY_MIB: usize = 512;
 
 struct Arguments {
     table_data_dir: PathBuf,
     definition_id: u64,
+    generation_id: u64,
+    root_version: u64,
+    config_fingerprint: u64,
     memory_mib: usize,
     indegrees_path: Option<PathBuf>,
 }
@@ -29,8 +33,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("diagnostic memory limit overflows usize")?;
     let budget = ResourceBudget::standalone(memory_bytes, usize::MAX, 1);
     let started_at = Instant::now();
-    let qualification =
-        qualify_hnsw_generation(&arguments.table_data_dir, arguments.definition_id, &budget)?;
+    let head = SearchGenerationHeadMeta {
+        definition_id: arguments.definition_id,
+        generation_id: arguments.generation_id,
+        root_version: arguments.root_version,
+        config_fingerprint: arguments.config_fingerprint,
+        root_file_name: format!(
+            "manifest_root_g{}_v{}_f{}.json",
+            arguments.generation_id, arguments.root_version, arguments.config_fingerprint
+        ),
+    };
+    let qualification = qualify_hnsw_generation(&arguments.table_data_dir, &head, &budget)?;
     let report = qualification.diagnostics.report();
     let elapsed_seconds = started_at.elapsed().as_secs_f64();
 
@@ -66,6 +79,21 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
         .ok_or_else(usage)?
         .parse::<u64>()
         .map_err(|error| format!("invalid definition id: {error}"))?;
+    let generation_id = args
+        .next()
+        .ok_or_else(usage)?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid generation id: {error}"))?;
+    let root_version = args
+        .next()
+        .ok_or_else(usage)?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid root version: {error}"))?;
+    let config_fingerprint = args
+        .next()
+        .ok_or_else(usage)?
+        .parse::<u64>()
+        .map_err(|error| format!("invalid config fingerprint: {error}"))?;
     let mut memory_mib = DEFAULT_MEMORY_MIB;
     let mut indegrees_path = None;
     while let Some(option) = args.next() {
@@ -91,6 +119,9 @@ fn parse_arguments() -> Result<Arguments, Box<dyn std::error::Error>> {
     Ok(Arguments {
         table_data_dir,
         definition_id,
+        generation_id,
+        root_version,
+        config_fingerprint,
         memory_mib,
         indegrees_path,
     })
@@ -111,5 +142,5 @@ fn write_indegrees(path: &Path, indegrees: &[u32]) -> Result<(), Box<dyn std::er
 }
 
 fn usage() -> String {
-    "usage: hnsw_graph_diagnostics <table-data-dir> <definition-id> [--memory-mib N] [--indegrees PATH]".to_string()
+    "usage: hnsw_graph_diagnostics <table-data-dir> <definition-id> <generation-id> <root-version> <config-fingerprint> [--memory-mib N] [--indegrees PATH]".to_string()
 }

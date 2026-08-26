@@ -7,13 +7,13 @@ use crate::compaction::publish::record::{
     maintenance_storage_op, CompactionPublishRecord, CompactionPublishRequest, PkPublishDelta,
     RetiredInput,
 };
+use crate::durable_maintenance::DurableMaintenanceApplyCompletion;
 use crate::rowset::{Rowset, RowsetSharedPtr};
 use crate::tablet::Tablet;
 use paro_common::durability::{PrepareToken, PreparedMaintenancePlan, PreparedTabletPlan};
 use paro_common::effect::ArtifactRef;
 use paro_common::error::{self as paro_error, Result};
 use paro_common::journal::MaintenanceKind;
-use paro_journal::{ApplyRequest, TabletApplyPart, WaitMode};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -204,74 +204,91 @@ impl CompactionPublisher {
 
         let final_rowset = build_final_rowset(tablet, &artifact, final_path, staged_stats)?;
         tablet.ensure_rowset_rssids(&final_rowset);
-        let maintenance_context = match tablet.journal_coordinator() {
-            Some(coordinator) => Some(coordinator.submit_maintenance(maintenance_plan)?),
-            None => None,
-        };
-        *durable_record = maintenance_context.is_some();
-        let checkpoint_ticket = tablet
-            .begin_checkpoint_compaction_publish()
-            .map(|mut ticket| {
-                if let Some(context) = maintenance_context.as_ref() {
-                    ticket.maintenance_id = context.maintenance_id;
-                }
-                ticket
-            });
-        let output_maintenance_id = maintenance_context
+        let coordinator = tablet.journal_coordinator();
+        let runtime = coordinator
             .as_ref()
-            .map(|context| context.maintenance_id)
-            .or_else(|| {
-                checkpoint_ticket
-                    .as_ref()
-                    .map(|ticket| ticket.maintenance_id)
+            .map(|_| {
+                tablet.journal_apply_runtime().ok_or_else(|| {
+                    paro_error::internal(
+                        "compaction maintenance requires a bound journal apply runtime",
+                    )
+                })
             })
-            .unwrap_or(0);
+            .transpose()?;
+        let maintenance_context = coordinator
+            .map(|coordinator| coordinator.submit_maintenance(maintenance_plan))
+            .transpose()?;
+        *durable_record = maintenance_context.is_some();
+        let durable_maintenance_id = maintenance_context
+            .as_ref()
+            .map(|context| context.maintenance_id);
+        let completion = maintenance_context.map(|context| {
+            DurableMaintenanceApplyCompletion::arm(
+                runtime
+                    .as_ref()
+                    .expect("runtime validated before compaction WAL append")
+                    .clone(),
+                context.lsn,
+                context.durable_batch_lsn,
+                tablet.tablet_id(),
+                || Ok(()),
+            )
+        });
 
-        final_rowset.make_visible()?;
-        tablet.install_compaction_publish_locked(
-            &artifact.plan.input_rowset_ptrs(),
-            retired_inputs,
-            final_rowset.clone(),
-            output_maintenance_id,
-            record.cumulative_point_action,
-            false,
-        )?;
-        if let Some(ticket) = checkpoint_ticket {
-            tablet.finish_checkpoint_compaction_publish(ticket);
-        }
+        let inline_result = (|| {
+            let checkpoint_ticket =
+                tablet
+                    .begin_checkpoint_compaction_publish()
+                    .map(|mut ticket| {
+                        if let Some(maintenance_id) = durable_maintenance_id {
+                            ticket.maintenance_id = maintenance_id;
+                        }
+                        ticket
+                    });
+            let output_maintenance_id = durable_maintenance_id
+                .or_else(|| {
+                    checkpoint_ticket
+                        .as_ref()
+                        .map(|ticket| ticket.maintenance_id)
+                })
+                .unwrap_or(0);
 
-        if let Some(pk_delta) = pk_delta.as_ref() {
-            tablet.apply_compaction_publish_delta(
-                final_rowset.rowset_id(),
-                final_rowset.end_version(),
-                pk_delta,
+            final_rowset.make_visible()?;
+            tablet.install_compaction_publish_locked(
+                &artifact.plan.input_rowset_ptrs(),
+                retired_inputs,
+                final_rowset.clone(),
+                output_maintenance_id,
+                record.cumulative_point_action,
+                false,
             )?;
-        }
+            if let Some(ticket) = checkpoint_ticket {
+                tablet.finish_checkpoint_compaction_publish(ticket);
+            }
 
-        if matches!(
-            artifact.plan.merge_semantics,
-            crate::compaction::plan::types::MergeSemantics::Deduplicate
-        ) {
-            tablet.validate_primary_index_consistency_after_compaction(&final_rowset)?;
-            tablet.maybe_flush_primary_index()?;
-        }
+            if let Some(pk_delta) = pk_delta.as_ref() {
+                tablet.apply_compaction_publish_delta(
+                    final_rowset.rowset_id(),
+                    final_rowset.end_version(),
+                    pk_delta,
+                )?;
+            }
 
-        if let (Some(runtime), Some(context)) =
-            (tablet.journal_apply_runtime(), maintenance_context.as_ref())
-        {
-            runtime.submit(ApplyRequest {
-                lsn: context.lsn,
-                durable_batch_lsn: context.durable_batch_lsn,
-                commit_id: None,
-                wait_mode: WaitMode::Published,
-                catalog_serial: false,
-                catalog_pre: Box::new(|| Ok(())),
-                tablet_parts: Vec::<TabletApplyPart>::new(),
-                descriptor_phase: Box::new(|| Ok(())),
-                catalog_post: Box::new(|| Ok(())),
-                on_published: Box::new(|| Ok(())),
-            })?;
+            if matches!(
+                artifact.plan.merge_semantics,
+                crate::compaction::plan::types::MergeSemantics::Deduplicate
+            ) {
+                tablet.validate_primary_index_consistency_after_compaction(&final_rowset)?;
+                tablet.maybe_flush_primary_index()?;
+            }
+            Ok(())
+        })();
+
+        if let Some(completion) = completion {
+            completion.record_terminal_result(inline_result.clone())?;
+            completion.finish()?;
         }
+        inline_result?;
 
         if let Err(err) = tablet.persist_meta_snapshot() {
             warn!(

@@ -73,13 +73,13 @@ pub use tablet_reader_params::{
     ColumnProjection, ColumnValueProjection, TabletReaderBuilder, TabletReaderParams,
 };
 pub use tablet_rowid_lookup::TabletRowIdReader;
-pub(crate) use tablet_runtime::SearchGenerationPublishGuard;
 pub use tablet_runtime::{
     CheckpointMaintenanceTicket, CheckpointPublishObserver, CheckpointTabletFreezeMode,
     CheckpointTabletSnapshot, PrimaryIndexUpdate, RetiredGcBarrier, RetiredPendingGcStatus,
     RowsetPublishObserver, Tablet, TabletId, TabletIdentity, TabletReadGuard, TabletRef,
     TabletSnapshotMaterialization, TabletState, Version, VersionGap,
 };
+pub(crate) use tablet_runtime::{SearchGenerationPublishGuard, SearchGenerationPublishOutcome};
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 
 pub fn set_delete_patch_inline_row_ref_threshold(threshold: usize) {

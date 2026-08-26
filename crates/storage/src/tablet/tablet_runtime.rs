@@ -46,7 +46,7 @@ use paro_common::effect::{
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
-use paro_journal::{JournalApplyRuntime, JournalCoordinator, MutationIdentity};
+use paro_journal::{JournalApplyRuntime, JournalCoordinator, MutationIdentity, MutationKind};
 use paro_transaction::{
     CommitTs, DatabaseId, DerivedLagLease, LayoutEpoch, LayoutEpochLease, LockAcquireError,
     LockMode, LockNamespace, LockRequest, LockResource, ReadSnapshotLease, ReadTs,
@@ -491,6 +491,14 @@ pub(crate) struct SearchGenerationPublishGuard<'a> {
     _guard: MutexGuard<'a, ()>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SearchGenerationPublishOutcome {
+    Advanced,
+    AlreadyCurrent,
+    Superseded,
+    Retired,
+}
+
 impl Tablet {
     /// Create a new Tablet from metadata
     ///
@@ -776,21 +784,33 @@ impl Tablet {
         Ok(rowsets)
     }
 
-    fn apply_search_generation_heads_locked(
-        &self,
-        heads: Vec<SearchGenerationHeadMeta>,
-    ) -> Result<()> {
+    fn apply_search_generation_heads_locked(&self, heads: Vec<SearchGenerationHeadMeta>) {
         if heads.is_empty() {
-            return Ok(());
+            return;
         }
-        let mut meta = self
-            .meta
-            .write()
-            .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
+        let mut meta = self.meta.write().unwrap_or_else(|poisoned| {
+            tracing::error!(
+                tablet_id = self.tablet_id(),
+                "recovering poisoned tablet meta while applying derived search heads"
+            );
+            poisoned.into_inner()
+        });
         for head in heads {
-            meta.advance_search_generation_head(head)?;
+            let definition_id = head.definition_id;
+            if let Err(error) = meta.advance_search_generation_head(head) {
+                // Search metadata is derived from the just-published base
+                // rowsets. A conflicting index revision must make that index
+                // unavailable, never roll back or poison an already-durable
+                // base-table write.
+                let _ = meta.remove_search_generation_head(definition_id);
+                tracing::error!(
+                    tablet_id = self.tablet_id(),
+                    definition_id,
+                    error = %error,
+                    "disabled inconsistent search generation during rowset publication"
+                );
+            }
         }
-        Ok(())
     }
 
     pub(crate) fn search_generation_head(
@@ -808,6 +828,13 @@ impl Tablet {
 
     pub(crate) fn search_generation_heads(&self) -> Vec<SearchGenerationHeadMeta> {
         self.meta.read().unwrap().search_generation_heads().to_vec()
+    }
+
+    pub(crate) fn is_search_definition_retired(&self, definition_id: u64) -> bool {
+        self.meta
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_search_definition_retired(definition_id)
     }
 
     pub(crate) fn remove_search_generation_heads_guarded(
@@ -828,25 +855,27 @@ impl Tablet {
             .meta_lock
             .write()
             .map_err(|_| paro_error::internal("tablet meta lock poisoned"))?;
-        let previous_heads = {
+        let removed_heads = {
             let mut meta = self
                 .meta
                 .write()
                 .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
-            let previous = meta.search_generation_heads().to_vec();
-            for definition_id in definition_ids {
-                meta.remove_search_generation_head(*definition_id);
-            }
-            if meta.search_generation_heads() == previous.as_slice() {
+            let removed = definition_ids
+                .iter()
+                .filter_map(|definition_id| meta.remove_search_generation_head(*definition_id))
+                .collect::<Vec<_>>();
+            if removed.is_empty() {
                 return Ok(());
             }
-            previous
+            removed
         };
         if let Err(error) = self.save_meta() {
-            self.meta
-                .write()
-                .map_err(|_| paro_error::internal("tablet meta state poisoned after save failure"))?
-                .set_search_generation_heads(previous_heads);
+            let mut meta = self.meta.write().map_err(|_| {
+                paro_error::internal("tablet meta state poisoned after save failure")
+            })?;
+            for head in removed_heads {
+                meta.restore_search_generation_head(head.definition_id, Some(head));
+            }
             return Err(error);
         }
         Ok(())
@@ -922,10 +951,20 @@ impl Tablet {
     pub(crate) fn acquire_search_generation_publish_guard(
         &self,
     ) -> Result<SearchGenerationPublishGuard<'_>> {
-        let guard = self
-            .search_generation_publish_lock
-            .lock()
-            .map_err(|_| paro_error::internal("search generation publication lock poisoned"))?;
+        // Durable tablet apply is not cancellable after WAL append. Keep this
+        // critical section short and recover poison just like the layout gate:
+        // the mutex protects ordering only and contains no partially valid
+        // payload whose invariants could be lost by a panic.
+        let guard = match self.search_generation_publish_lock.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                tracing::error!(
+                    tablet_id = self.tablet_id(),
+                    "recovering poisoned search-generation publication lock"
+                );
+                poisoned.into_inner()
+            }
+        };
         Ok(SearchGenerationPublishGuard {
             tablet_id: self.tablet_id(),
             _guard: guard,
@@ -937,17 +976,36 @@ impl Tablet {
     }
 
     pub fn has_applied_mutation_identity(&self, identity: MutationIdentity) -> bool {
+        if matches!(
+            identity.mutation_kind,
+            MutationKind::PublishSearchGeneration | MutationKind::RetireSearchGeneration
+        ) {
+            return false;
+        }
         let applied = AppliedMutationMeta::from_journal(identity);
         self.applied_mutations.read().unwrap().contains(&applied)
     }
 
     pub fn note_applied_mutation_identity(&self, identity: MutationIdentity) -> Result<bool> {
+        if matches!(
+            identity.mutation_kind,
+            MutationKind::PublishSearchGeneration | MutationKind::RetireSearchGeneration
+        ) {
+            // Search publication and retirement are already represented by
+            // the durable head/tombstone state. Replaying them through that
+            // contract is idempotent and validates the referenced artifact;
+            // retaining a second skip-hint history would add an extra meta
+            // fsync to every revision and could turn failure to persist a
+            // disposable hint into a fatal apply-runtime error.
+            return Ok(false);
+        }
         let applied = AppliedMutationMeta::from_journal(identity);
         {
             let mut mutations = self.applied_mutations.write().unwrap();
-            if !mutations.insert(applied) {
+            if mutations.contains(&applied) {
                 return Ok(false);
             }
+            mutations.insert(applied);
         }
         self.save_meta()?;
         Ok(true)
@@ -1875,7 +1933,7 @@ impl Tablet {
         let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
-        self.apply_search_generation_heads_locked(search_heads)?;
+        self.apply_search_generation_heads_locked(search_heads);
         self.save_meta()?;
 
         self.validate_version_graph()?;
@@ -1945,7 +2003,7 @@ impl Tablet {
         self.register_rowset_locked(rowset)?;
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
-        self.apply_search_generation_heads_locked(search_heads)?;
+        self.apply_search_generation_heads_locked(search_heads);
         self.save_meta()?;
         self.validate_version_graph()?;
         Ok(true)
@@ -3448,14 +3506,31 @@ impl Tablet {
     /// rebuilding or overwriting any artifact.
     pub(crate) fn apply_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
         let guard = self.acquire_search_generation_publish_guard()?;
+        match self.apply_search_generation_publish_guarded(op, &guard)? {
+            SearchGenerationPublishOutcome::Advanced
+            | SearchGenerationPublishOutcome::AlreadyCurrent => Ok(()),
+            SearchGenerationPublishOutcome::Superseded => Err(paro_error::invalid_input(
+                "online search generation publication was superseded by a newer durable head",
+            )),
+            SearchGenerationPublishOutcome::Retired => Err(paro_error::invalid_input(
+                "online search generation publication targeted a retired definition",
+            )),
+        }
+    }
+
+    /// Recovery is intentionally tolerant of an older record whose effect is
+    /// already dominated by a newer durable head.
+    pub(crate) fn replay_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
+        let guard = self.acquire_search_generation_publish_guard()?;
         self.apply_search_generation_publish_guarded(op, &guard)
+            .map(|_| ())
     }
 
     pub(crate) fn apply_search_generation_publish_guarded(
         &self,
         op: &TabletMutation,
         guard: &SearchGenerationPublishGuard<'_>,
-    ) -> Result<()> {
+    ) -> Result<SearchGenerationPublishOutcome> {
         self.apply_search_generation_publish_guarded_with_after_install(op, guard, || Ok(()))
     }
 
@@ -3464,7 +3539,7 @@ impl Tablet {
         &self,
         op: &TabletMutation,
         after_install: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<SearchGenerationPublishOutcome> {
         let guard = self.acquire_search_generation_publish_guard()?;
         self.apply_search_generation_publish_guarded_with_after_install(op, &guard, after_install)
     }
@@ -3474,7 +3549,7 @@ impl Tablet {
         op: &TabletMutation,
         guard: &SearchGenerationPublishGuard<'_>,
         after_install: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<SearchGenerationPublishOutcome> {
         if guard.tablet_id != self.tablet_id() {
             return Err(paro_error::internal(
                 "search generation publication guard belongs to another tablet",
@@ -3542,17 +3617,25 @@ impl Tablet {
             .iter()
             .find(|current| current.definition_id == head.definition_id)
             .cloned();
+        if self
+            .meta
+            .read()
+            .map_err(|_| paro_error::internal("tablet meta state poisoned"))?
+            .is_search_definition_retired(head.definition_id)
+        {
+            return Ok(SearchGenerationPublishOutcome::Retired);
+        }
         if let Some(current) = previous_head.as_ref() {
             let current_revision = (current.generation_id, current.root_version);
             let candidate_revision = (head.generation_id, head.root_version);
             match candidate_revision.cmp(&current_revision) {
                 std::cmp::Ordering::Less => {
                     Self::validate_installed_search_generation(&manifests, current)?;
-                    return Ok(());
+                    return Ok(SearchGenerationPublishOutcome::Superseded);
                 }
                 std::cmp::Ordering::Equal if current == head => {
                     Self::validate_installed_search_generation(&manifests, current)?;
-                    return Ok(());
+                    return Ok(SearchGenerationPublishOutcome::AlreadyCurrent);
                 }
                 std::cmp::Ordering::Equal => {
                     return Err(paro_error::data_corrupted(format!(
@@ -3624,6 +3707,53 @@ impl Tablet {
                 paro_error::internal("tablet meta state poisoned after save failure")
             })?;
             meta.restore_search_generation_head(head.definition_id, previous_head);
+            return Err(error);
+        }
+        Ok(SearchGenerationPublishOutcome::Advanced)
+    }
+
+    /// Durably retire one catalog search definition. Retirement is a tablet
+    /// mutation rather than an in-memory cleanup so delayed maintenance records
+    /// cannot recreate the head during live apply or recovery.
+    pub(crate) fn apply_search_generation_retirement(&self, op: &TabletMutation) -> Result<()> {
+        let TabletMutation::RetireSearchGeneration { definition_id } = op else {
+            return Err(paro_error::internal(
+                "apply_search_generation_retirement called with non-retirement op",
+            ));
+        };
+        let _publication_guard = self.acquire_search_generation_publish_guard()?;
+        let _meta_guard = self
+            .meta_lock
+            .write()
+            .map_err(|_| paro_error::internal("tablet meta lock poisoned"))?;
+        let (previous_head, was_retired) = {
+            let meta = self
+                .meta
+                .read()
+                .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
+            (
+                meta.search_generation_heads()
+                    .iter()
+                    .find(|head| head.definition_id == *definition_id)
+                    .cloned(),
+                meta.is_search_definition_retired(*definition_id),
+            )
+        };
+        if was_retired {
+            return Ok(());
+        }
+        {
+            let mut meta = self
+                .meta
+                .write()
+                .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
+            meta.retire_search_definition(*definition_id)?;
+        }
+        if let Err(error) = self.save_meta() {
+            let mut meta = self.meta.write().map_err(|_| {
+                paro_error::internal("tablet meta state poisoned after retirement save failure")
+            })?;
+            meta.restore_search_definition_retirement(*definition_id, previous_head, was_retired);
             return Err(error);
         }
         Ok(())
@@ -3846,6 +3976,30 @@ mod tests {
     }
 
     #[test]
+    fn retired_search_definition_rejects_live_publish_and_absorbs_replay() {
+        let data_dir = test_data_dir();
+        let tablet = Tablet::new(1, 100, 1000, create_test_schema(), &data_dir, None).unwrap();
+        let publish = staged_search_generation_publish(&tablet, 7, 41, 1);
+        tablet.apply_search_generation_publish(&publish).unwrap();
+
+        let retire = TabletMutation::RetireSearchGeneration { definition_id: 41 };
+        tablet.apply_search_generation_retirement(&retire).unwrap();
+        tablet.apply_search_generation_retirement(&retire).unwrap();
+
+        assert!(tablet.search_generation_head(41).is_none());
+        assert!(tablet.meta.read().unwrap().is_search_definition_retired(41));
+        assert!(tablet.apply_search_generation_publish(&publish).is_err());
+        tablet.replay_search_generation_publish(&publish).unwrap();
+        assert!(tablet.search_generation_head(41).is_none());
+
+        let persisted = tablet.meta.read().unwrap().serialize().unwrap();
+        let restored = TabletMeta::deserialize(&persisted).unwrap();
+        assert!(restored.is_search_definition_retired(41));
+        assert!(restored.search_generation_heads().is_empty());
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
     fn search_generation_replay_completes_crash_between_rename_and_meta_save() {
         let data_dir = test_data_dir();
         let baseline = TabletMeta::new(
@@ -3900,14 +4054,14 @@ mod tests {
         let data_dir = test_data_dir();
         let tablet = Tablet::new(1, 100, 1000, create_test_schema(), &data_dir, None).unwrap();
         let initial = staged_search_generation_publish(&tablet, 7, 41, 1);
-        tablet.apply_search_generation_publish(&initial).unwrap();
+        tablet.replay_search_generation_publish(&initial).unwrap();
         let next = installed_search_generation_revision(&tablet, 41, 2);
         tablet.apply_search_generation_publish(&next).unwrap();
 
         let initial_identity = initial.stable_artifact_id();
         let next_identity = next.stable_artifact_id();
         assert_ne!(initial_identity, next_identity);
-        tablet.apply_search_generation_publish(&initial).unwrap();
+        tablet.replay_search_generation_publish(&initial).unwrap();
         tablet.apply_search_generation_publish(&next).unwrap();
         assert_eq!(tablet.search_generation_head(41).unwrap().root_version, 2);
         let _ = fs::remove_dir_all(data_dir);
@@ -3925,9 +4079,7 @@ mod tests {
 
         let maintenance_tablet = Arc::clone(&tablet);
         let maintenance_thread = std::thread::spawn(move || {
-            maintenance_tablet
-                .apply_search_generation_publish(&maintenance)
-                .unwrap();
+            maintenance_tablet.apply_search_generation_publish(&maintenance)
         });
         let replacement_tablet = Arc::clone(&tablet);
         let replacement_thread = std::thread::spawn(move || {
@@ -3935,11 +4087,70 @@ mod tests {
                 .apply_search_generation_publish(&replacement)
                 .unwrap();
         });
-        maintenance_thread.join().unwrap();
+        let maintenance_result = maintenance_thread.join().unwrap();
         replacement_thread.join().unwrap();
 
         let head = tablet.search_generation_head(41).unwrap();
         assert_eq!((head.generation_id, head.root_version), (2, 1));
+        if let Err(error) = maintenance_result {
+            assert!(error.to_string().contains("superseded"));
+        }
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn search_mutation_identity_history_is_derived_from_durable_lifecycle_state() {
+        let data_dir = test_data_dir();
+        let tablet = Tablet::new(1, 100, 1000, create_test_schema(), &data_dir, None).unwrap();
+        let initial = staged_search_generation_publish(&tablet, 7, 41, 1);
+        tablet.apply_search_generation_publish(&initial).unwrap();
+        tablet
+            .note_applied_mutation_identity(mutation_identity_for_tablet(
+                1,
+                tablet.tablet_id(),
+                &initial,
+            ))
+            .unwrap();
+        let next = installed_search_generation_revision(&tablet, 41, 2);
+        tablet.apply_search_generation_publish(&next).unwrap();
+        tablet
+            .note_applied_mutation_identity(mutation_identity_for_tablet(
+                2,
+                tablet.tablet_id(),
+                &next,
+            ))
+            .unwrap();
+        let retire = TabletMutation::RetireSearchGeneration { definition_id: 41 };
+        tablet.apply_search_generation_retirement(&retire).unwrap();
+        tablet
+            .note_applied_mutation_identity(mutation_identity_for_tablet(
+                3,
+                tablet.tablet_id(),
+                &retire,
+            ))
+            .unwrap();
+        assert!(
+            !tablet.has_applied_mutation_identity(mutation_identity_for_tablet(
+                3,
+                tablet.tablet_id(),
+                &retire,
+            ))
+        );
+
+        let search_identities = tablet
+            .applied_mutations
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|identity| {
+                matches!(
+                    identity.mutation_kind,
+                    super::super::tablet_meta::AppliedMutationKind::PublishSearchGeneration
+                        | super::super::tablet_meta::AppliedMutationKind::RetireSearchGeneration
+                )
+            })
+            .count();
+        assert_eq!(search_identities, 0);
         let _ = fs::remove_dir_all(data_dir);
     }
 

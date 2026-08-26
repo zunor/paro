@@ -211,7 +211,7 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                 generation_ref,
                 ..
             } => {
-                route.storage.apply_search_generation_publish(mutation)?;
+                route.storage.replay_search_generation_publish(mutation)?;
                 let generation_path =
                     generation_ref.resolve_for_tablet(route.storage.tablet().data_dir())?;
                 tracing::info!(
@@ -225,6 +225,21 @@ impl<'handler, 'catalog> ApplyEngine<'handler, 'catalog> {
                     generation_id = head.generation_id,
                     generation_path = %generation_path.display(),
                     "Applied PublishSearchGeneration"
+                );
+            }
+            TabletMutation::RetireSearchGeneration { definition_id } => {
+                route
+                    .storage
+                    .apply_search_generation_retirement(mutation)?;
+                tracing::info!(
+                    target: targets::INSTANCE,
+                    schema = %route.schema_name,
+                    table = %route.table_name,
+                    lsn,
+                    commit_id = commit_visibility.unwrap_or_default(),
+                    tablet_id,
+                    definition_id,
+                    "Applied RetireSearchGeneration"
                 );
             }
         }

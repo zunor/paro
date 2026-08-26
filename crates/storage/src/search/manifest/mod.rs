@@ -347,8 +347,8 @@ impl ManifestStore {
 
     pub(crate) fn root_file_name(root: &GenerationManifestRoot) -> String {
         format!(
-            "manifest_root_g{}_v{}.json",
-            root.generation_id, root.root_version
+            "manifest_root_g{}_v{}_f{}.json",
+            root.generation_id, root.root_version, root.config_fingerprint
         )
     }
 
@@ -382,6 +382,12 @@ impl ManifestStore {
         let path = self
             .generation_dir(definition_id, root_to_write.generation_id)
             .join(Self::root_file_name(&root_to_write));
+        if path.exists() {
+            return Err(paro_error::object_exists(
+                "immutable search manifest root",
+                path.display().to_string(),
+            ));
+        }
         self.write_root_fragment(&path, &root_to_write, embedded_state.as_ref())?;
         Ok(path)
     }
@@ -417,7 +423,15 @@ impl ManifestStore {
         Ok(ManifestFileRef::new(file_name, self.codec_kind))
     }
 
-    pub(crate) fn load_manifest(&self, definition_id: u64) -> Result<Option<LoadedManifest>> {
+    /// Load the greatest immutable root in an isolated build workspace.
+    ///
+    /// This must not be used for an installed table: failed and superseded
+    /// roots intentionally remain on disk, so only the tablet's durable head
+    /// can select a queryable revision there.
+    pub(crate) fn load_latest_manifest_for_private_workspace(
+        &self,
+        definition_id: u64,
+    ) -> Result<Option<LoadedManifest>> {
         let Some(path) = self.latest_versioned_root_path(definition_id)? else {
             return Ok(None);
         };
@@ -852,6 +866,40 @@ impl ManifestStore {
         }
     }
 
+    pub(crate) fn prune_empty_definition_dirs(&self, definition_id: u64) {
+        let definition_dir = self.definition_dir(definition_id);
+        let generations_dir = definition_dir.join("generations");
+        if let Ok(entries) = fs::read_dir(&generations_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    match fs::remove_dir(&path) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => tracing::warn!(
+                            path = %path.display(),
+                            error = %error,
+                            "failed to prune empty search generation directory"
+                        ),
+                    }
+                }
+            }
+        }
+        for path in [&generations_dir, &definition_dir] {
+            match fs::remove_dir(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    error = %error,
+                    "failed to prune empty search definition directory"
+                ),
+            }
+        }
+    }
+
     pub(crate) fn sweep_orphan_staging_fragments(&self) -> Result<usize> {
         let definitions_dir = self
             .table_data_dir
@@ -1219,7 +1267,9 @@ fn parse_manifest_root_file_name(name: &str) -> Option<(SearchGenerationId, u64)
     let body = name
         .strip_prefix("manifest_root_g")?
         .strip_suffix(".json")?;
-    let (generation, version) = body.split_once("_v")?;
+    let (generation, revision) = body.split_once("_v")?;
+    let (version, fingerprint) = revision.split_once("_f")?;
+    fingerprint.parse::<u64>().ok()?;
     Some((generation.parse().ok()?, version.parse().ok()?))
 }
 
@@ -1302,9 +1352,10 @@ fn upsert_tail_entry(
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_manifest_fragment, encode_manifest_fragment, GenerationManifestRoot,
-        ManifestCodecKind, ManifestDelta, ManifestDeltaEntry, ManifestFileRef, ManifestShard,
-        ManifestStore, DELTA_COUNT_HARD_LIMIT, DELTA_COUNT_SOFT_LIMIT,
+        decode_manifest_fragment, encode_manifest_fragment, parse_manifest_root_file_name,
+        GenerationManifestRoot, ManifestCodecKind, ManifestDelta, ManifestDeltaEntry,
+        ManifestFileRef, ManifestShard, ManifestStore, DELTA_COUNT_HARD_LIMIT,
+        DELTA_COUNT_SOFT_LIMIT,
     };
     use crate::search::artifact::{ArtifactLocation, SegmentPagePointer};
     use crate::search::capability::{
@@ -1525,7 +1576,7 @@ mod tests {
         let bytes = std::fs::read(&root_path).unwrap();
         assert!(bytes.starts_with(b"PMB2"));
         let loaded = store
-            .load_manifest(definition_id)
+            .load_latest_manifest_for_private_workspace(definition_id)
             .unwrap()
             .expect("binary manifest should load");
         assert!(loaded.embedded_materialized_state);
@@ -1631,9 +1682,30 @@ mod tests {
         generation_ten.recompute_checksum().unwrap();
         store.write_root(definition_id, &generation_ten).unwrap();
 
-        let loaded = store.load_manifest(definition_id).unwrap().unwrap();
+        let loaded = store
+            .load_latest_manifest_for_private_workspace(definition_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(loaded.root.generation_id, 10);
         assert_eq!(loaded.root.root_version, 1);
+    }
+
+    #[test]
+    fn manifest_root_identity_includes_contract_fingerprint() {
+        let mut first = sample_root(9, Vec::new(), Vec::new());
+        first.generation_id = 3;
+        first.root_version = 7;
+        let mut changed_contract = first.clone();
+        changed_contract.config_fingerprint = first.config_fingerprint + 1;
+
+        assert_ne!(
+            ManifestStore::root_file_name(&first),
+            ManifestStore::root_file_name(&changed_contract)
+        );
+        assert_eq!(
+            parse_manifest_root_file_name(&ManifestStore::root_file_name(&first)),
+            Some((first.generation_id, first.root_version))
+        );
     }
 
     #[test]
@@ -1668,7 +1740,7 @@ mod tests {
         store.write_root(definition_id, &root).unwrap();
 
         let loaded = store
-            .load_manifest(definition_id)
+            .load_latest_manifest_for_private_workspace(definition_id)
             .expect("load manifest")
             .expect("manifest exists");
         assert!(loaded.artifacts.artifacts.is_empty());
@@ -1747,7 +1819,7 @@ mod tests {
         assert!(store.load_manifest_for_head(&old_head).unwrap().is_some());
 
         let loaded = store
-            .load_manifest(definition_id)
+            .load_latest_manifest_for_private_workspace(definition_id)
             .expect("load compacted manifest")
             .expect("manifest exists");
         assert_eq!(loaded.root.recent_delta_files.len(), 0);
@@ -1797,7 +1869,7 @@ mod tests {
         store.write_root(definition_id, &root).unwrap();
 
         let loaded = store
-            .load_manifest(definition_id)
+            .load_latest_manifest_for_private_workspace(definition_id)
             .expect("load manifest")
             .expect("manifest exists");
         assert_eq!(
@@ -1834,7 +1906,7 @@ mod tests {
         store.write_root(definition_id, &root).unwrap();
 
         let err = store
-            .load_manifest(definition_id)
+            .load_latest_manifest_for_private_workspace(definition_id)
             .expect_err("hard over-budget delta window must not open");
         assert!(format!("{err}").contains("exceeds open hard budget"));
     }

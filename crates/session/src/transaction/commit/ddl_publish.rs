@@ -3,7 +3,7 @@
 
 //! DDL publish helpers used by the SQL commit pipeline.
 
-use super::super::ddl_changes::IndexPostCommitAction;
+use super::super::ddl_changes::{IndexPostCommitAction, SearchGenerationRetirementAction};
 use super::super::index_backfill::IndexBackfillPlan;
 use paro_catalog::entry::{
     IndexCatalogEntry, IndexCoverage, IndexType as CatalogIndexType, TableCatalogEntry,
@@ -17,7 +17,6 @@ use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_instance::{DatabaseHandle, Instance};
-use paro_journal::mutation_identity_for_tablet;
 use paro_storage::{
     index::{
         graph::{lock_graph_artifact_io, GraphProjectionIndex, GraphStorageGeneration},
@@ -265,24 +264,46 @@ pub(super) struct StagedGenerationPublishTask {
     owner: Arc<StagedSearchGeneration>,
 }
 
+#[derive(Clone)]
+pub(super) struct SearchGenerationRetirementTask {
+    tablet_id: u64,
+    storage: Arc<TableHandle>,
+    mutation: TabletMutation,
+}
+
+impl SearchGenerationRetirementTask {
+    pub(super) fn from_action(action: &SearchGenerationRetirementAction) -> Self {
+        let tablet_id = action.storage.tablet_id();
+        Self {
+            tablet_id,
+            storage: Arc::clone(&action.storage),
+            mutation: TabletMutation::RetireSearchGeneration {
+                definition_id: action.definition_id,
+            },
+        }
+    }
+
+    pub(super) fn tablet_id(&self) -> u64 {
+        self.tablet_id
+    }
+
+    pub(super) fn apply(&self) -> Result<()> {
+        self.storage
+            .apply_search_generation_retirement(&self.mutation)
+    }
+}
+
 impl StagedGenerationPublishTask {
     pub(super) fn tablet_id(&self) -> u64 {
         self.tablet_id
     }
 
-    pub(super) fn apply(&self, commit_id: u64) -> Result<()> {
+    pub(super) fn apply(&self) -> Result<()> {
         self.storage
             .apply_search_generation_publish(&self.mutation)?;
         // Once the immutable directory and tablet head are durable, recovery
         // no longer needs the private staging workspace as a source.
         self.owner.mark_published()?;
-        self.storage
-            .tablet()
-            .note_applied_mutation_identity(mutation_identity_for_tablet(
-                commit_id,
-                self.tablet_id,
-                &self.mutation,
-            ))?;
         Ok(())
     }
 }
