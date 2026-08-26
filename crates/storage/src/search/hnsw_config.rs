@@ -11,15 +11,17 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub use crate::index::hnsw::types::{
-    DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH,
-    DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
+    DEFAULT_HNSW_BUILD_SEED, DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
+    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
+    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
     DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
     DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
     DEFAULT_HNSW_WARMUP_POINT_COUNT, HNSW_BUILT_IN_DISTANCE_COST_REVISION,
 };
 use crate::index::hnsw::{
-    DistanceMetric, HnswBuildContract, HnswDistanceCostProfile, HnswDistanceCostProfileSource,
-    HnswFilterTopologyContract, HnswSearchPolicy, MAX_HNSW_FILTER_COLUMNS,
+    DistanceMetric, HnswBuildContract, HnswBuildVectorEncoding, HnswDistanceCostProfile,
+    HnswDistanceCostProfileSource, HnswFilterTopologyContract, HnswSearchPolicy,
+    MAX_HNSW_FILTER_COLUMNS,
 };
 use paro_common::error::{self as paro_error, Result};
 
@@ -27,6 +29,11 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 18 upgrades compact routing to symmetric i16 so ordered geometry
+/// cannot collapse into an i8 codebook. Version 17 makes the construction
+/// routing-vector encoding an explicit,
+/// durable definition choice. Version 16 pins the dimension-aware distance
+/// cost model and its provenance to the definition.
 /// Version 15 binds construction to canonical unordered point-pair scoring so
 /// cosine topology cannot vary with heuristic operand order.
 /// Version 14 removes cardinality thresholds from search policy. Exact versus
@@ -45,7 +52,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 15;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 18;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -62,6 +69,8 @@ pub struct HnswProviderConfig {
     pub version: u32,
     pub dimension: u32,
     pub distance: DistanceMetric,
+    pub build_vector_encoding: HnswBuildVectorEncoding,
+    pub build_routing_dimensions: u32,
     /// Fixed-width durable fields. Runtime `usize` values are derived only
     /// after validation so catalog bytes have platform-independent meaning.
     pub m: u32,
@@ -103,6 +112,26 @@ impl HnswProviderConfig {
                 "HNSW provider_config dimension must be greater than zero",
             ));
         }
+        match self.build_vector_encoding {
+            HnswBuildVectorEncoding::ExactF32 if self.build_routing_dimensions != 0 => {
+                return Err(paro_error::invalid_input(
+                    "exact_f32 HNSW construction does not accept build_routing_dimensions",
+                ));
+            }
+            HnswBuildVectorEncoding::SymmetricI16
+                if self.build_routing_dimensions == 0
+                    || self.build_routing_dimensions > self.dimension
+                    || self.build_routing_dimensions > u16::MAX as u32 =>
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "symmetric_i16 HNSW build_routing_dimensions must be between 1 and min(dimension, {}), got {} for dimension {}",
+                    u16::MAX,
+                    self.build_routing_dimensions,
+                    self.dimension
+                )));
+            }
+            _ => {}
+        }
         if !(2..=1_024).contains(&self.m) {
             return Err(paro_error::invalid_input(format!(
                 "HNSW m must be between 2 and 1024, got {}",
@@ -131,6 +160,14 @@ impl HnswProviderConfig {
             return Err(paro_error::invalid_input(format!(
                 "HNSW ef_search must be between 1 and 1000000, got {}",
                 self.ef_search
+            )));
+        }
+        if self.distance_cost.reference_dimension == 0
+            || self.distance_cost.reference_dimension > 1_000_000
+        {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW distance_cost_reference_dimension must be between 1 and 1000000, got {}",
+                self.distance_cost.reference_dimension
             )));
         }
         for (name, ratio) in [
@@ -235,6 +272,8 @@ impl HnswProviderConfig {
             m0: self.m * 2,
             ef_construct: self.ef_construct,
             distance: self.distance,
+            vector_encoding: self.build_vector_encoding,
+            routing_dimensions: self.build_routing_dimensions,
             build_seed: self.build_seed,
             proposal_wave_size: self.proposal_wave_size,
             warmup_point_count: self.warmup_point_count,
@@ -278,6 +317,8 @@ mod tests {
             version: HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 100,
             distance: DistanceMetric::Euclidean,
+            build_vector_encoding: HnswBuildVectorEncoding::SymmetricI16,
+            build_routing_dimensions: 100,
             m: 24,
             ef_construct: 100,
             ef_search: 100,

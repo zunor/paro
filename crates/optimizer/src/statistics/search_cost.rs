@@ -114,11 +114,17 @@ impl VectorScanCostModel {
         // Planning and execution consume the same immutable definition-owned
         // profile. Timing history from this process cannot change EXPLAIN or
         // make otherwise identical replicas choose different paths.
-        let sequential_vector_scan_factor = 1.0
-            / policy
+        let vector_dimension = u32::try_from(stats.dimension).unwrap_or(u32::MAX).max(1);
+        let dimension = f64::from(vector_dimension);
+        let reference_dimension = f64::from(policy.distance_cost.reference_dimension.max(1));
+        let reference_ratio = f64::from(
+            policy
                 .distance_cost
                 .sequential_covering_scores_per_random_score
-                .max(1) as f64;
+                .max(1),
+        );
+        let sequential_vector_scan_factor =
+            dimension / (dimension + (reference_ratio - 1.0) * reference_dimension);
         // Planning cannot assume every predicate part has a generation
         // covering layout: a fresh tail may still gather base vectors. Use
         // the conservative indexed-base profile for filtered exact scoring;
@@ -175,6 +181,7 @@ impl VectorScanCostModel {
                 stats.num_indexed_vectors as u64,
                 k,
                 effective_ef,
+                vector_dimension,
                 policy,
             );
             let search_cost = match decision.strategy {
@@ -388,12 +395,18 @@ mod tests {
             policy,
             Some(ExactFilterMaterialization::ColumnScan),
         );
-        let expected_scan_delta = 1_000_000.0
-            / (f64::from(
-                policy
-                    .distance_cost
-                    .sequential_covering_scores_per_random_score,
-            ) * VectorScanCostModel::REFERENCE_VECTOR_DIMENSION)
+        let dimension = 128.0;
+        let reference_dimension = f64::from(policy.distance_cost.reference_dimension.max(1));
+        let ratio = f64::from(
+            policy
+                .distance_cost
+                .sequential_covering_scores_per_random_score
+                .max(1),
+        );
+        let sequential_vector_scan_factor =
+            dimension / (dimension + (ratio - 1.0) * reference_dimension);
+        let expected_scan_delta = 1_000_000.0 * sequential_vector_scan_factor
+            / VectorScanCostModel::REFERENCE_VECTOR_DIMENSION
             - 1_000_000.0_f64.ln();
         assert!(scan > postings, "scan={scan}, postings={postings}");
         assert!(

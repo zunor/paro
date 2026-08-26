@@ -1071,10 +1071,11 @@ fn push_vector_search_properties(
         properties,
         "Exact/Graph Cost Profile",
         format!(
-            "covering={} sequential scores/random score, indexed-base={} gathered scores/random score, graph={} unique scores/ef (source={}, definition-pinned); observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
+            "covering={} sequential scores/random score at {}D reference, indexed-base={} gathered scores/random score, graph={} unique scores/ef (source={}, definition-pinned); random-access cost is dimension-scaled; observed generation average level-0 degree={:.2} is descriptive, not a cost cap",
             spec.search_policy
                 .distance_cost
                 .sequential_covering_scores_per_random_score,
+            spec.search_policy.distance_cost.reference_dimension,
             spec.search_policy
                 .distance_cost
                 .indexed_base_scores_per_random_score,

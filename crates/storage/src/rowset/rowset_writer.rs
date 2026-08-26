@@ -2013,6 +2013,8 @@ mod tests {
                 "version": HNSW_PROVIDER_CONFIG_VERSION,
                 "dimension": 2,
                 "distance": "euclidean",
+                "build_vector_encoding": "exact_f32",
+                "build_routing_dimensions": 0,
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
@@ -2021,6 +2023,8 @@ mod tests {
                         "kind": "built_in",
                         "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
                     },
+                    "reference_dimension":
+                        crate::search::DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
                     "sequential_covering_scores_per_random_score":
                         crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
                     "indexed_base_scores_per_random_score":

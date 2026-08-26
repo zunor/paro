@@ -431,6 +431,8 @@ impl VectorSearchCursor {
             total_rows: segment.segment.num_rows(),
             top_k: self.k,
             effective_ef,
+            vector_dimension: u32::try_from(self.vector_dim)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
             exact_scan_workload,
             cost_profile: self.search_policy.distance_cost,
         });
@@ -551,6 +553,8 @@ impl VectorSearchCursor {
             total_rows: artifact.coverage.row_count(),
             top_k: self.k,
             effective_ef,
+            vector_dimension: u32::try_from(self.vector_dim)
+                .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
             exact_scan_workload: index.exact_scan_workload(filter),
             cost_profile: self.search_policy.distance_cost,
         });

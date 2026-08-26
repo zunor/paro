@@ -113,7 +113,14 @@ fn should_refine_predicate(
     phase_one_floor: f32,
 ) -> bool {
     if admission_count == 0 {
-        return false;
+        // Zero admissions are the strongest evidence that ordinary graph
+        // navigation never reached the predicate geometry. The caller may
+        // still have durable partition witnesses that can seed the predicate
+        // topology without a phase-one result. Returning false here used to
+        // bypass that topology and jump directly to an exact full-row-set
+        // fallback for precisely the anti-correlated filters it was built to
+        // serve.
+        return true;
     }
     let required = usize::try_from(required_filtered_admissions(top))
         .unwrap_or(usize::MAX)
@@ -1069,7 +1076,7 @@ mod tests {
     #[test]
     fn adaptive_refinement_uses_locality_as_well_as_admission_count() {
         assert!(should_refine_predicate(10, 160, 20, false, Some(0.4), 0.5,));
-        assert!(!should_refine_predicate(10, 160, 0, false, None, 0.5));
+        assert!(should_refine_predicate(10, 160, 0, false, None, 0.5));
     }
 
     #[test]

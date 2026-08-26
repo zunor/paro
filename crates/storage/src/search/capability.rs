@@ -899,6 +899,8 @@ mod tests {
             version: HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 16,
             distance: DistanceMetric::Cosine,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
+            build_routing_dimensions: 16,
             m: 16,
             ef_construct: 96,
             ef_search: 64,

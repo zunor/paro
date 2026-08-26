@@ -57,10 +57,13 @@ pub use persistence::{
     HnswFilterColumnBlocks, HnswIndex, HNSW_ARTIFACT_ALIGNMENT, HNSW_ARTIFACT_FORMAT_VERSION,
 };
 pub use predicate_scan::PredicateScanLayout;
+pub(crate) use predicate_scan::PREDICATE_SCAN_BUILD_STREAM_BYTES;
 pub use scorer::VectorScorer;
 pub use search_context::{FixedLengthPriorityQueue, SearchContext};
 pub use types::*;
-pub(crate) use vector_storage::PartitionedVectorStorage;
+pub(crate) use vector_storage::{
+    open_plain_vector_column, open_plain_vector_column_pages, PartitionedVectorStorage,
+};
 pub use vector_storage::{
     InMemoryVectorStorage, IndexedVectorStorage, MmapVectorStorage, SharedVectorStorage,
     VectorStorage,

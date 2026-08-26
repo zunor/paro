@@ -974,6 +974,8 @@ mod tests {
             version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 16,
             distance: crate::index::hnsw::DistanceMetric::Euclidean,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
+            build_routing_dimensions: 16,
             m: 8,
             ef_construct: 64,
             ef_search: 100,

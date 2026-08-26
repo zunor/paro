@@ -5,6 +5,7 @@ use super::{HnswBuildContract, HnswFilterBlocks, HnswIndex, VectorStorage};
 use paro_common::error::{self as paro_error, Result};
 use rayon::ThreadPool;
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -125,6 +126,7 @@ impl fmt::Debug for HnswBuildStopCheck {
 #[derive(Clone, Debug, Default)]
 pub struct HnswBuilder {
     stop_check: Option<HnswBuildStopCheck>,
+    workspace_dir: Option<PathBuf>,
 }
 
 impl HnswBuilder {
@@ -137,17 +139,27 @@ impl HnswBuilder {
         self
     }
 
+    /// Place large build-only routing workspaces beside the artifact staging
+    /// files. This keeps them on a governed, capacity-checked filesystem and
+    /// makes cancellation cleanup deterministic.
+    pub fn with_workspace_dir(mut self, workspace_dir: impl AsRef<Path>) -> Self {
+        self.workspace_dir = Some(workspace_dir.as_ref().to_path_buf());
+        self
+    }
+
     pub fn build(
         &self,
         storage: Arc<dyn VectorStorage>,
         build_contract: HnswBuildContract,
     ) -> Result<HnswIndex> {
         let (pool, _) = hnsw_build_pool()?;
-        HnswIndex::build_with_controls(
+        HnswIndex::build_with_controls_and_filter_blocks_in_workspace(
             storage,
             build_contract,
+            HnswFilterBlocks::default(),
             Some(pool),
             self.stop_check.as_ref(),
+            self.workspace_dir.as_deref(),
         )
     }
 
@@ -158,12 +170,13 @@ impl HnswBuilder {
         filter_blocks: HnswFilterBlocks,
     ) -> Result<HnswIndex> {
         let (pool, _) = hnsw_build_pool()?;
-        HnswIndex::build_with_controls_and_filter_blocks(
+        HnswIndex::build_with_controls_and_filter_blocks_in_workspace(
             storage,
             build_contract,
             filter_blocks,
             Some(pool),
             self.stop_check.as_ref(),
+            self.workspace_dir.as_deref(),
         )
     }
 }

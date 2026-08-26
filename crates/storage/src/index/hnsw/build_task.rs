@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    HnswBuildContract, HnswBuildStopCheck, HnswBuilder, MmapVectorStorage, HNSW_ARTIFACT_ALIGNMENT,
+    open_plain_vector_column, HnswBuildContract, HnswBuildStopCheck, HnswBuilder,
+    HNSW_ARTIFACT_ALIGNMENT,
 };
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{SegmentFooter, SegmentSharedPtr};
 use crate::rowset::RowsetSharedPtr;
@@ -359,13 +359,17 @@ fn build_hnsw_page_data(
         return Ok(None);
     }
 
-    let vector_storage = Arc::new(MmapVectorStorage::open_range(
-        segment_path,
-        col_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-        col_meta.num_rows * job.dim as u64 * std::mem::size_of::<f32>() as u64,
-        job.dim,
-    )?);
-    let index = hnsw_builder.build(vector_storage, job.build_contract)?;
+    let vector_storage = open_plain_vector_column(segment_path, col_meta, job.dim)?;
+    let workspace_dir = segment_path.parent().ok_or_else(|| {
+        paro_error::internal(format!(
+            "segment path {} has no parent for HNSW build workspace",
+            segment_path.display()
+        ))
+    })?;
+    let index = hnsw_builder
+        .clone()
+        .with_workspace_dir(workspace_dir)
+        .build(vector_storage, job.build_contract)?;
     let statistics = HnswIndexStatistics::collect(&index)?;
     let index_data = index.serialize()?;
     Ok(Some(PendingHnswPage {

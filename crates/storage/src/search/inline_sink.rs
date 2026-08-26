@@ -672,7 +672,6 @@ impl HnswInlineThreshold {
         )
         .saturating_add(Self::estimate_filter_build_peak_memory_bytes(
             vector_count,
-            dimension,
             contract.filter_topology.columns().len(),
             contract.filter_topology.m,
             contract.ef_construct,
@@ -683,7 +682,6 @@ impl HnswInlineThreshold {
 
     fn estimate_filter_build_peak_memory_bytes(
         vector_count: u64,
-        dimension: u32,
         filter_columns: usize,
         filter_m: u32,
         ef_construct: u32,
@@ -707,13 +705,6 @@ impl HnswInlineThreshold {
             .div_ceil(u64::from(filter_m.max(2)) - 1)
             .saturating_mul(std::mem::size_of::<Vec<u32>>() as u64);
         let block_membership = vector_count.saturating_mul(std::mem::size_of::<u32>() as u64);
-        // The retained covering layout owns one vector copy for every point.
-        // Building the current predicate-local graph also needs a temporary
-        // row-id-ordered block copy because scan order must not perturb graph
-        // topology. Both coexist at the block build peak.
-        let graph_order_block_vectors = max_block_rows
-            .saturating_mul(u64::from(dimension.max(1)))
-            .saturating_mul(std::mem::size_of::<f32>() as u64);
         let expected_visits =
             u64::from(ef_construct).saturating_mul(u64::from(filter_m).saturating_mul(2));
         let local_visited =
@@ -727,12 +718,11 @@ impl HnswInlineThreshold {
                 max_block_rows,
                 filter_m,
             ))
-            .saturating_add(Self::estimate_filter_scan_layout_bytes(
-                vector_count,
-                dimension,
-                filter_columns,
-            ))
-            .saturating_add(graph_order_block_vectors)
+            // Covering vectors are streamed directly from the canonical
+            // generation image. Only one bounded encoder batch is resident;
+            // the durable full-size layout is an I/O/storage cost, not build
+            // memory.
+            .saturating_add(crate::index::hnsw::PREDICATE_SCAN_BUILD_STREAM_BYTES as u64)
             .saturating_add(local_visited)
     }
 }
@@ -925,6 +915,26 @@ mod tests {
     }
 
     #[test]
+    fn predicate_covering_vectors_are_streamed_instead_of_retained_at_build_time() {
+        const POINTS: u64 = 10_000_000;
+        const DIMENSION: u64 = 768;
+        let predicate_peak =
+            HnswInlineThreshold::estimate_filter_build_peak_memory_bytes(POINTS, 1, 16, 100, 10);
+        let former_covering_copy = POINTS
+            .saturating_mul(DIMENSION)
+            .saturating_mul(std::mem::size_of::<f32>() as u64);
+
+        assert!(
+            predicate_peak < former_covering_copy,
+            "predicate build estimate must not contain a full f32 covering copy"
+        );
+        assert!(
+            predicate_peak >= crate::index::hnsw::PREDICATE_SCAN_BUILD_STREAM_BYTES as u64,
+            "predicate build estimate must retain the bounded publication stream buffer"
+        );
+    }
+
+    #[test]
     fn persisted_fixed_record_budget_does_not_inherit_builder_container_overhead() {
         let points = 1_000_000;
         let resident = HnswInlineThreshold::estimate_graph_memory_bytes(points, 16);
@@ -967,6 +977,8 @@ mod tests {
                 "version": HNSW_PROVIDER_CONFIG_VERSION,
                 "dimension": 4,
                 "distance": "euclidean",
+                "build_vector_encoding": "symmetric_i16",
+                "build_routing_dimensions": 4,
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
@@ -975,6 +987,7 @@ mod tests {
                         "kind": "built_in",
                         "revision": crate::index::hnsw::HNSW_BUILT_IN_DISTANCE_COST_REVISION
                     },
+                    "reference_dimension": crate::search::DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION,
                     "sequential_covering_scores_per_random_score": crate::search::DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
                     "indexed_base_scores_per_random_score": crate::search::DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
                     "graph_scored_points_per_ef": crate::search::DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF

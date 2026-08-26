@@ -18,11 +18,11 @@ use paro_storage::index::hnsw::DistanceMetric;
 use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
-    DEFAULT_HNSW_EF_CONSTRUCT, DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTER_BLOCK_ROWS,
-    DEFAULT_HNSW_FILTER_M, DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF,
-    DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_M,
-    DEFAULT_HNSW_PROPOSAL_WAVE_SIZE, DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE,
-    DEFAULT_HNSW_WARMUP_POINT_COUNT,
+    DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION, DEFAULT_HNSW_EF_CONSTRUCT,
+    DEFAULT_HNSW_EF_SEARCH, DEFAULT_HNSW_FILTER_BLOCK_ROWS, DEFAULT_HNSW_FILTER_M,
+    DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF, DEFAULT_HNSW_INDEXED_BASE_SCORES_PER_RANDOM_SCORE,
+    DEFAULT_HNSW_M, DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
+    DEFAULT_HNSW_SEQUENTIAL_COVERING_SCORES_PER_RANDOM_SCORE, DEFAULT_HNSW_WARMUP_POINT_COUNT,
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
@@ -309,7 +309,10 @@ fn hnsw_provider_config(
         "ef_construct",
         "ef_search",
         "distance",
+        "build_vector_encoding",
+        "build_routing_dimensions",
         "build_seed",
+        "distance_cost_reference_dimension",
         "sequential_covering_scores_per_random_score",
         "indexed_base_scores_per_random_score",
         "graph_scored_points_per_ef",
@@ -361,8 +364,26 @@ fn hnsw_provider_config(
             "HNSW index option distance must be one of l2, cosine, ip, or l1, got '{distance_name}'"
         ))
     })?;
+    let build_vector_encoding = match options
+        .get("build_vector_encoding")
+        .map(String::as_str)
+        .unwrap_or("symmetric_i16")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "exact_f32" | "f32" => paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32,
+        "symmetric_i16" | "i16" => {
+            paro_storage::index::hnsw::HnswBuildVectorEncoding::SymmetricI16
+        }
+        value => {
+            return Err(paro_error::invalid_input(format!(
+                "HNSW index option build_vector_encoding must be exact_f32 or symmetric_i16, got '{value}'"
+            )))
+        }
+    };
     let build_seed = parse_u64_index_option(options, "build_seed", DEFAULT_HNSW_BUILD_SEED)?;
     let cost_option_names = [
+        "distance_cost_reference_dimension",
         "sequential_covering_scores_per_random_score",
         "indexed_base_scores_per_random_score",
         "graph_scored_points_per_ef",
@@ -377,12 +398,18 @@ fn hnsw_provider_config(
         .transpose()?;
     let distance_cost = match (cost_option_count, calibration_id) {
         (0, None) => paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
-        (3, Some(calibration_id)) if calibration_id != 0 => {
+        (4, Some(calibration_id)) if calibration_id != 0 => {
             paro_storage::index::hnsw::HnswDistanceCostProfile {
                 source:
                     paro_storage::index::hnsw::HnswDistanceCostProfileSource::OfflineCalibration {
                         calibration_id,
                     },
+                reference_dimension: u32::try_from(parse_u64_index_option(
+                    options,
+                    "distance_cost_reference_dimension",
+                    u64::from(DEFAULT_HNSW_DISTANCE_COST_REFERENCE_DIMENSION),
+                )?)
+                .map_err(|_| paro_error::out_of_range("HNSW distance_cost_reference_dimension"))?,
                 sequential_covering_scores_per_random_score: u32::try_from(parse_u64_index_option(
                     options,
                     "sequential_covering_scores_per_random_score",
@@ -407,14 +434,14 @@ fn hnsw_provider_config(
                 .map_err(|_| paro_error::out_of_range("HNSW graph_scored_points_per_ef"))?,
             }
         }
-        (3, Some(0)) => {
+        (4, Some(0)) => {
             return Err(paro_error::invalid_input(
                 "HNSW distance_cost_calibration_id must be non-zero",
             ));
         }
         _ => {
             return Err(paro_error::invalid_input(
-                "HNSW distance-cost tuning requires all three cost coefficients and a non-zero distance_cost_calibration_id",
+                "HNSW distance-cost tuning requires a reference dimension, all three cost coefficients, and a non-zero distance_cost_calibration_id",
             ));
         }
     };
@@ -511,10 +538,27 @@ fn hnsw_provider_config(
     let dimension = u32::try_from(*dimension).map_err(|_| {
         paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
     })?;
+    let build_routing_dimensions = match build_vector_encoding {
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::ExactF32 => {
+            parse_u64_index_option(options, "build_routing_dimensions", 0)?
+        }
+        paro_storage::index::hnsw::HnswBuildVectorEncoding::SymmetricI16 => parse_u64_index_option(
+            options,
+            "build_routing_dimensions",
+            u64::from(
+                dimension.min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
+            ),
+        )?,
+    };
+    let build_routing_dimensions = u32::try_from(build_routing_dimensions).map_err(|_| {
+        paro_error::invalid_input("HNSW build_routing_dimensions exceeds durable u32 width")
+    })?;
     HnswProviderConfig {
         version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
         distance,
+        build_vector_encoding,
+        build_routing_dimensions,
         m: u32::try_from(m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
         ef_construct: u32::try_from(ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
@@ -939,6 +983,7 @@ mod tests {
                 "CREATE VECTOR INDEX idx_items_embedding ON items (embedding) \
                  m = 32 ef_construct = 160 ef_search = 96 distance = cosine \
                  build_seed = 42 \
+                 distance_cost_reference_dimension = 768 \
                  sequential_covering_scores_per_random_score = 14 \
                  indexed_base_scores_per_random_score = 1 \
                  graph_scored_points_per_ef = 20 distance_cost_calibration_id = 42 \
@@ -958,6 +1003,11 @@ mod tests {
         assert_eq!(bound.info.provider_config["ef_construct"], 160);
         assert_eq!(bound.info.provider_config["ef_search"], 96);
         assert_eq!(bound.info.provider_config["distance"], "cosine");
+        assert_eq!(
+            bound.info.provider_config["build_vector_encoding"],
+            "symmetric_i16"
+        );
+        assert_eq!(bound.info.provider_config["build_routing_dimensions"], 100);
         assert_eq!(bound.info.provider_config["build_seed"], 42);
         assert_eq!(
             bound.info.provider_config["version"],
@@ -975,6 +1025,10 @@ mod tests {
         assert_eq!(
             bound.info.provider_config["distance_cost"]["graph_scored_points_per_ef"],
             20
+        );
+        assert_eq!(
+            bound.info.provider_config["distance_cost"]["reference_dimension"],
+            768
         );
         assert_eq!(
             bound.info.provider_config["filter_columns"],
@@ -1007,13 +1061,14 @@ mod tests {
         .unwrap_err();
         assert!(partial
             .to_string()
-            .contains("requires all three cost coefficients"));
+            .contains("requires a reference dimension"));
 
         let mut binder = test_binder_with_public_table("items", &[("embedding", vector_type)]);
         let unidentified = bind_create_index(
             &mut binder,
             parse_create_index_stmt(
                 "CREATE VECTOR INDEX idx_unidentified ON items (embedding) \
+                 distance_cost_reference_dimension = 32 \
                  sequential_covering_scores_per_random_score = 14 \
                  indexed_base_scores_per_random_score = 1 \
                  graph_scored_points_per_ef = 20",
@@ -1022,7 +1077,7 @@ mod tests {
         .unwrap_err();
         assert!(unidentified
             .to_string()
-            .contains("requires all three cost coefficients"));
+            .contains("non-zero distance_cost_calibration_id"));
     }
 
     #[test]
@@ -1081,6 +1136,18 @@ mod tests {
         assert!(invalid_inline_dimension
             .to_string()
             .contains("max_dimension"));
+
+        let invalid_exact_routing = bind_create_index(
+            &mut binder,
+            parse_create_index_stmt(
+                "CREATE VECTOR INDEX idx_bad_exact_routing ON items (embedding) \
+                 build_vector_encoding = exact_f32 build_routing_dimensions = 4",
+            ),
+        )
+        .expect_err("exact construction must reject compact routing dimensions");
+        assert!(invalid_exact_routing
+            .to_string()
+            .contains("does not accept build_routing_dimensions"));
     }
 
     #[test]

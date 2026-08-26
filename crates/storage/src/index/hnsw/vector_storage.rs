@@ -8,13 +8,18 @@
 use super::types::PointOffset;
 use super::DistanceMetric;
 use bytes::Bytes;
-use memmap2::Mmap;
+use memmap2::{Mmap, MmapMut};
 use paro_common::error::Result;
 use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::index::partition_directory::PartitionDirectory;
+use crate::rowset::column::OrdinalIndexReader;
+use crate::rowset::encoding::{FieldType, PLAIN_PAGE_HEADER_SIZE};
+use crate::rowset::page::{CompressionType, EncodingType, PageFooter, PageIO, PageReadOptions};
+use crate::rowset::segment::ColumnMeta;
 
 /// Immutable per-point cosine preprocessing owned by an HNSW artifact.
 ///
@@ -180,6 +185,707 @@ pub trait VectorStorage: Send + Sync {
     fn is_mmap_backed(&self) -> bool {
         false
     }
+
+    /// Compact immutable routing image used only by graph navigation. Exact
+    /// scans and SQL-visible scores continue to use the canonical f32 matrix.
+    fn i16_routing_view(&self) -> Option<I16RoutingView<'_>> {
+        None
+    }
+
+    /// Score two stored points for durable graph construction.
+    ///
+    /// The default is the canonical f32 metric. Build-only wrappers may
+    /// override this with a compact deterministic representation; query
+    /// scoring remains owned by [`crate::index::hnsw::scorer::VectorScorer`]
+    /// and therefore cannot accidentally emit encoded scores to SQL.
+    fn construction_similarity(
+        &self,
+        distance: DistanceMetric,
+        left: PointOffset,
+        right: PointOffset,
+    ) -> f32 {
+        if distance == DistanceMetric::Cosine {
+            let norms = self
+                .cosine_inverse_norms()
+                .unwrap_or_else(|| unreachable!("cosine construction storage is prepared once"));
+            distance.similarity_indexed(
+                self.get_vector(left),
+                self.get_vector(right),
+                norms.value(left),
+                norms.value(right),
+            )
+        } else {
+            distance.similarity(self.get_vector(left), self.get_vector(right))
+        }
+    }
+}
+
+const I16_BUILD_ALIGNMENT: usize = 16;
+const MAX_OWNED_I16_BUILD_BYTES: usize = 64 * 1024 * 1024;
+
+enum WritableI16BuildBacking {
+    Owned(Vec<u8>),
+    Mmap(MmapMut),
+}
+
+impl WritableI16BuildBacking {
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Mmap(mmap) => mmap,
+        }
+    }
+
+    fn freeze(self) -> Result<I16BuildBacking> {
+        match self {
+            Self::Owned(bytes) => Ok(I16BuildBacking::Owned(bytes.into_boxed_slice())),
+            Self::Mmap(mmap) => Ok(I16BuildBacking::Mmap(mmap.make_read_only()?)),
+        }
+    }
+}
+
+pub(crate) enum I16BuildBacking {
+    Owned(Box<[u8]>),
+    Bytes(Bytes),
+    Mmap(Mmap),
+    MmapRange {
+        mmap: Arc<Mmap>,
+        offset: usize,
+        len: usize,
+    },
+}
+
+impl I16BuildBacking {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            Self::Owned(bytes) => bytes,
+            Self::Bytes(bytes) => bytes,
+            Self::Mmap(mmap) => mmap,
+            Self::MmapRange { mmap, offset, len } => &mmap[*offset..*offset + *len],
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct I16RoutingView<'a> {
+    pub codes: &'a [u8],
+    pub source_dimension: usize,
+    pub row_stride_bytes: usize,
+    pub scales: &'a [f32],
+    pub selected_dimensions: &'a [usize],
+    pub inverse_norms: Option<&'a CosineInverseNorms>,
+}
+
+/// Build-only symmetric scalar encoding over canonical base vectors.
+///
+/// A single scale keeps every supported metric symmetric and makes pair
+/// scoring independent of operand order. Large code matrices are file-backed
+/// in the caller's sidecar staging directory; only explicitly bounded inline
+/// builds may retain codes on the heap.
+pub(crate) struct SymmetricI16BuildVectorStorage {
+    base: Arc<dyn VectorStorage>,
+    codes: I16BuildBacking,
+    dimension: usize,
+    row_stride_bytes: usize,
+    selected_dimensions: Box<[usize]>,
+    scales: Box<[f32]>,
+    routing_inverse_norms: Option<CosineInverseNorms>,
+}
+
+impl SymmetricI16BuildVectorStorage {
+    fn prepare(
+        base: Arc<dyn VectorStorage>,
+        routing_dimensions: usize,
+        build_seed: u64,
+        workspace_dir: Option<&Path>,
+    ) -> Result<Arc<dyn VectorStorage>> {
+        let dimension = base.vector_dim();
+        if dimension == 0 {
+            return Err(paro_common::error::invalid_input(
+                "HNSW symmetric-i16 build encoding requires a non-zero dimension",
+            ));
+        }
+        if routing_dimensions == 0 || routing_dimensions > dimension {
+            return Err(paro_common::error::invalid_input(format!(
+                "HNSW symmetric-i16 routing dimension {routing_dimensions} is invalid for base dimension {dimension}"
+            )));
+        }
+        let mut minima = vec![f32::INFINITY; dimension];
+        let mut maxima = vec![f32::NEG_INFINITY; dimension];
+        base.try_for_each_contiguous_chunk(&mut |values| {
+            if values.len() % dimension != 0 {
+                return Err(paro_common::error::data_corrupted(
+                    "HNSW build vector chunk contains a partial row",
+                ));
+            }
+            for vector in values.chunks_exact(dimension) {
+                for (source_dimension, &value) in vector.iter().enumerate() {
+                    if !value.is_finite() {
+                        return Err(paro_common::error::invalid_input(
+                            "symmetric-i16 HNSW construction requires finite vector values",
+                        ));
+                    }
+                    minima[source_dimension] = minima[source_dimension].min(value);
+                    maxima[source_dimension] = maxima[source_dimension].max(value);
+                }
+            }
+            Ok(())
+        })?;
+        let selected_dimensions =
+            multiscale_routing_dimensions(&minima, &maxima, routing_dimensions, build_seed);
+        let scales = selected_dimensions
+            .iter()
+            .map(|&source_dimension| {
+                let max_abs = minima[source_dimension]
+                    .abs()
+                    .max(maxima[source_dimension].abs());
+                if !max_abs.is_finite() || max_abs == 0.0 {
+                    1.0
+                } else {
+                    max_abs / 32_767.0
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        let encoded_dimension = routing_dimensions
+            .checked_add(I16_BUILD_ALIGNMENT - 1)
+            .map(|value| value / I16_BUILD_ALIGNMENT * I16_BUILD_ALIGNMENT)
+            .ok_or_else(|| {
+                paro_common::error::out_of_range("HNSW i16 encoded dimension overflow")
+            })?;
+        let row_stride_bytes = encoded_dimension
+            .checked_mul(std::mem::size_of::<i16>())
+            .ok_or_else(|| paro_common::error::out_of_range("HNSW i16 row stride overflow"))?;
+        let encoded_len = base
+            .num_vectors()
+            .checked_mul(row_stride_bytes)
+            .ok_or_else(|| paro_common::error::out_of_range("HNSW i16 build workspace overflow"))?;
+
+        let mut backing = if encoded_len <= MAX_OWNED_I16_BUILD_BYTES {
+            WritableI16BuildBacking::Owned(vec![0; encoded_len])
+        } else {
+            let workspace_dir = workspace_dir.ok_or_else(|| {
+                paro_common::error::configuration_limit_exceeded(format!(
+                    "HNSW symmetric-i16 build requires a governed staging directory for its {}-byte routing workspace",
+                    encoded_len
+                ))
+            })?;
+            std::fs::create_dir_all(workspace_dir)?;
+            let file = tempfile::tempfile_in(workspace_dir)?;
+            file.set_len(u64::try_from(encoded_len).map_err(|_| {
+                paro_common::error::out_of_range("HNSW i16 build workspace exceeds u64")
+            })?)?;
+            // SAFETY: the private temporary file has the exact validated
+            // length and is never concurrently resized or mutated elsewhere.
+            let mmap = unsafe { MmapMut::map_mut(&file)? };
+            WritableI16BuildBacking::Mmap(mmap)
+        };
+
+        let output = backing.as_mut_slice();
+        let mut routing_inverse_norms = base
+            .cosine_inverse_norms()
+            .map(|_| vec![0.0; base.num_vectors()]);
+        let mut encoded_row = 0usize;
+        base.try_for_each_contiguous_chunk(&mut |values| {
+            if values.len() % dimension != 0 {
+                return Err(paro_common::error::data_corrupted(
+                    "HNSW build vector chunk contains a partial row",
+                ));
+            }
+            for vector in values.chunks_exact(dimension) {
+                let start = encoded_row.checked_mul(row_stride_bytes).ok_or_else(|| {
+                    paro_common::error::out_of_range("HNSW i16 row offset overflow")
+                })?;
+                let row = &mut output[start..start + row_stride_bytes];
+                if let Some(norms) = routing_inverse_norms.as_mut() {
+                    let mut squared_norm = 0.0f32;
+                    for ((encoded, &source_dimension), &scale) in row
+                        .chunks_exact_mut(std::mem::size_of::<i16>())
+                        .take(routing_dimensions)
+                        .zip(selected_dimensions.iter())
+                        .zip(scales.iter())
+                    {
+                        let value = vector[source_dimension];
+                        let quantized = (value / scale).round().clamp(-32_767.0, 32_767.0) as i16;
+                        encoded.copy_from_slice(&quantized.to_le_bytes());
+                        let reconstructed = f32::from(quantized) * scale;
+                        squared_norm += reconstructed * reconstructed;
+                    }
+                    norms[encoded_row] = if squared_norm < f32::EPSILON {
+                        0.0
+                    } else {
+                        squared_norm.sqrt().recip()
+                    };
+                } else {
+                    for ((encoded, &source_dimension), &scale) in row
+                        .chunks_exact_mut(std::mem::size_of::<i16>())
+                        .take(routing_dimensions)
+                        .zip(selected_dimensions.iter())
+                        .zip(scales.iter())
+                    {
+                        let value = vector[source_dimension];
+                        let quantized = (value / scale).round().clamp(-32_767.0, 32_767.0) as i16;
+                        encoded.copy_from_slice(&quantized.to_le_bytes());
+                    }
+                }
+                row[routing_dimensions * std::mem::size_of::<i16>()..].fill(0);
+                encoded_row += 1;
+            }
+            Ok(())
+        })?;
+        if encoded_row != base.num_vectors() {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW i16 build encoded {encoded_row} rows, expected {}",
+                base.num_vectors()
+            )));
+        }
+
+        Ok(Arc::new(Self {
+            base,
+            codes: backing.freeze()?,
+            dimension,
+            row_stride_bytes,
+            selected_dimensions,
+            scales,
+            routing_inverse_norms: routing_inverse_norms
+                .map(|values| CosineInverseNorms::Owned(Arc::from(values))),
+        }))
+    }
+
+    pub(crate) fn from_persisted(
+        base: Arc<dyn VectorStorage>,
+        codes: I16BuildBacking,
+        selected_dimensions: Box<[usize]>,
+        scales: Box<[f32]>,
+        routing_inverse_norms: Option<CosineInverseNorms>,
+    ) -> Result<Arc<dyn VectorStorage>> {
+        let dimension = base.vector_dim();
+        let routing_dimensions = selected_dimensions.len();
+        if routing_dimensions == 0 || routing_dimensions > dimension {
+            return Err(paro_common::error::data_corrupted(format!(
+                "persisted HNSW routing dimension {routing_dimensions} is invalid for base dimension {dimension}"
+            )));
+        }
+        if scales.len() != routing_dimensions
+            || scales
+                .iter()
+                .any(|scale| !scale.is_finite() || *scale <= 0.0)
+        {
+            return Err(paro_common::error::data_corrupted(
+                "persisted HNSW routing scales must be finite, positive, and cardinality-aligned",
+            ));
+        }
+        if selected_dimensions
+            .iter()
+            .any(|source| *source >= dimension)
+            || selected_dimensions
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(paro_common::error::data_corrupted(
+                "persisted HNSW routing dimensions must be unique, source-ordered, and in range",
+            ));
+        }
+        let encoded_dimension = routing_dimensions
+            .checked_add(I16_BUILD_ALIGNMENT - 1)
+            .map(|value| value / I16_BUILD_ALIGNMENT * I16_BUILD_ALIGNMENT)
+            .ok_or_else(|| paro_common::error::data_corrupted("HNSW routing dimension overflow"))?;
+        let row_stride_bytes = encoded_dimension
+            .checked_mul(std::mem::size_of::<i16>())
+            .ok_or_else(|| paro_common::error::data_corrupted("HNSW routing row overflow"))?;
+        let expected_len = base
+            .num_vectors()
+            .checked_mul(row_stride_bytes)
+            .ok_or_else(|| {
+                paro_common::error::data_corrupted("HNSW routing code length overflow")
+            })?;
+        if codes.as_slice().len() != expected_len {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW routing code length mismatch: expected {expected_len}, got {}",
+                codes.as_slice().len()
+            )));
+        }
+        match (&routing_inverse_norms, base.cosine_inverse_norms()) {
+            (Some(norms), Some(_)) if norms.len() == base.num_vectors() => {}
+            (None, None) => {}
+            (Some(norms), Some(_)) => {
+                return Err(paro_common::error::data_corrupted(format!(
+                    "HNSW routing inverse norm count mismatch: expected {}, got {}",
+                    base.num_vectors(),
+                    norms.len()
+                )));
+            }
+            _ => {
+                return Err(paro_common::error::data_corrupted(
+                    "HNSW routing inverse norm presence disagrees with the metric",
+                ));
+            }
+        }
+        Ok(Arc::new(Self {
+            base,
+            codes,
+            dimension,
+            row_stride_bytes,
+            selected_dimensions,
+            scales,
+            routing_inverse_norms,
+        }))
+    }
+
+    #[inline]
+    fn code(&self, point: PointOffset) -> &[u8] {
+        let start = point as usize * self.row_stride_bytes;
+        &self.codes.as_slice()[start..start + self.row_stride_bytes]
+    }
+}
+
+impl VectorStorage for SymmetricI16BuildVectorStorage {
+    fn get_vector(&self, idx: PointOffset) -> &[f32] {
+        self.base.get_vector(idx)
+    }
+
+    fn contiguous_vectors(&self) -> Option<&[f32]> {
+        self.base.contiguous_vectors()
+    }
+
+    fn try_for_each_contiguous_chunk(
+        &self,
+        visitor: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        self.base.try_for_each_contiguous_chunk(visitor)
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.base.num_vectors()
+    }
+
+    fn vector_dim(&self) -> usize {
+        self.dimension
+    }
+
+    fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
+        self.base.cosine_inverse_norms()
+    }
+
+    fn is_mmap_backed(&self) -> bool {
+        self.base.is_mmap_backed()
+    }
+
+    fn i16_routing_view(&self) -> Option<I16RoutingView<'_>> {
+        Some(I16RoutingView {
+            codes: self.codes.as_slice(),
+            source_dimension: self.dimension,
+            row_stride_bytes: self.row_stride_bytes,
+            scales: &self.scales,
+            selected_dimensions: &self.selected_dimensions,
+            inverse_norms: self.routing_inverse_norms.as_ref(),
+        })
+    }
+
+    #[inline]
+    fn construction_similarity(
+        &self,
+        distance: DistanceMetric,
+        left: PointOffset,
+        right: PointOffset,
+    ) -> f32 {
+        let left_code = self.code(left);
+        let right_code = self.code(right);
+        match distance {
+            DistanceMetric::Euclidean => {
+                -weighted_i16_l2_squared(left_code, right_code, &self.scales)
+            }
+            DistanceMetric::DotProduct => {
+                weighted_i16_dot_product(left_code, right_code, &self.scales)
+            }
+            DistanceMetric::Cosine => {
+                let norms = self.routing_inverse_norms.as_ref().unwrap_or_else(|| {
+                    unreachable!("symmetric-i16 routing norms are prepared once")
+                });
+                weighted_i16_dot_product(left_code, right_code, &self.scales)
+                    * (norms.value(left) * norms.value(right))
+            }
+            DistanceMetric::Manhattan => {
+                -weighted_i16_l1_distance(left_code, right_code, &self.scales)
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_build_vector_storage(
+    base: Arc<dyn VectorStorage>,
+    encoding: super::HnswBuildVectorEncoding,
+    routing_dimensions: u32,
+    build_seed: u64,
+    workspace_dir: Option<&Path>,
+) -> Result<Arc<dyn VectorStorage>> {
+    match encoding {
+        super::HnswBuildVectorEncoding::ExactF32 => Ok(base),
+        super::HnswBuildVectorEncoding::SymmetricI16 => SymmetricI16BuildVectorStorage::prepare(
+            base,
+            routing_dimensions as usize,
+            build_seed,
+            workspace_dir,
+        ),
+    }
+}
+
+/// Dense local point ids projected onto an immutable parent construction
+/// space. Predicate-local HNSW graphs need their own contiguous ids, but they
+/// must use the exact same routing metric as the generation graph. Keeping an
+/// id map avoids copying raw f32 rows and, more importantly, prevents local
+/// topology from silently being built under a different metric.
+pub(crate) struct PointRemappedBuildVectorStorage {
+    base: Arc<dyn VectorStorage>,
+    global_points: Arc<[PointOffset]>,
+    local_cosine_inverse_norms: Option<CosineInverseNorms>,
+}
+
+impl PointRemappedBuildVectorStorage {
+    pub(crate) fn try_new(
+        base: Arc<dyn VectorStorage>,
+        global_points: Arc<[PointOffset]>,
+    ) -> Result<Self> {
+        if global_points
+            .iter()
+            .any(|&point| point as usize >= base.num_vectors())
+        {
+            return Err(paro_common::error::data_corrupted(
+                "HNSW remapped construction point exceeds the parent vector domain",
+            ));
+        }
+        let local_cosine_inverse_norms = base.cosine_inverse_norms().map(|norms| {
+            CosineInverseNorms::Owned(Arc::from(
+                global_points
+                    .iter()
+                    .map(|&point| norms.value(point))
+                    .collect::<Vec<_>>(),
+            ))
+        });
+        Ok(Self {
+            base,
+            global_points,
+            local_cosine_inverse_norms,
+        })
+    }
+
+    #[inline]
+    fn global_point(&self, local_point: PointOffset) -> PointOffset {
+        self.global_points[local_point as usize]
+    }
+}
+
+impl VectorStorage for PointRemappedBuildVectorStorage {
+    fn get_vector(&self, idx: PointOffset) -> &[f32] {
+        self.base.get_vector(self.global_point(idx))
+    }
+
+    fn try_for_each_contiguous_chunk(
+        &self,
+        visitor: &mut dyn FnMut(&[f32]) -> Result<()>,
+    ) -> Result<()> {
+        for &point in self.global_points.iter() {
+            visitor(self.base.get_vector(point))?;
+        }
+        Ok(())
+    }
+
+    fn num_vectors(&self) -> usize {
+        self.global_points.len()
+    }
+
+    fn vector_dim(&self) -> usize {
+        self.base.vector_dim()
+    }
+
+    fn cosine_inverse_norms(&self) -> Option<&CosineInverseNorms> {
+        self.local_cosine_inverse_norms.as_ref()
+    }
+
+    fn is_mmap_backed(&self) -> bool {
+        self.base.is_mmap_backed()
+    }
+
+    #[inline]
+    fn construction_similarity(
+        &self,
+        distance: DistanceMetric,
+        left: PointOffset,
+        right: PointOffset,
+    ) -> f32 {
+        self.base.construction_similarity(
+            distance,
+            self.global_point(left),
+            self.global_point(right),
+        )
+    }
+}
+
+fn multiscale_routing_dimensions(
+    minima: &[f32],
+    maxima: &[f32],
+    routing_dimensions: usize,
+    build_seed: u64,
+) -> Box<[usize]> {
+    let dimension = minima.len();
+    debug_assert_eq!(dimension, maxima.len());
+    if routing_dimensions == dimension {
+        return (0..dimension).collect::<Vec<_>>().into_boxed_slice();
+    }
+
+    let mut by_range = (0..dimension)
+        .map(|source_dimension| {
+            let range = maxima[source_dimension] - minima[source_dimension];
+            let range = if range.is_finite() && range > 0.0 {
+                range
+            } else {
+                0.0
+            };
+            (range, source_dimension)
+        })
+        .collect::<Vec<_>>();
+    by_range.sort_unstable_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.cmp(&right.1))
+    });
+
+    let tail = (routing_dimensions / 4).max(1);
+    let mut selected = vec![false; dimension];
+    let mut selected_count = 0usize;
+    for &(_, source_dimension) in by_range.iter().filter(|(range, _)| *range > 0.0).take(tail) {
+        selected[source_dimension] = true;
+        selected_count += 1;
+    }
+    for &(_, source_dimension) in by_range.iter().rev().take(tail) {
+        if !selected[source_dimension] {
+            selected[source_dimension] = true;
+            selected_count += 1;
+        }
+    }
+    let mut seeded = (0..dimension)
+        .map(|source_dimension| {
+            (
+                splitmix64(
+                    build_seed
+                        ^ (source_dimension as u64).wrapping_mul(0xD6E8_FEB8_6659_FD93)
+                        ^ 0xA076_1D64_78BD_642F,
+                ),
+                source_dimension,
+            )
+        })
+        .collect::<Vec<_>>();
+    seeded.sort_unstable();
+    for (_, source_dimension) in seeded {
+        if selected_count == routing_dimensions {
+            break;
+        }
+        if !selected[source_dimension] {
+            selected[source_dimension] = true;
+            selected_count += 1;
+        }
+    }
+
+    selected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(source_dimension, selected)| selected.then_some(source_dimension))
+        .collect::<Vec<_>>()
+        .into_boxed_slice()
+}
+
+#[inline]
+fn splitmix64(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    value ^ (value >> 31)
+}
+
+#[inline]
+pub(crate) fn weighted_i16_dot_product(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+    left.chunks_exact(std::mem::size_of::<i16>())
+        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((left, right), &scale)| {
+            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
+            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
+            f32::from(left) * f32::from(right) * scale * scale
+        })
+        .sum()
+}
+
+#[inline]
+pub(crate) fn weighted_i16_l2_squared(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+    left.chunks_exact(std::mem::size_of::<i16>())
+        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((left, right), &scale)| {
+            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
+            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
+            let delta = f32::from(left) - f32::from(right);
+            let scaled = delta * scale;
+            scaled * scaled
+        })
+        .sum()
+}
+
+#[inline]
+pub(crate) fn weighted_i16_l1_distance(left: &[u8], right: &[u8], scales: &[f32]) -> f32 {
+    left.chunks_exact(std::mem::size_of::<i16>())
+        .zip(right.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((left, right), &scale)| {
+            let left = i16::from_le_bytes(left.try_into().expect("i16 width"));
+            let right = i16::from_le_bytes(right.try_into().expect("i16 width"));
+            (i32::from(left) - i32::from(right)).unsigned_abs() as f32 * scale
+        })
+        .sum()
+}
+
+/// Score an unquantized query against one persisted symmetric-i16 routing row.
+///
+/// Query values deliberately remain in the original f32 domain. Quantizing a
+/// query with the artifact's build-time range would clamp out-of-distribution
+/// inputs and change their geometry; only the immutable point image is lossy.
+#[inline]
+pub(crate) fn f32_query_i16_dot_product(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    query
+        .iter()
+        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((&query, code), &scale)| {
+            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
+            query * f32::from(code) * scale
+        })
+        .sum()
+}
+
+#[inline]
+pub(crate) fn f32_query_i16_l2_squared(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    query
+        .iter()
+        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((&query, code), &scale)| {
+            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
+            let delta = query - f32::from(code) * scale;
+            delta * delta
+        })
+        .sum()
+}
+
+#[inline]
+pub(crate) fn f32_query_i16_l1_distance(query: &[f32], code: &[u8], scales: &[f32]) -> f32 {
+    query
+        .iter()
+        .zip(code.chunks_exact(std::mem::size_of::<i16>()))
+        .zip(scales)
+        .map(|((&query, code), &scale)| {
+            let code = i16::from_le_bytes(code.try_into().expect("i16 width"));
+            (query - f32::from(code) * scale).abs()
+        })
+        .sum()
 }
 
 /// Raw table vectors plus HNSW-private metric preprocessing. The wrapper never
@@ -483,6 +1189,24 @@ pub struct MmapVectorStorage {
 impl MmapVectorStorage {
     /// Create new mmap-based storage from a file range.
     pub fn open_range(path: impl AsRef<Path>, offset: u64, size: u64, dim: usize) -> Result<Self> {
+        if dim == 0 {
+            return Err(paro_common::error::invalid_input(
+                "mmap vector dimension must be non-zero",
+            ));
+        }
+        let size = usize::try_from(size).map_err(|_| {
+            paro_common::error::configuration_limit_exceeded(
+                "mmap vector range exceeds the addressable process domain",
+            )
+        })?;
+        let vector_bytes = dim
+            .checked_mul(std::mem::size_of::<f32>())
+            .ok_or_else(|| paro_common::error::out_of_range("mmap vector row width overflow"))?;
+        if size == 0 || size % vector_bytes != 0 {
+            return Err(paro_common::error::data_corrupted(format!(
+                "mmap vector range length {size} is not a non-zero multiple of row width {vector_bytes}"
+            )));
+        }
         let file = File::open(path)?;
         // We mmap the whole file but only access the range.
         // Alternatively, we could use MapOptions to map a range if supported by the OS.
@@ -490,9 +1214,14 @@ impl MmapVectorStorage {
         let mmap = unsafe {
             memmap2::MmapOptions::new()
                 .offset(offset)
-                .len(size as usize)
+                .len(size)
                 .map(&file)?
         };
+        if (mmap.as_ptr() as usize) % std::mem::align_of::<f32>() != 0 {
+            return Err(paro_common::error::data_corrupted(format!(
+                "mmap vector range offset {offset} is not f32-aligned"
+            )));
+        }
         #[cfg(unix)]
         {
             // HNSW point lookups are intentionally non-sequential. Prevent
@@ -501,13 +1230,7 @@ impl MmapVectorStorage {
             let _ = mmap.advise(memmap2::Advice::Random);
         }
 
-        let vector_bytes = dim * std::mem::size_of::<f32>();
-        debug_assert_eq!(
-            size % vector_bytes as u64,
-            0,
-            "Range size must be multiple of vector size"
-        );
-        let count = size as usize / vector_bytes;
+        let count = size / vector_bytes;
 
         Ok(Self { mmap, dim, count })
     }
@@ -656,12 +1379,195 @@ impl VectorStorage for PartitionedVectorStorage {
     }
 }
 
+/// Open every physical data page that belongs to one immutable plain vector
+/// column. A [`ColumnMeta::data_page_pointer`] names only the first page; the
+/// ordinal index is the durable source of truth for the complete page set.
+///
+/// Keeping one mmap view per data page avoids copying large base columns while
+/// preserving page envelopes and checksums. Callers may concatenate these
+/// views through [`PartitionedVectorStorage`] without assuming that a logical
+/// column occupies one physical page.
+pub(crate) fn open_plain_vector_column_pages(
+    path: impl AsRef<Path>,
+    column: &ColumnMeta,
+    dim: usize,
+) -> Result<Vec<Arc<dyn VectorStorage>>> {
+    let path = path.as_ref();
+    if column.field_type != FieldType::Vector {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} is not stored as a vector",
+            column.column_id
+        )));
+    }
+    if column.encoding != EncodingType::Plain || column.compression != CompressionType::None {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} requires plain, uncompressed base pages",
+            column.column_id
+        )));
+    }
+    if dim == 0 {
+        return Err(paro_common::error::invalid_input(
+            "HNSW vector dimension must be non-zero",
+        ));
+    }
+    if column.num_rows == 0 {
+        return Ok(Vec::new());
+    }
+
+    let row_width = dim
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| paro_common::error::out_of_range("HNSW vector row width overflow"))?;
+    let mut file = File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let ordinal_page = PageIO::read_page(
+        &mut file,
+        &PageReadOptions::new(column.ordinal_index_pointer).with_codec(column.compression),
+    )?;
+    if !matches!(ordinal_page.footer, PageFooter::Index(_)) {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} ordinal pointer does not reference an index page",
+            column.column_id
+        )));
+    }
+    let mut ordinal = OrdinalIndexReader::from_bytes(&ordinal_page.body)?;
+    ordinal.set_num_rows(column.num_rows);
+    let entries = ordinal.entries();
+    if entries.is_empty() || entries[0].first_ordinal != 0 {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} ordinal index does not start at row zero",
+            column.column_id
+        )));
+    }
+    if entries[0].page_pointer != column.data_page_pointer {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} first data page disagrees with its ordinal index",
+            column.column_id
+        )));
+    }
+
+    let mut storages = Vec::<Arc<dyn VectorStorage>>::with_capacity(entries.len());
+    let mut expected_first = 0_u64;
+    for (position, entry) in entries.iter().enumerate() {
+        if entry.first_ordinal != expected_first {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} has non-contiguous data pages: expected row {}, got {}",
+                column.column_id, expected_first, entry.first_ordinal
+            )));
+        }
+        let next_first = entries
+            .get(position + 1)
+            .map_or(column.num_rows, |next| next.first_ordinal);
+        let page_rows = next_first.checked_sub(entry.first_ordinal).ok_or_else(|| {
+            paro_common::error::data_corrupted(format!(
+                "HNSW column {} ordinal index is not monotonic",
+                column.column_id
+            ))
+        })?;
+        if page_rows == 0 || page_rows > u64::from(u32::MAX) {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} has invalid data-page row count {page_rows}",
+                column.column_id
+            )));
+        }
+        let page_end = entry
+            .page_pointer
+            .offset
+            .checked_add(u64::from(entry.page_pointer.size))
+            .ok_or_else(|| paro_common::error::data_corrupted("vector page range overflow"))?;
+        if page_end > file_len {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} data page exceeds segment length",
+                column.column_id
+            )));
+        }
+
+        let layout = PageIO::read_page_layout(&mut file, entry.page_pointer)?;
+        let data_footer = layout.footer.as_data().ok_or_else(|| {
+            paro_common::error::data_corrupted(format!(
+                "HNSW column {} ordinal entry does not reference a data page",
+                column.column_id
+            ))
+        })?;
+        if data_footer.first_ordinal != entry.first_ordinal || data_footer.num_values != page_rows {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} data-page footer disagrees with its ordinal index",
+                column.column_id
+            )));
+        }
+        let vector_bytes = page_rows
+            .checked_mul(row_width as u64)
+            .ok_or_else(|| paro_common::error::out_of_range("vector page byte length overflow"))?;
+        let expected_body = u64::try_from(PLAIN_PAGE_HEADER_SIZE)
+            .expect("plain header width fits u64")
+            .checked_add(vector_bytes)
+            .and_then(|bytes| bytes.checked_add(u64::from(data_footer.nullmap_size)))
+            .ok_or_else(|| paro_common::error::out_of_range("vector page body length overflow"))?;
+        if layout.body_size as u64 != expected_body
+            || u64::from(layout.uncompressed_size) != expected_body
+        {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} vector page body length mismatch: expected {expected_body}, got {}",
+                column.column_id, layout.body_size
+            )));
+        }
+
+        file.seek(SeekFrom::Start(entry.page_pointer.offset))?;
+        let mut header = [0_u8; PLAIN_PAGE_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        if u64::from(u32::from_le_bytes(header)) != page_rows {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} plain-page header row count mismatch",
+                column.column_id
+            )));
+        }
+        PageIO::verify_page_checksum_streaming(&mut file, entry.page_pointer)?;
+
+        let values_offset = entry
+            .page_pointer
+            .offset
+            .checked_add(PLAIN_PAGE_HEADER_SIZE as u64)
+            .ok_or_else(|| paro_common::error::data_corrupted("vector body offset overflow"))?;
+        storages.push(Arc::new(MmapVectorStorage::open_range(
+            path,
+            values_offset,
+            vector_bytes,
+            dim,
+        )?));
+        expected_first = next_first;
+    }
+    if expected_first != column.num_rows {
+        return Err(paro_common::error::data_corrupted(format!(
+            "HNSW column {} data pages cover {expected_first} rows, expected {}",
+            column.column_id, column.num_rows
+        )));
+    }
+    Ok(storages)
+}
+
+pub(crate) fn open_plain_vector_column(
+    path: impl AsRef<Path>,
+    column: &ColumnMeta,
+    dim: usize,
+) -> Result<Arc<dyn VectorStorage>> {
+    let mut pages = open_plain_vector_column_pages(path, column, dim)?;
+    match pages.len() {
+        0 => Err(paro_common::error::invalid_input(
+            "cannot open an empty vector column",
+        )),
+        1 => Ok(pages.pop().expect("single vector page")),
+        _ => Ok(Arc::new(PartitionedVectorStorage::try_new(pages, dim)?)),
+    }
+}
+
 /// Shared pointer to a VectorStorage.
 pub type SharedVectorStorage = Arc<dyn VectorStorage>;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rowset::column::{ColumnWriter, ColumnWriterOptions, ScalarColumnWriter};
+    use paro_common::types::LogicalType;
+    use std::io::Write;
 
     #[test]
     fn partitioned_storage_resolves_vectors_across_physical_boundaries() {
@@ -678,5 +1584,145 @@ mod tests {
         assert_eq!(storage.get_vector(1), &[3.0, 4.0]);
         assert_eq!(storage.get_vector(2), &[5.0, 6.0]);
         assert_eq!(storage.get_vector(4), &[9.0, 10.0]);
+    }
+
+    #[test]
+    fn symmetric_i16_build_storage_preserves_raw_values_and_metric_order() {
+        let vectors = vec![
+            1.0_f32, -2.0, 0.5, 3.0, // point 0
+            1.1, -1.9, 0.4, 2.8, // point 1 (near)
+            -3.0, 2.0, -1.0, -2.5, // point 2 (far)
+        ];
+        for metric in [
+            DistanceMetric::Euclidean,
+            DistanceMetric::DotProduct,
+            DistanceMetric::Cosine,
+            DistanceMetric::Manhattan,
+        ] {
+            let raw: Arc<dyn VectorStorage> =
+                Arc::new(InMemoryVectorStorage::new(vectors.clone(), 4));
+            let raw = IndexedVectorStorage::prepare(raw, metric);
+            let encoded = prepare_build_vector_storage(
+                Arc::clone(&raw),
+                super::super::HnswBuildVectorEncoding::SymmetricI16,
+                3,
+                17,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(encoded.get_vector(1), raw.get_vector(1));
+            let near = encoded.construction_similarity(metric, 0, 1);
+            let far = encoded.construction_similarity(metric, 0, 2);
+            assert!(
+                near > far,
+                "{metric:?} encoded construction score must preserve this neighbor order"
+            );
+            assert_eq!(
+                encoded.construction_similarity(metric, 0, 1).to_bits(),
+                encoded.construction_similarity(metric, 1, 0).to_bits(),
+                "{metric:?} encoded pair scoring must be bitwise symmetric"
+            );
+        }
+    }
+
+    #[test]
+    fn remapped_build_storage_preserves_parent_routing_metric() {
+        let raw: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
+            vec![0.0, 0.0, 1.0, 2.0, -3.0, 4.0],
+            2,
+        ));
+        let routing = prepare_build_vector_storage(
+            raw,
+            super::super::HnswBuildVectorEncoding::SymmetricI16,
+            2,
+            19,
+            None,
+        )
+        .unwrap();
+        let expected = routing.construction_similarity(DistanceMetric::Euclidean, 2, 0);
+        let remapped = PointRemappedBuildVectorStorage::try_new(
+            Arc::clone(&routing),
+            Arc::from([2_u32, 0_u32]),
+        )
+        .unwrap();
+
+        assert_eq!(remapped.get_vector(0), routing.get_vector(2));
+        assert_eq!(
+            remapped
+                .construction_similarity(DistanceMetric::Euclidean, 0, 1)
+                .to_bits(),
+            expected.to_bits()
+        );
+    }
+
+    #[test]
+    fn compact_routing_dimensions_are_seeded_unique_and_source_ordered() {
+        let minima = vec![-0.01; 768];
+        let mut maxima = vec![0.01; 768];
+        maxima[0] = 0.52;
+        maxima[1] = -0.009_998;
+        let first = multiscale_routing_dimensions(&minima, &maxima, 128, 42);
+        let repeated = multiscale_routing_dimensions(&minima, &maxima, 128, 42);
+        let other_seed = multiscale_routing_dimensions(&minima, &maxima, 128, 43);
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other_seed);
+        assert_eq!(first.len(), 128);
+        assert!(first.contains(&0), "the high-range tail must be retained");
+        assert!(
+            first.contains(&1),
+            "the low non-zero-range tail must be retained"
+        );
+        assert!(first.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            multiscale_routing_dimensions(&minima[..4], &maxima[..4], 4, 42).as_ref(),
+            &[0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn plain_vector_column_opens_every_physical_page() {
+        let opts = ColumnWriterOptions::new(FieldType::Vector, 7)
+            .with_logical_type(LogicalType::Array(Box::new(LogicalType::Float), 2))
+            .with_nullable(false)
+            .with_fixed_len(2 * std::mem::size_of::<f32>())
+            .with_page_size(2 * 2 * std::mem::size_of::<f32>())
+            .with_compression(CompressionType::None);
+        let mut writer = ScalarColumnWriter::create_in_memory(opts).unwrap();
+        let values = [
+            [1.0_f32, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+            [9.0, 10.0],
+        ];
+        let bytes = values
+            .iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<_>>();
+        writer.append(&bytes, None, values.len() as u32).unwrap();
+        let meta = writer.finish().unwrap();
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(&writer.get_data()).unwrap();
+        file.flush().unwrap();
+
+        let mut column = ColumnMeta::new(7, FieldType::Vector);
+        column.num_rows = meta.num_rows;
+        column.encoding = meta.encoding;
+        column.compression = meta.compression;
+        column.data_page_pointer = meta.data_page_pointer;
+        column.ordinal_index_pointer = meta.ordinal_index_pointer;
+        column.null_count = Some(meta.null_count);
+
+        let pages = open_plain_vector_column_pages(file.path(), &column, 2).unwrap();
+        assert_eq!(pages.len(), 3);
+        let storage = PartitionedVectorStorage::try_new(pages, 2).unwrap();
+        assert_eq!(storage.num_vectors(), values.len());
+        for (point, expected) in values.iter().enumerate() {
+            assert_eq!(storage.get_vector(point as PointOffset), expected);
+        }
     }
 }

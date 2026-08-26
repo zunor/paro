@@ -1071,15 +1071,32 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
             null_encoding: NullEncoding::BitShuffle,
         });
 
-        // Write page with compression
-        let codec_ref = self.codec.as_deref();
-        let ptr = PageIO::compress_and_write_page(
-            codec_ref,
-            self.opts.min_space_saving,
-            &mut self.writer,
-            &page_body,
-            &footer,
-        )?;
+        // Every vector data page is an independently addressable typed mmap
+        // region. Align each page, not merely the start of the containing
+        // column: page footers make adjacent page bodies non-contiguous and
+        // do not preserve the next page's alignment by accident.
+        let ptr = if self.opts.field_type == FieldType::Vector {
+            if self.opts.compression != CompressionType::None {
+                return Err(paro_error::internal(
+                    "vector data pages must be uncompressed mmap pages",
+                ));
+            }
+            PageIO::write_mmap_page(
+                &mut self.writer,
+                &page_body,
+                &footer,
+                std::mem::align_of::<f32>(),
+            )?
+        } else {
+            let codec_ref = self.codec.as_deref();
+            PageIO::compress_and_write_page(
+                codec_ref,
+                self.opts.min_space_saving,
+                &mut self.writer,
+                &page_body,
+                &footer,
+            )?
+        };
 
         // Update indexes
         self.ordinal_index.add(self.first_ordinal, ptr);

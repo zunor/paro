@@ -8,11 +8,10 @@ use crate::compaction::plan::types::CompactionPlan;
 #[cfg(test)]
 use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
-    DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer, HnswBuildContract,
-    HnswIndex, IndexedVectorStorage, MmapVectorStorage, PointOffset, VectorStorage,
+    open_plain_vector_column, DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer,
+    HnswBuildContract, HnswIndex, IndexedVectorStorage, PointOffset, VectorStorage,
     HNSW_ARTIFACT_ALIGNMENT, HNSW_BUILD_CONTRACT_VERSION,
 };
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
@@ -86,6 +85,15 @@ impl HnswIndexRebuilder {
                                 c.hnsw_distance, c.id
                             ))
                         })?,
+                        vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
+                        routing_dimensions: u32::try_from(dim)
+                            .map_err(|_| {
+                                paro_error::data_corrupted(format!(
+                                    "HNSW dimension {dim} on column {} exceeds durable u32 width",
+                                    c.id
+                                ))
+                            })?
+                            .min(crate::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
                         build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
                         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
                         warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
@@ -165,24 +173,8 @@ impl HnswIndexRebuilder {
                 continue;
             }
 
-            let byte_len = col_meta
-                .num_rows
-                .checked_mul(indexed_col.dim as u64)
-                .and_then(|v| v.checked_mul(std::mem::size_of::<f32>() as u64))
-                .ok_or_else(|| {
-                    paro_error::invalid_input(format!(
-                        "HNSW compaction rebuild vector byte length overflow: segment={} column={}",
-                        segment.segment_id(),
-                        indexed_col.column_id
-                    ))
-                })?;
-
-            let output_storage: Arc<dyn VectorStorage> = Arc::new(MmapVectorStorage::open_range(
-                segment.file_path(),
-                col_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-                byte_len,
-                indexed_col.dim,
-            )?);
+            let output_storage: Arc<dyn VectorStorage> =
+                open_plain_vector_column(segment.file_path(), &col_meta, indexed_col.dim)?;
 
             let old_candidates = old_indexes_by_col
                 .get(&indexed_col.column_id)

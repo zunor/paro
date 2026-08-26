@@ -27,14 +27,13 @@ use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
-    HnswBuildStopCheck, HnswBuilder, HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks,
-    HnswFilterTopologyContract, PartitionedVectorStorage, VectorStorage,
+    open_plain_vector_column_pages, HnswBuildStopCheck, HnswBuilder, HnswFilterBlock,
+    HnswFilterBlocks, HnswFilterColumnBlocks, HnswFilterTopologyContract, PartitionedVectorStorage,
+    VectorStorage,
 };
-use crate::index::MmapVectorStorage;
 use crate::metrics::{storage_metrics, SearchSidecarBuildMetricKey};
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::encoding::BinaryPlainPageDecoder;
-use crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE;
 use crate::rowset::{ColumnData, RowsetSharedPtr, SegmentIterator};
 use crate::statistics::HnswIndexStatistics;
 
@@ -169,6 +168,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                 &input.tail_window,
                 budget,
                 input.stop_check.as_ref(),
+                writer.workspace_dir(),
             )? {
                 let location = writer.append_streamed_artifact(|file, offset| {
                     partition
@@ -299,6 +299,7 @@ fn build_hnsw_partition_sidecar_artifact(
     tail_window: &[TailPendingEntry],
     budget: &BuildBudget,
     stop_check: Option<&super::inline_sink::SearchBuildStopCheck>,
+    workspace_dir: &Path,
 ) -> Result<Option<HnswPartitionArtifact>> {
     let column_id = definition
         .column_ids
@@ -364,12 +365,8 @@ fn build_hnsw_partition_sidecar_artifact(
             )));
         }
         let point_base = point_count;
-        let segment_vectors = MmapVectorStorage::open_range(
-            segment.file_path(),
-            column_meta.data_page_pointer.offset + PLAIN_PAGE_HEADER_SIZE as u64,
-            column_meta.num_rows * dimension as u64 * std::mem::size_of::<f32>() as u64,
-            dimension,
-        )?;
+        let segment_vectors =
+            open_plain_vector_column_pages(segment.file_path(), column_meta, dimension)?;
         let total_points = u64::from(point_base)
             .checked_add(column_meta.num_rows)
             .ok_or_else(|| paro_error::out_of_range("HNSW partition point count overflow"))?;
@@ -383,7 +380,7 @@ fn build_hnsw_partition_sidecar_artifact(
                 "HNSW partition exceeds the u32 point-id domain",
             )
         })?;
-        vector_partitions.push(std::sync::Arc::new(segment_vectors));
+        vector_partitions.extend(segment_vectors);
         coverage.push(ArtifactSegmentSpan {
             segment: segment_ref,
             row_count: column_meta.num_rows,
@@ -407,7 +404,7 @@ fn build_hnsw_partition_sidecar_artifact(
         partition_segments.iter().map(AsRef::as_ref),
         &provider.build_contract().filter_topology,
     )?;
-    let mut builder = HnswBuilder::new();
+    let mut builder = HnswBuilder::new().with_workspace_dir(workspace_dir);
     if let Some(stop_check) = stop_check.cloned() {
         builder =
             builder.with_stop_check(HnswBuildStopCheck::new(move || stop_check.should_stop()));
@@ -1013,6 +1010,8 @@ mod tests {
             version: HNSW_PROVIDER_CONFIG_VERSION,
             dimension: 2,
             distance: DistanceMetric::Euclidean,
+            build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
+            build_routing_dimensions: 2,
             m: 4,
             ef_construct: 8,
             ef_search: 16,
@@ -1069,6 +1068,7 @@ mod tests {
                 grant_id: None,
             },
             None,
+            temp_dir.path(),
         )
         .unwrap()
         .expect("partition artifact");

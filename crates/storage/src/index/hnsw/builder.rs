@@ -624,17 +624,9 @@ impl GraphLayersBuilder {
             if left > right {
                 std::mem::swap(&mut left, &mut right);
             }
-            let norms = storage
-                .cosine_inverse_norms()
-                .unwrap_or_else(|| unreachable!("cosine build storage is prepared once"));
-            distance.similarity_indexed(
-                storage.get_vector(left),
-                storage.get_vector(right),
-                norms.value(left),
-                norms.value(right),
-            )
+            storage.construction_similarity(distance, left, right)
         } else {
-            distance.similarity(storage.get_vector(left), storage.get_vector(right))
+            storage.construction_similarity(distance, left, right)
         }
     }
 

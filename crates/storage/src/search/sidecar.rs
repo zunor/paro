@@ -250,6 +250,12 @@ pub struct SidecarPackageWriter {
 impl SidecarPackageWriter {
     const ARTIFACT_ALIGNMENT: u64 = 64;
 
+    pub(crate) fn workspace_dir(&self) -> &Path {
+        self.staging_path
+            .parent()
+            .expect("sidecar staging path always has a parent")
+    }
+
     fn create(table_data_dir: PathBuf, file_id: ArtifactFileId) -> Result<Self> {
         let final_path = table_data_dir.join(SidecarArtifactStore::package_relative_path(file_id));
         if final_path.exists() {

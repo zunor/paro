@@ -68,7 +68,109 @@ impl PageReadOptions {
 /// Page I/O operations.
 pub struct PageIO;
 
+/// Envelope metadata that can be inspected without materializing the page
+/// body. Large fixed-width vector pages are mmap inputs and may be close to
+/// the `u32` page-size ceiling, so opening them must never allocate a buffer
+/// proportional to the page size merely to discover their footer.
+#[derive(Debug, Clone)]
+pub struct PageLayout {
+    pub footer: PageFooter,
+    pub uncompressed_size: u32,
+    pub body_size: usize,
+    pub expected_checksum: u32,
+}
+
 impl PageIO {
+    /// Read the fixed trailer and variable footer of a page without reading
+    /// its body.
+    pub fn read_page_layout<R: Read + Seek>(
+        reader: &mut R,
+        page_pointer: PagePointer,
+    ) -> Result<PageLayout> {
+        let page_size = page_pointer.size as usize;
+        if page_size < 8 {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: too small ({page_size})"
+            )));
+        }
+
+        let trailer_offset = page_pointer
+            .offset
+            .checked_add(page_size as u64 - 8)
+            .ok_or_else(|| paro_error::data_corrupted("page trailer offset overflow"))?;
+        reader.seek(SeekFrom::Start(trailer_offset))?;
+        let mut trailer = [0_u8; 8];
+        reader.read_exact(&mut trailer)?;
+        let footer_size = u32::from_le_bytes(trailer[..4].try_into().expect("u32 width")) as usize;
+        let expected_checksum = u32::from_le_bytes(trailer[4..].try_into().expect("u32 width"));
+        let footer_size_offset = page_size - 8;
+        if footer_size > footer_size_offset {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: invalid footer size ({footer_size})"
+            )));
+        }
+
+        let body_size = footer_size_offset - footer_size;
+        let footer_offset = page_pointer
+            .offset
+            .checked_add(body_size as u64)
+            .ok_or_else(|| paro_error::data_corrupted("page footer offset overflow"))?;
+        reader.seek(SeekFrom::Start(footer_offset))?;
+        let mut footer_bytes = vec![0_u8; footer_size];
+        reader.read_exact(&mut footer_bytes)?;
+        let (footer, uncompressed_size) = PageFooter::deserialize(&footer_bytes)?;
+
+        Ok(PageLayout {
+            footer,
+            uncompressed_size,
+            body_size,
+            expected_checksum,
+        })
+    }
+
+    /// Verify a page envelope with bounded memory. This is intended for
+    /// immutable mmap consumers: one sequential verification at the open or
+    /// publication boundary establishes the same checksum invariant as a
+    /// normal page read without allocating the potentially multi-gigabyte
+    /// body.
+    pub fn verify_page_checksum_streaming<R: Read + Seek>(
+        reader: &mut R,
+        page_pointer: PagePointer,
+    ) -> Result<()> {
+        if page_pointer.size < 8 {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: too small ({})",
+                page_pointer.size
+            )));
+        }
+        let checksum_offset = page_pointer
+            .offset
+            .checked_add(u64::from(page_pointer.size) - 4)
+            .ok_or_else(|| paro_error::data_corrupted("page checksum offset overflow"))?;
+        reader.seek(SeekFrom::Start(checksum_offset))?;
+        let mut expected = [0_u8; 4];
+        reader.read_exact(&mut expected)?;
+        let expected = u32::from_le_bytes(expected);
+
+        reader.seek(SeekFrom::Start(page_pointer.offset))?;
+        let mut remaining = u64::from(page_pointer.size) - 4;
+        let mut checksum = 0_u32;
+        let mut buffer = vec![0_u8; 1024 * 1024];
+        while remaining != 0 {
+            let bytes = usize::try_from(remaining.min(buffer.len() as u64))
+                .expect("bounded checksum chunk fits usize");
+            reader.read_exact(&mut buffer[..bytes])?;
+            checksum = crc32c::crc32c_append(checksum, &buffer[..bytes]);
+            remaining -= bytes as u64;
+        }
+        if checksum != expected {
+            return Err(paro_error::data_corrupted(format!(
+                "Bad page: checksum mismatch (actual={checksum} vs expect={expected})"
+            )));
+        }
+        Ok(())
+    }
+
     /// Advance `writer` to the next power-of-two byte boundary.
     ///
     /// Padding lives outside every page envelope, so callers must invoke this

@@ -40,6 +40,9 @@ pub(crate) fn schema_seed_definition(
         version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
         distance,
+        build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::SymmetricI16,
+        build_routing_dimensions: dimension
+            .min(crate::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
         m: u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
         ef_construct: u32::try_from(column.hnsw_ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,

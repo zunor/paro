@@ -20,7 +20,7 @@ use paro_common::error::{self as paro_error, Result};
 use crate::index::{ExactOrdinalPosting, ExactScalarKey};
 
 use super::artifact_integrity::ArtifactIntegrity;
-use super::PointOffset;
+use super::{PointOffset, VectorStorage};
 
 const PREDICATE_SCAN_MAGIC: [u8; 4] = *b"HPSC";
 const PREDICATE_SCAN_VERSION: u32 = 3;
@@ -29,6 +29,7 @@ const COLUMN_HEADER_LEN: usize = 32;
 const ORDINAL_RANGE_LEN: usize = 20;
 const BLOCK_HEADER_LEN: usize = 24;
 const NO_BLOCK: u32 = u32::MAX;
+pub(crate) const PREDICATE_SCAN_BUILD_STREAM_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug)]
 pub(crate) struct PredicateScanBuildBlock {
@@ -37,7 +38,6 @@ pub(crate) struct PredicateScanBuildBlock {
     pub(crate) ordinal_row_counts: Box<[u32]>,
     pub(crate) ordinal_fingerprints: Box<[u64]>,
     pub(crate) row_ids: Box<[PointOffset]>,
-    pub(crate) vectors: Arc<[f32]>,
 }
 
 #[derive(Debug)]
@@ -67,9 +67,8 @@ impl PredicateScanBacking {
 
 #[derive(Debug)]
 enum PredicateScanBlock {
-    Owned {
+    Build {
         row_ids: Box<[PointOffset]>,
-        vectors: Arc<[f32]>,
     },
     Encoded {
         rows: usize,
@@ -81,9 +80,20 @@ enum PredicateScanBlock {
 impl PredicateScanBlock {
     fn rows(&self) -> usize {
         match self {
-            Self::Owned { row_ids, .. } => row_ids.len(),
+            Self::Build { row_ids } => row_ids.len(),
             Self::Encoded { rows, .. } => *rows,
         }
+    }
+}
+
+struct PredicateScanBuildSource(Arc<dyn VectorStorage>);
+
+impl std::fmt::Debug for PredicateScanBuildSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PredicateScanBuildSource")
+            .field("point_count", &self.0.num_vectors())
+            .field("dimension", &self.0.vector_dim())
+            .finish()
     }
 }
 
@@ -124,6 +134,11 @@ pub struct PredicateScanLayout {
     point_count: usize,
     columns: Box<[PredicateScanColumn]>,
     backing: Option<PredicateScanBacking>,
+    /// Canonical generation vectors retained only by a newly built layout.
+    /// Publication streams rows from this source into the immutable covering
+    /// image with a bounded scratch buffer. Opened artifacts use `backing`
+    /// instead and never retain this source.
+    build_source: Option<PredicateScanBuildSource>,
     integrity: Option<PredicateIntegrityRange>,
     serialized_len: usize,
 }
@@ -207,8 +222,7 @@ impl PredicateScanLayout {
         for column in &self.columns {
             let mut covered = roaring::RoaringBitmap::new();
             for block_id in 0..column.blocks.len() {
-                let block = self.block_ref(column, block_id)?;
-                for &row_id in block.row_ids() {
+                for &row_id in self.block_row_ids(column, block_id)? {
                     if row_id as usize >= self.point_count || !covered.insert(row_id) {
                         return Err(paro_error::data_corrupted(format!(
                             "predicate scan column {} has invalid or duplicate row id {row_id}",
@@ -221,7 +235,7 @@ impl PredicateScanLayout {
                 (!column.null_range.is_missing())
                     .then_some((usize::from(u16::MAX), column.null_range)),
             ) {
-                let row_ids = self.range_ref(column, range)?.row_ids();
+                let row_ids = self.range_row_ids(column, range)?;
                 if row_ids.windows(2).any(|rows| rows[0] >= rows[1]) {
                     return Err(paro_error::data_corrupted(format!(
                         "predicate scan column {} ordinal {ordinal} is not a strictly ordered posting",
@@ -293,6 +307,7 @@ impl PredicateScanLayout {
         dimension: usize,
         point_count: usize,
         columns: Vec<PredicateScanBuildColumn>,
+        vector_storage: Arc<dyn VectorStorage>,
     ) -> Result<Self> {
         if dimension == 0 && point_count != 0 {
             return Err(paro_error::invalid_input(
@@ -314,6 +329,15 @@ impl PredicateScanLayout {
                 "predicate scan column count exceeds the durable u32 width",
             )
         })?;
+        if vector_storage.vector_dim() != dimension || vector_storage.num_vectors() != point_count {
+            return Err(paro_error::data_corrupted(format!(
+                "predicate scan build source shape {}x{} differs from layout {}x{}",
+                vector_storage.num_vectors(),
+                vector_storage.vector_dim(),
+                point_count,
+                dimension
+            )));
+        }
         let mut built_columns = Vec::with_capacity(columns.len());
         for column in columns {
             u32::try_from(column.blocks.len()).map_err(|_| {
@@ -368,16 +392,6 @@ impl PredicateScanLayout {
                 if block.row_ids.is_empty() {
                     return Err(paro_error::data_corrupted(format!(
                         "predicate scan column {} contains an empty block",
-                        column.column_id
-                    )));
-                }
-                if block.vectors.len()
-                    != block.row_ids.len().checked_mul(dimension).ok_or_else(|| {
-                        paro_error::data_corrupted("predicate scan vector length overflow")
-                    })?
-                {
-                    return Err(paro_error::data_corrupted(format!(
-                        "predicate scan column {} block vector cardinality mismatch",
                         column.column_id
                     )));
                 }
@@ -455,9 +469,8 @@ impl PredicateScanLayout {
                         paro_error::data_corrupted("predicate scan ordinal range overflow")
                     })?;
                 }
-                blocks.push(PredicateScanBlock::Owned {
+                blocks.push(PredicateScanBlock::Build {
                     row_ids: block.row_ids,
-                    vectors: block.vectors,
                 });
             }
             if covered.len() != point_count as u64 {
@@ -513,6 +526,7 @@ impl PredicateScanLayout {
             point_count,
             columns: built_columns.into_boxed_slice(),
             backing: None,
+            build_source: Some(PredicateScanBuildSource(vector_storage)),
             integrity: None,
             serialized_len,
         })
@@ -606,6 +620,74 @@ impl PredicateScanLayout {
         Ok(PredicateScanRangeRef { row_ids, vectors })
     }
 
+    fn range_row_ids<'a>(
+        &'a self,
+        column: &'a PredicateScanColumn,
+        range: PredicateScanRange,
+    ) -> Result<&'a [PointOffset]> {
+        let row_ids = self.block_row_ids(column, range.block_id as usize)?;
+        let start = range.row_start as usize;
+        let end = start
+            .checked_add(range.row_count as usize)
+            .ok_or_else(|| paro_error::data_corrupted("predicate scan ordinal range overflow"))?;
+        row_ids.get(start..end).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan ordinal row range exceeds its block")
+        })
+    }
+
+    fn block_row_ids<'a>(
+        &'a self,
+        column: &'a PredicateScanColumn,
+        block_id: usize,
+    ) -> Result<&'a [PointOffset]> {
+        let block = column.blocks.get(block_id).ok_or_else(|| {
+            paro_error::data_corrupted("predicate scan ordinal references a missing block")
+        })?;
+        match block {
+            PredicateScanBlock::Build { row_ids } => Ok(row_ids),
+            PredicateScanBlock::Encoded {
+                rows,
+                row_ids_offset,
+                ..
+            } => {
+                let bytes = self
+                    .backing
+                    .as_ref()
+                    .expect("encoded predicate scan block retains its backing")
+                    .as_bytes();
+                let row_ids_end = row_ids_offset
+                    .checked_add(
+                        rows.checked_mul(std::mem::size_of::<PointOffset>())
+                            .ok_or_else(|| {
+                                paro_error::data_corrupted("predicate scan row-id range overflow")
+                            })?,
+                    )
+                    .ok_or_else(|| {
+                        paro_error::data_corrupted("predicate scan row-id range overflow")
+                    })?;
+                let row_bytes = bytes.get(*row_ids_offset..row_ids_end).ok_or_else(|| {
+                    paro_error::data_corrupted("predicate scan row-id range exceeds backing")
+                })?;
+                if let Some(integrity) = &self.integrity {
+                    integrity.verify(*row_ids_offset, row_ids_end - *row_ids_offset)?;
+                }
+                #[cfg(target_endian = "little")]
+                {
+                    bytemuck::try_cast_slice(row_bytes).map_err(|_| {
+                        paro_error::data_corrupted("predicate scan row-id payload is unaligned")
+                    })
+                }
+                #[cfg(not(target_endian = "little"))]
+                {
+                    let _ = row_bytes;
+                    Err(paro_error::not_supported(
+                        "predicate scan native views require little-endian storage",
+                    ))
+                }
+            }
+        }
+    }
+
     fn block_ref<'a>(
         &'a self,
         column: &'a PredicateScanColumn,
@@ -615,9 +697,9 @@ impl PredicateScanLayout {
             paro_error::data_corrupted("predicate scan ordinal references a missing block")
         })?;
         match block {
-            PredicateScanBlock::Owned { row_ids, vectors } => {
-                Ok(PredicateScanRangeRef { row_ids, vectors })
-            }
+            PredicateScanBlock::Build { .. } => Err(paro_error::internal(
+                "newly built predicate scan layout must be published before query access",
+            )),
             PredicateScanBlock::Encoded {
                 rows,
                 row_ids_offset,
@@ -680,6 +762,7 @@ impl PredicateScanLayout {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn serialize(&self) -> Result<Vec<u8>> {
         let mut data = Vec::with_capacity(self.serialized_len);
         self.serialize_into(&mut data)?;
@@ -775,28 +858,38 @@ impl PredicateScanLayout {
         metadata.resize(metadata_len, 0);
         writer.write_all(&metadata)?;
         let mut written = metadata.len();
+        let mut build_batch = Vec::new();
         for column in &self.columns {
-            for block_id in 0..column.blocks.len() {
-                let block = self.block_ref(column, block_id)?;
+            for (block_id, block) in column.blocks.iter().enumerate() {
+                let row_ids = match block {
+                    PredicateScanBlock::Build { row_ids } => row_ids.as_ref(),
+                    PredicateScanBlock::Encoded { .. } => {
+                        self.block_ref(column, block_id)?.row_ids()
+                    }
+                };
                 #[cfg(target_endian = "little")]
                 {
-                    writer.write_all(bytemuck::cast_slice(block.row_ids()))?;
-                    writer.write_all(bytemuck::cast_slice(block.vectors()))?;
+                    writer.write_all(bytemuck::cast_slice(row_ids))?;
                 }
                 #[cfg(not(target_endian = "little"))]
                 {
-                    for row_id in block.row_ids() {
+                    for row_id in row_ids {
                         writer.write_all(&row_id.to_le_bytes())?;
                     }
-                    for value in block.vectors() {
-                        writer.write_all(&value.to_le_bytes())?;
-                    }
                 }
+                self.write_block_vectors(&mut writer, column, block_id, block, &mut build_batch)?;
+                let block_vector_bytes = row_ids
+                    .len()
+                    .checked_mul(self.dimension)
+                    .and_then(|values| values.checked_mul(std::mem::size_of::<f32>()))
+                    .ok_or_else(|| paro_error::out_of_range("predicate scan length overflow"))?;
+                let block_row_bytes = row_ids
+                    .len()
+                    .checked_mul(std::mem::size_of::<PointOffset>())
+                    .ok_or_else(|| paro_error::out_of_range("predicate scan length overflow"))?;
                 written = written
-                    .checked_add(block.row_ids().len() * std::mem::size_of::<PointOffset>())
-                    .and_then(|bytes| {
-                        bytes.checked_add(block.vectors().len() * std::mem::size_of::<f32>())
-                    })
+                    .checked_add(block_row_bytes)
+                    .and_then(|bytes| bytes.checked_add(block_vector_bytes))
                     .ok_or_else(|| paro_error::out_of_range("predicate scan length overflow"))?;
             }
         }
@@ -805,6 +898,68 @@ impl PredicateScanLayout {
                 "predicate scan encoder produced {} bytes, expected {}",
                 written, self.serialized_len
             )));
+        }
+        Ok(())
+    }
+
+    fn write_block_vectors<W: Write>(
+        &self,
+        writer: &mut W,
+        column: &PredicateScanColumn,
+        block_id: usize,
+        block: &PredicateScanBlock,
+        build_batch: &mut Vec<f32>,
+    ) -> Result<()> {
+        match block {
+            PredicateScanBlock::Encoded { .. } => {
+                let vectors = self.block_ref(column, block_id)?.vectors();
+                #[cfg(target_endian = "little")]
+                writer.write_all(bytemuck::cast_slice(vectors))?;
+                #[cfg(not(target_endian = "little"))]
+                for value in vectors {
+                    writer.write_all(&value.to_le_bytes())?;
+                }
+            }
+            PredicateScanBlock::Build { row_ids } => {
+                let source = &self
+                    .build_source
+                    .as_ref()
+                    .expect("build predicate scan layout retains its vector source")
+                    .0;
+                let rows_per_batch = PREDICATE_SCAN_BUILD_STREAM_BYTES
+                    .checked_div(
+                        self.dimension
+                            .checked_mul(std::mem::size_of::<f32>())
+                            .ok_or_else(|| {
+                                paro_error::out_of_range("predicate scan build row width overflow")
+                            })?,
+                    )
+                    .unwrap_or(0)
+                    .max(1);
+                let batch_values = rows_per_batch.checked_mul(self.dimension).ok_or_else(|| {
+                    paro_error::out_of_range("predicate scan build batch overflow")
+                })?;
+                build_batch.clear();
+                if build_batch.capacity() < batch_values {
+                    build_batch.try_reserve_exact(batch_values).map_err(|_| {
+                        paro_error::configuration_limit_exceeded(
+                            "predicate scan build stream buffer exceeds available memory",
+                        )
+                    })?;
+                }
+                for points in row_ids.chunks(rows_per_batch) {
+                    build_batch.clear();
+                    for &point in points {
+                        build_batch.extend_from_slice(source.get_vector(point));
+                    }
+                    #[cfg(target_endian = "little")]
+                    writer.write_all(bytemuck::cast_slice(build_batch))?;
+                    #[cfg(not(target_endian = "little"))]
+                    for value in build_batch.iter() {
+                        writer.write_all(&value.to_le_bytes())?;
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -869,7 +1024,9 @@ impl PredicateScanLayout {
     }
 
     pub(crate) fn save(&self, path: &Path) -> Result<()> {
-        std::fs::write(path, self.serialize()?).map_err(paro_error::io)
+        let mut file = std::fs::File::create(path).map_err(paro_error::io)?;
+        self.serialize_into(&mut file)?;
+        file.sync_all().map_err(paro_error::io)
     }
 
     pub(crate) fn load_mmap(path: &Path) -> Result<Self> {
@@ -1155,6 +1312,7 @@ impl PredicateScanLayout {
             point_count,
             columns: columns.into_boxed_slice(),
             backing: Some(backing),
+            build_source: None,
             integrity,
             serialized_len,
         })
@@ -1217,6 +1375,7 @@ impl PredicateScanLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::hnsw::InMemoryVectorStorage;
     use crate::index::{ExactRowPartitions, ExactRowSet, OrdinalRowSet};
     use roaring::RoaringBitmap;
 
@@ -1228,7 +1387,7 @@ mod tests {
     }
 
     fn build_layout() -> PredicateScanLayout {
-        PredicateScanLayout::from_build_columns(
+        let layout = PredicateScanLayout::from_build_columns(
             2,
             4,
             vec![PredicateScanBuildColumn {
@@ -1247,11 +1406,15 @@ mod tests {
                     ]
                     .into_boxed_slice(),
                     row_ids: vec![0, 2, 1, 3].into_boxed_slice(),
-                    vectors: Arc::from([0.0, 0.5, 2.0, 2.5, 1.0, 1.5, 3.0, 3.5]),
                 }],
             }],
+            Arc::new(InMemoryVectorStorage::new(
+                vec![0.0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5],
+                2,
+            )),
         )
-        .unwrap()
+        .unwrap();
+        PredicateScanLayout::deserialize_bytes(Bytes::from(layout.serialize().unwrap())).unwrap()
     }
 
     #[test]
@@ -1357,7 +1520,6 @@ mod tests {
                         )]
                         .into_boxed_slice(),
                         row_ids: vec![0, 1].into_boxed_slice(),
-                        vectors: Arc::from([0.0, 1.0]),
                     },
                     PredicateScanBuildBlock {
                         dictionary_ordinals: vec![1].into_boxed_slice(),
@@ -1368,10 +1530,10 @@ mod tests {
                         )]
                         .into_boxed_slice(),
                         row_ids: vec![1].into_boxed_slice(),
-                        vectors: Arc::from([1.0]),
                     },
                 ],
             }],
+            Arc::new(InMemoryVectorStorage::new(vec![0.0, 1.0], 1)),
         )
         .unwrap_err();
         assert!(error.to_string().contains("repeats a row"));
