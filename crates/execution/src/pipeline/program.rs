@@ -959,7 +959,7 @@ mod tests {
             orders: vec![order_by_first_column()].into_boxed_slice(),
             limit: 2,
             offset: 0,
-            hnsw_ef_hint: None,
+            hnsw_options: Default::default(),
             output_names: Box::new(["a".to_string()]),
             output_types: Box::new([LogicalType::Integer]),
         }
@@ -1093,7 +1093,7 @@ mod tests {
                         LogicalType::Integer,
                     ))),
                     offset: None,
-                    hnsw_ef_hint: None,
+                    hnsw_options: Default::default(),
                 }),
             ],
             sink: client_sink(),

@@ -253,7 +253,7 @@ pub struct ProjectSpec {
 pub struct LimitSpec {
     pub limit: Option<Expression>,
     pub offset: Option<Expression>,
-    pub hnsw_ef_hint: Option<usize>,
+    pub hnsw_options: paro_storage::index::hnsw::HnswQueryOptions,
 }
 
 #[derive(Debug, Clone)]

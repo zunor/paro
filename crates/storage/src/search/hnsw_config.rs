@@ -27,6 +27,8 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
+/// Version 15 binds construction to canonical unordered point-pair scoring so
+/// cosine topology cannot vary with heuristic operand order.
 /// Version 14 removes cardinality thresholds from search policy. Exact versus
 /// graph selection is now derived exclusively from the definition-pinned
 /// physical cost profile, effective ef, executable graph-pass count, and
@@ -43,7 +45,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 14;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 15;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

@@ -100,6 +100,7 @@ impl Segment {
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
         let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: params.objective,
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.num_rows(),

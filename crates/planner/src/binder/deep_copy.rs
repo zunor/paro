@@ -293,7 +293,7 @@ impl LogicalPlanDeepCopy {
                 LogicalOperator::Limit(LimNode {
                     limit: l.limit.clone(),
                     offset: l.offset.clone(),
-                    hnsw_ef_hint: l.hnsw_ef_hint,
+                    hnsw_options: l.hnsw_options,
                     child: Box::new(child),
                 })
             }
@@ -311,7 +311,7 @@ impl LogicalPlanDeepCopy {
                     orders: t.orders.clone(),
                     limit: t.limit,
                     offset: t.offset,
-                    hnsw_ef_hint: t.hnsw_ef_hint,
+                    hnsw_options: t.hnsw_options,
                     child: Box::new(child),
                 })
             }

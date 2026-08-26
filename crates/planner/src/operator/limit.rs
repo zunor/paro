@@ -7,14 +7,15 @@
 
 use crate::expression::Expression;
 use crate::plan::LogicalPlan;
+use paro_storage::index::hnsw::HnswQueryOptions;
 
 /// Limit represents a LIMIT/OFFSET operation.
 #[derive(Debug)]
 pub struct Limit {
     pub limit: Option<Expression>,
     pub offset: Option<Expression>,
-    /// Optional SQL hint `/*+ HNSW_EF(N) */` propagated to TopN/VectorScan.
-    pub hnsw_ef_hint: Option<usize>,
+    /// Typed dense-vector query options propagated to TopN/VectorScan.
+    pub hnsw_options: HnswQueryOptions,
     pub child: Box<LogicalPlan>,
 }
 
@@ -23,13 +24,13 @@ impl Limit {
         Self {
             limit,
             offset,
-            hnsw_ef_hint: None,
+            hnsw_options: HnswQueryOptions::default(),
             child: Box::new(child),
         }
     }
 
-    pub fn with_hnsw_ef_hint(mut self, hnsw_ef_hint: Option<usize>) -> Self {
-        self.hnsw_ef_hint = hnsw_ef_hint;
+    pub fn with_hnsw_options(mut self, hnsw_options: HnswQueryOptions) -> Self {
+        self.hnsw_options = hnsw_options;
         self
     }
 }

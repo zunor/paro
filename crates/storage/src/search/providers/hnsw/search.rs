@@ -425,6 +425,7 @@ impl VectorSearchCursor {
             |index| index.exact_scan_workload(filter),
         );
         let search_strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: self.params.objective,
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: segment.segment.num_rows(),
@@ -544,6 +545,7 @@ impl VectorSearchCursor {
             .row_set()
             .map_or(artifact.coverage.row_count(), ExactRowSet::len);
         let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: self.params.objective,
             filter_kind,
             matching_rows,
             total_rows: artifact.coverage.row_count(),

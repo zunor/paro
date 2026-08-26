@@ -168,7 +168,7 @@ impl TopNOptimizer {
 
         let order_child = *order.child;
         let topn = TopN::new(order_child, order.orders, limit_val, offset_val)
-            .with_hnsw_ef_hint(limit.hnsw_ef_hint);
+            .with_hnsw_options(limit.hnsw_options);
         let mut result = LogicalOperator::TopN(topn);
 
         while let Some((table_index, expressions, output_names, visible_count, qualifier)) =
@@ -416,7 +416,7 @@ mod tests {
     }
 
     #[test]
-    fn test_optimize_propagates_hnsw_ef_hint() {
+    fn test_optimize_propagates_typed_hnsw_query_options() {
         let mut optimizer = TopNOptimizer::new();
         let get = create_test_get();
         let order = create_order_by(get);
@@ -426,14 +426,21 @@ mod tests {
                 Some(create_constant_expr(10)),
                 None,
             )
-            .with_hnsw_ef_hint(Some(256)),
+            .with_hnsw_options(paro_storage::index::hnsw::HnswQueryOptions {
+                ef: Some(256),
+                objective: paro_storage::index::hnsw::HnswSearchObjective::Exact,
+            }),
         );
 
         let result = optimizer.optimize(limit);
 
         assert_eq!(result.op_type(), LogicalOperatorType::TopN);
         if let LogicalOperator::TopN(topn) = result {
-            assert_eq!(topn.hnsw_ef_hint, Some(256));
+            assert_eq!(topn.hnsw_options.ef, Some(256));
+            assert_eq!(
+                topn.hnsw_options.objective,
+                paro_storage::index::hnsw::HnswSearchObjective::Exact
+            );
         } else {
             panic!("Expected TopN operator");
         }

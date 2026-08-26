@@ -26,7 +26,7 @@ fn topn_and_window_stream_through_typed_transforms() {
             .into_boxed_slice(),
             limit: 2,
             offset: 0,
-            hnsw_ef_hint: None,
+            hnsw_options: Default::default(),
             output_names: vec!["v".to_string()].into_boxed_slice(),
             output_types: vec![LogicalType::Integer].into_boxed_slice(),
         })],

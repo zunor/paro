@@ -1211,7 +1211,7 @@ fn project_filter_limit_chain_pushes_without_dyn_dispatch() {
             TransformSpec::Limit(LimitSpec {
                 limit: Some(int_constant(1)),
                 offset: None,
-                hnsw_ef_hint: None,
+                hnsw_options: Default::default(),
             }),
         ],
         sink: SinkSpec::ClientResult(ClientResultSpec::default()),

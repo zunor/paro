@@ -280,7 +280,7 @@ fn streaming_limit_stop_pipeline_still_runs_completion() {
             TransformSpec::Limit(LimitSpec {
                 limit: Some(int_constant(0)),
                 offset: None,
-                hnsw_ef_hint: None,
+                hnsw_options: Default::default(),
             }),
         ],
         sink: SinkSpec::ClientResult(ClientResultSpec::default()),
@@ -317,7 +317,7 @@ fn transform_stop_pipeline_flushes_only_downstream_transforms() {
             TransformSpec::Limit(LimitSpec {
                 limit: Some(int_constant(0)),
                 offset: None,
-                hnsw_ef_hint: None,
+                hnsw_options: Default::default(),
             }),
             TransformSpec::Project(ProjectSpec {
                 expressions: vec![int_constant(1)].into_boxed_slice(),

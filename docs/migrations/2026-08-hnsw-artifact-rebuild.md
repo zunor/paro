@@ -7,7 +7,7 @@ previous artifacts. Recreate every HNSW/vector index from its
 The rebuild is required because the durable contract now:
 
 - stores only immutable graph-construction fields, separate from search policy;
-- uses the fixed-width, self-contained HNSW artifact envelope version 14. The
+- uses the fixed-width, self-contained HNSW artifact envelope version 15. The
   artifact owns its canonical dense-vector region as well as its graph,
   predicate covering layout, metric preprocessing and statistics, so one
   generation partition may cover several base segments without borrowing any
@@ -25,10 +25,12 @@ The rebuild is required because the durable contract now:
   artifact carries canonical, generation-owned multi-segment coverage and its
   deterministic local point-id mapping; old single-segment manifest images
   are rejected;
-- requires HNSW provider-config version 14 and build-contract version 10, which
+- requires HNSW provider-config version 15 and build-contract version 11, which
   select deterministic frozen-wave construction, keyed Feistel point ordering,
-  barrier publication, exact predicate-local covering runs, and the full
-  configured construction beam on every graph layer. Exact/graph costing is
+  barrier publication, canonical unordered point-pair scoring (so cosine
+  topology cannot vary with inverse-norm operand order), exact predicate-local
+  covering runs, and the full configured construction beam on every graph
+  layer. Exact/graph costing is
   definition-pinned for sequential covering scores, indexed gathers, and
   unique graph scores per `ef`. The three coefficients form one atomic profile
   with either a built-in revision or a non-zero offline-calibration id; partial

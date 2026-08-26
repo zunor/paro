@@ -964,6 +964,17 @@ fn push_dense_search_filter_properties(
         spec.filter_materialization,
         spec.table.as_ref(),
     );
+    if spec.params.objective == paro_storage::index::hnsw::HnswSearchObjective::Exact {
+        if spec.predicate.is_some() {
+            push_string_property(
+                properties,
+                "Filtered Strategy",
+                "query objective forces exact row-set distance scan; HNSW navigation, predicate topology, and adaptive refinement are disabled"
+                    .to_string(),
+            );
+        }
+        return;
+    }
     if spec.predicate.is_none() {
         return;
     }
@@ -1036,6 +1047,19 @@ fn push_vector_search_properties(
         table_column_name(spec.table.as_ref(), spec.column_id),
     );
     push_string_property(properties, "Limit", spec.k.to_string());
+    push_string_property(
+        properties,
+        "Search Objective",
+        match spec.params.objective {
+            paro_storage::index::hnsw::HnswSearchObjective::CostOptimized => {
+                "cost_optimized: definition-pinned cost selects exact scoring or graph traversal"
+                    .to_string()
+            }
+            paro_storage::index::hnsw::HnswSearchObjective::Exact => {
+                "exact: score every admitted vector; graph traversal disabled".to_string()
+            }
+        },
+    );
     push_string_property(
         properties,
         "Search Ef",

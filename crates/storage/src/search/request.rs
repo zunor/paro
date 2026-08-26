@@ -8,7 +8,7 @@ use crate::index::fulltext::query_parser::{
 pub use crate::index::fulltext::scoring::FullTextScoreMode;
 use crate::index::fulltext::tokenizer::{tokenizer_from_config, TokenizerKind};
 use crate::index::fulltext::ts_serde::parse_serialized_tsquery;
-use crate::index::hnsw::DistanceMetric;
+use crate::index::hnsw::{DistanceMetric, HnswQueryOptions};
 use crate::index::PredicateTree;
 use crate::rowset::SparseVector;
 use crate::tablet::ColumnId;
@@ -74,7 +74,7 @@ pub struct HnswIntent {
     /// SQL distance function that defines both index compatibility and score
     /// materialization semantics.
     pub distance: DistanceMetric,
-    pub ef: Option<usize>,
+    pub options: HnswQueryOptions,
 }
 
 #[derive(Debug, Clone, PartialEq)]

@@ -601,13 +601,24 @@ impl GraphLayersBuilder {
         search_context.nearest.into_sorted_vec()
     }
 
+    /// Score one unordered artifact point pair in a canonical operand order.
+    ///
+    /// Cosine scoring multiplies the dot product by two persisted inverse
+    /// norms. Floating-point multiplication is not associative, so allowing
+    /// call-site order to choose `(dot * norm_a) * norm_b` versus
+    /// `(dot * norm_b) * norm_a` can change the last bit and, at a heuristic
+    /// boundary, the durable topology. Every construction and repair path must
+    /// use this function rather than calling `similarity_indexed` directly.
     #[inline]
-    fn score_indexed(
+    pub(crate) fn score_indexed(
         storage: &dyn VectorStorage,
         distance: DistanceMetric,
-        left: PointOffset,
-        right: PointOffset,
+        mut left: PointOffset,
+        mut right: PointOffset,
     ) -> ScoreType {
+        if left > right {
+            std::mem::swap(&mut left, &mut right);
+        }
         if distance == DistanceMetric::Cosine {
             let norms = storage
                 .cosine_inverse_norms()

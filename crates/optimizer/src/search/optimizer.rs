@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use paro_common::error::Result;
+use paro_common::error::{self as paro_error, Result};
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_external::routine::identity::BuiltinIntrinsicId;
@@ -83,6 +83,17 @@ impl SearchOptimizer {
         let Some(pattern) = extract_topn_pattern(topn) else {
             return Ok(None);
         };
+        let vector_intent = extract_vector_intent(
+            pattern.order_expr,
+            pattern.get,
+            topn.hnsw_options,
+            pattern.topn.orders[0].ascending,
+        )?;
+        if topn.hnsw_options != Default::default() && vector_intent.is_none() {
+            return Err(paro_error::invalid_input(
+                "HNSW_EF and VECTOR_SEARCH_MODE apply only to ascending dense-vector distance ORDER BY ... LIMIT queries",
+            ));
+        }
         let Some((table_id, storage)) = get_search_storage(pattern.get) else {
             return Ok(None);
         };
@@ -101,12 +112,7 @@ impl SearchOptimizer {
         // which vectors survive. Output cardinality is not scan work.
         let sequential = build_sequential_capability(table_id, base_rows);
 
-        if let Some(intent) = extract_vector_intent(
-            pattern.order_expr,
-            pattern.get,
-            topn.hnsw_ef_hint,
-            pattern.topn.orders[0].ascending,
-        )? {
+        if let Some(intent) = vector_intent {
             let search_intent = SearchIntent::Hnsw(intent.clone());
             let Some(capability) = storage.search_capability(&search_intent) else {
                 return Ok(None);
@@ -126,7 +132,7 @@ impl SearchOptimizer {
                 &stats,
                 topn.limit,
                 filter_selectivity,
-                topn.hnsw_ef_hint,
+                topn.hnsw_options,
                 search_policy,
                 filter_materialization,
             );
@@ -612,7 +618,7 @@ fn find_filters_and_get_plan(mut plan: &LogicalPlan) -> Option<(Vec<Expression>,
 fn extract_vector_intent(
     expr: &Expression,
     get: &Get,
-    ef: Option<usize>,
+    options: paro_storage::index::hnsw::HnswQueryOptions,
     ascending: bool,
 ) -> Result<Option<HnswIntent>> {
     if !ascending {
@@ -650,7 +656,7 @@ fn extract_vector_intent(
                     column_id,
                     query: query_vector,
                     distance,
-                    ef,
+                    options,
                 }),
             );
         }
@@ -662,7 +668,7 @@ fn extract_vector_intent(
                     column_id,
                     query: query_vector,
                     distance,
-                    ef,
+                    options,
                 }),
             );
         }
@@ -1171,7 +1177,7 @@ mod tests {
                     column_id: 1,
                     query: DenseVectorQuery::Literal(vec![1.0, 2.0]),
                     distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
-                    ef: None,
+                    options: Default::default(),
                 }),
                 token: paro_storage::search::CapabilityToken {
                     definition_id: 1,

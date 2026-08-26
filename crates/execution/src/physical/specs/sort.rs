@@ -17,7 +17,7 @@ pub struct TopNSpec {
     pub orders: Box<[OrderByNode]>,
     pub limit: usize,
     pub offset: usize,
-    pub hnsw_ef_hint: Option<usize>,
+    pub hnsw_options: paro_storage::index::hnsw::HnswQueryOptions,
     pub output_names: Box<[String]>,
     pub output_types: Box<[LogicalType]>,
 }

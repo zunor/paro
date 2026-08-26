@@ -3581,6 +3581,7 @@ mod tests {
                 1,
                 SearchParams {
                     ef: Some(16),
+                    objective: crate::index::hnsw::HnswSearchObjective::CostOptimized,
                     random_entry_point: Some(false),
                 },
                 None,

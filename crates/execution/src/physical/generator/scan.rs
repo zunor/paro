@@ -331,7 +331,7 @@ impl PhysicalPlanGenerator {
         let spec = LimitSpec {
             limit: limit.limit.clone(),
             offset: limit.offset.clone(),
-            hnsw_ef_hint: limit.hnsw_ef_hint,
+            hnsw_options: limit.hnsw_options,
         };
         Ok((PhysicalNodeKind::Limit(spec), vec![child]))
     }
@@ -348,7 +348,7 @@ impl PhysicalPlanGenerator {
             orders: topn.orders.clone().into_boxed_slice(),
             limit: topn.limit,
             offset: topn.offset,
-            hnsw_ef_hint: topn.hnsw_ef_hint,
+            hnsw_options: topn.hnsw_options,
             output_names: output_names.into_boxed_slice(),
             output_types: output_types.into_boxed_slice(),
         };
@@ -748,7 +748,8 @@ fn search_source_spec_for_candidate(
                 distance: intent.distance,
                 k: scan.limit,
                 params: paro_storage::index::hnsw::types::SearchParams {
-                    ef: intent.ef,
+                    ef: intent.options.ef,
+                    objective: intent.options.objective,
                     ..Default::default()
                 },
                 search_policy,

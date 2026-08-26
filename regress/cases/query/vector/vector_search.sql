@@ -121,6 +121,24 @@ FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]'
 LIMIT 2;
 
+-- Exact is a binding query objective rather than an ef convention. The
+-- physical source must expose that graph navigation is disabled, while the
+-- exact scalar row-set pushdown remains available.
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+SELECT count(*) AS exact_rows
+FROM (
+    SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+    FROM indexed_items
+    WHERE id <= 1024
+    ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+    LIMIT 2
+) AS forced_exact;
+
 -- Vector search with different target
 SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
 

@@ -1615,7 +1615,7 @@ mod tests {
                     column_id: 1,
                     query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
                     distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
-                    ef: None,
+                    options: Default::default(),
                 })],
                 fusion: None,
             },
@@ -1625,7 +1625,7 @@ mod tests {
                         column_id: 1,
                         query: DenseVectorQuery::Literal(vec![0.1, 0.2]),
                         distance: paro_storage::index::hnsw::DistanceMetric::Euclidean,
-                        ef: None,
+                        options: Default::default(),
                     }),
                     token: paro_storage::search::CapabilityToken {
                         definition_id: 1,

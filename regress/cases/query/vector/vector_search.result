@@ -94,6 +94,7 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
@@ -112,6 +113,7 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
@@ -136,6 +138,7 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id = 1
@@ -160,6 +163,7 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id <= 1024
@@ -248,6 +252,7 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: default
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
@@ -276,8 +281,44 @@ PROJECTION  (rows=2)
     Search Candidate: dense vector
     Column: emb
     Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
     Search Ef: 37
     Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+FROM indexed_items
+WHERE id <= 1024
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: exact: score every admitted vector; graph traversal disabled
+    Search Ef: default
+    Exact/Graph Cost Profile: covering=1 sequential scores/random score, indexed-base=1 gathered scores/random score, graph=1 unique scores/ef (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+    Pushed Predicate: id <= 1024
+    Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
+    Filtered Strategy: query objective forces exact row-set distance scan; HNSW navigation, predicate topology, and adaptive refinement are disabled
+
+SELECT count(*) AS exact_rows
+FROM (
+    SELECT /*+ VECTOR_SEARCH_MODE('exact') */ id
+    FROM indexed_items
+    WHERE id <= 1024
+    ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+    LIMIT 2
+) AS forced_exact;
+exact_rows
+2
 
 SELECT id FROM items ORDER BY emb <-> '[2.0, 2.0, 2.0]' LIMIT 2;
 id

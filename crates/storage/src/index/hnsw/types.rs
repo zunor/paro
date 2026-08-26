@@ -50,6 +50,9 @@ pub const DEFAULT_HNSW_GRAPH_SCORED_POINTS_PER_EF: u32 = 24;
 pub const HNSW_BUILT_IN_DISTANCE_COST_REVISION: u32 = 3;
 pub const MAX_HNSW_FILTER_COLUMNS: usize = 8;
 pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
+/// Version 11 canonicalizes unordered point-pair scoring before every build
+/// and repair heuristic, including cosine inverse-norm multiplication. This
+/// makes the last-bit score image independent of call-site operand order.
 /// Version 10 applies `ef_construct` on every HNSW layer. Earlier builders
 /// silently narrowed upper-layer construction to M, weakening the sparse
 /// routing hierarchy as graph partitions grew.
@@ -71,7 +74,7 @@ pub const HNSW_FILTER_TOPOLOGY_VERSION: u32 = 4;
 /// followed by cycle walking. One-point warm-up waves and deterministic frozen
 /// proposal waves remain durable topology fields; changing point ordering or
 /// publication semantics requires a new contract version.
-pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 10;
+pub const HNSW_BUILD_CONTRACT_VERSION: u32 = 11;
 
 /// A scored point — a point with its similarity/distance score.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -286,12 +289,50 @@ impl<'a> HnswSearchFilter<'a> {
     }
 }
 
+/// Query-level semantic objective for dense HNSW Top-K.
+///
+/// `CostOptimized` permits the immutable, definition-pinned cost model to
+/// choose between graph traversal and exact scoring. `Exact` is a binding
+/// result contract: every admitted vector is scored and the graph is not
+/// consulted. It deliberately does not expose a numeric recall target because
+/// an approximate graph cannot prove such a probability for one query.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HnswSearchObjective {
+    #[default]
+    CostOptimized,
+    Exact,
+}
+
+impl std::fmt::Display for HnswSearchObjective {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CostOptimized => f.write_str("cost_optimized"),
+            Self::Exact => f.write_str("exact"),
+        }
+    }
+}
+
+/// Planner-owned dense vector search options propagated as one typed value.
+///
+/// Keeping quality/performance intent beside `ef` prevents query modifiers,
+/// logical operators, and prepared plans from growing parallel optional
+/// fields whose combinations are never validated together.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HnswQueryOptions {
+    pub ef: Option<usize>,
+    pub objective: HnswSearchObjective,
+}
+
 /// Search parameters for HNSW queries.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct SearchParams {
     /// Size of the beam in beam-search. Larger = more accurate but slower.
     /// If None, uses the index's default ef.
     pub ef: Option<usize>,
+    /// Binding result contract selected by the query.
+    pub objective: HnswSearchObjective,
     /// Whether to randomize entry point selection during graph search.
     /// `None` lets the index choose a default strategy.
     #[serde(default)]
@@ -574,6 +615,7 @@ impl HnswDistanceCostModel {
 /// own covering/base work and graph degree are the complete cost boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSegmentSearchInput {
+    pub objective: HnswSearchObjective,
     pub filter_kind: HnswFilterKind,
     pub matching_rows: u64,
     pub total_rows: u64,
@@ -590,6 +632,9 @@ impl HnswSearchStrategy {
     /// calibration changes. The definition-pinned cost profile is the single
     /// decision surface for both small exact scans and graph traversal.
     pub fn choose(input: HnswSegmentSearchInput) -> Self {
+        if input.objective == HnswSearchObjective::Exact {
+            return Self::ExactScan;
+        }
         // The physical cost contract charges a width-ef traversal at least ef
         // random scores, while exact scoring of at most ef admitted rows does
         // no more work under any valid profile. Keep that invariant explicit
@@ -690,6 +735,7 @@ pub fn estimate_filtered_search_strategy(
     );
 
     let search_input = HnswSegmentSearchInput {
+        objective: HnswSearchObjective::CostOptimized,
         filter_kind: HnswFilterKind::Predicate,
         matching_rows,
         total_rows,
@@ -726,6 +772,7 @@ impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
             ef: None,
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: None,
         }
     }
@@ -1228,6 +1275,7 @@ mod tests {
     fn predicate_cost_charges_the_deferred_beam_retry() {
         let profile = HnswDistanceCostProfile::default();
         let selective = HnswSegmentSearchInput {
+            objective: HnswSearchObjective::CostOptimized,
             filter_kind: HnswFilterKind::Predicate,
             matching_rows: 100_000,
             total_rows: 10_000_000,
@@ -1329,6 +1377,7 @@ mod tests {
         let policy = HnswSearchPolicy::default();
         assert_eq!(
             HnswSearchStrategy::choose(HnswSegmentSearchInput {
+                objective: HnswSearchObjective::CostOptimized,
                 filter_kind: HnswFilterKind::Predicate,
                 matching_rows: 10_000,
                 total_rows: 1_000_000,
@@ -1341,6 +1390,7 @@ mod tests {
         );
         assert_eq!(
             HnswSearchStrategy::choose(HnswSegmentSearchInput {
+                objective: HnswSearchObjective::CostOptimized,
                 filter_kind: HnswFilterKind::Predicate,
                 matching_rows: 10_000,
                 total_rows: 1_000_000,
@@ -1350,6 +1400,33 @@ mod tests {
                 cost_profile: policy.distance_cost,
             }),
             HnswSearchStrategy::AdaptiveFilteredGraph
+        );
+    }
+
+    #[test]
+    fn exact_objective_bypasses_the_latency_cost_model() {
+        let policy = HnswSearchPolicy::default();
+        let input = HnswSegmentSearchInput {
+            objective: HnswSearchObjective::Exact,
+            filter_kind: HnswFilterKind::Predicate,
+            matching_rows: 5_000_000,
+            total_rows: 10_000_000,
+            top_k: 10,
+            effective_ef: 160,
+            exact_scan_workload: HnswExactScanWorkload::indexed_base(5_000_000),
+            cost_profile: policy.distance_cost,
+        };
+
+        assert_eq!(
+            HnswSearchStrategy::choose(input),
+            HnswSearchStrategy::ExactScan
+        );
+        assert_ne!(
+            HnswSearchStrategy::choose(HnswSegmentSearchInput {
+                objective: HnswSearchObjective::CostOptimized,
+                ..input
+            }),
+            HnswSearchStrategy::ExactScan
         );
     }
 

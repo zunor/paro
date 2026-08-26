@@ -32,7 +32,7 @@ impl Binder {
         if let Some(limit) = node.limit {
             root = LogicalOperator::Limit(
                 Limit::new(self.wrap_plan(root), limit.limit, limit.offset)
-                    .with_hnsw_ef_hint(node.hnsw_ef_hint),
+                    .with_hnsw_options(node.hnsw_options),
             );
         }
 

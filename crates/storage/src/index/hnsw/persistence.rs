@@ -52,6 +52,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
+/// Version 15 binds artifacts to canonical unordered point-pair scoring during
+/// construction and repair, including cosine inverse-norm multiplication.
 /// Version 14 binds every fixed level-0 record to its durable degree capacity;
 /// observed data can no longer change artifact width.
 /// Version 13 replaces level-0 CSR offsets with fixed-stride adjacency records.
@@ -59,7 +61,7 @@ const HNSW_ARTIFACT_MAGIC: [u8; 4] = *b"HNSW";
 /// longer pays an independent random offset-table lookup. Version 11's
 /// canonical predicate dictionary keys remain part of the format. Earlier
 /// graph layouts are intentionally rejected rather than translated at open.
-pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 14;
+pub const HNSW_ARTIFACT_FORMAT_VERSION: u32 = 15;
 const HNSW_ARTIFACT_VERSION: u32 = HNSW_ARTIFACT_FORMAT_VERSION;
 pub(crate) const HNSW_ARTIFACT_HEADER_LEN: usize = 192;
 const HNSW_NORM_COUNT_FIELD: usize = 48;
@@ -2012,6 +2014,7 @@ impl HnswIndex {
             .row_set()
             .map_or(self.graph.num_points() as u64, ExactRowSet::len);
         let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
+            objective: params.objective,
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.graph.num_points() as u64,
@@ -2839,7 +2842,9 @@ impl HnswIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::index::hnsw::{HnswBuilder, HnswM, InMemoryVectorStorage, PointOffset};
+    use crate::index::hnsw::{
+        HnswBuilder, HnswM, HnswSearchObjective, InMemoryVectorStorage, PointOffset,
+    };
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
     use roaring::RoaringBitmap;
@@ -3187,25 +3192,27 @@ mod tests {
     #[test]
     fn frozen_wave_build_is_byte_deterministic_across_pool_widths() {
         let vectors = make_sift_like_vectors(0xdef, 4_352, 24, 16);
-        let contract = HnswConfig::new(12, 72)
-            .with_build_seed(0x0fed_cba9_8765_4321)
-            .build_contract(DistanceMetric::Euclidean);
-        let build = |width| {
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(width)
-                .build()
-                .unwrap();
-            HnswIndex::build_with_controls(make_storage(&vectors), contract, Some(&pool), None)
-                .unwrap()
-                .serialize()
-                .unwrap()
-        };
-        let width_2 = build(2);
-        let width_7 = build(7);
-        let width_16 = build(16);
+        for distance in [DistanceMetric::Euclidean, DistanceMetric::Cosine] {
+            let contract = HnswConfig::new(12, 72)
+                .with_build_seed(0x0fed_cba9_8765_4321)
+                .build_contract(distance);
+            let build = |width| {
+                let pool = rayon::ThreadPoolBuilder::new()
+                    .num_threads(width)
+                    .build()
+                    .unwrap();
+                HnswIndex::build_with_controls(make_storage(&vectors), contract, Some(&pool), None)
+                    .unwrap()
+                    .serialize()
+                    .unwrap()
+            };
+            let width_1 = build(1);
+            let width_2 = build(2);
+            let width_8 = build(8);
 
-        assert_eq!(width_2, width_7);
-        assert_eq!(width_2, width_16);
+            assert_eq!(width_1, width_2, "distance={distance:?}");
+            assert_eq!(width_1, width_8, "distance={distance:?}");
+        }
     }
 
     #[test]
@@ -3505,6 +3512,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
         let top_k = 12;
@@ -3615,6 +3623,7 @@ mod tests {
         let prepared_queries = vec![DistanceMetric::Euclidean.prepare(&query)];
         let params = SearchParams {
             ef: Some(96),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
         let top_k = 8;
@@ -3647,6 +3656,7 @@ mod tests {
 
         let params = SearchParams {
             ef: Some(50),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: None,
         };
         let result = index.search_one(&[0.0], 1, &params, Some(&bitmap)).unwrap();
@@ -3702,6 +3712,7 @@ mod tests {
         let query = &vectors[7];
         let params = SearchParams {
             ef: Some(96),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
         let policy = HnswSearchPolicy {
@@ -3788,6 +3799,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
         let top_k = 10;
@@ -4262,6 +4274,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
         let top_k = 6;

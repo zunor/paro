@@ -7,7 +7,8 @@
 
 use paro_planner::operator::{FullTextQueryStats, FullTextScoreMode};
 use paro_storage::index::hnsw::{
-    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswSearchPolicy,
+    estimate_filtered_search_strategy, HnswFilteredSearchStrategy, HnswQueryOptions,
+    HnswSearchObjective, HnswSearchPolicy,
 };
 use paro_storage::search::ExactFilterMaterialization;
 use paro_storage::statistics::{
@@ -94,7 +95,7 @@ impl VectorScanCostModel {
         stats: &HnswIndexStatistics,
         k: usize,
         filter_selectivity: f64,
-        ef: Option<usize>,
+        options: HnswQueryOptions,
         policy: HnswSearchPolicy,
         filter_materialization: Option<ExactFilterMaterialization>,
     ) -> f64 {
@@ -107,7 +108,7 @@ impl VectorScanCostModel {
             n
         };
         let log_n = n.ln().max(1.0);
-        let effective_ef = policy.effective_ef(k, ef);
+        let effective_ef = policy.effective_ef(k, options.ef);
         let ef_val = effective_ef as f64;
         let dim_factor = (stats.dimension.max(1) as f64 / 128.0).max(1.0);
         // Planning and execution consume the same immutable definition-owned
@@ -163,6 +164,10 @@ impl VectorScanCostModel {
             sequential_vector_scan_factor
         };
         let exact_scan_cost = (candidate_rows * dim_factor * exact_scan_factor).max(1.0);
+
+        if options.objective == HnswSearchObjective::Exact {
+            return bitmap_cost + exact_scan_cost;
+        }
 
         if filtered {
             let decision = estimate_filtered_search_strategy(
@@ -288,6 +293,13 @@ fn weighted_query_terms(query_stats: &FullTextQueryStats) -> f64 {
 mod tests {
     use super::*;
 
+    fn hnsw_options(ef: usize) -> HnswQueryOptions {
+        HnswQueryOptions {
+            ef: Some(ef),
+            ..Default::default()
+        }
+    }
+
     fn hnsw_stats(rows: usize, dimension: usize) -> HnswIndexStatistics {
         HnswIndexStatistics {
             num_indexed_vectors: rows,
@@ -314,7 +326,7 @@ mod tests {
             &hnsw_stats(20_000, 100),
             10,
             0.001,
-            Some(40),
+            hnsw_options(40),
             policy,
             Some(ExactFilterMaterialization::ScalarIndex),
         );
@@ -333,13 +345,19 @@ mod tests {
             ..HnswSearchPolicy::default()
         };
         let stats = hnsw_stats(1_000_000, 128);
-        let unfiltered =
-            VectorScanCostModel::estimate_hnsw_cost(&stats, 10, 1.0, Some(40), policy, None);
+        let unfiltered = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            1.0,
+            hnsw_options(40),
+            policy,
+            None,
+        );
         let filtered = VectorScanCostModel::estimate_hnsw_cost(
             &stats,
             10,
             0.75,
-            Some(40),
+            hnsw_options(40),
             policy,
             Some(ExactFilterMaterialization::ScalarIndex),
         );
@@ -358,7 +376,7 @@ mod tests {
             &stats,
             10,
             0.01,
-            Some(80),
+            hnsw_options(80),
             policy,
             Some(ExactFilterMaterialization::ScalarIndex),
         );
@@ -366,7 +384,7 @@ mod tests {
             &stats,
             10,
             0.01,
-            Some(80),
+            hnsw_options(80),
             policy,
             Some(ExactFilterMaterialization::ColumnScan),
         );
@@ -395,7 +413,7 @@ mod tests {
             &stats,
             10,
             20_000.0 / 1_000_000.0,
-            Some(160),
+            hnsw_options(160),
             policy,
             Some(ExactFilterMaterialization::ScalarIndex),
         );
@@ -403,7 +421,7 @@ mod tests {
             &stats,
             10,
             20_001.0 / 1_000_000.0,
-            Some(160),
+            hnsw_options(160),
             policy,
             Some(ExactFilterMaterialization::ScalarIndex),
         );
@@ -420,7 +438,7 @@ mod tests {
             &hnsw_stats(10_000_000, 128),
             10,
             1.0,
-            Some(80),
+            hnsw_options(80),
             policy,
             None,
         );
@@ -428,10 +446,40 @@ mod tests {
             &hnsw_stats(10_000_000, 128),
             10,
             1.0,
-            Some(320),
+            hnsw_options(320),
             policy,
             None,
         );
         assert!(high > low * 2.0, "low={low}, high={high}");
+    }
+
+    #[test]
+    fn exact_objective_costs_the_exact_path_instead_of_the_graph_minimum() {
+        let stats = hnsw_stats(10_000_000, 32);
+        let policy = HnswSearchPolicy::default();
+        let approximate = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            0.5,
+            hnsw_options(160),
+            policy,
+            Some(ExactFilterMaterialization::ScalarIndex),
+        );
+        let exact = VectorScanCostModel::estimate_hnsw_cost(
+            &stats,
+            10,
+            0.5,
+            HnswQueryOptions {
+                ef: Some(160),
+                objective: HnswSearchObjective::Exact,
+            },
+            policy,
+            Some(ExactFilterMaterialization::ScalarIndex),
+        );
+
+        assert!(
+            exact > approximate,
+            "exact={exact}, approximate={approximate}"
+        );
     }
 }
