@@ -13,12 +13,13 @@ use paro_scheduler::scheduler::TaskScheduler;
 use crate::metrics::storage_metrics;
 use crate::rowset::{RowsetId, RowsetSharedPtr};
 use crate::tablet::{ColumnId, RowsetPublishObserver, TabletId, TabletRef};
+use paro_common::effect::ArtifactRef;
 use paro_common::error::{self as paro_error, Result};
 
 use super::artifact::{ArtifactFileId, ArtifactGcContext, ArtifactLocation, GcDecision};
 use super::capability::{
-    CapabilityToken, SearchArtifactRef, SearchCapability, SearchDefinitionOrigin,
-    SearchIndexDefinition, SearchIndexKind,
+    ArtifactSegmentRef, CapabilityToken, SearchArtifactRef, SearchCapability,
+    SearchDefinitionOrigin, SearchIndexDefinition, SearchIndexKind,
 };
 use super::cursor::{GenerationArtifactSet, GenerationReadSnapshot, OpenSearchCursorResult};
 use super::definition::freshness::capability_needs_required_freshness_wait;
@@ -28,7 +29,8 @@ use super::generation::coverage::{search_generation_coverage_for_state, SearchGe
 use super::generation::head::{head_for_state, persist_head_for_state};
 use super::generation::maintenance_state::build_maintenance_state;
 use super::generation::snapshot::{
-    collect_rowset_snapshot, collect_visible_snapshot, RowsetSearchSnapshot,
+    collect_full_rebuild_tail, collect_rowset_snapshot, collect_visible_snapshot,
+    RowsetSearchSnapshot,
 };
 use super::generation::stats::{
     empty_generation_stats_for_definition, generation_stats_after_artifact_replacement,
@@ -43,7 +45,8 @@ use super::generation::view::{
     indexed_through_ts, record_tail_metrics_for_state, SearchDefinitionState, SearchView,
 };
 use super::inline_sink::{
-    BuildBudget, SearchAdmission, SearchInlineBuilderSet, SidecarArtifactBuilder,
+    BuildBudget, SearchAdmission, SearchBuildStopCheck, SearchInlineBuilderSet,
+    SidecarArtifactBuilder, SidecarBuildInput,
 };
 use super::lifecycle::bootstrap::SearchBootstrapReport;
 use super::lifecycle::gc::gc_policy_for_kind;
@@ -62,6 +65,7 @@ use super::manifest::{
 };
 use super::sidecar::{SearchReaderRuntime, SidecarArtifactStore};
 use super::sidecar_builder::ProviderSidecarArtifactBuilder;
+use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
 use super::stats::MaintenancePriority;
 use super::tail::{
     TailEntryId, TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
@@ -194,6 +198,13 @@ impl SearchIndexRegistry {
         registry
     }
 
+    /// Sweep pre-commit workspaces only after WAL replay has consumed every
+    /// committed `PublishSearchGeneration` mutation. Running this during table
+    /// construction could delete the sole source directory needed by replay.
+    pub(crate) fn sweep_orphan_generation_workspaces(&self) -> Result<usize> {
+        self.manifests.sweep_orphan_generation_workspaces()
+    }
+
     pub(crate) fn bind_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
         *self.hnsw_task_scheduler.write().unwrap() = scheduler;
     }
@@ -225,6 +236,190 @@ impl SearchIndexRegistry {
             definition.clone(),
             SearchDefinitionOrigin::catalog(definition.definition_id),
         )
+    }
+
+    /// Build a complete immutable generation without making its definition
+    /// visible. The returned owner retains an exclusive physical-layout lease
+    /// until transaction publish or abort.
+    pub(crate) fn stage_definition_generation(
+        &self,
+        definition: SearchIndexDefinition,
+        txn_id: u64,
+        stop_check: SearchBuildStopCheck,
+    ) -> Result<StagedSearchGeneration> {
+        validate_definition(&definition, &self.tablet)?;
+        stop_check.check()?;
+        let layout_lease = self
+            .tablet
+            .acquire_stable_layout_lease(txn_id, || stop_check.should_stop())?;
+        stop_check.check()?;
+
+        let snapshot_version = self.tablet.max_version();
+        let visible_rowsets = self.tablet.capture_consistent_rowsets(snapshot_version)?;
+        let tail_window = collect_full_rebuild_tail(snapshot_version, &visible_rowsets)?;
+        let generation_id = 1;
+        let staging_root = self
+            .tablet
+            .data_dir()
+            .join("_staged")
+            .join("search-generation")
+            .join(format!(
+                "txn-{txn_id}-def-{}-gen-{generation_id}",
+                definition.definition_id
+            ));
+        if staging_root.exists() {
+            return Err(paro_error::object_exists(
+                "search generation staging directory",
+                staging_root.display().to_string(),
+            ));
+        }
+
+        let staged_manifests = ManifestStore::new(staging_root.clone());
+        let sidecar_store = SidecarArtifactStore::new(staging_root.clone());
+        let builder = ProviderSidecarArtifactBuilder::new(sidecar_store);
+        let input = SidecarBuildInput {
+            definition: definition.clone(),
+            generation_id,
+            tail_window,
+            rowset_refs: visible_rowsets.clone(),
+            snapshot_version,
+            stop_check: Some(stop_check.clone()),
+        };
+        let build_result = (|| {
+            let estimate = builder.estimate_cost(&input)?;
+            let result = builder.build(
+                input,
+                &BuildBudget {
+                    cost_envelope: estimate.cost,
+                    deadline: None,
+                    grant_id: None,
+                },
+            )?;
+            stop_check.check()?;
+            validate_staged_artifact_coverage(
+                &definition,
+                generation_id,
+                &visible_rowsets,
+                &result.artifact_refs,
+            )?;
+
+            let visible_snapshot =
+                collect_visible_snapshot(&definition, snapshot_version, &visible_rowsets)?;
+            let mut delete_tail = visible_snapshot
+                .tail_pending
+                .entries
+                .into_iter()
+                .filter(|entry| entry.mutation == TailMutationKind::Delete)
+                .collect::<Vec<_>>();
+            let next_tail_entry_id =
+                assign_tail_entry_ids_for_full_snapshot(&mut delete_tail, None);
+            let tail_pending = TailPendingSet {
+                entries: delete_tail,
+            };
+            let coverage = coverage_for_definition(&definition, &tail_pending);
+            let generation_stats =
+                generation_stats_from_artifacts(&definition, &result.artifact_refs)?;
+            let execution_modes = execution_modes_for_definition(&definition, &coverage);
+            let mut root = GenerationManifestRoot {
+                definition_id: definition.definition_id,
+                generation_id,
+                build_epoch: 1,
+                build_snapshot_version: snapshot_version,
+                indexed_through_ts: indexed_through_ts(snapshot_version),
+                config_fingerprint: definition.config_fingerprint,
+                coverage: coverage.clone(),
+                generation_stats: generation_stats.clone(),
+                next_tail_entry_id,
+                execution_modes,
+                maintenance_state: build_maintenance_state(
+                    &definition,
+                    snapshot_version,
+                    1,
+                    generation_stats.indexed_rows,
+                    &tail_pending,
+                    tail_pending.delete_rows(),
+                    None,
+                    Vec::new(),
+                ),
+                root_version: 1,
+                checksum: 0,
+                shard_files: Vec::new(),
+                recent_delta_files: Vec::new(),
+                materialized_state_file: None,
+            };
+            let artifact_set = GenerationArtifactSet::try_new(result.artifact_refs)?;
+            root.shard_files.push(staged_manifests.write_shard(
+                definition.definition_id,
+                generation_id,
+                root.root_version,
+                &ManifestShard {
+                    artifact_refs: artifact_set.artifacts,
+                    tail_pending_entries: tail_pending.entries,
+                },
+            )?);
+            root.recompute_checksum()?;
+            staged_manifests.write_root(definition.definition_id, &root)?;
+            let loaded = staged_manifests
+                .load_manifest(definition.definition_id)?
+                .ok_or_else(|| paro_error::internal("staged search manifest disappeared"))?;
+            if loaded.root != root {
+                return Err(paro_error::data_corrupted(
+                    "staged search manifest changed during self-verification",
+                ));
+            }
+            let indexed_segment_count = expected_segment_rows(&visible_rowsets)?.len();
+            Ok((
+                SearchGenerationCoverage {
+                    visible_version: snapshot_version,
+                    indexed_through_ts: indexed_through_ts(snapshot_version),
+                    visible_segment_count: indexed_segment_count,
+                    indexed_segment_count,
+                    coverage,
+                },
+                staged_manifests.head_for_root(&root),
+            ))
+        })();
+
+        let (coverage, head) = match build_result {
+            Ok(result) => result,
+            Err(error) => {
+                match fs::remove_dir_all(&staging_root) {
+                    Ok(()) => {}
+                    Err(cleanup_error) if cleanup_error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(cleanup_error) => {
+                        tracing::warn!(
+                            path = %staging_root.display(),
+                            error = %cleanup_error,
+                            "failed to remove aborted search-generation workspace"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
+        let staging_generation_dir =
+            staged_manifests.generation_dir(definition.definition_id, generation_id);
+        let final_manifests = ManifestStore::new(self.tablet.data_dir().to_path_buf());
+        let final_generation_dir =
+            final_manifests.generation_dir(definition.definition_id, generation_id);
+        Ok(StagedSearchGeneration::new(StagedSearchGenerationInit {
+            staged_ref: ArtifactRef::from_tablet_path(
+                self.tablet.data_dir(),
+                &staging_generation_dir,
+            )?,
+            generation_ref: ArtifactRef::from_tablet_path(
+                self.tablet.data_dir(),
+                &final_generation_dir,
+            )?,
+            head,
+            staging_root,
+            definition_id: definition.definition_id,
+            generation_id,
+            build_snapshot_version: snapshot_version,
+            config_fingerprint: definition.config_fingerprint,
+            coverage,
+            layout_lease,
+        }))
     }
 
     pub(crate) fn drop_definition(&self, definition_id: u64) -> Result<()> {
@@ -561,6 +756,7 @@ impl SearchIndexRegistry {
                 .map(|item| item.rowset.clone())
                 .collect(),
             snapshot_version: self.tablet.max_version(),
+            stop_check: None,
         };
         let estimate = builder.estimate_cost(&input)?;
         let result = builder.build(
@@ -639,6 +835,7 @@ impl SearchIndexRegistry {
                 .map(|item| item.rowset.clone())
                 .collect(),
             snapshot_version: self.tablet.max_version(),
+            stop_check: None,
         };
         let estimate = builder.estimate_cost(&input)?;
         let result = builder.build(
@@ -748,9 +945,11 @@ impl SearchIndexRegistry {
                 provider_stats: manifest.root.generation_stats.provider_stats.clone(),
             };
             let gc_decision = gc_policy_for_kind(state.definition.kind).should_gc(&gc_context);
-            let delta_window_bytes = manifest
-                .root
-                .delta_window_bytes(&self.manifests.definition_dir(definition_id));
+            let delta_window_bytes = manifest.root.delta_window_bytes(
+                &self
+                    .manifests
+                    .generation_dir(definition_id, manifest.root.generation_id),
+            );
             let decision = self.maintenance_scheduler.plan_definition(
                 &state.definition,
                 manifest,
@@ -1360,7 +1559,7 @@ impl SearchIndexRegistry {
         )?;
         let shard_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation_id)
             .join(&shard_name.file_name);
         root.shard_files.push(shard_name);
         root.recompute_checksum()?;
@@ -1379,7 +1578,7 @@ impl SearchIndexRegistry {
                 .iter()
                 .map(|file| {
                     self.manifests
-                        .definition_dir(definition_id)
+                        .generation_dir(definition_id, generation_id)
                         .join(&file.file_name)
                 })
                 .collect(),
@@ -1495,7 +1694,7 @@ impl SearchIndexRegistry {
         )?;
         let delta_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation.generation_id)
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
@@ -1692,7 +1891,7 @@ impl SearchIndexRegistry {
         )?;
         let delta_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation.generation_id)
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
@@ -1834,7 +2033,7 @@ impl SearchIndexRegistry {
         )?;
         let delta_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation.generation_id)
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
@@ -1911,7 +2110,7 @@ impl SearchIndexRegistry {
         )?;
         let delta_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation.generation_id)
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
@@ -2122,7 +2321,7 @@ impl SearchIndexRegistry {
         )?;
         let delta_path = self
             .manifests
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, generation.generation_id)
             .join(&delta_name.file_name);
         root.recent_delta_files.push(delta_name);
         root.recompute_checksum()?;
@@ -2387,6 +2586,80 @@ impl SearchIndexRegistry {
     }
 }
 
+fn expected_segment_rows(
+    visible_rowsets: &[RowsetSharedPtr],
+) -> Result<BTreeMap<ArtifactSegmentRef, u64>> {
+    let mut expected = BTreeMap::new();
+    for rowset in visible_rowsets {
+        rowset.load()?;
+        for segment in rowset.segments() {
+            let row_count = u64::try_from(segment.num_rows()).map_err(|_| {
+                paro_error::out_of_range("segment row count does not fit staged coverage")
+            })?;
+            if row_count == 0 {
+                continue;
+            }
+            expected.insert(
+                ArtifactSegmentRef {
+                    rowset_id: rowset.rowset_id(),
+                    segment_id: segment.segment_id(),
+                },
+                row_count,
+            );
+        }
+    }
+    Ok(expected)
+}
+
+fn validate_staged_artifact_coverage(
+    definition: &SearchIndexDefinition,
+    generation_id: u64,
+    visible_rowsets: &[RowsetSharedPtr],
+    artifacts: &[SearchArtifactRef],
+) -> Result<()> {
+    let expected_segments = expected_segment_rows(visible_rowsets)?;
+    let expected = definition
+        .column_ids
+        .iter()
+        .flat_map(|column_id| {
+            expected_segments
+                .iter()
+                .map(move |(segment, rows)| ((*segment, *column_id), *rows))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut actual = BTreeMap::new();
+    for artifact in artifacts {
+        artifact.validate()?;
+        if artifact.definition_id != definition.definition_id
+            || artifact.generation_id != generation_id
+            || artifact.kind != definition.kind
+        {
+            return Err(paro_error::data_corrupted(
+                "staged search artifact identity does not match its definition",
+            ));
+        }
+        for span in artifact.coverage.segments() {
+            if actual
+                .insert((span.segment, artifact.column_id), span.row_count)
+                .is_some()
+            {
+                return Err(paro_error::data_corrupted(format!(
+                    "staged search generation contains duplicate coverage for {:?} column {}",
+                    span.segment, artifact.column_id
+                )));
+            }
+        }
+    }
+    if actual != expected {
+        return Err(paro_error::data_corrupted(format!(
+            "staged search generation coverage mismatch: expected {} segment-columns, built {}",
+            expected.len(),
+            actual.len()
+        )));
+    }
+    Ok(())
+}
+
 fn elapsed_micros_since(started_at: Instant) -> u64 {
     let micros = started_at.elapsed().as_micros();
     micros.min(u128::from(u64::MAX)) as u64
@@ -2642,7 +2915,7 @@ mod tests {
         let definition_dir = table
             .search_registry()
             .manifests
-            .definition_dir(definition_id);
+            .generation_dir(definition_id, manifest.root.generation_id);
         drop(current);
 
         delta_files
@@ -4208,7 +4481,7 @@ mod tests {
         let failing_sparse_root = table
             .search_registry()
             .manifests
-            .definition_dir(201)
+            .generation_dir(201, 1)
             .join("manifest_root_g1_v2.json");
         std::fs::create_dir(&failing_sparse_root).unwrap();
 
@@ -4453,7 +4726,7 @@ mod tests {
         let root_path = table
             .search_registry()
             .manifests
-            .definition_dir(144)
+            .generation_dir(144, 1)
             .join("manifest_root_g1_v2.json");
         std::fs::create_dir(&root_path).unwrap();
 
@@ -4462,7 +4735,7 @@ mod tests {
         let delta_path = table
             .search_registry()
             .manifests
-            .definition_dir(144)
+            .generation_dir(144, 1)
             .join("delta_g1_v2_0.json");
 
         let err = table
@@ -5755,7 +6028,10 @@ mod tests {
             assert!(manifest.root.recent_delta_files.is_empty());
             assert_eq!(manifest.root.shard_files.len(), 1);
 
-            let definition_dir = table.search_registry().manifests.definition_dir(89);
+            let definition_dir = table
+                .search_registry()
+                .manifests
+                .generation_dir(89, manifest.root.generation_id);
             let root_bytes = std::fs::read(&manifest.root_path).expect("read root");
             let root_json: serde_json::Value =
                 serde_json::from_slice(&root_bytes).expect("decode root json");

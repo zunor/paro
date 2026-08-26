@@ -8,6 +8,7 @@ use paro_catalog::entry::{
 };
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::error;
+use paro_common::logging::targets;
 use paro_storage::table::table_handle::TableHandle;
 use std::sync::Arc;
 
@@ -85,6 +86,50 @@ pub(crate) fn restore_search_registry_definitions(catalog: &Arc<ParoCatalog>) {
                     "search coverage restore failed for index '{}': {}",
                     index.base.base.name, err
                 ))),
+            }
+        }
+    }
+}
+
+/// Remove generation workspaces only after the entire durable WAL prefix has
+/// been replayed (or startup proved that no WAL needs replay).
+///
+/// Keeping this separate from runtime restoration prevents a partial recovery
+/// from deleting the source named by a later, not-yet-applied mutation.
+pub(crate) fn sweep_orphan_search_generation_workspaces(catalog: &Arc<ParoCatalog>) {
+    let txn = CatalogSnapshot::read_only(u64::MAX);
+    let schemas = catalog
+        .get_schema_collection()
+        .scan(txn.transaction_id, txn.start_time);
+    for schema_entry in schemas {
+        let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+            continue;
+        };
+        for table_entry in schema
+            .collection(CatalogType::Table)
+            .expect("table collection")
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                continue;
+            };
+            let Some(storage) = table.get_storage() else {
+                continue;
+            };
+            match storage.sweep_orphan_search_generation_workspaces() {
+                Ok(removed) if removed > 0 => tracing::info!(
+                    target: targets::INSTANCE,
+                    tablet_id = storage.tablet_id(),
+                    removed,
+                    "removed crash-orphaned search-generation workspaces after replay"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::warn!(
+                    target: targets::INSTANCE,
+                    tablet_id = storage.tablet_id(),
+                    error = %error,
+                    "failed to sweep crash-orphaned search-generation workspaces"
+                ),
             }
         }
     }

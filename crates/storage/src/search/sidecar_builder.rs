@@ -27,7 +27,7 @@ use super::stats::{HnswProviderStats, SearchArtifactStats, SearchProviderStats};
 use super::tail::{TailMutationKind, TailPendingEntry};
 use crate::index::bitmap::BitmapIndexWriter;
 use crate::index::hnsw::{
-    HnswBuilder, HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks,
+    HnswBuildStopCheck, HnswBuilder, HnswFilterBlock, HnswFilterBlocks, HnswFilterColumnBlocks,
     HnswFilterTopologyContract, PartitionedVectorStorage, VectorStorage,
 };
 use crate::index::MmapVectorStorage;
@@ -168,6 +168,7 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
                 &rowsets,
                 &input.tail_window,
                 budget,
+                input.stop_check.as_ref(),
             )? {
                 let location = writer.append_streamed_artifact(|file, offset| {
                     partition
@@ -187,6 +188,9 @@ impl SidecarArtifactBuilder for ProviderSidecarArtifactBuilder {
         } else {
             let mut built_segments = BTreeSet::new();
             for entry in &input.tail_window {
+                if let Some(stop_check) = input.stop_check.as_ref() {
+                    stop_check.check()?;
+                }
                 if matches!(entry.mutation, TailMutationKind::Delete) {
                     continue;
                 }
@@ -294,6 +298,7 @@ fn build_hnsw_partition_sidecar_artifact(
     rowsets: &BTreeMap<u64, RowsetSharedPtr>,
     tail_window: &[TailPendingEntry],
     budget: &BuildBudget,
+    stop_check: Option<&super::inline_sink::SearchBuildStopCheck>,
 ) -> Result<Option<HnswPartitionArtifact>> {
     let column_id = definition
         .column_ids
@@ -321,6 +326,9 @@ fn build_hnsw_partition_sidecar_artifact(
     let mut coverage = Vec::new();
     let mut partition_segments = Vec::new();
     for segment_ref in requested_segments {
+        if let Some(stop_check) = stop_check {
+            stop_check.check()?;
+        }
         check_deadline(budget.deadline)?;
         let Some(rowset) = rowsets.get(&segment_ref.rowset_id) else {
             continue;
@@ -399,7 +407,12 @@ fn build_hnsw_partition_sidecar_artifact(
         partition_segments.iter().map(AsRef::as_ref),
         &provider.build_contract().filter_topology,
     )?;
-    let index = HnswBuilder::new().build_with_filter_blocks(
+    let mut builder = HnswBuilder::new();
+    if let Some(stop_check) = stop_check.cloned() {
+        builder =
+            builder.with_stop_check(HnswBuildStopCheck::new(move || stop_check.should_stop()));
+    }
+    let index = builder.build_with_filter_blocks(
         vector_storage,
         provider.build_contract(),
         filter_blocks,
@@ -1055,6 +1068,7 @@ mod tests {
                 deadline: None,
                 grant_id: None,
             },
+            None,
         )
         .unwrap()
         .expect("partition artifact");

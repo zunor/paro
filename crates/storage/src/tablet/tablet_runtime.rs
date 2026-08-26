@@ -37,10 +37,12 @@ use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
 use crate::rowset::{
     PhysicalRowRef, Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
 };
+use crate::search::manifest::ManifestStore;
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
-    CompactionCumulativePointAction, RetiredRowsetInput, TabletMutation, VersionSpan,
+    ArtifactNamespace, CompactionCumulativePointAction, RetiredRowsetInput, TabletMutation,
+    VersionSpan,
 };
 use paro_common::error::{self as paro_error, Result};
 use paro_journal::wal::write_ahead_log::WriteAheadLog;
@@ -420,6 +422,10 @@ pub struct Tablet {
     /// Monotonic epoch covering visible rowset/delete state.
     layout_epoch: AtomicU64,
 
+    /// Prevents physical rowset replacement while a staged artifact embeds
+    /// the current layout. Ordinary reads never acquire this gate.
+    layout_maintenance_gate: super::LayoutMaintenanceGate,
+
     /// Highest journal LSN durably reflected by authoritative tablet state.
     applied_lsn: AtomicU64,
 
@@ -533,6 +539,7 @@ impl Tablet {
             max_version: AtomicI64::new(max_version),
             next_rowset_id: AtomicI64::new(1),
             layout_epoch: AtomicU64::new(layout_epoch),
+            layout_maintenance_gate: super::LayoutMaintenanceGate::default(),
             applied_lsn: AtomicU64::new(applied_lsn),
             rssid_manager,
             meta_lock: RwLock::new(()),
@@ -846,6 +853,27 @@ impl Tablet {
 
     pub fn layout_epoch(&self) -> u64 {
         self.layout_epoch.load(Ordering::Acquire)
+    }
+
+    pub fn acquire_stable_layout_lease(
+        &self,
+        owner_id: u64,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<super::LayoutMaintenanceLease> {
+        self.layout_maintenance_gate
+            .acquire_exclusive(owner_id, should_stop)
+    }
+
+    pub(crate) fn try_acquire_compaction_layout_lease(
+        &self,
+    ) -> Result<Option<super::LayoutMaintenanceLease>> {
+        self.layout_maintenance_gate.try_acquire_shared()
+    }
+
+    pub(crate) fn acquire_storage_publish_layout_lease(
+        &self,
+    ) -> Result<super::LayoutMaintenanceLease> {
+        self.layout_maintenance_gate.acquire_shared()
     }
 
     pub fn applied_lsn(&self) -> u64 {
@@ -3291,8 +3319,8 @@ impl Tablet {
             return Ok(());
         }
 
-        let final_path = output_ref.resolve_for_tablet(self.data_dir());
-        let staged_path = staged_ref.resolve_for_tablet(self.data_dir());
+        let final_path = output_ref.resolve_for_tablet(self.data_dir())?;
+        let staged_path = staged_ref.resolve_for_tablet(self.data_dir())?;
         let output = if let Some(existing) = maybe_output {
             existing
         } else {
@@ -3351,6 +3379,199 @@ impl Tablet {
         Ok(())
     }
 
+    /// Install one immutable search-generation directory and its tablet head
+    /// as a single idempotent storage mutation.
+    ///
+    /// A crash after `rename` but before `save_meta` leaves a harmless
+    /// unreferenced generation directory. Replaying the same mutation observes
+    /// that directory, validates it, and completes the head update without
+    /// rebuilding or overwriting any artifact.
+    pub(crate) fn apply_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.apply_search_generation_publish_with_after_install(op, || Ok(()))
+    }
+
+    fn apply_search_generation_publish_with_after_install(
+        &self,
+        op: &TabletMutation,
+        after_install: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let TabletMutation::PublishSearchGeneration {
+            staged_ref,
+            generation_ref,
+            head,
+        } = op
+        else {
+            return Err(paro_error::internal(
+                "apply_search_generation_publish called with non-search-generation op",
+            ));
+        };
+        if head.definition_id == 0 || head.generation_id == 0 || head.root_file_name.is_empty() {
+            return Err(paro_error::invalid_input(
+                "search generation publish requires non-zero identities and a root file",
+            ));
+        }
+        if staged_ref.namespace != ArtifactNamespace::Staged
+            || generation_ref.namespace != ArtifactNamespace::SearchGeneration
+        {
+            return Err(paro_error::invalid_input(
+                "search generation publish uses invalid artifact namespaces",
+            ));
+        }
+        let root_file = Path::new(&head.root_file_name);
+        if !matches!(
+            root_file.components().next(),
+            Some(std::path::Component::Normal(_))
+        ) || root_file.components().count() != 1
+        {
+            return Err(paro_error::invalid_input(
+                "search generation root file must be one relative path component",
+            ));
+        }
+        let staged_suffix = [
+            "search_registry".to_string(),
+            "definitions".to_string(),
+            head.definition_id.to_string(),
+            "generations".to_string(),
+            format!("g{}", head.generation_id),
+        ];
+        if staged_ref.locator.first().map(String::as_str) != Some("search-generation")
+            || !staged_ref.locator.ends_with(&staged_suffix)
+        {
+            return Err(paro_error::invalid_input(
+                "search generation staging reference does not match its durable identity",
+            ));
+        }
+
+        let manifests = ManifestStore::new(self.data_dir().to_path_buf());
+        let expected_generation_path =
+            manifests.generation_dir(head.definition_id, head.generation_id);
+        let final_path = generation_ref.resolve_for_tablet(self.data_dir())?;
+        if final_path != expected_generation_path {
+            return Err(paro_error::invalid_input(format!(
+                "search generation destination {} does not match definition {} generation {}",
+                final_path.display(),
+                head.definition_id,
+                head.generation_id
+            )));
+        }
+
+        if let Some(current) = self.search_generation_head(head.definition_id) {
+            match current.generation_id.cmp(&head.generation_id) {
+                std::cmp::Ordering::Greater => {
+                    Self::validate_installed_search_generation(&manifests, &current)?;
+                    return Ok(());
+                }
+                std::cmp::Ordering::Equal if current == *head => {
+                    Self::validate_installed_search_generation(&manifests, head)?;
+                    return Ok(());
+                }
+                std::cmp::Ordering::Equal => {
+                    return Err(paro_error::data_corrupted(format!(
+                        "search generation {} conflicts with its durable head",
+                        head.definition_id
+                    )));
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+
+        let staged_path = staged_ref.resolve_for_tablet(self.data_dir())?;
+        if !final_path.exists() {
+            if !staged_path.exists() {
+                return Err(paro_error::io_error(format!(
+                    "staged search generation {} and destination {} are both missing",
+                    staged_path.display(),
+                    final_path.display()
+                )));
+            }
+            if let Some(parent) = final_path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    paro_error::io_error(format!(
+                        "create search generation parent {}: {}",
+                        parent.display(),
+                        error
+                    ))
+                })?;
+            }
+            fs::rename(&staged_path, &final_path).map_err(|error| {
+                paro_error::io_error(format!(
+                    "atomically publish search generation {} -> {}: {} (staging and final roots must share a filesystem)",
+                    staged_path.display(),
+                    final_path.display(),
+                    error
+                ))
+            })?;
+            Self::sync_parent_dir(&final_path)?;
+        }
+
+        after_install()?;
+        Self::validate_installed_search_generation(&manifests, head)?;
+
+        let _meta_guard = self
+            .meta_lock
+            .write()
+            .map_err(|_| paro_error::internal("tablet meta lock poisoned"))?;
+        let previous_head = {
+            let mut meta = self
+                .meta
+                .write()
+                .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
+            let previous = meta
+                .search_generation_heads()
+                .iter()
+                .find(|current| current.definition_id == head.definition_id)
+                .cloned();
+            if let Some(current) = previous.as_ref() {
+                if current.generation_id > head.generation_id {
+                    Self::validate_installed_search_generation(&manifests, current)?;
+                    return Ok(());
+                }
+                if current.generation_id == head.generation_id && current != head {
+                    return Err(paro_error::data_corrupted(format!(
+                        "search generation {} raced with a conflicting durable head",
+                        head.definition_id
+                    )));
+                }
+            }
+            meta.upsert_search_generation_head(head.clone());
+            previous
+        };
+        if let Err(error) = self.save_meta() {
+            let mut meta = self.meta.write().map_err(|_| {
+                paro_error::internal("tablet meta state poisoned after save failure")
+            })?;
+            match previous_head {
+                Some(previous) => meta.upsert_search_generation_head(previous),
+                None => meta.remove_search_generation_head(head.definition_id),
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    fn validate_installed_search_generation(
+        manifests: &ManifestStore,
+        head: &SearchGenerationHeadMeta,
+    ) -> Result<()> {
+        let loaded = manifests.load_manifest_for_head(head)?.ok_or_else(|| {
+            paro_error::data_corrupted(format!(
+                "published search generation {} generation {} is missing root {}",
+                head.definition_id, head.generation_id, head.root_file_name
+            ))
+        })?;
+        if loaded.root.definition_id != head.definition_id
+            || loaded.root.generation_id != head.generation_id
+            || loaded.root.root_version != head.root_version
+            || loaded.root.config_fingerprint != head.config_fingerprint
+        {
+            return Err(paro_error::data_corrupted(format!(
+                "published search generation {} manifest identity mismatch",
+                head.definition_id
+            )));
+        }
+        Ok(())
+    }
+
     fn retired_input_from_op(input: &RetiredRowsetInput) -> RetiredInput {
         RetiredInput {
             rowset_id: input.rowset_id,
@@ -3372,10 +3593,16 @@ mod tests {
     use crate::primary_key::{PersistentIndex, PrimaryKeySerializer, RowID};
     use crate::rowset::RowsetMeta;
     use crate::rowset::{RowsetWriter, RowsetWriterContext};
+    use crate::search::capability::CoverageState;
+    use crate::search::manifest::{GenerationManifestRoot, ManifestShard, ManifestStore};
+    use crate::search::stats::{ExecutionModes, GenerationMaintenanceState, GenerationStats};
+    use crate::search::tail::TailEntryId;
     use crate::tablet::tablet_schema::{KeysType, TabletColumn, TabletSchema};
     use crate::test_utils::*;
     use paro_common::chunk::Chunk;
+    use paro_common::effect::ArtifactRef;
     use paro_common::types::LogicalType;
+    use paro_journal::mutation_identity_for_tablet;
     use std::path::PathBuf;
     use std::time::Duration;
     use tempfile::TempDir;
@@ -3403,6 +3630,53 @@ mod tests {
             .tempdir()
             .unwrap()
             .keep()
+    }
+
+    fn staged_search_generation_publish(
+        tablet: &Tablet,
+        txn_id: u64,
+        definition_id: u64,
+        generation_id: u64,
+    ) -> TabletMutation {
+        let staging_root = tablet
+            .data_dir()
+            .join("_staged")
+            .join("search-generation")
+            .join(format!(
+                "txn-{txn_id}-def-{definition_id}-gen-{generation_id}"
+            ));
+        let staged_manifests = ManifestStore::new(staging_root.clone());
+        let shard = staged_manifests
+            .write_shard(definition_id, generation_id, 1, &ManifestShard::default())
+            .unwrap();
+        let mut root = GenerationManifestRoot {
+            definition_id,
+            generation_id,
+            build_epoch: 1,
+            build_snapshot_version: 0,
+            indexed_through_ts: 0,
+            config_fingerprint: 991,
+            coverage: CoverageState::Complete,
+            generation_stats: GenerationStats::default(),
+            next_tail_entry_id: TailEntryId(1),
+            execution_modes: ExecutionModes::default(),
+            maintenance_state: GenerationMaintenanceState::default(),
+            root_version: 1,
+            checksum: 0,
+            shard_files: vec![shard],
+            recent_delta_files: Vec::new(),
+            materialized_state_file: None,
+        };
+        root.recompute_checksum().unwrap();
+        staged_manifests.write_root(definition_id, &root).unwrap();
+        let staged_path = staged_manifests.generation_dir(definition_id, generation_id);
+        let final_manifests = ManifestStore::new(tablet.data_dir().to_path_buf());
+        let final_path = final_manifests.generation_dir(definition_id, generation_id);
+        TabletMutation::PublishSearchGeneration {
+            staged_ref: ArtifactRef::from_tablet_path(tablet.data_dir(), &staged_path).unwrap(),
+            generation_ref: ArtifactRef::from_tablet_path(tablet.data_dir(), &final_path).unwrap(),
+            head: staged_manifests.head_for_root(&root),
+        }
     }
 
     #[test]
@@ -3439,6 +3713,78 @@ mod tests {
         assert_eq!(tablet.partition_id(), 1000);
         assert_eq!(tablet.state(), TabletState::NotReady);
         assert_eq!(tablet.num_rowsets(), 0);
+    }
+
+    #[test]
+    fn search_generation_publish_is_idempotent() {
+        let data_dir = test_data_dir();
+        let tablet = Tablet::new(1, 100, 1000, create_test_schema(), &data_dir, None).unwrap();
+        let mutation = staged_search_generation_publish(&tablet, 7, 41, 1);
+
+        tablet.apply_search_generation_publish(&mutation).unwrap();
+        let first = tablet.meta.read().unwrap().serialize().unwrap();
+        tablet
+            .apply_search_generation_publish_with_after_install(&mutation, || {
+                Err(paro_error::internal(
+                    "idempotent replay must not re-enter installation",
+                ))
+            })
+            .unwrap();
+        let second = tablet.meta.read().unwrap().serialize().unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(tablet.search_generation_head(41).unwrap().generation_id, 1);
+        let _ = fs::remove_dir_all(data_dir);
+    }
+
+    #[test]
+    fn search_generation_replay_completes_crash_between_rename_and_meta_save() {
+        let data_dir = test_data_dir();
+        let baseline = TabletMeta::new(
+            1,
+            100,
+            1000,
+            create_test_schema(),
+            data_dir.to_string_lossy(),
+        )
+        .unwrap();
+
+        let live = Tablet::create_from_meta(baseline.clone(), None).unwrap();
+        let live_mutation = staged_search_generation_publish(&live, 7, 41, 1);
+        live.apply_search_generation_publish(&live_mutation)
+            .unwrap();
+        let identity = mutation_identity_for_tablet(88, live.tablet_id(), &live_mutation);
+        live.note_applied_mutation_identity(identity).unwrap();
+        let live_meta = live.meta.read().unwrap().serialize().unwrap();
+        fs::remove_dir_all(data_dir.join("search_registry")).unwrap();
+
+        let replay = Tablet::create_from_meta(baseline, None).unwrap();
+        let replay_mutation = staged_search_generation_publish(&replay, 7, 41, 1);
+        let injected = replay
+            .apply_search_generation_publish_with_after_install(&replay_mutation, || {
+                Err(paro_error::internal(
+                    "injected crash after generation rename",
+                ))
+            })
+            .unwrap_err();
+        assert!(injected.to_string().contains("injected crash"));
+        assert!(replay.search_generation_head(41).is_none());
+        let TabletMutation::PublishSearchGeneration { generation_ref, .. } = &replay_mutation
+        else {
+            unreachable!();
+        };
+        assert!(generation_ref
+            .resolve_for_tablet(replay.data_dir())
+            .unwrap()
+            .exists());
+
+        replay
+            .apply_search_generation_publish(&replay_mutation)
+            .unwrap();
+        replay.note_applied_mutation_identity(identity).unwrap();
+        let replay_meta = replay.meta.read().unwrap().serialize().unwrap();
+        assert_eq!(live_meta, replay_meta);
+        let _ = fs::remove_dir_all(data_dir);
     }
 
     fn create_test_rowset(id: u64, version: Version, tablet_id: u64) -> RowsetSharedPtr {

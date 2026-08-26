@@ -84,6 +84,16 @@ impl TableHandle {
         self.search_registry.install_definition(definition)
     }
 
+    pub fn stage_search_definition_generation(
+        &self,
+        definition: SearchIndexDefinition,
+        txn_id: u64,
+        stop_check: crate::search::SearchBuildStopCheck,
+    ) -> Result<crate::search::StagedSearchGeneration> {
+        self.search_registry
+            .stage_definition_generation(definition, txn_id, stop_check)
+    }
+
     pub fn unregister_search_definition(&self, definition_id: u64) -> Result<()> {
         self.search_registry.drop_definition(definition_id)
     }

@@ -73,6 +73,11 @@ impl TableHandle {
             .bind_hnsw_integrity_scheduler(scheduler)
     }
 
+    /// Remove search-generation staging workspaces after recovery replay.
+    pub fn sweep_orphan_search_generation_workspaces(&self) -> paro_common::error::Result<usize> {
+        self.search_registry.sweep_orphan_generation_workspaces()
+    }
+
     pub fn bound_compaction_manager(&self) -> Option<Arc<CompactionManager>> {
         self.compaction_manager
             .read()

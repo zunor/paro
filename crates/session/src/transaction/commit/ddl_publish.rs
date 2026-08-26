@@ -11,17 +11,21 @@ use paro_catalog::entry::{
 use paro_catalog::mvcc::CatalogSnapshot;
 use paro_common::effect::{
     ApplyDescriptor, CleanupDescriptor, RuntimeTransitionDescriptor, StagedArtifactDescriptor,
+    TabletMutation,
 };
 use paro_common::error::Result;
 use paro_common::identity::GraphId;
 use paro_common::logging::targets;
 use paro_instance::{DatabaseHandle, Instance};
+use paro_journal::mutation_identity_for_tablet;
 use paro_storage::{
     index::{
         graph::{lock_graph_artifact_io, GraphProjectionIndex, GraphStorageGeneration},
         BoundIndex,
     },
-    search::{SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind},
+    search::{
+        SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind, StagedSearchGeneration,
+    },
     table::table_handle::TableHandle,
     transaction::descriptor_cleanup::apply_cleanup_descriptor as run_cleanup_descriptor,
 };
@@ -121,6 +125,7 @@ fn publish_staged_artifact(
             })
         }
         StagedArtifactDescriptor::BulkLoadRowset(_artifact) => Ok(()),
+        StagedArtifactDescriptor::SearchGenerationBuild(_artifact) => Ok(()),
     }
 }
 
@@ -249,6 +254,37 @@ pub(super) struct IndexBackfillPublishTask {
     built_index: Option<Arc<dyn BoundIndex>>,
     coverage: Option<IndexCoverage>,
     backfill: Option<IndexBackfillPlan>,
+    staged_search_generation: Option<Arc<StagedSearchGeneration>>,
+}
+
+#[derive(Clone)]
+pub(super) struct StagedGenerationPublishTask {
+    tablet_id: u64,
+    storage: Arc<TableHandle>,
+    mutation: TabletMutation,
+    owner: Arc<StagedSearchGeneration>,
+}
+
+impl StagedGenerationPublishTask {
+    pub(super) fn tablet_id(&self) -> u64 {
+        self.tablet_id
+    }
+
+    pub(super) fn apply(&self, commit_id: u64) -> Result<()> {
+        self.storage
+            .apply_search_generation_publish(&self.mutation)?;
+        // Once the immutable directory and tablet head are durable, recovery
+        // no longer needs the private staging workspace as a source.
+        self.owner.mark_published()?;
+        self.storage
+            .tablet()
+            .note_applied_mutation_identity(mutation_identity_for_tablet(
+                commit_id,
+                self.tablet_id,
+                &self.mutation,
+            ))?;
+        Ok(())
+    }
 }
 
 impl IndexBackfillPublishTask {
@@ -260,25 +296,55 @@ impl IndexBackfillPublishTask {
             built_index: action.built_index.clone(),
             coverage: action.coverage.clone(),
             backfill: action.backfill.clone(),
+            staged_search_generation: action.staged_search_generation.clone(),
         }
     }
 
+    pub(super) fn staged_generation_publish_task(
+        &self,
+    ) -> Result<Option<StagedGenerationPublishTask>> {
+        let Some(staged) = self.staged_search_generation.as_ref() else {
+            return Ok(None);
+        };
+        let storage = self.table.get_storage().cloned().ok_or_else(|| {
+            paro_common::error::internal("staged search generation lost table storage")
+        })?;
+        let mutation = staged.mutation();
+        if !matches!(mutation, TabletMutation::PublishSearchGeneration { .. }) {
+            return Err(paro_common::error::internal(
+                "staged search generation produced the wrong mutation kind",
+            ));
+        }
+        Ok(Some(StagedGenerationPublishTask {
+            tablet_id: storage.tablet_id(),
+            storage,
+            mutation,
+            owner: Arc::clone(staged),
+        }))
+    }
+
+    pub(super) fn staged_search_generation(&self) -> Option<Arc<StagedSearchGeneration>> {
+        self.staged_search_generation.clone()
+    }
+
     pub(super) fn execute(&self, publish_ts: u64) -> Result<()> {
-        if let Some(backfill) = &self.backfill {
-            let report = backfill.bounded_final_catch_up(
-                publish_ts,
-                self.table.as_ref(),
-                self.entry.as_ref(),
-            )?;
-            tracing::debug!(
-                target: targets::TRANSACTION,
-                index = %self.info.name,
-                table = %self.info.table_name,
-                from_ts = report.from_ts,
-                to_ts = report.to_ts,
-                consumed_commits = report.consumed_commits,
-                "CREATE INDEX bounded final catch-up completed"
-            );
+        if self.staged_search_generation.is_none() {
+            if let Some(backfill) = &self.backfill {
+                let report = backfill.bounded_final_catch_up(
+                    publish_ts,
+                    self.table.as_ref(),
+                    self.entry.as_ref(),
+                )?;
+                tracing::debug!(
+                    target: targets::TRANSACTION,
+                    index = %self.info.name,
+                    table = %self.info.table_name,
+                    from_ts = report.from_ts,
+                    to_ts = report.to_ts,
+                    consumed_commits = report.consumed_commits,
+                    "CREATE INDEX bounded final catch-up completed"
+                );
+            }
         }
 
         let Some(storage) = self.table.get_storage() else {
@@ -313,8 +379,12 @@ impl IndexBackfillPublishTask {
         }
 
         Self::register_search_definition(storage.as_ref(), self.entry.as_ref())?;
-        if Self::search_kind(self.info.index_type).is_some() {
-            storage.materialize_search_generation(self.entry.base.base.object_id.raw())?;
+        if Self::search_kind(self.info.index_type).is_some()
+            && self.staged_search_generation.is_none()
+        {
+            return Err(paro_common::error::internal(
+                "search index reached required publish without a staged generation",
+            ));
         }
         let coverage = self.recompute_coverage(storage.as_ref())?;
         self.entry.mark_ready_with_coverage(coverage);

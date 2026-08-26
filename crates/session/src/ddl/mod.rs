@@ -26,9 +26,13 @@ use paro_common::effect::{
 use paro_common::error::{self as paro_error, Result};
 use paro_context::{
     DdlApplyContext, DdlExecutionProfile, IndexBuildHandle, PendingDdlAdmission,
-    PreparedIndexArtifact, TxnAdmissionState, WriteGuard,
+    PreparedIndexArtifact, StatementCancellation, TxnAdmissionState, WriteGuard,
 };
 use paro_instance::DatabaseHandle;
+use paro_storage::search::{
+    SearchBuildStopCheck, SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind,
+    StagedSearchGeneration,
+};
 use paro_storage::table::table_factory::TableFactory;
 use paro_storage::table::table_handle::TableColumnSpec;
 use paro_storage::transaction::txn::Transaction;
@@ -59,6 +63,7 @@ struct SessionCreateIndexHandle {
     catalog: Option<paro_catalog::collection::StagedCatalogMutation>,
     dependencies: Option<DependencyDelta>,
     backfill: Option<IndexBackfillPlan>,
+    staged_search_generation: Option<Arc<StagedSearchGeneration>>,
     skip_build: bool,
 }
 
@@ -70,6 +75,27 @@ impl IndexBuildHandle for SessionCreateIndexHandle {
     fn skip_build(&self) -> bool {
         self.skip_build
     }
+}
+
+fn search_index_kind(index_type: paro_catalog::entry::IndexType) -> Option<SearchIndexKind> {
+    match index_type {
+        paro_catalog::entry::IndexType::HNSW => Some(SearchIndexKind::Hnsw),
+        paro_catalog::entry::IndexType::Sparse => Some(SearchIndexKind::Sparse),
+        paro_catalog::entry::IndexType::FullText => Some(SearchIndexKind::FullText),
+        _ => None,
+    }
+}
+
+fn search_index_expression(info: &CreateIndexInfo) -> Option<String> {
+    if info.index_type != paro_catalog::entry::IndexType::FullText {
+        return None;
+    }
+    let binding = info.fulltext.as_ref()?;
+    let column_id = info.column_ids.first()?.index;
+    Some(format!(
+        "to_tsvector('{}', col_{})",
+        binding.config, column_id
+    ))
 }
 
 impl SessionDdlBridge {
@@ -94,23 +120,83 @@ impl SessionDdlBridge {
     }
 
     fn record_change(&self, change: PreparedCatalogOp) -> Result<()> {
-        self.active_txn
-            .acquire_lock_requests(change.profile.lock_requests(
-                self.active_txn.lock_namespace(),
-                &change.record.key,
-                &change.dml_targets,
-            ))?;
-        self.txn_admission.record_ddl(PendingDdlAdmission {
+        self.record_change_inner(change, true)
+    }
+
+    fn record_change_with_locks_held(&self, change: PreparedCatalogOp) -> Result<()> {
+        self.record_change_inner(change, false)
+    }
+
+    fn record_change_inner(
+        &self,
+        mut change: PreparedCatalogOp,
+        acquire_locks: bool,
+    ) -> Result<()> {
+        if acquire_locks {
+            if let Err(error) = self
+                .active_txn
+                .acquire_lock_requests(change.profile.lock_requests(
+                    self.active_txn.lock_namespace(),
+                    &change.record.key,
+                    &change.dml_targets,
+                ))
+            {
+                Self::discard_unrecorded_change(&mut change);
+                return Err(error);
+            }
+        }
+        let admission_mark = self.txn_admission.mark();
+        if let Err(error) = self.txn_admission.record_ddl(PendingDdlAdmission {
             object: change.record.key.clone(),
             profile: change.profile,
             dml_targets: change.dml_targets.clone(),
-        })?;
-        let mut ddl_state = self
-            .ddl_state
-            .lock()
-            .map_err(|_| paro_error::internal("ddl state poisoned"))?;
+        }) {
+            Self::discard_unrecorded_change(&mut change);
+            return Err(error);
+        }
+        let mut ddl_state = match self.ddl_state.lock() {
+            Ok(ddl_state) => ddl_state,
+            Err(_) => {
+                self.txn_admission.rollback_to_mark(admission_mark);
+                Self::discard_unrecorded_change(&mut change);
+                return Err(paro_error::internal("ddl state poisoned"));
+            }
+        };
         ddl_state.record(change);
         Ok(())
+    }
+
+    fn discard_unrecorded_change(change: &mut PreparedCatalogOp) {
+        if let Some(delta) = change.dependencies.take() {
+            delta.discard();
+        }
+        if let Some(catalog) = change.catalog.take() {
+            if let Err(error) = catalog.discard() {
+                tracing::warn!(
+                    target: paro_common::logging::targets::TRANSACTION,
+                    error = %error,
+                    "failed to discard unrecorded catalog mutation"
+                );
+            }
+        }
+    }
+
+    fn discard_index_build_staging(handle: &mut SessionCreateIndexHandle) {
+        if let Some(delta) = handle.dependencies.take() {
+            delta.discard();
+        }
+        if let Some(catalog) = handle.catalog.take() {
+            if let Err(error) = catalog.discard() {
+                tracing::warn!(
+                    target: paro_common::logging::targets::TRANSACTION,
+                    index = %handle.info.name,
+                    error = %error,
+                    "failed to discard CREATE INDEX catalog staging"
+                );
+            }
+        }
+        handle.staged_search_generation.take();
+        handle.backfill.take();
     }
 
     fn begin_object_ddl(&self) -> Result<()> {
@@ -558,6 +644,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: Vec::new(),
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: Vec::new(),
                     cleanups: Vec::new(),
                     post_commit_hooks: Vec::new(),
@@ -620,6 +707,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: vec![self.table_key(schema_name, object_ref.name.clone())],
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: Vec::new(),
                     cleanups,
                     post_commit_hooks: Vec::new(),
@@ -650,6 +738,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: Vec::new(),
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: Vec::new(),
                     cleanups: Vec::new(),
                     post_commit_hooks: Vec::new(),
@@ -697,6 +786,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: vec![self.table_key(schema_name, index.table_name.clone())],
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: vec![RuntimeTransitionDescriptor::DetachIndexState {
                         index: key,
                         table_name: index.table_name.clone(),
@@ -735,6 +825,7 @@ impl SessionDdlBridge {
                     dependencies,
                     dml_targets: Vec::new(),
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: Vec::new(),
                     cleanups: Vec::new(),
                     post_commit_hooks: Vec::new(),
@@ -792,6 +883,7 @@ impl SessionDdlBridge {
                         }))
                         .collect(),
                     staged_artifacts: Vec::new(),
+                    storage_ops: Vec::new(),
                     runtime_transitions: vec![
                         RuntimeTransitionDescriptor::UnregisterGraphRuntime { graph: key },
                     ],
@@ -914,6 +1006,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: vec![self.table_key(info.schema.clone(), info.name.clone())],
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -965,6 +1058,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: Vec::new(),
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1022,6 +1116,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: Vec::new(),
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1079,6 +1174,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: Vec::new(),
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1151,6 +1247,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: Vec::new(),
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1338,6 +1435,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets,
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1447,6 +1545,7 @@ impl DdlApplyContext for SessionDdlBridge {
                     staging,
                     schema_fingerprint,
                 }],
+                storage_ops: Vec::new(),
                 runtime_transitions: vec![RuntimeTransitionDescriptor::RegisterGraphRuntime {
                     graph: key,
                 }],
@@ -1522,6 +1621,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: graph_dml_targets,
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: vec![RuntimeTransitionDescriptor::UnregisterGraphRuntime {
                     graph: key,
                 }],
@@ -1632,6 +1732,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 dependencies,
                 dml_targets: Vec::new(),
                 staged_artifacts: Vec::new(),
+                storage_ops: Vec::new(),
                 runtime_transitions: Vec::new(),
                 cleanups: Vec::new(),
                 post_commit_hooks: Vec::new(),
@@ -1663,6 +1764,7 @@ impl DdlApplyContext for SessionDdlBridge {
         &self,
         mut info: CreateIndexInfo,
         table: Arc<TableCatalogEntry>,
+        cancellation: StatementCancellation,
     ) -> Result<Box<dyn IndexBuildHandle>> {
         self.reject_if_table_touched(table.as_ref(), "CREATE INDEX")?;
         self.begin_object_ddl()?;
@@ -1682,6 +1784,7 @@ impl DdlApplyContext for SessionDdlBridge {
                     catalog: None,
                     dependencies: None,
                     backfill: None,
+                    staged_search_generation: None,
                     skip_build: true,
                 }));
             }
@@ -1701,7 +1804,7 @@ impl DdlApplyContext for SessionDdlBridge {
             self.db.catalog().object_id_allocator().allocate(),
         ));
         index_entry.mark_building();
-        let handle = schema
+        let mut handle = schema
             .collection(CatalogType::Index)
             .expect("index collection")
             .stage_create(
@@ -1709,7 +1812,7 @@ impl DdlApplyContext for SessionDdlBridge {
                 &info.name,
                 Arc::new(CatalogEntryEnum::Index(Arc::clone(&index_entry))),
             )?;
-        let dependencies = handle
+        let mut dependencies = handle
             .as_ref()
             .map(|handle| {
                 Self::created_entry_dependency_delta(
@@ -1720,20 +1823,105 @@ impl DdlApplyContext for SessionDdlBridge {
                 )
             })
             .transpose()?;
-        let current_published_ts = self.db.transaction_manager().published_commit_id();
-        let backfill_read_ts = current_published_ts;
-        let backfill_lease = lease_index_backfill(
-            self.db.transaction_manager().retention_registry(),
-            backfill_read_ts,
-            current_published_ts,
-        )?;
-        let backfill = Some(IndexBackfillPlan::new(
-            table.base.base.object_id.raw(),
-            index_entry.base.base.object_id.raw(),
-            backfill_read_ts,
-            current_published_ts,
-            backfill_lease,
-        ));
+        let prepared_runtime = (|| {
+            let search_kind = search_index_kind(info.index_type);
+            let backfill = if search_kind.is_none() {
+                let current_published_ts = self.db.transaction_manager().published_commit_id();
+                let backfill_read_ts = current_published_ts;
+                let backfill_lease = lease_index_backfill(
+                    self.db.transaction_manager().retention_registry(),
+                    backfill_read_ts,
+                    current_published_ts,
+                )?;
+                Some(IndexBackfillPlan::new(
+                    table.base.base.object_id.raw(),
+                    index_entry.base.base.object_id.raw(),
+                    backfill_read_ts,
+                    current_published_ts,
+                    backfill_lease,
+                ))
+            } else {
+                None
+            };
+
+            let index_key = DdlObjectKey::new(
+                self.db.name(),
+                Some(info.schema.clone()),
+                info.name.clone(),
+                DdlObjectKind::Index,
+            );
+            let table_key = self.entry_table_key(table.as_ref());
+            self.active_txn.acquire_lock_requests(
+                DdlExecutionProfile::attach_index_state().lock_requests(
+                    self.active_txn.lock_namespace(),
+                    &index_key,
+                    std::slice::from_ref(&table_key),
+                ),
+            )?;
+
+            let staged_search_generation = if let Some(kind) = search_kind {
+                let storage = table.get_storage().ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "table '{}' has no storage for CREATE INDEX staging",
+                        table.base.base.name
+                    ))
+                })?;
+                let column_ids = info
+                    .column_ids
+                    .iter()
+                    .map(|column| column.index)
+                    .collect::<Vec<_>>();
+                let expression = search_index_expression(&info);
+                let config_fingerprint = SearchIndexDefinition::try_compute_config_fingerprint(
+                    kind,
+                    &column_ids,
+                    expression.as_deref(),
+                    &info.provider_config,
+                )?;
+                let definition = SearchIndexDefinition {
+                    definition_id: index_entry.base.base.object_id.raw(),
+                    table_id: storage.tablet().table_id(),
+                    name: info.name.clone(),
+                    kind,
+                    column_ids,
+                    expression,
+                    freshness_policy: SearchFreshnessPolicy::default_for_kind(kind),
+                    provider_config: info.provider_config.clone(),
+                    config_fingerprint,
+                };
+                let cancellation_for_build = cancellation.clone();
+                let stop_check = SearchBuildStopCheck::new(move || {
+                    cancellation_for_build.is_cancelled()
+                        || cancellation_for_build.connection_cancelled()
+                });
+                Some(Arc::new(storage.stage_search_definition_generation(
+                    definition,
+                    self.txn_id,
+                    stop_check,
+                )?))
+            } else {
+                None
+            };
+            Ok::<_, paro_common::error::ParoError>((backfill, staged_search_generation))
+        })();
+        let (backfill, staged_search_generation) = match prepared_runtime {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(delta) = dependencies.take() {
+                    delta.discard();
+                }
+                if let Some(catalog) = handle.take() {
+                    if let Err(cleanup_error) = catalog.discard() {
+                        tracing::warn!(
+                            target: paro_common::logging::targets::TRANSACTION,
+                            error = %cleanup_error,
+                            "failed to discard CREATE INDEX catalog staging after build error"
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        };
 
         Ok(Box::new(SessionCreateIndexHandle {
             info,
@@ -1742,6 +1930,7 @@ impl DdlApplyContext for SessionDdlBridge {
             catalog: handle,
             dependencies,
             backfill,
+            staged_search_generation,
             skip_build: false,
         }))
     }
@@ -1755,7 +1944,7 @@ impl DdlApplyContext for SessionDdlBridge {
             .into_any()
             .downcast::<SessionCreateIndexHandle>()
             .map_err(|_| paro_error::internal("invalid CREATE INDEX build handle"))?;
-        let handle = *handle;
+        let mut handle = *handle;
 
         if handle.skip_build {
             return Ok(());
@@ -1767,30 +1956,70 @@ impl DdlApplyContext for SessionDdlBridge {
             handle.info.name.clone(),
             DdlObjectKind::Index,
         );
-        let (built_index, coverage) = match artifact {
+        let (built_index, mut coverage) = match artifact {
             PreparedIndexArtifact::RuntimeIndex { index, coverage } => (Some(index), coverage),
             PreparedIndexArtifact::MetadataOnly { coverage } => (None, coverage),
         };
-        let object_id = handle
+        if let Some(staged) = &handle.staged_search_generation {
+            let staged_coverage = staged.coverage();
+            coverage = Some(paro_catalog::entry::IndexCoverage::from_counts(
+                staged_coverage.visible_version,
+                staged_coverage.visible_segment_count,
+                staged_coverage.indexed_segment_count,
+            ));
+        }
+        let Some(object_id) = handle
             .entry
             .as_ref()
             .map(|entry| entry.base.base.object_id.raw())
-            .ok_or_else(|| paro_error::internal("staged CREATE INDEX entry is missing"))?;
-        if let Some(backfill) = &handle.backfill {
-            let current_published_ts = self.db.transaction_manager().published_commit_id();
-            let report = backfill.tail_committed_records_to(current_published_ts)?;
-            tracing::debug!(
-                target: paro_common::logging::targets::TRANSACTION,
-                index = %handle.info.name,
-                table = %handle.info.table_name,
-                from_ts = report.from_ts,
-                to_ts = report.to_ts,
-                consumed_commits = report.consumed_commits,
-                "CREATE INDEX backfill journal tail advanced before commit publish"
-            );
+        else {
+            Self::discard_index_build_staging(&mut handle);
+            return Err(paro_error::internal("staged CREATE INDEX entry is missing"));
+        };
+        if handle.staged_search_generation.is_none() {
+            if let Some(backfill) = &handle.backfill {
+                let current_published_ts = self.db.transaction_manager().published_commit_id();
+                let report = match backfill.tail_committed_records_to(current_published_ts) {
+                    Ok(report) => report,
+                    Err(error) => {
+                        Self::discard_index_build_staging(&mut handle);
+                        return Err(error);
+                    }
+                };
+                tracing::debug!(
+                    target: paro_common::logging::targets::TRANSACTION,
+                    index = %handle.info.name,
+                    table = %handle.info.table_name,
+                    from_ts = report.from_ts,
+                    to_ts = report.to_ts,
+                    consumed_commits = report.consumed_commits,
+                    "CREATE INDEX backfill journal tail advanced before commit publish"
+                );
+            }
         }
 
-        self.record_change(PreparedCatalogOp {
+        let table_object = self.entry_table_key(handle.table.as_ref());
+        let (staged_artifacts, storage_ops) = if let Some(staged) = &handle.staged_search_generation
+        {
+            let Some(storage) = handle.table.get_storage() else {
+                Self::discard_index_build_staging(&mut handle);
+                return Err(paro_error::internal(
+                    "CREATE INDEX staged generation lost table storage",
+                ));
+            };
+            (
+                vec![staged.durable_descriptor(
+                    table_object.clone(),
+                    handle.table.base.base.object_id.raw(),
+                    storage.tablet_id(),
+                )],
+                vec![staged.storage_op(storage.tablet_id())],
+            )
+        } else {
+            (Vec::new(), Vec::new())
+        };
+
+        self.record_change_with_locks_held(PreparedCatalogOp {
             record: DdlChangeRecord {
                 key: key.clone(),
                 change: DdlChange::CreateIndex(CreateIndexPayload {
@@ -1815,10 +2044,11 @@ impl DdlApplyContext for SessionDdlBridge {
                 }),
             },
             profile: DdlExecutionProfile::attach_index_state(),
-            catalog: handle.catalog,
-            dependencies: handle.dependencies,
-            dml_targets: vec![self.entry_table_key(handle.table.as_ref())],
-            staged_artifacts: Vec::new(),
+            catalog: handle.catalog.take(),
+            dependencies: handle.dependencies.take(),
+            dml_targets: vec![table_object],
+            staged_artifacts,
+            storage_ops,
             runtime_transitions: vec![RuntimeTransitionDescriptor::AttachIndexState {
                 index: key,
                 table_name: handle.info.table_name.clone(),
@@ -1837,7 +2067,7 @@ impl DdlApplyContext for SessionDdlBridge {
             }],
             cleanups: Vec::new(),
             post_commit_hooks: Vec::new(),
-            transient_runtime: handle.entry.map(|entry| {
+            transient_runtime: handle.entry.take().map(|entry| {
                 TransientCatalogRuntime::CreateIndex(IndexPostCommitAction {
                     entry,
                     table: handle.table,
@@ -1845,6 +2075,7 @@ impl DdlApplyContext for SessionDdlBridge {
                     built_index,
                     coverage,
                     backfill: handle.backfill,
+                    staged_search_generation: handle.staged_search_generation,
                 })
             }),
         })
@@ -1852,12 +2083,8 @@ impl DdlApplyContext for SessionDdlBridge {
 
     fn abort_index_build(&self, handle: Box<dyn IndexBuildHandle>, _reason: String) {
         if let Ok(handle) = handle.into_any().downcast::<SessionCreateIndexHandle>() {
-            if let Some(delta) = handle.dependencies {
-                delta.discard();
-            }
-            if let Some(catalog) = handle.catalog {
-                let _ = catalog.discard();
-            }
+            let mut handle = *handle;
+            Self::discard_index_build_staging(&mut handle);
         }
     }
 }

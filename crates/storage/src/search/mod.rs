@@ -27,6 +27,7 @@ pub mod qualification;
 pub mod request;
 pub mod sidecar;
 pub(crate) mod sidecar_builder;
+mod staged_generation;
 pub mod stats;
 pub mod tail;
 pub mod telemetry;
@@ -66,10 +67,11 @@ pub use inline_sink::{
     CostEstimate, FlushSearchMode, FullTextStatsDelta, HnswInlineBuildEstimate,
     HnswInlineThreshold, HnswStatsDelta, InlineAdmissionRequest, InlineArtifactBlob,
     InlineArtifactBuildResult, InlineArtifactBuilder, MaintenanceBenefit, MaintenanceCost,
-    ProviderConfig, ProviderStatsProfile, SearchAdmission, SearchInlineBuilderEntry,
-    SearchInlineBuilderSet, SearchStatsDelta, SegmentChunkInput, SegmentChunkSink, SegmentFlushCtx,
-    SegmentSinkSavepoint, SidecarArtifactBuildResult, SidecarArtifactBuilder,
-    SidecarArtifactFileId, SidecarArtifactLocation, SidecarBuildInput, SparseStatsDelta,
+    ProviderConfig, ProviderStatsProfile, SearchAdmission, SearchBuildStopCheck,
+    SearchInlineBuilderEntry, SearchInlineBuilderSet, SearchStatsDelta, SegmentChunkInput,
+    SegmentChunkSink, SegmentFlushCtx, SegmentSinkSavepoint, SidecarArtifactBuildResult,
+    SidecarArtifactBuilder, SidecarArtifactFileId, SidecarArtifactLocation, SidecarBuildInput,
+    SparseStatsDelta,
 };
 pub use lifecycle::bootstrap::SearchBootstrapReport;
 pub use maintenance::{
@@ -98,6 +100,7 @@ pub use sidecar::{
     SidecarIntegrityPolicy, SidecarMappedPackage, SidecarPackageWriter, SidecarReaderCache,
     SidecarReaderCacheKey, SidecarReaderRequest, SIDECAR_PACKAGE_CODEC,
 };
+pub use staged_generation::StagedSearchGeneration;
 pub use stats::{
     BuildEpoch, BuildWatermarks, CatchUpBacklogTier, ConfigFingerprint, ExecutionModes,
     FullTextProviderStats, GenerationMaintenanceState, GenerationRecoveryState, GenerationStats,

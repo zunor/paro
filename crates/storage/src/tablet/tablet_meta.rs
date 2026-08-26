@@ -18,6 +18,7 @@ use super::versioned_rowset_catalog::{
 };
 use crate::primary_key::RssidMappingEntry;
 use crate::rowset::RowsetMeta;
+pub use paro_common::effect::SearchGenerationHeadMeta;
 use paro_common::error::{self as paro_error, Result};
 use paro_journal::{MutationIdentity, MutationKind};
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,7 @@ pub enum AppliedMutationKind {
     ApplyPrimaryDelete = 2,
     ApplyDeletePatch = 3,
     PublishCompaction = 4,
+    PublishSearchGeneration = 5,
 }
 
 impl AppliedMutationKind {
@@ -49,6 +51,7 @@ impl AppliedMutationKind {
             2 => Ok(Self::ApplyPrimaryDelete),
             3 => Ok(Self::ApplyDeletePatch),
             4 => Ok(Self::PublishCompaction),
+            5 => Ok(Self::PublishSearchGeneration),
             _ => Err(paro_error::internal(format!(
                 "TabletMeta: invalid applied mutation kind {raw}"
             ))),
@@ -63,6 +66,7 @@ impl From<MutationKind> for AppliedMutationKind {
             MutationKind::ApplyPrimaryDelete => Self::ApplyPrimaryDelete,
             MutationKind::ApplyDeletePatch => Self::ApplyDeletePatch,
             MutationKind::PublishCompaction => Self::PublishCompaction,
+            MutationKind::PublishSearchGeneration => Self::PublishSearchGeneration,
         }
     }
 }
@@ -206,15 +210,6 @@ pub struct TabletMeta {
     /// Durable search generation heads whose referenced manifest roots are
     /// visible for this tablet snapshot.
     search_generation_heads: Vec<SearchGenerationHeadMeta>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SearchGenerationHeadMeta {
-    pub definition_id: u64,
-    pub generation_id: u64,
-    pub root_version: u64,
-    pub config_fingerprint: u64,
-    pub root_file_name: String,
 }
 
 impl TabletMeta {

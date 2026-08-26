@@ -183,6 +183,38 @@ pub trait SidecarArtifactBuilder: Send + Sync {
     ) -> Result<SidecarArtifactBuildResult>;
 }
 
+/// Provider-neutral cooperative stop signal for pre-commit artifact builds.
+///
+/// Search maintenance normally owns its work after admission. A foreground
+/// CREATE INDEX build is different: until WAL append it remains statement
+/// work and must stop when that statement is cancelled.
+#[derive(Clone)]
+pub struct SearchBuildStopCheck(Arc<dyn Fn() -> bool + Send + Sync + 'static>);
+
+impl SearchBuildStopCheck {
+    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self(Arc::new(check))
+    }
+
+    pub fn should_stop(&self) -> bool {
+        (self.0)()
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.should_stop() {
+            Err(paro_error::query_canceled())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+impl fmt::Debug for SearchBuildStopCheck {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("SearchBuildStopCheck(..)")
+    }
+}
+
 pub struct SegmentFlushCtx<'a> {
     pub rowset_id: RowsetId,
     pub segment_id: SegmentId,
@@ -200,6 +232,7 @@ pub struct SidecarBuildInput {
     pub tail_window: Vec<TailPendingEntry>,
     pub rowset_refs: Vec<RowsetSharedPtr>,
     pub snapshot_version: i64,
+    pub stop_check: Option<SearchBuildStopCheck>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

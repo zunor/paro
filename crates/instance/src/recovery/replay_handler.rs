@@ -6,12 +6,15 @@
 use super::consistency_report::{
     build_recovery_consistency_report, log_recovery_consistency_report,
 };
-use super::index_restore::{restore_runtime_art_indexes, restore_search_registry_definitions};
+use super::index_restore::{
+    restore_runtime_art_indexes, restore_search_registry_definitions,
+    sweep_orphan_search_generation_workspaces,
+};
 use crate::checkpoint::runtime::RecordWatermarks;
 use crate::commit::recovery_publish::{
     build_recovery_required_publish_plan, RecoveryPublishPlanInput,
 };
-use crate::search_registry::{register_search_definition, unregister_search_definition_by_name};
+use crate::search_registry::unregister_search_definition_by_name;
 use paro_catalog::collection::{InstallMode, StagedCatalogMutation};
 use paro_catalog::database_catalog::ParoCatalog;
 use paro_catalog::entry::{
@@ -251,6 +254,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 // metadata and COPY-specific recovery diagnostics.
                 Ok(())
             }
+            StagedArtifactDescriptor::SearchGenerationBuild(_artifact) => Ok(()),
         }
     }
 
@@ -280,42 +284,12 @@ impl<'a> CatalogReplayHandler<'a> {
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
         match transition {
-            RuntimeTransitionDescriptor::AttachIndexState {
-                index,
-                table_name,
-                index_type: _,
-                column_ids: _,
-                fulltext_config: _,
-            } => {
-                let schema_name = index.schema.as_deref().ok_or_else(|| {
-                    paro_error::serialization_error(
-                        "CREATE INDEX runtime transition missing schema name",
-                    )
-                })?;
-                let schema = self.ensure_schema(schema_name, commit_id)?;
-                let index_entry = schema
-                    .get_index(
-                        self.transaction.transaction_id,
-                        self.transaction.start_time,
-                        &index.name,
-                    )
-                    .and_then(|entry| match &*entry {
-                        CatalogEntryEnum::Index(index) => Some(index.clone()),
-                        _ => None,
-                    });
-                if let Some(table_entry) = schema.get_table(
-                    self.transaction.transaction_id,
-                    self.transaction.start_time,
-                    table_name,
-                ) {
-                    if let Some(table) = table_entry.as_ref().as_table() {
-                        if let Some(storage) = table.get_storage() {
-                            if let Some(entry) = index_entry.as_ref() {
-                                register_search_definition(storage.as_ref(), entry)?;
-                            }
-                        }
-                    }
-                }
+            RuntimeTransitionDescriptor::AttachIndexState { .. } => {
+                // Recovery replays every storage mutation before one bootstrap
+                // pass restores index runtimes from their final tablet heads.
+                // Never schedule or materialize an index from an intermediate
+                // record state while WAL replay is still in progress.
+                let _ = commit_id;
                 Ok(())
             }
             RuntimeTransitionDescriptor::DetachIndexState {
@@ -477,6 +451,7 @@ impl<'a> CatalogReplayHandler<'a> {
                 })
             }
             StagedArtifactDescriptor::BulkLoadRowset(_artifact) => Ok(()),
+            StagedArtifactDescriptor::SearchGenerationBuild(_artifact) => Ok(()),
         }
     }
 
@@ -487,19 +462,11 @@ impl<'a> CatalogReplayHandler<'a> {
         commit_id: u64,
     ) -> paro_common::error::Result<()> {
         match transition {
-            RuntimeTransitionDescriptor::AttachIndexState {
-                index, table_name, ..
-            } => {
-                let Some((storage, entry)) = Self::recovery_table_storage_and_index(
-                    catalog,
-                    transaction,
-                    index,
-                    table_name,
-                )?
-                else {
-                    return Ok(());
-                };
-                register_search_definition(storage.as_ref(), entry.as_ref())
+            RuntimeTransitionDescriptor::AttachIndexState { .. } => {
+                // See the synchronous replay path above. The post-replay
+                // bootstrap observes the final head exactly once.
+                let _ = (catalog, transaction, commit_id);
+                Ok(())
             }
             RuntimeTransitionDescriptor::DetachIndexState {
                 index,
@@ -527,53 +494,6 @@ impl<'a> CatalogReplayHandler<'a> {
                 Ok(())
             }
         }
-    }
-
-    fn recovery_table_storage_and_index(
-        catalog: &ParoCatalog,
-        transaction: &CatalogSnapshot,
-        index: &paro_common::ddl::DdlObjectKey,
-        table_name: &str,
-    ) -> paro_common::error::Result<
-        Option<(
-            Arc<TableHandle>,
-            Arc<paro_catalog::entry::IndexCatalogEntry>,
-        )>,
-    > {
-        let schema_name = index.schema.as_deref().ok_or_else(|| {
-            paro_error::serialization_error("runtime transition missing schema name")
-        })?;
-        let schema = match catalog.get_schema(transaction, schema_name) {
-            Ok(schema) => schema,
-            Err(_) => return Ok(None),
-        };
-        let index_entry = schema
-            .get_index(
-                transaction.transaction_id,
-                transaction.start_time,
-                &index.name,
-            )
-            .and_then(|entry| match &*entry {
-                CatalogEntryEnum::Index(index) => Some(index.clone()),
-                _ => None,
-            });
-        let Some(index_entry) = index_entry else {
-            return Ok(None);
-        };
-        let Some(table_entry) = schema.get_table(
-            transaction.transaction_id,
-            transaction.start_time,
-            table_name,
-        ) else {
-            return Ok(None);
-        };
-        let Some(table) = table_entry.as_ref().as_table() else {
-            return Ok(None);
-        };
-        Ok(table
-            .get_storage()
-            .cloned()
-            .map(|storage| (storage, index_entry)))
     }
 
     fn recovery_table_storage(
@@ -1005,7 +925,7 @@ fn apply_recovered_tablet_mutation(
             version_span,
             rowset_ref,
         } => {
-            let rowset_path = rowset_ref.resolve_for_tablet(storage.tablet().data_dir());
+            let rowset_path = rowset_ref.resolve_for_tablet(storage.tablet().data_dir())?;
             storage.replay_rowset_commit(
                 *rowset_id,
                 version_span.start,
@@ -1035,6 +955,9 @@ fn apply_recovered_tablet_mutation(
         }
         TabletMutation::PublishCompaction { .. } => {
             storage.apply_compaction_publish(mutation)?;
+        }
+        TabletMutation::PublishSearchGeneration { .. } => {
+            storage.apply_search_generation_publish(mutation)?;
         }
     }
 
@@ -1306,6 +1229,9 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
     let replayed_deferred_tasks = handler.drain_replayed_deferred_tasks();
     catalog.rebuild_dependency_graph()?;
     restore_runtime_art_indexes(catalog);
+    if replay_result.all_succeeded {
+        sweep_orphan_search_generation_workspaces(catalog);
+    }
     restore_search_registry_definitions(catalog);
     let report = build_recovery_consistency_report(catalog);
     log_recovery_consistency_report(&report);

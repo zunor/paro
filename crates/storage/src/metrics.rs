@@ -370,6 +370,7 @@ pub struct StorageMetricsSnapshot {
     pub compaction_output_bytes: u64,
     pub compaction_queue_len: usize,
     pub compaction_running_tablets: usize,
+    pub compaction_layout_gate_skips: u64,
     pub prefetch_hits: u64,
     pub prefetch_waits: u64,
     pub prefetch_wastes: u64,
@@ -483,6 +484,7 @@ pub struct StorageMetrics {
     compaction_output_bytes: AtomicU64,
     compaction_queue_len: AtomicUsize,
     compaction_running_tablets: AtomicUsize,
+    compaction_layout_gate_skips: AtomicU64,
     prefetch_hits: AtomicU64,
     prefetch_waits: AtomicU64,
     prefetch_wastes: AtomicU64,
@@ -694,6 +696,12 @@ impl StorageMetrics {
     pub fn set_compaction_running_tablets(&self, count: usize) {
         self.compaction_running_tablets
             .store(count, Ordering::Relaxed);
+    }
+
+    /// Record a background compaction yielding to a stable-layout build.
+    pub fn inc_compaction_layout_gate_skips(&self) {
+        self.compaction_layout_gate_skips
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Record a prefetch hit (page consumed after prefetch ready).
@@ -1462,6 +1470,7 @@ impl StorageMetrics {
             compaction_output_bytes: self.compaction_output_bytes.load(Ordering::Relaxed),
             compaction_queue_len: self.compaction_queue_len.load(Ordering::Relaxed),
             compaction_running_tablets: self.compaction_running_tablets.load(Ordering::Relaxed),
+            compaction_layout_gate_skips: self.compaction_layout_gate_skips.load(Ordering::Relaxed),
             prefetch_hits: self.prefetch_hits.load(Ordering::Relaxed),
             prefetch_waits: self.prefetch_waits.load(Ordering::Relaxed),
             prefetch_wastes: self.prefetch_wastes.load(Ordering::Relaxed),
@@ -1618,6 +1627,8 @@ impl StorageMetrics {
         self.compaction_output_bytes.store(0, Ordering::Relaxed);
         self.compaction_queue_len.store(0, Ordering::Relaxed);
         self.compaction_running_tablets.store(0, Ordering::Relaxed);
+        self.compaction_layout_gate_skips
+            .store(0, Ordering::Relaxed);
         self.prefetch_hits.store(0, Ordering::Relaxed);
         self.prefetch_waits.store(0, Ordering::Relaxed);
         self.prefetch_wastes.store(0, Ordering::Relaxed);

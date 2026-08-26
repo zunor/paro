@@ -6,7 +6,7 @@
 //! Coordinates undo tracking, staged writes, commit, rollback, and cleanup.
 
 use crate::search::write_path::SearchWriteContext;
-use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef};
+use crate::tablet::{LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, TabletRef};
 use crate::transaction::undo_buffer::{ActiveTransactionState, UndoBuffer};
 use crate::transaction::write_buffer::{
     GraphTableDmlDelta, PendingMutation, PendingPrimaryDelete, PendingRowIdDelete, PendingRowset,
@@ -1026,10 +1026,35 @@ impl Transaction {
             .push(mutation);
     }
 
+    fn acquire_storage_publish_layout_leases(
+        pending: &[PendingMutation],
+    ) -> Result<Vec<LayoutMaintenanceLease>> {
+        let mut tablets = BTreeMap::<u64, TabletRef>::new();
+        for mutation in pending {
+            let tablet = match mutation {
+                PendingMutation::Rowset(pending) => &pending.tablet,
+                PendingMutation::PrimaryDelete(pending) => &pending.tablet,
+                PendingMutation::RowIdDelete(pending) => &pending.tablet,
+            };
+            tablets
+                .entry(tablet.tablet_id())
+                .or_insert_with(|| Arc::clone(tablet));
+        }
+        tablets
+            .into_values()
+            .map(|tablet| tablet.acquire_storage_publish_layout_lease())
+            .collect()
+    }
+
     pub fn prepare_commit(&self) -> Result<PreparedStorageCommit> {
         self.write_buffer.materialize_writers()?;
 
         let pending = self.write_buffer.take_mutations()?;
+        // Acquire in tablet-id order while SQL write locks are still held.
+        // These leases bridge the later lock-release -> required-apply window,
+        // preventing a stable-layout index build from snapshotting ahead of an
+        // earlier durable DML commit whose rowset is not published yet.
+        let layout_leases = Self::acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
 
         let mut data_ops = Vec::new();
@@ -1143,6 +1168,7 @@ impl Transaction {
             rowsets,
             primary_deletes,
             row_id_deletes,
+            _layout_leases: layout_leases,
         })?;
 
         Ok(PreparedStorageCommit {
@@ -1154,6 +1180,7 @@ impl Transaction {
 
     fn apply_pending_writes(&self, commit_id: u64) -> Result<()> {
         let pending = self.write_buffer.take_mutations()?;
+        let _layout_leases = Self::acquire_storage_publish_layout_leases(&pending)?;
         let (primary_deletes, row_id_deletes, rowsets) = self.split_pending_operations(pending)?;
         self.apply_materialized_writes(commit_id, &primary_deletes, &row_id_deletes, rowsets)
     }
@@ -2048,6 +2075,31 @@ mod tests {
             &tablet_op.mutations[2],
             TabletMutation::PublishRowset { rowset_id, .. } if *rowset_id > 0
         ));
+
+        let started = Arc::new(AtomicBool::new(false));
+        let acquired = Arc::new(AtomicBool::new(false));
+        let tablet_for_waiter = tablet.clone();
+        let started_for_waiter = Arc::clone(&started);
+        let acquired_for_waiter = Arc::clone(&acquired);
+        let waiter = thread::spawn(move || {
+            started_for_waiter.store(true, Ordering::Release);
+            let lease = tablet_for_waiter
+                .acquire_stable_layout_lease(77, || false)
+                .unwrap();
+            acquired_for_waiter.store(true, Ordering::Release);
+            lease
+        });
+        while !started.load(Ordering::Acquire) {
+            thread::yield_now();
+        }
+        thread::sleep(std::time::Duration::from_millis(10));
+        assert!(
+            !acquired.load(Ordering::Acquire),
+            "prepared DML must retain its shared layout lease"
+        );
+        txn.rollback_prepared_storage_only();
+        drop(waiter.join().unwrap());
+        assert!(acquired.load(Ordering::Acquire));
     }
 
     #[test]

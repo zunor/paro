@@ -8,6 +8,7 @@ use crate::compaction::plan::types::{
     CompactionJobId, CompactionLifecycleState, CompactionPlan, ExecutionLayout,
 };
 use crate::compaction::publish::{CompactionPublisher, CompactionValidator};
+use crate::metrics::storage_metrics;
 use crate::search::SearchInlineBuilderSet;
 use crate::tablet::Tablet;
 use paro_common::allocator::Allocator;
@@ -108,6 +109,14 @@ fn run_job_inner<F>(
 where
     F: FnMut(CompactionLifecycleState),
 {
+    // A search generation embeds physical rowset/segment identities. Yield
+    // background compaction while a foreground staged build owns that stable
+    // layout, and hold this shared lease through durable compaction publish so
+    // the two artifact lifecycles cannot cross.
+    let Some(_layout_lease) = tablet.try_acquire_compaction_layout_lease()? else {
+        storage_metrics().inc_compaction_layout_gate_skips();
+        return Ok(false);
+    };
     on_state(CompactionLifecycleState::Building);
     let workspace =
         crate::compaction::execution::workspace::CompactionWorkspace::create_with_cancel_token(

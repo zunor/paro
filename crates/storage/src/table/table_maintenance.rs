@@ -141,6 +141,10 @@ impl TableHandle {
         Ok(())
     }
 
+    pub fn apply_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {
+        self.tablet().apply_search_generation_publish(op)
+    }
+
     /// Replay table-level DELETE row IDs from WAL.
     pub fn replay_delete_rows(&self, _row_ids: &[u64]) -> Result<usize> {
         Err(paro_error::not_supported(

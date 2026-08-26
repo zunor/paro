@@ -99,7 +99,8 @@ pub fn run_once(spec: &UtilitySpec, ctx: &mut UtilityContext<'_>) -> Result<Util
                 .session
                 .ddl()
                 .expect("ddl context must exist inside transactions");
-            let handle = ddl.prepare_index_build(spec.info.clone(), spec.table.clone())?;
+            let handle =
+                ddl.prepare_index_build(spec.info.clone(), spec.table.clone(), ctx.cancel.clone())?;
             if !handle.skip_build() {
                 ddl.commit_index_build(
                     handle,

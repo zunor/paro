@@ -11,7 +11,9 @@ use crate::primary_key::RowID;
 use crate::rowset::RowsetSharedPtr;
 use crate::search::write_path::SearchWriteContext;
 use crate::table::runtime_indexes::RuntimeIndexes;
-use crate::tablet::{PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState};
+use crate::tablet::{
+    LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState,
+};
 use crate::transaction::spill::{
     StagedDeleteVectorArtifact, StagedRowsetArtifact, TxnSpillMark, TxnSpillState,
 };
@@ -315,6 +317,9 @@ pub(crate) struct PreparedStorageState {
     pub(crate) rowsets: Vec<PendingRowset>,
     pub(crate) primary_deletes: Vec<PendingPrimaryDelete>,
     pub(crate) row_id_deletes: Vec<PendingRowIdDelete>,
+    /// Shared physical-layout leases acquired before SQL transaction locks are
+    /// released and retained through required tablet publication.
+    pub(crate) _layout_leases: Vec<LayoutMaintenanceLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

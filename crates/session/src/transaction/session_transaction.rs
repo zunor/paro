@@ -274,6 +274,9 @@ impl SessionTransaction {
             .map_err(|_| paro_error::internal("ddl state poisoned"))?
             .rollback_to_mark(frame.ddl_mark);
         for mut change in rolled_back.into_iter().rev() {
+            if let Some(delta) = change.dependencies.take() {
+                delta.discard();
+            }
             if let Some(handle) = change.catalog.take() {
                 handle.discard()?;
             }
@@ -1627,6 +1630,7 @@ mod tests {
             dependencies: None,
             dml_targets: Vec::new(),
             staged_artifacts: Vec::new(),
+            storage_ops: Vec::new(),
             runtime_transitions: Vec::new(),
             cleanups: Vec::new(),
             post_commit_hooks: Vec::new(),

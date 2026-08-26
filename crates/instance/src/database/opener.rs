@@ -8,6 +8,9 @@ use crate::checkpoint::recovery::{CheckpointBaseState, CheckpointRecovery};
 use crate::checkpoint::RetentionCoordinator;
 use crate::config::{CheckpointConfigOptions, CompactionConfigOptions};
 use crate::metadata::instance_catalog::DatabaseRecord;
+use crate::recovery::{
+    restore_search_registry_definitions, sweep_orphan_search_generation_workspaces,
+};
 use crate::storage_manager::StorageManager;
 use paro_catalog::catalog::Catalog;
 use paro_catalog::database_catalog::ParoCatalog;
@@ -193,11 +196,17 @@ impl DatabaseOpener {
         apply_runtime.bootstrap_frontiers(Self::journal_recovery_summary(&recovery_summary));
         db.bootstrap_checkpoint_runtime(recovery_summary.clone());
         if !replayed_wal {
+            // With no WAL to replay, every private generation workspace lies
+            // outside the durable checkpoint and is safe to collect now.
+            sweep_orphan_search_generation_workspaces(db.catalog());
             CheckpointRecovery::redeliver_deferred_tasks(
                 db.catalog(),
                 &inputs.checkpoint_base.deferred_tasks,
             );
         }
+        // Bootstrap search runtimes once the final tablet heads are known,
+        // even when the checkpoint had no outstanding deferred task.
+        restore_search_registry_definitions(db.catalog());
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
         Self::sweep_checkpoint_artifacts(db, checkpoint)?;
         Self::ensure_recovered_journal_published(&apply_runtime, recovery_summary.max_lsn)?;

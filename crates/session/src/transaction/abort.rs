@@ -45,6 +45,12 @@ impl AbortPipeline {
                 StagedArtifactDescriptor::BulkLoadRowset(artifact) => {
                     Self::path_from_components(&artifact.staging.path_components)
                 }
+                StagedArtifactDescriptor::SearchGenerationBuild(_artifact) => {
+                    // The transient staged-generation owner resolves the
+                    // tablet-relative ref and removes its workspace. Crash
+                    // leftovers are handled by startup staging GC.
+                    continue;
+                }
             };
             if !path.exists() {
                 continue;
@@ -138,6 +144,7 @@ mod tests {
             dependencies: Some(dependencies),
             dml_targets: Vec::new(),
             staged_artifacts: Vec::new(),
+            storage_ops: Vec::new(),
             runtime_transitions: Vec::new(),
             cleanups: Vec::new(),
             post_commit_hooks: Vec::new(),

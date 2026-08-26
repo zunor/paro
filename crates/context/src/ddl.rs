@@ -12,6 +12,8 @@ use paro_storage::index::BoundIndex;
 use std::any::Any;
 use std::sync::Arc;
 
+use crate::StatementCancellation;
+
 pub trait IndexBuildHandle: Any + Send + Sync {
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
     fn skip_build(&self) -> bool;
@@ -43,6 +45,7 @@ pub trait DdlApplyContext: Send + Sync {
         &self,
         info: CreateIndexInfo,
         table: Arc<TableCatalogEntry>,
+        cancellation: StatementCancellation,
     ) -> Result<Box<dyn IndexBuildHandle>>;
     fn commit_index_build(
         &self,

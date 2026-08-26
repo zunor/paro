@@ -55,8 +55,9 @@ impl SidecarArtifactStore {
         PathBuf::from("search_registry")
             .join("definitions")
             .join(file_id.definition_id.to_string())
-            .join("sidecars")
+            .join("generations")
             .join(format!("g{}", file_id.generation_id))
+            .join("sidecars")
             .join(format!("package_{}.scar", file_id.package_index))
     }
 

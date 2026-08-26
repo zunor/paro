@@ -7,13 +7,13 @@ use crate::ddl::{
     DdlChange, DdlChangeRecord, DdlDependencyRef, DdlObjectKey, DdlStorageDescriptor,
 };
 use crate::effect::{
-    ApplyDescriptor, CatalogTxnOp, DeferredTask, StagedArtifactDescriptor, StorageCommitOp,
-    TabletMutation,
+    ApplyDescriptor, CatalogTxnOp, DeferredTask, SearchGenerationHeadMeta,
+    StagedArtifactDescriptor, StorageCommitOp, TabletMutation,
 };
 use serde::{Deserialize, Serialize};
 
 /// Journal frame schema version used by the binary codec.
-pub const JOURNAL_FORMAT_VERSION: u16 = 4;
+pub const JOURNAL_FORMAT_VERSION: u16 = 5;
 pub const COMMIT_RECORD_VERSION: u16 = 2;
 pub const MAINTENANCE_RECORD_VERSION: u16 = 2;
 pub const JOURNAL_RECORD_METADATA_VERSION: u16 = 1;
@@ -351,6 +351,22 @@ impl JournalChangeDescriptor {
                     descriptor_checksum_crc32c: checksum_serialized(descriptor),
                 });
             }
+            ApplyDescriptor::PublishStagedArtifact(
+                StagedArtifactDescriptor::SearchGenerationBuild(artifact),
+            ) => {
+                push_unique(&mut self.catalog_objects, artifact.table_object.clone());
+                push_nonzero_u64(&mut self.object_ids, artifact.table_id);
+                push_nonzero_u64(&mut self.tablet_ids, artifact.tablet_id);
+                self.artifacts.push(JournalArtifactDescriptor {
+                    tablet_id: Some(artifact.tablet_id),
+                    artifact_id: SearchGenerationHeadMeta::stable_artifact_id(
+                        artifact.definition_id,
+                        artifact.generation_id,
+                    ),
+                    kind: JournalArtifactKind::ApplyDescriptor,
+                    descriptor_checksum_crc32c: checksum_serialized(descriptor),
+                });
+            }
             ApplyDescriptor::RuntimeTransition(_) | ApplyDescriptor::Cleanup(_) => {
                 self.artifacts.push(JournalArtifactDescriptor {
                     tablet_id: None,
@@ -369,6 +385,7 @@ pub enum JournalArtifactKind {
     PrimaryDelete,
     DeletePatch,
     CompactionOutput,
+    SearchGeneration,
     ApplyDescriptor,
     BulkLoadRowset,
 }
@@ -380,6 +397,7 @@ impl JournalArtifactKind {
             TabletMutation::ApplyPrimaryDelete { .. } => Self::PrimaryDelete,
             TabletMutation::ApplyDeletePatch { .. } => Self::DeletePatch,
             TabletMutation::PublishCompaction { .. } => Self::CompactionOutput,
+            TabletMutation::PublishSearchGeneration { .. } => Self::SearchGeneration,
         }
     }
 }

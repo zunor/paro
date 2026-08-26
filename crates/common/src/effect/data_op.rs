@@ -15,6 +15,7 @@ pub enum ArtifactNamespace {
     CanonicalRowset,
     Staged,
     DeletePatch,
+    SearchGeneration,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -34,6 +35,10 @@ impl ArtifactRef {
             (
                 ArtifactNamespace::DeletePatch,
                 tablet_data_dir.join("_delete_patch"),
+            ),
+            (
+                ArtifactNamespace::SearchGeneration,
+                tablet_data_dir.join("search_registry").join("definitions"),
             ),
         ];
         for (namespace, root) in namespaces {
@@ -62,8 +67,20 @@ impl ArtifactRef {
         )))
     }
 
-    pub fn resolve_for_tablet(&self, tablet_data_dir: &Path) -> PathBuf {
-        match self.namespace {
+    /// Resolve a durable tablet-relative reference without permitting an
+    /// absolute component or parent traversal to escape its namespace.
+    pub fn resolve_for_tablet(&self, tablet_data_dir: &Path) -> Result<PathBuf> {
+        for component in &self.locator {
+            let mut components = Path::new(component).components();
+            if !matches!(components.next(), Some(Component::Normal(_)))
+                || components.next().is_some()
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "artifact locator contains invalid path component {component:?}"
+                )));
+            }
+        }
+        let path = match self.namespace {
             ArtifactNamespace::CanonicalRowset => {
                 let mut path = tablet_data_dir.join("rowsets");
                 for component in &self.locator {
@@ -93,7 +110,36 @@ impl ArtifactRef {
                 }
                 path
             }
-        }
+            ArtifactNamespace::SearchGeneration => {
+                let mut path = tablet_data_dir.join("search_registry").join("definitions");
+                for component in &self.locator {
+                    path.push(component);
+                }
+                path
+            }
+        };
+        Ok(path)
+    }
+}
+
+/// Durable search-generation root selected by a tablet snapshot.
+///
+/// The head and the immutable generation directory are installed by one
+/// [`TabletMutation::PublishSearchGeneration`] operation. Keeping this type in
+/// `paro-common` makes the durable mutation the single source of truth shared
+/// by live publication, recovery, and tablet metadata.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchGenerationHeadMeta {
+    pub definition_id: u64,
+    pub generation_id: u64,
+    pub root_version: u64,
+    pub config_fingerprint: u64,
+    pub root_file_name: String,
+}
+
+impl SearchGenerationHeadMeta {
+    pub(crate) fn stable_artifact_id(definition_id: u64, generation_id: u64) -> u64 {
+        stable_search_generation_artifact_id(definition_id, generation_id)
     }
 }
 
@@ -185,6 +231,14 @@ pub enum TabletMutation {
         retired_inputs: Vec<RetiredRowsetInput>,
         cumulative_point_action: CompactionCumulativePointAction,
     },
+    /// Atomically install one immutable search generation and make its head
+    /// visible in tablet metadata. `generation_ref` always names a fresh,
+    /// generation-qualified directory; publication never overwrites it.
+    PublishSearchGeneration {
+        staged_ref: ArtifactRef,
+        generation_ref: ArtifactRef,
+        head: SearchGenerationHeadMeta,
+    },
 }
 
 impl TabletMutation {
@@ -194,7 +248,9 @@ impl TabletMutation {
             Self::PublishCompaction {
                 output_rowset_id, ..
             } => Some(*output_rowset_id),
-            Self::ApplyPrimaryDelete { .. } | Self::ApplyDeletePatch { .. } => None,
+            Self::ApplyPrimaryDelete { .. }
+            | Self::ApplyDeletePatch { .. }
+            | Self::PublishSearchGeneration { .. } => None,
         }
     }
 
@@ -204,6 +260,9 @@ impl TabletMutation {
             Self::PublishCompaction {
                 output_rowset_id, ..
             } => *output_rowset_id,
+            Self::PublishSearchGeneration { head, .. } => {
+                stable_search_generation_artifact_id(head.definition_id, head.generation_id)
+            }
             Self::ApplyPrimaryDelete { keys } => stable_hash_keys(keys),
             Self::ApplyDeletePatch { patch, .. } => stable_hash_delete_patch(patch),
         }
@@ -236,7 +295,7 @@ impl DeletePatchRef {
         match self {
             Self::Inline(patch) => patch.decode_row_refs(),
             Self::Artifact(reference) => {
-                let artifact_path = reference.resolve_for_tablet(tablet_data_dir);
+                let artifact_path = reference.resolve_for_tablet(tablet_data_dir)?;
                 let bytes = std::fs::read(&artifact_path).map_err(|err| {
                     paro_error::io_error(format!(
                         "read delete patch artifact {}: {}",
@@ -263,6 +322,13 @@ fn stable_hash_keys(keys: &[Vec<u8>]) -> u64 {
     for key in keys {
         hash.write_bytes(key);
     }
+    hash.finish()
+}
+
+pub(crate) fn stable_search_generation_artifact_id(definition_id: u64, generation_id: u64) -> u64 {
+    let mut hash = StableHasher::new(0x5345_4152_4348_474e);
+    hash.write_u64(definition_id);
+    hash.write_u64(generation_id);
     hash.finish()
 }
 
@@ -294,6 +360,7 @@ fn stable_hash_delete_patch(patch: &DeletePatchRef) -> u64 {
                 ArtifactNamespace::CanonicalRowset => 1,
                 ArtifactNamespace::Staged => 2,
                 ArtifactNamespace::DeletePatch => 3,
+                ArtifactNamespace::SearchGeneration => 4,
             });
             hash.write_u64(reference.locator.len() as u64);
             for component in &reference.locator {
@@ -555,9 +622,22 @@ mod tests {
             }
         );
         assert_eq!(
-            delete_patch_ref.resolve_for_tablet(&tablet_dir),
+            delete_patch_ref.resolve_for_tablet(&tablet_dir).unwrap(),
             delete_patch
         );
+        let _ = std::fs::remove_dir_all(&tablet_dir);
+    }
+
+    #[test]
+    fn artifact_ref_rejects_absolute_and_parent_traversal_components() {
+        let tablet_dir = temp_tablet_dir();
+        for locator in [vec!["..".to_string()], vec!["/tmp".to_string()]] {
+            let reference = ArtifactRef {
+                namespace: ArtifactNamespace::Staged,
+                locator,
+            };
+            assert!(reference.resolve_for_tablet(&tablet_dir).is_err());
+        }
         let _ = std::fs::remove_dir_all(&tablet_dir);
     }
 }

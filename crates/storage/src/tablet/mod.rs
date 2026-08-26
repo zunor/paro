@@ -41,6 +41,7 @@
 //! - `tablet_schema`: Schema definition for Tablet columns
 //! - `tablet_reader`: Cross-Rowset merge reader
 
+mod layout_maintenance_gate;
 mod prepared_txn_registry;
 mod primary_index;
 mod schema_adapter;
@@ -63,6 +64,7 @@ static DELETE_PATCH_INLINE_ROW_REF_THRESHOLD: AtomicUsize =
 
 // Re-export main types
 pub use crate::rowset::PhysicalRowRef;
+pub use layout_maintenance_gate::{LayoutMaintenanceGate, LayoutMaintenanceLease};
 pub use schema_adapter::TabletSchemaAdaptationPlan;
 pub use statistics::{TabletColumnStatistics, TabletStatistics};
 pub use tablet_meta::{SearchGenerationHeadMeta, TabletMeta};

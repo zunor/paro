@@ -4,8 +4,12 @@
 use super::super::ddl_changes::{PreparedCatalogOp, TransientCatalogRuntime};
 use super::super::post_commit::PostCommitActions;
 use super::super::session_transaction::FrozenTransaction;
-use super::ddl_publish::{build_apply_descriptor_phase, IndexBackfillPublishTask};
-use super::errors::{commit_runtime_error_to_paro, CommitFailure};
+use super::ddl_publish::{
+    build_apply_descriptor_phase, IndexBackfillPublishTask, StagedGenerationPublishTask,
+};
+use super::errors::{
+    commit_runtime_error_is_definitely_nondurable, commit_runtime_error_to_paro, CommitFailure,
+};
 use super::job_builder;
 use crate::session::Session;
 use paro_catalog::transaction::{
@@ -21,16 +25,18 @@ use paro_common::error::Result;
 use paro_common::logging::targets;
 use paro_instance::commit::live_publish::{build_required_publish_plan, LivePublishPlanInput};
 use paro_journal::{encoded_size_upper_bound_for_plan, TabletApplyPart};
+use paro_storage::search::StagedSearchGeneration;
 use paro_storage::transaction::lifecycle_action;
 use paro_storage::transaction::participant::{
     StorageCommitParticipant, StorageCommittedRecordApplier,
 };
 use paro_storage::transaction::txn::{PreparedStorageCommit, Transaction};
 use paro_transaction::{
-    AbortReason, ApplyTargetDescriptor, CommitFinalizeReservationInput, CommitParticipant,
-    CommitRequest, CommitRuntimeAck, CommitSequencingPlan, CommittedRecordApplier, DatabaseId,
-    ParticipantDescriptor, ParticipantId, ParticipantKind, PreparedCommitJob, PreparedCommitPart,
-    TransactionView, TxnResourceKey, WriteConflictPlacementInput,
+    AbortReason, AppendFailureRollbackPlan, ApplyTargetDescriptor, CommitFinalizeReservationInput,
+    CommitParticipant, CommitRequest, CommitRuntimeAck, CommitSequencingPlan,
+    CommittedRecordApplier, DatabaseId, ParticipantDescriptor, ParticipantId, ParticipantKind,
+    PreparedCommitJob, PreparedCommitPart, TransactionView, TxnResourceKey,
+    WriteConflictPlacementInput,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -214,18 +220,44 @@ impl<'a> CommitPipeline<'a> {
 
         let apply_descriptors = Self::collect_apply_descriptors(&ddl_changes);
         let publish_apply_descriptors = apply_descriptors.clone();
+        let ddl_storage_ops = Self::collect_ddl_storage_ops(&ddl_changes);
         let durable_deferred_tasks = Self::collect_deferred_tasks(&prepared_storage, &ddl_changes);
         let post_commit_deferred_tasks = Self::post_commit_deferred_tasks(&durable_deferred_tasks);
         let index_publish_tasks = Self::collect_index_backfill_publish_tasks(&ddl_changes);
+        let staged_generation_owners = index_publish_tasks
+            .iter()
+            .filter_map(IndexBackfillPublishTask::staged_search_generation)
+            .collect::<Vec<_>>();
+        let staged_generation_publish_tasks =
+            match Self::collect_staged_generation_publish_tasks(&index_publish_tasks) {
+                Ok(tasks) => tasks,
+                Err(error) => {
+                    if let Some(prepare) = &catalog_prepare {
+                        let _ = prepare.applier.abort_prepared();
+                    }
+                    let _ = storage_participant.abort(AbortReason::ValidationFailed);
+                    let rollback_succeeded =
+                        manager.rollback_transaction(Arc::clone(&active)).is_ok();
+                    return Err(CommitFailure {
+                        error,
+                        rollback_succeeded,
+                    });
+                }
+            };
+        if !ddl_storage_ops.is_empty() {
+            request.add_participants(vec![storage_descriptor.clone()]);
+        }
         request.add_participants(Self::participants_for_durable_tasks(
             database_id,
             &durable_deferred_tasks,
         ));
+        let mut durable_storage_ops = prepared_storage.storage_ops.clone();
+        durable_storage_ops.extend(ddl_storage_ops);
         let durable_plan = PreparedCommitPlan {
             txn_id: active.id,
             start_time: active.start_time,
             catalog_ops: catalog_ops.to_vec(),
-            storage_ops: prepared_storage.storage_ops.clone(),
+            storage_ops: durable_storage_ops,
             apply_descriptors,
             deferred_tasks: durable_deferred_tasks.clone(),
             tablets: Vec::new(),
@@ -307,6 +339,22 @@ impl<'a> CommitPipeline<'a> {
                 rollback_succeeded,
             });
         }
+        for owner in &staged_generation_owners {
+            if let Err(error) = owner.prepare_durable_handoff() {
+                for staged in &staged_generation_owners {
+                    let _ = staged.discard_before_durable_append();
+                }
+                if let Some(prepare) = &catalog_prepare {
+                    let _ = prepare.applier.abort_prepared();
+                }
+                let _ = storage_participant.abort(AbortReason::ValidationFailed);
+                let rollback_succeeded = manager.rollback_transaction(Arc::clone(&active)).is_ok();
+                return Err(CommitFailure {
+                    error,
+                    rollback_succeeded,
+                });
+            }
+        }
         let storage_applier =
             StorageCommittedRecordApplier::new(Arc::clone(&manager), Arc::clone(&active));
         let database = Arc::clone(&session.current_database);
@@ -326,7 +374,7 @@ impl<'a> CommitPipeline<'a> {
         let storage_apply_descriptor = storage_descriptor.clone();
         let publish_commit_id = Arc::new(AtomicU64::new(0));
         let request_for_tablets = request.clone();
-        let tablet_parts = if has_storage_apply {
+        let mut tablet_parts = if has_storage_apply {
             let publish_commit_id = Arc::clone(&publish_commit_id);
             vec![TabletApplyPart {
                 tablet_id: storage_apply_tablet_id,
@@ -346,6 +394,22 @@ impl<'a> CommitPipeline<'a> {
         } else {
             Vec::new()
         };
+        for task in staged_generation_publish_tasks {
+            let tablet_id = task.tablet_id();
+            let publish_commit_id = Arc::clone(&publish_commit_id);
+            tablet_parts.push(TabletApplyPart {
+                tablet_id,
+                apply: Box::new(move || {
+                    let commit_id = publish_commit_id.load(Ordering::Acquire);
+                    if commit_id == 0 {
+                        return Err(paro_common::error::internal(
+                            "search generation apply started before commit id assignment",
+                        ));
+                    }
+                    task.apply(commit_id)
+                }),
+            });
+        }
         let catalog_post_request = request.clone();
         let publish_database = Arc::clone(&database);
         let catalog_post = Box::new(move |commit_id| {
@@ -419,8 +483,9 @@ impl<'a> CommitPipeline<'a> {
                 Arc::clone(&manager),
                 Arc::clone(&active),
             ),
-            append_failure_rollback_plan: lifecycle_action::append_failure_rollback_plan(
+            append_failure_rollback_plan: Self::append_failure_rollback_plan(
                 Arc::clone(&active),
+                staged_generation_owners.clone(),
             ),
             required_publish: publish_plan,
             deferred_publish: Vec::new(),
@@ -433,6 +498,17 @@ impl<'a> CommitPipeline<'a> {
         let runtime_outcome = match database.commit_runtime().commit_blocking(job) {
             Ok(outcome) => outcome,
             Err(error) => {
+                if commit_runtime_error_is_definitely_nondurable(&error) {
+                    for owner in &staged_generation_owners {
+                        if let Err(cleanup_error) = owner.discard_before_durable_append() {
+                            tracing::warn!(
+                                target: targets::TRANSACTION,
+                                error = %cleanup_error,
+                                "failed to discard non-durable staged search generation"
+                            );
+                        }
+                    }
+                }
                 return Err(CommitFailure {
                     error: commit_runtime_error_to_paro(error),
                     rollback_succeeded: false,
@@ -580,6 +656,34 @@ impl<'a> CommitPipeline<'a> {
             .collect()
     }
 
+    fn collect_staged_generation_publish_tasks(
+        index_tasks: &[IndexBackfillPublishTask],
+    ) -> Result<Vec<StagedGenerationPublishTask>> {
+        index_tasks
+            .iter()
+            .filter_map(|task| task.staged_generation_publish_task().transpose())
+            .collect()
+    }
+
+    fn append_failure_rollback_plan(
+        transaction: Arc<Transaction>,
+        staged_generations: Vec<Arc<StagedSearchGeneration>>,
+    ) -> AppendFailureRollbackPlan {
+        AppendFailureRollbackPlan::new(move || {
+            transaction.rollback_prepared_storage_only();
+            let mut first_error = None;
+            for staged in staged_generations {
+                if let Err(error) = staged.discard_before_durable_append() {
+                    first_error.get_or_insert(error);
+                }
+            }
+            match first_error {
+                Some(error) => Err(error),
+                None => Ok(()),
+            }
+        })
+    }
+
     fn storage_apply_tablet_id(prepared_storage: &PreparedStorageCommit) -> u64 {
         prepared_storage
             .storage_ops
@@ -659,6 +763,13 @@ impl<'a> CommitPipeline<'a> {
             descriptors.extend(op.cleanups.iter().cloned().map(ApplyDescriptor::Cleanup));
         }
         descriptors
+    }
+
+    fn collect_ddl_storage_ops(ddl_changes: &[PreparedCatalogOp]) -> Vec<StorageCommitOp> {
+        ddl_changes
+            .iter()
+            .flat_map(|change| change.storage_ops.iter().cloned())
+            .collect()
     }
 }
 
@@ -759,6 +870,7 @@ mod tests {
             dependencies: Some(dependencies),
             dml_targets: Vec::new(),
             staged_artifacts: Vec::new(),
+            storage_ops: Vec::new(),
             runtime_transitions: Vec::new(),
             cleanups: Vec::new(),
             post_commit_hooks: Vec::new(),

@@ -89,6 +89,32 @@ pub(crate) fn collect_visible_snapshot(
     })
 }
 
+/// Build input covering every physical segment in one stable tablet layout.
+///
+/// Unlike `collect_visible_snapshot`, this deliberately ignores any inline
+/// provider artifact already embedded in a segment. A staged catalog index is
+/// generation-owned and must produce one self-contained sidecar generation,
+/// not inherit accidental per-segment fan-out from earlier write policy.
+pub(crate) fn collect_full_rebuild_tail(
+    visible_version: i64,
+    visible_rowsets: &[RowsetSharedPtr],
+) -> Result<Vec<TailPendingEntry>> {
+    let mut entries = Vec::with_capacity(visible_rowsets.len());
+    for rowset in visible_rowsets {
+        rowset.load()?;
+        let segment_ids = rowset
+            .segments()
+            .iter()
+            .map(|segment| segment.segment_id())
+            .collect::<Vec<_>>();
+        if segment_ids.is_empty() {
+            continue;
+        }
+        entries.push(rowset_tail_entry(rowset, &segment_ids, visible_version)?);
+    }
+    Ok(entries)
+}
+
 pub(crate) fn collect_rowset_snapshot(
     definition: &SearchIndexDefinition,
     rowset: &RowsetSharedPtr,

@@ -83,7 +83,7 @@ impl ManifestFileRef {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct GenerationManifestRoot {
     pub definition_id: u64,
     pub generation_id: SearchGenerationId,
@@ -264,6 +264,7 @@ impl ManifestStore {
         self.codec_kind.metric_label()
     }
 
+    /// Stable container for all immutable generations of one definition.
     pub(crate) fn definition_dir(&self, definition_id: u64) -> PathBuf {
         self.table_data_dir
             .join("search_registry")
@@ -271,13 +272,25 @@ impl ManifestStore {
             .join(definition_id.to_string())
     }
 
-    pub(crate) fn root_path(&self, definition_id: u64) -> PathBuf {
+    /// Immutable namespace installed atomically by `PublishSearchGeneration`.
+    pub(crate) fn generation_dir(
+        &self,
+        definition_id: u64,
+        generation_id: SearchGenerationId,
+    ) -> PathBuf {
         self.definition_dir(definition_id)
-            .join("manifest_root.json")
+            .join("generations")
+            .join(format!("g{generation_id}"))
     }
 
-    pub(crate) fn root_path_for_file(&self, definition_id: u64, file_name: &str) -> PathBuf {
-        self.definition_dir(definition_id).join(file_name)
+    pub(crate) fn root_path_for_file(
+        &self,
+        definition_id: u64,
+        generation_id: SearchGenerationId,
+        file_name: &str,
+    ) -> PathBuf {
+        self.generation_dir(definition_id, generation_id)
+            .join(file_name)
     }
 
     pub(crate) fn root_file_name(root: &GenerationManifestRoot) -> String {
@@ -315,7 +328,7 @@ impl ManifestStore {
             root_to_write.recompute_checksum_for_codec_and_state(self.codec_kind, None)?;
         }
         let path = self
-            .definition_dir(definition_id)
+            .generation_dir(definition_id, root_to_write.generation_id)
             .join(Self::root_file_name(&root_to_write));
         self.write_root_fragment(&path, &root_to_write, embedded_state.as_ref())?;
         Ok(path)
@@ -329,7 +342,9 @@ impl ManifestStore {
         shard: &ManifestShard,
     ) -> Result<ManifestFileRef> {
         let file_name = format!("shard_g{generation_id}_v{root_version}.json");
-        let path = self.definition_dir(definition_id).join(&file_name);
+        let path = self
+            .generation_dir(definition_id, generation_id)
+            .join(&file_name);
         self.write_typed_fragment(&path, self.codec_kind, shard)?;
         Ok(ManifestFileRef::new(file_name, self.codec_kind))
     }
@@ -343,50 +358,76 @@ impl ManifestStore {
         delta: &ManifestDelta,
     ) -> Result<ManifestFileRef> {
         let file_name = format!("delta_g{generation_id}_v{root_version}_{ordinal}.json");
-        let path = self.definition_dir(definition_id).join(&file_name);
+        let path = self
+            .generation_dir(definition_id, generation_id)
+            .join(&file_name);
         self.write_typed_fragment(&path, self.codec_kind, delta)?;
         Ok(ManifestFileRef::new(file_name, self.codec_kind))
     }
 
     pub(crate) fn load_manifest(&self, definition_id: u64) -> Result<Option<LoadedManifest>> {
-        let root_path = if self.root_path(definition_id).exists() {
-            self.root_path(definition_id)
-        } else {
-            let Some(path) = self.latest_versioned_root_path(definition_id)? else {
-                return Ok(None);
-            };
-            path
+        let Some(path) = self.latest_versioned_root_path(definition_id)? else {
+            return Ok(None);
         };
+        let root_path = path;
         self.load_manifest_from_root_path(definition_id, root_path)
     }
 
     fn latest_versioned_root_path(&self, definition_id: u64) -> Result<Option<PathBuf>> {
-        let definition_dir = self.definition_dir(definition_id);
-        if !definition_dir.exists() {
+        let generations_dir = self.definition_dir(definition_id).join("generations");
+        if !generations_dir.exists() {
             return Ok(None);
         }
-        let mut roots = Vec::new();
-        for entry in fs::read_dir(&definition_dir).map_err(|err| {
-            paro_error::io_error(format!("scan {}: {}", definition_dir.display(), err))
+        let mut latest: Option<(SearchGenerationId, u64, PathBuf)> = None;
+        for generation in fs::read_dir(&generations_dir).map_err(|err| {
+            paro_error::io_error(format!("scan {}: {}", generations_dir.display(), err))
         })? {
-            let entry = entry.map_err(paro_error::io)?;
-            if !entry.file_type().map_err(paro_error::io)?.is_file() {
+            let generation = generation.map_err(paro_error::io)?;
+            if !generation.file_type().map_err(paro_error::io)?.is_dir() {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("manifest_root_g") && name.ends_with(".json") {
-                roots.push(entry.path());
+            let Some(directory_generation_id) = generation
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_prefix('g'))
+                .and_then(|value| value.parse::<SearchGenerationId>().ok())
+            else {
+                continue;
+            };
+            for entry in fs::read_dir(generation.path()).map_err(paro_error::io)? {
+                let entry = entry.map_err(paro_error::io)?;
+                if !entry.file_type().map_err(paro_error::io)?.is_file() {
+                    continue;
+                }
+                let name = entry.file_name().to_string_lossy().to_string();
+                let Some((generation_id, root_version)) = parse_manifest_root_file_name(&name)
+                else {
+                    continue;
+                };
+                if generation_id != directory_generation_id {
+                    return Err(paro_error::data_corrupted(format!(
+                        "search manifest root {} disagrees with generation directory g{}",
+                        entry.path().display(),
+                        directory_generation_id
+                    )));
+                }
+                let candidate = (generation_id, root_version, entry.path());
+                if latest.as_ref().is_none_or(|current| {
+                    candidate.0 > current.0 || candidate.0 == current.0 && candidate.1 > current.1
+                }) {
+                    latest = Some(candidate);
+                }
             }
         }
-        roots.sort();
-        Ok(roots.pop())
+        Ok(latest.map(|(_, _, path)| path))
     }
 
     pub(crate) fn load_manifest_for_head(
         &self,
         head: &SearchGenerationHeadMeta,
     ) -> Result<Option<LoadedManifest>> {
-        let root_path = self.root_path_for_file(head.definition_id, &head.root_file_name);
+        let root_path =
+            self.root_path_for_file(head.definition_id, head.generation_id, &head.root_file_name);
         if !root_path.exists() {
             return Ok(None);
         }
@@ -446,7 +487,7 @@ impl ManifestStore {
         } else {
             self.load_materialized_state(definition_id, &root, true)?
         };
-        let definition_dir = self.definition_dir(definition_id);
+        let definition_dir = self.generation_dir(definition_id, root.generation_id);
         let shard_paths = root
             .shard_files
             .iter()
@@ -494,8 +535,12 @@ impl ManifestStore {
             )));
         }
         artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
-        let definition_dir = self.definition_dir(definition_id);
-        let root_path = self.root_path_for_file(definition_id, &Self::root_file_name(&root));
+        let definition_dir = self.generation_dir(definition_id, root.generation_id);
+        let root_path = self.root_path_for_file(
+            definition_id,
+            root.generation_id,
+            &Self::root_file_name(&root),
+        );
         Ok(LoadedManifest {
             root_path,
             shard_paths: root
@@ -525,7 +570,7 @@ impl ManifestStore {
         root: &GenerationManifestRoot,
         enforce_open_budget: bool,
     ) -> Result<MaterializedManifestState> {
-        let definition_dir = self.definition_dir(definition_id);
+        let definition_dir = self.generation_dir(definition_id, root.generation_id);
         if enforce_open_budget {
             if root.materialized_state_file.is_some() {
                 self.enforce_materialized_state_open_budget(definition_id, root)?;
@@ -770,6 +815,62 @@ impl ManifestStore {
                 continue;
             }
             removed = removed.saturating_add(self.sweep_orphan_staging_fragments_in_dir(&path)?);
+            let generations = path.join("generations");
+            if let Ok(entries) = fs::read_dir(generations) {
+                for generation in entries.flatten() {
+                    if generation.path().is_dir() {
+                        removed = removed.saturating_add(
+                            self.sweep_orphan_staging_fragments_in_dir(&generation.path())?,
+                        );
+                    }
+                }
+            }
+        }
+        Ok(removed)
+    }
+
+    /// Remove private generation workspaces left by a process crash.
+    ///
+    /// This must run only after WAL replay: a committed generation publish may
+    /// still name its private workspace as the source of an unapplied rename.
+    /// Once replay has completed, every remaining entry is necessarily
+    /// unreferenced by the durable prefix and may be removed.
+    pub(crate) fn sweep_orphan_generation_workspaces(&self) -> Result<usize> {
+        let staging_root = self
+            .table_data_dir
+            .join("_staged")
+            .join("search-generation");
+        let Ok(entries) = fs::read_dir(&staging_root) else {
+            return Ok(0);
+        };
+        let mut removed = 0usize;
+        for entry in entries {
+            let entry = entry.map_err(paro_error::io)?;
+            let path = entry.path();
+            if entry.file_type().map_err(paro_error::io)?.is_dir() {
+                fs::remove_dir_all(&path).map_err(|error| {
+                    paro_error::io_error(format!(
+                        "remove orphan search-generation workspace {}: {}",
+                        path.display(),
+                        error
+                    ))
+                })?;
+            } else {
+                fs::remove_file(&path).map_err(|error| {
+                    paro_error::io_error(format!(
+                        "remove invalid search-generation staging entry {}: {}",
+                        path.display(),
+                        error
+                    ))
+                })?;
+            }
+            removed = removed.saturating_add(1);
+        }
+        if fs::read_dir(&staging_root)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+        {
+            let _ = fs::remove_dir(&staging_root);
         }
         Ok(removed)
     }
@@ -797,20 +898,22 @@ impl ManifestStore {
     }
 
     pub(crate) fn definition_paths(&self, definition_id: u64) -> Vec<PathBuf> {
-        let root_path = self.root_path(definition_id);
-        let Some(parent) = root_path.parent() else {
-            return vec![root_path];
-        };
-        if let Ok(entries) = fs::read_dir(parent) {
-            let mut paths = entries
-                .flatten()
-                .map(|entry| entry.path())
-                .filter(|path| path.is_file())
-                .collect::<Vec<_>>();
-            paths.sort();
-            return paths;
+        let generations_dir = self.definition_dir(definition_id).join("generations");
+        let mut paths = Vec::new();
+        if let Ok(generations) = fs::read_dir(generations_dir) {
+            for generation in generations.flatten() {
+                if let Ok(entries) = fs::read_dir(generation.path()) {
+                    paths.extend(
+                        entries
+                            .flatten()
+                            .map(|entry| entry.path())
+                            .filter(|path| path.is_file()),
+                    );
+                }
+            }
         }
-        vec![root_path]
+        paths.sort();
+        paths
     }
 
     pub(crate) fn maybe_compact_deltas(
@@ -818,7 +921,7 @@ impl ManifestStore {
         definition_id: u64,
         root: &mut GenerationManifestRoot,
     ) -> Result<bool> {
-        let definition_dir = self.definition_dir(definition_id);
+        let definition_dir = self.generation_dir(definition_id, root.generation_id);
         let delta_bytes = root.delta_window_bytes(&definition_dir);
         let delta_count = root.recent_delta_files.len();
         if delta_count <= DELTA_COUNT_SOFT_LIMIT && delta_bytes <= DELTA_BYTES_SOFT_LIMIT {
@@ -1068,6 +1171,14 @@ fn is_manifest_staging_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .is_some_and(|name| name.starts_with('.') && name.contains(".staging-"))
+}
+
+fn parse_manifest_root_file_name(name: &str) -> Option<(SearchGenerationId, u64)> {
+    let body = name
+        .strip_prefix("manifest_root_g")?
+        .strip_suffix(".json")?;
+    let (generation, version) = body.split_once("_v")?;
+    Some((generation.parse().ok()?, version.parse().ok()?))
 }
 
 fn sync_manifest_parent_dir(parent: &Path) -> Result<()> {
@@ -1417,7 +1528,7 @@ mod tests {
         root.recompute_checksum().unwrap();
         store.write_root(definition_id, &root).unwrap();
 
-        let definition_dir = store.definition_dir(definition_id);
+        let definition_dir = store.generation_dir(definition_id, 1);
         let staging_leftovers = std::fs::read_dir(definition_dir)
             .unwrap()
             .flatten()
@@ -1436,7 +1547,7 @@ mod tests {
         let temp_dir = TempDir::new().expect("temp dir");
         let store = ManifestStore::new(temp_dir.path());
         let definition_id = 19;
-        let definition_dir = store.definition_dir(definition_id);
+        let definition_dir = store.generation_dir(definition_id, 1);
         std::fs::create_dir_all(&definition_dir).unwrap();
         let orphan = definition_dir.join(".manifest_root.json.staging-test");
         std::fs::write(&orphan, b"partial-root").unwrap();
@@ -1444,6 +1555,43 @@ mod tests {
         assert!(orphan.exists());
         assert_eq!(store.sweep_orphan_staging_fragments().unwrap(), 1);
         assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn generation_workspace_sweep_runs_after_replay_boundary() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let workspace = temp_dir
+            .path()
+            .join("_staged")
+            .join("search-generation")
+            .join("txn-9-def-44-gen-1");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join("partial"), b"staged").unwrap();
+
+        assert_eq!(store.sweep_orphan_generation_workspaces().unwrap(), 1);
+        assert!(!workspace.exists());
+    }
+
+    #[test]
+    fn manifest_latest_root_orders_generation_ids_numerically() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let store = ManifestStore::new(temp_dir.path());
+        let definition_id = 27;
+        let mut generation_nine = sample_root(definition_id, Vec::new(), Vec::new());
+        generation_nine.generation_id = 9;
+        generation_nine.root_version = 99;
+        generation_nine.recompute_checksum().unwrap();
+        store.write_root(definition_id, &generation_nine).unwrap();
+        let mut generation_ten = sample_root(definition_id, Vec::new(), Vec::new());
+        generation_ten.generation_id = 10;
+        generation_ten.root_version = 1;
+        generation_ten.recompute_checksum().unwrap();
+        store.write_root(definition_id, &generation_ten).unwrap();
+
+        let loaded = store.load_manifest(definition_id).unwrap().unwrap();
+        assert_eq!(loaded.root.generation_id, 10);
+        assert_eq!(loaded.root.root_version, 1);
     }
 
     #[test]
@@ -1484,7 +1632,7 @@ mod tests {
         assert!(loaded.artifacts.artifacts.is_empty());
         assert!(
             store
-                .definition_dir(definition_id)
+                .generation_dir(definition_id, 1)
                 .join(unreferenced_delta.file_name)
                 .exists(),
             "unreferenced delta may remain on disk, but root does not publish it"
@@ -1536,7 +1684,7 @@ mod tests {
         }
         let old_delta_paths = delta_refs
             .iter()
-            .map(|file| store.definition_dir(definition_id).join(&file.file_name))
+            .map(|file| store.generation_dir(definition_id, 1).join(&file.file_name))
             .collect::<Vec<_>>();
         let mut root = sample_root(definition_id, vec![shard_ref], delta_refs);
         root.recompute_checksum().unwrap();
