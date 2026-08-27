@@ -99,13 +99,15 @@ impl Segment {
         let index = self
             .open_hnsw_index(column_id)?
             .ok_or_else(|| paro_error::object_not_found("HNSW index", column_id.to_string()))?;
+        let widths = policy.effective_widths(top_k, params.ef, params.rerank_window);
         let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             objective: params.objective,
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.num_rows(),
             top_k,
-            effective_ef: policy.effective_ef(top_k, params.ef),
+            effective_ef: widths.ef,
+            rerank_window: widths.rerank_window,
             vector_dimension: u32::try_from(index.vector_storage.vector_dim())
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
             vector_encoding: index.build_contract.vector_encoding,

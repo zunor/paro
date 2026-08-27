@@ -6,16 +6,17 @@ use crate::compaction::execution::index_rebuild::{
 };
 use crate::compaction::plan::types::CompactionPlan;
 use crate::index::hnsw::vector_storage::prepare_build_vector_storage;
-#[cfg(test)]
-use crate::index::hnsw::HnswConfig;
 use crate::index::hnsw::{
-    open_plain_vector_column, DistanceMetric, GraphLayers, GraphLayersBuilder, GraphLayersHealer,
+    open_plain_vector_column, GraphLayers, GraphLayersBuilder, GraphLayersHealer,
     HnswBuildContract, HnswIndex, IndexedVectorStorage, PointOffset, VectorStorage,
-    HNSW_ARTIFACT_ALIGNMENT, HNSW_BUILD_CONTRACT_VERSION,
+    HNSW_ARTIFACT_ALIGNMENT,
 };
+#[cfg(test)]
+use crate::index::hnsw::{DistanceMetric, HnswConfig};
 use crate::rowset::page::{IndexPageFooter, IndexPageType, PageFooter, PageIO, PagePointer};
 use crate::rowset::segment::{Segment, SegmentFooter, SegmentOptions};
 use crate::rowset::RowsetSharedPtr;
+use crate::search::SearchIndexKind;
 use crate::statistics::HnswIndexStatistics;
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
@@ -47,72 +48,73 @@ impl HnswIndexRebuilder {
         Self
     }
 
-    fn collect_indexed_columns(tablet: &Tablet) -> Result<Vec<HnswIndexedColumn>> {
+    fn collect_indexed_columns(
+        generation_context: &CompactionGenerationContext,
+        tablet: &Tablet,
+    ) -> Result<Vec<HnswIndexedColumn>> {
         let schema = tablet
             .schema()
             .ok_or_else(|| paro_error::internal("Tablet schema not available for HNSW rebuild"))?;
-
-        schema
-            .columns()
+        let mut indexed_columns = Vec::new();
+        for definition in generation_context
+            .search_definitions
             .iter()
-            .filter(|c| c.index_hnsw)
-            .map(|c| match c.logical_type {
-                LogicalType::Array(ref inner, dim) if matches!(**inner, LogicalType::Float) => {
-                    let m = u32::try_from(c.hnsw_m).map_err(|_| {
-                        paro_error::data_corrupted(format!(
-                            "HNSW m {} on column {} exceeds durable u32 width",
-                            c.hnsw_m, c.id
-                        ))
-                    })?;
-                    let ef_construct = u32::try_from(c.hnsw_ef_construct).map_err(|_| {
-                        paro_error::data_corrupted(format!(
-                            "HNSW ef_construct {} on column {} exceeds durable u32 width",
-                            c.hnsw_ef_construct, c.id
-                        ))
-                    })?;
-                    let build_contract = HnswBuildContract {
-                        version: HNSW_BUILD_CONTRACT_VERSION,
-                        m,
-                        m0: m.checked_mul(2).ok_or_else(|| {
-                            paro_error::data_corrupted(format!(
-                                "HNSW m {} on column {} overflows m0",
-                                c.hnsw_m, c.id
-                            ))
-                        })?,
-                        ef_construct,
-                        distance: DistanceMetric::from_u8(c.hnsw_distance).ok_or_else(|| {
-                            paro_error::data_corrupted(format!(
-                                "invalid HNSW distance tag {} on column {}",
-                                c.hnsw_distance, c.id
-                            ))
-                        })?,
-                        vector_encoding:
-                            crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
-                                u32::try_from(dim).map_err(|_| {
-                                    paro_error::data_corrupted(format!(
-                                        "HNSW dimension {dim} on column {} exceeds durable u32 width",
-                                        c.id
-                                    ))
-                                })?,
-                            )?,
-                        build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
-                        proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
-                        warmup_point_count: crate::index::hnsw::DEFAULT_HNSW_WARMUP_POINT_COUNT,
-                        filter_topology: Default::default(),
-                    };
-                    build_contract.validate()?;
-                    Ok(HnswIndexedColumn {
-                        column_id: c.id,
-                        dim,
-                        build_contract,
-                    })
-                }
-                _ => Err(paro_error::not_supported(format!(
-                    "HNSW compaction rebuild only supports Array(Float, N), got {:?} for column {}",
-                    c.logical_type, c.id
-                ))),
-            })
-            .collect()
+            .filter(|definition| definition.kind == SearchIndexKind::Hnsw)
+        {
+            let [column_id] = definition.column_ids.as_slice() else {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} must reference exactly one column",
+                    definition.definition_id
+                )));
+            };
+            if indexed_columns
+                .iter()
+                .any(|column: &HnswIndexedColumn| column.column_id == *column_id)
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "compaction cannot materialize multiple active HNSW definitions for column {}",
+                    column_id
+                )));
+            }
+            let column = schema
+                .columns()
+                .iter()
+                .find(|column| column.id == *column_id)
+                .ok_or_else(|| {
+                    paro_error::data_corrupted(format!(
+                        "HNSW definition {} references missing column {}",
+                        definition.definition_id, column_id
+                    ))
+                })?;
+            let LogicalType::Array(inner, dim) = &column.logical_type else {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} column {} must be VECTOR(Float, N), got {:?}",
+                    definition.definition_id, column_id, column.logical_type
+                )));
+            };
+            if !matches!(inner.as_ref(), LogicalType::Float) {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} column {} must be VECTOR(Float, N), got {:?}",
+                    definition.definition_id, column_id, column.logical_type
+                )));
+            }
+            let provider = definition.hnsw_provider_config()?;
+            if provider.dimension as usize != *dim {
+                return Err(paro_error::data_corrupted(format!(
+                    "HNSW definition {} dimension {} does not match column {} dimension {}",
+                    definition.definition_id, provider.dimension, column_id, dim
+                )));
+            }
+            let build_contract = provider.build_contract();
+            build_contract.validate()?;
+            indexed_columns.push(HnswIndexedColumn {
+                column_id: *column_id,
+                dim: *dim,
+                build_contract,
+            });
+        }
+        indexed_columns.sort_by_key(|column| column.column_id);
+        Ok(indexed_columns)
     }
 
     fn collect_old_indexes(
@@ -132,34 +134,13 @@ impl HnswIndexRebuilder {
                 if index.graph.links.num_points() == 0 {
                     continue;
                 }
+                if index.build_contract != indexed_col.build_contract {
+                    continue;
+                }
                 candidates.push(index);
             }
         }
         Ok(candidates)
-    }
-
-    /// Resolve the immutable build contract from the artifacts being
-    /// compacted. A compaction must preserve an explicit definition choice;
-    /// deriving compact routing from vector dimension would silently turn an
-    /// exact-f32 index into a lossy one. The schema-derived contract is only
-    /// the creation contract for a legacy column that has no source artifact.
-    fn resolve_build_contract(
-        schema_contract: HnswBuildContract,
-        old_indexes: &[Arc<HnswIndex>],
-    ) -> Result<HnswBuildContract> {
-        let Some(first) = old_indexes.first() else {
-            return Ok(schema_contract);
-        };
-        let contract = first.build_contract;
-        if old_indexes
-            .iter()
-            .any(|index| index.build_contract != contract)
-        {
-            return Err(paro_error::data_corrupted(
-                "compaction inputs contain heterogeneous HNSW build contracts",
-            ));
-        }
-        Ok(contract)
     }
 
     fn rebuild_segment_indexes(
@@ -268,9 +249,11 @@ impl HnswIndexRebuilder {
             indexed_col.build_contract.build_seed,
             Some(workspace_dir),
         )?;
-        let Some((best_old_index, signature_overlap)) =
-            Self::select_best_old_index(output_storage.as_ref(), old_candidates)
-        else {
+        let Some((best_old_index, signature_overlap)) = Self::select_best_old_index(
+            output_storage.as_ref(),
+            old_candidates,
+            indexed_col.build_contract,
+        ) else {
             return Ok(None);
         };
         let overlap_ratio = signature_overlap as f64 / output_storage.num_vectors().max(1) as f64;
@@ -337,6 +320,7 @@ impl HnswIndexRebuilder {
     fn select_best_old_index(
         output_storage: &dyn VectorStorage,
         old_candidates: &[Arc<HnswIndex>],
+        expected_contract: HnswBuildContract,
     ) -> Option<(Arc<HnswIndex>, usize)> {
         if old_candidates.is_empty() || output_storage.num_vectors() == 0 {
             return None;
@@ -344,7 +328,10 @@ impl HnswIndexRebuilder {
 
         let output_counts = Self::build_signature_count_map(output_storage);
         let mut best: Option<(Arc<HnswIndex>, usize)> = None;
-        for candidate in old_candidates {
+        for candidate in old_candidates
+            .iter()
+            .filter(|candidate| candidate.build_contract == expected_contract)
+        {
             let overlap =
                 Self::count_signature_overlap(candidate.vector_storage.as_ref(), &output_counts);
             match best {
@@ -534,24 +521,26 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
 
     fn is_applicable(
         &self,
-        tablet: &Tablet,
+        generation_context: &CompactionGenerationContext,
+        _tablet: &Tablet,
         _rowset: &RowsetSharedPtr,
         _plan: &CompactionPlan,
     ) -> bool {
-        tablet
-            .schema()
-            .is_some_and(|schema| schema.columns().iter().any(|c| c.index_hnsw))
+        generation_context
+            .search_definitions
+            .iter()
+            .any(|definition| definition.kind == SearchIndexKind::Hnsw)
     }
 
     fn rebuild(
         &self,
-        _generation_context: &CompactionGenerationContext,
+        generation_context: &CompactionGenerationContext,
         tablet: &Tablet,
         rowset: &RowsetSharedPtr,
         plan: &CompactionPlan,
     ) -> Result<()> {
         rowset.load()?;
-        let mut indexed_columns = Self::collect_indexed_columns(tablet)?;
+        let indexed_columns = Self::collect_indexed_columns(generation_context, tablet)?;
         if indexed_columns.is_empty() {
             return Ok(());
         }
@@ -563,16 +552,6 @@ impl CompactionIndexRebuilder for HnswIndexRebuilder {
                 indexed_col.column_id,
                 Self::collect_old_indexes(&input_rowsets, *indexed_col)?,
             );
-        }
-
-        for indexed_col in &mut indexed_columns {
-            indexed_col.build_contract = Self::resolve_build_contract(
-                indexed_col.build_contract,
-                old_indexes_by_col
-                    .get(&indexed_col.column_id)
-                    .map(Vec::as_slice)
-                    .unwrap_or_default(),
-            )?;
         }
 
         for segment in rowset.segments() {
@@ -665,25 +644,42 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_the_artifact_owned_build_contract() {
+    fn healer_ignores_source_artifacts_from_a_different_definition_contract() {
         let config = HnswConfig::new(8, 32);
         let distance = DistanceMetric::Euclidean;
-        let exact_contract = config.try_build_contract(distance).unwrap();
-        let old = Arc::new(HnswIndex::build(
-            Arc::new(storage(&[
-                vec![1.0, 1.0, 1.0, 1.0],
-                vec![2.0, 2.0, 2.0, 2.0],
-            ])),
+        let mut compact_contract = config.try_build_contract(distance).unwrap();
+        compact_contract.vector_encoding =
+            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(4).unwrap();
+        let indexed_col = HnswIndexedColumn {
+            column_id: 1,
+            dim: 4,
+            build_contract: compact_contract,
+        };
+        let vectors = vec![
+            vec![1.0, 1.0, 1.0, 1.0],
+            vec![2.0, 2.0, 2.0, 2.0],
+            vec![3.0, 3.0, 3.0, 3.0],
+            vec![4.0, 4.0, 4.0, 4.0],
+        ];
+        let old_index = Arc::new(HnswIndex::build(
+            Arc::new(storage(&vectors)),
             config,
             distance,
         ));
-        let mut schema_fallback = exact_contract;
-        schema_fallback.vector_encoding =
-            crate::index::hnsw::HnswBuildVectorEncoding::symmetric_i16(4).unwrap();
+        let workspace = TempDir::new().unwrap();
 
-        let resolved = HnswIndexRebuilder::resolve_build_contract(schema_fallback, &[old])
-            .expect("homogeneous source contract");
-        assert_eq!(resolved, exact_contract);
+        let healed = HnswIndexRebuilder::build_index_with_healer(
+            Arc::new(storage(&vectors)),
+            indexed_col,
+            &[old_index],
+            workspace.path(),
+        )
+        .unwrap();
+
+        assert!(
+            healed.is_none(),
+            "definition-owned build contracts must not be inferred from heterogeneous inputs"
+        );
     }
 
     fn write_vector_segment(

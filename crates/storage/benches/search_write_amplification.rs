@@ -314,6 +314,12 @@ fn search_definition(
             m: 16,
             ef_construct: 64,
             ef_search: 64,
+            rerank_policy: paro_storage::index::hnsw::HnswRerankPolicy::default_for_encoding(
+                paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
+                    dimension.unwrap_or(HNSW_DIMENSION as u64) as u32,
+                )
+                .unwrap(),
+            ),
             distance_cost: paro_storage::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: paro_storage::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: paro_storage::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,

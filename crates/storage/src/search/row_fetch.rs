@@ -869,6 +869,10 @@ mod tests {
             m: 8,
             ef_construct: 64,
             ef_search: 64,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
+                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
+                    .unwrap(),
+            ),
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: crate::index::hnsw::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,

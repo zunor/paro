@@ -126,6 +126,7 @@ where
             cancel_token,
         )?;
 
+    let rebuild_search_definitions = search_inline_builders.clone();
     let output = match plan.execution_layout {
         ExecutionLayout::Vertical => VerticalMerger::build_with_search_inline_builders(
             tablet,
@@ -149,13 +150,23 @@ where
     on_state(CompactionLifecycleState::Validated);
     match &output {
         crate::compaction::execution::workspace::CompactionBuildOutput::Rowset(artifact) => {
-            rebuild_compaction_indexes(tablet, artifact.rowset.clone(), plan.as_ref())?;
+            rebuild_compaction_indexes(
+                tablet,
+                artifact.rowset.clone(),
+                plan.as_ref(),
+                &rebuild_search_definitions,
+            )?;
         }
         crate::compaction::execution::workspace::CompactionBuildOutput::PrimaryKey {
             artifact,
             ..
         } => {
-            rebuild_compaction_indexes(tablet, artifact.rowset.clone(), plan.as_ref())?;
+            rebuild_compaction_indexes(
+                tablet,
+                artifact.rowset.clone(),
+                plan.as_ref(),
+                &rebuild_search_definitions,
+            )?;
         }
     }
 

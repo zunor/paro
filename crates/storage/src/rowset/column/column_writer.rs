@@ -1081,7 +1081,13 @@ impl<W: DataWriter> ScalarColumnWriter<W> {
         // column: page footers make adjacent page bodies non-contiguous and
         // do not preserve the next page's alignment by accident.
         let ptr = if self.opts.field_type == FieldType::Vector {
-            PageIO::write_mmap_page(&mut self.writer, &page_body, &footer, 64)?
+            PageIO::write_mmap_page_with_aligned_body_offset(
+                &mut self.writer,
+                &page_body,
+                &footer,
+                crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT,
+                crate::rowset::encoding::PLAIN_PAGE_HEADER_SIZE,
+            )?
         } else {
             let codec_ref = self.codec.as_deref();
             PageIO::compress_and_write_page(

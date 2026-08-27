@@ -321,6 +321,7 @@ impl Binder {
 
         let mut options = HnswQueryOptions::default();
         let mut saw_ef = false;
+        let mut saw_rerank_window = false;
         let mut saw_objective = false;
         for hint in &hints.hints_list {
             if hint.name.name.eq_ignore_ascii_case("hnsw_ef") {
@@ -331,6 +332,15 @@ impl Binder {
                 }
                 options.ef = Some(Self::parse_positive_hint_usize(&hint.expr, "HNSW_EF")?);
                 saw_ef = true;
+            } else if hint.name.name.eq_ignore_ascii_case("hnsw_rerank") {
+                if saw_rerank_window {
+                    return Err(paro_error::invalid_input(
+                        "HNSW_RERANK hint may be specified only once",
+                    ));
+                }
+                options.rerank_window =
+                    Some(Self::parse_positive_hint_usize(&hint.expr, "HNSW_RERANK")?);
+                saw_rerank_window = true;
             } else if hint.name.name.eq_ignore_ascii_case("vector_search_mode") {
                 if saw_objective {
                     return Err(paro_error::invalid_input(

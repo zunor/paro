@@ -123,6 +123,13 @@ FROM indexed_items
 ORDER BY emb <-> '[1.0, 1.0, 1.0]'
 LIMIT 2;
 
+-- Navigation beam and canonical rerank window are independent query inputs.
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+
 -- Exact is a binding query objective rather than an ef convention. The
 -- physical source must expose that graph navigation is disabled, while the
 -- exact scalar row-set pushdown remains available.

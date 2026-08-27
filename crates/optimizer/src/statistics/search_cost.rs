@@ -106,7 +106,8 @@ impl VectorScanCostModel {
             n
         };
         let log_n = n.ln().max(1.0);
-        let effective_ef = policy.effective_ef(k, options.ef);
+        let widths = policy.effective_widths(k, options.ef, options.rerank_window);
+        let effective_ef = widths.ef;
         // Planning and execution consume the same immutable definition-owned
         // profile. Timing history from this process cannot change EXPLAIN or
         // make otherwise identical replicas choose different paths.
@@ -137,6 +138,7 @@ impl VectorScanCostModel {
         let graph_cost = HnswDistanceCostModel::graph_work(
             stats.num_indexed_vectors as u64,
             effective_ef,
+            widths.rerank_window,
             vector_dimension,
             policy.vector_encoding,
             policy.distance_cost,
@@ -484,6 +486,7 @@ mod tests {
             0.5,
             HnswQueryOptions {
                 ef: Some(160),
+                rerank_window: None,
                 objective: HnswSearchObjective::Exact,
             },
             policy,

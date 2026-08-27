@@ -348,6 +348,14 @@ impl SymmetricI16BuildVectorStorage {
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        if scales.iter().any(|scale| {
+            let square = *scale * *scale;
+            !square.is_finite() || square == 0.0
+        }) {
+            return Err(paro_common::error::invalid_input(
+                "symmetric-i16 HNSW routing scale cannot be squared stably",
+            ));
+        }
         let scale_squares = scales
             .iter()
             .map(|scale| scale * scale)
@@ -474,12 +482,13 @@ impl SymmetricI16BuildVectorStorage {
             )));
         }
         if scales.len() != routing_dimensions
-            || scales
-                .iter()
-                .any(|scale| !scale.is_finite() || *scale <= 0.0)
+            || scales.iter().any(|scale| {
+                let square = *scale * *scale;
+                !scale.is_finite() || *scale <= 0.0 || !square.is_finite() || square == 0.0
+            })
         {
             return Err(paro_common::error::data_corrupted(
-                "persisted HNSW routing scales must be finite, positive, and cardinality-aligned",
+                "persisted HNSW routing scales must be finite, positive, square-stable, and cardinality-aligned",
             ));
         }
         if selected_dimensions
@@ -1539,6 +1548,13 @@ pub(crate) fn open_plain_vector_column_pages(
             .offset
             .checked_add(PLAIN_PAGE_HEADER_SIZE as u64)
             .ok_or_else(|| paro_common::error::data_corrupted("vector body offset overflow"))?;
+        if values_offset % crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT as u64 != 0 {
+            return Err(paro_common::error::data_corrupted(format!(
+                "HNSW column {} vector payload offset {values_offset} is not {}-byte aligned",
+                column.column_id,
+                crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT,
+            )));
+        }
         storages.push(Arc::new(MmapVectorStorage::open_range(
             path,
             values_offset,
@@ -1638,6 +1654,23 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_i16_rejects_scales_that_cannot_be_squared_stably() {
+        for value in [f32::from_bits(1), f32::MAX] {
+            let raw: Arc<dyn VectorStorage> =
+                Arc::new(InMemoryVectorStorage::new(vec![value, -value], 1));
+            let error = prepare_build_vector_storage(
+                raw,
+                super::super::HnswBuildVectorEncoding::symmetric_i16(1).unwrap(),
+                17,
+                None,
+            )
+            .err()
+            .expect("unstable scale must be rejected");
+            assert!(error.to_string().contains("cannot be squared stably"));
+        }
+    }
+
+    #[test]
     fn remapped_build_storage_preserves_parent_routing_metric() {
         let raw: Arc<dyn VectorStorage> = Arc::new(InMemoryVectorStorage::new(
             vec![0.0, 0.0, 1.0, 2.0, -3.0, 4.0],
@@ -1729,6 +1762,14 @@ mod tests {
 
         let pages = open_plain_vector_column_pages(file.path(), &column, 2).unwrap();
         assert_eq!(pages.len(), 3);
+        for page in &pages {
+            let values = page.contiguous_vectors().expect("plain mmap vectors");
+            assert_eq!(
+                values.as_ptr() as usize % crate::index::hnsw::HNSW_ARTIFACT_ALIGNMENT,
+                0,
+                "the typed f32 region, not only the page envelope, must be cache-line aligned"
+            );
+        }
         let storage = PartitionedVectorStorage::try_new(pages, 2).unwrap();
         assert_eq!(storage.num_vectors(), values.len());
         for (point, expected) in values.iter().enumerate() {

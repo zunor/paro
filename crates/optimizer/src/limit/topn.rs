@@ -428,6 +428,7 @@ mod tests {
             )
             .with_hnsw_options(paro_storage::index::hnsw::HnswQueryOptions {
                 ef: Some(256),
+                rerank_window: Some(64),
                 objective: paro_storage::index::hnsw::HnswSearchObjective::Exact,
             }),
         );
@@ -437,6 +438,7 @@ mod tests {
         assert_eq!(result.op_type(), LogicalOperatorType::TopN);
         if let LogicalOperator::TopN(topn) = result {
             assert_eq!(topn.hnsw_options.ef, Some(256));
+            assert_eq!(topn.hnsw_options.rerank_window, Some(64));
             assert_eq!(
                 topn.hnsw_options.objective,
                 paro_storage::index::hnsw::HnswSearchObjective::Exact

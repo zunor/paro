@@ -204,7 +204,42 @@ impl PageIO {
         footer: &PageFooter,
         alignment: usize,
     ) -> Result<PagePointer> {
-        Self::write_alignment_padding(writer, alignment)?;
+        Self::write_mmap_page_with_aligned_body_offset(writer, body, footer, alignment, 0)
+    }
+
+    /// Write a plain mmap page while aligning a typed region inside its body.
+    ///
+    /// Plain fixed-width pages place a small encoding header before the typed
+    /// values. Aligning the page pointer itself therefore does not align the
+    /// vector rows. This API makes the typed offset part of the write contract
+    /// rather than requiring readers to rely on coincidental envelope sizes.
+    pub fn write_mmap_page_with_aligned_body_offset<W: Write + Seek>(
+        writer: &mut W,
+        body: &[u8],
+        footer: &PageFooter,
+        alignment: usize,
+        aligned_body_offset: usize,
+    ) -> Result<PagePointer> {
+        if aligned_body_offset > body.len() {
+            return Err(paro_error::invalid_input(format!(
+                "aligned mmap body offset {aligned_body_offset} exceeds body length {}",
+                body.len()
+            )));
+        }
+        if !alignment.is_power_of_two() {
+            return Err(paro_error::invalid_input(format!(
+                "page alignment must be a non-zero power of two, got {alignment}"
+            )));
+        }
+        let position = writer.stream_position()?;
+        let alignment_u64 = alignment as u64;
+        let aligned_position = position
+            .checked_add(aligned_body_offset as u64)
+            .ok_or_else(|| paro_error::out_of_range("aligned mmap page position overflow"))?;
+        let padding = ((alignment_u64 - aligned_position % alignment_u64) % alignment_u64) as usize;
+        if padding != 0 {
+            writer.write_all(&vec![0_u8; padding])?;
+        }
         let uncompressed_size = u32::try_from(body.len())
             .map_err(|_| paro_error::out_of_range("mmap page body exceeds u32 width"))?;
         Self::write_page(writer, body, footer, uncompressed_size)
@@ -497,6 +532,18 @@ mod tests {
         assert_eq!(uncompressed_size as usize, body.len());
         assert_eq!(body_size, body.len());
         assert_eq!(&page[..body_size], body);
+
+        let mut prefixed = Cursor::new(vec![1_u8, 2, 3]);
+        prefixed.set_position(3);
+        let ptr = PageIO::write_mmap_page_with_aligned_body_offset(
+            &mut prefixed,
+            body,
+            &create_test_footer(),
+            8,
+            3,
+        )
+        .unwrap();
+        assert_eq!((ptr.offset + 3) % 8, 0);
     }
 
     #[test]

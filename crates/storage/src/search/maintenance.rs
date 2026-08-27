@@ -978,6 +978,7 @@ mod tests {
             m: 8,
             ef_construct: 64,
             ef_search: 100,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: crate::search::DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,

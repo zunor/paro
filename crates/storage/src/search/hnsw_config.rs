@@ -20,7 +20,7 @@ pub use crate::index::hnsw::types::{
 };
 use crate::index::hnsw::{
     DistanceMetric, HnswBuildContract, HnswBuildVectorEncoding, HnswDistanceCostProfile,
-    HnswDistanceCostProfileSource, HnswFilterTopologyContract, HnswSearchPolicy,
+    HnswDistanceCostProfileSource, HnswFilterTopologyContract, HnswRerankPolicy, HnswSearchPolicy,
     MAX_HNSW_FILTER_COLUMNS,
 };
 use paro_common::error::{self as paro_error, Result};
@@ -29,7 +29,9 @@ use super::provider_config::{
     decode_provider_config, encode_provider_config, StrictProviderConfig,
 };
 
-/// Version 19 makes compact encoding and its non-zero routing dimension an
+/// Version 20 makes the exact rerank window an explicit search policy rather
+/// than inferring it from the graph encoding and ef. Version 19 makes compact
+/// encoding and its non-zero routing dimension an
 /// atomic sum type and replaces reference-dimension cost ratios with direct,
 /// encoding-aware physical work units. Version 18 upgrades compact routing to
 /// symmetric i16 so ordered geometry cannot collapse into an i8 codebook.
@@ -55,7 +57,7 @@ use super::provider_config::{
 /// generation. Artifact-envelope compatibility is versioned independently;
 /// provider-config versions describe the definition and build contract rather
 /// than the physical checksum hierarchy used by a particular binary.
-pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 19;
+pub const HNSW_PROVIDER_CONFIG_VERSION: u32 = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -78,6 +80,7 @@ pub struct HnswProviderConfig {
     pub m: u32,
     pub ef_construct: u32,
     pub ef_search: u32,
+    pub rerank_policy: HnswRerankPolicy,
     pub distance_cost: HnswDistanceCostProfile,
     pub build_seed: u64,
     pub proposal_wave_size: u32,
@@ -152,6 +155,14 @@ impl HnswProviderConfig {
                 "HNSW ef_search must be between 1 and 1000000, got {}",
                 self.ef_search
             )));
+        }
+        if let HnswRerankPolicy::Fixed { candidates } = self.rerank_policy {
+            if candidates.get() > 1_000_000 {
+                return Err(paro_error::invalid_input(format!(
+                    "HNSW fixed rerank window must not exceed 1000000, got {}",
+                    candidates.get()
+                )));
+            }
         }
         for (name, units) in [
             (
@@ -278,6 +289,7 @@ impl HnswProviderConfig {
     pub const fn search_policy(&self) -> HnswSearchPolicy {
         HnswSearchPolicy {
             ef_search: self.ef_search as usize,
+            rerank_policy: self.rerank_policy,
             distance_cost: self.distance_cost,
             vector_encoding: self.build_vector_encoding,
         }
@@ -311,6 +323,7 @@ mod tests {
             m: 24,
             ef_construct: 100,
             ef_search: 100,
+            rerank_policy: HnswRerankPolicy::Ef,
             distance_cost: HnswDistanceCostProfile::default(),
             build_seed: DEFAULT_HNSW_BUILD_SEED,
             proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,

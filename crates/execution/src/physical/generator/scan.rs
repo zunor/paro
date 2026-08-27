@@ -749,6 +749,7 @@ fn search_source_spec_for_candidate(
                 k: scan.limit,
                 params: paro_storage::index::hnsw::types::SearchParams {
                     ef: intent.options.ef,
+                    rerank_window: intent.options.rerank_window,
                     objective: intent.options.objective,
                     ..Default::default()
                 },

@@ -1040,6 +1040,9 @@ fn push_vector_search_properties(
     properties: &mut Vec<ExplainProperty>,
     spec: &crate::physical::specs::VectorSearchSpec,
 ) {
+    let widths =
+        spec.search_policy
+            .effective_widths(spec.k, spec.params.ef, spec.params.rerank_window);
     push_string_property(properties, "Search Candidate", "dense vector".to_string());
     push_string_property(
         properties,
@@ -1063,9 +1066,25 @@ fn push_vector_search_properties(
     push_string_property(
         properties,
         "Search Ef",
-        spec.params
-            .ef
-            .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+        format!(
+            "{} (effective {})",
+            spec.params
+                .ef
+                .map_or_else(|| "default".to_string(), |ef| ef.to_string()),
+            widths.ef
+        ),
+    );
+    push_string_property(
+        properties,
+        "Exact Rerank Window",
+        format!(
+            "{} (effective {}, definition policy {})",
+            spec.params
+                .rerank_window
+                .map_or_else(|| "default".to_string(), |window| window.to_string()),
+            widths.rerank_window,
+            spec.search_policy.rerank_policy,
+        ),
     );
     push_string_property(
         properties,

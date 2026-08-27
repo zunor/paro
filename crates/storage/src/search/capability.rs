@@ -904,6 +904,7 @@ mod tests {
             m: 16,
             ef_construct: 96,
             ef_search: 64,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 7,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
@@ -922,6 +923,7 @@ mod tests {
         .unwrap();
         let mut policy_tuned = base.clone();
         policy_tuned.ef_search = 240;
+        policy_tuned.rerank_policy = crate::index::hnsw::HnswRerankPolicy::TopK;
         policy_tuned.distance_cost = crate::index::hnsw::HnswDistanceCostProfile {
             source: crate::index::hnsw::HnswDistanceCostProfileSource::OfflineCalibration {
                 calibration_id: 1,

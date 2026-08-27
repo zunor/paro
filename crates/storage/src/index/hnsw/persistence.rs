@@ -2377,7 +2377,8 @@ impl HnswIndex {
                 SearchAlgorithm::MaskedTopK => HnswSearchPath::MaskedGraph,
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
-            let ef = Self::effective_graph_ef(top_k, params, policy);
+            let widths = Self::effective_graph_widths(top_k, params, policy);
+            let ef = widths.ef;
             let predicate_seed_rows = if predicate_topology_available {
                 Some(filter_row_set.expect("predicate topology requires an exact row set"))
             } else {
@@ -2388,12 +2389,8 @@ impl HnswIndex {
             let admission = filter_row_set.map(ExactRowSet::admission);
             let mut graph_scorer =
                 GraphVectorScorer::new(&prepared_query, self.vector_storage.as_ref())?;
-            // A compact routing metric owns navigation, not final candidate
-            // elimination. Its complete retained beam must cross the exact
-            // metric boundary: trimming to an arbitrary multiple of K in the
-            // lossy domain makes a larger `ef` incapable of improving recall.
             let rerank_window = if graph_scorer.uses_compact_routing() {
-                ef
+                widths.rerank_window
             } else {
                 top_k
             };
@@ -2477,13 +2474,15 @@ impl HnswIndex {
         let matching_rows = filter
             .row_set()
             .map_or(self.graph.num_points() as u64, ExactRowSet::len);
+        let widths = policy.effective_widths(top_k, params.ef, params.rerank_window);
         let strategy = HnswSearchStrategy::choose(HnswSegmentSearchInput {
             objective: params.objective,
             filter_kind: filter.kind(),
             matching_rows,
             total_rows: self.graph.num_points() as u64,
             top_k,
-            effective_ef: policy.effective_ef(top_k, params.ef),
+            effective_ef: widths.ef,
+            rerank_window: widths.rerank_window,
             vector_dimension: u32::try_from(self.vector_storage.vector_dim())
                 .map_err(|_| error::out_of_range("HNSW vector dimension exceeds u32"))?,
             vector_encoding: self.build_contract.vector_encoding,
@@ -2564,7 +2563,8 @@ impl HnswIndex {
                 SearchAlgorithm::MaskedTopK => HnswSearchPath::MaskedGraph,
                 SearchAlgorithm::AdaptiveFilteredTopK => HnswSearchPath::AdaptiveGraph,
             };
-            let ef = Self::effective_graph_ef(top_k, params, policy);
+            let widths = Self::effective_graph_widths(top_k, params, policy);
+            let ef = widths.ef;
             let predicate_seed_rows = if predicate_topology_available {
                 Some(filter_row_set.expect("predicate topology requires an exact row set"))
             } else {
@@ -2588,7 +2588,11 @@ impl HnswIndex {
                     "HNSW batch scorers disagree on the artifact routing representation",
                 ));
             }
-            let rerank_window = if uses_compact_routing { ef } else { top_k };
+            let rerank_window = if uses_compact_routing {
+                widths.rerank_window
+            } else {
+                top_k
+            };
             let limits = GraphSearchLimits::try_new(top_k, rerank_window, ef)?;
             let results = self.graph.search_many(
                 limits,
@@ -2925,8 +2929,12 @@ impl HnswIndex {
         }
     }
 
-    fn effective_graph_ef(top_k: usize, params: &SearchParams, policy: &HnswSearchPolicy) -> usize {
-        policy.effective_ef(top_k, params.ef)
+    fn effective_graph_widths(
+        top_k: usize,
+        params: &SearchParams,
+        policy: &HnswSearchPolicy,
+    ) -> super::HnswSearchWidths {
+        policy.effective_widths(top_k, params.ef, params.rerank_window)
     }
 
     fn use_random_entry_point(params: &SearchParams) -> bool {
@@ -4079,6 +4087,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
@@ -4190,6 +4199,7 @@ mod tests {
         let prepared_queries = vec![DistanceMetric::Euclidean.prepare(&query)];
         let params = SearchParams {
             ef: Some(96),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
@@ -4223,6 +4233,7 @@ mod tests {
 
         let params = SearchParams {
             ef: Some(50),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: None,
         };
@@ -4279,6 +4290,7 @@ mod tests {
         let query = &vectors[7];
         let params = SearchParams {
             ef: Some(96),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
@@ -4366,6 +4378,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };
@@ -4871,6 +4884,7 @@ mod tests {
         let prepared_queries = prepare_queries(DistanceMetric::Euclidean, &queries);
         let params = SearchParams {
             ef: Some(96),
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: Some(false),
         };

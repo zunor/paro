@@ -9,6 +9,7 @@
 use paro_common::error::{self as paro_error, Result};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
+use std::num::NonZeroU32;
 
 use crate::index::{ExactRowPartitions, ExactRowSet};
 use crate::tablet::ColumnId;
@@ -371,6 +372,48 @@ pub enum HnswSearchObjective {
     Exact,
 }
 
+/// Definition-pinned policy for crossing the lossy graph-routing boundary.
+///
+/// `TopK` retains only the user-visible result width, `Ef` retains the full
+/// navigation beam, and `Fixed` retains at least the configured number of
+/// candidates. Query-level hints may override the resolved window without
+/// changing the durable graph contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HnswRerankPolicy {
+    TopK,
+    Ef,
+    Fixed { candidates: NonZeroU32 },
+}
+
+impl HnswRerankPolicy {
+    pub const fn default_for_encoding(encoding: HnswBuildVectorEncoding) -> Self {
+        match encoding {
+            HnswBuildVectorEncoding::ExactF32 => Self::TopK,
+            HnswBuildVectorEncoding::SymmetricI16 { .. } => Self::Ef,
+        }
+    }
+
+    fn resolve(self, top_k: usize, effective_ef: usize) -> usize {
+        match self {
+            Self::TopK => top_k,
+            Self::Ef => effective_ef,
+            Self::Fixed { candidates } => usize::try_from(candidates.get()).unwrap_or(usize::MAX),
+        }
+        .max(top_k)
+    }
+}
+
+impl std::fmt::Display for HnswRerankPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TopK => f.write_str("top_k"),
+            Self::Ef => f.write_str("ef"),
+            Self::Fixed { candidates } => write!(f, "fixed({candidates})"),
+        }
+    }
+}
+
 impl std::fmt::Display for HnswSearchObjective {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -389,6 +432,7 @@ impl std::fmt::Display for HnswSearchObjective {
 #[serde(deny_unknown_fields)]
 pub struct HnswQueryOptions {
     pub ef: Option<usize>,
+    pub rerank_window: Option<usize>,
     pub objective: HnswSearchObjective,
 }
 
@@ -398,6 +442,9 @@ pub struct SearchParams {
     /// Size of the beam in beam-search. Larger = more accurate but slower.
     /// If None, uses the index's default ef.
     pub ef: Option<usize>,
+    /// Candidate window re-scored with canonical f32 vectors after lossy
+    /// graph navigation. `None` uses the definition-pinned rerank policy.
+    pub rerank_window: Option<usize>,
     /// Binding result contract selected by the query.
     pub objective: HnswSearchObjective,
     /// Whether to randomize entry point selection during graph search.
@@ -639,6 +686,7 @@ impl HnswDistanceCostModel {
     pub fn graph_work(
         total_rows: u64,
         effective_ef: usize,
+        rerank_window: usize,
         vector_dimension: u32,
         vector_encoding: HnswBuildVectorEncoding,
         cost_profile: HnswDistanceCostProfile,
@@ -661,7 +709,7 @@ impl HnswDistanceCostModel {
             HnswBuildVectorEncoding::SymmetricI16 { routing_dimensions } => (
                 u64::from(routing_dimensions.get()),
                 u64::from(cost_profile.symmetric_i16_dimension_cost_units.max(1)),
-                effective_ef.max(1) as u64,
+                rerank_window.max(1) as u64,
             ),
         };
         let random_access = u64::from(cost_profile.random_access_cost_units.max(1));
@@ -706,6 +754,7 @@ impl HnswDistanceCostModel {
         Self::graph_work(
             input.total_rows,
             input.effective_ef,
+            input.rerank_window,
             input.vector_dimension,
             input.vector_encoding,
             input.cost_profile,
@@ -732,6 +781,7 @@ impl HnswDistanceCostModel {
             <= Self::graph_work(
                 total_rows,
                 effective_ef,
+                effective_ef,
                 vector_dimension,
                 HnswBuildVectorEncoding::ExactF32,
                 cost_profile,
@@ -750,6 +800,7 @@ pub struct HnswSegmentSearchInput {
     pub total_rows: u64,
     pub top_k: usize,
     pub effective_ef: usize,
+    pub rerank_window: usize,
     pub vector_dimension: u32,
     pub vector_encoding: HnswBuildVectorEncoding,
     pub exact_scan_workload: HnswExactScanWorkload,
@@ -876,6 +927,9 @@ pub fn estimate_filtered_search_strategy(
         total_rows,
         top_k,
         effective_ef,
+        rerank_window: policy
+            .effective_widths(top_k, Some(effective_ef), None)
+            .rerank_window,
         vector_dimension,
         vector_encoding: policy.vector_encoding,
         exact_scan_workload: HnswExactScanWorkload::indexed_base(matching_rows),
@@ -910,6 +964,7 @@ impl Default for SearchParams {
     fn default() -> Self {
         SearchParams {
             ef: None,
+            rerank_window: None,
             objective: HnswSearchObjective::CostOptimized,
             random_entry_point: None,
         }
@@ -1118,6 +1173,7 @@ impl HnswBuildContract {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HnswSearchPolicy {
     pub ef_search: usize,
+    pub rerank_policy: HnswRerankPolicy,
     pub distance_cost: HnswDistanceCostProfile,
     pub vector_encoding: HnswBuildVectorEncoding,
 }
@@ -1126,6 +1182,7 @@ impl Default for HnswSearchPolicy {
     fn default() -> Self {
         Self {
             ef_search: DEFAULT_HNSW_EF_SEARCH as usize,
+            rerank_policy: HnswRerankPolicy::TopK,
             distance_cost: HnswDistanceCostProfile::default(),
             vector_encoding: HnswBuildVectorEncoding::ExactF32,
         }
@@ -1133,9 +1190,28 @@ impl Default for HnswSearchPolicy {
 }
 
 impl HnswSearchPolicy {
-    pub fn effective_ef(self, top_k: usize, requested_ef: Option<usize>) -> usize {
-        requested_ef.unwrap_or(self.ef_search).max(top_k).max(1)
+    pub fn effective_widths(
+        self,
+        top_k: usize,
+        requested_ef: Option<usize>,
+        requested_rerank_window: Option<usize>,
+    ) -> HnswSearchWidths {
+        let top_k = top_k.max(1);
+        let base_ef = requested_ef.unwrap_or(self.ef_search).max(top_k);
+        let rerank_window = requested_rerank_window
+            .unwrap_or_else(|| self.rerank_policy.resolve(top_k, base_ef))
+            .max(top_k);
+        HnswSearchWidths {
+            ef: base_ef.max(rerank_window),
+            rerank_window,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HnswSearchWidths {
+    pub ef: usize,
+    pub rerank_window: usize,
 }
 
 /// Unit-test adapter for concise graph fixtures. Production build entrypoints
@@ -1222,6 +1298,7 @@ impl HnswConfig {
     pub fn search_policy(self) -> HnswSearchPolicy {
         HnswSearchPolicy {
             ef_search: self.ef,
+            rerank_policy: HnswRerankPolicy::TopK,
             distance_cost: HnswDistanceCostProfile::default(),
             vector_encoding: HnswBuildVectorEncoding::ExactF32,
         }
@@ -1397,6 +1474,7 @@ mod tests {
             HnswDistanceCostModel::graph_work(
                 10_000_000,
                 160,
+                10,
                 32,
                 HnswBuildVectorEncoding::ExactF32,
                 HnswDistanceCostProfile::default(),
@@ -1429,6 +1507,7 @@ mod tests {
             total_rows: 10_000_000,
             top_k: 10,
             effective_ef: 160,
+            rerank_window: 10,
             vector_dimension: 32,
             vector_encoding: HnswBuildVectorEncoding::ExactF32,
             exact_scan_workload: HnswExactScanWorkload::sequential(100_000),
@@ -1501,6 +1580,7 @@ mod tests {
             HnswDistanceCostModel::graph_work(
                 10_000_000,
                 8_192,
+                10,
                 32,
                 HnswBuildVectorEncoding::ExactF32,
                 profile,
@@ -1515,12 +1595,14 @@ mod tests {
         let exact = HnswDistanceCostModel::graph_work(
             10_000_000,
             640,
+            10,
             768,
             HnswBuildVectorEncoding::ExactF32,
             profile,
         );
         let compact = HnswDistanceCostModel::graph_work(
             10_000_000,
+            640,
             640,
             768,
             HnswBuildVectorEncoding::symmetric_i16(128).unwrap(),
@@ -1530,6 +1612,39 @@ mod tests {
         let scored_points = 10_000_000u64.ilog2() as u64 + 640 * 24;
         let expected_compact = scored_points * (416 + 128) + 640 * (416 + 768);
         assert_eq!(compact, expected_compact);
+    }
+
+    #[test]
+    fn compact_rerank_width_is_explicit_and_can_raise_the_navigation_beam() {
+        let compact = HnswBuildVectorEncoding::symmetric_i16(128).unwrap();
+        let policy = HnswSearchPolicy {
+            ef_search: 160,
+            rerank_policy: HnswRerankPolicy::Ef,
+            vector_encoding: compact,
+            ..HnswSearchPolicy::default()
+        };
+        assert_eq!(
+            policy.effective_widths(10, None, None),
+            HnswSearchWidths {
+                ef: 160,
+                rerank_window: 160,
+            }
+        );
+        assert_eq!(
+            policy.effective_widths(10, Some(80), Some(256)),
+            HnswSearchWidths {
+                ef: 256,
+                rerank_window: 256,
+            },
+            "an exact rerank window cannot exceed the candidate beam that feeds it"
+        );
+
+        let profile = HnswDistanceCostProfile::default();
+        let top_k_cost =
+            HnswDistanceCostModel::graph_work(10_000_000, 640, 10, 768, compact, profile);
+        let ef_cost =
+            HnswDistanceCostModel::graph_work(10_000_000, 640, 640, 768, compact, profile);
+        assert!(top_k_cost < ef_cost);
     }
 
     #[test]
@@ -1585,6 +1700,7 @@ mod tests {
                 total_rows: 1_000_000,
                 top_k: 10,
                 effective_ef: 100,
+                rerank_window: 10,
                 vector_dimension: 32,
                 vector_encoding: policy.vector_encoding,
                 exact_scan_workload: HnswExactScanWorkload::sequential(10_000),
@@ -1600,6 +1716,7 @@ mod tests {
                 total_rows: 1_000_000,
                 top_k: 10,
                 effective_ef: 100,
+                rerank_window: 10,
                 vector_dimension: 32,
                 vector_encoding: policy.vector_encoding,
                 exact_scan_workload: HnswExactScanWorkload::indexed_base(10_000),
@@ -1619,6 +1736,7 @@ mod tests {
             total_rows: 10_000_000,
             top_k: 10,
             effective_ef: 160,
+            rerank_window: 10,
             vector_dimension: 32,
             vector_encoding: policy.vector_encoding,
             exact_scan_workload: HnswExactScanWorkload::indexed_base(5_000_000),

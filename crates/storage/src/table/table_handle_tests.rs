@@ -3430,6 +3430,7 @@ fn art_compaction_rebuild_preserves_predicate_results() {
         table.tablet().as_ref(),
         output_rowset.clone(),
         &artifact.plan,
+        &crate::search::SearchInlineBuilderSet::default(),
     )
     .unwrap();
 

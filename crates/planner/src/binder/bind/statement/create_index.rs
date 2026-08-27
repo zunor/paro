@@ -14,7 +14,7 @@ use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_parser::ast::{ColumnID, ColumnRef, CreateIndexStmt, Expr, IndexKind};
 use paro_storage::index::fulltext::tokenizer::TokenizerKind;
-use paro_storage::index::hnsw::DistanceMetric;
+use paro_storage::index::hnsw::{DistanceMetric, HnswRerankPolicy};
 use paro_storage::index::IndexConstraintType;
 use paro_storage::search::{
     HnswInlineConfig, HnswInlineThreshold, HnswProviderConfig, DEFAULT_HNSW_BUILD_SEED,
@@ -26,6 +26,7 @@ use paro_storage::search::{
 };
 use serde_json::{json, Value as JsonValue};
 use std::collections::BTreeMap;
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 const SIMPLE_CONFIG: &str = "simple";
@@ -308,6 +309,7 @@ fn hnsw_provider_config(
         "m",
         "ef_construct",
         "ef_search",
+        "rerank_window",
         "distance",
         "build_vector_encoding",
         "build_routing_dimensions",
@@ -541,12 +543,14 @@ fn hnsw_provider_config(
         paro_error::invalid_input(format!("HNSW vector dimension exceeds {}", u32::MAX))
     })?;
     let build_routing_dimensions = if compact_build_vectors {
+        let default_encoding =
+            paro_storage::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
         parse_u64_index_option(
             options,
             "build_routing_dimensions",
-            u64::from(
-                dimension.min(paro_storage::index::hnsw::DEFAULT_HNSW_BUILD_ROUTING_DIMENSIONS),
-            ),
+            u64::from(default_encoding.routing_dimensions().ok_or_else(|| {
+                paro_error::internal("compact HNSW default encoding has no routing dimension")
+            })?),
         )?
     } else {
         parse_u64_index_option(options, "build_routing_dimensions", 0)?
@@ -563,6 +567,23 @@ fn hnsw_provider_config(
             "exact_f32 HNSW construction does not accept build_routing_dimensions",
         ));
     };
+    let rerank_policy = match options.get("rerank_window").map(String::as_str) {
+        None => HnswRerankPolicy::default_for_encoding(build_vector_encoding),
+        Some(value) if value.eq_ignore_ascii_case("top_k") => HnswRerankPolicy::TopK,
+        Some(value) if value.eq_ignore_ascii_case("ef") => HnswRerankPolicy::Ef,
+        Some(value) => {
+            let candidates = value.parse::<u32>().map_err(|_| {
+                paro_error::invalid_input(format!(
+                    "HNSW rerank_window must be top_k, ef, or a positive integer, got '{value}'"
+                ))
+            })?;
+            HnswRerankPolicy::Fixed {
+                candidates: NonZeroU32::new(candidates).ok_or_else(|| {
+                    paro_error::invalid_input("HNSW rerank_window must be greater than zero")
+                })?,
+            }
+        }
+    };
     HnswProviderConfig {
         version: paro_storage::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
@@ -573,6 +594,7 @@ fn hnsw_provider_config(
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
         ef_search: u32::try_from(ef_search)
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        rerank_policy,
         distance_cost,
         build_seed,
         proposal_wave_size: DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
@@ -997,6 +1019,7 @@ mod tests {
                  sequential_dimension_cost_units = 1 \
                  symmetric_i16_dimension_cost_units = 1 \
                  graph_scored_points_per_ef = 20 distance_cost_calibration_id = 42 \
+                 rerank_window = top_k \
                  filter_columns = 'bucket' filter_block_rows = 4096 filter_m = 12 \
                  inline_max_vector_count = 90000 \
                  inline_max_graph_memory_bytes = 268435456 \
@@ -1012,6 +1035,7 @@ mod tests {
         assert_eq!(bound.info.provider_config["m"], 32);
         assert_eq!(bound.info.provider_config["ef_construct"], 160);
         assert_eq!(bound.info.provider_config["ef_search"], 96);
+        assert_eq!(bound.info.provider_config["rerank_policy"], "top_k");
         assert_eq!(bound.info.provider_config["distance"], "cosine");
         assert_eq!(
             bound.info.provider_config["build_vector_encoding"]["symmetric_i16"]

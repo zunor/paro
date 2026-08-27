@@ -3233,6 +3233,10 @@ mod tests {
             m: m as u32,
             ef_construct: ef_construct as u32,
             ef_search: ef_construct as u32,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
+                crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)
+                    .unwrap(),
+            ),
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 1,
             proposal_wave_size: crate::search::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,
@@ -4038,6 +4042,7 @@ mod tests {
                 1,
                 SearchParams {
                     ef: Some(16),
+                    rerank_window: None,
                     objective: crate::index::hnsw::HnswSearchObjective::CostOptimized,
                     random_entry_point: Some(false),
                 },

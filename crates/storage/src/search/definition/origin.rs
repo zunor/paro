@@ -35,19 +35,22 @@ pub(crate) fn schema_seed_definition(
         ))
     })?;
     let defaults = HnswSearchPolicy::default();
+    let build_vector_encoding =
+        crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(dimension)?;
     let inline = HnswInlineThreshold::DEFAULT;
     let provider_config = HnswProviderConfig {
         version: crate::search::HNSW_PROVIDER_CONFIG_VERSION,
         dimension,
         distance,
-        build_vector_encoding: crate::index::hnsw::HnswBuildVectorEncoding::default_for_dimension(
-            dimension,
-        )?,
+        build_vector_encoding,
         m: u32::try_from(column.hnsw_m).map_err(|_| paro_error::out_of_range("HNSW m"))?,
         ef_construct: u32::try_from(column.hnsw_ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_construct"))?,
         ef_search: u32::try_from(column.hnsw_ef_construct)
             .map_err(|_| paro_error::out_of_range("HNSW ef_search"))?,
+        rerank_policy: crate::index::hnsw::HnswRerankPolicy::default_for_encoding(
+            build_vector_encoding,
+        ),
         distance_cost: defaults.distance_cost,
         build_seed: DEFAULT_HNSW_BUILD_SEED,
         proposal_wave_size: crate::index::hnsw::DEFAULT_HNSW_PROPOSAL_WAVE_SIZE,

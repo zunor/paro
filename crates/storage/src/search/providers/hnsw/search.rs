@@ -224,7 +224,10 @@ impl VectorSearchCursor {
             rows.saturating_add(segment.segment.num_rows())
         });
         let parallelism_slots = budget.parallelism_slots.max(1);
-        let effective_ef = self.search_policy.effective_ef(self.k, self.params.ef);
+        let widths =
+            self.search_policy
+                .effective_widths(self.k, self.params.ef, self.params.rerank_window);
+        let effective_ef = widths.ef;
 
         // Exact segment row sets are prepared once and retained at the query
         // boundary. Both singleton and generation-owned partition artifacts
@@ -349,7 +352,13 @@ impl VectorSearchCursor {
                         ))
                     }
                 };
-                self.dispatch_segment_search(segment, filter, effective_ef, budget)
+                self.dispatch_segment_search(
+                    segment,
+                    filter,
+                    effective_ef,
+                    widths.rerank_window,
+                    budget,
+                )
             },
         )?;
 
@@ -365,6 +374,7 @@ impl VectorSearchCursor {
                     predicate.is_some(),
                     &predicate_columns,
                     effective_ef,
+                    widths.rerank_window,
                     budget,
                 )
             },
@@ -408,6 +418,7 @@ impl VectorSearchCursor {
         segment: &VisibleSegment,
         filter: HnswSearchFilter<'_>,
         effective_ef: usize,
+        rerank_window: usize,
         budget: &ResourceBudget,
     ) -> Result<SegmentDispatchResult<(Vec<RankedRow>, bool, Option<String>)>> {
         let matching_rows = filter
@@ -431,13 +442,13 @@ impl VectorSearchCursor {
             total_rows: segment.segment.num_rows(),
             top_k: self.k,
             effective_ef,
+            rerank_window,
             vector_dimension: u32::try_from(self.vector_dim)
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
-            vector_encoding: inline_index
-                .as_ref()
-                .map_or(self.search_policy.vector_encoding, |index| {
-                    index.build_contract.vector_encoding
-                }),
+            vector_encoding: inline_index.as_ref().map_or(
+                crate::index::hnsw::HnswBuildVectorEncoding::ExactF32,
+                |index| index.build_contract.vector_encoding,
+            ),
             exact_scan_workload,
             cost_profile: self.search_policy.distance_cost,
         });
@@ -461,6 +472,7 @@ impl VectorSearchCursor {
         has_predicate: bool,
         predicate_columns: &[u32],
         effective_ef: usize,
+        rerank_window: usize,
         budget: &ResourceBudget,
     ) -> Result<Vec<RankedRow>> {
         let visible_segments = self.snapshot.table_lease.visible_segments();
@@ -558,6 +570,7 @@ impl VectorSearchCursor {
             total_rows: artifact.coverage.row_count(),
             top_k: self.k,
             effective_ef,
+            rerank_window,
             vector_dimension: u32::try_from(self.vector_dim)
                 .map_err(|_| paro_error::out_of_range("HNSW vector dimension exceeds u32"))?,
             vector_encoding: index.build_contract.vector_encoding,

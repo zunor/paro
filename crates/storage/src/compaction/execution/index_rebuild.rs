@@ -4,7 +4,7 @@
 use crate::compaction::plan::types::CompactionPlan;
 use crate::rowset::RowsetSharedPtr;
 use crate::search::manifest::ManifestStore;
-use crate::search::SearchGenerationId;
+use crate::search::{SearchGenerationId, SearchIndexDefinition, SearchInlineBuilderSet};
 use crate::tablet::Tablet;
 use paro_common::error::{self as paro_error, Result};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -15,9 +15,13 @@ pub struct ActiveSearchGeneration {
     pub generation_id: SearchGenerationId,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct CompactionGenerationContext {
     pub active_generations: Vec<ActiveSearchGeneration>,
+    /// Immutable definition snapshot used to write this compaction output.
+    /// Provider rebuilders must derive physical contracts from this source,
+    /// never from lossy schema compatibility fields or source artifacts.
+    pub search_definitions: Vec<SearchIndexDefinition>,
 }
 
 /// Trait for rebuilding secondary indexes during compaction.
@@ -31,6 +35,7 @@ pub trait CompactionIndexRebuilder: Send + Sync {
     /// Whether this rebuilder should run for the given compaction output.
     fn is_applicable(
         &self,
+        _generation_context: &CompactionGenerationContext,
         _tablet: &Tablet,
         _rowset: &RowsetSharedPtr,
         _plan: &CompactionPlan,
@@ -116,9 +121,10 @@ pub fn rebuild_compaction_indexes(
     tablet: &Tablet,
     rowset: RowsetSharedPtr,
     plan: &CompactionPlan,
+    search_inline_builders: &SearchInlineBuilderSet,
 ) -> Result<()> {
     ensure_default_rebuilders_registered();
-    let generation_context = load_generation_context(tablet)?;
+    let generation_context = load_generation_context(tablet, search_inline_builders)?;
 
     let builders = CompactionIndexRegistry::global().list()?;
     if builders.is_empty() {
@@ -127,7 +133,7 @@ pub fn rebuild_compaction_indexes(
 
     let applicable: Vec<_> = builders
         .into_iter()
-        .filter(|b| b.is_applicable(tablet, &rowset, plan))
+        .filter(|b| b.is_applicable(&generation_context, tablet, &rowset, plan))
         .collect();
 
     if applicable.is_empty() {
@@ -167,7 +173,10 @@ pub fn rebuild_compaction_indexes(
     Ok(())
 }
 
-fn load_generation_context(tablet: &Tablet) -> Result<CompactionGenerationContext> {
+fn load_generation_context(
+    tablet: &Tablet,
+    search_inline_builders: &SearchInlineBuilderSet,
+) -> Result<CompactionGenerationContext> {
     let manifests = ManifestStore::new(tablet.data_dir().to_path_buf());
     let mut active_generations = Vec::new();
     for head in tablet.search_generation_heads() {
@@ -179,7 +188,16 @@ fn load_generation_context(tablet: &Tablet) -> Result<CompactionGenerationContex
         }
     }
     active_generations.sort_by_key(|entry| entry.definition_id);
-    Ok(CompactionGenerationContext { active_generations })
+    let mut search_definitions = search_inline_builders
+        .entries()
+        .iter()
+        .map(|entry| entry.definition.clone())
+        .collect::<Vec<_>>();
+    search_definitions.sort_by_key(|definition| definition.definition_id);
+    Ok(CompactionGenerationContext {
+        active_generations,
+        search_definitions,
+    })
 }
 
 #[cfg(test)]

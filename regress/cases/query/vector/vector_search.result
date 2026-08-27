@@ -97,7 +97,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 -- @normalize explain_search_ids
@@ -116,7 +117,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
@@ -141,7 +143,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id = 1
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
@@ -166,7 +169,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id <= 1024
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
@@ -255,7 +259,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: bucket = 3
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter
@@ -284,7 +289,29 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
-    Search Ef: 37
+    Search Ef: 37 (effective 37)
+    Exact Rerank Window: default (effective 37, definition policy ef)
+    Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
+
+-- @normalize explain_search_ids
+EXPLAIN SELECT /*+ HNSW_EF(37) HNSW_RERANK(7) */ id
+FROM indexed_items
+ORDER BY emb <-> '[1.0, 1.0, 1.0]'
+LIMIT 2;
+QUERY PLAN
+PROJECTION  (rows=2)
+  Output: id
+  ->  VECTOR_SEARCH on public.indexed_items  (rows=2)
+    Search Definition: <search-definition-id>
+    Search Generation: <search-generation-id>
+    Search Root: <search-root-id>
+    Search Capability: Queryable
+    Search Candidate: dense vector
+    Column: emb
+    Limit: 2
+    Search Objective: cost_optimized: definition-pinned cost selects exact scoring or graph traversal
+    Search Ef: 37 (effective 37)
+    Exact Rerank Window: 7 (effective 7, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
 
 -- @normalize explain_search_ids
@@ -305,7 +332,8 @@ PROJECTION  (rows=2)
     Column: emb
     Limit: 2
     Search Objective: exact: score every admitted vector; graph traversal disabled
-    Search Ef: default
+    Search Ef: default (effective 24)
+    Exact Rerank Window: default (effective 24, definition policy ef)
     Exact/Graph Cost Profile: random-access=1 units, exact-f32=1 units/dimension, sequential=1 units/dimension, symmetric-i16=1 units/dimension, graph=1 unique scores/ef, routing=symmetric_i16(3) (source=offline-calibration-1, definition-pinned); observed generation average level-0 degree=16.00 is descriptive, not a cost cap
     Pushed Predicate: id <= 1024
     Filter Pushdown: exact segment row set from scalar index; ordinal admission and posting scan; no residual filter

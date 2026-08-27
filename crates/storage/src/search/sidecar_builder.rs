@@ -1018,6 +1018,7 @@ mod tests {
             m: 4,
             ef_construct: 8,
             ef_search: 16,
+            rerank_policy: crate::index::hnsw::HnswRerankPolicy::Ef,
             distance_cost: crate::index::hnsw::HnswDistanceCostProfile::default(),
             build_seed: 17,
             proposal_wave_size: 4,
@@ -1108,6 +1109,7 @@ mod tests {
                 2,
                 &SearchParams {
                     ef: Some(16),
+                    rerank_window: None,
                     objective: crate::index::hnsw::HnswSearchObjective::CostOptimized,
                     random_entry_point: Some(false),
                 },
