@@ -203,7 +203,7 @@ mod tests {
                     }
                 },
                 generation_stats: GenerationStats::default(),
-                next_tail_entry_id: TailEntryId(2),
+                persisted_tail_entry_id_seed: TailEntryId(2),
                 execution_modes: ExecutionModes::default(),
                 maintenance_state: GenerationMaintenanceState {
                     build_watermarks: BuildWatermarks::default(),
@@ -221,14 +221,14 @@ mod tests {
                 recent_delta_files: (0..recent_delta_count)
                     .map(|ordinal| ManifestFileRef {
                         file_name: format!("delta_{ordinal}.json"),
-                        codec: ManifestCodecKind::JSON_DEBUG_V3,
+                        codec: ManifestCodecKind::JSON_DEBUG_V4,
                     })
                     .collect(),
             },
             root_path: PathBuf::new(),
             shard_paths: Vec::new(),
             delta_paths: Vec::new(),
-            next_tail_entry_id: TailEntryId(2),
+            tail_entry_id_allocator: TailEntryId(2),
             publication_lease: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries,

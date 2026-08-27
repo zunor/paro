@@ -238,7 +238,7 @@ mod tests {
                 artifact_count: 1,
                 provider_stats: None,
             },
-            next_tail_entry_id: TailEntryId(1),
+            persisted_tail_entry_id_seed: TailEntryId(1),
             execution_modes: ExecutionModes::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             root_version: 1,

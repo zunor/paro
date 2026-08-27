@@ -92,6 +92,29 @@ pub(crate) fn publish_head_for_state(
             head.definition_id
         )));
     }
+    match tablet.preflight_search_generation_publish_guarded(&head, guard)? {
+        SearchGenerationPublishOutcome::Advanced => {}
+        SearchGenerationPublishOutcome::AlreadyCurrent => {
+            if let Some(manifest) = state.manifest.as_ref() {
+                manifest.mark_revision_published();
+            }
+            return Ok(SearchGenerationPublishCompletion {
+                durable: None,
+                publication_result: Ok(SearchGenerationPublishOutcome::AlreadyCurrent),
+            });
+        }
+        SearchGenerationPublishOutcome::Superseded => {
+            return Err(paro_common::error::invalid_input(
+                "online search generation publication was superseded before WAL append",
+            ));
+        }
+        SearchGenerationPublishOutcome::Retired => {
+            return Err(paro_common::error::invalid_input(format!(
+                "search definition {} was retired before WAL append",
+                head.definition_id
+            )));
+        }
+    }
     let mutation = TabletMutation::PublishSearchGeneration {
         publication: SearchGenerationPublication::AdvanceInstalled,
         generation_ref: manifests.generation_ref(head.definition_id, head.generation_id)?,
@@ -124,6 +147,15 @@ pub(crate) fn publish_head_for_state(
     let maintenance_context = coordinator
         .map(|coordinator| coordinator.submit_maintenance(maintenance_plan))
         .transpose()?;
+    if maintenance_context.is_some() {
+        // A durable WAL record now names this immutable revision. It is no
+        // longer rollback-owned even if live apply subsequently fails; the
+        // apply runtime will surface that fatal error and recovery must retain
+        // the referenced files.
+        if let Some(manifest) = state.manifest.as_ref() {
+            manifest.mark_revision_published();
+        }
+    }
 
     let publication_result = tablet
         .apply_search_generation_publish_guarded(&mutation, guard)
@@ -137,6 +169,11 @@ pub(crate) fn publish_head_for_state(
                 "online search generation publication targeted a retired definition",
             )),
         });
+    if publication_result.is_ok() {
+        if let Some(manifest) = state.manifest.as_ref() {
+            manifest.mark_revision_published();
+        }
+    }
     let durable = maintenance_context
         .map(|context| {
             let tablet = Arc::clone(tablet);

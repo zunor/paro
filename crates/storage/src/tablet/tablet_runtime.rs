@@ -37,7 +37,7 @@ use crate::rowset::segment::{Segment, SegmentOptions, SegmentSharedPtr};
 use crate::rowset::{
     PhysicalRowRef, Rowset, RowsetMeta, RowsetSharedPtr, RowsetState, SegmentRowId, SegmentsOverlap,
 };
-use crate::search::manifest::{ManifestStore, SearchManifestRevisionLease};
+use crate::search::manifest::{LoadedManifest, ManifestStore};
 use crate::search::SearchInlineBuilderSet;
 use paro_common::durability::PrepareToken;
 use paro_common::effect::{
@@ -152,23 +152,64 @@ pub trait CheckpointPublishObserver: Send + Sync + std::fmt::Debug {
     fn finish_compaction_publish(&self, ticket: CheckpointMaintenanceTicket);
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedSearchGenerationHeadUpdate {
+    head: SearchGenerationHeadMeta,
+    manifest: LoadedManifest,
+}
+
 #[derive(Debug, Default)]
-pub struct SearchGenerationHeadUpdates {
-    pub heads: Vec<SearchGenerationHeadMeta>,
-    pub(crate) revision_leases: Vec<(u64, SearchManifestRevisionLease)>,
+pub(crate) struct SearchGenerationHeadUpdates {
+    prepared: Vec<PreparedSearchGenerationHeadUpdate>,
+    stale_definition_ids: HashSet<u64>,
 }
 
 impl SearchGenerationHeadUpdates {
-    fn mark_published(&self, advanced_definition_ids: &HashSet<u64>) {
-        for (definition_id, lease) in &self.revision_leases {
-            if advanced_definition_ids.contains(definition_id) {
-                lease.mark_published();
+    pub(crate) fn push(&mut self, head: SearchGenerationHeadMeta, manifest: LoadedManifest) {
+        debug_assert_eq!(head.definition_id, manifest.root.definition_id);
+        self.prepared
+            .push(PreparedSearchGenerationHeadUpdate { head, manifest });
+    }
+
+    pub(crate) fn mark_stale(&mut self, definition_id: u64) {
+        self.stale_definition_ids.insert(definition_id);
+    }
+
+    fn accept_in_memory_heads(&mut self, advanced_definition_ids: &HashSet<u64>) {
+        for update in &self.prepared {
+            if advanced_definition_ids.contains(&update.head.definition_id) {
+                // Once the tablet's in-memory head points at this immutable
+                // revision, rollback cleanup must never delete it. A later
+                // metadata-save failure may leave an orphan on disk, which is
+                // safe and reclaimed by recovery reachability GC. Deleting it
+                // here would create a dangling head that a later save could
+                // make durable.
+                update.manifest.mark_revision_published();
+            } else {
+                self.stale_definition_ids.insert(update.head.definition_id);
             }
         }
+        self.prepared
+            .retain(|update| advanced_definition_ids.contains(&update.head.definition_id));
+    }
+
+    pub(crate) fn into_parts(
+        self,
+    ) -> (
+        Vec<(SearchGenerationHeadMeta, LoadedManifest)>,
+        HashSet<u64>,
+    ) {
+        (
+            self.prepared
+                .into_iter()
+                .map(|update| (update.head, update.manifest))
+                .collect(),
+            self.stale_definition_ids,
+        )
     }
 }
 
-pub trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
+pub(crate) trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
     fn prepare_rowset_publish(
         &self,
         _tablet_id: TabletId,
@@ -178,7 +219,13 @@ pub trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
         Ok(SearchGenerationHeadUpdates::default())
     }
 
-    fn rowset_published(&self, tablet_id: TabletId, version: i64, rowset: RowsetSharedPtr);
+    fn rowset_published(
+        &self,
+        tablet_id: TabletId,
+        version: i64,
+        rowset: RowsetSharedPtr,
+        search_updates: SearchGenerationHeadUpdates,
+    );
 
     fn search_inline_builders_for_compaction(
         &self,
@@ -747,14 +794,19 @@ impl Tablet {
         *self.checkpoint_publish_observer.write().unwrap() = Some(observer);
     }
 
-    pub fn bind_rowset_publish_observer(
+    pub(crate) fn bind_rowset_publish_observer(
         &self,
         observer: std::sync::Weak<dyn RowsetPublishObserver>,
     ) {
         *self.rowset_publish_observer.write().unwrap() = Some(observer);
     }
 
-    fn notify_rowset_published(&self, version: i64, rowset: RowsetSharedPtr) {
+    fn notify_rowset_published(
+        &self,
+        version: i64,
+        rowset: RowsetSharedPtr,
+        search_updates: SearchGenerationHeadUpdates,
+    ) {
         let observer = self
             .rowset_publish_observer
             .read()
@@ -762,7 +814,7 @@ impl Tablet {
             .as_ref()
             .and_then(std::sync::Weak::upgrade);
         if let Some(observer) = observer {
-            observer.rowset_published(self.tablet_id(), version, rowset);
+            observer.rowset_published(self.tablet_id(), version, rowset, search_updates);
         }
     }
 
@@ -814,7 +866,7 @@ impl Tablet {
         &self,
         updates: &SearchGenerationHeadUpdates,
     ) -> HashSet<u64> {
-        if updates.heads.is_empty() {
+        if updates.prepared.is_empty() {
             return HashSet::new();
         }
         let mut advanced_definition_ids = HashSet::new();
@@ -825,7 +877,7 @@ impl Tablet {
             );
             poisoned.into_inner()
         });
-        for head in updates.heads.iter().cloned() {
+        for head in updates.prepared.iter().map(|update| update.head.clone()) {
             let definition_id = head.definition_id;
             if let Err(error) = meta.advance_search_generation_head(head) {
                 // Search metadata is derived from the just-published base
@@ -1925,13 +1977,13 @@ impl Tablet {
     /// metadata is only updated in memory and persisted via `save_meta`.
     pub fn rowset_commit(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         self.ensure_not_shutdown("commit rowset")?;
-        let published = {
+        let search_updates = {
             let _search_publish = self.acquire_search_generation_publish_guard()?;
             let _lock = self.meta_lock.write().unwrap();
             self.rowset_commit_locked(version, rowset.clone())?
         };
-        if published {
-            self.notify_rowset_published(version, rowset);
+        if let Some(search_updates) = search_updates {
+            self.notify_rowset_published(version, rowset, search_updates);
         }
         Ok(())
     }
@@ -1939,38 +1991,42 @@ impl Tablet {
     /// Commit a rowset using the next available version.
     pub fn rowset_commit_auto(&self, rowset: RowsetSharedPtr) -> Result<i64> {
         self.ensure_not_shutdown("commit rowset")?;
-        let (version, published) = {
+        let (version, search_updates) = {
             let _search_publish = self.acquire_search_generation_publish_guard()?;
             let _lock = self.meta_lock.write().unwrap();
             let next_version = self.max_version.load(Ordering::Acquire) + 1;
-            let published = self.rowset_commit_locked(next_version, rowset.clone())?;
-            (next_version, published)
+            let search_updates = self.rowset_commit_locked(next_version, rowset.clone())?;
+            (next_version, search_updates)
         };
-        if published {
-            self.notify_rowset_published(version, rowset);
+        if let Some(search_updates) = search_updates {
+            self.notify_rowset_published(version, rowset, search_updates);
         }
         Ok(version)
     }
 
-    fn rowset_commit_locked(&self, version: i64, rowset: RowsetSharedPtr) -> Result<bool> {
+    fn rowset_commit_locked(
+        &self,
+        version: i64,
+        rowset: RowsetSharedPtr,
+    ) -> Result<Option<SearchGenerationHeadUpdates>> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
         if version <= current_max {
             // Already committed (idempotent)
-            return Ok(false);
+            return Ok(None);
         }
 
         let visible_rowsets = self.rowsets_with_pending_publish(current_max, version, &rowset)?;
         self.validate_rowset_registration_locked(&rowset)?;
-        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
+        let mut search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
         let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
+        search_heads.accept_in_memory_heads(&advanced_search_heads);
         self.save_meta()?;
-        search_heads.mark_published(&advanced_search_heads);
 
         self.validate_version_graph()?;
-        Ok(true)
+        Ok(Some(search_heads))
     }
 
     /// Publish a PRIMARY_KEYS rowset and staged index updates atomically.
@@ -1981,13 +2037,13 @@ impl Tablet {
         update: PrimaryIndexUpdate,
     ) -> Result<()> {
         self.ensure_not_shutdown("publish rowset with primary index")?;
-        let published = {
+        let search_updates = {
             let _search_publish = self.acquire_search_generation_publish_guard()?;
             let _lock = self.meta_lock.write().unwrap();
             self.publish_rowset_with_index_locked(version, rowset.clone(), update)?
         };
-        if published {
-            self.notify_rowset_published(version, rowset);
+        if let Some(search_updates) = search_updates {
+            self.notify_rowset_published(version, rowset, search_updates);
         }
         Ok(())
     }
@@ -1999,16 +2055,16 @@ impl Tablet {
         update: PrimaryIndexUpdate,
     ) -> Result<i64> {
         self.ensure_not_shutdown("publish rowset with primary index")?;
-        let (version, published) = {
+        let (version, search_updates) = {
             let _search_publish = self.acquire_search_generation_publish_guard()?;
             let _lock = self.meta_lock.write().unwrap();
             let version = self.max_version.load(Ordering::Acquire) + 1;
-            let published =
+            let search_updates =
                 self.publish_rowset_with_index_locked(version, rowset.clone(), update)?;
-            (version, published)
+            (version, search_updates)
         };
-        if published {
-            self.notify_rowset_published(version, rowset);
+        if let Some(search_updates) = search_updates {
+            self.notify_rowset_published(version, rowset, search_updates);
         }
         Ok(version)
     }
@@ -2018,11 +2074,11 @@ impl Tablet {
         version: i64,
         rowset: RowsetSharedPtr,
         update: PrimaryIndexUpdate,
-    ) -> Result<bool> {
+    ) -> Result<Option<SearchGenerationHeadUpdates>> {
         let current_max = self.max_version.load(Ordering::Acquire);
 
         if version <= current_max {
-            return Ok(false);
+            return Ok(None);
         }
 
         let visible_rowsets = self.rowsets_with_pending_publish(current_max, version, &rowset)?;
@@ -2030,17 +2086,17 @@ impl Tablet {
         self.align_next_rowset_id(rowset.rowset_id());
         self.validate_rowset_registration_locked(&rowset)?;
         let prepared = self.prepare_primary_index_publish(&rowset, update)?;
-        let search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
+        let mut search_heads = self.prepare_search_rowset_publish(version, &visible_rowsets);
         self.apply_prepared_primary_index_publish(version, &rowset, prepared)?;
         rowset.make_visible()?;
         self.register_rowset_locked(rowset)?;
         self.reconcile_primary_index_row_count()?;
         self.maybe_flush_primary_index()?;
         let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
+        search_heads.accept_in_memory_heads(&advanced_search_heads);
         self.save_meta()?;
-        search_heads.mark_published(&advanced_search_heads);
         self.validate_version_graph()?;
-        Ok(true)
+        Ok(Some(search_heads))
     }
 
     /// Apply row-id deletes for journal replay and persist delete vectors.
@@ -3568,6 +3624,45 @@ impl Tablet {
         self.apply_search_generation_publish_guarded_with_after_install(op, guard, || Ok(()))
     }
 
+    pub(crate) fn preflight_search_generation_publish_guarded(
+        &self,
+        head: &SearchGenerationHeadMeta,
+        guard: &SearchGenerationPublishGuard<'_>,
+    ) -> Result<SearchGenerationPublishOutcome> {
+        if guard.tablet_id != self.tablet_id() {
+            return Err(paro_error::internal(
+                "search generation publication guard belongs to another tablet",
+            ));
+        }
+        let meta = self
+            .meta
+            .read()
+            .map_err(|_| paro_error::internal("tablet meta state poisoned"))?;
+        if meta.is_search_definition_retired(head.definition_id) {
+            return Ok(SearchGenerationPublishOutcome::Retired);
+        }
+        let Some(current) = meta
+            .search_generation_heads()
+            .iter()
+            .find(|current| current.definition_id == head.definition_id)
+        else {
+            return Ok(SearchGenerationPublishOutcome::Advanced);
+        };
+        match (head.generation_id, head.root_version)
+            .cmp(&(current.generation_id, current.root_version))
+        {
+            std::cmp::Ordering::Less => Ok(SearchGenerationPublishOutcome::Superseded),
+            std::cmp::Ordering::Equal if current == head => {
+                Ok(SearchGenerationPublishOutcome::AlreadyCurrent)
+            }
+            std::cmp::Ordering::Equal => Err(paro_error::data_corrupted(format!(
+                "search generation {} has conflicting head at generation {} revision {}",
+                head.definition_id, head.generation_id, head.root_version
+            ))),
+            std::cmp::Ordering::Greater => Ok(SearchGenerationPublishOutcome::Advanced),
+        }
+    }
+
     #[cfg(test)]
     fn apply_search_generation_publish_with_after_install(
         &self,
@@ -3864,7 +3959,14 @@ mod tests {
             Err(paro_error::internal("injected search manifest failure"))
         }
 
-        fn rowset_published(&self, _tablet_id: TabletId, _version: i64, _rowset: RowsetSharedPtr) {}
+        fn rowset_published(
+            &self,
+            _tablet_id: TabletId,
+            _version: i64,
+            _rowset: RowsetSharedPtr,
+            _search_updates: SearchGenerationHeadUpdates,
+        ) {
+        }
     }
 
     fn create_test_schema() -> TabletSchemaRef {
@@ -3918,7 +4020,7 @@ mod tests {
             config_fingerprint: 991,
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
-            next_tail_entry_id: TailEntryId(1),
+            persisted_tail_entry_id_seed: TailEntryId(1),
             execution_modes: ExecutionModes::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             root_version: 1,
@@ -4243,16 +4345,18 @@ mod tests {
     fn search_manifest_failure_preserves_last_head_without_rolling_back_rowset() {
         let schema = create_test_schema();
         let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
-        tablet.apply_search_generation_heads_locked(&SearchGenerationHeadUpdates {
-            heads: vec![SearchGenerationHeadMeta {
+        tablet
+            .meta
+            .write()
+            .unwrap()
+            .advance_search_generation_head(SearchGenerationHeadMeta {
                 definition_id: 77,
                 generation_id: 1,
                 root_version: 1,
                 config_fingerprint: 99,
                 root_file_name: "manifest_root_g1_v1_f99.json".to_string(),
-            }],
-            revision_leases: Vec::new(),
-        });
+            })
+            .unwrap();
         assert!(tablet.search_generation_head(77).is_some());
 
         let observer: Arc<dyn RowsetPublishObserver> = Arc::new(FailingSearchPublishObserver);
@@ -4264,6 +4368,65 @@ mod tests {
 
         assert_eq!(tablet.max_version(), 0);
         assert_eq!(tablet.search_generation_head(77).unwrap().root_version, 1);
+    }
+
+    #[test]
+    fn accepted_manifest_revision_survives_tablet_meta_save_failure() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let tablet = Tablet::new(
+            1,
+            100,
+            1000,
+            create_test_schema(),
+            tmp.path(),
+            Some(manager),
+        )
+        .unwrap();
+        let manifests = ManifestStore::new(tablet.data_dir().to_path_buf());
+        let definition_id = 78;
+        let mut root = GenerationManifestRoot {
+            definition_id,
+            generation_id: 1,
+            build_epoch: 1,
+            build_snapshot_version: 0,
+            indexed_through_ts: 0,
+            config_fingerprint: 1001,
+            coverage: CoverageState::Complete,
+            generation_stats: GenerationStats::default(),
+            persisted_tail_entry_id_seed: TailEntryId(1),
+            execution_modes: ExecutionModes::default(),
+            maintenance_state: GenerationMaintenanceState::default(),
+            root_version: 0,
+            checksum: 0,
+            shard_files: Vec::new(),
+            recent_delta_files: Vec::new(),
+        };
+        root.recompute_checksum().unwrap();
+        let mut revision = manifests.begin_empty_revision(definition_id, root).unwrap();
+        revision
+            .replace_with_shard(&ManifestShard::default())
+            .unwrap();
+        let manifest = revision.commit().unwrap();
+        let root_path = manifest.root_path.clone();
+        let head = manifests.head_for_root(&manifest.root);
+        let mut updates = SearchGenerationHeadUpdates::default();
+        updates.push(head.clone(), manifest);
+
+        let advanced = tablet.apply_search_generation_heads_locked(&updates);
+        updates.accept_in_memory_heads(&advanced);
+        crate::meta::metadata_store::testing::arm_metadata_rename_failure_for_path_on_nth_call(
+            tmp.path().join("meta/tablet/1/meta.bin"),
+            1,
+        );
+        assert!(tablet.save_meta().is_err());
+        drop(updates);
+
+        assert_eq!(tablet.search_generation_head(definition_id), Some(head));
+        assert!(
+            root_path.exists(),
+            "an in-memory head must retain its immutable manifest after save failure"
+        );
     }
 
     #[test]

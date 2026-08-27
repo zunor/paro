@@ -1,7 +1,7 @@
 // Copyright 2024-2026 Zunor
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -24,7 +24,8 @@ use super::inline_sink::SearchStatsDelta;
 mod binary;
 
 use self::binary::{
-    decode_binary_manifest_fragment, encode_binary_manifest_fragment, BinaryManifestFragment,
+    decode_binary_manifest_fragment, encode_binary_manifest_fragment,
+    encode_manifest_root_checksum_image, BinaryManifestFragment,
 };
 use super::sidecar::SidecarArtifactStore;
 use super::stats::{
@@ -52,20 +53,20 @@ pub(crate) struct ManifestCodecKind {
 }
 
 impl ManifestCodecKind {
-    pub(crate) const JSON_DEBUG_V3: Self = Self {
+    pub(crate) const JSON_DEBUG_V4: Self = Self {
         family: ManifestCodecFamily::JsonDebug,
-        version: 3,
+        version: 4,
     };
 
-    pub(crate) const BINARY_V3: Self = Self {
+    pub(crate) const BINARY_V4: Self = Self {
         family: ManifestCodecFamily::Binary,
-        version: 3,
+        version: 4,
     };
 
     pub(crate) const fn metric_label(self) -> &'static str {
         match (self.family, self.version) {
-            (ManifestCodecFamily::JsonDebug, 3) => "json-debug-v3",
-            (ManifestCodecFamily::Binary, 3) => "binary-v3",
+            (ManifestCodecFamily::JsonDebug, 4) => "json-debug-v4",
+            (ManifestCodecFamily::Binary, 4) => "binary-v4",
             _ => "unknown",
         }
     }
@@ -93,7 +94,10 @@ pub(crate) struct GenerationManifestRoot {
     pub config_fingerprint: u64,
     pub coverage: CoverageState,
     pub generation_stats: GenerationStats,
-    pub next_tail_entry_id: TailEntryId,
+    /// Durable allocator seed. Runtime callers must use
+    /// `LoadedManifest::next_tail_entry_id()` because recovery may derive a
+    /// larger value after degrading missing artifacts to tail entries.
+    pub persisted_tail_entry_id_seed: TailEntryId,
     pub execution_modes: ExecutionModes,
     pub maintenance_state: GenerationMaintenanceState,
     pub root_version: u64,
@@ -104,12 +108,11 @@ pub(crate) struct GenerationManifestRoot {
 
 impl GenerationManifestRoot {
     pub(crate) fn recompute_checksum(&mut self) -> Result<()> {
-        self.checksum = 0;
-        // The logical checksum is codec-independent. Physical encodings may
-        // change without changing the root identity or its integrity proof.
-        let bytes = serde_json::to_vec(self).map_err(|err| {
-            paro_error::serialization_error(format!("serialize generation manifest root: {err}"))
-        })?;
+        // The integrity image is an explicit, versioned binary schema rather
+        // than a serde representation. Floats therefore participate by exact
+        // bit pattern, and JSON field ordering/renames cannot silently change
+        // the durable checksum contract.
+        let bytes = encode_manifest_root_checksum_image(self)?;
         self.checksum = checksum_bytes(&bytes);
         Ok(())
     }
@@ -172,7 +175,10 @@ pub(crate) struct LoadedManifest {
     pub root_path: PathBuf,
     pub shard_paths: Vec<PathBuf>,
     pub delta_paths: Vec<PathBuf>,
-    pub next_tail_entry_id: TailEntryId,
+    /// Runtime allocator state. Callers consume it through
+    /// `next_tail_entry_id`; crate visibility is retained only for focused
+    /// construction in storage tests.
+    pub(crate) tail_entry_id_allocator: TailEntryId,
     pub(crate) publication_lease: Option<SearchManifestRevisionLease>,
     /// Shared by immutable registry snapshots, query leases, and the retirement queue.
     /// Keeping one ownership token makes artifact reclamation wait for every reader and
@@ -190,22 +196,22 @@ impl LoadedManifest {
         paths
     }
 
-    pub(crate) fn opened_paths(&self) -> Vec<PathBuf> {
-        let mut paths = Vec::with_capacity(1 + self.shard_paths.len() + self.delta_paths.len());
-        paths.push(self.root_path.clone());
-        paths.extend(self.shard_paths.iter().cloned());
-        paths.extend(self.delta_paths.iter().cloned());
-        paths
-    }
-
-    pub(crate) fn revision_lease(&self) -> Option<SearchManifestRevisionLease> {
-        self.publication_lease.clone()
+    pub(crate) fn next_tail_entry_id(&self) -> TailEntryId {
+        self.tail_entry_id_allocator
     }
 
     pub(crate) fn mark_revision_published(&self) {
         if let Some(lease) = &self.publication_lease {
             lease.mark_published();
         }
+    }
+
+    pub(crate) fn rollback_owned_paths(&self) -> BTreeSet<PathBuf> {
+        self.publication_lease
+            .as_ref()
+            .map_or_else(BTreeSet::new, |lease| {
+                lease.inner.created_paths.iter().cloned().collect()
+            })
     }
 }
 
@@ -222,6 +228,8 @@ type ArtifactManifestKey = (SearchPartitionCoverage, u32, SearchIndexKind, u32);
 pub(crate) struct ManifestStore {
     table_data_dir: PathBuf,
     codec_kind: ManifestCodecKind,
+    #[cfg(test)]
+    full_replay_count: Arc<AtomicU64>,
 }
 
 /// Owns every immutable fragment prepared for one manifest revision.
@@ -377,6 +385,7 @@ impl StagedManifestRevision<'_> {
         if !self.compaction_checked {
             self.compact_if_needed()?;
         }
+        self.root.persisted_tail_entry_id_seed = self.materialized.next_tail_entry_id;
         self.root.recompute_checksum()?;
         let root_path = self.store.write_root(self.definition_id, &self.root)?;
         self.unpublished_paths.push(root_path.clone());
@@ -414,7 +423,7 @@ impl StagedManifestRevision<'_> {
                 .iter()
                 .map(|file| definition_dir.join(&file.file_name))
                 .collect(),
-            next_tail_entry_id: self.materialized.next_tail_entry_id,
+            tail_entry_id_allocator: self.materialized.next_tail_entry_id,
             publication_lease: Some(lease),
             artifacts: self.materialized.artifacts.clone(),
             tail_pending_entries: self.materialized.tail_pending_entries.clone(),
@@ -435,10 +444,16 @@ fn materialized_state_from_published_shard(
     for entry in shard.tail_pending_entries.iter().cloned() {
         upsert_tail_entry(definition_id, &mut tail_map, entry)?;
     }
+    let tail_pending_entries = tail_map.into_values().collect::<Vec<_>>();
+    validate_tail_entry_id_allocator(
+        definition_id,
+        root.persisted_tail_entry_id_seed,
+        &tail_pending_entries,
+    )?;
     Ok(MaterializedManifestState {
         artifacts: Arc::new(artifacts),
-        tail_pending_entries: tail_map.into_values().collect(),
-        next_tail_entry_id: root.next_tail_entry_id,
+        tail_pending_entries,
+        next_tail_entry_id: root.persisted_tail_entry_id_seed,
     })
 }
 
@@ -481,10 +496,16 @@ fn apply_manifest_delta(
     }
     let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
     artifacts.validate_for_generation(definition_id, root.generation_id)?;
+    let tail_pending_entries = tail_map.into_values().collect::<Vec<_>>();
+    validate_tail_entry_id_allocator(
+        definition_id,
+        root.persisted_tail_entry_id_seed,
+        &tail_pending_entries,
+    )?;
     Ok(MaterializedManifestState {
         artifacts: Arc::new(artifacts),
-        tail_pending_entries: tail_map.into_values().collect(),
-        next_tail_entry_id: root.next_tail_entry_id,
+        tail_pending_entries,
+        next_tail_entry_id: root.persisted_tail_entry_id_seed,
     })
 }
 
@@ -498,7 +519,7 @@ impl Drop for StagedManifestRevision<'_> {
 
 impl ManifestStore {
     pub(crate) fn new(table_data_dir: impl Into<PathBuf>) -> Self {
-        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V3)
+        Self::new_with_codec(table_data_dir, ManifestCodecKind::JSON_DEBUG_V4)
     }
 
     pub(crate) fn new_with_codec(
@@ -508,11 +529,18 @@ impl ManifestStore {
         Self {
             table_data_dir: table_data_dir.into(),
             codec_kind,
+            #[cfg(test)]
+            full_replay_count: Arc::new(AtomicU64::new(0)),
         }
     }
 
     pub(crate) fn codec_label(&self) -> &'static str {
         self.codec_kind.metric_label()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn full_replay_count(&self) -> u64 {
+        self.full_replay_count.load(Ordering::Relaxed)
     }
 
     /// Private workspace root for a transaction-owned generation build.
@@ -617,13 +645,14 @@ impl ManifestStore {
         definition_id: u64,
         root: GenerationManifestRoot,
     ) -> Result<StagedManifestRevision<'_>> {
+        let next_tail_entry_id = root.persisted_tail_entry_id_seed;
         self.begin_revision_with_state(
             definition_id,
             root,
             MaterializedManifestState {
                 artifacts: Arc::new(GenerationArtifactSet::default()),
                 tail_pending_entries: Vec::new(),
-                next_tail_entry_id: TailEntryId(1),
+                next_tail_entry_id,
             },
         )
     }
@@ -640,7 +669,7 @@ impl ManifestStore {
             MaterializedManifestState {
                 artifacts: manifest.artifacts.clone(),
                 tail_pending_entries: manifest.tail_pending_entries.clone(),
-                next_tail_entry_id: manifest.next_tail_entry_id,
+                next_tail_entry_id: manifest.next_tail_entry_id(),
             },
         )
     }
@@ -904,7 +933,7 @@ impl ManifestStore {
             root_path,
             shard_paths,
             delta_paths,
-            next_tail_entry_id: materialized.next_tail_entry_id,
+            tail_entry_id_allocator: materialized.next_tail_entry_id,
             publication_lease: None,
             artifacts: materialized.artifacts,
             tail_pending_entries: materialized.tail_pending_entries,
@@ -924,6 +953,8 @@ impl ManifestStore {
         root: &GenerationManifestRoot,
         enforce_open_budget: bool,
     ) -> Result<MaterializedManifestState> {
+        #[cfg(test)]
+        self.full_replay_count.fetch_add(1, Ordering::Relaxed);
         let definition_dir = self.generation_dir(definition_id, root.generation_id);
         if enforce_open_budget {
             self.enforce_delta_open_budget(definition_id, root, &definition_dir)?;
@@ -979,9 +1010,11 @@ impl ManifestStore {
 
         let artifacts = GenerationArtifactSet::try_new(artifact_map.into_values().collect())?;
         artifacts.validate_for_generation(root.definition_id, root.generation_id)?;
+        let tail_pending_entries = tail_map.into_values().collect::<Vec<_>>();
+        validate_tail_entry_id_allocator(definition_id, next_tail_entry_id, &tail_pending_entries)?;
         Ok(MaterializedManifestState {
             artifacts: Arc::new(artifacts),
-            tail_pending_entries: tail_map.into_values().collect(),
+            tail_pending_entries,
             next_tail_entry_id,
         })
     }
@@ -996,7 +1029,7 @@ impl ManifestStore {
         BTreeMap<ArtifactManifestKey, SearchArtifactRef>,
         TailEntryId,
     )> {
-        let mut next_recovery_tail_id = root.next_tail_entry_id.0.max(1);
+        let mut next_recovery_tail_id = root.persisted_tail_entry_id_seed.0.max(1);
         let mut retained = BTreeMap::new();
         for (key, artifact) in artifact_map {
             if self.sidecar_artifact_range_exists(&artifact.location)? {
@@ -1262,6 +1295,7 @@ impl ManifestStore {
                 // reclaimed only by the explicit retirement path.
                 continue;
             };
+            let reachable = self.reachable_fragment_paths_for_head(head)?;
             let generations_dir = definition.path().join("generations");
             let generations = match fs::read_dir(&generations_dir) {
                 Ok(generations) => generations,
@@ -1273,28 +1307,20 @@ impl ManifestStore {
                 if !generation.file_type().map_err(paro_error::io)?.is_dir() {
                     continue;
                 }
-                let generation_id = generation
-                    .file_name()
-                    .to_str()
-                    .and_then(|name| name.strip_prefix('g'))
-                    .and_then(|value| value.parse::<u64>().ok());
-                if generation_id != Some(head.generation_id) {
-                    continue;
-                }
                 for entry in fs::read_dir(generation.path()).map_err(paro_error::io)? {
                     let entry = entry.map_err(paro_error::io)?;
                     let path = entry.path();
                     if !entry.file_type().map_err(paro_error::io)?.is_file() {
                         continue;
                     }
-                    let Some((_, root_version)) = path
+                    let Some(_) = path
                         .file_name()
                         .and_then(|name| name.to_str())
                         .and_then(parse_manifest_fragment_version)
                     else {
                         continue;
                     };
-                    if root_version <= head.root_version {
+                    if reachable.contains(&path) {
                         continue;
                     }
                     fs::remove_file(&path).map_err(|error| {
@@ -1310,6 +1336,50 @@ impl ManifestStore {
             self.prune_empty_definition_dirs(definition_id);
         }
         Ok(removed)
+    }
+
+    fn reachable_fragment_paths_for_head(
+        &self,
+        head: &SearchGenerationHeadMeta,
+    ) -> Result<BTreeSet<PathBuf>> {
+        let root_path =
+            self.root_path_for_file(head.definition_id, head.generation_id, &head.root_file_name);
+        if !root_path.exists() {
+            return Err(paro_error::data_corrupted(format!(
+                "durable search generation head for definition {} is missing root {}",
+                head.definition_id,
+                root_path.display()
+            )));
+        }
+        let root = self.read_root_fragment(&root_path)?;
+        let mut verified = root.clone();
+        let expected_checksum = verified.checksum;
+        verified.recompute_checksum()?;
+        if verified.checksum != expected_checksum
+            || root.definition_id != head.definition_id
+            || root.generation_id != head.generation_id
+            || root.root_version != head.root_version
+            || root.config_fingerprint != head.config_fingerprint
+        {
+            return Err(paro_error::data_corrupted(format!(
+                "durable search generation head for definition {} does not match its root",
+                head.definition_id
+            )));
+        }
+        let generation_dir = self.generation_dir(head.definition_id, head.generation_id);
+        let mut reachable = BTreeSet::new();
+        reachable.insert(root_path);
+        reachable.extend(
+            root.shard_files
+                .iter()
+                .map(|fragment| generation_dir.join(&fragment.file_name)),
+        );
+        reachable.extend(
+            root.recent_delta_files
+                .iter()
+                .map(|fragment| generation_dir.join(&fragment.file_name)),
+        );
+        Ok(reachable)
     }
 
     fn sweep_orphan_staging_fragments_in_dir(&self, dir: &Path) -> Result<usize> {
@@ -1364,14 +1434,14 @@ impl ManifestStore {
             })?;
         }
         let bytes = match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V3 => serde_json::to_vec_pretty(root).map_err(|err| {
+            ManifestCodecKind::JSON_DEBUG_V4 => serde_json::to_vec_pretty(root).map_err(|err| {
                 paro_error::serialization_error(format!(
                     "serialize search manifest root fragment: {err}"
                 ))
             })?,
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 3,
+                version: 4,
             } => encode_binary_manifest_fragment(root)?,
             other => {
                 return Err(paro_error::not_supported(format!(
@@ -1408,7 +1478,7 @@ impl ManifestStore {
         })?;
         storage_metrics().add_search_manifest_open_bytes(self.codec_label(), bytes.len() as u64);
         match self.codec_kind {
-            ManifestCodecKind::JSON_DEBUG_V3 => {
+            ManifestCodecKind::JSON_DEBUG_V4 => {
                 let root = serde_json::from_slice(&bytes).map_err(|err| {
                     paro_error::serialization_error(format!(
                         "deserialize search manifest root fragment: {err}"
@@ -1418,7 +1488,7 @@ impl ManifestStore {
             }
             ManifestCodecKind {
                 family: ManifestCodecFamily::Binary,
-                version: 3,
+                version: 4,
             } => decode_binary_manifest_fragment(&bytes),
             other => Err(paro_error::not_supported(format!(
                 "unsupported search manifest codec {:?}",
@@ -1445,12 +1515,12 @@ fn encode_manifest_fragment<T: Serialize + BinaryManifestFragment>(
     value: &T,
 ) -> Result<Vec<u8>> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V3 => serde_json::to_vec_pretty(value).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V4 => serde_json::to_vec_pretty(value).map_err(|err| {
             paro_error::serialization_error(format!("serialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 3,
+            version: 4,
         } => encode_binary_manifest_fragment(value),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1610,12 +1680,12 @@ fn decode_manifest_fragment<T: for<'de> Deserialize<'de> + BinaryManifestFragmen
     bytes: &[u8],
 ) -> Result<T> {
     match codec {
-        ManifestCodecKind::JSON_DEBUG_V3 => serde_json::from_slice(bytes).map_err(|err| {
+        ManifestCodecKind::JSON_DEBUG_V4 => serde_json::from_slice(bytes).map_err(|err| {
             paro_error::serialization_error(format!("deserialize search manifest fragment: {err}"))
         }),
         ManifestCodecKind {
             family: ManifestCodecFamily::Binary,
-            version: 3,
+            version: 4,
         } => decode_binary_manifest_fragment(bytes),
         other => Err(paro_error::not_supported(format!(
             "unsupported search manifest codec {:?}",
@@ -1657,6 +1727,26 @@ fn upsert_tail_entry(
     Ok(())
 }
 
+fn validate_tail_entry_id_allocator(
+    definition_id: u64,
+    next_entry_id: TailEntryId,
+    entries: &[TailPendingEntry],
+) -> Result<()> {
+    let max_assigned = entries
+        .iter()
+        .filter(|entry| entry.entry_id.is_assigned())
+        .map(|entry| entry.entry_id.0)
+        .max()
+        .unwrap_or(0);
+    if next_entry_id.0 == 0 || next_entry_id.0 <= max_assigned {
+        return Err(paro_error::data_corrupted(format!(
+            "search manifest for definition {definition_id} has tail allocator {} at or below assigned id {max_assigned}",
+            next_entry_id.0
+        )));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1674,7 +1764,7 @@ mod tests {
     use crate::search::inline_sink::{FullTextStatsDelta, SearchStatsDelta};
     use crate::search::stats::{
         ExecutionModes, FullTextProviderStats, GenerationMaintenanceState, GenerationStats,
-        SearchArtifactStats,
+        SearchArtifactStats, SearchProviderStats,
     };
     use crate::search::tail::{TailEntryId, TailMutationKind, TailPendingEntry};
     use tempfile::TempDir;
@@ -1779,24 +1869,24 @@ mod tests {
     }
 
     #[test]
-    fn manifest_codec_dispatch_round_trips_json_and_binary_v3() {
+    fn manifest_codec_dispatch_round_trips_json_and_binary_v4() {
         let delta = ManifestDelta::new(vec![
             ManifestDeltaEntry::AddArtifact(sample_artifact(10, 0)),
             ManifestDeltaEntry::UpsertTail(sample_tail_entry(1, 10, 0)),
         ]);
         let json_bytes =
-            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V3, &delta).unwrap();
+            encode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V4, &delta).unwrap();
         let decoded_json: ManifestDelta =
-            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V3, &json_bytes).unwrap();
+            decode_manifest_fragment(ManifestCodecKind::JSON_DEBUG_V4, &json_bytes).unwrap();
         assert_eq!(decoded_json, delta);
 
-        let binary_v3 = ManifestCodecKind::BINARY_V3;
-        let binary_bytes = encode_manifest_fragment(binary_v3, &delta).unwrap();
+        let binary_v4 = ManifestCodecKind::BINARY_V4;
+        let binary_bytes = encode_manifest_fragment(binary_v4, &delta).unwrap();
         assert!(!binary_bytes.starts_with(b"{"));
         let decoded_binary: ManifestDelta =
-            decode_manifest_fragment(binary_v3, &binary_bytes).unwrap();
+            decode_manifest_fragment(binary_v4, &binary_bytes).unwrap();
         assert_eq!(decoded_binary, delta);
-        assert_eq!(binary_v3.metric_label(), "binary-v3");
+        assert_eq!(binary_v4.metric_label(), "binary-v4");
     }
 
     #[test]
@@ -1843,17 +1933,18 @@ mod tests {
             root_json["shard_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
         );
-        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 3);
+        assert_eq!(root_json["shard_files"][0]["codec"]["version"], 4);
         assert_eq!(
             root_json["recent_delta_files"][0]["codec"]["family"],
             serde_json::Value::String("json_debug".to_string())
         );
+        assert_eq!(root_json["recent_delta_files"][0]["codec"]["version"], 4);
     }
 
     #[test]
     fn binary_manifest_root_keeps_fragment_graph_explicit() {
         let temp_dir = TempDir::new().expect("temp dir");
-        let store = ManifestStore::new_with_codec(temp_dir.path(), ManifestCodecKind::BINARY_V3);
+        let store = ManifestStore::new_with_codec(temp_dir.path(), ManifestCodecKind::BINARY_V4);
         let definition_id = 88;
         let shard_ref = store
             .write_shard(
@@ -1882,13 +1973,13 @@ mod tests {
         let root_path = store.write_root(definition_id, &root).unwrap();
 
         let bytes = std::fs::read(&root_path).unwrap();
-        assert!(bytes.starts_with(b"PMB3"));
+        assert!(bytes.starts_with(b"PMB4"));
         let loaded = store
             .load_latest_manifest_for_private_workspace(definition_id)
             .unwrap()
             .expect("binary manifest should load");
-        assert_eq!(loaded.opened_paths().len(), 3);
-        assert_eq!(loaded.opened_paths()[0], root_path);
+        assert_eq!(loaded.all_paths().len(), 3);
+        assert_eq!(loaded.all_paths()[0], root_path);
         assert_eq!(loaded.artifacts.artifacts.len(), 1);
         assert_eq!(loaded.tail_pending_entries.len(), 2);
     }
@@ -2012,6 +2103,29 @@ mod tests {
     }
 
     #[test]
+    fn manifest_root_checksum_preserves_non_finite_float_bits() {
+        let mut positive = sample_root(44, Vec::new(), Vec::new());
+        positive.generation_stats.provider_stats =
+            Some(SearchProviderStats::FullText(FullTextProviderStats {
+                avg_doc_length: f32::INFINITY,
+                ..FullTextProviderStats::default()
+            }));
+        positive.recompute_checksum().unwrap();
+
+        let mut negative = positive.clone();
+        negative.checksum = 0;
+        let Some(SearchProviderStats::FullText(stats)) =
+            negative.generation_stats.provider_stats.as_mut()
+        else {
+            unreachable!()
+        };
+        stats.avg_doc_length = f32::NEG_INFINITY;
+        negative.recompute_checksum().unwrap();
+
+        assert_ne!(positive.checksum, negative.checksum);
+    }
+
+    #[test]
     fn manifest_root_is_only_visibility_boundary_for_delta_candidates() {
         let temp_dir = TempDir::new().expect("temp dir");
         let store = ManifestStore::new(temp_dir.path());
@@ -2104,6 +2218,7 @@ mod tests {
             .map(|file| store.generation_dir(definition_id, 1).join(&file.file_name))
             .collect::<Vec<_>>();
         let mut root = sample_root(definition_id, vec![shard_ref], delta_refs);
+        root.persisted_tail_entry_id_seed = TailEntryId(3 + DELTA_COUNT_SOFT_LIMIT as u64);
         root.recompute_checksum().unwrap();
         store.write_root(definition_id, &root).unwrap();
         let old_head = store.head_for_root(&root);
@@ -2172,6 +2287,20 @@ mod tests {
                 &ManifestShard::default(),
             )
             .expect("write rootless abandoned shard");
+        let unreachable_same_revision_shard = store
+            .write_shard(
+                definition_id,
+                durable.generation_id,
+                durable.root_version,
+                &ManifestShard::default(),
+            )
+            .expect("write unreachable same-revision shard");
+        let mut abandoned_generation = durable.clone();
+        abandoned_generation.generation_id = 2;
+        abandoned_generation.recompute_checksum().unwrap();
+        let abandoned_generation_path = store
+            .write_root(definition_id, &abandoned_generation)
+            .unwrap();
 
         let committed = store
             .begin_empty_revision(definition_id, durable.clone())
@@ -2184,7 +2313,7 @@ mod tests {
         let removed = store
             .sweep_unpublished_installed_revisions(&[durable_head])
             .expect("sweep revisions newer than durable head");
-        assert_eq!(removed, 3);
+        assert_eq!(removed, 5);
         assert!(durable_path.exists());
         assert!(!abandoned_path.exists());
         assert!(!committed.root_path.exists());
@@ -2192,6 +2321,11 @@ mod tests {
             .generation_dir(definition_id, durable.generation_id)
             .join(abandoned_shard.file_name)
             .exists());
+        assert!(!store
+            .generation_dir(definition_id, durable.generation_id)
+            .join(unreachable_same_revision_shard.file_name)
+            .exists());
+        assert!(!abandoned_generation_path.exists());
     }
 
     #[test]
@@ -2333,7 +2467,7 @@ mod tests {
             (shard_count * artifacts_per_shard) as usize
         );
         assert!(loaded.tail_pending_entries.is_empty());
-        assert_eq!(loaded.opened_paths().len(), 1 + shard_count as usize);
+        assert_eq!(loaded.all_paths().len(), 1 + shard_count as usize);
     }
 
     #[test]
@@ -2455,7 +2589,7 @@ mod tests {
             config_fingerprint: 99,
             coverage: CoverageState::Complete,
             generation_stats: GenerationStats::default(),
-            next_tail_entry_id: TailEntryId(3),
+            persisted_tail_entry_id_seed: TailEntryId(3),
             execution_modes: ExecutionModes::default(),
             maintenance_state: GenerationMaintenanceState::default(),
             root_version: 1,

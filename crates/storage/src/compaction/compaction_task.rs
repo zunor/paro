@@ -225,6 +225,7 @@ mod tests {
             _tablet_id: crate::tablet::TabletId,
             _version: i64,
             _rowset: RowsetSharedPtr,
+            _search_updates: crate::tablet::SearchGenerationHeadUpdates,
         ) {
         }
 

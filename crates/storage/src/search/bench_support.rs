@@ -64,7 +64,7 @@ impl ManifestOpenBenchConfig {
             entries_per_delta: 1,
             shard_count: 1,
             entries_per_shard: 0,
-            codec: ManifestBenchCodec::JsonDebugV3,
+            codec: ManifestBenchCodec::JsonDebugV4,
         }
     }
 
@@ -82,22 +82,22 @@ impl ManifestOpenBenchConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManifestBenchCodec {
-    JsonDebugV3,
-    BinaryV3,
+    JsonDebugV4,
+    BinaryV4,
 }
 
 impl ManifestBenchCodec {
     pub const fn label(self) -> &'static str {
         match self {
-            Self::JsonDebugV3 => "json-debug-v3",
-            Self::BinaryV3 => "binary-v3",
+            Self::JsonDebugV4 => "json-debug-v4",
+            Self::BinaryV4 => "binary-v4",
         }
     }
 
     const fn manifest_codec(self) -> ManifestCodecKind {
         match self {
-            Self::JsonDebugV3 => ManifestCodecKind::JSON_DEBUG_V3,
-            Self::BinaryV3 => ManifestCodecKind::BINARY_V3,
+            Self::JsonDebugV4 => ManifestCodecKind::JSON_DEBUG_V4,
+            Self::BinaryV4 => ManifestCodecKind::BINARY_V4,
         }
     }
 }
@@ -172,7 +172,9 @@ pub fn prepare_manifest_open_bench_fixture(
         config_fingerprint: 1,
         coverage: CoverageState::Complete,
         generation_stats: GenerationStats::default(),
-        next_tail_entry_id: TailEntryId((config.delta_count * config.entries_per_delta) as u64 + 1),
+        persisted_tail_entry_id_seed: TailEntryId(
+            (config.delta_count * config.entries_per_delta) as u64 + 1,
+        ),
         execution_modes: ExecutionModes::default(),
         maintenance_state: GenerationMaintenanceState::default(),
         root_version: config.delta_count as u64 + 1,
@@ -210,7 +212,7 @@ pub fn open_manifest_bench_fixture_with_manifest_bytes(
         });
     };
     let manifest_bytes =
-        manifest_bytes.unwrap_or_else(|| manifest_path_bytes(&manifest.opened_paths()));
+        manifest_bytes.unwrap_or_else(|| manifest_path_bytes(&manifest.all_paths()));
     Ok(ManifestOpenBenchSummary {
         artifact_count: manifest.artifacts.artifacts.len(),
         tail_pending_count: manifest.tail_pending_entries.len(),

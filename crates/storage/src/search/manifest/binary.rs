@@ -4,7 +4,7 @@
 //! Compact binary codec for search manifest fragments.
 //!
 //! This codec is intentionally explicit instead of serde-driven. Manifest open is
-//! on the search query hot path, so binary-v3 keeps stable field order, small
+//! on the search query hot path, so binary-v4 keeps stable field order, small
 //! enum tags, and little-endian scalar encoding without reflection-style map
 //! dispatch. Binary-v2 stores generation-owned multi-segment partition
 //! coverage for every artifact.
@@ -32,7 +32,8 @@ use super::{
     ManifestDeltaEntry, ManifestFileRef, ManifestShard,
 };
 
-const MAGIC: &[u8; 4] = b"PMB3";
+const MAGIC: &[u8; 4] = b"PMB4";
+const ROOT_CHECKSUM_MAGIC: &[u8; 4] = b"PMR1";
 const ROOT_FRAGMENT: u8 = 1;
 const SHARD_FRAGMENT: u8 = 2;
 const DELTA_FRAGMENT: u8 = 3;
@@ -159,7 +160,7 @@ impl<'a> BinaryReader<'a> {
         let actual = self.take(magic.len())?;
         if actual != magic {
             return Err(paro_error::serialization_error(
-                "decode binary search manifest fragment: missing PMB3 magic",
+                "decode binary search manifest fragment: missing PMB4 magic",
             ));
         }
         Ok(())
@@ -251,21 +252,7 @@ impl BinaryManifestFragment for GenerationManifestRoot {
     const FRAGMENT_TAG: u8 = ROOT_FRAGMENT;
 
     fn encode_binary(&self, writer: &mut BinaryWriter) -> Result<()> {
-        writer.u64(self.definition_id);
-        writer.u64(self.generation_id);
-        writer.u64(self.build_epoch);
-        writer.i64(self.build_snapshot_version);
-        writer.u64(self.indexed_through_ts);
-        writer.u64(self.config_fingerprint);
-        encode_coverage_state(writer, &self.coverage)?;
-        encode_generation_stats(writer, &self.generation_stats)?;
-        writer.u64(self.next_tail_entry_id.0);
-        encode_execution_modes(writer, &self.execution_modes)?;
-        encode_maintenance_state(writer, &self.maintenance_state)?;
-        writer.u64(self.root_version);
-        writer.u64(self.checksum);
-        encode_vec(writer, &self.shard_files, encode_manifest_file_ref)?;
-        encode_vec(writer, &self.recent_delta_files, encode_manifest_file_ref)
+        encode_manifest_root_fields(writer, self, true)
     }
 
     fn decode_binary(reader: &mut BinaryReader<'_>) -> Result<Self> {
@@ -278,7 +265,7 @@ impl BinaryManifestFragment for GenerationManifestRoot {
             config_fingerprint: reader.u64()?,
             coverage: decode_coverage_state(reader)?,
             generation_stats: decode_generation_stats(reader)?,
-            next_tail_entry_id: TailEntryId(reader.u64()?),
+            persisted_tail_entry_id_seed: TailEntryId(reader.u64()?),
             execution_modes: decode_execution_modes(reader)?,
             maintenance_state: decode_maintenance_state(reader)?,
             root_version: reader.u64()?,
@@ -287,6 +274,39 @@ impl BinaryManifestFragment for GenerationManifestRoot {
             recent_delta_files: decode_vec(reader, decode_manifest_file_ref)?,
         })
     }
+}
+
+pub(super) fn encode_manifest_root_checksum_image(
+    root: &GenerationManifestRoot,
+) -> Result<Vec<u8>> {
+    let mut writer = BinaryWriter::new();
+    writer.bytes(ROOT_CHECKSUM_MAGIC);
+    encode_manifest_root_fields(&mut writer, root, false)?;
+    Ok(writer.finish())
+}
+
+fn encode_manifest_root_fields(
+    writer: &mut BinaryWriter,
+    root: &GenerationManifestRoot,
+    include_checksum: bool,
+) -> Result<()> {
+    writer.u64(root.definition_id);
+    writer.u64(root.generation_id);
+    writer.u64(root.build_epoch);
+    writer.i64(root.build_snapshot_version);
+    writer.u64(root.indexed_through_ts);
+    writer.u64(root.config_fingerprint);
+    encode_coverage_state(writer, &root.coverage)?;
+    encode_generation_stats(writer, &root.generation_stats)?;
+    writer.u64(root.persisted_tail_entry_id_seed.0);
+    encode_execution_modes(writer, &root.execution_modes)?;
+    encode_maintenance_state(writer, &root.maintenance_state)?;
+    writer.u64(root.root_version);
+    if include_checksum {
+        writer.u64(root.checksum);
+    }
+    encode_vec(writer, &root.shard_files, encode_manifest_file_ref)?;
+    encode_vec(writer, &root.recent_delta_files, encode_manifest_file_ref)
 }
 
 impl BinaryManifestFragment for ManifestShard {

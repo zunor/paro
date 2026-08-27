@@ -136,25 +136,73 @@ impl RowsetPublishObserver for SearchIndexRegistry {
         self.prepare_heads_for_visible_rowsets(version, visible_rowsets)
     }
 
-    fn rowset_published(&self, tablet_id: TabletId, version: i64, rowset: RowsetSharedPtr) {
+    fn rowset_published(
+        &self,
+        tablet_id: TabletId,
+        version: i64,
+        rowset: RowsetSharedPtr,
+        search_updates: SearchGenerationHeadUpdates,
+    ) {
         if tablet_id != self.tablet.tablet_id() {
             return;
         }
-        let definition_ids = self
-            .view
-            .load()
-            .definitions
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        for definition_id in definition_ids {
-            if let Err(err) = self.refresh_definition(definition_id) {
+        let (prepared, stale_definition_ids) = search_updates.into_parts();
+        for definition_id in stale_definition_ids {
+            if let Err(error) = self.disable_definition_capability(definition_id) {
+                tracing::warn!(
+                    tablet_id,
+                    definition_id,
+                    rowset_id = rowset.rowset_id(),
+                    version,
+                    error = %error,
+                    "failed to disable search capability after rowset manifest preparation was rejected"
+                );
+            }
+        }
+        for (head, manifest) in prepared {
+            let definition_id = head.definition_id;
+            if self.tablet.search_generation_head(definition_id).as_ref() != Some(&head) {
+                // A newer publication won the race after the rowset commit.
+                // Its callback (or recovery reconciliation) owns the view.
+                continue;
+            }
+            let result = (|| -> Result<()> {
+                let definition_lock = self.definition_lock(definition_id);
+                let _guard = definition_lock
+                    .lock()
+                    .map_err(|_| paro_error::internal("lock search definition publish lock"))?;
+                let current = self.view.load_full();
+                let Some(state) = current.definitions.get(&definition_id).cloned() else {
+                    return Ok(());
+                };
+                drop(current);
+                if head_for_state(&self.manifests, &state).as_ref() == Some(&head) {
+                    return Ok(());
+                }
+                let next_state = state.clone().with_manifest(manifest);
+                if head_for_state(&self.manifests, &next_state).as_ref() != Some(&head) {
+                    return Err(paro_error::data_corrupted(format!(
+                        "prepared search manifest for definition {definition_id} does not match accepted tablet head"
+                    )));
+                }
+                self.publish_definition_state(&state, next_state.clone())?;
+                if let Some(next_manifest) = next_state.manifest.as_ref() {
+                    self.retire_manifest_replaced_by(
+                        state.definition.kind,
+                        state.manifest.as_ref(),
+                        next_manifest,
+                    );
+                }
+                record_tail_metrics_for_state(&next_state);
+                Ok(())
+            })();
+            if let Err(error) = result {
                 if let Err(disable_error) = self.disable_definition_capability(definition_id) {
                     tracing::error!(
                         tablet_id,
                         definition_id,
                         error = %disable_error,
-                        "failed to disable stale search capability after refresh failure"
+                        "failed to disable stale search capability after prepared manifest install failure"
                     );
                 }
                 tracing::warn!(
@@ -162,11 +210,12 @@ impl RowsetPublishObserver for SearchIndexRegistry {
                     definition_id,
                     rowset_id = rowset.rowset_id(),
                     version,
-                    error = %err,
-                    "search registry eager refresh after rowset publish failed"
+                    error = %error,
+                    "failed to install prepared search manifest after rowset publish"
                 );
             }
         }
+        self.sweep_retired();
     }
 
     fn search_inline_builders_for_compaction(&self, tablet_id: TabletId) -> SearchInlineBuilderSet {
@@ -369,7 +418,7 @@ impl SearchIndexRegistry {
                 config_fingerprint: definition.config_fingerprint,
                 coverage: coverage.clone(),
                 generation_stats: generation_stats.clone(),
-                next_tail_entry_id,
+                persisted_tail_entry_id_seed: next_tail_entry_id,
                 execution_modes,
                 maintenance_state: build_maintenance_state(
                     &definition,
@@ -1388,8 +1437,7 @@ impl SearchIndexRegistry {
             .keys()
             .copied()
             .collect::<Vec<_>>();
-        let mut heads = Vec::new();
-        let mut revision_leases = Vec::new();
+        let mut updates = SearchGenerationHeadUpdates::default();
         for definition_id in definition_ids {
             let definition_lock = self.definition_lock(definition_id);
             let _guard = definition_lock
@@ -1415,24 +1463,20 @@ impl SearchIndexRegistry {
                         error = %error,
                         "kept prior search generation head after rowset manifest preparation failed"
                     );
+                    updates.mark_stale(definition_id);
                     continue;
                 }
             };
             if let Some(head) = head_for_state(&self.manifests, &next_state) {
-                if let Some(lease) = next_state
-                    .manifest
-                    .as_ref()
-                    .and_then(LoadedManifest::revision_lease)
-                {
-                    revision_leases.push((definition_id, lease));
-                }
-                heads.push(head);
+                let manifest = next_state.manifest.ok_or_else(|| {
+                    paro_error::internal(format!(
+                        "prepared search head for definition {definition_id} has no manifest"
+                    ))
+                })?;
+                updates.push(head, manifest);
             }
         }
-        Ok(SearchGenerationHeadUpdates {
-            heads,
-            revision_leases,
-        })
+        Ok(updates)
     }
 
     pub(crate) fn ensure_fresh(&self) {
@@ -1670,7 +1714,7 @@ impl SearchIndexRegistry {
             config_fingerprint: state.definition.config_fingerprint,
             coverage: snapshot.coverage.clone(),
             generation_stats: snapshot.generation_stats.clone(),
-            next_tail_entry_id,
+            persisted_tail_entry_id_seed: next_tail_entry_id,
             execution_modes: snapshot.execution_modes.clone(),
             maintenance_state: build_maintenance_state(
                 &state.definition,
@@ -1762,9 +1806,9 @@ impl SearchIndexRegistry {
         root.build_epoch = state.next_build_epoch;
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
-        let mut next_tail_entry_id = current_manifest.next_tail_entry_id.0;
+        let mut next_tail_entry_id = current_manifest.next_tail_entry_id().0;
         assign_tail_entry_ids(&mut added_tail_entries, &mut next_tail_entry_id);
-        root.next_tail_entry_id = TailEntryId(next_tail_entry_id);
+        root.persisted_tail_entry_id_seed = TailEntryId(next_tail_entry_id);
 
         let mut tail_pending_entries = current_manifest.tail_pending_entries.clone();
         tail_pending_entries.extend(added_tail_entries.iter().cloned());
@@ -1871,9 +1915,9 @@ impl SearchIndexRegistry {
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
 
-        let mut next_tail_entry_id = current_manifest.next_tail_entry_id.0;
+        let mut next_tail_entry_id = current_manifest.next_tail_entry_id().0;
         assign_tail_entry_ids(&mut added_tail_entries, &mut next_tail_entry_id);
-        root.next_tail_entry_id = TailEntryId(next_tail_entry_id);
+        root.persisted_tail_entry_id_seed = TailEntryId(next_tail_entry_id);
 
         added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
         let covered_tail_ids = covered_tail_ids.into_iter().collect::<BTreeSet<_>>();
@@ -2222,9 +2266,9 @@ impl SearchIndexRegistry {
         root.build_snapshot_version = visible_version;
         root.indexed_through_ts = indexed_through_ts(root.build_snapshot_version);
 
-        let mut next_tail_entry_id = current_manifest.next_tail_entry_id.0;
+        let mut next_tail_entry_id = current_manifest.next_tail_entry_id().0;
         assign_tail_entry_ids(&mut added_tail_entries, &mut next_tail_entry_id);
-        root.next_tail_entry_id = TailEntryId(next_tail_entry_id);
+        root.persisted_tail_entry_id_seed = TailEntryId(next_tail_entry_id);
 
         added_artifacts = assign_generation_id(added_artifacts, generation.generation_id);
         let covered_tail_ids = covered_tail_ids.into_iter().collect::<BTreeSet<_>>();
@@ -2464,10 +2508,11 @@ impl SearchIndexRegistry {
                     .collect::<BTreeSet<_>>()
             })
             .unwrap_or_default();
+        let rollback_owned_paths = candidate_manifest.rollback_owned_paths();
         let retired_paths =
             retire_paths_for_manifest(&self.tablet.data_dir().clone(), candidate_manifest)
                 .into_iter()
-                .filter(|path| !keep_paths.contains(path))
+                .filter(|path| !keep_paths.contains(path) && !rollback_owned_paths.contains(path))
                 .collect();
         self.retire_manifest_paths(candidate.definition.kind, candidate_manifest, retired_paths);
     }
@@ -3336,7 +3381,7 @@ mod tests {
                 config_fingerprint: definition.config_fingerprint,
                 coverage: CoverageState::Complete,
                 generation_stats: GenerationStats::default(),
-                next_tail_entry_id: TailEntryId(1),
+                persisted_tail_entry_id_seed: TailEntryId(1),
                 execution_modes: ExecutionModes::default(),
                 maintenance_state: GenerationMaintenanceState::default(),
                 root_version: 1,
@@ -3347,7 +3392,7 @@ mod tests {
             root_path: root.path().join("manifest-root"),
             shard_paths: Vec::new(),
             delta_paths: Vec::new(),
-            next_tail_entry_id: TailEntryId(1),
+            tail_entry_id_allocator: TailEntryId(1),
             publication_lease: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries: Vec::new(),
@@ -3535,7 +3580,7 @@ mod tests {
                     exact_tail_merge: true,
                 },
                 generation_stats: GenerationStats::default(),
-                next_tail_entry_id: TailEntryId(10),
+                persisted_tail_entry_id_seed: TailEntryId(10),
                 execution_modes: ExecutionModes::default(),
                 maintenance_state: GenerationMaintenanceState::default(),
                 root_version: 1,
@@ -3546,7 +3591,7 @@ mod tests {
             root_path: std::path::PathBuf::new(),
             shard_paths: Vec::new(),
             delta_paths: Vec::new(),
-            next_tail_entry_id: TailEntryId(10),
+            tail_entry_id_allocator: TailEntryId(10),
             publication_lease: None,
             artifacts: Arc::new(GenerationArtifactSet::default()),
             tail_pending_entries: vec![existing_tail.clone()],
@@ -4307,11 +4352,17 @@ mod tests {
         };
 
         table.register_search_definition(definition).unwrap();
+        let replay_count_before_append = table.search_registry().manifests.full_replay_count();
         table
             .append(&test_chunk_from_vectors(vec![test_string_vector(&[
                 "observer refresh",
             ])]))
             .unwrap();
+        assert_eq!(
+            table.search_registry().manifests.full_replay_count(),
+            replay_count_before_append,
+            "rowset publish must install its prepared in-memory manifest without disk replay"
+        );
 
         let current = table.search_registry().view.load();
         let state = current.definitions.get(&43).expect("definition state");
@@ -4713,7 +4764,7 @@ mod tests {
                 }
             ));
             assert!(manifest.root.recent_delta_files.is_empty());
-            assert_eq!(manifest.root.next_tail_entry_id, TailEntryId(2));
+            assert_eq!(manifest.next_tail_entry_id(), TailEntryId(2));
         }
 
         let touched = table.search_registry().catch_up_definition(44).unwrap();
@@ -4747,7 +4798,7 @@ mod tests {
             .expect("manifest after catch up");
         assert!(manifest.tail_pending_entries.is_empty());
         assert!(manifest.root.coverage.is_complete());
-        assert_eq!(manifest.root.next_tail_entry_id, TailEntryId(2));
+        assert_eq!(manifest.next_tail_entry_id(), TailEntryId(2));
         assert_eq!(manifest.artifacts.artifacts.len(), 1);
         assert!(matches!(
             manifest.artifacts.artifacts[0].location,
@@ -6286,7 +6337,7 @@ mod tests {
                 .expect("manifest");
             assert_eq!(manifest.tail_pending_entries.len(), 1);
             assert_eq!(manifest.tail_pending_entries[0].entry_id, TailEntryId(1));
-            assert_eq!(manifest.root.next_tail_entry_id, TailEntryId(2));
+            assert_eq!(manifest.next_tail_entry_id(), TailEntryId(2));
             assert!(manifest.root.recent_delta_files.is_empty());
             assert_eq!(manifest.root.shard_files.len(), 1);
 
@@ -6335,7 +6386,7 @@ mod tests {
             .and_then(|state| state.manifest.as_ref())
             .expect("manifest after delta");
         assert_eq!(manifest.tail_pending_entries.len(), 2);
-        assert_eq!(manifest.root.next_tail_entry_id, TailEntryId(3));
+        assert_eq!(manifest.next_tail_entry_id(), TailEntryId(3));
 
         let root_bytes = std::fs::read(&manifest.root_path).expect("read root");
         let root_json: serde_json::Value =
