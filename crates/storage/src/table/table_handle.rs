@@ -65,6 +65,10 @@ impl TableHandle {
         self.search_registry.bind_task_scheduler(scheduler);
     }
 
+    pub fn bind_search_maintenance_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.search_registry.bind_maintenance_notifier(notifier);
+    }
+
     pub fn bind_hnsw_integrity_scheduler(
         &self,
         scheduler: Option<Arc<crate::index::hnsw::HnswIntegrityScheduler>>,

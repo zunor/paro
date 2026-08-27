@@ -378,7 +378,6 @@ impl Tablet {
         if !pairs.is_empty() {
             let commit_ts = u64::try_from(output_version)
                 .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
-            self.persist_primary_index_upserts_at(&pairs, commit_ts)?;
             self.primary_index_handle()
                 .batch_upsert_at(pairs, commit_ts);
         }
@@ -484,14 +483,6 @@ impl Tablet {
         Ok(())
     }
 
-    pub(crate) fn persist_primary_index_upserts_at(
-        &self,
-        pairs: &[(Vec<u8>, RowID)],
-        commit_ts: u64,
-    ) -> Result<()> {
-        self.persistent_index()?.apply_upserts_at(pairs, commit_ts)
-    }
-
     pub(super) fn prepare_primary_index_publish(
         &self,
         rowset: &Rowset,
@@ -581,6 +572,12 @@ impl Tablet {
         rowset: &RowsetSharedPtr,
         prepared: PreparedPrimaryIndexPublish,
     ) -> Result<()> {
+        // The database journal plus immutable rowsets are the durable truth.
+        // Keep the mutable primary index in the transaction's in-memory
+        // publication boundary; its persistent levels are a derived cache
+        // flushed only when the memory watermark requests it. Writing a
+        // second WAL here would serialize every group-committed transaction
+        // and still require rowset reconciliation after a crash.
         if !prepared.tombstones.is_empty() {
             let commit_ts = u64::try_from(version)
                 .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
@@ -588,8 +585,6 @@ impl Tablet {
             for key in &prepared.tombstones {
                 idx.remove_at(key, commit_ts);
             }
-            self.persistent_index()?
-                .apply_deletes_at(&prepared.tombstones, commit_ts)?;
         }
 
         if !prepared.pairs.is_empty() {
@@ -597,7 +592,6 @@ impl Tablet {
                 .map_err(|_| paro_error::invalid_input("negative primary index version"))?;
             self.primary_index_handle()
                 .batch_upsert_at(prepared.pairs.clone(), commit_ts);
-            self.persist_primary_index_upserts_at(&prepared.pairs, commit_ts)?;
         }
 
         self.persist_delete_vectors_for_rowset_publish(
@@ -631,8 +625,6 @@ impl Tablet {
 
         let resolved = self.lookup_primary_keys(&unique_keys)?;
         let idx = self.primary_index_handle();
-        let persistent = self.persistent_index()?;
-
         let mut resolved_locations = Vec::with_capacity(unique_keys.len());
         let mut existing_keys = Vec::with_capacity(unique_keys.len());
         for (key, current) in unique_keys.into_iter().zip(resolved.into_iter()) {
@@ -657,7 +649,6 @@ impl Tablet {
         for key in &existing_keys {
             idx.remove_at(key, commit_ts);
         }
-        persistent.apply_deletes_at(&existing_keys, commit_ts)?;
 
         let mut pending: HashMap<(u64, u32), DeleteVector> = HashMap::new();
         for loc in resolved_locations {
@@ -940,21 +931,33 @@ impl Tablet {
         Ok(())
     }
 
-    fn rebuild_primary_index_from_visible_rowsets(&self) -> Result<()> {
-        let schema = match self.schema() {
-            Some(schema) => schema,
-            None => return Ok(()),
+    pub(crate) fn apply_replayed_rowset_to_primary_index(&self, rowset_id: u64) -> Result<()> {
+        let Some(schema) = self.schema() else {
+            return Ok(());
         };
         if schema.keys_type() != KeysType::PrimaryKeys {
             return Ok(());
         }
-
-        let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
-        if visible_rowsets.is_empty() {
+        let Some(rowset) = self.find_rowset_by_id(rowset_id) else {
             return Ok(());
-        }
+        };
+        let index = self.primary_index_handle();
+        self.upsert_visible_rowset_into_primary_index(
+            index.as_ref(),
+            &rowset,
+            &schema,
+            self.max_version(),
+        )
+    }
 
-        let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(&schema)?;
+    fn upsert_visible_rowset_into_primary_index(
+        &self,
+        target: &PrimaryIndex,
+        rowset: &RowsetSharedPtr,
+        schema: &crate::tablet::TabletSchemaRef,
+        visible_version: i64,
+    ) -> Result<()> {
+        let serializer = crate::primary_key::PrimaryKeySerializer::from_schema_ref(schema)?;
         let key_projection: Vec<crate::tablet::ColumnId> = schema
             .columns()
             .iter()
@@ -969,6 +972,61 @@ impl Tablet {
             .collect();
         let allocator = Arc::new(default_allocator());
 
+        rowset.load()?;
+        for segment in rowset.segments() {
+            let delete_vector = DeleteVector::load_from_dir_at_version(
+                rowset.rowset_path(),
+                segment.segment_id(),
+                visible_version,
+            )?;
+            let mut iter = crate::rowset::SegmentIterator::new_with_delete_vector(
+                &segment,
+                key_projection.clone(),
+                delete_vector,
+            )?;
+
+            while iter.has_next() {
+                let (row_ids, batch) = iter.next_batch(4096)?;
+                if row_ids.is_empty() || batch.is_empty() {
+                    continue;
+                }
+                let rows =
+                    infer_row_count_for_keys(&key_projection, &key_types, &batch, row_ids.len())?;
+                if rows == 0 {
+                    continue;
+                }
+                let chunk =
+                    build_key_chunk(&key_projection, &key_types, &batch, rows, allocator.clone())?;
+                let mut pairs = Vec::with_capacity(chunk.size());
+                for (row_idx, &row_id) in row_ids.iter().enumerate().take(chunk.size()) {
+                    let key = serializer.encode_row(&chunk, row_idx)?;
+                    let row_id = self.encode_row_location(PhysicalRowRef::new(
+                        rowset.rowset_id(),
+                        segment.segment_id(),
+                        row_id,
+                    ))?;
+                    pairs.push((key, row_id));
+                }
+                target.batch_upsert_at(pairs, u64::try_from(rowset.end_version()).unwrap_or(0));
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_primary_index_from_visible_rowsets(&self) -> Result<()> {
+        let schema = match self.schema() {
+            Some(schema) => schema,
+            None => return Ok(()),
+        };
+        if schema.keys_type() != KeysType::PrimaryKeys {
+            return Ok(());
+        }
+
+        let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
+        if visible_rowsets.is_empty() {
+            return Ok(());
+        }
+
         let repaired = PrimaryIndex::new();
         let snapshot = self.primary_index_handle().snapshot();
         if !snapshot.is_empty() {
@@ -976,55 +1034,12 @@ impl Tablet {
         }
 
         for rowset in visible_rowsets {
-            rowset.load()?;
-            let segments = rowset.segments();
-            for segment in segments {
-                let delete_vector = DeleteVector::load_from_dir_at_version(
-                    rowset.rowset_path(),
-                    segment.segment_id(),
-                    self.max_version(),
-                )?;
-                let mut iter = crate::rowset::SegmentIterator::new_with_delete_vector(
-                    &segment,
-                    key_projection.clone(),
-                    delete_vector,
-                )?;
-
-                while iter.has_next() {
-                    let (row_ids, batch) = iter.next_batch(4096)?;
-                    if row_ids.is_empty() || batch.is_empty() {
-                        continue;
-                    }
-                    let rows = infer_row_count_for_keys(
-                        &key_projection,
-                        &key_types,
-                        &batch,
-                        row_ids.len(),
-                    )?;
-                    if rows == 0 {
-                        continue;
-                    }
-                    let chunk = build_key_chunk(
-                        &key_projection,
-                        &key_types,
-                        &batch,
-                        rows,
-                        allocator.clone(),
-                    )?;
-                    let mut pairs = Vec::with_capacity(chunk.size());
-                    for (row_idx, &row_id) in row_ids.iter().enumerate().take(chunk.size()) {
-                        let key = serializer.encode_row(&chunk, row_idx)?;
-                        let row_id = self.encode_row_location(PhysicalRowRef::new(
-                            rowset.rowset_id(),
-                            segment.segment_id(),
-                            row_id,
-                        ))?;
-                        pairs.push((key, row_id));
-                    }
-                    repaired
-                        .batch_upsert_at(pairs, u64::try_from(rowset.end_version()).unwrap_or(0));
-                }
-            }
+            self.upsert_visible_rowset_into_primary_index(
+                &repaired,
+                &rowset,
+                &schema,
+                self.max_version(),
+            )?;
         }
 
         let repaired = Arc::new(repaired);

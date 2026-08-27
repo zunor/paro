@@ -198,7 +198,12 @@ impl TableHandle {
         self.search_registry.bootstrap_migration()
     }
 
-    pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
+    /// Run provider-owned derived-state maintenance without rewriting base
+    /// rowsets. Instance background maintenance uses this entry point so tail
+    /// catch-up, manifest compaction, and sidecar repacking share the search
+    /// scheduler's admission policy while table compaction remains owned by
+    /// the compaction manager.
+    pub fn search_derived_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
         let mut report = self.search_registry.maintenance_sweep()?;
         if report.manifest_delta_compaction_requested
             && self.search_registry.compact_manifest_deltas()? > 0
@@ -210,9 +215,14 @@ impl TableHandle {
             self.search_registry.ensure_fresh();
             report = self.search_registry.maintenance_sweep()?;
         }
+        Ok(report)
+    }
+
+    pub fn search_maintenance_sweep(&self) -> Result<SearchMaintenanceReport> {
+        let mut report = self.search_derived_maintenance_sweep()?;
         if report.compaction_requested && self.optimize_compact()? {
             self.search_registry.ensure_fresh();
-            report = self.search_registry.maintenance_sweep()?;
+            report = self.search_derived_maintenance_sweep()?;
         }
         Ok(report)
     }

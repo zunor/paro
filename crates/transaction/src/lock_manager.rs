@@ -341,6 +341,64 @@ impl LockMode {
     }
 }
 
+/// Return whether two grants conflict after accounting for multi-granularity
+/// intent locks.  `LockMode::compatible_with` is the same-resource matrix; an
+/// intent lock on an ancestor is deliberately compatible with locks on its
+/// descendants.  Treating the ancestor IX as an ordinary peer of a child X
+/// serializes every writer on the table and defeats the purpose of intent
+/// locking.
+fn lock_grants_conflict(
+    held_resource: &LockResource,
+    held_mode: LockMode,
+    requested_resource: &LockResource,
+    requested_mode: LockMode,
+) -> bool {
+    if !held_resource.conflicts_with(requested_resource) {
+        return false;
+    }
+    if held_resource != requested_resource
+        && (proper_ancestor_intent(held_resource, held_mode, requested_resource)
+            || proper_ancestor_intent(requested_resource, requested_mode, held_resource))
+    {
+        return false;
+    }
+    !held_mode.compatible_with(requested_mode) || !requested_mode.compatible_with(held_mode)
+}
+
+fn proper_ancestor_intent(
+    ancestor: &LockResource,
+    mode: LockMode,
+    descendant: &LockResource,
+) -> bool {
+    if !matches!(
+        mode,
+        LockMode::IS | LockMode::IX | LockMode::SchemaStability
+    ) {
+        return false;
+    }
+    match ancestor {
+        LockResource::Database { .. } => ancestor.namespace() == descendant.namespace(),
+        LockResource::Table { table_id, .. } => {
+            descendant.table_id() == Some(*table_id)
+                && !matches!(descendant, LockResource::Table { .. })
+        }
+        LockResource::Tablet {
+            table_id,
+            tablet_id,
+            ..
+        } => {
+            descendant.tablet_identity() == Some((*table_id, *tablet_id))
+                && !matches!(descendant, LockResource::Tablet { .. })
+        }
+        LockResource::Schema { .. }
+        | LockResource::PrimaryKey { .. }
+        | LockResource::RowId { .. }
+        | LockResource::Range { .. }
+        | LockResource::Predicate { .. }
+        | LockResource::CatalogObject { .. } => false,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LockRequest {
     pub resource: LockResource,
@@ -966,9 +1024,7 @@ impl LockTableShard {
                 if holder.txn_id == txn_id {
                     continue;
                 }
-                if !holder.mode.compatible_with(request.mode)
-                    || !request.mode.compatible_with(holder.mode)
-                {
+                if lock_grants_conflict(resource, holder.mode, &request.resource, request.mode) {
                     blockers.push(holder.txn_id);
                 }
             }
@@ -1266,6 +1322,50 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, LockAcquireError::WouldWait { .. }));
         assert_eq!(manager.stats().granted_count, 1);
+    }
+
+    #[test]
+    fn table_intent_locks_allow_disjoint_child_writers() {
+        let manager = ShardedLockManager::with_shards(8);
+        let table = LockResource::Table {
+            namespace: ns(),
+            table_id: TableId::new(10),
+        };
+        let _first_intent = manager
+            .lock_one(TxnId::new(10), table.clone(), LockMode::IX)
+            .unwrap();
+        let _second_intent = manager
+            .lock_one(TxnId::new(11), table, LockMode::IX)
+            .unwrap();
+
+        let _first_key = manager
+            .lock_one(TxnId::new(10), pk(1), LockMode::X)
+            .unwrap();
+        let _second_key = manager
+            .lock_one(TxnId::new(11), pk(2), LockMode::X)
+            .unwrap();
+
+        let err = manager
+            .lock_one(TxnId::new(11), pk(1), LockMode::X)
+            .unwrap_err();
+        assert!(matches!(err, LockAcquireError::WouldWait { .. }));
+    }
+
+    #[test]
+    fn table_shared_lock_still_blocks_child_writer() {
+        let manager = ShardedLockManager::with_shards(8);
+        let table = LockResource::Table {
+            namespace: ns(),
+            table_id: TableId::new(10),
+        };
+        let _reader = manager
+            .lock_one(TxnId::new(10), table, LockMode::S)
+            .unwrap();
+
+        let err = manager
+            .lock_one(TxnId::new(11), pk(2), LockMode::X)
+            .unwrap_err();
+        assert!(matches!(err, LockAcquireError::WouldWait { .. }));
     }
 
     #[test]

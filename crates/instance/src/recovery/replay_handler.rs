@@ -159,6 +159,31 @@ impl<'a> CatalogReplayHandler<'a> {
         None
     }
 
+    fn finalize_replayed_derived_state(&self) -> paro_common::error::Result<()> {
+        let txn = CatalogSnapshot::read_only(u64::MAX);
+        for schema_entry in self
+            .catalog
+            .get_schema_collection()
+            .scan(txn.transaction_id, txn.start_time)
+        {
+            let CatalogEntryEnum::Schema(schema) = schema_entry.as_ref() else {
+                continue;
+            };
+            let Some(tables) = schema.collection(CatalogType::Table) else {
+                continue;
+            };
+            for table_entry in tables.scan(txn.transaction_id, txn.start_time) {
+                let CatalogEntryEnum::Table(table) = table_entry.as_ref() else {
+                    continue;
+                };
+                if let Some(storage) = table.get_storage() {
+                    storage.finalize_replayed_derived_state()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn apply_cleanup_descriptor(
         &self,
         cleanup: &CleanupDescriptor,
@@ -1217,6 +1242,9 @@ pub(crate) fn recover_database_with_checkpoint_bootstrap(
         }
     }
 
+    if replay_result.all_succeeded {
+        handler.finalize_replayed_derived_state()?;
+    }
     let summary = handler.summary();
     let recovered_wal = WriteAheadLog::with_state_and_start_lsn(
         wal_path,

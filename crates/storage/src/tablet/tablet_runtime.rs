@@ -1973,8 +1973,12 @@ impl Tablet {
 
     /// Commit a rowset with the given version.
     ///
-    /// The database journal is the durable truth for committed rowsets; tablet
-    /// metadata is only updated in memory and persisted via `save_meta`.
+    /// The database journal is the durable truth for committed rowsets. The
+    /// live tablet metadata is updated synchronously so readers observe the
+    /// publish, while the on-disk tablet snapshot is advanced only by the
+    /// checkpoint path. Rewriting that reconstructible snapshot for every
+    /// journaled transaction would create a second, serialized durability
+    /// protocol and defeat group commit.
     pub fn rowset_commit(&self, version: i64, rowset: RowsetSharedPtr) -> Result<()> {
         self.ensure_not_shutdown("commit rowset")?;
         let search_updates = {
@@ -2023,7 +2027,13 @@ impl Tablet {
         self.register_rowset_locked(rowset)?;
         let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
         search_heads.accept_in_memory_heads(&advanced_search_heads);
-        self.save_meta()?;
+        if !advanced_search_heads.is_empty() {
+            // Required-freshness providers still couple their immutable head
+            // to this base publish. Deferred HNSW maintenance deliberately
+            // produces no head here, so ordinary ingest avoids rewriting the
+            // reconstructible tablet snapshot.
+            self.save_meta()?;
+        }
 
         self.validate_version_graph()?;
         Ok(Some(search_heads))
@@ -2094,7 +2104,9 @@ impl Tablet {
         self.maybe_flush_primary_index()?;
         let advanced_search_heads = self.apply_search_generation_heads_locked(&search_heads);
         search_heads.accept_in_memory_heads(&advanced_search_heads);
-        self.save_meta()?;
+        if !advanced_search_heads.is_empty() {
+            self.save_meta()?;
+        }
         self.validate_version_graph()?;
         Ok(Some(search_heads))
     }
@@ -4342,6 +4354,67 @@ mod tests {
     }
 
     #[test]
+    fn journaled_rowset_publish_defers_reconstructible_meta_until_checkpoint() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let schema = create_test_schema();
+        let tablet = Tablet::new(
+            1,
+            100,
+            1000,
+            schema,
+            tmp.path().join("tablet"),
+            Some(Arc::clone(&manager)),
+        )
+        .unwrap();
+        tablet.save_meta().unwrap();
+
+        tablet
+            .rowset_commit(0, create_test_rowset(7, Version::singleton(0), 1))
+            .unwrap();
+        assert_eq!(tablet.max_version(), 0);
+
+        let durable_before_checkpoint = manager.load_tablet_meta(1).unwrap().unwrap();
+        assert_eq!(durable_before_checkpoint.max_version(), -1);
+        assert!(durable_before_checkpoint.find_rowset_meta(7).is_none());
+
+        tablet.persist_meta_snapshot().unwrap();
+        let durable_checkpoint = manager.load_tablet_meta(1).unwrap().unwrap();
+        assert_eq!(durable_checkpoint.max_version(), 0);
+        assert!(durable_checkpoint.find_rowset_meta(7).is_some());
+    }
+
+    #[test]
+    fn primary_index_is_a_reconstructible_derived_cache() {
+        let tmp = TempDir::new().unwrap();
+        let manager = create_test_meta_manager(&tmp);
+        let schema = create_test_schema();
+        let tablet = Arc::new(
+            Tablet::new(1, 100, 1000, schema, tmp.path(), Some(Arc::clone(&manager))).unwrap(),
+        );
+        tablet.init().unwrap();
+        tablet.save_meta().unwrap();
+
+        let mut writer = crate::write::DeltaWriter::open(Arc::clone(&tablet), 10).unwrap();
+        writer
+            .write_chunk(&chunk_with_names(&[7], &["seven"]))
+            .unwrap();
+        writer.commit().unwrap();
+
+        let serializer = PrimaryKeySerializer::from_schema_ref(&tablet.schema().unwrap()).unwrap();
+        let key = serializer
+            .encode_row(&chunk_with_names(&[7], &["ignored"]), 0)
+            .unwrap();
+        assert!(tablet.lookup_primary_key(&key).unwrap().is_some());
+        assert!(!tmp.path().join("primary_index/wal_0.wal").exists());
+
+        tablet.persist_meta_snapshot().unwrap();
+        drop(tablet);
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
+        assert!(reopened.lookup_primary_key(&key).unwrap().is_some());
+    }
+
+    #[test]
     fn search_manifest_failure_preserves_last_head_without_rolling_back_rowset() {
         let schema = create_test_schema();
         let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
@@ -5116,6 +5189,7 @@ mod tests {
             .write_chunk(&chunk_with_names(&[1], &["new"]))
             .unwrap();
         let rowset2 = writer2.commit().unwrap();
+        tablet.persist_meta_snapshot().unwrap();
 
         let pi_dir = tmp.path().join("primary_index");
         std::fs::write(pi_dir.join("sst_1.sst"), b"legacy").unwrap();
@@ -5164,6 +5238,7 @@ mod tests {
             .write_chunk(&chunk_with_names(&[1], &["new"]))
             .unwrap();
         let rowset2 = writer2.commit().unwrap();
+        tablet.persist_meta_snapshot().unwrap();
 
         let persistent = PersistentIndex::new(tmp.path().join("primary_index")).unwrap();
         persistent.reset().unwrap();

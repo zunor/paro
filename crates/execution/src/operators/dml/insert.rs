@@ -29,7 +29,12 @@ pub struct InsertSinkExec {
 
 impl InsertSinkExec {
     pub(crate) fn create_global(&self, ctx: &mut PipelineInitContext) -> Result<SinkGlobal> {
-        bind_dml_write(ctx, &self.spec.table, true)?;
+        // INSERT does not read the existing table as a predicate. Primary-key
+        // uniqueness and write/write serialization are guarded by exact key
+        // locks and the primary-index conflict window. Recording a table-wide
+        // read here creates false SSI cycles between disjoint insert batches
+        // and prevents group commit from admitting independent writers.
+        bind_dml_write(ctx, &self.spec.table, false)?;
         Ok(SinkGlobal::Dml(Arc::new(DmlSinkGlobal::default())))
     }
 

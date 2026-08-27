@@ -84,7 +84,8 @@ impl TableHandle {
         self.tablet()
             .replay_rowset_commit(rowset_id, start_version, end_version, rowset_path)?;
         self.restore_runtime_indexes_for_rowset(rowset_id)?;
-        self.tablet().repair_primary_index_after_replay()?;
+        self.tablet()
+            .apply_replayed_rowset_to_primary_index(rowset_id)?;
         Ok(())
     }
 
@@ -100,14 +101,12 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .apply_row_id_delete_locations_idempotent_at_version(locations, delete_version)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
     pub fn replay_primary_delete(&self, keys: &[Vec<u8>]) -> Result<()> {
         self.tablet()
             .replay_primary_delete_idempotent(keys.to_vec())?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
@@ -118,14 +117,12 @@ impl TableHandle {
     ) -> Result<()> {
         self.tablet()
             .replay_primary_delete_idempotent_at_version(keys.to_vec(), delete_version)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
     pub fn replay_compaction_publish(&self, record: &CompactionPublishRecord) -> Result<()> {
         self.tablet().replay_compaction_publish(record)?;
         self.restore_runtime_indexes_for_rowset(record.output_rowset_id)?;
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
     }
 
@@ -137,8 +134,17 @@ impl TableHandle {
         {
             self.restore_runtime_indexes_for_rowset(*output_rowset_id)?;
         }
-        self.tablet().repair_primary_index_after_replay()?;
         Ok(())
+    }
+
+    /// Reconcile derived structures once after the complete durable replay
+    /// prefix is installed.
+    ///
+    /// Per-record repair would repeatedly rescan every visible rowset when a
+    /// reconstructible primary-index cache trails the journal, making crash
+    /// recovery quadratic in the number of incremental commits.
+    pub fn finalize_replayed_derived_state(&self) -> Result<()> {
+        self.tablet().repair_primary_index_after_replay()
     }
 
     pub fn apply_search_generation_publish(&self, op: &TabletMutation) -> Result<()> {

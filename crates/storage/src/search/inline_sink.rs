@@ -103,7 +103,13 @@ impl SearchInlineBuilderEntry {
     }
 
     pub const fn flush_mode(&self) -> FlushSearchMode {
-        self.freshness_policy.default_flush_mode()
+        match (self.definition.kind, self.freshness_policy) {
+            (
+                SearchIndexKind::Hnsw,
+                SearchFreshnessPolicy::BoundedLag { .. } | SearchFreshnessPolicy::Opportunistic,
+            ) => FlushSearchMode::TailOnly,
+            _ => self.freshness_policy.default_flush_mode(),
+        }
     }
 }
 

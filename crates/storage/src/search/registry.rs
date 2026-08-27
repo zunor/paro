@@ -111,6 +111,7 @@ pub(crate) struct SearchIndexRegistry {
     reader_runtime: Arc<SearchReaderRuntime>,
     maintenance_scheduler: Arc<MaintenanceScheduler>,
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
+    maintenance_notifier: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl std::fmt::Debug for SearchIndexRegistry {
@@ -147,6 +148,15 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             return;
         }
         let (prepared, stale_definition_ids) = search_updates.into_parts();
+        let maintenance_needed = !prepared.is_empty()
+            || !stale_definition_ids.is_empty()
+            || self.view.load().definitions.values().any(|state| {
+                state.definition.kind == SearchIndexKind::Hnsw
+                    && !matches!(
+                        state.definition.freshness_policy,
+                        super::capability::SearchFreshnessPolicy::Required
+                    )
+            });
         for definition_id in stale_definition_ids {
             if let Err(error) = self.disable_definition_capability(definition_id) {
                 tracing::warn!(
@@ -216,6 +226,11 @@ impl RowsetPublishObserver for SearchIndexRegistry {
             }
         }
         self.sweep_retired();
+        if maintenance_needed {
+            if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
+                notifier();
+            }
+        }
     }
 
     fn search_inline_builders_for_compaction(&self, tablet_id: TabletId) -> SearchInlineBuilderSet {
@@ -265,6 +280,7 @@ impl SearchIndexRegistry {
             reader_runtime,
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
             hnsw_task_scheduler: RwLock::new(None),
+            maintenance_notifier: RwLock::new(None),
         };
         if let Err(err) = registry.manifests.sweep_orphan_staging_fragments() {
             tracing::warn!(
@@ -293,6 +309,10 @@ impl SearchIndexRegistry {
 
     pub(crate) fn bind_task_scheduler(&self, scheduler: Option<Arc<TaskScheduler>>) {
         *self.hnsw_task_scheduler.write().unwrap() = scheduler;
+    }
+
+    pub(crate) fn bind_maintenance_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+        *self.maintenance_notifier.write().unwrap() = notifier;
     }
 
     pub(crate) fn bind_hnsw_integrity_scheduler(
@@ -610,7 +630,6 @@ impl SearchIndexRegistry {
         column_id: ColumnId,
         distance: crate::index::hnsw::DistanceMetric,
     ) -> Option<crate::index::hnsw::HnswSearchPolicy> {
-        self.ensure_fresh();
         self.view.load().hnsw_search_policy(column_id, distance)
     }
 
@@ -618,7 +637,6 @@ impl SearchIndexRegistry {
         &self,
         definition_id: u64,
     ) -> Result<Option<crate::statistics::HnswIndexStatistics>> {
-        self.ensure_fresh();
         self.view.load().hnsw_generation_statistics(definition_id)
     }
 
@@ -627,7 +645,6 @@ impl SearchIndexRegistry {
         column_id: ColumnId,
         distance: crate::index::hnsw::DistanceMetric,
     ) -> Option<crate::index::hnsw::HnswFilterTopologyContract> {
-        self.ensure_fresh();
         self.view.load().hnsw_filter_topology(column_id, distance)
     }
 
@@ -635,7 +652,6 @@ impl SearchIndexRegistry {
         &self,
         finder: impl Fn(&SearchView) -> Option<SearchCapability>,
     ) -> Option<SearchCapability> {
-        self.ensure_fresh();
         let capability = {
             let view = self.view.load();
             finder(&view)
@@ -695,7 +711,6 @@ impl SearchIndexRegistry {
         segment_id: u32,
         column_id: ColumnId,
     ) -> bool {
-        self.ensure_fresh();
         self.view
             .load()
             .has_queryable_artifact(kind, rowset_id, segment_id, column_id)
@@ -705,7 +720,6 @@ impl SearchIndexRegistry {
         &self,
         definition_id: u64,
     ) -> Result<Option<GenerationReadSnapshot>> {
-        self.ensure_fresh();
         let current = self.view.load();
         let Some(state) = current.definitions.get(&definition_id) else {
             return Ok(None);
@@ -717,7 +731,6 @@ impl SearchIndexRegistry {
         &self,
         token: &CapabilityToken,
     ) -> Result<OpenSearchCursorResult<GenerationReadSnapshot>> {
-        self.ensure_fresh();
         let current = self.view.load();
         let Some(state) = current.definitions.get(&token.definition_id) else {
             return Ok(OpenSearchCursorResult::NotQueryable);
@@ -750,7 +763,6 @@ impl SearchIndexRegistry {
         &self,
         definition_id: u64,
     ) -> Result<Option<SearchGenerationCoverage>> {
-        self.ensure_fresh();
         let current = self.view.load();
         let Some(state) = current.definitions.get(&definition_id) else {
             return Ok(None);
@@ -1430,12 +1442,25 @@ impl SearchIndexRegistry {
         visible_version: i64,
         visible_rowsets: &[RowsetSharedPtr],
     ) -> Result<SearchGenerationHeadUpdates> {
+        // Bounded/opportunistic HNSW definitions derive their
+        // exact tail from the committed rowset snapshot at read time, then the
+        // instance-owned maintenance loop coalesces durable manifest/head work.
+        // Persisting one derived revision per small DML transaction serializes
+        // unrelated writers and records state already recoverable from the
+        // tablet rowset graph.
         let definition_ids = self
             .view
             .load()
             .definitions
-            .keys()
-            .copied()
+            .iter()
+            .filter_map(|(definition_id, state)| {
+                let deferred_hnsw = state.definition.kind == SearchIndexKind::Hnsw
+                    && !matches!(
+                        state.definition.freshness_policy,
+                        super::capability::SearchFreshnessPolicy::Required
+                    );
+                (!deferred_hnsw).then_some(*definition_id)
+            })
             .collect::<Vec<_>>();
         let mut updates = SearchGenerationHeadUpdates::default();
         for definition_id in definition_ids {
@@ -3861,12 +3886,14 @@ mod tests {
         let vector_type = LogicalType::Array(Box::new(LogicalType::Float), 4);
         let table =
             create_schema_seeded_hnsw_table(root.path(), &[LogicalType::Integer, vector_type], 1);
+        table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
         table
             .append(&test_chunk_from_vectors(vec![
                 test_i32_vector(&[1, 2]),
                 test_embedding_vector(&[vec![1.0, 0.0, 0.0, 0.0], vec![0.0, 1.0, 0.0, 0.0]], 4),
             ]))
             .unwrap();
+        table.search_registry().maintenance_sweep().unwrap();
 
         let seed_definition_id = SCHEMA_SEED_BIT | 1;
         {
@@ -3883,7 +3910,7 @@ mod tests {
             assert_eq!(manifest.artifacts.artifacts.len(), 1);
             assert!(matches!(
                 manifest.artifacts.artifacts[0].location,
-                ArtifactLocation::Inline { .. }
+                ArtifactLocation::SidecarArtifactFile { .. }
             ));
         }
 
@@ -6045,6 +6072,11 @@ mod tests {
             )]))
             .unwrap();
 
+        // Deferred HNSW rowsets are not serialized into the foreground
+        // transaction. The background reconciliation owns the coalesced
+        // manifest revision.
+        table.search_registry().ensure_fresh();
+
         let delta_entries = load_manifest_delta_entries(&table, 88);
         assert!(delta_entries.iter().any(|entry| matches!(
             entry,
@@ -6188,8 +6220,37 @@ mod tests {
                 .and_then(|state| state.manifest.as_ref())
                 .expect("tail-pending manifest");
             assert!(manifest.artifacts.artifacts.is_empty());
-            assert_eq!(manifest.tail_pending_entries.len(), 2);
+            assert!(manifest.tail_pending_entries.is_empty());
         }
+
+        // The durable generation head deliberately remains unchanged until
+        // maintenance. Query correctness comes from the read snapshot's
+        // version-derived exact tail, not from a foreground manifest rewrite.
+        let opened = table
+            .open_vector_search_cursor(
+                0,
+                &[1.0, 0.0],
+                DistanceMetric::Euclidean,
+                4,
+                SearchParams::default(),
+                None,
+                table.max_version(),
+                &crate::search::SearchReadOptions::ungoverned(),
+            )
+            .unwrap();
+        let mut tail_cursor = opened.cursor;
+        let batch = SearchBatchConfig {
+            row_limit: 16,
+            preferred_bytes: 1 << 20,
+        };
+        let mut budget = ResourceBudget::standalone(64 * 1024 * 1024, 16, 2);
+        let mut tail_rows = 0;
+        while let SearchBatchState::Ready(batch) =
+            tail_cursor.next_batch(&batch, &mut budget).unwrap()
+        {
+            tail_rows += batch.rows.len();
+        }
+        assert_eq!(tail_rows, 4);
 
         let report = table.search_registry().maintenance_sweep().unwrap();
         assert_eq!(report.definitions_updated, 1);
@@ -6368,6 +6429,8 @@ mod tests {
                 1,
             )]))
             .unwrap();
+
+        table.search_registry().ensure_fresh();
 
         let delta_entries = load_manifest_delta_entries(&table, 89);
         assert!(delta_entries.iter().any(|entry| matches!(

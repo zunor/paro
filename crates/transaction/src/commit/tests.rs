@@ -361,6 +361,24 @@ fn in_flight_batch_rejects_later_conflicting_write() {
 }
 
 #[test]
+fn in_flight_batch_accepts_disjoint_primary_key_writes() {
+    let sequencer = CommitSequencer::new(CommitTs::new(20), CommitSequencerOptions::default());
+    let first = plan(1, 18, vec![pk_resource(7)]);
+    let second = plan(2, 18, vec![pk_resource(8)]);
+    let batch = sequencer
+        .sequence_batch(vec![first, second], |accepted| {
+            assert_eq!(accepted.len(), 2);
+            Ok::<_, ()>(())
+        })
+        .unwrap();
+
+    assert_eq!(batch.accepted.len(), 2);
+    assert!(batch.rejected.is_empty());
+    assert_eq!(batch.accepted[0].commit_ts, CommitTs::new(20));
+    assert_eq!(batch.accepted[1].commit_ts, CommitTs::new(21));
+}
+
+#[test]
 fn group_commit_batch_size_limit_is_hard_cap() {
     let options = CommitSequencerOptions {
         max_group_commit_batch_size: 1,
