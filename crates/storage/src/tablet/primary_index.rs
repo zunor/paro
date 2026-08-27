@@ -5,8 +5,8 @@ use super::tablet_runtime::{PrimaryIndexUpdate, Tablet};
 use crate::codec::vector_decoder;
 use crate::compaction::publish::record::PkPublishDelta;
 use crate::primary_key::{
-    DeleteVector, PersistentIndex, PrimaryIndex, PrimaryIndexVersion, PrimaryKeyWriteConflict,
-    RowID,
+    DeleteVector, PersistentIndex, PrimaryIndex, PrimaryIndexProvenance, PrimaryIndexRowsetRoot,
+    PrimaryIndexVersion, PrimaryKeyWriteConflict, RowID,
 };
 use crate::rowset::column::ColumnBatch;
 use crate::rowset::PhysicalRowRef;
@@ -258,11 +258,7 @@ impl Tablet {
             return Ok(Vec::new());
         }
 
-        if self.primary_index_full.load(Ordering::Acquire) {
-            return Ok(self.primary_index_handle().snapshot());
-        }
-
-        Ok(self.persistent_index()?.load()?.snapshot())
+        Ok(self.materialize_complete_primary_index()?.snapshot())
     }
 
     #[doc(hidden)]
@@ -847,8 +843,18 @@ impl Tablet {
     }
 
     pub(super) fn rebuild_primary_index_from_persistent(&self) -> Result<bool> {
-        let persistent = self.persistent_index()?;
-        match persistent.load() {
+        let expected_provenance = self.primary_index_provenance()?;
+        let loaded = (|| {
+            let persistent = self.persistent_index()?;
+            if persistent.provenance() != Some(&expected_provenance) {
+                return Err(paro_error::data_corrupted(format!(
+                    "persistent primary-index provenance does not match tablet {} durable state",
+                    self.tablet_id()
+                )));
+            }
+            persistent.load()
+        })();
+        match loaded {
             Ok(index) => {
                 let index = Arc::new(index);
                 self.register_primary_index_callbacks(&index);
@@ -901,8 +907,21 @@ impl Tablet {
             return Ok(());
         }
 
+        if self.primary_index_full.load(Ordering::Acquire) {
+            if let Err(err) = self.persist_primary_index_snapshot() {
+                self.primary_index_flush_requested
+                    .store(true, Ordering::Release);
+                return Err(err);
+            }
+            idx.clear();
+            self.primary_index_full.store(false, Ordering::Release);
+            return Ok(());
+        }
+
+        let provenance = self.primary_index_provenance()?;
         let mut persistent = self.persistent_index()?;
-        if let Err(err) = persistent.flush_l0(&idx, true) {
+        if let Err(err) = persistent.flush_l0_with_provenance(idx.as_ref(), true, Some(provenance))
+        {
             self.primary_index_flush_requested
                 .store(true, Ordering::Release);
             return Err(err);
@@ -921,12 +940,19 @@ impl Tablet {
             return Ok(());
         }
 
-        if self.reconcile_primary_index_row_count().is_ok() {
-            return Ok(());
+        // Recovery starts from either a provenance-matched base or a strict
+        // rowset rebuild.  Replayed rowsets/deletes then advance that base.
+        // Cardinality remains a diagnostic only; it is never used to accept an
+        // unproven persistent cache.
+        if let Err(error) = self.reconcile_primary_index_row_count() {
+            warn!(
+                tablet_id = self.tablet_id(),
+                error = %error,
+                "replayed primary index failed diagnostics; rebuilding from durable rowsets"
+            );
+            self.rebuild_primary_index_from_visible_rowsets()?;
+            self.reconcile_primary_index_row_count()?;
         }
-
-        self.rebuild_primary_index_from_visible_rowsets()?;
-        self.reconcile_primary_index_row_count()?;
         self.persist_primary_index_snapshot()?;
         Ok(())
     }
@@ -1023,16 +1049,7 @@ impl Tablet {
         }
 
         let visible_rowsets = self.capture_consistent_rowsets(self.max_version())?;
-        if visible_rowsets.is_empty() {
-            return Ok(());
-        }
-
         let repaired = PrimaryIndex::new();
-        let snapshot = self.primary_index_handle().snapshot();
-        if !snapshot.is_empty() {
-            repaired.batch_upsert(snapshot);
-        }
-
         for rowset in visible_rowsets {
             self.upsert_visible_rowset_into_primary_index(
                 &repaired,
@@ -1050,17 +1067,56 @@ impl Tablet {
     }
 
     pub(super) fn persist_primary_index_snapshot(&self) -> Result<()> {
-        let snapshot = self.primary_index_handle().snapshot();
-        let persistent = self.persistent_index()?;
+        let complete = self.materialize_complete_primary_index()?;
+        let provenance = self.primary_index_provenance()?;
+        let persistent = self.persistent_index().or_else(|_| {
+            let _ = std::fs::remove_dir_all(self.persistent_index_dir());
+            self.persistent_index()
+        })?;
         persistent.reset()?;
         let mut persistent = self.persistent_index()?;
-        if !snapshot.is_empty() {
-            let commit_ts = u64::try_from(self.max_version()).unwrap_or(0);
-            persistent.apply_upserts_at(&snapshot, commit_ts)?;
-            let idx = self.primary_index_handle();
-            persistent.flush_l0(&idx, true)?;
-        }
+        persistent.flush_l0_with_provenance(&complete, true, Some(provenance))?;
         Ok(())
+    }
+
+    fn materialize_complete_primary_index(&self) -> Result<PrimaryIndex> {
+        let in_memory = self.primary_index_handle();
+        if self.primary_index_full.load(Ordering::Acquire) {
+            let complete = PrimaryIndex::new();
+            complete.batch_apply_versions(in_memory.snapshot_versions());
+            return Ok(complete);
+        }
+
+        let complete = self.persistent_index()?.load()?;
+        complete.batch_apply_versions(in_memory.snapshot_versions());
+        Ok(complete)
+    }
+
+    fn primary_index_provenance(&self) -> Result<PrimaryIndexProvenance> {
+        let indexed_through_version = self.max_version();
+        let mut rowset_root = self
+            .capture_consistent_rowsets(indexed_through_version)?
+            .into_iter()
+            .map(|rowset| {
+                let meta = rowset.rowset_meta();
+                PrimaryIndexRowsetRoot {
+                    rowset_id: rowset.rowset_id(),
+                    start_version: rowset.start_version(),
+                    end_version: rowset.end_version(),
+                    num_segments: rowset.num_segments(),
+                    effective_rows: meta.effective_rows(),
+                }
+            })
+            .collect::<Vec<_>>();
+        rowset_root.sort_by_key(|rowset| (rowset.start_version, rowset.rowset_id));
+        Ok(PrimaryIndexProvenance {
+            tablet_id: self.tablet_id(),
+            indexed_through_version,
+            layout_epoch: self.layout_epoch(),
+            schema_epoch: self.schema_epoch(),
+            schema_hash: self.schema_hash(),
+            rowset_root,
+        })
     }
 }
 

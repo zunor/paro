@@ -31,6 +31,22 @@ pub enum SearchMaintenanceAction {
     Rebuild,
 }
 
+/// How quickly the database coordinator should service newly visible search
+/// debt. Notifications accelerate discovery; durable manifest state remains
+/// the level-triggered source of truth.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchMaintenanceUrgency {
+    #[default]
+    Debounced,
+    Immediate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SearchMaintenanceFailure {
+    pub definition_id: Option<u64>,
+    pub message: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DefinitionMaintenanceReport {
     pub definition_id: u64,
@@ -56,6 +72,28 @@ pub struct SearchMaintenanceReport {
     pub manifest_delta_compaction_requested: bool,
     pub sidecar_repack_requested: bool,
     pub definitions: Vec<DefinitionMaintenanceReport>,
+    pub failures: Vec<SearchMaintenanceFailure>,
+    pub retry_deferred_definitions: usize,
+}
+
+impl SearchMaintenanceReport {
+    pub fn has_pending_work(&self) -> bool {
+        self.retry_deferred_definitions > 0
+            || !self.failures.is_empty()
+            || self.definitions.iter().any(|definition| {
+                !matches!(definition.action, SearchMaintenanceAction::Skip)
+                    || definition.tail_pending_rows > 0
+            })
+    }
+
+    pub fn requires_immediate_follow_up(&self) -> bool {
+        self.definitions.iter().any(|definition| {
+            matches!(
+                definition.priority,
+                MaintenancePriority::Elevated | MaintenancePriority::Critical
+            )
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,6 +467,58 @@ mod tests {
             scheduler.admit_requests(&[follow_up])[0].is_admitted(),
             "queued task leases must release active provider slots after execution"
         );
+    }
+
+    #[test]
+    fn maintenance_scheduler_single_quantum_does_not_leak_unexecuted_grants() {
+        let scheduler = Arc::new(MaintenanceScheduler::with_policy(
+            MaintenanceAdmissionPolicy {
+                fulltext_concurrency: 2,
+                table_concurrency: 2,
+                ..MaintenanceAdmissionPolicy::default()
+            },
+        ));
+        let requests = [
+            admission_request(
+                8,
+                SearchIndexKind::FullText,
+                MaintenancePriority::Opportunistic,
+                CatchUpBacklogTier::Healthy,
+                CostEstimate::default(),
+            ),
+            admission_request(
+                7,
+                SearchIndexKind::FullText,
+                MaintenancePriority::Critical,
+                CatchUpBacklogTier::Degraded,
+                CostEstimate::default(),
+            ),
+        ];
+
+        let decisions = scheduler.schedule_next_request(&requests);
+        assert_eq!(
+            decisions
+                .iter()
+                .filter(|decision| decision.is_admitted())
+                .count(),
+            1
+        );
+        assert_eq!(scheduler.queued_task_count(), 1);
+        let task = scheduler.pop_next_task().expect("one fairness quantum");
+        assert_eq!(task.request.definition_id, 7);
+        drop(scheduler.scoped_task_lease(&task));
+        assert_eq!(scheduler.queued_task_count(), 0);
+
+        let follow_up = scheduler.schedule_next_request(&requests);
+        assert_eq!(
+            follow_up
+                .iter()
+                .filter(|decision| decision.is_admitted())
+                .count(),
+            1
+        );
+        let task = scheduler.pop_next_task().expect("next fairness quantum");
+        drop(scheduler.scoped_task_lease(&task));
     }
 
     #[test]

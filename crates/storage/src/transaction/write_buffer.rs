@@ -12,7 +12,8 @@ use crate::rowset::RowsetSharedPtr;
 use crate::search::write_path::SearchWriteContext;
 use crate::table::runtime_indexes::RuntimeIndexes;
 use crate::tablet::{
-    LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, TabletRef, TabletState,
+    LayoutMaintenanceLease, PhysicalRowRef, PrimaryIndexUpdate, SearchIngestAdmissionLease,
+    TabletRef, TabletState,
 };
 use crate::transaction::spill::{
     StagedDeleteVectorArtifact, StagedRowsetArtifact, TxnSpillMark, TxnSpillState,
@@ -320,6 +321,10 @@ pub(crate) struct PreparedStorageState {
     /// Shared physical-layout leases acquired before SQL transaction locks are
     /// released and retained through required tablet publication.
     pub(crate) _layout_leases: Vec<LayoutMaintenanceLease>,
+    /// Capacity reservations acquired before durable append and released by
+    /// required apply or abort. This closes the check-then-publish race among
+    /// concurrently prepared transactions targeting the same HNSW tail.
+    pub(crate) _search_ingest_admissions: Vec<SearchIngestAdmissionLease>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -1035,6 +1040,38 @@ impl TxnWriteBuffer {
         let mutations = std::mem::take(&mut inner.mutations);
         self.republish_stats_locked(&inner);
         Ok(mutations)
+    }
+
+    /// Return the physical rowset volume that will be published per tablet.
+    ///
+    /// Commit admission runs before the durable journal append. Keeping this
+    /// read-only snapshot on the write buffer avoids moving pending artifacts
+    /// out of rollback ownership while a level-triggered search-maintenance
+    /// gate may wait or reject the transaction.
+    pub(crate) fn pending_rowset_volume_by_tablet(&self) -> Result<Vec<(TabletRef, u64, u64)>> {
+        let inner = self
+            .inner
+            .lock()
+            .map_err(|e| paro_error::internal(format!("failed to lock txn write buffer: {e}")))?;
+        let mut volume_by_tablet = BTreeMap::<u64, (TabletRef, u64, u64)>::new();
+        for mutation in &inner.mutations {
+            let PendingMutation::Rowset(pending) = mutation else {
+                continue;
+            };
+            let entry = volume_by_tablet
+                .entry(pending.tablet.tablet_id())
+                .or_insert_with(|| (Arc::clone(&pending.tablet), 0, 0));
+            let rows = pending.rowset.num_rows();
+            let on_disk = pending.rowset.total_disk_size();
+            let bytes = if on_disk > 0 {
+                on_disk
+            } else {
+                rows.saturating_mul(64)
+            };
+            entry.1 = entry.1.saturating_add(rows);
+            entry.2 = entry.2.saturating_add(bytes);
+        }
+        Ok(volume_by_tablet.into_values().collect())
     }
 
     pub(crate) fn set_prepared(&self, prepared: PreparedStorageState) -> Result<()> {

@@ -24,7 +24,10 @@ pub use delete_vector::{DeleteVector, DeleteVectorSnapshot};
 pub use immutable_index::{
     ImmutableIndexBuildOptions, ImmutableIndexReader, ImmutableIndexStats, ImmutableIndexWriter,
 };
-pub use persistent_index::{PersistentIndex, PERSISTENT_INDEX_FORMAT_VERSION};
+pub use persistent_index::{
+    PersistentIndex, PrimaryIndexProvenance, PrimaryIndexRowsetRoot,
+    PERSISTENT_INDEX_FORMAT_VERSION,
+};
 pub use primary_index::{
     PrimaryIndex, PrimaryIndexVersion, PrimaryKeySerializer, PrimaryKeyWriteConflict,
 };

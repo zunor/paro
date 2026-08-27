@@ -4,8 +4,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock};
-use std::time::Instant;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, RwLock};
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 use paro_scheduler::scheduler::TaskScheduler;
@@ -21,7 +21,7 @@ use paro_common::error::{self as paro_error, Result};
 use super::artifact::{ArtifactFileId, ArtifactGcContext, ArtifactLocation, GcDecision};
 use super::capability::{
     ArtifactSegmentRef, CapabilityToken, SearchArtifactRef, SearchCapability,
-    SearchDefinitionOrigin, SearchIndexDefinition, SearchIndexKind,
+    SearchDefinitionOrigin, SearchFreshnessPolicy, SearchIndexDefinition, SearchIndexKind,
 };
 use super::cursor::{GenerationArtifactSet, GenerationReadSnapshot, OpenSearchCursorResult};
 use super::definition::freshness::capability_needs_required_freshness_wait;
@@ -61,7 +61,8 @@ use super::lifecycle::publisher::{
 };
 use super::maintenance::{
     CatchUpPlanner, DefinitionMaintenanceReport, InlineSearchAdmission, MaintenanceScheduler,
-    SearchMaintenanceAction, SearchMaintenanceReport,
+    SearchMaintenanceAction, SearchMaintenanceFailure, SearchMaintenanceReport,
+    SearchMaintenanceUrgency,
 };
 use super::manifest::{
     GenerationManifestRoot, LoadedManifest, ManifestDelta, ManifestDeltaEntry, ManifestShard,
@@ -72,12 +73,14 @@ use super::sidecar_builder::ProviderSidecarArtifactBuilder;
 use super::staged_generation::{StagedSearchGeneration, StagedSearchGenerationInit};
 use super::stats::MaintenancePriority;
 use super::tail::{
-    TailEntryId, TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
+    exact_merge::TailExactMergeBudget, provider_tail_exact_merge_policy, TailEntryId,
+    TailMutationKind, TailPendingEntry, TailPendingSet, TailRowImageRef,
 };
 use super::write_path::SearchWriteContext;
 
 const REQUIRED_FRESHNESS_WAIT_SWEEPS: usize = 32;
 const DEFINITION_LOCK_SHARDS: usize = 64;
+const HNSW_INGEST_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Debug)]
 struct RetiredManifest {
@@ -87,6 +90,28 @@ struct RetiredManifest {
     sidecar_file_ids: BTreeSet<ArtifactFileId>,
     paths: Vec<PathBuf>,
     retired_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+struct MaintenanceFailureBackoff {
+    consecutive_failures: u32,
+    retry_after: Instant,
+}
+
+#[derive(Debug, Default)]
+struct SearchIngestAdmissionState {
+    reserved_rows: u64,
+    reserved_bytes: u64,
+    progress_epoch: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HnswIngestAdmissionBlocker {
+    definition_id: u64,
+    pending_rows: u64,
+    pending_bytes: u64,
+    row_limit: u64,
+    byte_limit: u64,
 }
 
 pub(crate) struct SearchIndexRegistry {
@@ -111,7 +136,10 @@ pub(crate) struct SearchIndexRegistry {
     reader_runtime: Arc<SearchReaderRuntime>,
     maintenance_scheduler: Arc<MaintenanceScheduler>,
     hnsw_task_scheduler: RwLock<Option<Arc<TaskScheduler>>>,
-    maintenance_notifier: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
+    maintenance_notifier: RwLock<Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>>,
+    maintenance_failures: Mutex<BTreeMap<u64, MaintenanceFailureBackoff>>,
+    ingest_admission: Mutex<SearchIngestAdmissionState>,
+    maintenance_progress_changed: Condvar,
 }
 
 impl std::fmt::Debug for SearchIndexRegistry {
@@ -125,6 +153,102 @@ impl std::fmt::Debug for SearchIndexRegistry {
 }
 
 impl RowsetPublishObserver for SearchIndexRegistry {
+    fn wait_for_rowset_publish_admission(
+        &self,
+        tablet_id: TabletId,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+    ) -> Result<()> {
+        if tablet_id != self.tablet.tablet_id() || (incoming_rows == 0 && incoming_bytes == 0) {
+            return Ok(());
+        }
+        let deadline = Instant::now() + HNSW_INGEST_BACKPRESSURE_TIMEOUT;
+        let mut admission = self
+            .ingest_admission
+            .lock()
+            .map_err(|_| paro_error::internal("lock search ingest admission"))?;
+        loop {
+            let blocked = self.hnsw_ingest_admission_blocker(
+                incoming_rows,
+                incoming_bytes,
+                admission.reserved_rows,
+                admission.reserved_bytes,
+            );
+            let Some(blocker) = blocked else {
+                admission.reserved_rows = admission.reserved_rows.saturating_add(incoming_rows);
+                admission.reserved_bytes = admission.reserved_bytes.saturating_add(incoming_bytes);
+                return Ok(());
+            };
+            if blocker.pending_rows == 0
+                && blocker.pending_bytes == 0
+                && admission.reserved_rows == 0
+                && admission.reserved_bytes == 0
+                && (incoming_rows > blocker.row_limit || incoming_bytes > blocker.byte_limit)
+            {
+                return Err(paro_error::invalid_input(format!(
+                    "rowset with {incoming_rows} rows/{incoming_bytes} bytes exceeds HNSW definition {} freshness window {}/{}; split the write into bounded rowsets",
+                    blocker.definition_id, blocker.row_limit, blocker.byte_limit
+                )));
+            }
+
+            if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
+                notifier(SearchMaintenanceUrgency::Immediate);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "HNSW definition {} tail backpressure timed out: pending={}/{}, reserved={}/{}, admission_limit={}/{}",
+                    blocker.definition_id,
+                    blocker.pending_rows,
+                    blocker.pending_bytes,
+                    admission.reserved_rows,
+                    admission.reserved_bytes,
+                    blocker.row_limit,
+                    blocker.byte_limit
+                )));
+            }
+            let observed_epoch = admission.progress_epoch;
+            let wait = deadline.saturating_duration_since(now);
+            let (next, _) = self
+                .maintenance_progress_changed
+                .wait_timeout(admission, wait)
+                .map_err(|_| paro_error::internal("wait for search maintenance progress"))?;
+            admission = next;
+            if admission.progress_epoch == observed_epoch && Instant::now() >= deadline {
+                return Err(paro_error::artifact_not_ready(format!(
+                    "HNSW definition {} tail backpressure timed out: pending={}/{}, reserved={}/{}, admission_limit={}/{}",
+                    blocker.definition_id,
+                    blocker.pending_rows,
+                    blocker.pending_bytes,
+                    admission.reserved_rows,
+                    admission.reserved_bytes,
+                    blocker.row_limit,
+                    blocker.byte_limit
+                )));
+            }
+        }
+    }
+
+    fn release_rowset_publish_admission(
+        &self,
+        tablet_id: TabletId,
+        reserved_rows: u64,
+        reserved_bytes: u64,
+    ) {
+        if tablet_id != self.tablet.tablet_id() || (reserved_rows == 0 && reserved_bytes == 0) {
+            return;
+        }
+        let mut admission = self
+            .ingest_admission
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        admission.reserved_rows = admission.reserved_rows.saturating_sub(reserved_rows);
+        admission.reserved_bytes = admission.reserved_bytes.saturating_sub(reserved_bytes);
+        admission.progress_epoch = admission.progress_epoch.saturating_add(1);
+        self.maintenance_progress_changed.notify_all();
+    }
+
     fn prepare_rowset_publish(
         &self,
         tablet_id: TabletId,
@@ -228,7 +352,19 @@ impl RowsetPublishObserver for SearchIndexRegistry {
         self.sweep_retired();
         if maintenance_needed {
             if let Some(notifier) = self.maintenance_notifier.read().unwrap().as_ref() {
-                notifier();
+                let urgency = if self.view.load().definitions.values().any(|state| {
+                    state.manifest.as_ref().is_some_and(|manifest| {
+                        matches!(
+                            manifest.root.maintenance_state.recovery.priority,
+                            MaintenancePriority::Elevated | MaintenancePriority::Critical
+                        )
+                    })
+                }) {
+                    SearchMaintenanceUrgency::Immediate
+                } else {
+                    SearchMaintenanceUrgency::Debounced
+                };
+                notifier(urgency);
             }
         }
     }
@@ -252,6 +388,54 @@ impl RowsetPublishObserver for SearchIndexRegistry {
 }
 
 impl SearchIndexRegistry {
+    fn hnsw_ingest_admission_blocker(
+        &self,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+        reserved_rows: u64,
+        reserved_bytes: u64,
+    ) -> Option<HnswIngestAdmissionBlocker> {
+        self.view.load().definitions.values().find_map(|state| {
+            if state.definition.kind != SearchIndexKind::Hnsw {
+                return None;
+            }
+            let manifest = state.manifest.as_ref()?;
+            let pending_rows = manifest.root.maintenance_state.recovery.tail_pending_rows;
+            let pending_bytes = manifest
+                .tail_pending_entries
+                .iter()
+                .filter(|entry| entry.mutation != TailMutationKind::Delete)
+                .map(|entry| entry.byte_count)
+                .sum::<u64>();
+            let exact_limit =
+                provider_tail_exact_merge_policy(SearchIndexKind::Hnsw).hard_row_limit;
+            let row_limit = match state.definition.freshness_policy {
+                SearchFreshnessPolicy::Required => return None,
+                SearchFreshnessPolicy::BoundedLag { max_tail_rows, .. } => {
+                    max_tail_rows.min(exact_limit)
+                }
+                SearchFreshnessPolicy::Opportunistic => exact_limit,
+            };
+            let byte_limit = TailExactMergeBudget::for_search_kind(SearchIndexKind::Hnsw)
+                .max_tail_exact_merge_bytes;
+            (pending_rows
+                .saturating_add(reserved_rows)
+                .saturating_add(incoming_rows)
+                > row_limit
+                || pending_bytes
+                    .saturating_add(reserved_bytes)
+                    .saturating_add(incoming_bytes)
+                    > byte_limit)
+                .then_some(HnswIngestAdmissionBlocker {
+                    definition_id: state.definition.definition_id,
+                    pending_rows,
+                    pending_bytes,
+                    row_limit,
+                    byte_limit,
+                })
+        })
+    }
+
     fn disable_definition_capability(&self, definition_id: u64) -> Result<()> {
         self.mutate_view(|view| {
             let Some(state) = view.definitions.get_mut(&definition_id) else {
@@ -281,6 +465,9 @@ impl SearchIndexRegistry {
             maintenance_scheduler: Arc::new(MaintenanceScheduler::default()),
             hnsw_task_scheduler: RwLock::new(None),
             maintenance_notifier: RwLock::new(None),
+            maintenance_failures: Mutex::new(BTreeMap::new()),
+            ingest_admission: Mutex::new(SearchIngestAdmissionState::default()),
+            maintenance_progress_changed: Condvar::new(),
         };
         if let Err(err) = registry.manifests.sweep_orphan_staging_fragments() {
             tracing::warn!(
@@ -311,7 +498,10 @@ impl SearchIndexRegistry {
         *self.hnsw_task_scheduler.write().unwrap() = scheduler;
     }
 
-    pub(crate) fn bind_maintenance_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+    pub(crate) fn bind_maintenance_notifier(
+        &self,
+        notifier: Option<Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>>,
+    ) {
         *self.maintenance_notifier.write().unwrap() = notifier;
     }
 
@@ -905,9 +1095,9 @@ impl SearchIndexRegistry {
             return Ok(0);
         };
         drop(latest);
-        if head_for_state(&self.manifests, &latest_state) != head_for_state(&self.manifests, &state)
-            || latest_state.definition != state.definition
+        if latest_state.definition != state.definition
             || latest_state.origin != state.origin
+            || !Self::catch_up_artifacts_rebaseable(&latest_state, &result.artifact_refs)
         {
             remove_sidecar_packages(&sidecar_store, &sidecar_file_ids);
             return Ok(0);
@@ -937,7 +1127,45 @@ impl SearchIndexRegistry {
         drop(state);
         self.sweep_retired();
         record_tail_metrics_for_state(&next_state);
+        self.signal_maintenance_progress()?;
         Ok(touched)
+    }
+
+    /// A catch-up build owns a frozen prefix, not the whole manifest head.
+    /// Foreground ingest may append new tail entries while provider work runs;
+    /// those appends are safe to preserve. Physical replacement or another
+    /// publication covering any built segment is not safe and rejects rebase.
+    fn catch_up_artifacts_rebaseable(
+        latest_state: &SearchDefinitionState,
+        artifacts: &[SearchArtifactRef],
+    ) -> bool {
+        let (Some(manifest), Some(generation)) = (
+            latest_state.manifest.as_ref(),
+            latest_state.generation.as_ref(),
+        ) else {
+            return false;
+        };
+        let pending_segments = manifest
+            .tail_pending_entries
+            .iter()
+            .filter(|entry| !matches!(entry.mutation, TailMutationKind::Delete))
+            .flat_map(|entry| {
+                entry
+                    .segment_ids
+                    .iter()
+                    .map(move |segment_id| (entry.rowset_id, *segment_id))
+            })
+            .collect::<BTreeSet<_>>();
+        !artifacts.is_empty()
+            && artifacts.iter().all(|artifact| {
+                artifact.definition_id == latest_state.definition.definition_id
+                    && artifact.kind == latest_state.definition.kind
+                    && artifact.generation_id == generation.generation_id
+                    && artifact.coverage.segments().iter().all(|span| {
+                        pending_segments
+                            .contains(&(span.segment.rowset_id, span.segment.segment_id))
+                    })
+            })
     }
 
     pub(crate) fn bootstrap_migration(&self) -> Result<SearchBootstrapReport> {
@@ -980,6 +1208,17 @@ impl SearchIndexRegistry {
 
         let mut planned = Vec::new();
         for definition_id in definition_ids {
+            if self
+                .maintenance_failures
+                .lock()
+                .map_err(|_| paro_error::internal("lock search maintenance failure backoff"))?
+                .get(&definition_id)
+                .is_some_and(|failure| Instant::now() < failure.retry_after)
+            {
+                report.retry_deferred_definitions =
+                    report.retry_deferred_definitions.saturating_add(1);
+                continue;
+            }
             let snapshot = self.view.load();
             let Some(state) = snapshot.definitions.get(&definition_id).cloned() else {
                 continue;
@@ -1020,7 +1259,18 @@ impl SearchIndexRegistry {
                 &gc_context,
                 delta_window_bytes,
             );
-            let provider_request = provider_maintenance_request_for_definition(&state, manifest)?;
+            let provider_request =
+                match provider_maintenance_request_for_definition(&state, manifest) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.record_maintenance_failure(definition_id)?;
+                        report.failures.push(SearchMaintenanceFailure {
+                            definition_id: Some(definition_id),
+                            message: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
             let request = self.maintenance_scheduler.admission_request(
                 &state.definition,
                 manifest,
@@ -1039,7 +1289,7 @@ impl SearchIndexRegistry {
             .iter()
             .map(|(_, _, _, _, request)| request.clone())
             .collect::<Vec<_>>();
-        let admissions = self.maintenance_scheduler.schedule_requests(&requests);
+        let admissions = self.maintenance_scheduler.schedule_next_request(&requests);
         for ((definition_id, recovery, mut decision, provider_request, _), admission) in
             planned.into_iter().zip(admissions)
         {
@@ -1070,36 +1320,83 @@ impl SearchIndexRegistry {
             });
         }
 
-        while let Some(task) = self.maintenance_scheduler.pop_next_task() {
+        // One admitted definition is one table-level quantum. The database
+        // coordinator visits every table before returning here, so a large
+        // definition set cannot monopolize the shared HNSW build executor.
+        if let Some(task) = self.maintenance_scheduler.pop_next_task() {
             let _grant_lease = self.maintenance_scheduler.scoped_task_lease(&task);
-            match task.request.action {
-                SearchMaintenanceAction::CatchUp => {
-                    let touched = self.catch_up_definition(task.request.definition_id)?;
-                    if touched > 0 {
-                        report.definitions_updated += 1;
-                        report.catch_up_rowsets = report.catch_up_rowsets.saturating_add(touched);
-                    }
-                }
-                SearchMaintenanceAction::CompactManifestDelta => {
-                    if self.compact_manifest_deltas_for_definition(task.request.definition_id)? {
-                        report.definitions_updated += 1;
-                    }
-                }
-                SearchMaintenanceAction::RepackSidecar => {
-                    let repacked =
-                        self.repack_sidecars_for_definition(task.request.definition_id)?;
-                    if repacked > 0 {
-                        report.definitions_updated += 1;
-                    }
-                }
+            let definition_id = task.request.definition_id;
+            let task_result = match task.request.action {
+                SearchMaintenanceAction::CatchUp => self
+                    .catch_up_definition(definition_id)
+                    .map(|touched| (touched > 0, touched)),
+                SearchMaintenanceAction::CompactManifestDelta => self
+                    .compact_manifest_deltas_for_definition(definition_id)
+                    .map(|updated| (updated, 0)),
+                SearchMaintenanceAction::RepackSidecar => self
+                    .repack_sidecars_for_definition(definition_id)
+                    .map(|repacked| (repacked > 0, 0)),
                 SearchMaintenanceAction::Compact | SearchMaintenanceAction::Rebuild => {
                     report.compaction_requested = true;
+                    Ok((false, 0))
                 }
-                SearchMaintenanceAction::Skip => {}
+                SearchMaintenanceAction::Skip => Ok((false, 0)),
+            };
+            match task_result {
+                Ok((updated, catch_up_rowsets)) => {
+                    self.clear_maintenance_failure(definition_id)?;
+                    report.definitions_updated += usize::from(updated);
+                    report.catch_up_rowsets =
+                        report.catch_up_rowsets.saturating_add(catch_up_rowsets);
+                }
+                Err(error) => {
+                    self.record_maintenance_failure(definition_id)?;
+                    report.failures.push(SearchMaintenanceFailure {
+                        definition_id: Some(definition_id),
+                        message: error.to_string(),
+                    });
+                }
             }
         }
 
         Ok(report)
+    }
+
+    fn record_maintenance_failure(&self, definition_id: u64) -> Result<()> {
+        let mut failures = self
+            .maintenance_failures
+            .lock()
+            .map_err(|_| paro_error::internal("lock search maintenance failure backoff"))?;
+        let consecutive_failures = failures
+            .get(&definition_id)
+            .map_or(1, |failure| failure.consecutive_failures.saturating_add(1));
+        let exponent = consecutive_failures.saturating_sub(1).min(6);
+        failures.insert(
+            definition_id,
+            MaintenanceFailureBackoff {
+                consecutive_failures,
+                retry_after: Instant::now() + Duration::from_secs(1u64 << exponent),
+            },
+        );
+        Ok(())
+    }
+
+    fn clear_maintenance_failure(&self, definition_id: u64) -> Result<()> {
+        self.maintenance_failures
+            .lock()
+            .map_err(|_| paro_error::internal("lock search maintenance failure backoff"))?
+            .remove(&definition_id);
+        Ok(())
+    }
+
+    fn signal_maintenance_progress(&self) -> Result<()> {
+        let mut admission = self
+            .ingest_admission
+            .lock()
+            .map_err(|_| paro_error::internal("lock search maintenance progress"))?;
+        admission.progress_epoch = admission.progress_epoch.saturating_add(1);
+        self.maintenance_progress_changed.notify_all();
+        Ok(())
     }
 
     pub(crate) fn repack_sidecars_for_definition(&self, definition_id: u64) -> Result<usize> {
@@ -3646,6 +3943,89 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_publication_rebases_only_over_appended_tail() {
+        let definition = hnsw_test_definition(45);
+        let manifest = LoadedManifest {
+            root: GenerationManifestRoot {
+                definition_id: 45,
+                generation_id: 1,
+                build_epoch: 1,
+                build_snapshot_version: 1,
+                indexed_through_ts: 1,
+                config_fingerprint: definition.config_fingerprint,
+                coverage: CoverageState::TailPending {
+                    pending_rowsets: 2,
+                    pending_segments: 2,
+                    pending_rows: 30,
+                    exact_tail_merge: true,
+                },
+                generation_stats: GenerationStats::default(),
+                persisted_tail_entry_id_seed: TailEntryId(3),
+                execution_modes: ExecutionModes::default(),
+                maintenance_state: GenerationMaintenanceState::default(),
+                root_version: 2,
+                checksum: 0,
+                shard_files: Vec::new(),
+                recent_delta_files: Vec::new(),
+            },
+            root_path: PathBuf::new(),
+            shard_paths: Vec::new(),
+            delta_paths: Vec::new(),
+            tail_entry_id_allocator: TailEntryId(3),
+            publication_lease: None,
+            artifacts: Arc::new(GenerationArtifactSet::default()),
+            tail_pending_entries: vec![
+                TailPendingEntry {
+                    entry_id: TailEntryId(1),
+                    rowset_id: 11,
+                    segment_ids: vec![0],
+                    mutation: TailMutationKind::Append,
+                    row_count: 10,
+                    byte_count: 1_024,
+                    row_image_ref: Some(TailRowImageRef::WholeRowset),
+                },
+                TailPendingEntry {
+                    entry_id: TailEntryId(2),
+                    rowset_id: 12,
+                    segment_ids: vec![0],
+                    mutation: TailMutationKind::Append,
+                    row_count: 20,
+                    byte_count: 2_048,
+                    row_image_ref: Some(TailRowImageRef::WholeRowset),
+                },
+            ],
+        };
+        let state = SearchDefinitionState::new(definition, SearchDefinitionOrigin::catalog(45))
+            .unwrap()
+            .with_manifest(manifest);
+        let built_prefix = hnsw_test_artifact(45, 11, 10, 1, 16);
+
+        assert!(SearchIndexRegistry::catch_up_artifacts_rebaseable(
+            &state,
+            std::slice::from_ref(&built_prefix)
+        ));
+
+        let mut compacted = state.clone();
+        compacted
+            .manifest
+            .as_mut()
+            .unwrap()
+            .tail_pending_entries
+            .remove(0);
+        assert!(!SearchIndexRegistry::catch_up_artifacts_rebaseable(
+            &compacted,
+            std::slice::from_ref(&built_prefix)
+        ));
+
+        let mut wrong_generation = built_prefix;
+        wrong_generation.generation_id = 2;
+        assert!(!SearchIndexRegistry::catch_up_artifacts_rebaseable(
+            &state,
+            &[wrong_generation]
+        ));
+    }
+
+    #[test]
     fn registry_write_context_carries_inline_builder_set() {
         let mut view = SearchView::default();
         let fulltext_definition = SearchIndexDefinition {
@@ -6115,6 +6495,33 @@ mod tests {
                 ..
             }
         ));
+        let blocker = table
+            .search_registry()
+            .hnsw_ingest_admission_blocker(4_095, 0, 0, 0)
+            .expect("row high watermark");
+        assert_eq!(blocker.definition_id, 88);
+        assert_eq!(blocker.pending_rows, 2);
+        assert_eq!(blocker.row_limit, 4_096);
+
+        let admission = table
+            .tablet()
+            .acquire_search_rowset_publish_admission(2_000, 1_234)
+            .unwrap()
+            .expect("search registry is bound");
+        let (reserved_rows, reserved_bytes) = {
+            let reserved = table.search_registry().ingest_admission.lock().unwrap();
+            (reserved.reserved_rows, reserved.reserved_bytes)
+        };
+        assert_eq!((reserved_rows, reserved_bytes), (2_000, 1_234));
+        assert!(table
+            .search_registry()
+            .hnsw_ingest_admission_blocker(2_095, 0, reserved_rows, reserved_bytes)
+            .is_some(),
+            "prepared transactions must reserve capacity instead of racing on a check-only watermark");
+        drop(admission);
+        let released = table.search_registry().ingest_admission.lock().unwrap();
+        assert_eq!(released.reserved_rows, 0);
+        assert_eq!(released.reserved_bytes, 0);
     }
 
     #[test]

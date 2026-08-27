@@ -368,14 +368,28 @@ impl MaintenanceScheduler {
         &self,
         requests: &[MaintenanceAdmissionRequest],
     ) -> Vec<MaintenanceAdmissionDecision> {
-        self.admit_requests_inner(requests, false)
+        self.admit_requests_inner(requests, false, None)
     }
 
     pub(crate) fn schedule_requests(
         &self,
         requests: &[MaintenanceAdmissionRequest],
     ) -> Vec<MaintenanceAdmissionDecision> {
-        self.admit_requests_inner(requests, true)
+        self.admit_requests_inner(requests, true, None)
+    }
+
+    /// Admit and enqueue at most one request from this scheduling quantum.
+    ///
+    /// Callers that execute one unit of work per fairness turn must not use
+    /// [`Self::schedule_requests`]: every admitted request owns an active grant
+    /// until its queued task is executed. Limiting admission here makes queue
+    /// ownership match execution ownership instead of leaving unconsumed
+    /// grants behind to throttle later turns.
+    pub(crate) fn schedule_next_request(
+        &self,
+        requests: &[MaintenanceAdmissionRequest],
+    ) -> Vec<MaintenanceAdmissionDecision> {
+        self.admit_requests_inner(requests, true, Some(1))
     }
 
     pub(crate) fn pop_next_task(&self) -> Option<MaintenanceQueuedTask> {
@@ -394,6 +408,7 @@ impl MaintenanceScheduler {
         &self,
         requests: &[MaintenanceAdmissionRequest],
         queue_admitted: bool,
+        max_new_grants: Option<usize>,
     ) -> Vec<MaintenanceAdmissionDecision> {
         let Ok(mut state) = self.state.lock() else {
             return requests
@@ -445,10 +460,17 @@ impl MaintenanceScheduler {
                 })
         });
 
+        let mut new_grants = 0usize;
         for index in order {
             let request = &requests[index];
             if matches!(request.action, SearchMaintenanceAction::Skip) {
                 decisions[index] = MaintenanceAdmissionDecision::NotRequired;
+                continue;
+            }
+            if max_new_grants.is_some_and(|limit| new_grants >= limit) {
+                decisions[index] = MaintenanceAdmissionDecision::Deferred {
+                    reason: MaintenanceAdmissionReason::TableFairness,
+                };
                 continue;
             }
             if state
@@ -505,6 +527,7 @@ impl MaintenanceScheduler {
                     budget: request.estimate.cost,
                 },
             );
+            new_grants = new_grants.saturating_add(1);
             if queue_admitted {
                 let task_id = state.next_task_id.fetch_add(1, Ordering::Relaxed);
                 state.queued_tasks.insert(

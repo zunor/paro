@@ -65,7 +65,10 @@ impl TableHandle {
         self.search_registry.bind_task_scheduler(scheduler);
     }
 
-    pub fn bind_search_maintenance_notifier(&self, notifier: Option<Arc<dyn Fn() + Send + Sync>>) {
+    pub fn bind_search_maintenance_notifier(
+        &self,
+        notifier: Option<Arc<dyn Fn(crate::search::SearchMaintenanceUrgency) + Send + Sync>>,
+    ) {
         self.search_registry.bind_maintenance_notifier(notifier);
     }
 

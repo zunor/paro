@@ -837,3 +837,31 @@ fn test_finalize_load_marks_database_ready_without_recovery() {
     assert_eq!(db.state(), DbState::Ready);
     assert!(db.has_storage_manager());
 }
+
+#[test]
+fn continuous_search_maintenance_requests_cannot_extend_max_delay() {
+    let now = Instant::now();
+    let pending = SearchMaintenancePending {
+        requested_epoch: 10_000,
+        completed_epoch: 0,
+        first_request: Some(now - SEARCH_MAINTENANCE_MAX_DELAY),
+        // Model a writer that reset the trailing edge immediately before this
+        // decision. The anchored first request still makes the pass runnable.
+        last_request: Some(now),
+        immediate: false,
+    };
+    assert_eq!(pending.wait_before_run(now), None);
+}
+
+#[test]
+fn elevated_search_maintenance_bypasses_debounce() {
+    let now = Instant::now();
+    let pending = SearchMaintenancePending {
+        requested_epoch: 1,
+        completed_epoch: 0,
+        first_request: Some(now),
+        last_request: Some(now),
+        immediate: true,
+    };
+    assert_eq!(pending.wait_before_run(now), None);
+}

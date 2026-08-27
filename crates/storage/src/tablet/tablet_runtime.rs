@@ -209,7 +209,55 @@ impl SearchGenerationHeadUpdates {
     }
 }
 
+pub(crate) struct SearchIngestAdmissionLease {
+    observer: Option<Arc<dyn RowsetPublishObserver>>,
+    tablet_id: TabletId,
+    reserved_rows: u64,
+    reserved_bytes: u64,
+}
+
+impl std::fmt::Debug for SearchIngestAdmissionLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SearchIngestAdmissionLease")
+            .field("tablet_id", &self.tablet_id)
+            .field("reserved_rows", &self.reserved_rows)
+            .field("reserved_bytes", &self.reserved_bytes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SearchIngestAdmissionLease {
+    fn drop(&mut self) {
+        if let Some(observer) = self.observer.take() {
+            observer.release_rowset_publish_admission(
+                self.tablet_id,
+                self.reserved_rows,
+                self.reserved_bytes,
+            );
+        }
+    }
+}
+
 pub(crate) trait RowsetPublishObserver: Send + Sync + std::fmt::Debug {
+    /// Apply level-triggered backpressure before taking tablet publication
+    /// locks. Implementations must not wait while a layout/meta lock is held.
+    fn wait_for_rowset_publish_admission(
+        &self,
+        _tablet_id: TabletId,
+        _incoming_rows: u64,
+        _incoming_bytes: u64,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    fn release_rowset_publish_admission(
+        &self,
+        _tablet_id: TabletId,
+        _reserved_rows: u64,
+        _reserved_bytes: u64,
+    ) {
+    }
+
     fn prepare_rowset_publish(
         &self,
         _tablet_id: TabletId,
@@ -816,6 +864,33 @@ impl Tablet {
         if let Some(observer) = observer {
             observer.rowset_published(self.tablet_id(), version, rowset, search_updates);
         }
+    }
+
+    pub(crate) fn acquire_search_rowset_publish_admission(
+        &self,
+        incoming_rows: u64,
+        incoming_bytes: u64,
+    ) -> Result<Option<SearchIngestAdmissionLease>> {
+        let observer = self
+            .rowset_publish_observer
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(std::sync::Weak::upgrade);
+        if let Some(observer) = observer {
+            observer.wait_for_rowset_publish_admission(
+                self.tablet_id(),
+                incoming_rows,
+                incoming_bytes,
+            )?;
+            return Ok(Some(SearchIngestAdmissionLease {
+                observer: Some(observer),
+                tablet_id: self.tablet_id(),
+                reserved_rows: incoming_rows,
+                reserved_bytes: incoming_bytes,
+            }));
+        }
+        Ok(None)
     }
 
     fn prepare_search_rowset_publish(
@@ -3981,6 +4056,31 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct RejectingSearchAdmissionObserver;
+
+    impl RowsetPublishObserver for RejectingSearchAdmissionObserver {
+        fn wait_for_rowset_publish_admission(
+            &self,
+            _tablet_id: TabletId,
+            _incoming_rows: u64,
+            _incoming_bytes: u64,
+        ) -> Result<()> {
+            Err(paro_error::artifact_not_ready(
+                "injected pre-durable search admission rejection",
+            ))
+        }
+
+        fn rowset_published(
+            &self,
+            _tablet_id: TabletId,
+            _version: i64,
+            _rowset: RowsetSharedPtr,
+            _search_updates: SearchGenerationHeadUpdates,
+        ) {
+        }
+    }
+
     fn create_test_schema() -> TabletSchemaRef {
         let columns = vec![
             TabletColumn::key(0, "id", LogicalType::BigInt),
@@ -4441,6 +4541,22 @@ mod tests {
 
         assert_eq!(tablet.max_version(), 0);
         assert_eq!(tablet.search_generation_head(77).unwrap().root_version, 1);
+    }
+
+    #[test]
+    fn required_rowset_apply_never_reenters_pre_durable_search_admission() {
+        let schema = create_test_schema();
+        let tablet = Tablet::new(1, 100, 1000, schema, test_data_dir(), None).unwrap();
+        let observer: Arc<dyn RowsetPublishObserver> = Arc::new(RejectingSearchAdmissionObserver);
+        tablet.bind_rowset_publish_observer(Arc::downgrade(&observer));
+
+        assert!(tablet
+            .acquire_search_rowset_publish_admission(1, 64)
+            .is_err());
+        tablet
+            .rowset_commit_auto(create_test_rowset(1, Version::singleton(0), 1))
+            .expect("required apply must not fail after the journal became durable");
+        assert_eq!(tablet.max_version(), 0);
     }
 
     #[test]
@@ -5101,7 +5217,7 @@ mod tests {
     }
 
     #[test]
-    fn test_tablet_init_rebuilds_primary_index_from_persistent() {
+    fn test_tablet_init_rejects_primary_index_without_durable_provenance() {
         let tmp = TempDir::new().unwrap();
         let schema = create_test_schema();
         let data_dir = tmp.path().to_string_lossy().to_string();
@@ -5116,7 +5232,7 @@ mod tests {
         let tablet = Tablet::create_from_meta(meta, None).unwrap();
         tablet.init().unwrap();
 
-        assert!(tablet.lookup_primary_key(b"k1").unwrap().is_some());
+        assert!(tablet.lookup_primary_key(b"k1").unwrap().is_none());
     }
 
     #[test]
@@ -5173,8 +5289,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let manager = create_test_meta_manager(&tmp);
         let schema = create_test_schema();
-        let tablet =
-            Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), Some(manager.clone())).unwrap());
+        let tablet = Arc::new(
+            Tablet::new(
+                1,
+                100,
+                1000,
+                schema.clone(),
+                tmp.path(),
+                Some(manager.clone()),
+            )
+            .unwrap(),
+        );
         tablet.init().unwrap();
         tablet.save_meta().unwrap();
 
@@ -5222,8 +5347,17 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let manager = create_test_meta_manager(&tmp);
         let schema = create_test_schema();
-        let tablet =
-            Arc::new(Tablet::new(1, 100, 1000, schema, tmp.path(), Some(manager.clone())).unwrap());
+        let tablet = Arc::new(
+            Tablet::new(
+                1,
+                100,
+                1000,
+                schema.clone(),
+                tmp.path(),
+                Some(manager.clone()),
+            )
+            .unwrap(),
+        );
         tablet.init().unwrap();
         tablet.save_meta().unwrap();
 
@@ -5232,6 +5366,7 @@ mod tests {
             .write_chunk(&chunk_with_names(&[1], &["old"]))
             .unwrap();
         let rowset1 = writer1.commit().unwrap();
+        tablet.persist_primary_index_snapshot().unwrap();
 
         let mut writer2 = crate::write::DeltaWriter::open(tablet.clone(), 11).unwrap();
         writer2
@@ -5240,16 +5375,19 @@ mod tests {
         let rowset2 = writer2.commit().unwrap();
         tablet.persist_meta_snapshot().unwrap();
 
-        let persistent = PersistentIndex::new(tmp.path().join("primary_index")).unwrap();
-        persistent.reset().unwrap();
-
-        drop(tablet);
-        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
-        let serializer =
-            PrimaryKeySerializer::from_schema_ref(&reopened.schema().unwrap()).unwrap();
+        let serializer = PrimaryKeySerializer::from_schema_ref(&schema).unwrap();
         let key = serializer
             .encode_row(&chunk_with_names(&[1], &["ignored"]), 0)
             .unwrap();
+        let stale = PersistentIndex::new(tmp.path().join("primary_index")).unwrap();
+        let stale_row_id = stale.get(&key).unwrap().unwrap();
+        assert_eq!(
+            tablet.decode_row_id(stale_row_id).unwrap().rowset_id,
+            rowset1.rowset_id()
+        );
+
+        drop(tablet);
+        let reopened = Tablet::open(1, tmp.path(), manager).unwrap();
         let row_id = reopened.lookup_primary_key(&key).unwrap().unwrap();
         let location = reopened.decode_row_id(row_id).unwrap();
 

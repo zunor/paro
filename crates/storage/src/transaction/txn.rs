@@ -1052,6 +1052,22 @@ impl Transaction {
     pub fn prepare_commit(&self) -> Result<PreparedStorageCommit> {
         self.write_buffer.materialize_writers()?;
 
+        // Search-tail pressure is commit admission, not rowset publication.
+        // A required apply happens after the database journal is durable and
+        // must therefore never time out or reject because a derived index is
+        // behind. Aggregate all rowsets for a tablet so one transaction cannot
+        // cross the freshness window through several individually-small parts.
+        let mut search_ingest_admissions = Vec::new();
+        for (tablet, incoming_rows, incoming_bytes) in
+            self.write_buffer.pending_rowset_volume_by_tablet()?
+        {
+            if let Some(admission) =
+                tablet.acquire_search_rowset_publish_admission(incoming_rows, incoming_bytes)?
+            {
+                search_ingest_admissions.push(admission);
+            }
+        }
+
         let pending = self.write_buffer.take_mutations()?;
         // Acquire in tablet-id order while SQL write locks are still held.
         // These leases bridge the later lock-release -> required-apply window,
@@ -1172,6 +1188,7 @@ impl Transaction {
             primary_deletes,
             row_id_deletes,
             _layout_leases: layout_leases,
+            _search_ingest_admissions: search_ingest_admissions,
         })?;
 
         Ok(PreparedStorageCommit {

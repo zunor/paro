@@ -207,6 +207,10 @@ impl DatabaseOpener {
         // Bootstrap search runtimes once the final tablet heads are known,
         // even when the checkpoint had no outstanding deferred task.
         restore_search_registry_definitions(db.catalog());
+        // Seed level-triggered discovery after recovery. A pending tail must
+        // progress even when the process crashed before its old notification
+        // was serviced and no later write arrives.
+        db.schedule_search_maintenance(paro_storage::search::SearchMaintenanceUrgency::Immediate);
         let report = Self::refresh_recovery_report(db, &inputs.wal_path);
         Self::sweep_checkpoint_artifacts(db, checkpoint)?;
         Self::ensure_recovered_journal_published(&apply_runtime, recovery_summary.max_lsn)?;

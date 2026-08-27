@@ -2017,6 +2017,7 @@ mod tests {
                 "m": 8,
                 "ef_construct": 64,
                 "ef_search": 64,
+                "rerank_policy": "top_k",
                 "distance_cost": {
                     "source": {
                         "kind": "built_in",
@@ -2441,10 +2442,7 @@ mod tests {
             .with_compression(CompressionType::None)
             .with_search_inline_builders(hnsw_recording_builder_set(
                 Arc::clone(&events),
-                SearchFreshnessPolicy::BoundedLag {
-                    max_tail_rows: 64,
-                    max_lag_millis: 250,
-                },
+                SearchFreshnessPolicy::Required,
                 Some(admission_trait),
             ));
         let mut writer = RowsetWriter::create(context).unwrap();
@@ -2704,10 +2702,7 @@ mod tests {
             .with_max_rows_per_segment(128)
             .with_search_inline_builders(hnsw_recording_builder_set(
                 Arc::clone(&events),
-                SearchFreshnessPolicy::BoundedLag {
-                    max_tail_rows: 64,
-                    max_lag_millis: 250,
-                },
+                SearchFreshnessPolicy::Required,
                 Some(admission_trait),
             ));
         let mut writer = RowsetWriter::create(context).unwrap();

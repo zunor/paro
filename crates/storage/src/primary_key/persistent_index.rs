@@ -15,7 +15,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 4;
+pub const PERSISTENT_INDEX_FORMAT_VERSION: u32 = 5;
 
 const WAL_MAGIC: [u8; 4] = *b"PIWL";
 const FILE_HEADER_LEN: usize = 8;
@@ -36,21 +36,45 @@ struct ImmutableFileMeta {
     entry_count: u64,
 }
 
+/// Exact durable state from which a primary-index cache was derived.
+///
+/// A persistent primary index is a rebuildable cache, not an authority.  It
+/// may only be reused when this provenance is identical to the tablet state
+/// restored from a checkpoint.  In particular, entry cardinality is not a
+/// correctness proof: an upsert can preserve cardinality while moving a key to
+/// a different physical row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryIndexProvenance {
+    pub tablet_id: u64,
+    pub indexed_through_version: i64,
+    pub layout_epoch: u64,
+    pub schema_epoch: Option<u64>,
+    pub schema_hash: u32,
+    pub rowset_root: Vec<PrimaryIndexRowsetRoot>,
+}
+
+/// One member of the exact visible-rowset root covered by a cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PrimaryIndexRowsetRoot {
+    pub rowset_id: u64,
+    pub start_version: i64,
+    pub end_version: i64,
+    pub num_segments: u32,
+    pub effective_rows: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Manifest {
-    #[serde(default = "default_manifest_format_version")]
     format_version: u32,
-    #[serde(default)]
     active_wal_id: u64,
-    #[serde(default = "default_next_file_id")]
     next_file_id: u64,
-    #[serde(default)]
     edit_version: u64,
-    #[serde(default)]
     applied_lsn: u64,
-    #[serde(default)]
+    provenance: Option<PrimaryIndexProvenance>,
     l1_files: Vec<ImmutableFileMeta>,
-    #[serde(default)]
     l2_file: Option<ImmutableFileMeta>,
 }
 
@@ -62,6 +86,7 @@ impl Default for Manifest {
             next_file_id: default_next_file_id(),
             edit_version: 0,
             applied_lsn: 0,
+            provenance: None,
             l1_files: Vec::new(),
             l2_file: None,
         }
@@ -84,6 +109,7 @@ pub struct PersistentIndex {
     next_file_id: u64,
     edit_version: u64,
     applied_lsn: u64,
+    provenance: Option<PrimaryIndexProvenance>,
     l1_files: Vec<ImmutableFileMeta>,
     l2_file: Option<ImmutableFileMeta>,
 }
@@ -131,6 +157,7 @@ impl PersistentIndex {
                         .unwrap_or(0),
                 ),
             applied_lsn: manifest.applied_lsn,
+            provenance: manifest.provenance,
             l1_files: manifest.l1_files,
             l2_file: manifest.l2_file,
         })
@@ -138,6 +165,10 @@ impl PersistentIndex {
 
     pub fn applied_lsn(&self) -> u64 {
         self.applied_lsn
+    }
+
+    pub fn provenance(&self) -> Option<&PrimaryIndexProvenance> {
+        self.provenance.as_ref()
     }
 
     pub fn load(&self) -> Result<PrimaryIndex> {
@@ -442,9 +473,22 @@ impl PersistentIndex {
         keys.iter().map(|key| idx.get(key)).collect()
     }
 
-    pub fn flush_l0(&mut self, _idx: &PrimaryIndex, truncate_wal: bool) -> Result<()> {
+    pub fn flush_l0(&mut self, idx: &PrimaryIndex, truncate_wal: bool) -> Result<()> {
+        self.flush_l0_with_provenance(idx, truncate_wal, None)
+    }
+
+    /// Publish the current in-memory delta and its exact tablet provenance in
+    /// one manifest replacement.  Immutable files are written first; the new
+    /// provenance cannot become visible without the file set it describes.
+    pub fn flush_l0_with_provenance(
+        &mut self,
+        idx: &PrimaryIndex,
+        truncate_wal: bool,
+        provenance: Option<PrimaryIndexProvenance>,
+    ) -> Result<()> {
         let wal_path = self.active_wal_path();
-        let records = self.read_wal_records(&wal_path)?;
+        let mut records = self.read_wal_records(&wal_path)?;
+        records.extend(idx.snapshot_versions());
 
         if !records.is_empty() {
             let file_id = self.next_file_id;
@@ -468,6 +512,7 @@ impl PersistentIndex {
             self.create_empty_wal(self.active_wal_id)?;
         }
 
+        self.provenance = provenance;
         self.write_manifest()?;
         self.cleanup_obsolete_files()?;
         Ok(())
@@ -769,6 +814,7 @@ impl PersistentIndex {
             next_file_id: self.next_file_id,
             edit_version: self.edit_version,
             applied_lsn: self.applied_lsn,
+            provenance: self.provenance.clone(),
             l1_files: self.l1_files.clone(),
             l2_file: self.l2_file.clone(),
         };
@@ -1178,6 +1224,38 @@ mod tests {
 
         let reopened = PersistentIndex::new(dir.path()).unwrap();
         assert_eq!(reopened.applied_lsn(), 42);
+    }
+
+    #[test]
+    fn provenance_is_published_with_the_flushed_file_set() {
+        let dir = tempdir().unwrap();
+        let mut pi = PersistentIndex::new(dir.path()).unwrap();
+        let index = PrimaryIndex::new();
+        index.upsert_at(
+            b"k".to_vec(),
+            RowID::new(7, crate::rowset::SegmentRowId::from_raw(3)),
+            11,
+        );
+        let provenance = PrimaryIndexProvenance {
+            tablet_id: 9,
+            indexed_through_version: 11,
+            layout_epoch: 4,
+            schema_epoch: Some(2),
+            schema_hash: 77,
+            rowset_root: vec![PrimaryIndexRowsetRoot {
+                rowset_id: 7,
+                start_version: 0,
+                end_version: 11,
+                num_segments: 1,
+                effective_rows: 1,
+            }],
+        };
+
+        pi.flush_l0_with_provenance(&index, true, Some(provenance.clone()))
+            .unwrap();
+        let reopened = PersistentIndex::new(dir.path()).unwrap();
+        assert_eq!(reopened.provenance(), Some(&provenance));
+        assert!(reopened.get(b"k").unwrap().is_some());
     }
 
     #[test]

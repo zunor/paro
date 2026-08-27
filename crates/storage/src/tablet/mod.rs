@@ -81,7 +81,7 @@ pub use tablet_runtime::{
 };
 pub(crate) use tablet_runtime::{
     RowsetPublishObserver, SearchGenerationHeadUpdates, SearchGenerationPublishGuard,
-    SearchGenerationPublishOutcome,
+    SearchGenerationPublishOutcome, SearchIngestAdmissionLease,
 };
 pub use tablet_schema::{ColumnId, KeysType, TabletColumn, TabletSchema, TabletSchemaRef};
 

@@ -35,6 +35,7 @@ use paro_common::chunk::Chunk;
 use paro_common::runtime_value::Value;
 use paro_common::types::LogicalType;
 use paro_common::vector::Vector;
+use paro_scheduler::scheduler::TaskScheduler;
 use paro_transaction::{
     CommandId, CommitTs, IsolationLevel, ParticipantStateSet, ReadSnapshot, ReadTs,
     RetentionLeaseKind, TransactionView,
@@ -1283,6 +1284,10 @@ fn partial_update_restart_with_meta_manager_rebuilds_primary_key_row_visibility(
         .unwrap();
     assert_eq!(updated, 1);
 
+    // The metadata manager represents a checkpoint image. Direct test writes
+    // bypass the database journal, so publish the checkpoint explicitly before
+    // exercising provenance-gated primary-index recovery.
+    table.tablet().persist_meta_snapshot().unwrap();
     let descriptor = table.to_descriptor().unwrap();
     let restored =
         open_table_from_descriptor_with_meta_manager(table.types(), &descriptor, Some(manager));
@@ -1425,6 +1430,10 @@ fn hnsw_capability_exposes_generation_level_provider_stats() {
             2,
         ))
         .unwrap();
+    table.bind_search_task_scheduler(Some(Arc::new(TaskScheduler::new())));
+    table
+        .bootstrap_search_generations()
+        .expect("materialize deferred HNSW generation");
 
     let capability = table
         .vector_capability(1, DistanceMetric::Euclidean)

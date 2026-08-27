@@ -96,7 +96,8 @@ pub use lifecycle::bootstrap::SearchBootstrapReport;
 pub use maintenance::{
     DefinitionMaintenanceReport, HnswMaintenanceRequest, HnswMaintenanceRowsetRef,
     MaintenanceAdmissionDecision, MaintenanceAdmissionReason, MaintenanceFairnessKey,
-    ProviderMaintenanceRequest, SearchMaintenanceAction, SearchMaintenanceReport,
+    ProviderMaintenanceRequest, SearchMaintenanceAction, SearchMaintenanceFailure,
+    SearchMaintenanceReport, SearchMaintenanceUrgency,
 };
 pub use posting_stream::{
     CandidateStreamStep, PostingCandidateStream, PostingPruningHint, SearchScore,

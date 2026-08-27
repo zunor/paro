@@ -34,6 +34,7 @@ use paro_storage::buffer::BufferPool;
 use paro_storage::compaction::compaction_manager::CompactionObservability;
 use paro_storage::index::hnsw::HnswIntegrityScheduler;
 use paro_storage::meta::TabletMetaManager;
+use paro_storage::search::SearchMaintenanceUrgency;
 use paro_storage::transaction::manager::TransactionManager;
 use paro_transaction::{
     CommitBatchPolicy, CommitDrainWakePool, CommitDrainWakePoolOptions, CommitJournal,
@@ -45,14 +46,14 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// A generation build is intentionally heavier than a rowset commit. A full
-// second of publication quiescence prevents normal group-commit gaps from
-// being mistaken for the end of a COPY/upsert stream. Exact tail merge keeps
-// the rows queryable during this debounce interval.
+// The quiet window coalesces bursts, while MAX_DELAY is deliberately anchored
+// at the first unserviced request and cannot be extended by later writes.
+// Durable manifest scans make notifications an acceleration hint rather than
+// the source of truth.
 const SEARCH_MAINTENANCE_QUIESCENCE: Duration = Duration::from_secs(1);
+const SEARCH_MAINTENANCE_MAX_DELAY: Duration = Duration::from_secs(5);
 const SEARCH_MAINTENANCE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
-const SEARCH_MAINTENANCE_LIFECYCLE_POLL: Duration = Duration::from_secs(1);
-const MAX_SEARCH_MAINTENANCE_SWEEPS_PER_PASS: usize = 64;
+const SEARCH_MAINTENANCE_DISCOVERY_INTERVAL: Duration = Duration::from_secs(5);
 
 /// State of an attached database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -300,7 +301,41 @@ struct SearchMaintenanceTriggerState {
 struct SearchMaintenancePending {
     requested_epoch: u64,
     completed_epoch: u64,
+    first_request: Option<Instant>,
     last_request: Option<Instant>,
+    immediate: bool,
+}
+
+impl SearchMaintenancePending {
+    fn wait_before_run(&self, now: Instant) -> Option<Duration> {
+        if self.immediate {
+            return None;
+        }
+        let quiet_for = self
+            .last_request
+            .map(|requested_at| now.saturating_duration_since(requested_at))
+            .unwrap_or(SEARCH_MAINTENANCE_QUIESCENCE);
+        let outstanding_for = self
+            .first_request
+            .map(|requested_at| now.saturating_duration_since(requested_at))
+            .unwrap_or(SEARCH_MAINTENANCE_MAX_DELAY);
+        if quiet_for >= SEARCH_MAINTENANCE_QUIESCENCE
+            || outstanding_for >= SEARCH_MAINTENANCE_MAX_DELAY
+        {
+            return None;
+        }
+        Some(
+            (SEARCH_MAINTENANCE_QUIESCENCE - quiet_for)
+                .min(SEARCH_MAINTENANCE_MAX_DELAY - outstanding_for),
+        )
+    }
+}
+
+#[derive(Debug, Default)]
+struct SearchMaintenancePass {
+    more_work: bool,
+    immediate: bool,
+    failures: usize,
 }
 
 impl std::fmt::Debug for DatabaseHandle {
@@ -669,6 +704,8 @@ impl DatabaseHandle {
         self.compaction.bind_scheduler(scheduler);
         self.bind_tablet_runtime_services();
         self.ensure_checkpoint_background_runner();
+        self.ensure_search_maintenance_background_runner();
+        self.schedule_search_maintenance(SearchMaintenanceUrgency::Immediate);
     }
 
     pub fn bind_hnsw_integrity_scheduler(self: &Arc<Self>, scheduler: Arc<HnswIntegrityScheduler>) {
@@ -1135,7 +1172,7 @@ impl DatabaseHandle {
     /// a short quiet period before asking each provider to materialize that
     /// tail into a derived generation. The quiet period is what prevents a
     /// COPY stream from producing a graph per input batch.
-    pub fn schedule_search_maintenance(self: &Arc<Self>) {
+    pub fn schedule_search_maintenance(&self, urgency: SearchMaintenanceUrgency) {
         if self.db_type().is_system()
             || self.db_type().is_temporary()
             || self.db_type().is_read_only()
@@ -1146,8 +1183,11 @@ impl DatabaseHandle {
         self.ensure_search_maintenance_background_runner();
         {
             let mut pending = self.search_maintenance_trigger.pending.lock();
+            let now = Instant::now();
             pending.requested_epoch = pending.requested_epoch.saturating_add(1);
-            pending.last_request = Some(Instant::now());
+            pending.first_request.get_or_insert(now);
+            pending.last_request = Some(now);
+            pending.immediate |= matches!(urgency, SearchMaintenanceUrgency::Immediate);
             tracing::trace!(
                 target: targets::INSTANCE,
                 db = %self.name(),
@@ -1202,7 +1242,14 @@ impl DatabaseHandle {
             .spawn(move || Self::checkpoint_background_loop(weak));
     }
 
-    fn ensure_search_maintenance_background_runner(self: &Arc<Self>) {
+    fn ensure_search_maintenance_background_runner(&self) {
+        let weak = self.self_weak.read().clone();
+        if weak.upgrade().is_none() {
+            // The owner Arc is installed by bind_task_scheduler. Keep any
+            // pending level-triggered request queued until that lifecycle
+            // boundary instead of spawning a thread that cannot own the DB.
+            return;
+        }
         if self
             .search_maintenance_trigger
             .background_started
@@ -1212,7 +1259,6 @@ impl DatabaseHandle {
             return;
         }
 
-        let weak = Arc::downgrade(self);
         let db_name = self.name().to_string();
         if let Err(error) = thread::Builder::new()
             .name(format!("paro-search-maintenance-{db_name}"))
@@ -1236,26 +1282,30 @@ impl DatabaseHandle {
                 return;
             };
 
-            let target_epoch = {
+            let target_epoch = loop {
                 let mut pending = db.search_maintenance_trigger.pending.lock();
                 if pending.requested_epoch == pending.completed_epoch {
                     db.search_maintenance_trigger
                         .changed
-                        .wait_for(&mut pending, SEARCH_MAINTENANCE_LIFECYCLE_POLL);
-                    continue;
+                        .wait_for(&mut pending, SEARCH_MAINTENANCE_DISCOVERY_INTERVAL);
+                    if pending.requested_epoch == pending.completed_epoch {
+                        let now = Instant::now();
+                        pending.requested_epoch = pending.requested_epoch.saturating_add(1);
+                        pending.first_request = Some(now);
+                        pending.last_request = Some(now);
+                        pending.immediate = true;
+                    } else {
+                        continue;
+                    }
                 }
 
-                let quiet_for = pending
-                    .last_request
-                    .map(|requested_at| requested_at.elapsed())
-                    .unwrap_or(SEARCH_MAINTENANCE_QUIESCENCE);
-                if quiet_for < SEARCH_MAINTENANCE_QUIESCENCE {
+                if let Some(wait) = pending.wait_before_run(Instant::now()) {
                     db.search_maintenance_trigger
                         .changed
-                        .wait_for(&mut pending, SEARCH_MAINTENANCE_QUIESCENCE - quiet_for);
+                        .wait_for(&mut pending, wait);
                     continue;
                 }
-                pending.requested_epoch
+                break pending.requested_epoch;
             };
 
             tracing::trace!(
@@ -1268,10 +1318,18 @@ impl DatabaseHandle {
             let mut pending = db.search_maintenance_trigger.pending.lock();
             match result {
                 Ok(more_work) => {
-                    if more_work {
-                        pending.last_request = Some(Instant::now());
+                    if more_work.more_work {
+                        let now = Instant::now();
+                        pending.first_request = Some(now);
+                        pending.last_request = Some(now);
+                        pending.immediate = more_work.immediate;
                     } else {
                         pending.completed_epoch = pending.completed_epoch.max(target_epoch);
+                        if pending.completed_epoch == pending.requested_epoch {
+                            pending.first_request = None;
+                            pending.last_request = None;
+                            pending.immediate = false;
+                        }
                     }
                     tracing::trace!(
                         target: targets::INSTANCE,
@@ -1279,11 +1337,15 @@ impl DatabaseHandle {
                         target_epoch,
                         requested_epoch = pending.requested_epoch,
                         completed_epoch = pending.completed_epoch,
+                        failures = more_work.failures,
                         "Completed coalesced search maintenance"
                     );
                 }
                 Err(error) => {
-                    pending.last_request = Some(Instant::now());
+                    let now = Instant::now();
+                    pending.first_request = Some(now);
+                    pending.last_request = Some(now);
+                    pending.immediate = false;
                     tracing::warn!(
                         target: targets::INSTANCE,
                         db = %db.name(),
@@ -1298,8 +1360,8 @@ impl DatabaseHandle {
         }
     }
 
-    fn run_search_derived_maintenance(&self) -> anyhow::Result<bool> {
-        let mut more_work = false;
+    fn run_search_derived_maintenance(&self) -> anyhow::Result<SearchMaintenancePass> {
+        let mut pass = SearchMaintenancePass::default();
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
             .catalog
@@ -1320,18 +1382,37 @@ impl DatabaseHandle {
                 let Some(storage) = table.get_storage() else {
                     continue;
                 };
-                let mut exhausted_pass = true;
-                for _ in 0..MAX_SEARCH_MAINTENANCE_SWEEPS_PER_PASS {
-                    let report = storage.search_derived_maintenance_sweep()?;
-                    if report.catch_up_rowsets == 0 {
-                        exhausted_pass = false;
-                        break;
+                match storage.search_derived_maintenance_sweep() {
+                    Ok(report) => {
+                        pass.more_work |= report.has_pending_work();
+                        pass.immediate |= report.requires_immediate_follow_up();
+                        pass.failures = pass.failures.saturating_add(report.failures.len());
+                        for failure in report.failures {
+                            tracing::warn!(
+                                target: targets::INSTANCE,
+                                db = %self.name(),
+                                table_id = ?table.base.base.object_id,
+                                definition_id = ?failure.definition_id,
+                                error = %failure.message,
+                                "Search maintenance definition failed; other definitions remain eligible"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        pass.more_work = true;
+                        pass.failures = pass.failures.saturating_add(1);
+                        tracing::warn!(
+                            target: targets::INSTANCE,
+                            db = %self.name(),
+                            table_id = ?table.base.base.object_id,
+                            error = %error,
+                            "Search maintenance table sweep failed; continuing with other tables"
+                        );
                     }
                 }
-                more_work |= exhausted_pass;
             }
         }
-        Ok(more_work)
+        Ok(pass)
     }
 
     fn checkpoint_background_loop(weak: Weak<Self>) {
@@ -1532,11 +1613,12 @@ impl DatabaseHandle {
         let hnsw_integrity_scheduler = self.hnsw_integrity_scheduler.read().clone();
         let search_maintenance_notifier = {
             let weak = self.self_weak.read().clone();
-            Some(Arc::new(move || {
+            Some(Arc::new(move |urgency| {
                 if let Some(database) = weak.upgrade() {
-                    database.schedule_search_maintenance();
+                    database.schedule_search_maintenance(urgency);
                 }
-            }) as Arc<dyn Fn() + Send + Sync>)
+            })
+                as Arc<dyn Fn(SearchMaintenanceUrgency) + Send + Sync>)
         };
         let txn = CatalogSnapshot::read_only(u64::MAX);
         for schema_entry in self
